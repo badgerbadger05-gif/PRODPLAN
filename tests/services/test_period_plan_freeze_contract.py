@@ -31,6 +31,7 @@ from app.models import (
     ProductionResource,
     SpecComponent,
     Specification,
+    StockWarehouse,
 )
 from app.services import period_plan_service
 from app.services.period_plan_service import (
@@ -64,7 +65,15 @@ def _accepted_planning_truth(db_session):
         },
         physical_import_batch=batch, algorithm_version="test",
     )
-    db_session.add(generation)
+    db_session.add_all([
+        generation,
+        StockWarehouse(
+            warehouse_ref1c="WH-FREEZE-PLAN",
+            warehouse_name="Freeze planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+    ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
     resource = ProductionResource(

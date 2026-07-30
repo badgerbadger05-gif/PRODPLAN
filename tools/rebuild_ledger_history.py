@@ -190,6 +190,8 @@ class GenerationState:
 class ReplayRuntime(Protocol):
     def preflight_assembly_rates(self, item_codes: Sequence[str]) -> None: ...
 
+    def preflight_planning_pools(self) -> None: ...
+
     def generation(self, key: str) -> GenerationState | None: ...
 
     def current_generation_id(self) -> int | None: ...
@@ -258,6 +260,7 @@ def replay_history(
     if max_import_iterations <= 0:
         raise ReplayError("max_import_iterations must be positive")
     runtime.preflight_assembly_rates(manifest.required_assembly_item_codes)
+    runtime.preflight_planning_pools()
 
     bootstrap = runtime.generation(manifest.bootstrap_key)
     if bootstrap is None:
@@ -432,6 +435,14 @@ class DatabaseRuntime:
             problems.append(f"ambiguous assembly rates: {', '.join(ambiguous)}")
         if problems:
             raise ReplayError("assembly-rate preflight failed; " + "; ".join(problems))
+
+    def preflight_planning_pools(self) -> None:
+        """Read-only gate for supplier and WIP future-supply qualification."""
+        from app.services.planning_pool_resolver import (
+            resolve_planning_pool_by_warehouse,
+        )
+
+        resolve_planning_pool_by_warehouse(self.db)
 
     def generation(self, key: str) -> GenerationState | None:
         from app import models
@@ -634,6 +645,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.preflight_only:
             runtime.preflight_assembly_rates(manifest.required_assembly_item_codes)
+            runtime.preflight_planning_pools()
             result = {
                 "status": "preflight-ok",
                 "required_assembly_item_codes": list(

@@ -16,6 +16,7 @@ from typing import Mapping
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.planning_pool_resolver import require_mapped_destination
 
 from .future_supply_capture import (
     FutureSupplyEvidence,
@@ -60,12 +61,7 @@ def _accepted_generation(db: Session, ledger_generation_id: int) -> models.Ledge
 
 
 def _pool_mapping(mapping: Mapping[str, str] | None) -> dict[str, str]:
-    """Normalize an injected, authoritative destination -> planning-pool map.
-
-    There is currently no authoritative database mapping for this boundary.
-    In particular, ``StockWarehouse.is_selected`` is a UI/configuration flag,
-    not proof that incoming WIP belongs to a planning pool.
-    """
+    """Normalize the live planning-contour mapping resolved by orchestration."""
     return {
         _text(warehouse): _text(pool)
         for warehouse, pool in (mapping or {}).items()
@@ -199,7 +195,11 @@ def collect_wip_future_supply_evidence(
         elif not destination:
             status, reason = "rejected", "missing destination warehouse mapping"
         elif not planning_pool:
-            status, reason = "rejected", "planning_pool_not_mapped"
+            planning_pool = require_mapped_destination(
+                pools_by_destination,
+                destination,
+                source=f"wip_order:{order_ref}:{line_ref}",
+            )
         elif invalid_reasons.get(product_id):
             status, reason = "rejected", "; ".join(sorted(invalid_reasons[product_id]))
         eta = _as_date(getattr(product.control_state, "planned_finish_date", None))

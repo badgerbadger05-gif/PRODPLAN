@@ -96,7 +96,13 @@ def _accepted_parent(db_session, *, generation_key="accepted-parent"):
         algorithm_version="accepted/1",
         accepted_at=cutoff,
     )
-    db_session.add_all([parent_batch, parent])
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        warehouse_name="Physical planning contour",
+        is_selected=True,
+        is_finished_goods=False,
+    )
+    db_session.add_all([parent_batch, parent, warehouse])
     db_session.flush()
     db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
     db_session.commit()

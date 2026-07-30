@@ -10,6 +10,7 @@ from app.services import obligation_refresh_orchestrator as workflow
 from app.services.mrp_result_snapshot import read_mrp_result_manifest
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
+from app.services.planning_pool_resolver import PlanningPoolConfigurationError
 
 
 def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка", period_from=date(2026, 8, 1)):
@@ -38,8 +39,8 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     )
     warehouse = models.StockWarehouse(
         warehouse_ref1c="WH-OUT",
-        warehouse_name="Outside planning contour",
-        is_selected=False,
+        warehouse_name="Planning contour",
+        is_selected=True,
         is_finished_goods=False,
     )
     db.add_all([physical, accepted, item, warehouse, resource]); db.flush()
@@ -71,7 +72,7 @@ def _run(db, parent, key, *, add=(), config=None, pool_mapping=None):
         db, parent_generation_id=parent.id, generation_key=key, add_plan_ids=add,
         started_by="test", horizon_days=30, config_version_id=None,
         config_snapshot=config or {},
-        planning_pool_by_warehouse=pool_mapping or {},
+        planning_pool_by_warehouse=pool_mapping,
         accepted_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
 
@@ -138,6 +139,181 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     ).one()
     assert queue.payload["total_rows"] == 1
     assert queue.payload["total_queue_qty"] == 5.0
+
+
+def test_production_refresh_resolves_live_pool_for_supplier_and_wip(db_session):
+    accepted, plan, _line, _item, _old, cutoff = _world(
+        db_session,
+        with_parent=False,
+    )
+    supplier_item = models.Item(
+        item_code="ORCH-SUPPLY",
+        item_name="orchestrator supplier supply",
+        replenishment_method="Покупка",
+    )
+    wip_item = models.Item(
+        item_code="ORCH-WIP",
+        item_name="orchestrator WIP supply",
+        replenishment_method="Производство",
+    )
+    db_session.add_all([supplier_item, wip_item])
+    db_session.flush()
+
+    supplier_order = models.SupplierOrder(
+        order_number="SO-ORCH",
+        order_ref1c="so-orch-ref",
+        order_date=cutoff - timedelta(days=3),
+        order_state_name="В пути",
+        deletion_mark=False,
+        created_at=cutoff - timedelta(days=3),
+        updated_at=cutoff - timedelta(days=1),
+    )
+    production_order = models.ProductionOrder(
+        order_number="WO-ORCH",
+        order_ref1c="wo-orch-ref",
+        order_date=cutoff - timedelta(days=2),
+        order_state_key="open",
+        deletion_mark=False,
+        created_at=cutoff - timedelta(days=2),
+        updated_at=cutoff - timedelta(days=1),
+    )
+    db_session.add_all([supplier_order, production_order])
+    db_session.flush()
+    db_session.add(
+        models.SupplierOrderItem(
+            order_id=supplier_order.order_id,
+            item_id_ref=supplier_item.item_id,
+            line_number=1,
+            destination_warehouse_ref1c="WH-OUT",
+            quantity=Decimal("7"),
+            received_qty=Decimal("0"),
+            remaining_qty=Decimal("7"),
+            delivery_date=cutoff + timedelta(days=10),
+            created_at=cutoff - timedelta(days=2),
+            updated_at=cutoff - timedelta(days=1),
+        )
+    )
+    product = models.ProductionProduct(
+        order_id=production_order.order_id,
+        item_id=wip_item.item_id,
+        line_number=1,
+        destination_warehouse_ref1c="WH-OUT",
+        quantity=Decimal("4"),
+        produced_qty=Decimal("0"),
+        remaining_qty=Decimal("4"),
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        models.ProductionOrderLineState(
+            product_id=product.product_id,
+            status="ready",
+            issue_status="not_requested",
+            planned_finish_date=(cutoff + timedelta(days=8)).date(),
+        )
+    )
+    db_session.commit()
+
+    result = _run(
+        db_session,
+        accepted,
+        "orch-live-planning-pools",
+        add=[plan.id],
+    )
+    exact = (
+        db_session.query(models.LedgerFutureSupply)
+        .filter_by(
+            ledger_generation_id=result.target_generation_id,
+            evidence_status="exact",
+        )
+        .all()
+    )
+    by_kind = {row.supply_kind: row for row in exact}
+
+    assert set(by_kind) >= {"supplier_order", "wip_order"}
+    assert by_kind["supplier_order"].planning_stock_pool == "default"
+    assert by_kind["wip_order"].planning_stock_pool == "default"
+    assert by_kind["supplier_order"].open_qty_at_cutoff == Decimal("7")
+    assert by_kind["wip_order"].open_qty_at_cutoff == Decimal("4")
+
+
+def test_production_refresh_fails_closed_for_unmapped_supplier_destination(db_session):
+    accepted, plan, _line, _item, _old, cutoff = _world(
+        db_session,
+        with_parent=False,
+    )
+    supplied_item = models.Item(
+        item_code="ORCH-UNMAPPED",
+        item_name="unmapped supplier destination",
+        replenishment_method="Покупка",
+    )
+    order = models.SupplierOrder(
+        order_number="SO-UNMAPPED",
+        order_ref1c="so-unmapped-ref",
+        order_date=cutoff - timedelta(days=2),
+        order_state_name="В пути",
+        deletion_mark=False,
+        created_at=cutoff - timedelta(days=2),
+        updated_at=cutoff - timedelta(days=1),
+    )
+    db_session.add_all([supplied_item, order])
+    db_session.flush()
+    db_session.add(
+        models.SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=supplied_item.item_id,
+            line_number=1,
+            destination_warehouse_ref1c="WH-NOT-IN-CONTOUR",
+            quantity=Decimal("2"),
+            received_qty=Decimal("0"),
+            remaining_qty=Decimal("2"),
+            delivery_date=cutoff + timedelta(days=5),
+            created_at=cutoff - timedelta(days=2),
+            updated_at=cutoff - timedelta(days=1),
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        PlanningPoolConfigurationError,
+        match="outside the live planning contour",
+    ):
+        _run(
+            db_session,
+            accepted,
+            "orch-unmapped-planning-pool",
+            add=[plan.id],
+        )
+
+
+def test_production_refresh_fails_before_build_when_planning_contour_is_empty(
+    db_session,
+):
+    accepted, plan, _line, _item, _old, _cutoff = _world(
+        db_session,
+        with_parent=False,
+    )
+    warehouse = db_session.query(models.StockWarehouse).one()
+    warehouse.is_selected = False
+    db_session.commit()
+
+    with pytest.raises(
+        PlanningPoolConfigurationError,
+        match="planning warehouse contour is empty",
+    ):
+        _run(
+            db_session,
+            accepted,
+            "orch-empty-planning-pool",
+            add=[plan.id],
+        )
+
+    assert (
+        db_session.query(models.LedgerGeneration)
+        .filter_by(generation_key="orch-empty-planning-pool")
+        .count()
+        == 0
+    )
 
 
 def test_add_plans_with_mixed_periods_fail_closed(db_session):

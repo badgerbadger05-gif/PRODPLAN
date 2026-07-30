@@ -20,6 +20,10 @@ from ..purchase_control_snapshot import (
 from ..production_control_journal_snapshot import (
     promote_candidate_snapshot as promote_production_journal_candidate,
 )
+from ..planning_pool_resolver import (
+    effective_planning_pool_by_warehouse,
+    validate_future_supply_destinations,
+)
 from .generation_lifecycle import accept_generation_build
 from .historical_bootstrap_phase0 import (
     BalanceConvergenceResult,
@@ -285,6 +289,15 @@ def run_physical_refresh(
         lock_context = physical_sequence_lock_context()
         lock_context.__enter__()
         parent = _current_parent(db)
+        pool_mapping = effective_planning_pool_by_warehouse(
+            db,
+            planning_pool_by_warehouse,
+        )
+        validate_future_supply_destinations(
+            db,
+            ledger_generation_id=int(parent.id),
+            mapping=pool_mapping,
+        )
         from_cutoff = _utc(parent.cutoff, "parent cutoff")
         fork = fork_physical_refresh_generation(
             db,

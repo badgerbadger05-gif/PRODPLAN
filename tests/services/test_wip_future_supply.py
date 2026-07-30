@@ -1,11 +1,14 @@
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
+
 from app import models
 from app.services.item_ledger.wip_future_supply import (
     capture_wip_future_supply,
     collect_wip_future_supply_evidence,
 )
+from app.services.planning_pool_resolver import PlanningPoolConfigurationError
 
 
 def _scope(db, suffix="one"):
@@ -103,10 +106,12 @@ def test_missing_destination_is_rejected_not_a_zero_fact(db_session):
     assert row.realized_qty_at_cutoff == Decimal("0")
 
 
-def test_no_explicit_pool_mapping_is_rejected_even_for_selected_warehouse(db_session):
+def test_no_explicit_pool_mapping_fails_visibly_even_for_selected_warehouse(db_session):
     generation, _physical, _build, item, warehouse = _scope(db_session, "pool")
     _product(db_session, item, warehouse)
 
-    row = collect_wip_future_supply_evidence(db_session, generation.id)[0]
-    assert row.evidence_status == "rejected"
-    assert row.reason == "planning_pool_not_mapped"
+    with pytest.raises(
+        PlanningPoolConfigurationError,
+        match="outside the live planning contour",
+    ):
+        collect_wip_future_supply_evidence(db_session, generation.id)

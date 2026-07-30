@@ -84,6 +84,9 @@ class FakeRuntime:
         if self.preflight_error is not None:
             raise ReplayError(self.preflight_error)
 
+    def preflight_planning_pools(self):
+        self.calls.append(("preflight_planning_pools",))
+
     def _add(self, key, cutoff, parent, status="accepted", historical=None, replay=None):
         state = GenerationState(
             self.next_id, key, status, cutoff, parent, historical, replay
@@ -173,6 +176,7 @@ def test_replay_sequences_bootstrap_then_plans_and_is_idempotent():
     assert result["plans"] == [1, 11]
     assert runtime.calls == [
         ("preflight", ("SKU-1", "SKU-11")),
+        ("preflight_planning_pools",),
         ("bootstrap", "bootstrap"),
         ("import", 1),
         ("import", 1),
@@ -190,7 +194,10 @@ def test_replay_sequences_bootstrap_then_plans_and_is_idempotent():
     runtime.calls.clear()
     second = replay_history(runtime, manifest, max_import_iterations=3)
     assert second == result
-    assert runtime.calls == [("preflight", ("SKU-1", "SKU-11"))]
+    assert runtime.calls == [
+        ("preflight", ("SKU-1", "SKU-11")),
+        ("preflight_planning_pools",),
+    ]
 
 
 def test_replay_is_bounded_and_does_not_accept_partial_import():
@@ -225,7 +232,10 @@ def test_resume_refuses_existing_key_with_wrong_lineage():
 
     with pytest.raises(ReplayError, match="different lineage"):
         replay_history(runtime, manifest, max_import_iterations=1)
-    assert runtime.calls == [("preflight", ("SKU-1", "SKU-11"))]
+    assert runtime.calls == [
+        ("preflight", ("SKU-1", "SKU-11")),
+        ("preflight_planning_pools",),
+    ]
 
 
 def test_resume_refuses_accepted_obligation_without_fixed_snapshot():
@@ -335,6 +345,9 @@ def test_preflight_only_path_performs_no_replay(monkeypatch, tmp_path, capsys):
         def preflight_assembly_rates(self, codes):
             calls.append(tuple(codes))
 
+        def preflight_planning_pools(self):
+            calls.append(("planning-pools",))
+
     class Session:
         def rollback(self):
             raise AssertionError("preflight-only must not mutate or roll back")
@@ -349,7 +362,11 @@ def test_preflight_only_path_performs_no_replay(monkeypatch, tmp_path, capsys):
         type("DatabaseModule", (), {"SessionLocal": staticmethod(Session)}),
     )
     assert tool.main([str(manifest_path), "--preflight-only"]) == 0
-    assert calls == [("SKU-1", "SKU-11"), ("closed",)]
+    assert calls == [
+        ("SKU-1", "SKU-11"),
+        ("planning-pools",),
+        ("closed",),
+    ]
     assert '"status": "preflight-ok"' in capsys.readouterr().out
 
 

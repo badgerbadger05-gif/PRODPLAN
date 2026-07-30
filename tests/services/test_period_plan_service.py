@@ -72,7 +72,15 @@ def _accepted_planning_truth(db_session):
         physical_import_batch=batch,
         algorithm_version="test",
     )
-    db_session.add(generation)
+    db_session.add_all([
+        generation,
+        models.StockWarehouse(
+            warehouse_ref1c="WH-PERIOD-PLAN",
+            warehouse_name="Period planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+    ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
     resource = ProductionResource(

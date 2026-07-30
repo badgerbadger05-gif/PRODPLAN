@@ -54,7 +54,13 @@ def _accepted_world(db):
         item_code="RETIRE-BUY", item_name="покупная деталь",
         replenishment_method="Покупка", replenishment_time=3, status="active",
     )
-    db.add_all([physical, accepted, item])
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="WH-RETIRE-PLAN",
+        warehouse_name="Retire planning contour",
+        is_selected=True,
+        is_finished_goods=False,
+    )
+    db.add_all([physical, accepted, item, warehouse])
     db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
     resource = models.ProductionResource(

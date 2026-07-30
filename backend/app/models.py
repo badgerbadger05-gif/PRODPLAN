@@ -729,6 +729,10 @@ class ProductionOrderLineState(Base):
     __tablename__ = "production_order_line_states"
     __table_args__ = (
         UniqueConstraint("product_id", name="ux_production_order_line_states_product"),
+        Index(
+            "ix_prod_line_state_coverage_generation",
+            "material_coverage_ledger_generation_id",
+        ),
     )
 
     state_id = Column(Integer, primary_key=True, index=True)
@@ -751,7 +755,6 @@ class ProductionOrderLineState(Base):
         BigInteger,
         ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
         nullable=True,
-        index=True,
     )
     material_coverage_snapshot = Column(CrossPlatformJSON, nullable=True)
     comment = Column(TEXT, nullable=True)

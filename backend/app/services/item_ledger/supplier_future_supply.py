@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.supplier_order_status import SupplyPhase, phase_for_state
+from app.services.planning_pool_resolver import require_mapped_destination
 
 from .future_supply_capture import FutureSupplyEvidence, future_supply_evidence_hash
 from .physical_visibility import visible_sle_query
@@ -53,7 +54,7 @@ def _after_cutoff(value: object, cutoff: datetime) -> bool:
 
 
 def _pool_mapping(mapping: Mapping[str, str] | None) -> dict[str, str]:
-    """Normalize the manifest-owned destination -> planning-pool mapping."""
+    """Normalize the live-contour mapping sealed into the refresh manifest."""
     return {
         _text(warehouse): _text(pool)
         for warehouse, pool in (mapping or {}).items()
@@ -284,11 +285,7 @@ def supplier_future_supply_evidence(
             if mirror_line is not None
             else next(iter(allocation_destinations), "")
         )
-        planning_pool = (
-            pools_by_destination.get(destination, "")
-            if mirror_line is not None
-            else next(iter(allocation_pools), "")
-        )
+        planning_pool = pools_by_destination.get(destination, "")
         eta = (
             _date(mirror_line.delivery_date)
             if mirror_line is not None
@@ -363,7 +360,11 @@ def supplier_future_supply_evidence(
         ):
             status, reason = "rejected", "destination_conflicts_with_export_provenance"
         elif not planning_pool:
-            status, reason = "rejected", "planning_pool_not_stamped"
+            planning_pool = require_mapped_destination(
+                pools_by_destination,
+                destination,
+                source=f"supplier_order:{external_order_ref}:{external_line_ref}",
+            )
         elif len(allocation_pools) > 1 or (
             allocation_pools and allocation_pools != {planning_pool}
         ):

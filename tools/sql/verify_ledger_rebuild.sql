@@ -296,19 +296,165 @@ BEGIN
             'current generation has no realization events';
     END IF;
 
+    -- One physical fact may legitimately be split across several FIFO
+    -- reservations.  Conservation applies to the sum per SLE, while
+    -- idempotency applies to the exact (SLE, reservation) allocation.
     SELECT count(*)
       INTO v_count
       FROM (
-          SELECT sle_id
+          SELECT event.sle_id
+            FROM reservation_event AS event
+            JOIN stock_ledger_entry AS sle ON sle.id = event.sle_id
+           WHERE event.ledger_generation_id = v_generation_id
+             AND event.realized_delta <> 0
+           GROUP BY event.sle_id, sle.qty
+          HAVING abs(sum(event.realized_delta)) > abs(sle.qty)
+      ) AS overallocated_sle;
+    IF v_count <> 0 THEN
+        RAISE EXCEPTION
+            '% physical SLE rows exceed realized quantity conservation',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM (
+          SELECT sle_id, reservation_id
             FROM reservation_event
            WHERE ledger_generation_id = v_generation_id
              AND realized_delta <> 0
-           GROUP BY sle_id
+           GROUP BY sle_id, reservation_id
           HAVING count(*) > 1
-      ) AS duplicated_sle;
+      ) AS duplicated_allocation;
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            '% physical SLE rows are realized more than once', v_count;
+            '% SLE/reservation realization allocations are duplicated',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM (
+          VALUES
+              ('mrp_result'),
+              ('period_plan_execution'),
+              ('assembly_queue'),
+              ('purchase_control_journal'),
+              ('production_control_journal')
+      ) AS required_consumer(consumer)
+     WHERE NOT EXISTS (
+         SELECT 1
+           FROM planning_read_snapshot AS snapshot
+          WHERE snapshot.consumer = required_consumer.consumer
+            AND snapshot.ledger_generation_id = v_generation_id
+            AND snapshot.cutoff = v_generation_cutoff
+            AND snapshot.truth_status = 'accepted'
+     );
+    IF v_count <> 0 THEN
+        RAISE EXCEPTION
+            '% required planning read snapshot consumers are missing',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM planning_run AS run
+     WHERE run.status = 'FIXED_SNAPSHOT'
+       AND NOT EXISTS (
+           SELECT 1
+             FROM planning_read_snapshot AS snapshot
+            WHERE snapshot.consumer = 'mrp_result'
+              AND snapshot.snapshot_key = 'run:' || run.run_id::text
+              AND snapshot.ledger_generation_id = v_generation_id
+              AND snapshot.cutoff = v_generation_cutoff
+              AND snapshot.truth_status = 'accepted'
+       );
+    IF v_count <> 0 THEN
+        RAISE EXCEPTION
+            '% fixed runs have no accepted MRP result snapshot',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM planning_run AS run
+     WHERE run.status = 'FIXED_SNAPSHOT'
+       AND NOT EXISTS (
+           SELECT 1
+             FROM planning_read_snapshot AS snapshot
+            WHERE snapshot.consumer = 'period_plan_execution'
+              AND snapshot.snapshot_key = (
+                  'plan=' || run.source_plan_id::text
+                  || ';run=' || run.run_id::text
+              )
+              AND snapshot.ledger_generation_id = v_generation_id
+              AND snapshot.cutoff = v_generation_cutoff
+              AND snapshot.truth_status = 'accepted'
+       );
+    IF v_count <> 0 THEN
+        RAISE EXCEPTION
+            '% fixed runs have no accepted period-plan execution snapshot',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM planning_read_snapshot
+     WHERE consumer = 'assembly_queue'
+       AND snapshot_key = 'current:v1'
+       AND ledger_generation_id = v_generation_id
+       AND cutoff = v_generation_cutoff
+       AND truth_status = 'accepted'
+       AND jsonb_typeof(payload::jsonb) = 'object';
+    IF v_count <> 1 THEN
+        RAISE EXCEPTION
+            'current accepted assembly queue snapshot count is %, expected 1',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM planning_read_snapshot AS snapshot
+     WHERE snapshot.consumer = 'production_control_journal'
+       AND snapshot.snapshot_key = 'journal:v1'
+       AND snapshot.ledger_generation_id = v_generation_id
+       AND snapshot.cutoff = v_generation_cutoff
+       AND snapshot.truth_status = 'accepted'
+       AND jsonb_typeof(snapshot.payload::jsonb) = 'object'
+       AND jsonb_typeof(snapshot.payload::jsonb -> 'meta') = 'object'
+       AND (snapshot.payload::jsonb -> 'meta' ->> 'read_only')::boolean
+       AND (snapshot.payload::jsonb -> 'meta' ->> 'ledger_generation_id')::bigint
+           = v_generation_id;
+    IF v_count <> 1 THEN
+        RAISE EXCEPTION
+            'current accepted production journal snapshot count is %, expected 1',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM planning_read_snapshot AS snapshot
+     WHERE snapshot.consumer = 'production_control_journal'
+       AND snapshot.snapshot_key = 'journal:v1'
+       AND snapshot.ledger_generation_id = v_generation_id
+       AND snapshot.truth_status = 'accepted'
+       AND (
+           NOT (snapshot.payload::jsonb -> 'meta' ? 'row_count')
+           OR jsonb_typeof(
+               snapshot.payload::jsonb -> 'meta' -> 'row_count'
+           ) <> 'number'
+           OR (snapshot.payload::jsonb -> 'meta' ->> 'row_count')::bigint <= 0
+           OR (snapshot.payload::jsonb -> 'meta' ->> 'row_count')::bigint
+              <> (
+                  SELECT count(*)
+                    FROM planning_read_row AS row
+                   WHERE row.snapshot_id = snapshot.id
+                     AND row.row_kind = 'production_order'
+              )
+       );
+    IF v_count <> 0 THEN
+        RAISE EXCEPTION
+            'current production journal is empty or its row count is inconsistent';
     END IF;
 
     SELECT count(*)

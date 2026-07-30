@@ -3,8 +3,11 @@
 from datetime import datetime, date
 from decimal import Decimal
 
+import pytest
+
 from app import models
 from app.services.item_ledger.supplier_future_supply import supplier_future_supply_evidence
+from app.services.planning_pool_resolver import PlanningPoolConfigurationError
 
 
 def _context(db):
@@ -255,10 +258,11 @@ def test_direct_1c_order_without_manifest_pool_fails_closed(db_session):
     db_session.query(models.SyncLink).delete()
     _mirrored_order_line(db_session, item)
 
-    row = supplier_future_supply_evidence(db_session, generation.id)[0]
-
-    assert row.evidence_status == "rejected"
-    assert row.reason == "planning_pool_not_stamped"
+    with pytest.raises(
+        PlanningPoolConfigurationError,
+        match="outside the live planning contour",
+    ):
+        supplier_future_supply_evidence(db_session, generation.id)
 
 
 def test_direct_order_changed_after_cutoff_fails_closed(db_session):
@@ -396,7 +400,11 @@ def test_stamped_line_counts_only_visible_exact_receipt_provenance(db_session):
     _receipt(db_session, generation, item, qty="9", ingest_batch_id=later.id, suffix="b")
     db_session.flush()
 
-    row = supplier_future_supply_evidence(db_session, generation.id)[0]
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
 
     assert row.evidence_status == "exact"
     assert row.realized_qty_at_cutoff == Decimal("4")
@@ -420,7 +428,11 @@ def test_buy_reservation_allocation_is_exact_with_successful_link(db_session):
     _receipt(db_session, generation, item, qty="4", suffix="a", order_ref=allocation.supplier_order_ref)
     db_session.flush()
 
-    row = supplier_future_supply_evidence(db_session, generation.id)[0]
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
 
     assert row.evidence_status == "exact"
     assert row.item_id == item.item_id
@@ -437,7 +449,11 @@ def test_buy_allocation_without_successful_link_is_rejected(db_session):
     _receipt(db_session, generation, item, qty="1", suffix="a", order_ref=allocation.supplier_order_ref)
     db_session.flush()
 
-    row = supplier_future_supply_evidence(db_session, generation.id)[0]
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
 
     assert row.source_ref == allocation.supplier_order_ref
     assert row.evidence_status == "rejected"
@@ -477,7 +493,11 @@ def test_buy_allocation_remains_future_supply_in_next_generation(db_session):
     db_session.add(generation2)
     db_session.flush()
 
-    rows = supplier_future_supply_evidence(db_session, generation2.id)
+    rows = supplier_future_supply_evidence(
+        db_session,
+        generation2.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )
 
     assert len(rows) == 1
     assert rows[0].evidence_status == "exact"

@@ -87,6 +87,7 @@ FROM (
         ('production_orders', (SELECT count(*) FROM production_orders)),
         ('production_products', (SELECT count(*) FROM production_products)),
         ('production_material_issues', (SELECT count(*) FROM production_material_issues)),
+        ('production_order_line_states', (SELECT count(*) FROM production_order_line_states)),
         ('sync_link', (SELECT count(*) FROM sync_link)),
         ('shelf_policy', (SELECT count(*) FROM shelf_policy)),
         ('dbr_assembly_rate', (SELECT count(*) FROM dbr_assembly_rate)),
@@ -95,24 +96,59 @@ FROM (
 
 -- KEEP -> CLEAR references.  The kept business rows remain, but their pointers
 -- to the retired rebuildable generation/run are deliberately detached.
-ALTER TABLE planning_truth_state
-    DROP CONSTRAINT planning_truth_state_current_generation_id_fkey;
-ALTER TABLE production_material_issues
-    DROP CONSTRAINT fk_prod_mat_issue_ledger_gen;
-ALTER TABLE production_orders
-    DROP CONSTRAINT production_orders_source_run_id_fkey;
-ALTER TABLE production_plan_line
-    DROP CONSTRAINT production_plan_line_locked_by_run_id_fkey;
-ALTER TABLE production_products
-    DROP CONSTRAINT fk_production_products_ledger_generation;
-ALTER TABLE production_products
-    DROP CONSTRAINT production_products_source_mrp_requirement_id_fkey;
-ALTER TABLE production_products
-    DROP CONSTRAINT production_products_source_planned_order_id_fkey;
-ALTER TABLE sync_link
-    DROP CONSTRAINT fk_sync_link_ledger_generation;
-ALTER TABLE forced_order_request
-    DROP CONSTRAINT forced_order_request_run_id_fkey;
+-- Resolve KEEP -> CLEAR foreign keys by their structural identity.  Constraint
+-- names differ between legacy create-table migrations, later named migrations,
+-- SQLAlchemy metadata and PostgreSQL's 63-byte truncation, but the local
+-- column and referenced table are the stable contract.
+DO $detach_rebuildable_fks$
+DECLARE
+    expected record;
+    constraint_name text;
+    constraint_count integer;
+BEGIN
+    FOR expected IN
+        SELECT *
+          FROM (
+              VALUES
+                  ('planning_truth_state', 'current_generation_id', 'ledger_generation'),
+                  ('production_material_issues', 'ledger_generation_id', 'ledger_generation'),
+                  ('production_orders', 'source_run_id', 'planning_run'),
+                  ('production_plan_line', 'locked_by_run_id', 'planning_run'),
+                  ('production_products', 'ledger_generation_id', 'ledger_generation'),
+                  ('production_products', 'source_mrp_requirement_id', 'mrp_requirement'),
+                  ('production_products', 'source_planned_order_id', 'planned_order'),
+                  ('production_order_line_states', 'material_coverage_ledger_generation_id', 'ledger_generation'),
+                  ('sync_link', 'ledger_generation_id', 'ledger_generation'),
+                  ('forced_order_request', 'run_id', 'planning_run')
+          ) AS expected_fk(table_name, column_name, target_table)
+    LOOP
+        SELECT count(*), min(constraint_row.conname)
+          INTO constraint_count, constraint_name
+          FROM pg_constraint AS constraint_row
+          JOIN pg_attribute AS local_column
+            ON local_column.attrelid = constraint_row.conrelid
+           AND local_column.attnum = constraint_row.conkey[1]
+         WHERE constraint_row.conrelid = expected.table_name::regclass
+           AND constraint_row.confrelid = expected.target_table::regclass
+           AND constraint_row.contype = 'f'
+           AND cardinality(constraint_row.conkey) = 1
+           AND local_column.attname = expected.column_name;
+        IF constraint_count <> 1 THEN
+            RAISE EXCEPTION
+                'required FK %.% -> % count is %, expected 1',
+                expected.table_name,
+                expected.column_name,
+                expected.target_table,
+                constraint_count;
+        END IF;
+        EXECUTE format(
+            'ALTER TABLE %I DROP CONSTRAINT %I',
+            expected.table_name,
+            constraint_name
+        );
+    END LOOP;
+END
+$detach_rebuildable_fks$;
 
 UPDATE production_orders
 SET source_run_id = NULL
@@ -134,6 +170,22 @@ WHERE ledger_generation_id IS NOT NULL
 UPDATE production_material_issues
 SET ledger_generation_id = NULL
 WHERE ledger_generation_id IS NOT NULL;
+
+-- Material coverage is a generation-bound read projection kept on an
+-- operational line.  Detach both its FK and the derived payload so no status
+-- from the retired generation can survive the rebuild.
+UPDATE production_order_line_states
+SET
+    material_coverage_ledger_generation_id = NULL,
+    material_coverage_status = NULL,
+    material_coverage_label = NULL,
+    material_coverage_calculated_at = NULL,
+    material_coverage_snapshot = NULL
+WHERE material_coverage_ledger_generation_id IS NOT NULL
+   OR material_coverage_status IS NOT NULL
+   OR material_coverage_label IS NOT NULL
+   OR material_coverage_calculated_at IS NOT NULL
+   OR material_coverage_snapshot IS NOT NULL;
 
 UPDATE sync_link
 SET ledger_generation_id = NULL
@@ -174,6 +226,8 @@ TRUNCATE
     capacity_load,
     forced_order_result,
     replenishment_work_item,
+    planning_run_bucket_modes,
+    mrp_bucket_type_legacy,
     planning_run,
     assembly_output_allocation,
     assembly_output_fact_decision,
@@ -202,7 +256,7 @@ ALTER TABLE production_material_issues
     REFERENCES ledger_generation(id)
     ON DELETE RESTRICT;
 ALTER TABLE production_orders
-    ADD CONSTRAINT production_orders_source_run_id_fkey
+    ADD CONSTRAINT fk_production_orders_source_run_id_planning_run
     FOREIGN KEY (source_run_id)
     REFERENCES planning_run(run_id)
     ON DELETE SET NULL;
@@ -217,15 +271,20 @@ ALTER TABLE production_products
     REFERENCES ledger_generation(id)
     ON DELETE RESTRICT;
 ALTER TABLE production_products
-    ADD CONSTRAINT production_products_source_mrp_requirement_id_fkey
+    ADD CONSTRAINT fk_production_products_source_mrp_requirement_id
     FOREIGN KEY (source_mrp_requirement_id)
     REFERENCES mrp_requirement(id)
     ON DELETE SET NULL;
 ALTER TABLE production_products
-    ADD CONSTRAINT production_products_source_planned_order_id_fkey
+    ADD CONSTRAINT fk_production_products_source_planned_order_id_planned_order
     FOREIGN KEY (source_planned_order_id)
     REFERENCES planned_order(order_id)
     ON DELETE SET NULL;
+ALTER TABLE production_order_line_states
+    ADD CONSTRAINT fk_prod_line_state_coverage_generation
+    FOREIGN KEY (material_coverage_ledger_generation_id)
+    REFERENCES ledger_generation(id)
+    ON DELETE RESTRICT;
 ALTER TABLE sync_link
     ADD CONSTRAINT fk_sync_link_ledger_generation
     FOREIGN KEY (ledger_generation_id)
@@ -253,6 +312,7 @@ BEGIN
             WHEN 'production_orders' THEN (SELECT count(*) FROM production_orders)
             WHEN 'production_products' THEN (SELECT count(*) FROM production_products)
             WHEN 'production_material_issues' THEN (SELECT count(*) FROM production_material_issues)
+            WHEN 'production_order_line_states' THEN (SELECT count(*) FROM production_order_line_states)
             WHEN 'sync_link' THEN (SELECT count(*) FROM sync_link)
             WHEN 'shelf_policy' THEN (SELECT count(*) FROM shelf_policy)
             WHEN 'dbr_assembly_rate' THEN (SELECT count(*) FROM dbr_assembly_rate)

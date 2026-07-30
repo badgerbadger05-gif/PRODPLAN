@@ -65,7 +65,7 @@ def _install_sqlite_compat() -> None:
     ApplyBatchImpl.drop_constraint = _tolerant_drop
 
 
-def main(db_path: str) -> int:
+def main(db_path: str, *, round_trip: bool = False) -> int:
     sys.path.insert(0, str(BACKEND))
     os.chdir(BACKEND)
     os.environ["DATABASE_URL"] = "sqlite:///" + db_path.replace("\\", "/")
@@ -75,7 +75,11 @@ def main(db_path: str) -> int:
     from alembic import command
     from alembic.config import Config
 
-    command.upgrade(Config("alembic.ini"), "head")
+    config = Config("alembic.ini")
+    command.upgrade(config, "head")
+    if round_trip:
+        command.downgrade(config, "20260726_14")
+        command.upgrade(config, "head")
 
     from sqlalchemy import create_engine, inspect
 
@@ -93,4 +97,9 @@ def main(db_path: str) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1]))
+    raise SystemExit(
+        main(
+            sys.argv[1],
+            round_trip="--round-trip" in sys.argv[2:],
+        )
+    )

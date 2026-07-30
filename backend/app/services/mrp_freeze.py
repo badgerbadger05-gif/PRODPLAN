@@ -68,6 +68,7 @@ from .planning_truth import (
 )
 from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from .bom_specification_resolver import BomSpecificationResolver
+from .planning_pool_resolver import DEFAULT_STOCK_POOL
 
 __all__ = [
     "PoolKey",
@@ -83,7 +84,6 @@ __all__ = [
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
 
-DEFAULT_STOCK_POOL = "default"
 EMPTY_REF = ""
 
 # Shared by freeze and generation publication so they never interleave. SQLite is

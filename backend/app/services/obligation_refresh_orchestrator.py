@@ -19,6 +19,9 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.item_ledger.candidate_future_supply import capture_candidate_future_supply
+from app.services.planning_pool_resolver import (
+    effective_planning_pool_by_warehouse,
+)
 from app.services.item_ledger.candidate_realization_replay import replay_candidate_realizations
 from app.services.item_ledger.generation_lifecycle import (
     GenerationValidationError,
@@ -276,6 +279,10 @@ def run_obligation_refresh(
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
+    pool_mapping = effective_planning_pool_by_warehouse(
+        db,
+        planning_pool_by_warehouse,
+    )
     config = dict(config_snapshot or {})
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
     retire_ids = tuple(sorted(int(v) for v in retire_plan_ids))
@@ -332,7 +339,7 @@ def run_obligation_refresh(
             db, existing, parent_generation_id=original_parent_id,
             add_plan_ids=add_ids, retire_plan_ids=retire_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
-            planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+            planning_pool_by_warehouse=pool_mapping,
         )
     if existing is not None and str(existing.status) != "building":
         raise ObligationRefreshOrchestratorError("generation_key exists in non-retryable state")
@@ -354,7 +361,7 @@ def run_obligation_refresh(
         db, int(parent_generation_id), target_id, add_ids,
         retire_plan_ids=retire_ids, started_by=started_by,
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
-        planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+        planning_pool_by_warehouse=pool_mapping,
     )
     candidate_ids = tuple(sorted(
         int(entry["candidate_run_id"])
@@ -378,7 +385,7 @@ def run_obligation_refresh(
     snapshot_batch = _single_stage(db, target_id, "snapshot_build", key)
     capture = capture_candidate_future_supply(
         db, int(parent_generation_id), target_id, int(snapshot_batch.id),
-        planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+        planning_pool_by_warehouse=pool_mapping,
         explicit_make_transfer_recorders=explicit_make_transfer_recorders,
     )
     freeze = (

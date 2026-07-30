@@ -23,6 +23,7 @@ from app.models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionResource,
+    StockWarehouse,
 )
 from app.routers.plan import router as plan_router
 
@@ -69,6 +70,13 @@ def accepted_generation(db_session):
     db_session.add(generation)
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(StockWarehouse(
+        warehouse_ref1c="fix-router-warehouse",
+        warehouse_code="FIX-ROUTER",
+        warehouse_name="Fix router planning warehouse",
+        is_selected=True,
+        is_finished_goods=False,
+    ))
     resource = ProductionResource(
         resource_name="Fix router assembly",
         planning_range=30,
