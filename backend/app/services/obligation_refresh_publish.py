@@ -21,6 +21,11 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.purchase_control_snapshot import validate_purchase_control_journal_buy_row
+from app.services.production_control_journal_snapshot import (
+    CONSUMER as _PRODUCTION_JOURNAL_CONSUMER,
+    SNAPSHOT_KEY as _PRODUCTION_JOURNAL_SNAPSHOT_KEY,
+    validate_candidate_snapshot as validate_production_journal_candidate,
+)
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
 from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
@@ -70,6 +75,7 @@ _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     # An obligation refresh always captures future supply; a target which does
     # not carry it would publish a purchase journal with zero ordered/in-transit.
     "future_supply",
+    "production_control_journal",
 })
 
 
@@ -625,6 +631,54 @@ def _exact_retry(
         if key in seen_journal_rows:
             return None
         seen_journal_rows.add(key)
+    try:
+        production_journal_id = int(
+            dict(snapshot_batch.metrics or {})[
+                "production_control_journal_snapshot_id"
+            ]
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    production_journal = db.get(
+        models.PlanningReadSnapshot,
+        production_journal_id,
+    )
+    if (
+        production_journal is None
+        or production_journal.consumer != _PRODUCTION_JOURNAL_CONSUMER
+        or production_journal.snapshot_key != _PRODUCTION_JOURNAL_SNAPSHOT_KEY
+        or production_journal.ledger_generation_id != target.id
+        or production_journal.truth_status != "accepted"
+        or production_journal.reason is not None
+        or _utc(
+            production_journal.published_at,
+            "production journal published_at",
+        )
+        != accepted_at
+    ):
+        return None
+    production_payload = (
+        production_journal.payload
+        if isinstance(production_journal.payload, dict)
+        else None
+    )
+    production_meta = production_payload.get("meta") if production_payload else None
+    if (
+        not isinstance(production_meta, dict)
+        or production_meta.get("read_only") is not True
+        or int(production_meta.get("ledger_generation_id") or -1)
+        != int(target.id)
+    ):
+        return None
+    try:
+        production_row_count = int(production_meta["row_count"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if production_row_count != db.query(models.PlanningReadRow.id).filter(
+        models.PlanningReadRow.snapshot_id == int(production_journal.id),
+        models.PlanningReadRow.row_kind == "production_order",
+    ).count():
+        return None
     by_parent = {int(old.run_id): candidate for old, candidate in refreshes}
     if len(by_parent) != len(refreshes):
         return None
@@ -800,6 +854,39 @@ def publish_obligation_refresh_batch(
         if key in seen_supply_rows:
             raise ObligationRefreshPublishError("purchase control journal row violates Ledger fact contract")
         seen_supply_rows.add(key)
+    try:
+        production_journal_id = int(
+            dict(snapshot_batch.metrics or {})[
+                "production_control_journal_snapshot_id"
+            ]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError(
+            "snapshot_build lacks production control journal snapshot"
+        ) from exc
+    candidate_production_journal = _lock(
+        db.query(models.PlanningReadSnapshot)
+    ).filter(
+        models.PlanningReadSnapshot.id == production_journal_id,
+        models.PlanningReadSnapshot.consumer == _PRODUCTION_JOURNAL_CONSUMER,
+        models.PlanningReadSnapshot.snapshot_key
+        == _PRODUCTION_JOURNAL_SNAPSHOT_KEY,
+        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
+        models.PlanningReadSnapshot.truth_status == "building",
+        models.PlanningReadSnapshot.cutoff == target.cutoff,
+    ).one_or_none()
+    if candidate_production_journal is None:
+        raise ObligationRefreshPublishError(
+            "production control journal candidate is missing or stale"
+        )
+    try:
+        validate_production_journal_candidate(
+            db,
+            candidate_production_journal,
+            target,
+        )
+    except RuntimeError as exc:
+        raise ObligationRefreshPublishError(str(exc)) from exc
     if _source_export_links_exist(db, candidate_ids):
         raise ObligationRefreshPublishError("candidate has external export links")
 
@@ -859,7 +946,11 @@ def publish_obligation_refresh_batch(
         candidate.pinned = True
         candidate.fixed_at = accepted_at
         candidate.finished_at = accepted_at
-    for snapshot in [*candidate_read_snapshots, candidate_purchase_journal]:
+    for snapshot in [
+        *candidate_read_snapshots,
+        candidate_purchase_journal,
+        candidate_production_journal,
+    ]:
         snapshot.truth_status = "accepted"
         snapshot.reason = None
         snapshot.published_at = accepted_at

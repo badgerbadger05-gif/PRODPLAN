@@ -1,5 +1,7 @@
 import datetime
 
+import pytest
+
 from app import models
 from app.models import (
     Item,
@@ -331,6 +333,59 @@ def test_production_fact_cache_uses_exact_manufacture_link(db_session, monkeypat
     assert other_order.order_id != order.order_id
 
 
+@pytest.mark.parametrize(
+    ("link_status", "expected_matched"),
+    [("posted", 1), ("planned", 0), ("error", 0)],
+)
+def test_production_fact_cache_accepts_only_fact_eligible_material_issue_links(
+    db_session,
+    monkeypatch,
+    link_status,
+    expected_matched,
+):
+    """`posted` preserves provenance; non-terminal links cannot identify fact."""
+    db = db_session
+    _no_odata(monkeypatch)
+    generation, batch = _accepted_generation(db, key=f"issue-{link_status}")
+    item = _fact_item(db, code=f"ASM-ISSUE-{link_status}")
+    order, product = _order_with_line(
+        db,
+        item=item,
+        order_ref1c=f"order-{link_status}",
+    )
+    issue = models.ProductionMaterialIssue(
+        document_number=f"MI-{link_status}",
+        product_id=product.product_id,
+        order_id=order.order_id,
+        status=link_status,
+        ledger_generation_id=generation.id,
+    )
+    db.add(issue)
+    db.flush()
+    recorder_ref = f"assembly-{link_status}"
+    db.add(models.SyncLink(
+        source_doctype="material_issue",
+        source_id=issue.issue_id,
+        target_entity="Document_ПеремещениеЗапасов",
+        target_ref_key=recorder_ref,
+        status=link_status,
+    ))
+    _assembly_fact(
+        db,
+        batch=batch,
+        item=item,
+        recorder_ref=recorder_ref,
+        qty=4,
+    )
+    db.commit()
+
+    stats = sync_production_facts(db)
+
+    assert stats["matched_facts"] == expected_matched
+    db.refresh(product)
+    assert float(product.produced_qty) == (4.0 if expected_matched else 0.0)
+
+
 def test_production_fact_cache_ignores_document_outside_accepted_generation(
     db_session, monkeypatch
 ):
@@ -379,8 +434,10 @@ def test_production_fact_cache_is_unavailable_without_accepted_generation(
     assert float(product.remaining_qty) == 6.0
 
 
-def test_production_fact_cache_does_not_revive_cancelled_line(db_session, monkeypatch):
-    """Ручное обнуление остатка терминальной строки не воскрешается фактом."""
+def test_production_fact_cache_keeps_cancellation_separate_from_physical_remaining(
+    db_session, monkeypatch
+):
+    """Статус cancelled не имеет права подменять физический остаток нулём."""
     db = db_session
     _no_odata(monkeypatch)
     _generation, batch = _accepted_generation(db)
@@ -398,7 +455,27 @@ def test_production_fact_cache_does_not_revive_cancelled_line(db_session, monkey
 
     db.refresh(product)
     assert float(product.produced_qty) == 2.0
-    assert float(product.remaining_qty) == 0.0
+    assert float(product.remaining_qty) == 8.0
+
+
+def test_production_fact_cache_repairs_corrupted_remaining_when_produced_is_unchanged(
+    db_session, monkeypatch
+):
+    db = db_session
+    _no_odata(monkeypatch)
+    _accepted_generation(db)
+    item = _fact_item(db)
+    _order, product = _order_with_line(db, item=item, order_ref1c="asm-order")
+    product.produced_qty = 0
+    product.remaining_qty = 0
+    db.commit()
+
+    stats = sync_production_facts(db)
+
+    db.refresh(product)
+    assert stats["products_updated"] == 1
+    assert float(product.produced_qty) == 0.0
+    assert float(product.remaining_qty) == 10.0
 
 
 def test_production_fact_cache_leaves_ambiguous_fact_unassigned(db_session, monkeypatch):

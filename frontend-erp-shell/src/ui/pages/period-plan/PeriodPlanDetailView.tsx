@@ -605,11 +605,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const journalExecutionPct = useMemo(() => {
     if (!journal || !isPlanningTruthAccepted(journal)) return null
     if (typeof journal.summary.execution_pct === 'number') return journal.summary.execution_pct
-    if (journal.summary.execution_pct === null) return null
-    const base = journal.rows.reduce((sum, row) => sum + (row.progress_base_qty ?? row.net_qty ?? 0), 0)
-    if (base <= 1e-9) return 100
-    const completed = journal.rows.reduce((sum, row) => sum + (row.completed_qty ?? 0), 0)
-    return Math.round((completed / base) * 1000) / 10
+    return null
   }, [journal])
 
   const journalExecutionByFlow = useMemo(() => {
@@ -667,27 +663,15 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         }))
       return [...productionAndRework, purchase, ...extras].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
     }
-    const grouped = new Map<string, { completed: number; base: number }>()
-    journal.rows.forEach((row) => {
-      const base = row.progress_base_qty ?? row.net_qty ?? 0
-      const entry = grouped.get(row.flow) ?? { completed: 0, base: 0 }
-      entry.completed += row.completed_qty ?? 0
-      entry.base += base
-      grouped.set(row.flow, entry)
-    })
-    const productionAndRework = ['production', 'rework']
-      .map((flow) => {
-        const entry = grouped.get(flow)
-        const base = entry?.base ?? 0
-        const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
-        return { flow, label: flowLabel(flow), pct, confirmedPct: pct, toOrderPct: null, base, available: true }
-      })
-      .filter((row) => row.base > 1e-9)
-    const purchase = {
-      ...purchaseRowBase,
-      base: journal.rows.some((row) => row.flow === 'purchase') ? 1 : 0,
-    }
-    return [...productionAndRework, purchase].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
+    return ['production', 'rework', 'purchase'].map((flow) => ({
+      flow,
+      label: flowLabel(flow),
+      pct: null,
+      confirmedPct: null,
+      toOrderPct: null,
+      base: 0,
+      available: false,
+    }))
   }, [journal])
 
   const journalTruthAccepted = isPlanningTruthAccepted(journal)
@@ -1401,7 +1385,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           <td style={{ textAlign: 'center' }}>{row.bom_level}</td>
                           <td
                             className="numCell"
-                            title={`Потребность с припусками: ${qty(row.gross_qty)} · Остаток склада: ${qty(row.stock_qty ?? Math.max(0, row.gross_qty - row.net_qty))}`}
+                            title={`Потребность с припусками: ${qty(row.gross_qty)} · Остаток склада: ${row.stock_qty == null ? 'н/д' : qty(row.stock_qty)}`}
                           >
                             <strong>{qty(row.net_qty)}</strong>
                           </td>

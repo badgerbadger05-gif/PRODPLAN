@@ -67,6 +67,7 @@ from .planning_truth import (
     require_accepted_truth,
 )
 from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+from .bom_specification_resolver import BomSpecificationResolver
 
 __all__ = [
     "PoolKey",
@@ -316,6 +317,10 @@ def build_shared_pools(
                 source_line_ref=str(row.source_line_ref),
             ))
         elif row.supply_kind == "supplier_order":
+            if eta is None:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: exact supplier future supply lacks ETA"
+                )
             supplier[item_id].append({
                 "order_ref1c": str(row.source_ref),
                 "source_ref": str(row.source_ref),
@@ -1104,24 +1109,6 @@ def _relevant_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
         .distinct()
         .all()
     }
-    frontier = set(relevant)
-    while frontier:
-        spec_rows = (
-            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-            .filter(DefaultSpecification.item_id.in_(frontier))
-            .all()
-        )
-        spec_ids = {int(spec_id) for _item_id, spec_id in spec_rows}
-        if not spec_ids:
-            break
-        children = {
-            int(item_id)
-            for (item_id,) in db.query(SpecComponent.item_id)
-            .filter(SpecComponent.spec_id.in_(spec_ids))
-            .distinct()
-            .all()
-        }
-        frontier = children - relevant
-        relevant.update(children)
-    return relevant
+    descendants = BomSpecificationResolver(db).descendant_ids_by_root(relevant)
+    return set().union(*descendants.values()) if descendants else relevant
 

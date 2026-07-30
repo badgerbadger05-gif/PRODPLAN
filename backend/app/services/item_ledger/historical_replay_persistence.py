@@ -22,6 +22,7 @@ from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
+from .production_fact_projection import SYNC_LINK_FACT_STATUSES
 from .reconcile import contour_warehouse_refs
 from .reservation import append_realization_event, fold_reservation_entry
 
@@ -107,10 +108,12 @@ def _identity_for_sle(
     ).first():
         order_refs.add(recorder)
 
-    # Relevant successful export links may identify the local source document.
+    # Exported or subsequently read-back-as-posted links may identify the local
+    # source document. The link is provenance only; the fact itself is still
+    # the visible StockLedgerEntry of this explicit generation.
     links = db.query(models.SyncLink).filter(
         models.SyncLink.target_ref_key == recorder,
-        models.SyncLink.status == "success",
+        models.SyncLink.status.in_(SYNC_LINK_FACT_STATUSES),
         models.SyncLink.source_doctype == "material_issue",
     ).all()
     order_ids: set[int] = set()

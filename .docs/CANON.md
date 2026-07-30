@@ -47,7 +47,9 @@ PRODPLAN состоит из четырёх последовательно св�
 | Остаток принятого поколения | `backend/app/services/item_ledger/physical_visibility.py` |
 | Формулы резерва и выполнения | `backend/app/services/item_ledger/reservation.py` |
 | События и fold резервов | `backend/app/services/item_ledger/reservation_ledger.py` |
+| Выпуск производственной строки (`produced`, `remaining`) | `backend/app/services/production_output_truth.py`; `remaining_qty` в таблице — только compatibility cache и никогда не читается как факт |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py` |
+| Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
 | Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |

@@ -12,7 +12,7 @@ from decimal import Decimal
 import re
 from typing import Any, Callable
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -40,9 +40,13 @@ from .assembly_output_persistence import (
 from .drum_schedule_persistence import materialize_drum_schedule
 from .shelf_projection_persistence import materialize_shelf_projections
 from .replenishment_work_item_builder import materialize_replenishment_work_items
+from .reservation import replenishment_remaining
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.purchase_control_snapshot import (
     build_candidate_snapshot as build_purchase_journal_candidate,
+)
+from app.services.production_control_journal_snapshot import (
+    build_candidate_snapshot as build_production_journal_candidate,
 )
 
 
@@ -58,6 +62,7 @@ CAPABILITIES = {
     "shelf_projection": True,
     "replenishment_work_item": True,
     "purchase_control_journal": True,
+    "production_control_journal": True,
     # Only a generation which actually carries a future-supply capture may
     # advertise this: consumers of "ordered"/"in transit" must fail closed
     # rather than read a fabricated zero out of an empty projection.
@@ -502,6 +507,112 @@ def _reservation_fact_conservation_checkpoint(
     return len(realized_by_sle)
 
 
+def _replenishment_work_item_checkpoint(
+    db: Session,
+    generation: models.LedgerGeneration,
+    entries: list[models.ReservationEntry],
+) -> int:
+    """Prove the journal projection equals the post-replay reservation fold."""
+    batch = (
+        db.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
+            models.LedgerBuildBatch.stage == "replenishment_work_item",
+        )
+        .one_or_none()
+    )
+    # Older accepted ancestors may predate this projection. A generation that
+    # advertises/builds it, however, must prove exact equality before publish.
+    if batch is None:
+        return 0
+    if str(batch.status) != "completed":
+        raise GenerationValidationError(
+            "replenishment work-item batch is not completed"
+        )
+    expected = {
+        int(entry.id): entry
+        for entry in entries
+        if str(entry.lifecycle_status) == "active"
+        and entry.run_id is not None
+        and _d(entry.replenishment_required_qty) > 0
+    }
+    actual_rows = (
+        db.query(models.ReplenishmentWorkItem)
+        .filter(
+            models.ReplenishmentWorkItem.ledger_generation_id
+            == int(generation.id)
+        )
+        .all()
+    )
+    actual = {int(row.reservation_id): row for row in actual_rows}
+    if set(actual) != set(expected):
+        raise GenerationValidationError(
+            "replenishment work items differ from active reservation scope"
+        )
+    for reservation_id, entry in expected.items():
+        row = actual[reservation_id]
+        required = _d(entry.replenishment_required_qty)
+        fulfilled = _d(entry.replenishment_received_qty)
+        remaining = replenishment_remaining(required, fulfilled)
+        if (
+            _d(row.replenishment_required_qty) != required
+            or _d(row.replenishment_fulfilled_qty) != fulfilled
+            or _d(row.replenishment_remaining_qty) != remaining
+            or str(row.replenishment_method) != str(entry.realization_mode)
+        ):
+            raise GenerationValidationError(
+                f"replenishment work item {row.id} differs from reservation fold"
+            )
+    return len(actual_rows)
+
+
+def _mrp_quantity_checkpoint(
+    db: Session,
+    generation: models.LedgerGeneration,
+) -> int:
+    """Reject a publish when any generation-owned gross/net pair is invalid."""
+    run_ids = (
+        db.query(models.PlanningRun.run_id)
+        .filter(models.PlanningRun.ledger_generation_id == int(generation.id))
+        .scalar_subquery()
+    )
+    bad_requirements = (
+        db.query(models.MrpRequirement.id)
+        .filter(
+            models.MrpRequirement.run_id.in_(run_ids),
+            or_(
+                models.MrpRequirement.total_required_qty < 0,
+                models.MrpRequirement.net_required_qty < 0,
+                models.MrpRequirement.net_required_qty
+                > models.MrpRequirement.total_required_qty,
+            ),
+        )
+        .count()
+    )
+    bad_buckets = (
+        db.query(models.MrpRequirementBucket.id)
+        .filter(
+            models.MrpRequirementBucket.run_id.in_(run_ids),
+            or_(
+                models.MrpRequirementBucket.gross_qty < 0,
+                models.MrpRequirementBucket.net_qty < 0,
+                models.MrpRequirementBucket.net_qty
+                > models.MrpRequirementBucket.gross_qty,
+            ),
+        )
+        .count()
+    )
+    if bad_requirements or bad_buckets:
+        raise GenerationValidationError(
+            "MRP gross/net quantities violate 0 <= net <= gross"
+        )
+    return (
+        db.query(models.MrpRequirement.id)
+        .filter(models.MrpRequirement.run_id.in_(run_ids))
+        .count()
+    )
+
+
 def _stock_bin_fold_checkpoint(
     db: Session,
     generation: models.LedgerGeneration,
@@ -643,6 +754,7 @@ def validate_obligation_refresh_build(
             "obligation-refresh validation requires an obligation_refresh generation"
         )
     _physical_boundary_checkpoint(db, generation)
+    requirement_count = _mrp_quantity_checkpoint(db, generation)
     visible = visible_sles_for_generation(db, int(generation.id))
 
     allowed_generation_ids = _ancestor_generation_ids(db, generation)
@@ -656,6 +768,11 @@ def validate_obligation_refresh_build(
         db, generation, is_allowed_cycle=_is_allowed_cycle
     )
     realized_fact_count = _reservation_fact_conservation_checkpoint(events, visible)
+    work_item_count = _replenishment_work_item_checkpoint(
+        db,
+        generation,
+        entries,
+    )
     bin_count = _stock_bin_fold_checkpoint(db, generation, visible)
     provenance, _candidates, excluded_ids, status_counts = (
         _supplier_provenance_checkpoint(db, generation, require_full_coverage=False)
@@ -664,8 +781,10 @@ def validate_obligation_refresh_build(
         "ledger_generation_id": int(generation.id),
         "physical_facts": len(visible),
         "stock_bins": bin_count,
+        "mrp_requirements": requirement_count,
         "reservation_entries": len(entries),
         "reservation_events": len(events),
+        "replenishment_work_items": work_item_count,
         "realized_physical_facts": realized_fact_count,
         "carried_forward_generations": sorted(
             allowed_generation_ids - {int(generation.id)}
@@ -686,6 +805,7 @@ def validate_generation_build(
     """Dry, read-only validation.  Raises before truth publication on any gap."""
     generation = _building_generation(db, generation_id)
     physical_batch = _physical_boundary_checkpoint(db, generation)
+    _mrp_quantity_checkpoint(db, generation)
     _validate_historical_bootstrap_watermarks(generation)
     _validate_physical_refresh_watermarks(generation)
 
@@ -740,6 +860,7 @@ def validate_generation_build(
         db, generation, is_allowed_cycle=_is_allowed_cycle
     )
     _reservation_fact_conservation_checkpoint(events, visible)
+    _replenishment_work_item_checkpoint(db, generation, entries)
     represented = {int(row.requirement_id) for row in entries}
     missing = sorted(selected_requirement_ids - represented)
     if missing:
@@ -975,6 +1096,18 @@ def accept_generation_build(
             purchase_journal_snapshot = build_purchase_journal_candidate(
                 db, int(generation.id)
             )
+            fixed_run_ids = [
+                int(run_id)
+                for (run_id,) in db.query(models.PlanningRun.run_id)
+                .filter(models.PlanningRun.status == "FIXED_SNAPSHOT")
+                .order_by(models.PlanningRun.run_id.asc())
+                .all()
+            ]
+            production_journal_snapshot = build_production_journal_candidate(
+                db,
+                int(generation.id),
+                accepted_run_ids=fixed_run_ids,
+            )
         except ValueError as exc:
             raise GenerationValidationError(
                 f"replenishment work item / purchase journal build failed: {exc}"
@@ -1011,6 +1144,7 @@ def accept_generation_build(
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
         "replenishment_work_items": replenishment_work_items,
         "purchase_journal_snapshot_id": int(purchase_journal_snapshot.id),
+        "production_journal_snapshot_id": int(production_journal_snapshot.id),
         "supplier_receipts": {
             "documents_fetched": (
                 extraction.fetched_document_count if extraction is not None else 0

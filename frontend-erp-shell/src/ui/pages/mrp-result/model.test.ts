@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow } from '../../../domain/planning'
+import type { MrpProductionRow, MrpPurchaseRow } from '../../../domain/planning'
 import {
   filterPurchaseRows,
   formatActionResult,
   isProductionRowSelectable,
-  mrpResultTotals,
   parseMrpResultTab,
   parsePositiveId,
   productionSourceIds,
@@ -44,20 +43,6 @@ describe('MRP result model', () => {
     })
     expect(filterPurchaseRows(rows, '__missing_supplier_name', 'category-b')).toEqual([rows[1]])
     expect(filterPurchaseRows(rows, '', '7')).toEqual([rows[0], rows[2]])
-  })
-
-  it('calculates quantities across result sections', () => {
-    expect(mrpResultTotals(
-      [production({ qty: 2 }), production({ qty: '3' as unknown as number })],
-      [purchase({ qty: 4 })],
-      [{ qty: 5 } as MrpReworkRow],
-      [{ overload_hours: 1.5 }, { overload_hours: 2 }] as MrpCapacityRow[],
-    )).toEqual({
-      productionQty: 5,
-      purchaseQty: 4,
-      reworkQty: 5,
-      overloadHours: 3.5,
-    })
   })
 
   it('expands aggregate source IDs and detects selectable production rows', () => {

@@ -64,7 +64,7 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
   }
 
   const flowPctFmt = (pct: number) =>
-    Math.min(100, Math.max(0, pct)).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+    pct.toLocaleString('ru-RU', { maximumFractionDigits: 1 })
 
   // Compact per-flow abbreviations for the list cell; full label lives in the tooltip.
   function flowAbbr(flow: string) {
@@ -105,8 +105,8 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
       }
       return <span className="muted">{plan.execution_reason ? `Недоступно: ${plan.execution_reason}` : 'Недоступно'}</span>
     }
-    const value = Math.max(0, plan.execution_pct)
-    const pct = Math.min(100, value).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+    const value = plan.execution_pct
+    const pct = value.toLocaleString('ru-RU', { maximumFractionDigits: 1 })
     const flows = executionFlowRows(plan.execution_by_flow)
     return (
       <span style={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4 }}>

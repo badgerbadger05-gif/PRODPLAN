@@ -11,7 +11,8 @@ from .. import models
 from ..services import planning_truth
 from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..database import get_db
-from ..models import DefaultSpecification, Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
+from ..models import Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
+from ..services.bom_specification_resolver import BomSpecificationResolver
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_piecework_export import export_piecework_to_1c
@@ -28,11 +29,15 @@ from ..services.production_control_journal import (
     materialize_make_work_items,
     cancel_local_order,
     dedupe_mrp_production_orders,
-    list_journal,
     update_line_state,
     update_product_quantity,
 )
+from ..services.production_control_journal_snapshot import (
+    ProductionControlJournalSnapshotUnavailable,
+    read_snapshot as read_production_control_journal_snapshot,
+)
 from ..services.production_control_material_availability import (
+    MaterialCoverageSnapshotUnavailable,
     get_materials_snapshot,
     preview_materials,
     refresh_materials_snapshot,
@@ -478,13 +483,7 @@ def get_order_line_operations(
         raise HTTPException(status_code=404, detail="Строка заказа не найдена")
     spec_id = product.spec_id
     if not spec_id:
-        default_spec = (
-            db.query(DefaultSpecification.spec_id)
-            .filter(DefaultSpecification.item_id == int(product.item_id))
-            .order_by(DefaultSpecification.id.asc())
-            .first()
-        )
-        spec_id = int(default_spec.spec_id) if default_spec else None
+        spec_id = BomSpecificationResolver(db).default_spec_id(int(product.item_id))
     if not spec_id:
         return {"rows": [], "total": 0}
     spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).one_or_none()
@@ -707,9 +706,8 @@ def get_orders_journal(
 ):
     try:
         truth = planning_truth.require_accepted_truth(db, "production_control.orders")
-        journal = list_journal(
+        journal = read_production_control_journal_snapshot(
             db,
-            truth=truth,
             product_id=product_id,
             order_id=order_id,
             root_item_id=root_item_id,
@@ -728,6 +726,8 @@ def get_orders_journal(
         journal["truth_meta"] = build_truth_meta(truth).model_dump()
         return journal
     except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except ProductionControlJournalSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -793,6 +793,8 @@ def get_order_line_materials(
 ):
     try:
         return get_materials_snapshot(db, int(product_id))
+    except MaterialCoverageSnapshotUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -1163,7 +1165,7 @@ def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_
 @router.get("/route-sheets/print", response_class=HTMLResponse)
 def print_route_sheets(
     product_ids: str = Query(..., description="Comma-separated production product ids"),
-    mark_printed: bool = True,
+    mark_printed: bool = False,
     auto_print: bool = False,
     db: Session = Depends(get_db),
 ):
@@ -1172,8 +1174,10 @@ def print_route_sheets(
         if not ids:
             raise ValueError("Не выбраны строки заказа")
         html = render_route_sheets_html(db, ids, auto_print=auto_print)
-        if mark_printed:
-            mark_route_sheets_printed(db, ids)
+        # Compatibility-only query parameter.  GET is strictly read-only even
+        # when an old bookmark sends mark_printed=true; persistence belongs to
+        # the explicit POST endpoint below.
+        _ = mark_printed
         return HTMLResponse(content=html)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

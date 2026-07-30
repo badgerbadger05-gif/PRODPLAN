@@ -41,6 +41,7 @@ from .production_material_custody import (
     load_material_custody,
 )
 from .planning_truth import require_accepted_truth
+from .production_output_truth import accepted_product_output
 from .workshop_resolution import (
     diagnose_product,
     format_diagnosis_error,
@@ -1249,7 +1250,11 @@ def _issue_header(
         "item_article": str(item.item_article or "") if item else "",
         "item_code": str(item.item_code or "") if item else "",
         "quantity": _to_float(product.quantity) if product else 0.0,
-        "remaining_qty": _to_float(product.remaining_qty) if product else 0.0,
+        "remaining_qty": (
+            _to_float(accepted_product_output(product).remaining_qty)
+            if product
+            else 0.0
+        ),
         "unit": _unit_display(db, item.unit) if item else "",
         "warehouse_ref1c": str(issue.warehouse_ref1c or ""),
         "destination_warehouse_name": _warehouse_display_name(warehouse_names, issue.warehouse_ref1c),

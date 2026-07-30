@@ -25,6 +25,33 @@ from .production_control_domain import (
     latest_run_id as _latest_run_id,
     unit_display as _unit_display,
 )
+from .planning_truth import require_accepted_truth
+from .production_output_truth import (
+    accepted_product_output,
+    accepted_product_remaining_expr,
+)
+
+
+class MaterialCoverageSnapshotUnavailable(RuntimeError):
+    def __init__(
+        self,
+        *,
+        product_id: int,
+        expected_generation_id: int,
+        stored_generation_id: int | None,
+    ) -> None:
+        self.detail = {
+            "code": "material_coverage_snapshot_unavailable",
+            "status": "unavailable",
+            "product_id": int(product_id),
+            "expected_generation_id": int(expected_generation_id),
+            "stored_generation_id": stored_generation_id,
+            "reason": (
+                "material coverage snapshot is missing or belongs to another "
+                "Ledger generation; run explicit refresh"
+            ),
+        }
+        super().__init__(self.detail["reason"])
 
 
 def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Optional[int], List[Dict[str, Any]]]:
@@ -38,7 +65,7 @@ def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Op
         .order_by(Item.item_name.asc())
         .all()
     )
-    qty = _to_float(product.remaining_qty) or _to_float(product.quantity)
+    qty = _to_float(accepted_product_output(product).remaining_qty)
     components: List[Dict[str, Any]] = []
     for comp, item in rows:
         required = _to_float(comp.quantity) * qty
@@ -190,13 +217,17 @@ def _production_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, L
 
     from .production_control_journal import DONE_STATE_KEY, _TERMINAL_LINE_STATUSES
 
+    remaining_expr = accepted_product_remaining_expr(
+        ProductionProduct.quantity,
+        ProductionProduct.produced_qty,
+    )
     rows = (
         db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionProduct.item_id.in_(ids))
         .filter(ProductionOrder.deletion_mark == False)
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(remaining_expr > 0)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
         .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
         .order_by(
@@ -215,7 +246,7 @@ def _production_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, L
             {
                 "source": "production_order",
                 "date": _date_to_iso(finish or order_dt),
-                "qty": _to_float(product.remaining_qty),
+                "qty": _to_float(accepted_product_output(product).remaining_qty),
                 "ref": str(order.order_number or ""),
                 "product_id": int(product.product_id),
                 "order_id": int(order.order_id),
@@ -269,6 +300,8 @@ def _store_material_coverage_status(
     new_status: str,
     label: str,
     snapshot: Dict[str, Any],
+    *,
+    ledger_generation_id: int,
 ) -> None:
     """
     Persist material availability separately from the workflow state.
@@ -279,6 +312,7 @@ def _store_material_coverage_status(
     state.material_coverage_status = new_status
     state.material_coverage_label = label
     state.material_coverage_calculated_at = datetime.now(timezone.utc)
+    state.material_coverage_ledger_generation_id = int(ledger_generation_id)
     state.material_coverage_snapshot = snapshot
     if (
         state.issue_status in {None, "", "not_requested"}
@@ -362,6 +396,8 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     Order-level field `coverage` aggregates per-component labels per the plan
     rules (any shortage -> shortage, else any partial -> partial, else ready).
     """
+    truth = require_accepted_truth(db, "production_control.material_coverage")
+    ledger_generation_id = int(truth.generation_id)
     product = (
         db.query(ProductionProduct)
         .options(
@@ -379,7 +415,11 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     comp_ids = [int(c["component_item_id"]) for c in components]
     from .item_ledger import item_ledger_position
 
-    ledger_positions = item_ledger_position(db, comp_ids)
+    ledger_positions = item_ledger_position(
+        db,
+        comp_ids,
+        ledger_generation_id=ledger_generation_id,
+    )
     stock_by_item = {
         item_id: float(position["on_hand"])
         for item_id, position in ledger_positions.items()
@@ -468,11 +508,12 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     order_coverage = _aggregate_coverage([str(c["coverage"]) for c in components])
 
     payload = {
+        "ledger_generation_id": ledger_generation_id,
         "product_id": int(product.product_id),
         "order_number": str(product.order.order_number or ""),
         "item_name": str(product.item.item_name or ""),
         "item_article": str(product.item.item_article or ""),
-        "qty": _to_float(product.remaining_qty) or _to_float(product.quantity),
+        "qty": _to_float(accepted_product_output(product).remaining_qty),
         "spec_id": spec_id,
         "components": components,
         "coverage": order_coverage,
@@ -481,22 +522,50 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     }
     if refresh_state:
         state = _ensure_state(db, product)
-        _store_material_coverage_status(state, order_coverage, _ui_coverage_label(order_coverage), payload)
+        _store_material_coverage_status(
+            state,
+            order_coverage,
+            _ui_coverage_label(order_coverage),
+            payload,
+            ledger_generation_id=ledger_generation_id,
+        )
         db.commit()
     return payload
 
 
 def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
-    """Read stored coverage only; missing snapshots use a read-only preview."""
+    """Read only coverage persisted for the currently accepted generation."""
+    truth = require_accepted_truth(db, "production_control.material_coverage")
+    generation_id = int(truth.generation_id)
     state = (
         db.query(ProductionOrderLineState)
         .filter(ProductionOrderLineState.product_id == int(product_id))
         .first()
     )
     snapshot = state.material_coverage_snapshot if state else None
-    if isinstance(snapshot, dict):
+    snapshot_generation_id = (
+        int(state.material_coverage_ledger_generation_id)
+        if state is not None
+        and state.material_coverage_ledger_generation_id is not None
+        else None
+    )
+    payload_generation_id = (
+        int(snapshot.get("ledger_generation_id"))
+        if isinstance(snapshot, dict)
+        and snapshot.get("ledger_generation_id") is not None
+        else None
+    )
+    if (
+        isinstance(snapshot, dict)
+        and snapshot_generation_id == generation_id
+        and payload_generation_id == generation_id
+    ):
         return dict(snapshot)
-    return preview_materials(db, int(product_id), refresh_state=False)
+    raise MaterialCoverageSnapshotUnavailable(
+        product_id=int(product_id),
+        expected_generation_id=generation_id,
+        stored_generation_id=snapshot_generation_id,
+    )
 
 
 def refresh_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
@@ -510,13 +579,17 @@ def _active_product_ids(db: Session, *, limit: int = 0) -> List[int]:
     from ..models import ProductionOrder
     from .production_control_journal import DONE_STATE_KEY, _TERMINAL_LINE_STATUSES
 
+    remaining_expr = accepted_product_remaining_expr(
+        ProductionProduct.quantity,
+        ProductionProduct.produced_qty,
+    )
     query = (
         db.query(ProductionProduct.product_id)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
+        .filter(remaining_expr > 0)
         .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
         .order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
     )

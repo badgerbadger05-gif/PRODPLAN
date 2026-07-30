@@ -7,6 +7,7 @@ from collections import defaultdict
 from sqlalchemy.orm import Session
 
 from ..models import ProductionResource, ResourceProductionKind, PlannedOrderStage, DefaultSpecification, Specification
+from .bom_specification_resolver import BomSpecificationResolver
 
 
 class CapacityScheduler:
@@ -40,19 +41,23 @@ class CapacityScheduler:
         for rpk in all_rpk:
             self._kind_to_res_cache[rpk.production_kind_id].append(rpk.resource_id)
         
-        # Map item_id -> production_kind_id via DefaultSpecification -> Specification
-        try:
-            self._item_kind_map: Dict[int, int] = {}
-            rows = (
-                db.query(DefaultSpecification.item_id, Specification.production_kind_id)
-                .join(Specification, DefaultSpecification.spec_id == Specification.spec_id)
-                .all()
-            )
-            for iid, pkid in rows:
-                if pkid is not None:
-                    self._item_kind_map[int(iid)] = int(pkid)
-        except Exception:
-            self._item_kind_map = {}
+        # Map item_id -> production_kind_id through the canonical default-spec
+        # resolver. Ambiguous defaults must stop capacity decisions.
+        resolver = BomSpecificationResolver(db)
+        specs_by_id = {
+            int(spec.spec_id): spec for spec in db.query(Specification).all()
+        }
+        self._item_kind_map: Dict[int, int] = {}
+        item_ids = sorted({
+            int(item_id)
+            for (item_id,) in db.query(DefaultSpecification.item_id).all()
+        })
+        for item_id in item_ids:
+            spec_id = resolver.default_spec_id(item_id)
+            spec = specs_by_id.get(int(spec_id)) if spec_id is not None else None
+            production_kind_id = getattr(spec, "production_kind_id", None)
+            if production_kind_id is not None:
+                self._item_kind_map[item_id] = int(production_kind_id)
 
     def _is_workday(self, d: date) -> bool:
         if not self._use_calendars:

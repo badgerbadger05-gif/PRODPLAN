@@ -45,6 +45,11 @@ from .mrp_mutation_guard import (
     MrpMutationLineageError,
     require_current_run,
 )
+from .bom_specification_resolver import BomSpecificationResolver
+from .item_ledger.production_output_cache import (
+    accepted_product_output,
+    update_accepted_product_output_cache,
+)
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -215,6 +220,7 @@ def _reused_product_payload(
     requirement_id: int,
 ) -> Dict[str, Any]:
     item = getattr(product, "item", None)
+    output = accepted_product_output(product)
     return {
         "requirement_id": int(requirement_id),
         "product_id": int(product.product_id),
@@ -222,7 +228,7 @@ def _reused_product_payload(
         "order_number": str(order.order_number or "") if order else None,
         "item_id": int(product.item_id),
         "item_name": str(item.item_name or "") if item else "",
-        "qty": _to_float(product.remaining_qty) or _to_float(product.quantity),
+        "qty": _to_float(output.remaining_qty),
     }
 
 
@@ -304,7 +310,10 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
         .filter(ProductionOrder.source == "mrp")
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(
+            func.coalesce(ProductionProduct.quantity, 0)
+            > func.coalesce(ProductionProduct.produced_qty, 0)
+        )
         .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
         .all()
     )
@@ -348,7 +357,7 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
         editable_target_qty = required_qty
         for row in sorted(group_rows, key=keep_priority, reverse=True):
             product, order, state, _req, _run = row
-            qty = _to_float(product.remaining_qty)
+            qty = _to_float(accepted_product_output(product).remaining_qty)
             is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
             if is_1c:
                 kept.append(row)
@@ -384,7 +393,7 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
 
         cancelled_payload: List[Dict[str, Any]] = []
         for product, order, state, req, _run in cancelled:
-            qty = _to_float(product.remaining_qty)
+            qty = _to_float(accepted_product_output(product).remaining_qty)
             cancelled_payload.append({
                 "product_id": int(product.product_id),
                 "order_id": int(order.order_id),
@@ -396,7 +405,6 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
                 actual_state = state or _ensure_state(db, product)
                 if actual_state.status not in _TERMINAL_LINE_STATUSES:
                     actual_state.status = "cancelled"
-                    product.remaining_qty = 0.0
             cancelled_count += 1
             released_qty_total += qty
 
@@ -413,9 +421,12 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
                 "delta_qty": delta,
             })
             if not dry_run and delta > 1e-9:
-                product.remaining_qty = new_qty
                 produced_qty = _to_float(product.produced_qty)
                 product.quantity = max(produced_qty + new_qty, produced_qty)
+                update_accepted_product_output_cache(
+                    product,
+                    produced_qty=product.produced_qty,
+                )
             if delta > 1e-9:
                 reduced_count += 1
                 reduced_qty_total += delta
@@ -450,31 +461,9 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
 
 
 def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
-    result = {int(root_item_id)}
-    spec_by_item: Dict[int, int] = {
-        int(row.item_id): int(row.spec_id)
-        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id == int(root_item_id))
-        .all()
-    }
-
-    def visit(item_id: int, seen_specs: set[int]) -> None:
-        spec_id = spec_by_item.get(int(item_id))
-        if not spec_id or spec_id in seen_specs:
-            return
-        next_seen = set(seen_specs)
-        next_seen.add(int(spec_id))
-        for row in db.query(SpecComponent.item_id).filter(SpecComponent.spec_id == int(spec_id)).all():
-            child_id = int(row.item_id)
-            result.add(child_id)
-            if child_id not in spec_by_item:
-                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
-                if ds:
-                    spec_by_item[child_id] = int(ds.spec_id)
-            visit(child_id, next_seen)
-
-    visit(int(root_item_id), set())
-    return result
+    return BomSpecificationResolver(db).descendant_ids_by_root(
+        [int(root_item_id)]
+    )[int(root_item_id)]
 
 
 def _accepted_plan_snapshot_run_ids_for_root(
@@ -914,6 +903,7 @@ def list_journal(
     db: Session,
     *,
     truth: PlanningTruthReadiness | None = None,
+    _accepted_run_ids_override: Optional[Sequence[int]] = None,
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
@@ -930,9 +920,13 @@ def list_journal(
     offset: int = 0,
 ) -> Dict[str, Any]:
     truth = truth or require_accepted_truth(db, "production_control_journal")
-    accepted_run_ids = _accepted_fixed_run_ids(
-        db,
-        ledger_generation_id=int(truth.generation_id),
+    accepted_run_ids = (
+        sorted({int(value) for value in _accepted_run_ids_override})
+        if _accepted_run_ids_override is not None
+        else _accepted_fixed_run_ids(
+            db,
+            ledger_generation_id=int(truth.generation_id),
+        )
     )
     # A scalar is retained only for an unambiguous scope.  Never choose the
     # numerically latest run as that can belong to a foreign generation.
@@ -946,7 +940,10 @@ def list_journal(
         .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
+        .filter(
+            func.coalesce(ProductionProduct.quantity, 0)
+            > func.coalesce(ProductionProduct.produced_qty, 0)
+        )
         .filter(
             func.coalesce(ProductionOrderLineState.status, "shortage").notin_(
                 tuple(_TERMINAL_LINE_STATUSES)
@@ -1274,6 +1271,7 @@ def list_journal(
             if row_coverage_status == material_coverage_status and material_coverage_label
             else COVERAGE_LABELS.get(row_coverage_status, row_coverage_status)
         )
+        output = accepted_product_output(product)
         result.append(
             {
                 "product_id": int(product.product_id),
@@ -1294,9 +1292,9 @@ def list_journal(
                 "item_article": str(product.item.item_article or ""),
                 "optimal_batch": _to_float(product.item.optimal_batch) if product.item.optimal_batch is not None else None,
                 "unit": unit_by_raw.get(str(product.item.unit or "").strip(), ""),
-                "quantity": _to_float(product.quantity),
-                "produced_qty": _to_float(product.produced_qty),
-                "remaining_qty": _to_float(product.remaining_qty),
+                "quantity": _to_float(output.planned_qty),
+                "produced_qty": _to_float(output.produced_qty),
+                "remaining_qty": _to_float(output.remaining_qty),
                 "status": work_status,
                 "coverage_status": row_coverage_status,
                 "coverage_label": coverage_label,
@@ -1377,9 +1375,10 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         status = str(payload.get("status")).strip()
         if status not in LINE_STATUSES:
             raise ValueError(f"Недопустимый статус: {status}")
+        output = accepted_product_output(product)
         if status == "completed" and (
-            _to_float(product.remaining_qty) > 1e-9
-            or _to_float(product.produced_qty) <= 1e-9
+            _to_float(output.remaining_qty) > 1e-9
+            or _to_float(output.produced_qty) <= 1e-9
         ):
             raise ValueError("Нельзя вручную завершить строку с невыпущенным остатком. Используйте выпуск.")
         state.status = status
@@ -1391,9 +1390,7 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         # from the requirement's coverage so the reconciliation job (and the
         # journal) can see the demand is no longer fully ordered.
         if status in _TERMINAL_LINE_STATUSES and prev_status not in _TERMINAL_LINE_STATUSES:
-            released = _to_float(product.remaining_qty)
-            if released > 1e-9:
-                product.remaining_qty = 0.0
+            released = _to_float(output.remaining_qty)
     if "issue_status" in payload and payload.get("issue_status"):
         issue_status = str(payload.get("issue_status")).strip()
         if issue_status not in ISSUE_STATUSES:
@@ -1486,10 +1483,11 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
     for row in products:
         state = row.control_state or _ensure_state(db, row)
         if state.status != "cancelled":
-            qty_to_release = _to_float(row.remaining_qty)
+            qty_to_release = _to_float(
+                accepted_product_output(row).remaining_qty
+            )
             if qty_to_release > 1e-9:
                 released_qty += qty_to_release
-                row.remaining_qty = 0.0
             state.status = "cancelled"
         state.issue_status = "not_requested"
 
@@ -1529,14 +1527,17 @@ def update_product_quantity(db: Session, product_id: int, quantity: float) -> Di
         )
 
     product.quantity = qty
-    product.remaining_qty = max(0.0, qty - produced)
+    update_accepted_product_output_cache(
+        product,
+        produced_qty=product.produced_qty,
+    )
     material_issues_refresh = refresh_existing_material_issues_for_product(db, product)
     db.commit()
     payload: Dict[str, Any] = {
         "status": "ok",
         "product_id": int(product_id),
         "quantity": float(qty),
-        "remaining_qty": float(product.remaining_qty),
+        "remaining_qty": float(accepted_product_output(product).remaining_qty),
         "material_issues_refresh": material_issues_refresh,
     }
     return payload

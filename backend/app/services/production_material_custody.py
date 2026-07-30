@@ -31,6 +31,7 @@ from ..models import (
     ProductionProduct,
 )
 from .production_control_common import to_float as _to_float
+from .production_output_truth import accepted_product_output
 
 # 1C state for completed production orders. Duplicated locally to keep this
 # low-level reservation module independent from journal/planning services.
@@ -97,7 +98,7 @@ def is_product_custody_active(product: ProductionProduct) -> bool:
     if line_status in _RESERVATION_CLOSED_LINE_STATUSES:
         return False
 
-    if _to_float(getattr(product, "remaining_qty", 0.0)) <= 1e-9:
+    if accepted_product_output(product).remaining_qty <= 0:
         return False
 
     return True

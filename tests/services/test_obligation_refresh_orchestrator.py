@@ -98,6 +98,7 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         "drum_schedule": True,
         "shelf_projection": True,
         "purchase_control_journal": True,
+        "production_control_journal": True,
         "future_supply": True,
     }
     assert {
@@ -114,6 +115,15 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert by_stage["snapshot_build"].metrics["future_supply_captured"] is True
     snapshot_id = by_stage["snapshot_build"].metrics["candidate_read_snapshot_ids"][str(candidate.run_id)]
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
+    production_journal_id = by_stage["snapshot_build"].metrics[
+        "production_control_journal_snapshot_id"
+    ]
+    production_journal = db_session.get(
+        models.PlanningReadSnapshot,
+        production_journal_id,
+    )
+    assert production_journal.consumer == "production_control_journal"
+    assert production_journal.truth_status == "accepted"
     # This public read function consumes the stored snapshot; it does not run MRP.
     assert read_mrp_result_manifest(db_session, candidate.run_id)["run_id"] == candidate.run_id
     # Journals must not go dark after a refresh: every published generation
@@ -192,6 +202,47 @@ def test_failure_after_freeze_is_reversible_by_outer_transaction(db_session, mon
     assert old.status == "FIXED_SNAPSHOT"
     assert line.locked_by_run_id is None
     assert db_session.query(models.LedgerGeneration).filter_by(generation_key="orch-rollback").count() == 0
+
+
+def test_replays_all_realizations_before_materializing_work_items(
+    db_session, monkeypatch
+):
+    accepted, plan, _line, _item, _old, _cutoff = _world(
+        db_session,
+        with_parent=False,
+    )
+    calls: list[str] = []
+
+    def record(name, original):
+        def wrapper(*args, **kwargs):
+            calls.append(name)
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        workflow,
+        "replay_candidate_realizations",
+        record("make_replay", workflow.replay_candidate_realizations),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "rebuild_supplier_receipt_coverage_from_persisted_provenance",
+        record(
+            "supplier_replay",
+            workflow.rebuild_supplier_receipt_coverage_from_persisted_provenance,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "materialize_replenishment_work_items",
+        record("work_items", workflow.materialize_replenishment_work_items),
+    )
+
+    _run(db_session, accepted, "orch-replay-before-work-items", add=[plan.id])
+
+    assert calls.index("make_replay") < calls.index("work_items")
+    assert calls.index("supplier_replay") < calls.index("work_items")
 
 
 def test_committed_exact_retry_is_publisher_noop_and_changed_request_is_rejected(db_session):

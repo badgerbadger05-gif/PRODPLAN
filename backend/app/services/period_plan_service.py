@@ -61,6 +61,10 @@ from .replenishment import (
     classify_replenishment_flow,
 )
 from .warnings import make_warning
+from .bom_specification_resolver import (
+    BomSpecificationResolutionError,
+    BomSpecificationResolver,
+)
 
 
 # Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
@@ -655,11 +659,12 @@ def _explode_bom_net_first(
         if classify_replenishment_flow(replenishment_method) == REPLENISHMENT_FLOW_PRODUCTION
     }
 
+    spec_resolver = BomSpecificationResolver(db)
     default_spec_map: Dict[int, int] = {
-        int(ds.item_id): int(ds.spec_id)
-        for ds in db.query(DefaultSpecification).all()
+        item_id: spec_id
+        for item_id in sorted(int(value) for value in plan_demands)
+        if (spec_id := spec_resolver.default_spec_id(item_id)) is not None
     }
-
     components_by_spec: Dict[int, List[SpecComponent]] = {}
     for comp in db.query(SpecComponent).all():
         components_by_spec.setdefault(int(comp.spec_id), []).append(comp)
@@ -681,11 +686,10 @@ def _explode_bom_net_first(
         wip_eta_by_item = _active_wip_eta_by_item(db)
 
     # --- Buffer-days lookup: item → default spec → production_kind → resource.buffer_days ---
-    all_spec_ids: set = set(default_spec_map.values())
-    if all_spec_ids:
-        specs = db.query(Specification).filter(Specification.spec_id.in_(all_spec_ids)).all()
-    else:
-        specs = []
+    # Pinned specs are selected by ref only when their edge is reached, but
+    # their production-kind metadata must already be available for lead-time
+    # shifting once selected.
+    specs = db.query(Specification).all()
     spec_by_id: Dict[int, Any] = {int(s.spec_id): s for s in specs}
 
     kind_ids: set = {int(s.production_kind_id) for s in specs if getattr(s, "production_kind_id", None)}
@@ -704,15 +708,15 @@ def _explode_bom_net_first(
         resources = db.query(ProductionResource).filter(ProductionResource.resource_id.in_(resource_ids)).all()
         res_by_id = {int(r.resource_id): r for r in resources}
 
-    buffer_days_cache: Dict[int, int] = {}
+    buffer_days_cache: Dict[Tuple[int, int | None], int] = {}
 
     def clamp_to_floor(value: date) -> date:
         return need_date_floor if value < need_date_floor else value
 
-    def resolve_buffer_days(item_id: int) -> int:
-        if item_id in buffer_days_cache:
-            return buffer_days_cache[item_id]
-        spec_id = default_spec_map.get(item_id)
+    def resolve_buffer_days(item_id: int, spec_id: int | None) -> int:
+        cache_key = (int(item_id), int(spec_id) if spec_id is not None else None)
+        if cache_key in buffer_days_cache:
+            return buffer_days_cache[cache_key]
         buffer_val = 0
         if spec_id:
             spec = spec_by_id.get(int(spec_id))
@@ -727,8 +731,8 @@ def _explode_bom_net_first(
                         if buffer_raw > 0:
                             buffer_val = int(buffer_raw)
                             break
-        buffer_days_cache[item_id] = max(0, buffer_val)
-        return buffer_days_cache[item_id]
+        buffer_days_cache[cache_key] = max(0, buffer_val)
+        return buffer_days_cache[cache_key]
 
     # --- BFS state ---
     gross_map: Dict[int, Dict[date, float]] = {}
@@ -759,6 +763,10 @@ def _explode_bom_net_first(
     demand_map: Dict[int, Dict[date, float]] = {
         int(iid): dict(buckets) for iid, buckets in plan_demands.items()
     }
+    demand_spec_map: Dict[int, int | None] = {
+        int(iid): default_spec_map.get(int(iid)) for iid in demand_map
+    }
+    traced_spec_scopes: Set[Tuple[int, int]] = set()
 
     MAX_BOM_DEPTH = 20
     for depth in range(MAX_BOM_DEPTH):
@@ -766,6 +774,7 @@ def _explode_bom_net_first(
             break
 
         next_demand: Dict[int, Dict[date, float]] = {}
+        next_demand_spec_map: Dict[int, int | None] = {}
 
         for iid, buckets in sorted(demand_map.items()):
             if not buckets:
@@ -880,20 +889,35 @@ def _explode_bom_net_first(
                 for bucket_date, net_q in net_buckets:
                     net_map[iid][bucket_date] = net_map[iid].get(bucket_date, 0.0) + float(net_q)
 
-            # Explode demand that on-hand stock does NOT cover (after-stock,
-            # NOT after-stock-and-WIP): an open parent order still needs its
-            # components produced, so WIP must not suppress the explosion or
-            # lower BOM levels silently stay in deficit with no orders.
-            if not explode_buckets:
-                continue  # Nothing to propagate
-
-            spec_id = default_spec_map.get(iid)
+            spec_id = demand_spec_map.get(iid)
             if not spec_id:
                 continue  # Leaf item (purchased material or item without BOM)
 
             comps = components_by_spec.get(int(spec_id), [])
             if not comps:
                 continue
+            if (
+                shared_pools is not None
+                and trace is not None
+                and (iid, int(spec_id)) not in traced_spec_scopes
+            ):
+                traced_spec_scopes.add((iid, int(spec_id)))
+                for component in comps:
+                    trace.component_norms.append(
+                        (
+                            int(iid),
+                            int(component.item_id),
+                            int(spec_id),
+                            float(component.quantity or 0.0),
+                        )
+                    )
+
+            # Explode demand that on-hand stock does NOT cover (after-stock,
+            # NOT after-stock-and-WIP): an open parent order still needs its
+            # components produced, so WIP must not suppress the explosion or
+            # lower BOM levels silently stay in deficit with no orders.
+            if not explode_buckets:
+                continue  # Nothing to propagate
 
             own_ancestors = ancestors_by_item.get(iid, set())
             child_ancestors = own_ancestors | {iid}
@@ -923,6 +947,17 @@ def _explode_bom_net_first(
                             ))
                         continue
                     child_qty = exp_q * per_unit
+                    child_spec_id = spec_resolver.child_spec_id(comp)
+                    if child_id in next_demand_spec_map:
+                        existing_spec_id = next_demand_spec_map[child_id]
+                        if existing_spec_id != child_spec_id:
+                            raise BomSpecificationResolutionError(
+                                "BOM component receives conflicting specification "
+                                f"selections in one expansion level: item_id={child_id}, "
+                                f"spec_ids={sorted({existing_spec_id, child_spec_id}, key=lambda value: -1 if value is None else value)}"
+                            )
+                    else:
+                        next_demand_spec_map[child_id] = child_spec_id
                     # Classical MRP lead-time offset: shift the child's
                     # need_date back by the PARENT's production time
                     # (`resolve_buffer_days(iid)`), so the components are
@@ -934,7 +969,7 @@ def _explode_bom_net_first(
                     # which shifted by the wrong link and effectively lost
                     # the parent's lead time at every level (over 3 levels
                     # with buffers 7/5/3 it produced a 12-day error).
-                    buf = resolve_buffer_days(iid)
+                    buf = resolve_buffer_days(iid, spec_id)
                     child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
                     child_date = clamp_to_floor(child_date)
                     if child_id not in next_demand:
@@ -945,6 +980,7 @@ def _explode_bom_net_first(
                     ancestors_by_item.setdefault(child_id, set()).update(child_ancestors)
 
         demand_map = next_demand
+        demand_spec_map = next_demand_spec_map
 
     if any(
         float(qty or 0.0) > 1e-9
@@ -959,24 +995,6 @@ def _explode_bom_net_first(
             f"({MAX_BOM_DEPTH}): потребность нижних уровней осталась "
             f"неразвёрнутой для номенклатур {sorted(demand_map)[:10]}"
         )
-
-    # Freeze v2: record the frozen BOM norms for EVERY parent that carries gross
-    # demand and has a default spec — including stock-covered parents whose
-    # explosion was skipped (empty explode_buckets). The writer aggregates dups.
-    if shared_pools is not None and trace is not None:
-        for iid, gross_buckets in gross_map.items():
-            if sum(float(q) for q in gross_buckets.values()) <= 1e-9:
-                continue
-            spec_id = default_spec_map.get(int(iid))
-            if not spec_id:
-                continue
-            for comp in components_by_spec.get(int(spec_id), []):
-                try:
-                    child_id = int(comp.item_id)
-                    per_unit = float(comp.quantity or 0.0)
-                except Exception:
-                    continue
-                trace.component_norms.append((int(iid), child_id, int(spec_id), per_unit))
 
     return gross_map, net_map, bom_level_map, explosion_warnings
 
@@ -2063,37 +2081,7 @@ def _bom_descendants_by_item(db: Session, item_ids: Iterable[int]) -> Dict[int, 
     roots = sorted({int(i) for i in item_ids})
     if not roots:
         return {}
-
-    spec_by_item: Dict[int, int] = {
-        int(row.item_id): int(row.spec_id)
-        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id.in_(roots))
-        .all()
-    }
-    result: Dict[int, Set[int]] = {root: {root} for root in roots}
-
-    def visit(root_id: int, item_id: int, seen: Set[int]) -> None:
-        spec_id = spec_by_item.get(int(item_id))
-        if not spec_id or spec_id in seen:
-            return
-        seen.add(spec_id)
-        components = (
-            db.query(SpecComponent.item_id)
-            .filter(SpecComponent.spec_id == int(spec_id))
-            .all()
-        )
-        for row in components:
-            child_id = int(row.item_id)
-            result[root_id].add(child_id)
-            if child_id not in spec_by_item:
-                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
-                if ds:
-                    spec_by_item[child_id] = int(ds.spec_id)
-            visit(root_id, child_id, seen)
-
-    for root in roots:
-        visit(root, root, set())
-    return result
+    return BomSpecificationResolver(db).descendant_ids_by_root(roots)
 
 
 def _plan_matrix_forecasts(

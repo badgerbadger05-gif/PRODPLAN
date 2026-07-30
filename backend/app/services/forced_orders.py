@@ -12,15 +12,22 @@ from ..models import (
     PlanningRun,
     Item,
     Unit,
-    DefaultSpecification,
     Specification,
     SpecComponent,
     ProductionResource,
     ResourceProductionKind,
+    LedgerFutureSupply,
 )
 
 from .order_quantity_calculator import OrderQuantityCalculator
 from .planning_service import DEFAULT_PLANNING_CONFIG, get_active_planning_config
+from .bom_specification_resolver import BomSpecificationResolver
+from .mrp_stock_helpers import effective_stock_by_item_all
+from .planning_truth import (
+    CAPABILITY_FUTURE_SUPPLY,
+    CAPABILITY_PHYSICAL_LEDGER,
+    require_accepted_truth,
+)
 
 
 def _to_date(val: Any) -> dt_date:
@@ -63,9 +70,13 @@ def _build_order_qty_calculator_for_single_item(
     item_id: int,
     requested_qty: float,
 ) -> OrderQuantityCalculator:
-    # Default spec map + spec cache
-    default_specs = db.query(DefaultSpecification).all()
-    default_spec_map = {int(ds.item_id): int(ds.spec_id) for ds in default_specs}
+    # The forced-order calculator only needs the requested item's root spec.
+    # Resolve it through the canonical owner so ambiguous defaults fail closed.
+    spec_resolver = BomSpecificationResolver(db)
+    root_spec_id = spec_resolver.default_spec_id(int(item_id))
+    default_spec_map = (
+        {int(item_id): int(root_spec_id)} if root_spec_id is not None else {}
+    )
 
     all_specs = db.query(Specification).all()
     spec_by_id = {int(s.spec_id): s for s in all_specs}
@@ -94,22 +105,39 @@ def _build_order_qty_calculator_for_single_item(
     units_all = db.query(Unit).all()
     units_by_ref = {getattr(u, "unit_ref1c"): u for u in units_all}
 
-    # Stock + WIP
-    stock_by_item = {int(item.item_id): float(item.stock_qty or 0.0)}
+    # Stock + WIP come from one accepted Ledger generation.  The mutable Item
+    # mirror and live production-order quantities are never planning facts.
     wip_by_item: Dict[int, float] = {}
     include_wip = bool((snapshot or {}).get("toggles", {}).get("include_wip", False))
+    required_capabilities = [CAPABILITY_PHYSICAL_LEDGER]
     if include_wip:
-        try:
-            from ..models import ProductionProduct
-
-            wip_rows = (
-                db.query(ProductionProduct.item_id, func.sum(ProductionProduct.quantity))
-                .group_by(ProductionProduct.item_id)
-                .all()
+        required_capabilities.append(CAPABILITY_FUTURE_SUPPLY)
+    truth = require_accepted_truth(
+        db,
+        "forced_orders",
+        required_capabilities=tuple(required_capabilities),
+    )
+    stock_by_item = effective_stock_by_item_all(db)
+    if include_wip:
+        wip_rows = (
+            db.query(
+                LedgerFutureSupply.item_id,
+                func.sum(LedgerFutureSupply.open_qty_at_cutoff),
             )
-            wip_by_item = {int(iid): float(qty or 0.0) for iid, qty in wip_rows}
-        except Exception:
-            wip_by_item = {}
+            .filter(
+                LedgerFutureSupply.ledger_generation_id
+                == int(truth.generation_id),
+                LedgerFutureSupply.supply_kind == "wip_order",
+                LedgerFutureSupply.evidence_status == "exact",
+                LedgerFutureSupply.open_qty_at_cutoff > 0,
+            )
+            .group_by(LedgerFutureSupply.item_id)
+            .all()
+        )
+        wip_by_item = {
+            int(position_item_id): float(qty or 0)
+            for position_item_id, qty in wip_rows
+        }
 
     horizon_days = int((snapshot or {}).get("planning_horizon_days", 90) or 90)
     # Important: for forced orders we treat requested qty as "demand in horizon" so horizon_limit is not 0.
@@ -349,8 +377,7 @@ def export_shortage_report_for_run(db: Session, run_id: int) -> Dict[str, Any]:
 
     # Resolve "участок" for grouping, similarly to production export: for shortage rows we may not have
     # planned_order stages (blocked cases). We group by the first mapped resource for item's production kind.
-    default_specs = db.query(DefaultSpecification).all()
-    default_spec_map = {int(ds.item_id): int(ds.spec_id) for ds in default_specs}
+    spec_resolver = BomSpecificationResolver(db)
     all_specs = db.query(Specification).all()
     spec_by_id = {int(s.spec_id): s for s in all_specs}
 
@@ -368,7 +395,7 @@ def export_shortage_report_for_run(db: Session, run_id: int) -> Dict[str, Any]:
             iid = int(item_id_val)
         except Exception:
             return "Без участка"
-        spec_id = default_spec_map.get(iid)
+        spec_id = spec_resolver.default_spec_id(iid)
         if not spec_id:
             return "Без участка"
         spec = spec_by_id.get(int(spec_id))

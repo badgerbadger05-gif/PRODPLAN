@@ -187,15 +187,15 @@ def test_active_wip_eta_skips_deleted_and_done_orders(db_session):
     assert entries == [(date(2026, 8, 1), 4.0)]
 
 
-def test_active_wip_eta_skips_zero_remaining(db_session):
+def test_active_wip_eta_ignores_corrupt_zero_remaining_cache(db_session):
     db = db_session
     item = _mk_item(db, code="WIP-Z", stock=0.0)
     product = _mk_active_wip(db, item, remaining=5.0, planned_finish=None)
-    product.remaining_qty = 0  # fully produced
+    product.remaining_qty = 0  # corrupt legacy cache: accepted produced is zero
     db.commit()
 
     result = active_wip_eta_by_item(db)
-    assert item.item_id not in result
+    assert result[item.item_id] == [(None, 5.0)]
 
 
 def test_active_wip_eta_excludes_completed_zero_remaining_even_with_produced_qty(db_session):

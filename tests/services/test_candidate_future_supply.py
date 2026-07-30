@@ -65,8 +65,9 @@ def _adapters(monkeypatch, source, item, *, calls=None):
         assert kwargs["planning_pool_by_warehouse"] == {"WH-1": "main"}
         return [wip]
 
-    def suppliers(db, generation_id):
+    def suppliers(db, generation_id, **kwargs):
         assert generation_id == source.id
+        assert kwargs["planning_pool_by_warehouse"] == {"WH-1": "main"}
         return (supplier,)
 
     monkeypatch.setattr(stage, "collect_wip_future_supply_evidence", collect)
@@ -98,6 +99,47 @@ def test_combined_stage_keeps_wip_and_supplier_in_one_replace(db_session, monkey
     ).all()
     assert [row.supply_kind for row in stored] == ["supplier_order", "wip_order"]
     assert metrics["rows"] == 2
+
+
+def test_candidate_captures_direct_1c_supplier_order_without_export_link(db_session):
+    source, target, batch, item = _scope(db_session, "direct-supplier")
+    order = models.SupplierOrder(
+        order_number="DIRECT-1",
+        order_date=datetime(2026, 7, 25),
+        order_ref1c="direct-supplier-ref",
+        order_state_name="В пути",
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        models.SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=item.item_id,
+            line_number=1,
+            destination_warehouse_ref1c="WH-1",
+            quantity=Decimal("9"),
+            received_qty=Decimal("0"),
+            remaining_qty=Decimal("9"),
+            delivery_date=datetime(2026, 8, 5),
+        )
+    )
+    db_session.flush()
+
+    metrics = stage.capture_candidate_future_supply(
+        db_session,
+        source.id,
+        target.id,
+        batch.id,
+        planning_pool_by_warehouse={"WH-1": "main"},
+    )
+
+    row = db_session.query(models.LedgerFutureSupply).one()
+    assert metrics["rows"] == 1
+    assert metrics["exact_rows"] == 1
+    assert row.source_ref == "direct-supplier-ref"
+    assert row.open_qty_at_cutoff == Decimal("9")
+    assert row.source_state_key == "В пути"
 
 
 def test_combined_stage_retry_does_not_rewrite_rows(db_session, monkeypatch):

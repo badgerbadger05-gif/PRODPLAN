@@ -33,13 +33,14 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    DefaultSpecification,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionProduct,
     SpecComponent,
 )
+from .bom_specification_resolver import BomSpecificationResolver
 from .production_control_common import to_float as _to_float
+from .production_output_truth import accepted_product_output
 
 # 1C state for completed production orders. Duplicated locally to keep this
 # low-level reservation module independent from journal/planning services.
@@ -96,31 +97,16 @@ class ReservationState:
 
 
 def _spec_qty_per_unit(db: Session, products: Sequence[ProductionProduct]) -> Dict[int, Dict[int, float]]:
-    """{product_id: {component_item_id: qty_per_unit}} via the default spec."""
+    """{product_id: {component_item_id: qty_per_unit}} via the selected spec."""
+    spec_resolver = BomSpecificationResolver(db)
     spec_by_product: Dict[int, Optional[int]] = {}
-    item_ids_needing_default: Set[int] = set()
     for product in products:
         if product.spec_id:
             spec_by_product[int(product.product_id)] = int(product.spec_id)
         else:
-            spec_by_product[int(product.product_id)] = None
-            item_ids_needing_default.add(int(product.item_id))
-
-    default_by_item: Dict[int, int] = {}
-    if item_ids_needing_default:
-        rows = (
-            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-            .filter(DefaultSpecification.item_id.in_(item_ids_needing_default))
-            .order_by(DefaultSpecification.id.asc())
-            .all()
-        )
-        for item_id, spec_id in rows:
-            default_by_item.setdefault(int(item_id), int(spec_id))
-
-    for product in products:
-        pid = int(product.product_id)
-        if spec_by_product[pid] is None:
-            spec_by_product[pid] = default_by_item.get(int(product.item_id))
+            spec_by_product[int(product.product_id)] = spec_resolver.default_spec_id(
+                int(product.item_id)
+            )
 
     spec_ids = {sid for sid in spec_by_product.values() if sid}
     per_unit_by_spec: Dict[int, Dict[int, float]] = {}
@@ -154,7 +140,7 @@ def is_product_reservation_active(product: ProductionProduct) -> bool:
     if line_status in _RESERVATION_CLOSED_LINE_STATUSES:
         return False
 
-    if _to_float(getattr(product, "remaining_qty", 0.0)) <= 1e-9:
+    if accepted_product_output(product).remaining_qty <= 0:
         return False
 
     return True

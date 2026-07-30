@@ -32,6 +32,9 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
 )
 from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
+from app.services.production_control_journal_snapshot import (
+    build_candidate_snapshot as build_production_journal_candidate,
+)
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import (
     build_mrp_result_candidate_snapshot,
@@ -60,7 +63,7 @@ from app.services.item_ledger.shelf_projection_persistence import (
 )
 
 
-_VERSION = "obligation-refresh-orchestrator/1"
+_VERSION = "obligation-refresh-orchestrator/2"
 _CORE_CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
@@ -73,6 +76,7 @@ _CORE_CAPABILITIES = {
     "drum_schedule": True,
     "shelf_projection": True,
     "purchase_control_journal": True,
+    "production_control_journal": True,
     "future_supply": True,
 }
 
@@ -402,23 +406,32 @@ def run_obligation_refresh(
         "input_checksum": sha256(_canonical({"candidate_run_ids": candidate_ids, "freeze": freeze}).encode()).hexdigest(),
     }
     _complete(reservation_batch, reservation_metrics)
+    replay = replay_candidate_realizations(db, target_id)
+    supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db,
+        ledger_generation_id=target_id,
+        cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
+    )
+    # Work items are a persisted projection of the reservation fold.  Both
+    # make and supplier realizations must therefore be applied first; building
+    # this projection earlier freezes stale ``fulfilled_qty``/``remaining_qty``
+    # and can offer the same replenishment for ordering again.
     replenishment_summary = materialize_replenishment_work_items(
         db,
         target_id,
         int(replenishment_batch.id),
     )
     _complete(replenishment_batch, replenishment_summary)
-    replay = replay_candidate_realizations(db, target_id)
     assembly_outputs = materialize_assembly_output_allocations(db, target_id)
     drum_schedule = materialize_drum_schedule(db, target_id)
     shelf_projection = materialize_shelf_projections(db, target_id)
-    supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
-        db,
-        ledger_generation_id=target_id,
-        cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
-    )
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
+    production_journal_snapshot = build_production_journal_candidate(
+        db,
+        target_id,
+        accepted_run_ids=(*candidate_ids, *retained_run_ids),
+    )
     assembly_queue_snapshot = build_assembly_queue_snapshot(db, target_id)
     target = db.get(models.LedgerGeneration, target_id)
     if target is None or str(target.status) != "building":
@@ -448,6 +461,7 @@ def run_obligation_refresh(
             "surplus_qty": supplier.surplus_qty,
         }),
         "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
+        "production_control_journal_snapshot_id": int(production_journal_snapshot.id),
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
     }
     _complete(snapshot_batch, snapshot_metrics)

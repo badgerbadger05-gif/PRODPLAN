@@ -69,6 +69,7 @@ from .one_c_document_numbers import production_order_number
 from .mrp_mutation_guard import MrpMutationLineageError, require_materialized_orders
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
+from .bom_specification_resolver import BomSpecificationResolver
 
 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
@@ -223,6 +224,7 @@ def _materials_for_spec(
         .order_by(Item.item_name.asc(), SpecComponent.component_id.asc())
         .all()
     )
+    spec_resolver = BomSpecificationResolver(db)
     result: List[ProductionOrderExportMaterial] = []
     for idx, (comp, item) in enumerate(rows, start=1):
         item_ref = _clean_ref1c(item.item_ref1c)
@@ -236,7 +238,11 @@ def _materials_for_spec(
                 item_ref1c=item_ref,
                 unit_ref1c=_clean_ref1c(item.unit) or None,
                 qty=qty,
-                spec_ref1c=spec_ref or None,
+                spec_ref1c=(
+                    spec_resolver.child_spec_ref1c(comp)
+                    or spec_ref
+                    or None
+                ),
                 reserve_structural_unit_ref1c=reserve_structural_unit_ref1c,
             )
         )

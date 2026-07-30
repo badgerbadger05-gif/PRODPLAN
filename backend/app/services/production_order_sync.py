@@ -19,6 +19,9 @@ from ..models import (
     WorkshopWarehouseBinding,
 )
 from ..schemas import ODataSyncRequest
+from .item_ledger.production_output_cache import (
+    update_accepted_product_output_cache,
+)
 
 
 PRODUCTION_ORDER_SYNC_FROM = datetime(2026, 5, 1)
@@ -625,24 +628,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
 FACT_CACHE_CONSUMER = "production_fact_cache"
 
 
-def _cache_line_states(db: Session, product_ids: List[int]) -> Dict[int, str]:
-    """Статусы строк пакетно; отсутствие строки статуса = пустой статус."""
-    statuses: Dict[int, str] = {}
-    for chunk in _chunked(product_ids, 500):
-        rows = (
-            db.query(
-                ProductionOrderLineState.product_id,
-                ProductionOrderLineState.status,
-            )
-            .filter(ProductionOrderLineState.product_id.in_(chunk))
-            .all()
-        )
-        statuses.update(
-            {int(product_id): str(status or "") for product_id, status in rows}
-        )
-    return statuses
-
-
 def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -> Dict[str, Any]:
     """
     Пересчитать кэш факта выпуска из ПРИНЯТОГО поколения Item Ledger.
@@ -657,11 +642,10 @@ def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -
     поколения кэш НЕ переписывается и НЕ обнуляется, а сводка возвращает
     `status="unavailable"` с причиной.
 
-    `remaining_qty` пересчитывается по той же формуле, что и ручная
-    корректировка `production_control_journal.update_product_quantity`
-    (`max(0, quantity - produced_qty)`), но терминальные строки
-    (`completed` / `cancelled`) не воскрешаются: их обнулённый остаток —
-    решение оператора, а не производная факта.
+    `remaining_qty` — только совместимый кэш той же принятой проекции:
+    `max(0, quantity - produced_qty)`. Терминальное состояние является
+    отдельным операционным решением и не имеет права подменять физический
+    остаток нулём.
     """
     from .planning_truth import (
         CAPABILITY_PHYSICAL_LEDGER,
@@ -670,9 +654,6 @@ def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -
     )
     from .item_ledger.physical_visibility import PhysicalVisibilityError
     from .item_ledger.production_fact_projection import derive_production_output
-    # Владелец терминальных статусов строки — производственный журнал.
-    from .production_control_journal import _TERMINAL_LINE_STATUSES
-
     dry_run = bool(getattr(req, "dry_run", False))
 
     try:
@@ -718,24 +699,18 @@ def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -
         }
 
     products = db.query(ProductionProduct).all()
-    line_status_by_product = _cache_line_states(
-        db, [int(product.product_id) for product in products]
-    )
-
     products_updated = 0
     products_unchanged = 0
     zero = Decimal("0")
     for product in products:
         product_id = int(product.product_id)
         derived = projection.produced_by_product.get(product_id, zero)
-        cached = Decimal(str(product.produced_qty or 0))
-        if cached == derived:
+        if not update_accepted_product_output_cache(
+            product,
+            produced_qty=derived,
+        ):
             products_unchanged += 1
             continue
-        product.produced_qty = derived
-        if line_status_by_product.get(product_id, "") not in _TERMINAL_LINE_STATUSES:
-            planned = Decimal(str(product.quantity or 0))
-            product.remaining_qty = max(planned - derived, zero)
         products_updated += 1
 
     if dry_run:

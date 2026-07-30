@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 from ..models import (
     Item,
     RootProduct,
-    DefaultSpecification,
     SpecComponent,
     ProductionStage,
     ProductionResource,
@@ -18,6 +17,8 @@ from ..models import (
     ResourceProductionKind,
     Specification,
 )
+from .bom_specification_resolver import BomSpecificationResolver
+from .mrp_stock_helpers import effective_stock_by_item_all
 
 
 @dataclass
@@ -85,14 +86,9 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
     # Кэши справочников
     items = db.query(Item).all()
     item_by_id: Dict[int, Item] = {int(x.item_id): x for x in items}
+    stock_by_item = effective_stock_by_item_all(db)
 
-    default_specs = db.query(DefaultSpecification).all()
-    default_spec_map: Dict[int, int] = {}
-    for rec in default_specs:
-        iid = int(rec.item_id)
-        sid = int(rec.spec_id)
-        if iid not in default_spec_map:
-            default_spec_map[iid] = sid
+    spec_resolver = BomSpecificationResolver(db)
 
     # Загружаем спецификации, чтобы получить вид производства
     specifications = db.query(Specification).all()
@@ -155,6 +151,7 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
         ambiguous: List[Dict[str, Any]],
         path: Set[int],
         depth: int = 0,
+        selected_spec_id: Optional[int] = None,
     ) -> None:
         if depth > 200:
             return
@@ -162,7 +159,11 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
             # защита от цикла
             return
 
-        spec_id = default_spec_map.get(parent_item_id)
+        spec_id = (
+            int(selected_spec_id)
+            if selected_spec_id is not None
+            else spec_resolver.default_spec_id(parent_item_id)
+        )
         if not spec_id:
             return
 
@@ -259,12 +260,20 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
             if child_occurrences <= 0:
                 continue
 
-            expand(child_item_id, child_occurrences, parent_entries, ambiguous, new_path, depth + 1)
+            expand(
+                child_item_id,
+                child_occurrences,
+                parent_entries,
+                ambiguous,
+                new_path,
+                depth + 1,
+                spec_resolver.child_spec_id(comp),
+            )
 
     # Расчёт для каждого корневого изделия
     for rid in root_item_ids:
         root_item = item_by_id.get(rid)
-        if not root_item or rid not in default_spec_map:
+        if not root_item or spec_resolver.default_spec_id(rid) is None:
             continue
 
         # Список распределённых РОДИТЕЛЕЙ для текущего корня
@@ -304,7 +313,7 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
                         item_code=str(parent_item.item_code or ""),
                         item_name=str(parent_item.item_name or ""),
                         qty_per_unit=occurrences_val,  # кратность вхождений родителя в изделии
-                        stock_qty=float(parent_item.stock_qty or 0.0),
+                        stock_qty=float(stock_by_item.get(parent_item_id, 0.0)),
                         replenishment_method=(parent_item.replenishment_method or None),
                         norm_hours=norm_hours_val,
                         norm_hours_total=norm_hours_val * occurrences_val,

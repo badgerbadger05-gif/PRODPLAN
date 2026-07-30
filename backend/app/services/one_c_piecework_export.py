@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    DefaultSpecification,
     ProductionManufacture,
     ProductionManufactureOperation,
     ProductionOrder,
@@ -61,8 +60,15 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import piecework_number
 from .one_c_manufacture_export import (
-    commanded_qty_by_product as _commanded_qty_by_product,
     export_manufactures_to_1c,
+)
+from .bom_specification_resolver import BomSpecificationResolver
+from .item_ledger.physical_visibility import PhysicalVisibilityError
+from .item_ledger.production_fact_projection import derive_production_output
+from .planning_truth import (
+    CAPABILITY_PHYSICAL_LEDGER,
+    PlanningTruthUnavailable,
+    require_accepted_truth,
 )
 
 
@@ -272,13 +278,7 @@ def _piecework_spec_id(db: Session, product: Optional[ProductionProduct]) -> Opt
     item_id = getattr(product, "item_id", None)
     if not item_id:
         return None
-    row = (
-        db.query(DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id == int(item_id))
-        .order_by(DefaultSpecification.id.asc())
-        .first()
-    )
-    return int(row.spec_id) if row else None
+    return BomSpecificationResolver(db).default_spec_id(int(item_id))
 
 
 def _piecework_operation_defaults(
@@ -732,20 +732,21 @@ def _record_manufacture_export_error(db: Session, manufacture_id: int, error: st
     m_row.export_error = f"СдельныйНаряд: {error}"
 
 
-def _order_is_fully_commanded(db: Session, order_id: int) -> bool:
+def _order_is_fully_produced_in_accepted_ledger(
+    db: Session,
+    order_id: int,
+) -> bool:
     """
-    True when every line of the production order is fully handed to executive
-    1C documents (or already reported as produced).
+    True only when accepted Item Ledger facts fully cover every order line.
 
     Closing Document_ЗаказНаПроизводство tells 1C the order is finished, so a
-    partial выпуск must not trigger it — the uncommanded remainder would be
-    silently written off together with the order.
+    command/export and the mutable ``produced_qty`` cache are not evidence.
+    Missing, stale, malformed or incomplete Ledger truth fails closed.
     """
     rows = (
         db.query(
             ProductionProduct.product_id,
             ProductionProduct.quantity,
-            ProductionProduct.produced_qty,
         )
         .filter(ProductionProduct.order_id == int(order_id))
         .all()
@@ -753,13 +754,22 @@ def _order_is_fully_commanded(db: Session, order_id: int) -> bool:
     if not rows:
         # Unknown scope — never close the 1C order on a guess.
         return False
-    commanded = _commanded_qty_by_product(db, [int(row[0]) for row in rows])
-    for product_id, quantity, produced_qty in rows:
-        covered = max(
-            commanded.get(int(product_id), 0.0),
-            float(produced_qty or 0),
+    try:
+        truth = require_accepted_truth(
+            db,
+            "one_c_production_order_completion",
+            required_capabilities=(CAPABILITY_PHYSICAL_LEDGER,),
         )
-        if covered + 1e-6 < float(quantity or 0):
+        projection = derive_production_output(
+            db,
+            ledger_generation_id=int(truth.generation_id),
+            cutoff=truth.cutoff,
+        )
+    except (PlanningTruthUnavailable, PhysicalVisibilityError):
+        return False
+    for product_id, quantity in rows:
+        fact_qty = projection.produced_by_product.get(int(product_id), 0)
+        if float(fact_qty) + 1e-6 < float(quantity or 0):
             return False
     return True
 
@@ -771,13 +781,22 @@ def _close_production_order(
 ) -> bool:
     """
     Mark the parent Document_ЗаказНаПроизводство as finished in 1C and locally.
-    No-op (returns False) while the order still has an uncommanded remainder.
+    No-op (returns False) until accepted Ledger facts cover every order line.
     """
     order_ref = _clean_ref1c(entry.order_ref1c)
     if not order_ref:
         return False
-    if not _order_is_fully_commanded(db, int(entry.order_id)):
+    if not _order_is_fully_produced_in_accepted_ledger(db, int(entry.order_id)):
         return False
+    order = (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_id == int(entry.order_id))
+        .one_or_none()
+    )
+    # Idempotent only after the accepted-fact gate above. A legacy/local done
+    # flag alone must never authorize completion.
+    if order is not None and str(order.order_state_key or "") == DONE_STATE_KEY:
+        return True
     patch = getattr(client, "patch", None)
     if patch is None:
         raise RuntimeError("OData client cannot patch production order completion state")
@@ -787,11 +806,6 @@ def _close_production_order(
             "СостояниеЗаказа_Key": DONE_STATE_KEY,
             "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
         },
-    )
-    order = (
-        db.query(ProductionOrder)
-        .filter(ProductionOrder.order_id == int(entry.order_id))
-        .one_or_none()
     )
     if order is not None:
         order.order_state_key = DONE_STATE_KEY
@@ -948,6 +962,13 @@ def export_piecework_to_1c(
         return summary
 
     client = _create_odata_client(config, OData1CClient)
+    # A successful piecework export normally precedes physical read-back. On a
+    # later idempotent call, reconcile only the parent completion state; do not
+    # PATCH or POST the already exported piecework document again.
+    for entry in already_linked:
+        entry.order_closed = _close_production_order(db, client, entry)
+    if already_linked:
+        db.commit()
     for entry, payload_envelope in zip(eligible, payloads):
         price_lookup = _enrich_payload_prices_from_1c(
             client,
@@ -977,8 +998,8 @@ def export_piecework_to_1c(
                     "ДатаЗакрытия": entry.document_datetime,
                 },
             )
-        # A выпуск closes the 1C order only when nothing is left uncommanded on
-        # it: partial production must keep Document_ЗаказНаПроизводство open.
+        # Executive documents are commands, not facts. Close the order only
+        # after their output has been read back into accepted Item Ledger.
         entry.order_closed = _close_production_order(db, client, entry)
 
     def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
@@ -1091,9 +1112,9 @@ def export_chain_piecework_to_1c(
 
     Основание — окрасочная СборкаЗапасов; строки сварки и окраски несут каждая
     свой ЗаказНаПроизводство_Key, участок и номенклатуру. Успешный экспорт
-    закрывает ОБА заказа («Успешно», Завершен) — одно закрытие из одного окна.
+    закрывает каждый заказ только после read-back выпуска в accepted Ledger.
     Идемпотентно: sync_link 'piecework' пишется на оба manufacture с одним
-    target_ref_key, повтор — no-op.
+    target_ref_key; повтор может только согласовать завершение заказов.
     """
     parent_export = _chain_export_parent_manufactures(
         db,
@@ -1129,6 +1150,20 @@ def export_chain_piecework_to_1c(
         summary["status"] = "existing"
         summary["target_ref_key"] = str(paint_link.target_ref_key)
         summary["reason"] = "комбинированный сдельный уже выгружен (sync_link)"
+        if not dry_run:
+            config = _load_odata_config()
+            client = _create_odata_client(config, OData1CClient)
+            for chain_entry in (weld_entry, paint_entry):
+                chain_entry.order_closed = _close_production_order(
+                    db,
+                    client,
+                    chain_entry,
+                )
+            db.commit()
+            summary["orders_closed"] = {
+                "weld": bool(weld_entry.order_closed),
+                "paint": bool(paint_entry.order_closed),
+            }
         return summary
     if weld_link and weld_link.status == "success" and (weld_link.target_ref_key or ""):
         summary["status"] = "error"
@@ -1223,9 +1258,8 @@ def export_chain_piecework_to_1c(
                 f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
                 {"Date": when, "Закрыт": True, "ДатаЗакрытия": when},
             )
-        # Закрытие обоих заказов цепочки — одним действием, но только тех, по
-        # которым не осталось нескомандованного остатка (частичный выпуск не
-        # закрывает заказ).
+        # Закрытие обоих заказов цепочки — только по считанному назад выпуску
+        # в принятом Item Ledger; созданные документы не являются фактом.
         for chain_entry in (weld_entry, paint_entry):
             chain_entry.order_closed = _close_production_order(db, client, chain_entry)
 

@@ -193,6 +193,24 @@ def test_chain_route_sheet_is_single_with_two_operation_blocks(db_session):
     assert "Кронштейн после покраски" in html
 
 
+def test_route_sheet_quantities_ignore_corrupt_remaining_cache(db_session):
+    paint_product, weld_product, *_ = _setup_chain(db_session)
+    paint_product.produced_qty = 2
+    paint_product.remaining_qty = 999
+    weld_product.produced_qty = 2
+    weld_product.remaining_qty = 999
+    db_session.commit()
+
+    html = render_route_sheets_html(db_session, [paint_product.product_id])
+
+    # Weld remaining is 6 - 2 = 4, therefore steel is 4 * 2.5 = 10.
+    assert "Сварка — заказ 1С №1C-WELD-1 · 4 шт" in html
+    assert "10.000" in html
+    # Paint quantity is 10 - 2 = 8.
+    assert "Окраска — заказ 1С №1C-PAINT-1 · 8 шт" in html
+    assert "999 шт" not in html
+
+
 def test_chain_route_sheet_deduplicates_both_sides_selected(db_session):
     paint_product, weld_product, *_ = _setup_chain(db_session)
 

@@ -61,6 +61,11 @@ from .supplier_order_status import (
     NETTING_PHASES,
     state_counts_in_mrp as _supplier_order_counts_in_mrp,
 )
+from .bom_specification_resolver import (
+    BomSpecificationResolutionError,
+    BomSpecificationResolver,
+)
+from .production_output_truth import accepted_product_remaining_expr
 
 
 _REF1C_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -85,33 +90,12 @@ def _bom_descendant_ids_for_roots(db: Session, root_item_ids: List[int]) -> Set[
     roots = sorted({int(i) for i in root_item_ids if i is not None})
     if not roots:
         return set()
-
-    spec_by_item: Dict[int, int] = {
-        int(row.item_id): int(row.spec_id)
-        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id.in_(roots))
-        .all()
+    descendants_by_root = BomSpecificationResolver(db).descendant_ids_by_root(roots)
+    return {
+        int(item_id)
+        for descendants in descendants_by_root.values()
+        for item_id in descendants
     }
-    result: Set[int] = set(roots)
-
-    def visit(item_id: int, seen_specs: Set[int]) -> None:
-        spec_id = spec_by_item.get(int(item_id))
-        if not spec_id or spec_id in seen_specs:
-            return
-        next_seen = set(seen_specs)
-        next_seen.add(int(spec_id))
-        for row in db.query(SpecComponent.item_id).filter(SpecComponent.spec_id == int(spec_id)).all():
-            child_id = int(row.item_id)
-            result.add(child_id)
-            if child_id not in spec_by_item:
-                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
-                if ds:
-                    spec_by_item[child_id] = int(ds.spec_id)
-            visit(child_id, next_seen)
-
-    for root_id in roots:
-        visit(root_id, set())
-    return result
 
 
 def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int], Dict[int, str]]:
@@ -204,20 +188,11 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
 
     stage_name_by_id, area_id_by_stage, area_name_by_id = _load_stage_area_context(db)
     item_to_spec: Dict[int, int] = {}
-    try:
-        defaults = (
-            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-            .filter(DefaultSpecification.item_id.in_(unique_item_ids))
-            .all()
-        )
-    except Exception:
-        defaults = []
-
+    spec_resolver = BomSpecificationResolver(db)
     spec_ids: Set[int] = set()
-    for row in defaults or []:
-        item_id_val = getattr(row, "item_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
-        spec_id_val = getattr(row, "spec_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
-        if item_id_val is None or spec_id_val is None:
+    for item_id_val in unique_item_ids:
+        spec_id_val = spec_resolver.default_spec_id(item_id_val)
+        if spec_id_val is None:
             continue
         item_to_spec[int(item_id_val)] = int(spec_id_val)
         spec_ids.add(int(spec_id_val))
@@ -320,7 +295,10 @@ def _production_supply_qty_expr():
     A completed 1C order is historical execution, not future supply. Its
     output becomes MRP coverage only through the synced warehouse balance.
     """
-    return func.coalesce(ProductionProduct.remaining_qty, 0.0)
+    return accepted_product_remaining_expr(
+        ProductionProduct.quantity,
+        ProductionProduct.produced_qty,
+    )
 # Состояния заказа поставщику, НЕ учитываемые как ожидаемое поступление в MRP.
 # Производная от канонической карты фаз (см. supplier_order_status): всё, что не
 # относится к фазам «в пути» / «на складе». Сохранена для обратной совместимости
@@ -999,21 +977,15 @@ def get_run_production(
     fallback_npu: Dict[int, float] = {}
     if item_ids_page:
         try:
-            defs = (
-                db.query(DefaultSpecification)
-                .filter(DefaultSpecification.item_id.in_(item_ids_page))
-                .all()
-            )
+            spec_resolver = BomSpecificationResolver(db)
             item_to_spec: Dict[int, int] = {}
             spec_ids_set: Set[int] = set()
-            for d in defs:
-                try:
-                    iid = int(d.item_id)
-                    sid = int(d.spec_id)
-                    item_to_spec[iid] = sid
-                    spec_ids_set.add(sid)
-                except Exception:
+            for iid in item_ids_page:
+                sid = spec_resolver.default_spec_id(iid)
+                if sid is None:
                     continue
+                item_to_spec[int(iid)] = int(sid)
+                spec_ids_set.add(int(sid))
             if spec_ids_set:
                 rows = (
                     db.query(
@@ -1033,6 +1005,8 @@ def get_run_production(
                             fallback_npu[int(iid)] = npu_val
                     except Exception:
                         continue
+        except BomSpecificationResolutionError:
+            raise
         except Exception as ex:
             logger.exception("fallback_npu build failed: %s", ex)
             fallback_npu = {}

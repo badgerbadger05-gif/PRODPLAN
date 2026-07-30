@@ -4,7 +4,8 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from ..models import DefaultSpecification, PlanningRun, ProductionOrderLineState, ProductionProduct, Unit
+from ..models import PlanningRun, ProductionOrderLineState, ProductionProduct, Unit
+from .bom_specification_resolver import BomSpecificationResolver
 from .production_control_common import looks_like_guid
 
 
@@ -42,14 +43,7 @@ def ensure_state(db: Session, product: ProductionProduct) -> ProductionOrderLine
 def default_spec_id(db: Session, product: ProductionProduct) -> Optional[int]:
     if product.spec_id:
         return int(product.spec_id)
-    item_id = int(product.item_id)
-    default_spec = (
-        db.query(DefaultSpecification)
-        .filter(DefaultSpecification.item_id == item_id)
-        .order_by(DefaultSpecification.id.asc())
-        .first()
-    )
-    return int(default_spec.spec_id) if default_spec else None
+    return BomSpecificationResolver(db).default_spec_id(int(product.item_id))
 
 
 def latest_run_id(db: Session) -> Optional[int]:

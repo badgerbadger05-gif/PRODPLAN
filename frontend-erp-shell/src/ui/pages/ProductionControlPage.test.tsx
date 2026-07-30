@@ -111,6 +111,7 @@ function fakeRows(): OrderRow[] {
 
 function fakeMaterials(): MaterialsResponse {
   return {
+    ledger_generation_id: 77,
     order_number: 'ORD-1',
     item_name: 'Кронштейн',
     coverage_status: 'assembled',

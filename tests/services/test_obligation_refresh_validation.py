@@ -171,6 +171,20 @@ def test_reservation_cache_that_disagrees_with_its_events_is_rejected(db_session
         validate_obligation_refresh_build(db_session, int(target.id))
 
 
+def test_generation_with_net_above_gross_is_rejected(db_session):
+    _parent, target, _item, run, requirement = _obligation_world(db_session)
+    run.ledger_generation_id = int(target.id)
+    requirement.total_required_qty = Decimal("5")
+    requirement.net_required_qty = Decimal("6")
+    db_session.flush()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="0 <= net <= gross",
+    ):
+        validate_obligation_refresh_build(db_session, int(target.id))
+
+
 def test_validation_requires_an_obligation_refresh_generation(db_session):
     _parent, target = _lineage(db_session)
     target.source_watermarks = {
@@ -208,6 +222,53 @@ def test_orchestrator_refuses_to_publish_a_structurally_broken_candidate(
         workflow.ObligationRefreshOrchestratorError, match="structurally invalid"
     ):
         _run(db_session, accepted, "orch-corrupt")
+
+    db_session.rollback()
+    assert db_session.get(
+        models.PlanningTruthState, 1
+    ).current_generation_id == accepted.id
+
+
+def test_orchestrator_refuses_stale_work_items_after_replay(
+    db_session, monkeypatch
+):
+    accepted, plan, _line, _item, _parent, _cutoff = _world(
+        db_session,
+        with_parent=False,
+    )
+    real_builder = workflow.materialize_replenishment_work_items
+
+    def corrupt_after_build(db, generation_id, batch_id):
+        result = real_builder(db, generation_id, batch_id)
+        row = (
+            db.query(models.ReplenishmentWorkItem)
+            .filter_by(ledger_generation_id=int(generation_id))
+            .first()
+        )
+        assert row is not None
+        row.replenishment_fulfilled_qty = Decimal("1")
+        row.replenishment_remaining_qty = (
+            Decimal(row.replenishment_required_qty) - Decimal("1")
+        )
+        db.flush()
+        return result
+
+    monkeypatch.setattr(
+        workflow,
+        "materialize_replenishment_work_items",
+        corrupt_after_build,
+    )
+
+    with pytest.raises(
+        workflow.ObligationRefreshOrchestratorError,
+        match="work item .* differs from reservation fold",
+    ):
+        _run(
+            db_session,
+            accepted,
+            "orch-stale-work-items",
+            add=[plan.id],
+        )
 
     db_session.rollback()
     assert db_session.get(

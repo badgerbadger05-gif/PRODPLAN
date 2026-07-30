@@ -153,6 +153,217 @@ def _receipt(
     ))
 
 
+def _mirrored_order_line(
+    db,
+    item,
+    *,
+    order_ref="direct-order-1",
+    line_number=1,
+    quantity="10",
+    state="В пути",
+    destination="warehouse-1",
+    characteristic=None,
+):
+    order = models.SupplierOrder(
+        order_number="ЗП-1",
+        order_date=datetime(2026, 7, 20),
+        order_ref1c=order_ref,
+        order_state_name=state,
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    line = models.SupplierOrderItem(
+        order_id=order.order_id,
+        item_id_ref=item.item_id,
+        line_number=line_number,
+        characteristic_ref1c=characteristic,
+        destination_warehouse_ref1c=destination,
+        quantity=Decimal(quantity),
+        received_qty=Decimal("999"),
+        remaining_qty=Decimal("999"),
+        delivery_date=datetime(2026, 8, 10),
+    )
+    db.add(line)
+    db.flush()
+    return order, line
+
+
+def test_direct_1c_order_is_exact_future_supply_in_netting_phase(db_session):
+    generation, item, _allocation = _context(db_session)
+    # Isolate the direct-1C path from the exported fixture line.
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    order, line = _mirrored_order_line(db_session, item)
+    _receipt(
+        db_session,
+        generation,
+        item,
+        qty="4",
+        suffix="d",
+        order_ref=order.order_ref1c,
+    )
+    db_session.flush()
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.evidence_status == "exact"
+    assert row.source_ref == order.order_ref1c
+    assert row.source_line_ref == str(line.line_number)
+    assert row.source_state_key == "В пути"
+    assert row.characteristic_ref == ""
+    assert row.planning_stock_pool == "main"
+    assert row.destination_warehouse_ref1c == "warehouse-1"
+    assert row.ordered_qty_at_cutoff == Decimal("10")
+    assert row.realized_qty_at_cutoff == Decimal("4")
+    # Mutable mirror counters are deliberately not evidence.
+    assert row.ordered_qty_at_cutoff != line.remaining_qty
+
+
+def test_direct_1c_order_unknown_or_non_netting_state_fails_closed(db_session):
+    generation, item, _allocation = _context(db_session)
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    _mirrored_order_line(db_session, item, order_ref="new", state="Новый заказ")
+    _mirrored_order_line(
+        db_session,
+        item,
+        order_ref="unknown",
+        state="Состояние вне канонической карты",
+    )
+
+    rows = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )
+
+    by_ref = {row.source_ref: row for row in rows}
+    assert by_ref["new"].evidence_status == "rejected"
+    assert by_ref["new"].reason == "supplier_order_phase_no_goods"
+    assert by_ref["unknown"].evidence_status == "rejected"
+    assert by_ref["unknown"].reason == "supplier_order_state_unknown"
+
+
+def test_direct_1c_order_without_manifest_pool_fails_closed(db_session):
+    generation, item, _allocation = _context(db_session)
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    _mirrored_order_line(db_session, item)
+
+    row = supplier_future_supply_evidence(db_session, generation.id)[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "planning_pool_not_stamped"
+
+
+def test_direct_order_changed_after_cutoff_fails_closed(db_session):
+    generation, item, _allocation = _context(db_session)
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    order, line = _mirrored_order_line(db_session, item)
+    order.updated_at = datetime(2026, 8, 1, 0, 1)
+    line.updated_at = datetime(2026, 8, 1, 0, 1)
+    db_session.flush()
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "supplier_order_changed_after_capture_cutoff"
+
+
+def test_direct_order_without_eta_fails_closed(db_session):
+    generation, item, _allocation = _context(db_session)
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    _order, line = _mirrored_order_line(db_session, item)
+    line.delivery_date = None
+    db_session.flush()
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "supplier_order_eta_missing"
+
+
+def test_characteristic_specific_direct_order_fails_closed_until_pool_support(db_session):
+    generation, item, _allocation = _context(db_session)
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    _mirrored_order_line(db_session, item, characteristic="char-1")
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "characteristic_not_supported_by_mrp_pool"
+
+
+def test_export_and_mirror_merge_into_one_line_without_double_quantity(db_session):
+    generation, item, allocation = _context(db_session)
+    allocation.planning_stock_pool = "main"
+    allocation.destination_warehouse_ref1c = "warehouse-1"
+    order, _line = _mirrored_order_line(
+        db_session,
+        item,
+        order_ref=allocation.supplier_order_ref,
+        line_number=1,
+        quantity="10",
+    )
+
+    rows = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )
+
+    assert len(rows) == 1
+    assert rows[0].evidence_status == "exact"
+    assert rows[0].ordered_qty_at_cutoff == Decimal("10")
+    assert rows[0].source_state_key == "В пути"
+    assert "supplier_order_item:" in str(rows[0].source_local_id)
+    assert "PurchaseExportLineAllocation:" in str(rows[0].source_local_id)
+    assert rows[0].source_ref == order.order_ref1c
+
+
+def test_export_mirror_quantity_conflict_is_rejected_not_summed(db_session):
+    generation, item, allocation = _context(db_session)
+    allocation.planning_stock_pool = "main"
+    allocation.destination_warehouse_ref1c = "warehouse-1"
+    _mirrored_order_line(
+        db_session,
+        item,
+        order_ref=allocation.supplier_order_ref,
+        line_number=1,
+        quantity="12",
+    )
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "quantity_conflicts_with_export_provenance"
+    assert row.ordered_qty_at_cutoff == Decimal("12")
+
+
 def test_old_unstamped_export_is_rejected_even_with_exact_receipt(db_session):
     generation, item, _allocation = _context(db_session)
     _receipt(db_session, generation, item, qty="4")

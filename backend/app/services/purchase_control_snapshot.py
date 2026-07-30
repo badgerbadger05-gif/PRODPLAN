@@ -250,7 +250,7 @@ def open_supplier_coverage_by_reservation(
             work_item.replenishment_remaining_qty
         )
 
-    supplies: dict[tuple[int, str, str, str], float] = {}
+    supplies: dict[tuple[int, str, str, str], dict[str, Any]] = {}
     for supply in (
         db.query(models.LedgerFutureSupply)
         .filter(
@@ -259,6 +259,10 @@ def open_supplier_coverage_by_reservation(
             models.LedgerFutureSupply.evidence_status == "exact",
             models.LedgerFutureSupply.open_qty_at_cutoff > _EPS_FLOAT,
         )
+        .order_by(
+            models.LedgerFutureSupply.eta_date.asc(),
+            models.LedgerFutureSupply.id.asc(),
+        )
         .all()
     ):
         source_ref = _clean_ref(supply.source_ref)
@@ -266,10 +270,17 @@ def open_supplier_coverage_by_reservation(
         pool = _clean_ref(supply.planning_stock_pool)
         if not source_ref or not source_line_ref or not pool:
             raise ValueError("exact supplier future supply lacks stable identity")
+        if supply.eta_date is None:
+            raise ValueError("exact supplier future supply lacks ETA")
         key = (int(supply.item_id), pool, source_ref, source_line_ref)
         if key in supplies:
             raise ValueError("supplier future supply identity is duplicated")
-        supplies[key] = _to_float(supply.open_qty_at_cutoff)
+        supplies[key] = {
+            "initial": _to_float(supply.open_qty_at_cutoff),
+            "remaining": _to_float(supply.open_qty_at_cutoff),
+            "eta": supply.eta_date,
+            "id": int(supply.id),
+        }
 
     if not supplies:
         return {}, {}
@@ -319,14 +330,15 @@ def open_supplier_coverage_by_reservation(
             _clean_ref(allocation.source_ref),
             _clean_ref(allocation.source_line_ref),
         )
-        line_left = supplies.get(key, 0.0)
+        supply = supplies.get(key)
+        line_left = _to_float(supply["remaining"]) if supply is not None else 0.0
         if line_left <= _EPS_FLOAT:
             continue
         take = min(_to_float(allocation.alloc_qty), line_left, reservation_left)
         if take <= _EPS_FLOAT:
             continue
 
-        supplies[key] = max(line_left - take, 0.0)
+        supply["remaining"] = max(line_left - take, 0.0)
         covered_by_reservation[reservation_id] = (
             covered_by_reservation.get(reservation_id, 0.0) + take
         )
@@ -338,6 +350,82 @@ def open_supplier_coverage_by_reservation(
                 "covered_qty": round(take, 6),
             }
         )
+
+    # A supplier order created directly in 1C has no immutable
+    # MrpFreezeAllocation because it did not exist when the plan was frozen.
+    # Allocate every still-unclaimed exact line by the canonical obligation
+    # order.  The persisted generation snapshot makes this deterministic and
+    # immutable; item/pool equality prevents cross-contour coverage.
+    reservations = sorted(
+        (
+            reservation
+            for reservation in reservation_by_requirement.values()
+            if outstanding_by_reservation.get(int(reservation.id), 0.0)
+            > _EPS_FLOAT
+        ),
+        key=lambda reservation: (
+            reservation.priority_period_from,
+            reservation.priority_period_to,
+            int(reservation.run_id),
+            int(reservation.id),
+        ),
+    )
+    supply_keys = sorted(
+        supplies,
+        key=lambda key: (
+            supplies[key]["eta"] or date.min,
+            key[2],
+            key[3],
+            supplies[key]["id"],
+        ),
+    )
+    for key in supply_keys:
+        supply = supplies[key]
+        line_left = _to_float(supply["remaining"])
+        if line_left <= _EPS_FLOAT:
+            continue
+        for reservation in reservations:
+            reservation_id = int(reservation.id)
+            if (
+                int(reservation.item_id) != key[0]
+                or _clean_ref(reservation.planning_stock_pool) != key[1]
+            ):
+                continue
+            reservation_left = max(
+                outstanding_by_reservation.get(reservation_id, 0.0)
+                - covered_by_reservation.get(reservation_id, 0.0),
+                0.0,
+            )
+            if reservation_left <= _EPS_FLOAT:
+                continue
+            take = min(line_left, reservation_left)
+            if take <= _EPS_FLOAT:
+                continue
+            line_left = max(line_left - take, 0.0)
+            supply["remaining"] = line_left
+            covered_by_reservation[reservation_id] = (
+                covered_by_reservation.get(reservation_id, 0.0) + take
+            )
+            slices_by_reservation.setdefault(reservation_id, []).append(
+                {
+                    "source_type": "supplier_order",
+                    "source_ref": key[2],
+                    "source_line_ref": key[3],
+                    "covered_qty": round(take, 6),
+                }
+            )
+            if line_left <= _EPS_FLOAT:
+                break
+
+    for reservation_id, covered in covered_by_reservation.items():
+        if covered > outstanding_by_reservation.get(reservation_id, 0.0) + _EPS_FLOAT:
+            raise ValueError("supplier future supply exceeds reservation remainder")
+    for supply in supplies.values():
+        if (
+            _to_float(supply["remaining"]) < -_EPS_FLOAT
+            or _to_float(supply["remaining"]) > _to_float(supply["initial"]) + _EPS_FLOAT
+        ):
+            raise ValueError("supplier future supply allocation violates conservation")
 
     return covered_by_reservation, slices_by_reservation
 

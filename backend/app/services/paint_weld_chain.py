@@ -54,6 +54,7 @@ from .mrp_mutation_guard import (
     MrpMutationLineageError,
     require_materialized_orders,
 )
+from .item_ledger.production_output_cache import accepted_product_output
 from .one_c_document_numbers import production_order_number
 from .one_c_production_order_export import export_production_orders_to_1c
 from .workshop_resolution import default_spec_ids_for_items, resolve_workshop_for_spec
@@ -806,9 +807,11 @@ def close_paint_chain(
     экспорт обеих СборкаЗапасов → один комбинированный СдельныйНаряд
     (основание — окрасочная СборкаЗапасов), закрывающий оба заказа.
 
-    Количества по умолчанию — remaining_qty строк; если сторона уже
-    произведена полностью, переиспользуется её последний выпуск. Требования
-    штатного produce_line (проведённые перемещения материалов) сохраняются.
+    Количества по умолчанию — физический остаток из принятого Ledger-кэша
+    (`quantity - produced_qty`), а не многописательное legacy-поле
+    `remaining_qty`. Если сторона уже произведена полностью, переиспользуется
+    её последний выпуск. Quantity-commanded гейт штатного ``produce_line``
+    остаётся окончательным владельцем допустимого количества команды.
 
     dry_run=True — предпросмотр: что будет произведено и, если оба выпуска уже
     существуют, payload комбинированного сдельного.
@@ -833,7 +836,7 @@ def close_paint_chain(
     def _plan_side(
         product: ProductionProduct, qty: Optional[float]
     ) -> Dict[str, Any]:
-        remaining = _to_float(product.remaining_qty)
+        remaining = _to_float(accepted_product_output(product).remaining_qty)
         planned = _to_float(qty) if qty is not None else remaining
         existing = _latest_manufacture(db, int(product.product_id))
         if planned <= 0 and existing is None:

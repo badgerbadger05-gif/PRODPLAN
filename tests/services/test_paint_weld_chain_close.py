@@ -81,6 +81,18 @@ def _stub_live(monkeypatch, fake) -> None:
         lambda: {"base_url": "http://mtzw7/unf_demo/odata/standard.odata", "username": "u", "password": "p"},
     )
     monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+    # These tests exercise the combined-document workflow. The accepted Ledger
+    # completion gate itself is covered by test_one_c_piecework_export.
+    monkeypatch.setattr(
+        exporter,
+        "_order_is_fully_produced_in_accepted_ledger",
+        lambda db, order_id: all(
+            float(product.produced_qty or 0) >= float(product.quantity or 0)
+            for product in db.query(ProductionProduct).filter(
+                ProductionProduct.order_id == int(order_id)
+            )
+        ),
+    )
 
 
 def _stub_manufactures_export(monkeypatch, *, failing_ids: set):
@@ -368,6 +380,24 @@ def test_close_chain_dry_run_previews_both_sides(db_session):
     assert len(result["piecework_preview"]["payloads"]) == 1
 
 
+def test_close_chain_ignores_corrupted_remaining_cache(db_session):
+    ctx = _setup_chain(db_session)
+    # Physical accepted output is complete. A non-factual writer corrupting the
+    # compatibility remainder must not create another production command.
+    ctx["weld"]["product"].remaining_qty = ctx["weld"]["product"].quantity
+    ctx["paint"]["product"].remaining_qty = ctx["paint"]["product"].quantity
+    db_session.commit()
+
+    result = close_paint_chain(
+        db_session, product_id=ctx["paint"]["product"].product_id, dry_run=True
+    )
+
+    assert result["weld"]["remaining_qty"] == 0.0
+    assert result["paint"]["remaining_qty"] == 0.0
+    assert result["weld"]["qty_to_produce"] == 0.0
+    assert result["paint"]["qty_to_produce"] == 0.0
+
+
 def test_close_chain_resolves_from_either_side(db_session):
     ctx = _setup_chain(db_session)
 
@@ -509,10 +539,9 @@ def test_close_chain_dry_run_reports_partially_posted_state(db_session):
 def test_close_chain_does_not_force_order_completion_on_partial_output(
     db_session, monkeypatch
 ):
-    """Цепочечный путь не форсит закрытие заказа: работает общая семантика —
-    заказ закрывается только при полном покрытии скомандованным объёмом."""
+    """Цепочечный путь применяет общий Ledger-гейт к каждому заказу."""
     ctx = _setup_chain(db_session)
-    # сварка скомандована частично: 4 из 6
+    # Тестовый Ledger-гейт считает сварку покрытой лишь частично: 4 из 6.
     ctx["weld"]["m"].qty = 4
     ctx["weld"]["product"].produced_qty = 0
     db_session.commit()

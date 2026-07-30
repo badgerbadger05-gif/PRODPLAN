@@ -160,9 +160,9 @@ export function getItem(itemId: number) {
   return api<Record<string, unknown>>(`/v1/items/${itemId}`)
 }
 
-export function updateItem(itemId: number, payload: Record<string, unknown>) {
+export function updateItem(itemId: number, payload: ApiSchemas['ItemPatch']) {
   return api(`/v1/items/${itemId}`, {
-    method: 'PUT',
+    method: 'PATCH',
     body: JSON.stringify(payload),
   })
 }

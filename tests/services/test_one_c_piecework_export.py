@@ -5,6 +5,7 @@ from datetime import datetime
 
 import pytest
 
+from app import models
 from app.models import (
     DefaultSpecification,
     Employee,
@@ -85,6 +86,50 @@ def _mk_manufacture(
     db.add(manufacture)
     db.commit()
     return manufacture
+
+
+def _publish_accepted_output_fact(db, manufacture: ProductionManufacture, *, qty: float) -> None:
+    """Publish one physical assembly receipt that exactly identifies the line."""
+    cutoff = datetime(2026, 7, 25, 12, 0)
+    batch = models.PhysicalImportBatch(
+        batch_key=f"piecework-close-{manufacture.manufacture_id}",
+        status="completed",
+        cutoff=cutoff,
+        completed_at=cutoff,
+        source_watermarks={},
+    )
+    generation = models.LedgerGeneration(
+        generation_key=f"piecework-close-{manufacture.manufacture_id}",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch=batch,
+        algorithm_version="tests/1",
+    )
+    db.add(generation)
+    db.flush()
+    db.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
+    db.add(models.StockLedgerEntry(
+        ingest_batch_id=batch.id,
+        source_content_hash=f"piecework-output-{manufacture.manufacture_id}",
+        item_id=manufacture.product.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="finished-goods",
+        qty=qty,
+        qty_after=qty,
+        posting_at=cutoff,
+        record_type="Receipt",
+        movement_kind="assembly_in",
+        recorder_type="Document_СборкаЗапасов",
+        recorder_ref=manufacture.exported_ref1c,
+        line_no="1",
+        ingest_source="test",
+        active=True,
+    ))
+    db.commit()
 
 
 class _FakeClient:
@@ -503,6 +548,7 @@ def test_live_post_creates_sync_link(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PW-LIVE", ref1c="item-ref-live")
     m = _mk_manufacture(db, item, exported_ref1c="ref-live")
+    _publish_accepted_output_fact(db, m, qty=float(m.product.quantity))
 
     fake = _FakeClient(ref_key="pw-created-ref")
     _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
@@ -546,6 +592,7 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     db = db_session
     item = _mk_item(db, code="PW-RETRY", ref1c="item-ref-retry")
     m = _mk_manufacture(db, item, exported_ref1c="ref-retry")
+    _publish_accepted_output_fact(db, m, qty=float(m.product.quantity))
 
     db.add(SyncLink(
         source_doctype="piecework",
@@ -624,7 +671,7 @@ def test_partial_release_does_not_close_the_production_order(db_session, monkeyp
     assert m.order.order_state_name is None
 
 
-def test_full_release_closes_the_production_order(db_session, monkeypatch):
+def test_full_command_does_not_close_without_accepted_ledger_fact(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PW-FULL", ref1c="item-ref-full")
     m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-full")
@@ -643,10 +690,78 @@ def test_full_release_closes_the_production_order(db_session, monkeypatch):
         dry_run=False,
     )
 
+    assert result["entries"][0]["order_closed"] is False
+    assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
+    db.refresh(m.order)
+    assert m.order.order_state_key is None
+
+
+def test_accepted_ledger_fact_closes_the_production_order(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-LEDGER-FULL", ref1c="item-ref-ledger-full")
+    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-ledger-full")
+    # Deliberately corrupt the operational mirrors. Closure must ignore both.
+    m.product.produced_qty = 0
+    m.product.remaining_qty = 999
+    _publish_accepted_output_fact(db, m, qty=4.0)
+
+    fake = _FakeClient(ref_key="pw-ledger-full-ref")
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db,
+        [m.manufacture_id],
+        operation_ref="op-ref-ledger-full",
+        dry_run=False,
+    )
+
     assert result["entries"][0]["order_closed"] is True
-    assert fake.patches[-1][0] == f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
+    assert fake.patches[-1][0] == (
+        f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
+    )
     db.refresh(m.order)
     assert m.order.order_state_key == exporter.DONE_STATE_KEY
+
+
+def test_idempotent_retry_closes_order_after_ledger_readback(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-READBACK", ref1c="item-ref-readback")
+    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-readback")
+    fake = _FakeClient(ref_key="pw-readback-ref")
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    first = exporter.export_piecework_to_1c(
+        db,
+        [m.manufacture_id],
+        operation_ref="op-ref-readback",
+        dry_run=False,
+    )
+    assert first["entries"][0]["order_closed"] is False
+    assert len(fake.posts) == 1
+    assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
+
+    _publish_accepted_output_fact(db, m, qty=4.0)
+    piecework_patch_count = sum(
+        "СдельныйНаряд" in path for path, _ in fake.patches
+    )
+    second = exporter.export_piecework_to_1c(
+        db,
+        [m.manufacture_id],
+        operation_ref="op-ref-readback",
+        dry_run=False,
+    )
+
+    assert second["manufactures_already_linked"] == 1
+    assert second["entries"][0]["order_closed"] is True
+    assert len(fake.posts) == 1
+    assert sum("СдельныйНаряд" in path for path, _ in fake.patches) == (
+        piecework_patch_count
+    )
+    assert fake.patches[-1][0] == (
+        f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
+    )
 
 
 def test_missing_spec_operation_fails_only_its_own_entry(db_session, monkeypatch):

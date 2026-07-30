@@ -280,6 +280,23 @@ def test_produce_full_creates_command_without_recording_fact(db_session):
     assert manufacture.status == "draft"
 
 
+def test_produce_gate_and_response_ignore_corrupt_remaining_cache(db_session):
+    db = db_session
+    item = _mk_item(db, code="PRD-CORRUPT", ref1c="ref-prd-corrupt")
+    product = _mk_product(db, item, qty=5.0)
+    product.produced_qty = 2
+    product.remaining_qty = 999
+    db.commit()
+
+    with pytest.raises(ValueError, match="остаток"):
+        produce_line(db, product.product_id, qty=4)
+
+    result = produce_line(db, product.product_id, qty=1)
+    assert result["produced_qty_total"] == 2.0
+    assert result["remaining_qty"] == 3.0
+    assert result["command_remaining_qty"] == 2.0
+
+
 def test_produce_line_saves_operation_executors(db_session):
     db = db_session
     item = _mk_item(db, code="PRD-OP-EXEC", ref1c="ref-prd-op-exec")
@@ -1305,6 +1322,7 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
             period_from=start,
             period_to=date(2026, 12, 31),
             status="fixed",
+            fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
         )
         db.add(plan)
         db.flush()
@@ -1317,6 +1335,7 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
             source_plan_id=int(plan.id),
             period_from=start,
             period_to=date(2026, 12, 31),
+            fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
         ))
         line = models.ProductionPlanLine(
             plan_id=int(plan.id),
@@ -1364,6 +1383,9 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
     )
     assert pulled.status == "done"
     generation.physical_import_batch_id = int(pulled.physical_import_batch_id)
+    # This part of the test exercises the documented FIFO fallback for a
+    # migrated/legacy product whose immutable plan-line identity is absent.
+    product.source_mrp_requirement_id = None
     db.flush()
     result = materialize_assembly_output_allocations(db, int(generation.id))
     allocations = (

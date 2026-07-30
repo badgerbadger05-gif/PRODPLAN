@@ -590,7 +590,12 @@ class SpecComponent(Base):
     __tablename__ = "spec_components"
 
     component_id = Column(Integer, primary_key=True, index=True)
-    spec_id = Column(Integer, ForeignKey('specifications.spec_id'), nullable=False)
+    spec_id = Column(
+        Integer,
+        ForeignKey('specifications.spec_id'),
+        nullable=False,
+        index=True,
+    )
     item_id = Column(Integer, ForeignKey('items.item_id'), nullable=False)
     quantity = Column(DECIMAL(10, 3), nullable=False)
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
@@ -742,6 +747,12 @@ class ProductionOrderLineState(Base):
     material_coverage_status = Column(String(32), nullable=True, index=True)
     material_coverage_label = Column(String(64), nullable=True)
     material_coverage_calculated_at = Column(TIMESTAMP, nullable=True)
+    material_coverage_ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     material_coverage_snapshot = Column(CrossPlatformJSON, nullable=True)
     comment = Column(TEXT, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), nullable=False)

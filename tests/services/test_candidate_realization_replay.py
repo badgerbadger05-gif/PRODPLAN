@@ -243,12 +243,17 @@ def test_retained_and_candidate_replay_partition_one_sle_and_keep_open_output(
     item = db_session.query(models.Item).filter_by(item_code="CAND-REPLAY").one()
     sle = db_session.query(models.StockLedgerEntry).one()
     sle.source_content_hash = sha256(b"candidate-replay-assembly-output").hexdigest()
+    # The physical output may only satisfy plans that were already fixed when
+    # it was posted.  Keep this fixture's intended retained-first FIFO scenario
+    # without reintroducing the old unbounded historical allocation.
+    candidate_plan.fixed_at = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
     retained_plan = models.ProductionPlanHeader(
         name="retained august",
         period_from=date(2026, 8, 1),
         period_to=date(2026, 8, 31),
         status="fixed",
+        fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
     )
     db_session.add(retained_plan)
     db_session.flush()

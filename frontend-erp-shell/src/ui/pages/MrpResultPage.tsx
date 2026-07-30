@@ -25,7 +25,6 @@ import {
   filterPurchaseRows,
   formatActionResult,
   isProductionRowSelectable,
-  mrpResultTotals,
   parseMrpResultTab,
   parsePositiveId,
   productionSourceIds,
@@ -46,6 +45,12 @@ function emptyTabFlags(): Record<Tab, boolean> {
 
 function emptyTabOffsets(): Record<Tab, number> {
   return { production: 0, purchases: 0, rework: 0, capacity: 0 }
+}
+
+function metricQuantity(value: number | null | undefined, unit: string) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${qty(value)} ${unit}`
+    : 'н/д'
 }
 
 function ForecastShift({ forecast }: { forecast?: { forecast_date?: string | null; forecast_shift_days?: number | null; forecast_reason?: string | null } | null }) {
@@ -119,11 +124,6 @@ export function MrpResultPage() {
   const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
   const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
   const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
-
-  const totals = useMemo(
-    () => mrpResultTotals(productionRows, purchaseRows, reworkRows, capacityRows),
-    [productionRows, purchaseRows, reworkRows, capacityRows],
-  )
 
   useEffect(() => {
     if (queryTab) setTab(queryTab)
@@ -409,10 +409,10 @@ export function MrpResultPage() {
         <div className="mrpSummaryStrip">
           <Metric title="Старт" value={truthAccepted ? dateTimeRu(summary?.run?.started_at) || '—' : 'Недоступно'} />
           <Metric title="Горизонт" value={truthAccepted ? `${qty(summary?.run?.horizon_days)} дн.` : 'Недоступно'} />
-          <Metric title="Производство" value={truthAccepted ? qty(summary?.counts?.production_orders ?? productionTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.productionQty)} шт.` : undefined} />
-          <Metric title="Закупки" value={truthAccepted ? qty(summary?.counts?.purchase_requests ?? purchaseTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.purchaseQty)} шт.` : undefined} />
-          <Metric title="Переработка" value={truthAccepted ? qty(summary?.counts?.rework_requests ?? reworkTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.reworkQty)} шт.` : undefined} />
-          <Metric title="Перегрузы" value={truthAccepted ? qty(summary?.capacity?.overloaded_buckets) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.overloadHours)} н/ч` : undefined} />
+          <Metric title="Производство" value={truthAccepted ? qty(summary?.counts?.production_orders ?? productionTotal) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.production, 'шт.') : undefined} />
+          <Metric title="Закупки" value={truthAccepted ? qty(summary?.counts?.purchase_requests ?? purchaseTotal) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.purchase, 'шт.') : undefined} />
+          <Metric title="Переработка" value={truthAccepted ? qty(summary?.counts?.rework_requests ?? reworkTotal) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.rework, 'шт.') : undefined} />
+          <Metric title="Перегрузы" value={truthAccepted ? qty(summary?.capacity?.overloaded_buckets) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.capacity?.overload_total, 'н/ч') : undefined} />
         </div>
 
         <div className="tabsBar">
@@ -614,7 +614,7 @@ function PurchaseResultTable({
         {rows.map((row) => {
           const covered = Number(row.supplier_covered_qty ?? 0)
           const requested = Number(row.requested_qty ?? row.qty)
-          const coveragePct = requested > 0 ? Math.min(100, Math.round((covered / requested) * 100)) : 0
+          const coveragePct = requested > 0 ? Math.round((covered / requested) * 100) : 0
           const coverageLabel = covered > 0
             ? `${qty(covered)} / ${qty(requested)} ${row.unit || ''} (${coveragePct}%)`
             : '—'

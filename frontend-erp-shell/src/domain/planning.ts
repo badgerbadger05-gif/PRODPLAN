@@ -45,6 +45,12 @@ export type MrpSummary = {
     hours_planned_total?: number
     hours_available_total?: number
   }
+  snapshot_total_qty?: {
+    production?: number
+    purchase?: number
+    rework?: number
+    capacity?: number
+  }
   warnings?: Array<Record<string, unknown>>
 }
 
@@ -296,18 +302,15 @@ export type ExecutionJournalRow = {
   ledger_links?: ExecutionJournalLedgerLinks | null
 }
 
-export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none'
+export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none' | 'execution_unavailable'
 
 export function journalRowStatus(row: Pick<ExecutionJournalRow, 'status' | 'net_qty' | 'remaining_qty' | 'completed_qty' | 'ordered_qty'>): JournalRowStatus {
   if (row.status) return row.status
-  if (row.net_qty <= 0) return 'net_zero'
-  if (row.remaining_qty <= 0) return 'covered'
-  if ((row.completed_qty ?? 0) > 0) return 'partial'
-  if (row.ordered_qty > 0) return 'ordered'
-  return 'none'
+  return 'execution_unavailable'
 }
 
 export function journalRowStatusLabel(status: JournalRowStatus) {
+  if (status === 'execution_unavailable') return 'Исполнение недоступно'
   if (status === 'covered') return 'Закрыто'
   if (status === 'partial') return 'Частично'
   if (status === 'ordered') return 'Оформлено'
@@ -316,6 +319,7 @@ export function journalRowStatusLabel(status: JournalRowStatus) {
 }
 
 export function journalRowStatusClass(status: JournalRowStatus) {
+  if (status === 'execution_unavailable') return 'unavailable'
   if (status === 'covered') return 'ready'
   if (status === 'partial') return 'partial'
   if (status === 'ordered') return 'to_move'

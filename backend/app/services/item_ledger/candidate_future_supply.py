@@ -98,7 +98,9 @@ def capture_candidate_future_supply(
         explicit_make_transfer_recorders=explicit_make_transfer_recorders,
     )
     supplier: tuple[FutureSupplyEvidence, ...] = supplier_future_supply_evidence(
-        db, int(source.id)
+        db,
+        int(source.id),
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
     )
     # One call is an accounting invariant: replacement is scoped to a capture
     # batch, not to a future-supply kind.

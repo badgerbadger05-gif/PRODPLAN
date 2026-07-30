@@ -17,6 +17,7 @@ from app.routers.purchase_control import get_orders
 from app.services.purchase_control_snapshot import (
     PurchaseJournalSnapshotUnavailable,
     build_candidate_snapshot,
+    open_supplier_coverage_by_reservation,
 )
 
 
@@ -271,6 +272,79 @@ def test_candidate_is_idempotent_and_groups_multiple_lines(db_session):
         "MAT-A", "MAT-B",
     ]
     assert all(row["row_generator"] == "mrp_reservation" for row in first.payload["rows"])
+
+
+def test_direct_supplier_supply_covers_frozen_reservations_fifo(db_session):
+    generation, _order, _legacy, supplies = _context(db_session)
+    item = db_session.query(models.Item).filter_by(item_code="MAT-B").one()
+    senior_run = _add_buy_plan_run(
+        db_session,
+        generation=generation,
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        item=item,
+        required_qty=Decimal("7"),
+        realized_qty=Decimal("0"),
+        covered_incoming=Decimal("0"),
+        uncovered=Decimal("7"),
+    )
+    junior_run = _add_buy_plan_run(
+        db_session,
+        generation=generation,
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        item=item,
+        required_qty=Decimal("7"),
+        realized_qty=Decimal("0"),
+        covered_incoming=Decimal("0"),
+        uncovered=Decimal("7"),
+    )
+    # This exact generation-scoped line has no MrpFreezeAllocation: it models a
+    # supplier order created directly in 1C after both plans were frozen.
+    supplies[0].open_qty_at_cutoff = Decimal("10")
+    supplies[0].ordered_qty_at_cutoff = Decimal("10")
+    supplies[0].realized_qty_at_cutoff = Decimal("0")
+    entries = (
+        db_session.query(
+            models.ReplenishmentWorkItem,
+            models.ReservationEntry,
+            models.Item,
+        )
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReplenishmentWorkItem.reservation_id,
+        )
+        .join(models.Item, models.Item.item_id == models.ReservationEntry.item_id)
+        .filter(
+            models.ReplenishmentWorkItem.run_id.in_(
+                (senior_run.run_id, junior_run.run_id)
+            )
+        )
+        .all()
+    )
+
+    covered, slices = open_supplier_coverage_by_reservation(
+        db_session,
+        generation.id,
+        entries,
+    )
+
+    reservations = {
+        int(reservation.run_id): reservation
+        for _work_item, reservation, _item in entries
+    }
+    senior = reservations[senior_run.run_id]
+    junior = reservations[junior_run.run_id]
+    assert covered == {senior.id: 7.0, junior.id: 3.0}
+    assert slices[senior.id][0]["source_ref"] == supplies[0].source_ref
+    assert slices[senior.id][0]["covered_qty"] == 7.0
+    assert slices[junior.id][0]["covered_qty"] == 3.0
+    assert sum(
+        row["covered_qty"]
+        for reservation_slices in slices.values()
+        for row in reservation_slices
+    ) == 10.0
 
 
 def test_candidate_conflict_is_rejected(db_session):
@@ -629,7 +703,7 @@ def test_candidate_subtracts_frozen_open_supplier_order_coverage(db_session):
 
 
 def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_session):
-    generation, _order, _legacy_lines, _supplies = _context(db_session)
+    generation, _order, _legacy_lines, supplies = _context(db_session)
 
     run = models.ProductionPlanHeader(
         name="purchase-buy-plan",
@@ -643,6 +717,10 @@ def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_sess
     item = db_session.query(models.Item).filter(models.Item.item_code == "MAT-A").first()
     if item is None:
         item = db_session.query(models.Item).filter(models.Item.item_name == "Материал А").first()
+    for supply in supplies:
+        if int(supply.item_id) == int(item.item_id):
+            supply.evidence_status = "rejected"
+            supply.reason = "test keeps the demand uncovered"
 
     planning_run = models.PlanningRun(
         status="FIXED_SNAPSHOT",

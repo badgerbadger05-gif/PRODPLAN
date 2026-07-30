@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
@@ -48,6 +49,7 @@ from app.services.production_control_journal import (
     cancel_local_order,
     dedupe_mrp_production_orders,
     list_journal,
+    update_line_state,
     update_product_quantity,
 )
 from app.services.production_control_material_availability import (
@@ -495,6 +497,16 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert materials["components"][0]["component_item_id"] == component.item_id
     assert materials["components"][0]["required_qty"] == 20
 
+    product.produced_qty = 2
+    product.remaining_qty = 999
+    db_session.commit()
+    corrupted_cache_preview = preview_materials(db_session, product.product_id)
+    assert corrupted_cache_preview["qty"] == 6
+    assert corrupted_cache_preview["components"][0]["required_qty"] == 15
+    product.produced_qty = 0
+    product.remaining_qty = 8
+    db_session.commit()
+
     created = create_material_issues(db_session, [product.product_id], initiated_by="кладовщик")
     assert len(created["created"]) == 1
     assert created["created"][0]["lines_count"] == 1
@@ -505,6 +517,56 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     # 'to_move' ("документы созданы, ждём проведения") per plan.
     assert journal_after["rows"][0]["status"] == "to_move"
     assert journal_after["rows"][0]["issue_count"] == 1
+
+
+def test_journal_visibility_and_completion_ignore_corrupted_remaining_cache(db_session):
+    item = Item(
+        item_code="P-REMAINING-CACHE",
+        item_name="Corrupted remaining cache",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    order = ProductionOrder(
+        order_number="REMAINING-CACHE-001",
+        order_date=datetime(2026, 5, 18),
+        deletion_mark=False,
+    )
+    db_session.add_all([item, order])
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=8,
+        produced_qty=2,
+        # A non-factual writer falsely closed the line.
+        remaining_qty=0,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    journal = list_journal(db_session)
+
+    assert journal["total"] == 1
+    assert journal["rows"][0]["produced_qty"] == 2
+    assert journal["rows"][0]["remaining_qty"] == 6
+    with pytest.raises(ValueError, match="невыпущенным остатком"):
+        update_line_state(db_session, product.product_id, {"status": "completed"})
+
+    # The inverse corruption must not keep a physically completed line visible
+    # or block the completion transition.
+    product.produced_qty = 8
+    product.remaining_qty = 999
+    db_session.commit()
+
+    journal = list_journal(db_session)
+    assert journal["total"] == 0
+    assert update_line_state(
+        db_session,
+        product.product_id,
+        {"status": "completed"},
+    )["status"] == "ok"
 
 
 
@@ -906,7 +968,8 @@ def test_dedupe_mrp_production_orders_cancels_local_excess_duplicates(db_session
     kept = [product for product in products if product.product_id != cancelled.product_id][0]
     db_session.refresh(cancelled)
     db_session.refresh(kept)
-    assert float(cancelled.remaining_qty) == 0
+    # Cancellation is operational state; it must not rewrite physical output.
+    assert float(cancelled.remaining_qty) == 25
     assert float(kept.remaining_qty) == 25
     old_req = next(req for req in reqs if req.id == cancelled.source_mrp_requirement_id)
     db_session.refresh(old_req)
@@ -1036,7 +1099,7 @@ def test_dedupe_mrp_production_orders_cancels_single_local_when_requirement_zero
     db_session.refresh(req)
     state = db_session.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
     assert state.status == "cancelled"
-    assert float(product.remaining_qty) == 0
+    assert float(product.remaining_qty) == 10
     assert not hasattr(req, "covered_qty")
     assert not hasattr(req, "remaining_qty")
 
@@ -1110,7 +1173,7 @@ def test_dedupe_mrp_production_orders_never_cancels_1c_open_order(db_session):
     db_session.refresh(one_c_product)
     db_session.refresh(local_product)
     assert float(one_c_product.remaining_qty) == 25
-    assert float(local_product.remaining_qty) == 0
+    assert float(local_product.remaining_qty) == 25
     one_c_state = db_session.query(ProductionOrderLineState).filter_by(product_id=one_c_product.product_id).one()
     local_state = db_session.query(ProductionOrderLineState).filter_by(product_id=local_product.product_id).one()
     assert one_c_state.status == "shortage"
@@ -1907,8 +1970,8 @@ def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_sess
         item_id=parent.item_id,
         line_number=1,
         quantity=5,
-        produced_qty=0,
-        remaining_qty=5,
+        produced_qty=2,
+        remaining_qty=999,
     )
     db_session.add(product)
     db_session.add(
@@ -1974,6 +2037,7 @@ def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_sess
     assert result["rows"][0]["order_prodplan_number"] == f"MRP-RC-12-{parent.item_id}-{order.order_id}"
     assert result["rows"][0]["source_warehouse_name"] == "Склад отправитель A"
     assert result["rows"][0]["destination_warehouse_name"] == "Склад получатель"
+    assert result["rows"][0]["remaining_qty"] == 3
     assert {row["warehouse_name"] for row in result["source_warehouses"]} == {
         "Склад отправитель A",
         "Склад отправитель B",
@@ -2134,13 +2198,15 @@ def test_materials_get_refresh_flag_is_read_only_and_post_persists(db_session):
     )
     _order, product = _make_internal_order_for(db_session, parent, qty=2)
 
-    first = get_order_line_materials(product.product_id, refresh=True, db=db_session)
+    with pytest.raises(HTTPException) as unavailable:
+        get_order_line_materials(product.product_id, refresh=True, db=db_session)
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.detail["code"] == "material_coverage_snapshot_unavailable"
     state = (
         db_session.query(ProductionOrderLineState)
         .filter_by(product_id=product.product_id)
         .one_or_none()
     )
-    assert first["coverage"] == "ready"
     assert state is None
 
     refreshed = post_order_line_materials_refresh(product.product_id, db=db_session)
@@ -2150,7 +2216,38 @@ def test_materials_get_refresh_flag_is_read_only_and_post_persists(db_session):
         .one()
     )
     assert refreshed["coverage"] == "ready"
+    assert refreshed["ledger_generation_id"] == db_session.info["production_journal_generation_id"]
+    assert (
+        state.material_coverage_ledger_generation_id
+        == db_session.info["production_journal_generation_id"]
+    )
     assert state.material_coverage_snapshot["coverage"] == "ready"
+    cached = get_order_line_materials(product.product_id, db=db_session)
+    assert cached == refreshed
+
+
+def test_materials_get_rejects_snapshot_from_previous_generation(db_session):
+    parent, _spec, _components = _make_basic_spec(
+        db_session,
+        parent_name="StaleCoverageParent",
+        child_specs=[("STALE-C", "Stale component", 10, 1)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+    refreshed = post_order_line_materials_refresh(product.product_id, db=db_session)
+    prior_generation_id = refreshed["ledger_generation_id"]
+
+    current, _cutoff = _accepted_mrp_context(
+        db_session,
+        key="production-journal-next",
+    )
+    assert current.id != prior_generation_id
+
+    with pytest.raises(HTTPException) as unavailable:
+        get_order_line_materials(product.product_id, db=db_session)
+
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.detail["expected_generation_id"] == current.id
+    assert unavailable.value.detail["stored_generation_id"] == prior_generation_id
 
 
 def test_preview_materials_marks_ready_when_stock_covers_all(db_session):

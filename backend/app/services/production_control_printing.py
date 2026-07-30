@@ -8,7 +8,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    DefaultSpecification,
     IgnoredWarehouse,
     Item,
     MrpRequirement,
@@ -31,6 +30,8 @@ from ..models import (
 from .production_control_common import looks_like_guid as _looks_like_guid, to_float as _to_float
 from . import planning_truth
 from .one_c_production_order_export import PRODUCTION_ORDER_ENTITY
+from .bom_specification_resolver import BomSpecificationResolver
+from .production_output_truth import accepted_product_output
 
 
 def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
@@ -128,19 +129,12 @@ def _first_default_specs(db: Session, item_ids: Sequence[int]) -> Dict[int, int]
     ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
     if not ids:
         return {}
-
-    result: Dict[int, int] = {}
-    rows = (
-        db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id.in_(ids))
-        .order_by(DefaultSpecification.item_id.asc(), DefaultSpecification.id.asc())
-        .all()
-    )
-    for item_id, spec_id in rows:
-        item_id_int = int(item_id)
-        if item_id_int not in result:
-            result[item_id_int] = int(spec_id)
-    return result
+    resolver = BomSpecificationResolver(db)
+    return {
+        item_id: int(spec_id)
+        for item_id in ids
+        if (spec_id := resolver.default_spec_id(item_id)) is not None
+    }
 
 
 def _components_by_spec(db: Session, spec_ids: Sequence[int]) -> Dict[int, List[Tuple[SpecComponent, Item]]]:
@@ -263,58 +257,7 @@ def _bom_descendant_ids_by_root(db: Session, root_item_ids: Sequence[int]) -> Di
     roots = sorted({int(item_id) for item_id in root_item_ids if item_id is not None})
     if not roots:
         return {}
-
-    descendants: Dict[int, set[int]] = {root: {root} for root in roots}
-    frontier_by_root: Dict[int, set[int]] = {root: {root} for root in roots}
-    seen_specs_by_root: Dict[int, set[int]] = {root: set() for root in roots}
-    spec_by_item: Dict[int, Optional[int]] = {}
-    components_by_loaded_spec: Dict[int, List[int]] = {}
-
-    while any(frontier_by_root.values()):
-        frontier_items = {
-            item_id
-            for item_ids in frontier_by_root.values()
-            for item_id in item_ids
-            if item_id not in spec_by_item
-        }
-        if frontier_items:
-            found = _first_default_specs(db, sorted(frontier_items))
-            for item_id in frontier_items:
-                spec_by_item[item_id] = found.get(item_id)
-
-        active_specs: set[int] = set()
-        for root, item_ids in frontier_by_root.items():
-            for item_id in item_ids:
-                spec_id = spec_by_item.get(item_id)
-                if spec_id and spec_id not in seen_specs_by_root[root]:
-                    active_specs.add(int(spec_id))
-
-        missing_specs = sorted(active_specs - set(components_by_loaded_spec))
-        if missing_specs:
-            for spec_id in missing_specs:
-                components_by_loaded_spec[spec_id] = []
-            rows = (
-                db.query(SpecComponent.spec_id, SpecComponent.item_id)
-                .filter(SpecComponent.spec_id.in_(missing_specs))
-                .all()
-            )
-            for spec_id, item_id in rows:
-                components_by_loaded_spec.setdefault(int(spec_id), []).append(int(item_id))
-
-        next_frontier_by_root: Dict[int, set[int]] = {root: set() for root in roots}
-        for root, item_ids in frontier_by_root.items():
-            for item_id in item_ids:
-                spec_id = spec_by_item.get(item_id)
-                if not spec_id or spec_id in seen_specs_by_root[root]:
-                    continue
-                seen_specs_by_root[root].add(int(spec_id))
-                for child_id in components_by_loaded_spec.get(int(spec_id), []):
-                    if child_id not in descendants[root]:
-                        descendants[root].add(child_id)
-                        next_frontier_by_root[root].add(child_id)
-        frontier_by_root = next_frontier_by_root
-
-    return descendants
+    return BomSpecificationResolver(db).descendant_ids_by_root(roots)
 
 
 def _route_contexts_for_products(
@@ -658,7 +601,7 @@ def _route_sheet_print_data(
     components_by_product_id: Dict[int, List[Dict[str, Any]]] = {}
     for product in products:
         spec_id = spec_id_by_product_id.get(int(product.product_id))
-        qty = _to_float(product.remaining_qty) or _to_float(product.quantity)
+        qty = _to_float(accepted_product_output(product).remaining_qty)
         component_rows: List[Dict[str, Any]] = []
         for comp, item in components_by_spec.get(int(spec_id), []) if spec_id else []:
             required = _to_float(comp.quantity) * qty
@@ -703,7 +646,7 @@ def _route_sheet_print_data(
         )
         chain_info_by_product_id[paint_pid] = {
             "weld_product_id": weld_pid,
-            "weld_qty": _to_float(weld_product.remaining_qty) or _to_float(weld_product.quantity),
+            "weld_qty": _to_float(accepted_product_output(weld_product).remaining_qty),
             "weld_one_c": (route_contexts.get(weld_pid) or {}).get("one_c_number", ""),
             "weld_order_number": str(weld_product.order.order_number or "") if weld_product.order else "",
         }
@@ -790,7 +733,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
             weld_ops = operations_by_product_id.get(int(chain["weld_product_id"]), [])
             weld_no = chain["weld_one_c"] or chain["weld_order_number"] or "—"
             paint_no = route_ctx.get("one_c_number") or str(product.order.order_number or "") or "—"
-            paint_qty = _to_float(product.remaining_qty) or _to_float(product.quantity)
+            paint_qty = _to_float(accepted_product_output(product).remaining_qty)
             op_rows = (
                 _operation_block_header_html(
                     f"Сварка — заказ 1С №{weld_no} · {chain['weld_qty']:g} {product_unit}".rstrip()
@@ -830,7 +773,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
                 <tr>
                   <td colspan="5" class="product-name"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
                   <td class="product-article"><b>Артикул:</b><br><strong class="strong-value">{html.escape(str(product.item.item_article or ""))}</strong></td>
-                  <td colspan="4"><b>Количество:</b><br>{_to_float(product.remaining_qty) or _to_float(product.quantity):g} {html.escape(product_unit)}</td>
+                  <td colspan="4"><b>Количество:</b><br>{_to_float(accepted_product_output(product).remaining_qty):g} {html.escape(product_unit)}</td>
                 </tr>
                 <tr>
                   <td colspan="5"><b>План:</b><br>{html.escape(route_ctx.get("plan_name") or "—")}</td>

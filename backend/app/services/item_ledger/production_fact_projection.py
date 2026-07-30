@@ -15,9 +15,9 @@ StockLedgerEntry (`physical_visibility.visible_sle_query`).
 `historical_replay_persistence._identity_for_sle`, но с точностью до строки:
 
 1. **Точная связь до строки.** `ProductionManufacture.exported_ref1c` и
-   `SyncLink(source_doctype='manufacture', status='success')` называют локальную
-   команду «Произвести», а та несёт `product_id`. Принимается только при
-   совпадении номенклатуры факта и строки.
+   терминальный `SyncLink(source_doctype='manufacture')` (`success`/`posted`)
+   называют локальную команду «Произвести», а та несёт `product_id`.
+   Принимается только при совпадении номенклатуры факта и строки.
 2. **Связь до заказа + FIFO по строкам.** `StockRecorderPull.order_ref`
    (шапка `СборкаЗапасов.ЗаказНаПроизводство_Key`), прямое совпадение
    `ProductionOrder.order_ref1c` с recorder'ом и `SyncLink` перемещений
@@ -46,6 +46,10 @@ from .physical_visibility import PhysicalVisibilityError, visible_sle_query
 ASSEMBLY_MOVEMENT_KIND = "assembly_in"
 MANUFACTURE_DOCTYPE = "manufacture"
 MATERIAL_ISSUE_DOCTYPE = "material_issue"
+# `posted` is the terminal state written after 1C read-back for an export link.
+# Both states are provenance only: a link never creates a fact, it may only
+# identify an already-visible StockLedgerEntry from the accepted generation.
+SYNC_LINK_FACT_STATUSES = frozenset({"success", "posted"})
 ZERO = Decimal("0")
 # SQLite не принимает больше 999 связанных параметров в одном выражении.
 _IN_CHUNK = 500
@@ -128,7 +132,7 @@ def _sync_link_sources(
             db.query(models.SyncLink.target_ref_key, models.SyncLink.source_id)
             .filter(
                 models.SyncLink.target_ref_key.in_(chunk),
-                models.SyncLink.status == "success",
+                models.SyncLink.status.in_(SYNC_LINK_FACT_STATUSES),
                 models.SyncLink.source_doctype == doctype,
             )
             .all()

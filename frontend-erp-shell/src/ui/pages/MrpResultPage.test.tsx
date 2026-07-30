@@ -59,7 +59,13 @@ const summary: MrpSummary = {
     purchase_requests: 3,
     rework_requests: 1,
   },
-  capacity: { overloaded_buckets: 1 },
+  capacity: { overloaded_buckets: 1, overload_total: 12.5 },
+  snapshot_total_qty: {
+    production: 505,
+    purchase: 404,
+    rework: 303,
+    capacity: 0,
+  },
 }
 
 const productionRows: MrpProductionRow[] = [
@@ -230,6 +236,10 @@ describe('MrpResultPage characterization', () => {
 
     expect(await screen.findByText('Насос ГА-1')).toBeVisible()
     expect(screen.getByText('Успешно')).toBeVisible()
+    expect(screen.getByText('505 шт.')).toBeVisible()
+    expect(screen.getByText('404 шт.')).toBeVisible()
+    expect(screen.getByText('303 шт.')).toBeVisible()
+    expect(screen.getByText('12,5 н/ч')).toBeVisible()
     expect(getPlanningRunSummary).toHaveBeenCalledWith(41)
     expect(getPlanningResultProduction).toHaveBeenCalledWith(41, {
       snapshot_id: 901,

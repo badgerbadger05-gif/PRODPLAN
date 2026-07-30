@@ -255,6 +255,73 @@ def test_confirmed_production_landing_before_the_slot_still_covers_it(db_session
     assert row.pull_qty == Decimal("0")
 
 
+def test_confirmed_production_ignores_corrupted_remaining_cache(db_session):
+    generation, item, component, run = _contour(
+        db_session, key="corrupt-cache", active_freeze_version=1
+    )
+    _freeze_component(
+        db_session, run=run, parent=item, component=component, version=1, norm="2"
+    )
+    requirement_id = int(
+        db_session.query(models.MrpRequirement.id)
+        .filter(models.MrpRequirement.run_id == run.run_id)
+        .scalar()
+    )
+    product = _confirmed_order(
+        db_session,
+        component=component,
+        requirement_id=requirement_id,
+        qty="20",
+        finish=date(2026, 7, 26),
+    )
+    product.produced_qty = Decimal("5")
+    product.remaining_qty = Decimal("999")
+    db_session.flush()
+
+    materialize_drum_schedule(db_session, generation.id)
+    materialize_shelf_projections(db_session, generation.id)
+
+    row = db_session.query(models.ShelfProjection).one()
+    assert row.confirmed_open_production_qty == Decimal("15")
+    assert row.projected_qty == Decimal("15")
+    assert row.gap_qty == Decimal("5")
+    assert row.unlaunched_mrp_qty == Decimal("85")
+
+
+def test_cancelled_production_is_not_shelf_coverage(db_session):
+    generation, item, component, run = _contour(
+        db_session, key="cancelled-order", active_freeze_version=1
+    )
+    _freeze_component(
+        db_session, run=run, parent=item, component=component, version=1, norm="2"
+    )
+    requirement_id = int(
+        db_session.query(models.MrpRequirement.id)
+        .filter(models.MrpRequirement.run_id == run.run_id)
+        .scalar()
+    )
+    product = _confirmed_order(
+        db_session,
+        component=component,
+        requirement_id=requirement_id,
+        qty="20",
+        finish=date(2026, 7, 26),
+    )
+    state = db_session.query(models.ProductionOrderLineState).filter_by(
+        product_id=product.product_id
+    ).one()
+    state.status = "cancelled"
+    db_session.flush()
+
+    materialize_drum_schedule(db_session, generation.id)
+    materialize_shelf_projections(db_session, generation.id)
+
+    row = db_session.query(models.ShelfProjection).one()
+    assert row.confirmed_open_production_qty == Decimal("0")
+    assert row.gap_qty == Decimal("20")
+    assert row.pull_qty == Decimal("20")
+
+
 def test_undated_confirmed_production_is_never_shelf_coverage(db_session):
     """An order with no planned finish date cannot be time-phased at all."""
     generation, item, component, run = _contour(

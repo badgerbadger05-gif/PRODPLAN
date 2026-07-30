@@ -17,6 +17,9 @@ from ..mrp_result_snapshot import build_mrp_result_snapshot
 from ..purchase_control_snapshot import (
     promote_candidate_snapshot as promote_purchase_journal_candidate,
 )
+from ..production_control_journal_snapshot import (
+    promote_candidate_snapshot as promote_production_journal_candidate,
+)
 from .generation_lifecycle import accept_generation_build
 from .historical_bootstrap_phase0 import (
     BalanceConvergenceResult,
@@ -169,6 +172,19 @@ def _publish_refresh_read_snapshots(
     if promoted is None and capabilities.get("purchase_control_journal"):
         raise PhysicalRefreshOrchestratorError(
             f"generation {generation.id} claims the purchase_control_journal "
+            "capability but has no journal candidate to publish"
+        )
+    production_journal = promote_production_journal_candidate(
+        db,
+        generation=generation,
+        accepted_at=accepted_at,
+    )
+    if (
+        production_journal is None
+        and capabilities.get("production_control_journal")
+    ):
+        raise PhysicalRefreshOrchestratorError(
+            f"generation {generation.id} claims the production_control_journal "
             "capability but has no journal candidate to publish"
         )
 

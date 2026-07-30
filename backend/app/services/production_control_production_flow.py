@@ -27,6 +27,7 @@ from .specification_sync import sync_specifications_from_odata
 from .one_c_document_numbers import material_issue_number
 from .one_c_manufacture_export import commanded_qty_by_product
 from .one_c_piecework_export import PIECEWORK_ENTITY
+from .production_output_truth import accepted_product_output
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +222,7 @@ def produce_line(
     commanded_before = commanded_qty_by_product(db, [int(product.product_id)]).get(
         int(product.product_id), 0.0
     )
+    accepted_output = accepted_product_output(product)
 
     # Resume before anything else: an unfinished выпуск already owns a 1C
     # Document_СборкаЗапасов, so a second press must finish that chain instead
@@ -240,15 +242,26 @@ def produce_line(
             "order_id": int(product.order_id),
             "qty": float(_to_float(manufacture.qty)),
             "requested_qty": float(qty_f),
-            "produced_qty_total": float(product.produced_qty or 0),
-            "remaining_qty": float(product.remaining_qty or 0),
+            "produced_qty_total": float(accepted_output.produced_qty),
+            "remaining_qty": float(accepted_output.remaining_qty),
             "commanded_qty_total": float(commanded_before),
-            "command_remaining_qty": float(max(order_quantity - commanded_before, 0.0)),
+            "command_remaining_qty": float(
+                min(
+                    max(order_quantity - commanded_before, 0.0),
+                    accepted_output.remaining_qty,
+                )
+            ),
             "fact_pending": True,
             "line_status": state.status,
         }
 
-    command_remaining = max(0.0, order_quantity - commanded_before)
+    # A legacy/imported 1C fact may have no corresponding local command row,
+    # while a pending local command may not yet be a physical fact. The safe
+    # executable quantity is bounded by both independent ceilings.
+    command_remaining = min(
+        max(0.0, order_quantity - commanded_before),
+        float(accepted_output.remaining_qty),
+    )
     if command_remaining <= 1e-9:
         raise ValueError(
             "По этой строке уже создана исполнительная команда на весь объём"
@@ -336,8 +349,8 @@ def produce_line(
         "product_id": int(product.product_id),
         "order_id": int(product.order_id),
         "qty": float(qty_f),
-        "produced_qty_total": float(product.produced_qty or 0),
-        "remaining_qty": float(product.remaining_qty or 0),
+        "produced_qty_total": float(accepted_output.produced_qty),
+        "remaining_qty": float(accepted_output.remaining_qty),
         "commanded_qty_total": float(commanded_before + qty_f),
         "command_remaining_qty": float(max(command_remaining - qty_f, 0.0)),
         "fact_pending": True,
@@ -371,6 +384,7 @@ def rollback_local_manufacture(db: Session, manufacture_id: int) -> Dict[str, An
         raise ValueError(f"product_id={manufacture.product_id}: строка заказа не найдена")
 
     state = _ensure_state(db, product)
+    accepted_output = accepted_product_output(product)
 
     db.delete(manufacture)
     db.commit()
@@ -379,8 +393,8 @@ def rollback_local_manufacture(db: Session, manufacture_id: int) -> Dict[str, An
         "status": "rolled_back",
         "manufacture_id": int(manufacture_id),
         "product_id": int(product.product_id),
-        "produced_qty_total": float(product.produced_qty),
-        "remaining_qty": float(product.remaining_qty),
+        "produced_qty_total": float(accepted_output.produced_qty),
+        "remaining_qty": float(accepted_output.remaining_qty),
         "line_status": state.status,
     }
 

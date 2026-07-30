@@ -13,12 +13,15 @@ from sqlalchemy.orm import Session
 
 from app import models
 
+from .production_output_cache import accepted_product_output
 from .reservation import replenishment_remaining
 from .shelf_projection_core import ShelfDemand, ShelfReceipt, project_shelf
 
 
 STAGE = "shelf_projection"
-ALGORITHM_VERSION = "shelf-projection/1"
+ALGORITHM_VERSION = "shelf-projection/2"
+_TERMINAL_LINE_STATUSES = {"completed", "cancelled"}
+_DONE_ORDER_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _d(value: Any) -> Decimal:
@@ -192,7 +195,15 @@ def _confirmed_receipts(
     if not requirement_ids:
         return ()
     rows = (
-        db.query(models.ProductionProduct, models.ProductionOrderLineState)
+        db.query(
+            models.ProductionProduct,
+            models.ProductionOrderLineState,
+            models.ProductionOrder,
+        )
+        .join(
+            models.ProductionOrder,
+            models.ProductionOrder.order_id == models.ProductionProduct.order_id,
+        )
         .outerjoin(
             models.ProductionOrderLineState,
             models.ProductionOrderLineState.product_id
@@ -201,20 +212,30 @@ def _confirmed_receipts(
         .filter(
             models.ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
             models.ProductionProduct.destination_warehouse_ref1c == warehouse_ref1c,
-            models.ProductionProduct.remaining_qty > 0,
+            models.ProductionProduct.quantity > models.ProductionProduct.produced_qty,
+            models.ProductionOrder.deletion_mark.is_(False),
+            func.lower(func.coalesce(models.ProductionOrder.order_state_key, ""))
+            != _DONE_ORDER_STATE_KEY,
+            func.lower(
+                func.coalesce(models.ProductionOrderLineState.status, "shortage")
+            ).notin_(tuple(_TERMINAL_LINE_STATUSES)),
         )
         .all()
     )
-    return tuple(
-        ShelfReceipt(
-            available_from=state.planned_finish_date,
-            qty=_d(product.remaining_qty),
+    receipts: list[ShelfReceipt] = []
+    for product, state, _order in rows:
+        if state is None or state.planned_finish_date is None:
+            continue
+        remaining = accepted_product_output(product).remaining_qty
+        if remaining <= 0:
+            continue
+        receipts.append(
+            ShelfReceipt(
+                available_from=state.planned_finish_date,
+                qty=remaining,
+            )
         )
-        for product, state in rows
-        if state is not None
-        and state.planned_finish_date is not None
-        and _d(product.remaining_qty) > 0
-    )
+    return tuple(receipts)
 
 
 def _payload(row: models.ShelfProjection) -> dict[str, Any]:
@@ -323,7 +344,6 @@ def materialize_shelf_projections(
             open_mrp_qty=open_qty,
             shelf_physical_qty=shelf_qty,
             other_stock_qty=other_qty,
-            confirmed_open_production_qty=Decimal("0"),
             confirmed_receipts=_confirmed_receipts(
                 db,
                 requirement_ids,

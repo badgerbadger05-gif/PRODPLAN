@@ -131,12 +131,12 @@ def test_patch_missing_item_is_404(client):
     assert response.status_code == 404
 
 
-def test_put_still_replaces_the_whole_record(client, db_session, item):
-    """Guards the reason PATCH exists: PUT defaults `stock_qty` to 0.0."""
+def test_put_never_overwrites_physical_stock(client, db_session, item):
+    """PUT may replace editable fields, but physical stock belongs to Ledger."""
     response = client.put(
         f"/api/v1/items/{item.item_id}",
         json={"item_code": "000001", "item_name": "Кронштейн", "optimal_batch": 24},
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["stock_qty"] == 0.0
+    assert response.json()["stock_qty"] == 17.5

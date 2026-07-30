@@ -32,6 +32,7 @@ from ..models import (
     StockBin,
     StockWarehouse,
 )
+from .production_output_truth import accepted_product_remaining_expr
 
 
 _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -43,7 +44,10 @@ def _production_supply_qty_expr():
     Completed 1C orders never provide future supply. Their factual output is
     available to MRP only after the stock sync has put it into warehouse stock.
     """
-    return func.coalesce(ProductionProduct.remaining_qty, 0.0)
+    return accepted_product_remaining_expr(
+        ProductionProduct.quantity,
+        ProductionProduct.produced_qty,
+    )
 
 
 def effective_stock_by_item_all(db: Session) -> Dict[int, float]:

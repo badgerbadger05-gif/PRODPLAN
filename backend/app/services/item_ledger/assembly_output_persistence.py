@@ -27,9 +27,10 @@ from app.services.item_ledger.assembly_output_core import (
 )
 from app.services.item_ledger.physical_visibility import visible_sle_query
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids
+from app.services.item_ledger.production_fact_projection import _build_recorder_index
 
 _STAGE = "assembly_output_allocation"
-_ALGORITHM_VERSION = "assembly-output-allocation/1"
+_ALGORITHM_VERSION = "assembly-output-allocation/2"
 
 
 def _dec(value: Any) -> Decimal:
@@ -77,6 +78,15 @@ class _OutputFact:
     recorder_type: str
     recorder_ref: str
     line_no: str
+
+
+@dataclass(frozen=True)
+class _FactProvenance:
+    exact_plan_line_ids: tuple[int, ...] = ()
+    link_kind: str = "none"
+    status: str = "none"
+    reason: str | None = None
+    exact_product_ids: tuple[int, ...] = ()
 
 
 def _load_visible_facts(
@@ -150,15 +160,186 @@ def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandida
         .all()
     )
 
-    return tuple(
-        QueueCandidate(
-            plan_id=int(plan.id),
-            plan_line_id=int(line.id),
-            item_id=int(line.item_id),
-            open_qty=_dec(line.qty),
+    candidates: list[QueueCandidate] = []
+    for run, plan, line in rows:
+        # A nullable boundary exists only for migrated legacy rows. Treat it as
+        # unavailable, never as “eligible since the beginning of history”.
+        eligible_from = plan.fixed_at or run.fixed_at
+        if eligible_from is None:
+            continue
+        candidates.append(
+            QueueCandidate(
+                plan_id=int(plan.id),
+                plan_line_id=int(line.id),
+                item_id=int(line.item_id),
+                open_qty=_dec(line.qty),
+                eligible_from=eligible_from,
+            )
         )
-        for _run, plan, line in rows
+    return tuple(candidates)
+
+
+def _fact_provenance(
+    db: Session,
+    facts: tuple[_OutputFact, ...],
+    candidates: tuple[QueueCandidate, ...],
+) -> dict[int, _FactProvenance]:
+    """Resolve auditable command -> product -> top-level plan lineage.
+
+    ``ProductionManufacture`` is exact to ``ProductionProduct``. A product is
+    exact to a plan line only when it names a level-0 MRP requirement and that
+    run has one eligible live candidate line for the same item. Older/direct
+    1C orders do not retain a plan-line id and remain FIFO fallback.
+    """
+    recorder_index = _build_recorder_index(
+        db, [_text(fact.recorder_ref) for fact in facts]
     )
+    product_ids = sorted(
+        {
+            int(product_id)
+            for values in recorder_index.exact_product_ids.values()
+            for product_id in values
+        }
+    )
+    products = {
+        int(row.product_id): row
+        for row in (
+            db.query(models.ProductionProduct)
+            .filter(models.ProductionProduct.product_id.in_(product_ids))
+            .all()
+            if product_ids
+            else ()
+        )
+    }
+    requirement_ids = sorted(
+        {
+            int(row.source_mrp_requirement_id)
+            for row in products.values()
+            if row.source_mrp_requirement_id is not None
+        }
+    )
+    requirements = {
+        int(row.id): row
+        for row in (
+            db.query(models.MrpRequirement)
+            .filter(models.MrpRequirement.id.in_(requirement_ids))
+            .all()
+            if requirement_ids
+            else ()
+        )
+    }
+    run_ids = sorted({int(row.run_id) for row in requirements.values()})
+    runs = {
+        int(row.run_id): row
+        for row in (
+            db.query(models.PlanningRun)
+            .filter(models.PlanningRun.run_id.in_(run_ids))
+            .all()
+            if run_ids
+            else ()
+        )
+    }
+    candidate_ids_by_plan_item: dict[tuple[int, int], list[int]] = {}
+    for candidate in candidates:
+        candidate_ids_by_plan_item.setdefault(
+            (int(candidate.plan_id), int(candidate.item_id)), []
+        ).append(int(candidate.plan_line_id))
+
+    result: dict[int, _FactProvenance] = {}
+    for fact in facts:
+        exact_product_ids = tuple(
+            sorted(
+                int(value)
+                for value in recorder_index.exact_product_ids.get(
+                    _text(fact.recorder_ref), ()
+                )
+            )
+        )
+        if not exact_product_ids:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance()
+            continue
+        if len(exact_product_ids) != 1:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                link_kind="exact_plan_line",
+                status="ambiguous",
+                reason="recorder resolves to multiple production products",
+                exact_product_ids=exact_product_ids,
+            )
+            continue
+
+        product = products.get(exact_product_ids[0])
+        if product is None or int(product.item_id) != int(fact.item_id):
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                link_kind="exact_plan_line",
+                status="invalid",
+                reason="exact production product is missing or has another item",
+                exact_product_ids=exact_product_ids,
+            )
+            continue
+        if product.source_mrp_requirement_id is None:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                link_kind="planned_order",
+                exact_product_ids=exact_product_ids,
+            )
+            continue
+
+        requirement = requirements.get(int(product.source_mrp_requirement_id))
+        if requirement is None:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                link_kind="exact_plan_line",
+                status="invalid",
+                reason="exact production product points to a missing MRP requirement",
+                exact_product_ids=exact_product_ids,
+            )
+            continue
+        if int(requirement.bom_level or 0) != 0:
+            # Exact to component replenishment, not to top-level plan output.
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                link_kind="planned_order",
+                exact_product_ids=exact_product_ids,
+            )
+            continue
+
+        run = runs.get(int(requirement.run_id))
+        plan_id = (
+            int(run.source_plan_id)
+            if run is not None and run.source_plan_id is not None
+            else None
+        )
+        line_ids = (
+            tuple(
+                sorted(
+                    candidate_ids_by_plan_item.get(
+                        (int(plan_id), int(fact.item_id)), ()
+                    )
+                )
+            )
+            if plan_id is not None
+            else ()
+        )
+        if len(line_ids) == 1:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                exact_plan_line_ids=line_ids,
+                link_kind="exact_plan_line",
+                status="exact",
+                exact_product_ids=exact_product_ids,
+            )
+        elif len(line_ids) > 1:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                exact_plan_line_ids=line_ids,
+                link_kind="exact_plan_line",
+                status="ambiguous",
+                reason="top-level MRP requirement maps to multiple live plan lines",
+                exact_product_ids=exact_product_ids,
+            )
+        else:
+            result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
+                link_kind="exact_plan_line",
+                status="invalid",
+                reason="top-level MRP requirement has no eligible live plan line",
+                exact_product_ids=exact_product_ids,
+            )
+    return result
 
 
 def _candidate_rows_for_fact(
@@ -177,6 +358,7 @@ def _candidate_rows_for_fact(
                 plan_line_id=int(candidate.plan_line_id),
                 item_id=int(candidate.item_id),
                 open_qty=remaining,
+                eligible_from=candidate.eligible_from,
             )
         )
     return tuple(ordered)
@@ -189,6 +371,7 @@ def _facts_by_sle(facts: tuple[_OutputFact, ...]) -> dict[int, _OutputFact]:
 def _expected_signatures(
     facts: tuple[_OutputFact, ...],
     ordered_candidates: tuple[QueueCandidate, ...],
+    provenance_by_sle: dict[int, _FactProvenance],
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -206,12 +389,16 @@ def _expected_signatures(
 
     for fact in facts:
         current_candidates = _candidate_rows_for_fact(ordered_candidates, remaining_by_line)
+        provenance = provenance_by_sle[int(fact.stock_ledger_entry_id)]
         core_fact = OutputFact(
             stock_ledger_entry_id=fact.stock_ledger_entry_id,
             item_id=fact.item_id,
             qty=fact.qty,
-            exact_plan_line_ids=(),
-            link_kind="none",
+            exact_plan_line_ids=provenance.exact_plan_line_ids,
+            link_kind=provenance.link_kind,
+            posting_at=fact.posting_at,
+            provenance_status=provenance.status,
+            provenance_reason=provenance.reason,
         )
         decision = allocate_output_fact(core_fact, current_candidates)
 
@@ -223,13 +410,9 @@ def _expected_signatures(
                 "reason": _text(decision.reason),
                 "source_content_hash": fact.source_content_hash,
                 "surplus_qty": _qty_text(decision.surplus_qty),
-                "evidence_payload": {
-                    "stock_ledger_entry_id": int(fact.stock_ledger_entry_id),
-                    "source_content_hash": fact.source_content_hash,
-                    "recorder_type": fact.recorder_type,
-                    "recorder_ref": fact.recorder_ref,
-                    "line_no": fact.line_no,
-                },
+                "evidence_payload": _decision_payload_by_fact(
+                    fact, provenance
+                ),
             }
         )
 
@@ -250,6 +433,41 @@ def _expected_signatures(
                 }
             )
 
+    decision_by_sle = {
+        int(row["stock_ledger_entry_id"]): row for row in decision_rows
+    }
+    allocated_by_sle: dict[int, Decimal] = {}
+    allocated_by_line: dict[int, Decimal] = {}
+    for row in allocation_rows:
+        sle_id = int(row["stock_ledger_entry_id"])
+        line_id = int(row["plan_line_id"])
+        allocated_by_sle[sle_id] = (
+            allocated_by_sle.get(sle_id, Decimal("0"))
+            + _dec(row["allocated_qty"])
+        )
+        allocated_by_line[line_id] = (
+            allocated_by_line.get(line_id, Decimal("0"))
+            + _dec(row["allocated_qty"])
+        )
+    for fact in facts:
+        sle_id = int(fact.stock_ledger_entry_id)
+        if (
+            allocated_by_sle.get(sle_id, Decimal("0"))
+            + _dec(decision_by_sle[sle_id]["surplus_qty"])
+            != _dec(fact.qty)
+        ):
+            raise ValueError(
+                f"assembly output fact conservation failed for SLE {sle_id}"
+            )
+    initial_by_line = {
+        int(row.plan_line_id): _dec(row.open_qty) for row in ordered_candidates
+    }
+    if any(
+        qty > initial_by_line.get(line_id, Decimal("0"))
+        for line_id, qty in allocated_by_line.items()
+    ):
+        raise ValueError("assembly output plan-line conservation failed")
+
     fact_qty = sum((_dec(fact.qty) for fact in facts), Decimal("0"))
     allocated_qty = sum((
         _dec(row["allocated_qty"]) for row in allocation_rows
@@ -267,6 +485,18 @@ def _expected_signatures(
         "allocated_qty": _qty_text(allocated_qty),
         "surplus_total": _qty_text(surplus_qty),
         "surplus_facts": len([row for row in decision_rows if _dec(row["surplus_qty"]) > 0]),
+        "exact_allocations": sum(
+            1 for row in allocation_rows if row["match_rule"] == "exact"
+        ),
+        "fifo_allocations": sum(
+            1 for row in allocation_rows if row["match_rule"] == "fifo"
+        ),
+        "ambiguous_facts": sum(
+            1 for row in decision_rows if row["decision_status"] == "ambiguous"
+        ),
+        "invalid_facts": sum(
+            1 for row in decision_rows if row["decision_status"] == "invalid"
+        ),
         "fact_checksum": _checksum(_canonical(decision_rows)),
         "allocation_checksum": _checksum(_canonical(allocation_rows)),
         "surplus_checksum": _checksum(_canonical([
@@ -360,7 +590,10 @@ def _signature_allocations(
     )
 
 
-def _decision_payload_by_fact(current_fact: _OutputFact) -> dict[str, Any]:
+def _decision_payload_by_fact(
+    current_fact: _OutputFact,
+    provenance: _FactProvenance,
+) -> dict[str, Any]:
     return _canonical(
         {
             "stock_ledger_entry_id": int(current_fact.stock_ledger_entry_id),
@@ -368,6 +601,11 @@ def _decision_payload_by_fact(current_fact: _OutputFact) -> dict[str, Any]:
             "recorder_type": current_fact.recorder_type,
             "recorder_ref": current_fact.recorder_ref,
             "line_no": current_fact.line_no,
+            "posting_at": current_fact.posting_at,
+            "exact_product_ids": list(provenance.exact_product_ids),
+            "exact_plan_line_ids": list(provenance.exact_plan_line_ids),
+            "provenance_status": provenance.status,
+            "provenance_reason": provenance.reason,
         }
     )
 
@@ -378,6 +616,7 @@ def _persist_rows(
     fact_signature: list[dict[str, Any]],
     allocation_signature: list[dict[str, Any]],
     fact_by_sle: dict[int, _OutputFact],
+    provenance_by_sle: dict[int, _FactProvenance],
 ) -> None:
     for fact_row in fact_signature:
         fact = fact_by_sle[int(fact_row["stock_ledger_entry_id"])]
@@ -388,7 +627,10 @@ def _persist_rows(
                 decision_status=_text(fact_row["decision_status"]),
                 link_kind=_text(fact_row["link_kind"]),
                 reason=_text(fact_row["reason"]) or None,
-                evidence_payload=_decision_payload_by_fact(fact),
+                evidence_payload=_decision_payload_by_fact(
+                    fact,
+                    provenance_by_sle[int(fact.stock_ledger_entry_id)],
+                ),
                 source_content_hash=_text(fact_row["source_content_hash"]),
                 surplus_qty=_dec(fact_row["surplus_qty"]),
             )
@@ -429,10 +671,12 @@ def materialize_assembly_output_allocations(
 
     facts = _load_visible_facts(db, generation)
     ordered_candidates = _load_live_candidates(db, int(generation.id))
+    provenance_by_sle = _fact_provenance(db, facts, ordered_candidates)
 
     fact_signature, allocation_signature, metrics, fact_by_sle = _expected_signatures(
         facts,
         ordered_candidates,
+        provenance_by_sle,
     )
 
     batch_key = _build_batch_key(generation)
@@ -507,14 +751,28 @@ def materialize_assembly_output_allocations(
             expected_batch_metrics
         ):
             raise ValueError("assembly output allocation batch drift")
-        _persist_rows(db, generation, fact_signature, allocation_signature, fact_by_sle)
+        _persist_rows(
+            db,
+            generation,
+            fact_signature,
+            allocation_signature,
+            fact_by_sle,
+            provenance_by_sle,
+        )
         return {
             "ledger_generation_id": int(generation.id),
             "batch_id": int(existing_batch.id),
             **metrics,
         }
 
-    _persist_rows(db, generation, fact_signature, allocation_signature, fact_by_sle)
+    _persist_rows(
+        db,
+        generation,
+        fact_signature,
+        allocation_signature,
+        fact_by_sle,
+        provenance_by_sle,
+    )
 
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(generation.id),

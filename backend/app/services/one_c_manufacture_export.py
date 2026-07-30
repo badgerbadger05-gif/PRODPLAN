@@ -62,6 +62,7 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import manufacture_number
 from .one_c_production_order_export import export_production_orders_to_1c
+from .bom_specification_resolver import BomSpecificationResolver
 
 
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
@@ -159,6 +160,7 @@ def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id
         .order_by(SpecComponent.component_id.asc())
         .all()
     )
+    spec_resolver = BomSpecificationResolver(db)
     for idx, (component, item) in enumerate(components, start=1):
         item_ref = _clean_ref1c(item.item_ref1c)
         if not item_ref:
@@ -170,8 +172,9 @@ def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id
             "КлючСвязи": idx,
         }
         _add_unit_payload(row, item.unit)
-        if spec_ref:
-            row["Спецификация_Key"] = spec_ref
+        pinned_child_ref = spec_resolver.child_spec_ref1c(component)
+        if pinned_child_ref or spec_ref:
+            row["Спецификация_Key"] = pinned_child_ref or spec_ref
         rows.append(row)
     return rows
 

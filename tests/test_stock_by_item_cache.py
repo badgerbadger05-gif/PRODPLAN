@@ -767,7 +767,8 @@ def test_get_active_1c_remaining_by_item_excludes_done_deleted_and_nonpositive(d
 
     db.add_all(
         [
-            ProductionProduct(order_id=active.order_id, item_id=item.item_id, quantity=10.0, produced_qty=5.0, remaining_qty=5.0),
+            # Corrupt compatibility cache must not inflate active WIP.
+            ProductionProduct(order_id=active.order_id, item_id=item.item_id, quantity=10.0, produced_qty=5.0, remaining_qty=999.0),
             ProductionProduct(order_id=done.order_id, item_id=item.item_id, quantity=10.0, produced_qty=3.0, remaining_qty=7.0),
             ProductionProduct(order_id=deleted.order_id, item_id=item.item_id, quantity=10.0, produced_qty=1.0, remaining_qty=9.0),
             ProductionProduct(order_id=active.order_id, item_id=item.item_id, quantity=10.0, produced_qty=10.0, remaining_qty=0.0),
@@ -872,7 +873,7 @@ def test_recursive_component_reservation_with_cycle_guard(db_session):
             item_id=a.item_id,
             quantity=10.0,
             produced_qty=8.0,
-            remaining_qty=2.0,
+            remaining_qty=999.0,
         )
     )
     db.commit()

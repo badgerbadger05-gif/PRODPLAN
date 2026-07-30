@@ -150,6 +150,7 @@ export type EmployeesResponse = {
 }
 
 export type MaterialsResponse = {
+  ledger_generation_id: number
   order_number?: string
   item_name?: string
   item_article?: string

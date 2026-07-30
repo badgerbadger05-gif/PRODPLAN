@@ -103,7 +103,6 @@ def project_shelf(
     open_mrp_qty: Decimal,
     shelf_physical_qty: Decimal,
     other_stock_qty: Decimal,
-    confirmed_open_production_qty: Decimal,
     confirmed_receipts: tuple[ShelfReceipt, ...] = (),
 ) -> ShelfProjectionResult:
     """Calculate timing only; never create demand beyond frozen MRP."""
@@ -112,12 +111,11 @@ def project_shelf(
     open_qty = max(_d(open_mrp_qty), Decimal("0"))
     physical = _d(shelf_physical_qty)
     other = max(_d(other_stock_qty), Decimal("0"))
-    opening_confirmed = max(_d(confirmed_open_production_qty), Decimal("0"))
     dated_receipts = sorted(
         (row for row in confirmed_receipts if _d(row.qty) > 0),
         key=lambda row: row.available_from,
     )
-    confirmed = opening_confirmed + sum(
+    confirmed = sum(
         (_d(row.qty) for row in dated_receipts), Decimal("0")
     )
     protection_until = as_of + timedelta(
@@ -141,7 +139,7 @@ def project_shelf(
     projected, first_shortage = _project_timely_coverage(
         ordered,
         protection_until=protection_until,
-        opening_balance=physical + opening_confirmed,
+        opening_balance=physical,
         receipts=dated_receipts,
     )
     gap = max(target - projected, Decimal("0"))

@@ -585,6 +585,24 @@ def test_exact_future_supply_without_pool_or_destination_is_rejected(db_session)
         )
 
 
+def test_exact_supplier_future_supply_without_eta_is_rejected(db_session):
+    _accepted, target, item, _parents, _candidates, _lines = _candidate_world(db_session)
+    row = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=target.id,
+        supply_kind="supplier_order",
+    ).one()
+    row.eta_date = None
+    db_session.flush()
+
+    with pytest.raises(LedgerPoolUnavailable, match="lacks ETA"):
+        build_shared_pools(
+            db_session,
+            [],
+            ledger_generation_id=target.id,
+            relevant_item_ids=[item.item_id],
+        )
+
+
 def _retained_claim_world(db, *, wip_open_qty):
     """World with one retained run claiming 1 unit of a WIP line whose ledger
     remainder is `wip_open_qty` (None = line fully received, absent from pool)."""

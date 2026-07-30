@@ -99,6 +99,7 @@ const journalResponse: ExecutionJournalResponse = {
       remaining_qty: 8,
       unassigned_qty: 0,
       coverage_pct: 20,
+      status: 'partial',
       need_date: '2026-05-15',
       work_items: [],
     },
@@ -185,6 +186,7 @@ const journalResponseMixed: ExecutionJournalResponse = {
       remaining_qty: 0,
       unassigned_qty: 0,
       coverage_pct: 100,
+      status: 'covered',
       need_date: '2026-05-15',
       work_items: [],
     },
@@ -205,6 +207,7 @@ const journalResponseMixed: ExecutionJournalResponse = {
       remaining_qty: 12,
       unassigned_qty: 12,
       coverage_pct: 0,
+      status: 'none',
       need_date: '2026-05-16',
       work_items: [],
     },
@@ -225,6 +228,7 @@ const journalResponseMixed: ExecutionJournalResponse = {
       remaining_qty: 5,
       unassigned_qty: 5,
       coverage_pct: 0,
+      status: 'ordered',
       need_date: '2026-05-17',
       work_items: [],
     },
@@ -369,6 +373,31 @@ describe('PeriodPlanPage — list view', () => {
     // Draft plan without an MRP run shows a neutral dash, not the raw reason.
     expect(screen.getAllByText('—').length).toBeGreaterThan(0)
     expect(screen.queryByText(/snapshot is missing/)).not.toBeInTheDocument()
+  })
+
+  it('does not clamp anomalous execution percentages', async () => {
+    vi.mocked(periodPlanSvc.listPeriodPlans).mockResolvedValue({
+      rows: [{
+        ...listPlanA,
+        status: 'fixed',
+        execution_pct: 125.4,
+        execution_by_flow: {
+          production: {
+            completed_qty: 12.54,
+            base_qty: 10,
+            execution_pct: 125.4,
+            available: true,
+          },
+        },
+      }],
+      total: 1,
+    })
+
+    renderAt('/period-plan')
+
+    expect(await screen.findByText('125,4%')).toBeInTheDocument()
+    expect(screen.getByText(/Пр 125,4%/)).toBeInTheDocument()
+    expect(screen.queryByText('100%')).not.toBeInTheDocument()
   })
 
   it('shows the empty state when no plans are returned', async () => {
@@ -547,6 +576,34 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.getByText('Производство: 20%')).toBeInTheDocument()
     expect(screen.queryByText(/≥/)).not.toBeInTheDocument()
     expect(screen.queryByText(/часть н\/д/)).not.toBeInTheDocument()
+  })
+
+  it('shows unavailable status and does not fabricate stock when journal data is anomalous', async () => {
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue({
+      ...journalResponse,
+      rows: [{
+        ...journalResponse.rows[0],
+        gross_qty: 10,
+        stock_qty: undefined,
+        net_qty: 12,
+        status: 'execution_unavailable',
+        execution_available: false,
+        execution_unavailable_reason: 'net exceeds gross',
+      }],
+      summary: {
+        ...journalResponse.summary,
+        execution_pct: null,
+        execution_by_flow: null,
+      },
+    })
+    const user = userEvent.setup()
+
+    renderAt('/period-plan/123')
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+
+    expect(await screen.findByText('Исполнение недоступно')).toBeInTheDocument()
+    expect(screen.getByTitle(/Остаток склада: н\/д/)).toBeInTheDocument()
+    expect(screen.queryByText(/Общее выполнение:/)).not.toBeInTheDocument()
   })
 
   it('shows exact 100% purchase coverage and 0% to-order from the execution snapshot', async () => {

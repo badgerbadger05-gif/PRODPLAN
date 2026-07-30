@@ -22,7 +22,7 @@ def test_shelf_target_is_protected_drum_demand_capped_by_mrp() -> None:
         open_mrp_qty=Decimal("10"),
         shelf_physical_qty=Decimal("2"),
         other_stock_qty=Decimal("3"),
-        confirmed_open_production_qty=Decimal("1"),
+        confirmed_receipts=(ShelfReceipt(date(2026, 8, 1), Decimal("1")),),
     )
 
     assert result.target_qty == Decimal("10")
@@ -46,7 +46,7 @@ def test_shelf_batch_rounding_never_exceeds_unlaunched_mrp() -> None:
         open_mrp_qty=Decimal("7"),
         shelf_physical_qty=Decimal("0"),
         other_stock_qty=Decimal("0"),
-        confirmed_open_production_qty=Decimal("2"),
+        confirmed_receipts=(ShelfReceipt(date(2026, 8, 1), Decimal("2")),),
     )
 
     assert result.unlaunched_mrp_qty == Decimal("5")
@@ -74,7 +74,6 @@ def test_projection_nets_earlier_drum_consumption_without_double_counting() -> N
         open_mrp_qty=Decimal("100"),
         shelf_physical_qty=Decimal("10"),
         other_stock_qty=Decimal("0"),
-        confirmed_open_production_qty=Decimal("0"),
     )
 
     assert result.target_qty == Decimal("14")
@@ -99,7 +98,6 @@ def test_confirmed_receipt_landing_after_the_need_date_is_not_coverage() -> None
         open_mrp_qty=Decimal("20"),
         shelf_physical_qty=Decimal("0"),
         other_stock_qty=Decimal("0"),
-        confirmed_open_production_qty=Decimal("0"),
         confirmed_receipts=(ShelfReceipt(date(2026, 8, 10), Decimal("10")),),
     )
 
@@ -115,8 +113,8 @@ def test_confirmed_receipt_landing_after_the_need_date_is_not_coverage() -> None
     assert result.latest_start_date == date(2026, 8, 2)
 
 
-def test_undated_confirmed_production_still_counts_as_opening_balance() -> None:
-    """Persistence still passes one scalar; it must keep behaving as on-shelf."""
+def test_undated_confirmed_production_cannot_be_fabricated_as_opening_balance() -> None:
+    """Without a dated receipt, only physical shelf stock is coverage."""
     result = project_shelf(
         (ShelfDemand(date(2026, 8, 3), Decimal("9"), ()),),
         as_of=date(2026, 8, 1),
@@ -127,9 +125,9 @@ def test_undated_confirmed_production_still_counts_as_opening_balance() -> None:
         open_mrp_qty=Decimal("20"),
         shelf_physical_qty=Decimal("2"),
         other_stock_qty=Decimal("0"),
-        confirmed_open_production_qty=Decimal("4"),
     )
 
-    assert result.projected_qty == Decimal("6")
-    assert result.gap_qty == Decimal("3")
+    assert result.confirmed_open_production_qty == Decimal("0")
+    assert result.projected_qty == Decimal("2")
+    assert result.gap_qty == Decimal("7")
     assert result.first_shortage_date == date(2026, 8, 3)

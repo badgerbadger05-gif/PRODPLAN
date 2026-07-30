@@ -1,4 +1,4 @@
-import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow } from '../../../domain/planning'
+import type { MrpProductionRow, MrpPurchaseRow } from '../../../domain/planning'
 
 export type MrpResultTab = 'production' | 'purchases' | 'rework' | 'capacity'
 
@@ -50,20 +50,6 @@ export function filterPurchaseRows(rows: MrpPurchaseRow[], supplier: string, cat
     (!supplier || supplierFilterKey(row) === supplier)
     && (!category || categoryFilterKey(row) === category)
   ))
-}
-
-export function mrpResultTotals(
-  production: MrpProductionRow[],
-  purchases: MrpPurchaseRow[],
-  rework: MrpReworkRow[],
-  capacity: MrpCapacityRow[],
-) {
-  return {
-    productionQty: production.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    purchaseQty: purchases.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    reworkQty: rework.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    overloadHours: capacity.reduce((sum, row) => sum + Number(row.overload_hours || 0), 0),
-  }
 }
 
 export function toggleMany(set: Set<number>, ids: number[], checked: boolean) {

@@ -17,7 +17,16 @@ jobs:
             backend/requirements.txt
             backend/requirements-dev.txt
       - run: python -m pip install -r backend/requirements-dev.txt
-      - run: pytest -q tests/test_canon_invariants.py
+      # Structural ownership plus executable data/conservation gates.  These
+      # suites build real generation rows in a temporary DB and exercise the
+      # same validators that run before publication.
+      - run: >-
+          pytest -q tests/test_canon_invariants.py
+          tests/services/test_generation_lifecycle.py
+          tests/services/test_obligation_refresh_validation.py
+          tests/services/test_assembly_output_persistence.py
+          tests/services/test_mrp_freeze.py
+          tests/services/test_purchase_control_snapshot.py
 
   backend:
     needs: canon-invariants
