@@ -3,11 +3,8 @@
 from datetime import datetime, date
 from decimal import Decimal
 
-import pytest
-
 from app import models
 from app.services.item_ledger.supplier_future_supply import supplier_future_supply_evidence
-from app.services.planning_pool_resolver import PlanningPoolConfigurationError
 
 
 def _context(db):
@@ -252,17 +249,31 @@ def test_direct_1c_order_unknown_or_non_netting_state_fails_closed(db_session):
     assert by_ref["unknown"].reason == "supplier_order_state_unknown"
 
 
-def test_direct_1c_order_without_manifest_pool_fails_closed(db_session):
+def test_direct_1c_order_outside_live_contour_is_rejected_not_fatal(db_session):
     generation, item, _allocation = _context(db_session)
     db_session.query(models.PurchaseExportLineAllocation).delete()
     db_session.query(models.SyncLink).delete()
-    _mirrored_order_line(db_session, item)
+    _mirrored_order_line(db_session, item, order_ref="inside")
+    _mirrored_order_line(
+        db_session,
+        item,
+        order_ref="outside",
+        line_number=2,
+        destination="warehouse-outside-contour",
+    )
 
-    with pytest.raises(
-        PlanningPoolConfigurationError,
-        match="outside the live planning contour",
-    ):
-        supplier_future_supply_evidence(db_session, generation.id)
+    rows = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )
+
+    by_ref = {row.source_ref: row for row in rows}
+    assert by_ref["inside"].evidence_status == "exact"
+    assert by_ref["inside"].planning_stock_pool == "main"
+    assert by_ref["outside"].evidence_status == "rejected"
+    assert by_ref["outside"].reason == "planning_pool_not_mapped"
+    assert by_ref["outside"].planning_stock_pool == ""
 
 
 def test_direct_order_changed_after_cutoff_fails_closed(db_session):

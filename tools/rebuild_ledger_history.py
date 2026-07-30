@@ -190,7 +190,13 @@ class GenerationState:
 class ReplayRuntime(Protocol):
     def preflight_assembly_rates(self, item_codes: Sequence[str]) -> None: ...
 
-    def preflight_planning_pools(self) -> None: ...
+    def preflight_planning_pools(
+        self, *, max_off_contour_percent: float, allow_off_contour: bool
+    ) -> Mapping[str, Any]: ...
+
+    def preflight_plan_statuses(
+        self, plan_ids: Sequence[int], *, allow_excluded_plans: bool
+    ) -> Mapping[str, Any]: ...
 
     def generation(self, key: str) -> GenerationState | None: ...
 
@@ -251,16 +257,49 @@ def _require_generation(
     return state
 
 
+def run_preflight(
+    runtime: ReplayRuntime,
+    manifest: ReplayManifest,
+    *,
+    max_off_contour_percent: float,
+    allow_off_contour: bool,
+    allow_excluded_plans: bool,
+) -> dict[str, Any]:
+    """Run every read-only gate and return one report section per gate."""
+    runtime.preflight_assembly_rates(manifest.required_assembly_item_codes)
+    pools = runtime.preflight_planning_pools(
+        max_off_contour_percent=max_off_contour_percent,
+        allow_off_contour=allow_off_contour,
+    )
+    plans = runtime.preflight_plan_statuses(
+        tuple(plan.plan_id for plan in manifest.plans),
+        allow_excluded_plans=allow_excluded_plans,
+    )
+    return {
+        "required_assembly_item_codes": list(manifest.required_assembly_item_codes),
+        "planning_pools": dict(pools or {}),
+        "plans": dict(plans or {}),
+    }
+
+
 def replay_history(
     runtime: ReplayRuntime,
     manifest: ReplayManifest,
     *,
     max_import_iterations: int,
+    max_off_contour_percent: float = 20.0,
+    allow_off_contour: bool = False,
+    allow_excluded_plans: bool = False,
 ) -> dict[str, Any]:
     if max_import_iterations <= 0:
         raise ReplayError("max_import_iterations must be positive")
-    runtime.preflight_assembly_rates(manifest.required_assembly_item_codes)
-    runtime.preflight_planning_pools()
+    preflight = run_preflight(
+        runtime,
+        manifest,
+        max_off_contour_percent=max_off_contour_percent,
+        allow_off_contour=allow_off_contour,
+        allow_excluded_plans=allow_excluded_plans,
+    )
 
     bootstrap = runtime.generation(manifest.bootstrap_key)
     if bootstrap is None:
@@ -367,6 +406,7 @@ def replay_history(
         "status": "complete",
         "final_generation_id": expected_parent_id,
         "plans": completed_plans,
+        "preflight": preflight,
     }
 
 
@@ -436,13 +476,228 @@ class DatabaseRuntime:
         if problems:
             raise ReplayError("assembly-rate preflight failed; " + "; ".join(problems))
 
-    def preflight_planning_pools(self) -> None:
-        """Read-only gate for supplier and WIP future-supply qualification."""
+    def preflight_planning_pools(
+        self,
+        *,
+        max_off_contour_percent: float,
+        allow_off_contour: bool,
+    ) -> dict[str, Any]:
+        """Read-only gate for supplier and WIP future-supply qualification.
+
+        The contour itself must be non-empty (hard fail).  Every destination a
+        capture boundary will actually evaluate is measured against it, so the
+        operator sees the expected ``rejected`` share *before* the destructive
+        clear instead of discovering it as zero coverage afterwards.
+        """
+        from app import models
         from app.services.planning_pool_resolver import (
+            PlanningPoolConfigurationError,
             resolve_planning_pool_by_warehouse,
         )
+        from app.services.supplier_order_status import SupplyPhase, phase_for_state
 
-        resolve_planning_pool_by_warehouse(self.db)
+        try:
+            mapping = resolve_planning_pool_by_warehouse(self.db)
+        except PlanningPoolConfigurationError as exc:
+            raise ReplayError(f"planning-pool preflight failed; {exc}") from exc
+
+        # Same sources the capture boundaries read: the 1C supplier-order mirror
+        # and every ProductionProduct line.
+        evaluated: list[tuple[str, str]] = []
+        not_evaluated = 0
+        for destination, state_name, deleted in (
+            self.db.query(
+                models.SupplierOrderItem.destination_warehouse_ref1c,
+                models.SupplierOrder.order_state_name,
+                models.SupplierOrder.deletion_mark,
+            )
+            .join(
+                models.SupplierOrder,
+                models.SupplierOrder.order_id == models.SupplierOrderItem.order_id,
+            )
+            .all()
+        ):
+            # Deleted and non-goods phases are rejected before the pool check,
+            # so they cannot contribute an off-contour destination.
+            if bool(deleted) or phase_for_state(state_name) not in {
+                SupplyPhase.IN_TRANSIT,
+                SupplyPhase.IN_STOCK,
+            }:
+                not_evaluated += 1
+                continue
+            evaluated.append(("supplier_order", str(destination or "").strip()))
+        for (destination,) in self.db.query(
+            models.ProductionProduct.destination_warehouse_ref1c
+        ).all():
+            evaluated.append(("wip_order", str(destination or "").strip()))
+
+        names = {
+            str(ref or "").strip(): str(name or "")
+            for ref, name in self.db.query(
+                models.StockWarehouse.warehouse_ref1c,
+                models.StockWarehouse.warehouse_name,
+            ).all()
+        }
+        off_by_warehouse: dict[str, dict[str, Any]] = {}
+        in_contour = 0
+        off_contour = 0
+        not_stamped = 0
+        for supply_kind, destination in evaluated:
+            if not destination:
+                not_stamped += 1
+                continue
+            if mapping.get(destination):
+                in_contour += 1
+                continue
+            off_contour += 1
+            bucket = off_by_warehouse.setdefault(
+                destination,
+                {
+                    "warehouse_ref": destination,
+                    "warehouse_name": names.get(destination, ""),
+                    "rows": 0,
+                    "supplier_order_rows": 0,
+                    "wip_order_rows": 0,
+                },
+            )
+            bucket["rows"] += 1
+            bucket[f"{supply_kind}_rows"] += 1
+
+        mapped = in_contour + off_contour
+        percent = (100.0 * off_contour / mapped) if mapped else 0.0
+        details = ", ".join(
+            f"{row['warehouse_ref']} ({row['warehouse_name'] or 'unknown name'}): "
+            f"{row['rows']} rows"
+            for row in sorted(
+                off_by_warehouse.values(), key=lambda row: (-row["rows"], row["warehouse_ref"])
+            )
+        )
+        warnings: list[str] = []
+        if not_stamped:
+            warnings.append(
+                f"{not_stamped} rows carry no destination warehouse and stay rejected"
+            )
+        if off_contour:
+            warnings.append(
+                f"{off_contour} of {mapped} rows ({percent:.1f}%) target "
+                f"{len(off_by_warehouse)} warehouse(s) outside the live planning "
+                f"contour and stay rejected: {details}"
+            )
+        report: dict[str, Any] = {
+            "contour_warehouses": len(mapping),
+            "rows_total": len(evaluated) + not_evaluated,
+            "rows_not_evaluated": not_evaluated,
+            "rows_destination_not_stamped": not_stamped,
+            "rows_in_contour": in_contour,
+            "rows_off_contour": off_contour,
+            "off_contour_percent": round(percent, 3),
+            "max_off_contour_percent": float(max_off_contour_percent),
+            "allow_off_contour": bool(allow_off_contour),
+            "off_contour_by_warehouse": sorted(
+                off_by_warehouse.values(),
+                key=lambda row: (-row["rows"], row["warehouse_ref"]),
+            ),
+            "warnings": warnings,
+        }
+        if off_contour and percent > max_off_contour_percent and not allow_off_contour:
+            raise ReplayError(
+                "planning-pool preflight failed; off-contour destinations are "
+                f"{percent:.1f}% of {mapped} rows (threshold "
+                f"{float(max_off_contour_percent):.1f}%): {details}; rerun with "
+                "--allow-off-contour to accept that coverage loss"
+            )
+        return report
+
+    def preflight_plan_statuses(
+        self,
+        plan_ids: Sequence[int],
+        *,
+        allow_excluded_plans: bool,
+    ) -> dict[str, Any]:
+        """Read-only gate: the replay range holds exactly the manifest plans.
+
+        ``create_mrp_snapshot_from_period_plan`` only accepts a ``fixed`` plan,
+        so a ``draft``/``closed`` plan would abort mid-replay.  A live plan
+        inside the range but outside the manifest would silently lose its
+        obligations, so it must be acknowledged instead of dropped in silence.
+        """
+        from app import models
+
+        wanted = [int(value) for value in plan_ids]
+        if not wanted:
+            raise ReplayError("plan-status preflight failed; manifest has no plans")
+        rows = (
+            self.db.query(
+                models.ProductionPlanHeader.id,
+                models.ProductionPlanHeader.name,
+                models.ProductionPlanHeader.status,
+            )
+            .filter(
+                models.ProductionPlanHeader.id >= min(wanted),
+                models.ProductionPlanHeader.id <= max(wanted),
+            )
+            .order_by(models.ProductionPlanHeader.id.asc())
+            .all()
+        )
+        live = {
+            int(plan_id): (str(name or ""), str(status or ""))
+            for plan_id, name, status in rows
+        }
+        selected = set(wanted)
+        missing = [plan_id for plan_id in wanted if plan_id not in live]
+        not_fixed = [
+            {"plan_id": plan_id, "name": live[plan_id][0], "status": live[plan_id][1]}
+            for plan_id in wanted
+            if plan_id in live and live[plan_id][1] != "fixed"
+        ]
+        excluded = [
+            {"plan_id": plan_id, "name": name, "status": status}
+            for plan_id, (name, status) in sorted(live.items())
+            if plan_id not in selected
+        ]
+        excluded_live = [row for row in excluded if row["status"] != "closed"]
+        warnings: list[str] = []
+        if excluded:
+            warnings.append(
+                "plans inside the replay range are excluded from the manifest: "
+                + ", ".join(
+                    f"{row['plan_id']}={row['status']}" for row in excluded
+                )
+            )
+        report: dict[str, Any] = {
+            "plan_id_range": [min(wanted), max(wanted)],
+            "manifest_plans": wanted,
+            "plans_in_range": len(live),
+            "missing_plans": missing,
+            "not_fixed_plans": not_fixed,
+            "excluded_plans": excluded,
+            "excluded_live_plans": [row["plan_id"] for row in excluded_live],
+            "allow_excluded_plans": bool(allow_excluded_plans),
+            "warnings": warnings,
+        }
+        problems = []
+        if missing:
+            problems.append(
+                "manifest plans do not exist: "
+                + ", ".join(str(plan_id) for plan_id in missing)
+            )
+        if not_fixed:
+            problems.append(
+                "manifest plans are not fixed: "
+                + ", ".join(f"{row['plan_id']}={row['status']}" for row in not_fixed)
+            )
+        if excluded_live and not allow_excluded_plans:
+            problems.append(
+                "live plans inside the replay range are absent from the manifest: "
+                + ", ".join(
+                    f"{row['plan_id']} ({row['name'] or 'unnamed'})={row['status']}"
+                    for row in excluded_live
+                )
+                + "; rerun with --allow-excluded-plans to drop their obligations"
+            )
+        if problems:
+            raise ReplayError("plan-status preflight failed; " + "; ".join(problems))
+        return report
 
     def generation(self, key: str) -> GenerationState | None:
         from app import models
@@ -592,7 +847,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preflight-only",
         action="store_true",
-        help="validate required assembly rates without replay mutations",
+        help="run every read-only gate and report without replay mutations",
+    )
+    parser.add_argument(
+        "--max-off-contour-percent",
+        type=float,
+        default=20.0,
+        help="fail when more of the measured supply rows target warehouses "
+        "outside the live planning contour",
+    )
+    parser.add_argument(
+        "--allow-off-contour",
+        action="store_true",
+        help="acknowledge the measured off-contour share above the threshold",
+    )
+    parser.add_argument(
+        "--allow-excluded-plans",
+        action="store_true",
+        help="acknowledge live plans inside the replay range that the manifest omits",
     )
     return parser
 
@@ -628,6 +900,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ReplayError("page_size must be between 1 and 5000")
     if args.max_pages_per_window < 1 or args.max_pages_per_window > 100_000:
         raise ReplayError("max_pages_per_window must be between 1 and 100000")
+    if not 0.0 <= args.max_off_contour_percent <= 100.0:
+        raise ReplayError("max_off_contour_percent must be between 0 and 100")
 
     manifest = load_manifest(args.manifest)
     backend = _backend_dir()
@@ -644,12 +918,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_pages_per_window=args.max_pages_per_window,
         )
         if args.preflight_only:
-            runtime.preflight_assembly_rates(manifest.required_assembly_item_codes)
-            runtime.preflight_planning_pools()
             result = {
                 "status": "preflight-ok",
-                "required_assembly_item_codes": list(
-                    manifest.required_assembly_item_codes
+                "preflight": run_preflight(
+                    runtime,
+                    manifest,
+                    max_off_contour_percent=args.max_off_contour_percent,
+                    allow_off_contour=args.allow_off_contour,
+                    allow_excluded_plans=args.allow_excluded_plans,
                 ),
             }
         else:
@@ -657,6 +933,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime,
                 manifest,
                 max_import_iterations=args.max_import_iterations,
+                max_off_contour_percent=args.max_off_contour_percent,
+                allow_off_contour=args.allow_off_contour,
+                allow_excluded_plans=args.allow_excluded_plans,
             )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

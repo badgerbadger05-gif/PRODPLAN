@@ -75,6 +75,62 @@ read-only from the checkout:
 
 If this fails, do not clear the database.
 
+## Rehearsal on a restored dump copy
+
+The SQLite-based tests cannot execute either SQL file: the migration harness
+stubs `ALTER TABLE ... ADD CONSTRAINT`, so most KEEP -> CLEAR foreign keys are
+invisible there. `tools/pg_rebuild_check.py` runs the migrations and both files
+against a real PostgreSQL and reports every stage as PASS/FAIL.
+
+Disposable smoke rehearsal (starts and removes its own `postgres:15` on a free
+port, seeds a minimal accepted generation so the clear guard can run, and takes
+about fifteen seconds):
+
+```bash
+python tools/pg_rebuild_check.py
+PRODPLAN_PG_CHECK=1 pytest tests/test_pg_rebuild_check.py   # same run via pytest
+```
+
+On a **restored copy** of the production dump — never on production — first
+prove that the clear transaction reaches `CLEAR PASS` on the real schema:
+
+```bash
+python tools/pg_rebuild_check.py \
+  --dsn "postgresql://USER:PASSWORD@HOST:PORT/prodplan_rebuild_copy" \
+  --stages migrate,round-trip,clear \
+  --allow-destructive-clear \
+  --expected-database prodplan_rebuild_copy \
+  --expected-generation-key "$expected_generation_key"
+```
+
+`--stages clear` commits on the copy, so run it only there. Add
+`--psql-container NAME` when psql lives inside a container instead of on the
+host. After the replay has finished on the same copy, gate it strictly:
+
+```bash
+python tools/pg_rebuild_check.py \
+  --dsn "postgresql://USER:PASSWORD@HOST:PORT/prodplan_rebuild_copy" \
+  --stages verify --strict \
+  --expected-database prodplan_rebuild_copy \
+  --expected-generation-key prod-rebuild-20260729-obligation-plan11 \
+  --expected-cutoff "2026-07-28 14:30:24+03" \
+  --expected-fixed-run-count 10 \
+  --expected-opening-baseline-at "2026-05-31 23:59:59.999999"
+```
+
+Notes:
+
+- The round trip is `head -> 20260726_14 -> head`. A full downgrade to base is
+  impossible by design: `20260726_04` is a destructive canon cleanup whose
+  `downgrade()` raises `RuntimeError`.
+- Default `--smoke` mode tolerates only the documented emptiness failures of the
+  verifier and additionally executes its summary projection, which the aborted
+  `DO` block never reaches. `--strict` treats any failure as a failure.
+- The manifest name, `expected_generation_key`, `expected_cutoff`,
+  `expected_fixed_run_count` and the compose/env defaults used elsewhere in this
+  runbook are still the shadow-contour values. Re-measure them on production
+  before the maintenance window instead of copying them.
+
 ## Maintenance and canonical clear
 
 Stop every database writer. The clear SQL independently refuses to run while

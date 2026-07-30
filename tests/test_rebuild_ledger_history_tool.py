@@ -84,8 +84,13 @@ class FakeRuntime:
         if self.preflight_error is not None:
             raise ReplayError(self.preflight_error)
 
-    def preflight_planning_pools(self):
+    def preflight_planning_pools(self, *, max_off_contour_percent, allow_off_contour):
         self.calls.append(("preflight_planning_pools",))
+        return {"rows_off_contour": 0}
+
+    def preflight_plan_statuses(self, plan_ids, *, allow_excluded_plans):
+        self.calls.append(("preflight_plan_statuses", tuple(plan_ids)))
+        return {"missing_plans": []}
 
     def _add(self, key, cutoff, parent, status="accepted", historical=None, replay=None):
         state = GenerationState(
@@ -177,6 +182,7 @@ def test_replay_sequences_bootstrap_then_plans_and_is_idempotent():
     assert runtime.calls == [
         ("preflight", ("SKU-1", "SKU-11")),
         ("preflight_planning_pools",),
+        ("preflight_plan_statuses", (1, 11)),
         ("bootstrap", "bootstrap"),
         ("import", 1),
         ("import", 1),
@@ -197,6 +203,7 @@ def test_replay_sequences_bootstrap_then_plans_and_is_idempotent():
     assert runtime.calls == [
         ("preflight", ("SKU-1", "SKU-11")),
         ("preflight_planning_pools",),
+        ("preflight_plan_statuses", (1, 11)),
     ]
 
 
@@ -235,6 +242,7 @@ def test_resume_refuses_existing_key_with_wrong_lineage():
     assert runtime.calls == [
         ("preflight", ("SKU-1", "SKU-11")),
         ("preflight_planning_pools",),
+        ("preflight_plan_statuses", (1, 11)),
     ]
 
 
@@ -330,6 +338,211 @@ def test_database_preflight_rejects_ambiguous_positive_rates(db_session):
         _database_runtime(db_session).preflight_assembly_rates(["AMBIGUOUS"])
 
 
+def _warehouse(db, ref, name, *, selected=True, finished_goods=False):
+    from app import models
+
+    db.add(
+        models.StockWarehouse(
+            warehouse_ref1c=ref,
+            warehouse_name=name,
+            is_selected=selected,
+            is_finished_goods=finished_goods,
+        )
+    )
+
+
+def _supplier_line(db, destination, *, state="В пути", deleted=False, number="1"):
+    from app import models
+
+    order = models.SupplierOrder(
+        order_number=number,
+        order_date=datetime(2026, 7, 1),
+        order_ref1c=f"so-{number}",
+        order_state_name=state,
+        deletion_mark=deleted,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        models.SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=1,
+            line_number=1,
+            destination_warehouse_ref1c=destination,
+            quantity=5,
+            remaining_qty=5,
+        )
+    )
+
+
+def _wip_line(db, destination, *, number="1"):
+    from app import models
+
+    order = models.ProductionOrder(
+        order_number=number,
+        order_date=datetime(2026, 7, 1),
+        order_ref1c=f"po-{number}",
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        models.ProductionProduct(
+            order_id=order.order_id,
+            item_id=1,
+            line_number=1,
+            destination_warehouse_ref1c=destination,
+            quantity=3,
+            remaining_qty=3,
+        )
+    )
+
+
+def _plan(db, plan_id, name, status):
+    from app import models
+    from datetime import date
+
+    db.add(
+        models.ProductionPlanHeader(
+            id=plan_id,
+            name=name,
+            period_from=date(2026, 7, 1),
+            period_to=date(2026, 7, 31),
+            status=status,
+        )
+    )
+
+
+def _planning_pools(db, **kwargs):
+    options = {"max_off_contour_percent": 20.0, "allow_off_contour": False}
+    options.update(kwargs)
+    return _database_runtime(db).preflight_planning_pools(**options)
+
+
+def test_planning_pool_preflight_measures_in_and_off_contour_destinations(db_session):
+    _warehouse(db_session, "WH-OK", "Основной")
+    _warehouse(db_session, "WH-FG", "Готовая продукция", finished_goods=True)
+    _supplier_line(db_session, "WH-OK", number="1")
+    _supplier_line(db_session, "WH-OK", number="2")
+    _supplier_line(db_session, None, number="3")
+    _wip_line(db_session, "WH-OK", number="1")
+    _wip_line(db_session, "WH-OK", number="2")
+    _wip_line(db_session, "WH-FG", number="3")
+    db_session.commit()
+
+    report = _planning_pools(db_session)
+
+    assert report["contour_warehouses"] == 1
+    assert report["rows_total"] == 6
+    assert report["rows_in_contour"] == 4
+    assert report["rows_off_contour"] == 1
+    assert report["rows_destination_not_stamped"] == 1
+    assert report["off_contour_percent"] == 20.0
+    assert report["off_contour_by_warehouse"] == [
+        {
+            "warehouse_ref": "WH-FG",
+            "warehouse_name": "Готовая продукция",
+            "rows": 1,
+            "supplier_order_rows": 0,
+            "wip_order_rows": 1,
+        }
+    ]
+    assert any("WH-FG" in warning for warning in report["warnings"])
+    assert any("no destination warehouse" in warning for warning in report["warnings"])
+
+
+def test_planning_pool_preflight_fails_above_threshold_without_explicit_flag(db_session):
+    _warehouse(db_session, "WH-OK", "Основной")
+    _warehouse(db_session, "WH-IGNORED", "Изолятор брака", selected=False)
+    _supplier_line(db_session, "WH-OK", number="1")
+    _wip_line(db_session, "WH-IGNORED", number="1")
+    db_session.commit()
+
+    with pytest.raises(ReplayError, match="--allow-off-contour"):
+        _planning_pools(db_session)
+
+    report = _planning_pools(db_session, allow_off_contour=True)
+    assert report["rows_off_contour"] == 1
+    assert report["off_contour_percent"] == 50.0
+    assert report["off_contour_by_warehouse"][0]["warehouse_ref"] == "WH-IGNORED"
+
+
+def test_planning_pool_preflight_fails_on_empty_contour(db_session):
+    _warehouse(db_session, "WH-FG", "Готовая продукция", finished_goods=True)
+    _wip_line(db_session, "WH-FG", number="1")
+    db_session.commit()
+
+    with pytest.raises(ReplayError, match="planning warehouse contour is empty"):
+        _planning_pools(db_session)
+
+
+def test_planning_pool_preflight_skips_rows_rejected_before_the_pool_check(db_session):
+    _warehouse(db_session, "WH-OK", "Основной")
+    _supplier_line(db_session, "WH-OK", number="1")
+    _supplier_line(db_session, "WH-OUTSIDE", state="В закупку", number="2")
+    _supplier_line(db_session, "WH-OUTSIDE", state="Завершён", number="3")
+    _supplier_line(db_session, "WH-OUTSIDE", deleted=True, number="4")
+    db_session.commit()
+
+    report = _planning_pools(db_session)
+
+    assert report["rows_total"] == 4
+    assert report["rows_not_evaluated"] == 3
+    assert report["rows_in_contour"] == 1
+    assert report["rows_off_contour"] == 0
+    assert report["warnings"] == []
+
+
+def _plan_statuses(db, plan_ids=(1, 11), **kwargs):
+    options = {"allow_excluded_plans": False}
+    options.update(kwargs)
+    return _database_runtime(db).preflight_plan_statuses(plan_ids, **options)
+
+
+def test_plan_status_preflight_rejects_missing_and_non_fixed_plans(db_session):
+    _plan(db_session, 1, "ИЮНЬ 2026", "fixed")
+    db_session.commit()
+
+    with pytest.raises(ReplayError, match="manifest plans do not exist: 11"):
+        _plan_statuses(db_session)
+
+    _plan(db_session, 11, "ИЮЛЬ 2026", "draft")
+    db_session.commit()
+
+    with pytest.raises(ReplayError, match="manifest plans are not fixed: 11=draft"):
+        _plan_statuses(db_session)
+
+
+def test_plan_status_preflight_names_excluded_live_plan_and_requires_flag(db_session):
+    _plan(db_session, 1, "ИЮНЬ 2026", "fixed")
+    _plan(db_session, 10, "СЕНТЯБРЬ 2026 РАЗНИЦА", "fixed")
+    _plan(db_session, 11, "ИЮЛЬ 2026", "fixed")
+    db_session.commit()
+
+    with pytest.raises(ReplayError, match="10 \\(СЕНТЯБРЬ 2026 РАЗНИЦА\\)=fixed"):
+        _plan_statuses(db_session)
+
+    report = _plan_statuses(db_session, allow_excluded_plans=True)
+    assert report["plan_id_range"] == [1, 11]
+    assert report["excluded_live_plans"] == [10]
+    assert report["excluded_plans"] == [
+        {"plan_id": 10, "name": "СЕНТЯБРЬ 2026 РАЗНИЦА", "status": "fixed"}
+    ]
+    assert any("10=fixed" in warning for warning in report["warnings"])
+
+
+def test_plan_status_preflight_reports_closed_excluded_plan_without_failing(db_session):
+    _plan(db_session, 1, "ИЮНЬ 2026", "fixed")
+    _plan(db_session, 10, "СЕНТЯБРЬ 2026 РАЗНИЦА", "closed")
+    _plan(db_session, 11, "ИЮЛЬ 2026", "fixed")
+    db_session.commit()
+
+    report = _plan_statuses(db_session)
+
+    assert report["excluded_live_plans"] == []
+    assert report["not_fixed_plans"] == []
+    assert any("10=closed" in warning for warning in report["warnings"])
+
+
 def test_preflight_only_path_performs_no_replay(monkeypatch, tmp_path, capsys):
     import json
     import rebuild_ledger_history as tool
@@ -345,8 +558,13 @@ def test_preflight_only_path_performs_no_replay(monkeypatch, tmp_path, capsys):
         def preflight_assembly_rates(self, codes):
             calls.append(tuple(codes))
 
-        def preflight_planning_pools(self):
-            calls.append(("planning-pools",))
+        def preflight_planning_pools(self, *, max_off_contour_percent, allow_off_contour):
+            calls.append(("planning-pools", max_off_contour_percent, allow_off_contour))
+            return {"rows_off_contour": 0}
+
+        def preflight_plan_statuses(self, plan_ids, *, allow_excluded_plans):
+            calls.append(("plans", tuple(plan_ids), allow_excluded_plans))
+            return {"missing_plans": []}
 
     class Session:
         def rollback(self):
@@ -364,7 +582,8 @@ def test_preflight_only_path_performs_no_replay(monkeypatch, tmp_path, capsys):
     assert tool.main([str(manifest_path), "--preflight-only"]) == 0
     assert calls == [
         ("SKU-1", "SKU-11"),
-        ("planning-pools",),
+        ("planning-pools", 20.0, False),
+        ("plans", (1, 11), False),
         ("closed",),
     ]
     assert '"status": "preflight-ok"' in capsys.readouterr().out

@@ -237,53 +237,125 @@ def test_production_refresh_resolves_live_pool_for_supplier_and_wip(db_session):
     assert by_kind["wip_order"].open_qty_at_cutoff == Decimal("4")
 
 
-def test_production_refresh_fails_closed_for_unmapped_supplier_destination(db_session):
+def test_production_refresh_rejects_only_lines_outside_the_live_contour(db_session):
+    """One stray destination must cost its own line, never the whole refresh."""
     accepted, plan, _line, _item, _old, cutoff = _world(
         db_session,
         with_parent=False,
     )
-    supplied_item = models.Item(
-        item_code="ORCH-UNMAPPED",
-        item_name="unmapped supplier destination",
+    # A finished-goods warehouse is live in 1C but deliberately outside the
+    # planning contour; production routinely releases output into it.
+    db_session.add(
+        models.StockWarehouse(
+            warehouse_ref1c="WH-FG",
+            warehouse_name="Finished goods",
+            is_selected=True,
+            is_finished_goods=True,
+        )
+    )
+    supplier_item = models.Item(
+        item_code="ORCH-MIXED-SUPPLY",
+        item_name="mixed supplier supply",
         replenishment_method="Покупка",
     )
-    order = models.SupplierOrder(
-        order_number="SO-UNMAPPED",
-        order_ref1c="so-unmapped-ref",
-        order_date=cutoff - timedelta(days=2),
+    wip_item = models.Item(
+        item_code="ORCH-MIXED-WIP",
+        item_name="mixed WIP supply",
+        replenishment_method="Производство",
+    )
+    db_session.add_all([supplier_item, wip_item])
+    db_session.flush()
+
+    supplier_order = models.SupplierOrder(
+        order_number="SO-MIXED",
+        order_ref1c="so-mixed-ref",
+        order_date=cutoff - timedelta(days=3),
         order_state_name="В пути",
+        deletion_mark=False,
+        created_at=cutoff - timedelta(days=3),
+        updated_at=cutoff - timedelta(days=1),
+    )
+    production_order = models.ProductionOrder(
+        order_number="WO-MIXED",
+        order_ref1c="wo-mixed-ref",
+        order_date=cutoff - timedelta(days=2),
+        order_state_key="open",
         deletion_mark=False,
         created_at=cutoff - timedelta(days=2),
         updated_at=cutoff - timedelta(days=1),
     )
-    db_session.add_all([supplied_item, order])
+    db_session.add_all([supplier_order, production_order])
     db_session.flush()
-    db_session.add(
-        models.SupplierOrderItem(
-            order_id=order.order_id,
-            item_id_ref=supplied_item.item_id,
-            line_number=1,
-            destination_warehouse_ref1c="WH-NOT-IN-CONTOUR",
-            quantity=Decimal("2"),
-            received_qty=Decimal("0"),
-            remaining_qty=Decimal("2"),
-            delivery_date=cutoff + timedelta(days=5),
-            created_at=cutoff - timedelta(days=2),
-            updated_at=cutoff - timedelta(days=1),
+    for line_number, destination, qty in (
+        (1, "WH-OUT", "7"),
+        (2, "WH-NOT-IN-CONTOUR", "3"),
+    ):
+        db_session.add(
+            models.SupplierOrderItem(
+                order_id=supplier_order.order_id,
+                item_id_ref=supplier_item.item_id,
+                line_number=line_number,
+                destination_warehouse_ref1c=destination,
+                quantity=Decimal(qty),
+                received_qty=Decimal("0"),
+                remaining_qty=Decimal(qty),
+                delivery_date=cutoff + timedelta(days=10),
+                created_at=cutoff - timedelta(days=2),
+                updated_at=cutoff - timedelta(days=1),
+            )
         )
-    )
+    for line_number, destination, qty in ((1, "WH-OUT", "4"), (2, "WH-FG", "9")):
+        db_session.add(
+            models.ProductionProduct(
+                order_id=production_order.order_id,
+                item_id=wip_item.item_id,
+                line_number=line_number,
+                destination_warehouse_ref1c=destination,
+                quantity=Decimal(qty),
+                produced_qty=Decimal("0"),
+                remaining_qty=Decimal(qty),
+            )
+        )
     db_session.commit()
 
-    with pytest.raises(
-        PlanningPoolConfigurationError,
-        match="outside the live planning contour",
-    ):
-        _run(
-            db_session,
-            accepted,
-            "orch-unmapped-planning-pool",
-            add=[plan.id],
-        )
+    result = _run(
+        db_session,
+        accepted,
+        "orch-mixed-planning-pool",
+        add=[plan.id],
+    )
+
+    assert result.published is True
+    rows = (
+        db_session.query(models.LedgerFutureSupply)
+        .filter_by(ledger_generation_id=result.target_generation_id)
+        .all()
+    )
+    by_line = {
+        (row.supply_kind, row.source_line_ref): row for row in rows
+    }
+    assert by_line[("supplier_order", "1")].evidence_status == "exact"
+    assert by_line[("supplier_order", "1")].planning_stock_pool == "default"
+    assert by_line[("supplier_order", "1")].open_qty_at_cutoff == Decimal("7")
+    assert by_line[("wip_order", "1")].evidence_status == "exact"
+    assert by_line[("wip_order", "1")].planning_stock_pool == "default"
+    assert by_line[("wip_order", "1")].open_qty_at_cutoff == Decimal("4")
+    for identity in (("supplier_order", "2"), ("wip_order", "2")):
+        rejected = by_line[identity]
+        assert rejected.evidence_status == "rejected"
+        assert rejected.reason == "planning_pool_not_mapped"
+        assert rejected.planning_stock_pool == ""
+        assert rejected.open_qty_at_cutoff == Decimal("0")
+
+    capture = (
+        db_session.query(models.LedgerBuildBatch)
+        .filter_by(ledger_generation_id=result.target_generation_id, stage="snapshot_build")
+        .one()
+        .metrics["future_supply_capture"]
+    )
+    assert capture["rows"] == 4
+    assert capture["exact_rows"] == 2
+    assert capture["non_supply_rows"] == 2
 
 
 def test_production_refresh_fails_before_build_when_planning_contour_is_empty(

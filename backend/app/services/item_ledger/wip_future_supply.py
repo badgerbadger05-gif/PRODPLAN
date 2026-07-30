@@ -16,7 +16,6 @@ from typing import Mapping
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.planning_pool_resolver import require_mapped_destination
 
 from .future_supply_capture import (
     FutureSupplyEvidence,
@@ -195,11 +194,10 @@ def collect_wip_future_supply_evidence(
         elif not destination:
             status, reason = "rejected", "missing destination warehouse mapping"
         elif not planning_pool:
-            planning_pool = require_mapped_destination(
-                pools_by_destination,
-                destination,
-                source=f"wip_order:{order_ref}:{line_ref}",
-            )
+            # Production lines are read without any state/date filter, so a
+            # finished-goods or retired destination is normal input: reject the
+            # line, never the whole capture.
+            status, reason = "rejected", "planning_pool_not_mapped"
         elif invalid_reasons.get(product_id):
             status, reason = "rejected", "; ".join(sorted(invalid_reasons[product_id]))
         eta = _as_date(getattr(product.control_state, "planned_finish_date", None))

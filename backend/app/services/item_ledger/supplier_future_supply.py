@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.supplier_order_status import SupplyPhase, phase_for_state
-from app.services.planning_pool_resolver import require_mapped_destination
 
 from .future_supply_capture import FutureSupplyEvidence, future_supply_evidence_hash
 from .physical_visibility import visible_sle_query
@@ -359,16 +358,16 @@ def supplier_future_supply_evidence(
             allocation_destinations and allocation_destinations != {destination}
         ):
             status, reason = "rejected", "destination_conflicts_with_export_provenance"
-        elif not planning_pool:
-            planning_pool = require_mapped_destination(
-                pools_by_destination,
-                destination,
-                source=f"supplier_order:{external_order_ref}:{external_line_ref}",
-            )
         elif len(allocation_pools) > 1 or (
-            allocation_pools and allocation_pools != {planning_pool}
+            allocation_pools and planning_pool and allocation_pools != {planning_pool}
         ):
+            # Ordered before the contour test so export provenance that already
+            # disagrees with itself is not masked by an unmapped destination.
             status, reason = "rejected", "planning_pool_conflicts_with_export_provenance"
+        elif not planning_pool:
+            # A destination outside the live contour disqualifies this line
+            # only; one stray warehouse must never abort the whole refresh.
+            status, reason = "rejected", "planning_pool_not_mapped"
         elif mirror_line is not None and rows and allocation_ordered != ordered:
             status, reason = "rejected", "quantity_conflicts_with_export_provenance"
         elif mirror_line is None and link_error:
