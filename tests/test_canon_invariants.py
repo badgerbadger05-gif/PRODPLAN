@@ -17,16 +17,17 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8").lstrip("\ufeff")
 
 
-def _read_owner_document(name: str) -> str | None:
-    """Read an owner-decision document kept outside the repository.
+def _read_owner_document(name: str) -> str:
+    """Read an owner-decision document from its canonical home in the repo.
 
-    Per .docs/CANON.md these live next to the checkout (the owner's machine)
-    and are deliberately not vendored in, so copying them here would create a
-    second source of truth. They are simply absent on CI and on any other
-    machine; the caller then checks only the in-repo half of the invariant.
+    Per .docs/CANON.md (owner decision 2026-07-30) these live in .docs/notes/
+    inside the repository; workstation copies are secondary and
+    machine-specific absolute paths are forbidden. A missing document is a
+    hard failure, never a silent skip.
     """
-    path = PRODPLAN / name
-    return _read(path) if path.is_file() else None
+    path = REPO / ".docs/notes" / name
+    assert path.is_file(), f"owner document missing from .docs/notes/: {name}"
+    return _read(path)
 
 
 def _python_sources(root: Path):
@@ -83,6 +84,11 @@ def test_canonical_module_registry_points_to_existing_code() -> None:
         "backend/app/services/item_ledger/physical_visibility.py",
         "backend/app/services/item_ledger/reservation.py",
         "backend/app/services/item_ledger/reservation_ledger.py",
+        "backend/app/services/item_ledger/historical_replay_core.py",
+        "backend/app/services/item_ledger/historical_replay_persistence.py",
+        "backend/app/services/item_ledger/supplier_receipt_allocation.py",
+        "backend/app/services/production_output_truth.py",
+        "backend/app/services/bom_specification_resolver.py",
         "backend/app/services/mrp_freeze.py",
         "backend/app/services/planning_service.py",
         "backend/app/services/item_ledger/generation_lifecycle.py",
@@ -98,25 +104,21 @@ def test_execution_contract_uses_percent_and_caps_execution() -> None:
     decisions = _read_owner_document("mrp-decisions-log.md")
     reservation = _read(REPO / ".docs/reservation-replenishment-core.md")
 
-    documents = [reservation] if decisions is None else [decisions, reservation]
-    for document in documents:
+    for document in (decisions, reservation):
         assert "replenishment_required_qty * 100" in document
         assert "min(" in document
         assert "replenishment_received_qty" in document
     assert "0 <= execution_pct <= 100" in reservation
-    if decisions is not None:
-        assert "от 0 до 100" in decisions
+    assert "от 0 до 100" in decisions
 
 
 def test_plan_output_field_name_is_canonical() -> None:
     design = _read_owner_document("mrp-item-ledger-design.md")
     assembly = _read(REPO / ".docs/assembly-queue-and-drum.md")
 
-    assert "accepted_plan_output_qty" in assembly
-    assert "accepted_output_qty" not in assembly
-    if design is not None:
-        assert "accepted_plan_output_qty" in design
-        assert "accepted_output_qty" not in design
+    for document in (assembly, design):
+        assert "accepted_plan_output_qty" in document
+        assert "accepted_output_qty" not in document
 
 
 def test_user_guide_does_not_restore_retired_workflows() -> None:
