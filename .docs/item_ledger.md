@@ -5,8 +5,8 @@
 - [`CANON.md`](CANON.md);
 - [`reservation-replenishment-core.md`](reservation-replenishment-core.md);
 - [`planning-truth-contract.md`](planning-truth-contract.md);
-- `/home/ivan/PRODPLAN/mrp-item-ledger-design.md`;
-- `/home/ivan/PRODPLAN/item-ledger-view-contract.md`.
+- [`notes/mrp-item-ledger-design.md`](notes/mrp-item-ledger-design.md);
+- [`notes/item-ledger-view-contract.md`](notes/item-ledger-view-contract.md).
 
 1С читается pull-by-document в `stock_ledger_entry`. `stock_bin` хранит
 материализованный остаток. Balance служит только сверкой и источником
