@@ -112,6 +112,75 @@ def test_execution_contract_uses_percent_and_caps_execution() -> None:
     assert "от 0 до 100" in decisions
 
 
+def test_owner_decision_keeps_address_first_fifo_policy() -> None:
+    decisions = _read_owner_document("mrp-decisions-log.md")
+    canon = _read(REPO / ".docs/CANON.md")
+    truth = _read(REPO / ".docs/planning-truth-contract.md")
+    reservation = _read(REPO / ".docs/reservation-replenishment-core.md")
+
+    required = (
+        "точная канонически подтверждённая связь",
+        "излишек",
+        "неизвестному PRODPLAN заказу 1С",
+        "неполная, обрезанная или отфильтрованная выгрузка",
+    )
+    for token in required:
+        assert token.casefold() in decisions.casefold()
+
+    for document in (canon, truth, reservation):
+        assert "адрес" in document.casefold()
+        assert "FIFO" in document
+
+    retired_phrases = (
+        "Requirement/order identity is provenance only",
+        "Ссылка на закупочный или производственный заказ является только provenance",
+        "при открытых заказах с обеих сторон ничего не гасит",
+        "Правило назначения всегда FIFO",
+    )
+    active_documents = (decisions, canon, truth, reservation)
+    found = [
+        phrase
+        for phrase in retired_phrases
+        if any(phrase in document for document in active_documents)
+    ]
+    assert not found, f"Retired FIFO-only policy returned: {found}"
+
+
+def test_owner_decisions_define_supplier_s0_and_master_data_edges() -> None:
+    decisions = _read_owner_document("mrp-decisions-log.md")
+    canon = _read(REPO / ".docs/CANON.md")
+    reservation = _read(REPO / ".docs/reservation-replenishment-core.md")
+    truth = _read(REPO / ".docs/planning-truth-contract.md")
+    shelves = _read(REPO / ".docs/shelves-buffers-and-mechshop-pull.md")
+
+    decision_tokens = (
+        "PurchaseExportObligationAllocation",
+        "allocated_qty",
+        "newest-first",
+        "senior_hold_qty",
+        "accepted_attributed_consumption_qty",
+        "Item.replenishment_time",
+        "Значение `0` валидно",
+        "не считается\nпроизводством по умолчанию",
+    )
+    for token in decision_tokens:
+        assert token in decisions
+
+    for document in (canon, reservation, truth):
+        assert "allocated_qty" in document
+        assert "newest-first" in document
+        assert "unavailable" in document
+
+    assert "free_s0_qty" in reservation
+    assert "Поступление удержание не освобождает" in reservation
+    assert "ShelfPolicy.replenishment_time_days" in canon
+    assert "Item.replenishment_time" in canon
+    assert "Ни одно из этих полей не подменяет другое" in shelves
+
+    one_c = _read(REPO / ".docs/one_c_export_from_prodplan.md")
+    assert "Как обрабатывать отмены, сторно и возвраты поставщику" not in one_c
+
+
 def test_plan_output_field_name_is_canonical() -> None:
     design = _read_owner_document("mrp-item-ledger-design.md")
     assembly = _read(REPO / ".docs/assembly-queue-and-drum.md")
