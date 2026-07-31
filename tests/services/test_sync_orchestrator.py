@@ -317,6 +317,82 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
     assert orch.status()["physical_refresh"]["active_generation_key"] is None
 
 
+def test_physical_refresh_drops_identity_of_discarded_candidate(
+    tmp_state, db_session, monkeypatch
+):
+    """An admin discard flips the candidate out of BUILDING behind the
+    orchestrator's back; the persisted retry identity must not resurrect the
+    dead cutoff, and the backoff earned by the dead candidate must reset."""
+    parent = _accepted_parent_fixture(db_session)
+    monkeypatch.setattr(
+        orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"}
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0},
+    )
+
+    class DummyClient:
+        base_url = "https://example.local/odata"
+        username = None
+        password = None
+        token = None
+
+    monkeypatch.setattr(orch, "_build_client", lambda: DummyClient())
+    monkeypatch.setattr(
+        orch,
+        "get_stock_from_1c_odata",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    assert orch.tick(db=db_session, now=now)["status"] == "error"
+    stale = orch.status()["physical_refresh"]
+    stale_key = stale["active_generation_key"]
+    assert stale_key and stale["failure_count"] == 1
+
+    db_session.add(
+        models.LedgerGeneration(
+            generation_key=stale_key,
+            status="rejected",
+            cutoff=now,
+            physical_import_batch_id=parent.physical_import_batch_id,
+            source_watermarks={
+                "generation_kind": "physical_refresh",
+                "parent_generation_id": parent.id,
+            },
+            capabilities={},
+            algorithm_version="ledger-physical-refresh-generation/1",
+        )
+    )
+    db_session.commit()
+
+    seen = {}
+
+    def _fresh(db, target_cutoff, generation_key):
+        seen.update(cutoff=target_cutoff, key=generation_key)
+        return {
+            "parent_generation_id": parent.id,
+            "physical_generation_id": 1,
+            "published_generation_id": 1,
+            "target_cutoff": target_cutoff.isoformat(),
+            "published": True,
+            "result": {"ok": True},
+        }
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _fresh)
+    monkeypatch.setattr(orch, "_due_jobs", lambda state, current: [])
+    retry_at = datetime.fromisoformat(stale["next_retry_at"])
+    result = orch.tick(db=db_session, now=retry_at + timedelta(seconds=1))
+
+    assert result["status"] == "ok"
+    assert result["job"] == "physicalRefresh"
+    assert seen["key"] != stale_key
+    assert seen["cutoff"] == (retry_at + timedelta(seconds=1)).replace(microsecond=0)
+    assert orch.status()["physical_refresh"]["active_generation_key"] is None
+
+
 def test_physical_refresh_recovers_building_generation_when_state_is_lost(
     tmp_state, db_session, monkeypatch
 ):
