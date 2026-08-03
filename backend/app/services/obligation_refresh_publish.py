@@ -706,6 +706,19 @@ def _exact_retry(
     except ObligationRefreshPublishError:
         return None
     for candidate in additions:
+        source_plan = _lock(db.query(models.ProductionPlanHeader)).filter(
+            models.ProductionPlanHeader.id == int(candidate.source_plan_id),
+        ).one_or_none()
+        if (
+            source_plan is None
+            or str(source_plan.status) != "fixed"
+            or source_plan.fixed_at is None
+        ):
+            raise ObligationRefreshPublishError(
+                "add source plan must be fixed with historical fixation time"
+            )
+        if candidate.fixed_at != source_plan.fixed_at:
+            return None
         locked_rows = _lock(db.query(models.ProductionPlanLine)).filter(
             models.ProductionPlanLine.plan_id == int(candidate.source_plan_id),
             models.ProductionPlanLine.locked_by_run_id.is_not(None),
@@ -869,7 +882,20 @@ def publish_obligation_refresh_batch(
         raise ObligationRefreshPublishError("candidate has external export links")
 
     # A source plan must not be half-transferred by an earlier/manual mutation.
+    addition_fixed_at: dict[int, datetime] = {}
     for candidate in additions:
+        source_plan = _lock(db.query(models.ProductionPlanHeader)).filter(
+            models.ProductionPlanHeader.id == int(candidate.source_plan_id),
+        ).one_or_none()
+        if (
+            source_plan is None
+            or str(source_plan.status) != "fixed"
+            or source_plan.fixed_at is None
+        ):
+            raise ObligationRefreshPublishError(
+                "add source plan must be fixed with historical fixation time"
+            )
+        addition_fixed_at[int(candidate.run_id)] = source_plan.fixed_at
         locked_rows = _lock(db.query(models.ProductionPlanLine)).filter(
             models.ProductionPlanLine.plan_id == int(candidate.source_plan_id),
             models.ProductionPlanLine.locked_by_run_id.is_not(None),
@@ -907,7 +933,12 @@ def publish_obligation_refresh_batch(
     for candidate in additions:
         candidate.status = "FIXED_SNAPSHOT"
         candidate.pinned = True
-        candidate.fixed_at = accepted_at
+        # The run is the immutable projection of the plan obligation.  Its
+        # fixation time is the business event recorded on the source plan,
+        # not the wall-clock time of this technical Ledger publication.  This
+        # distinction is essential for historical replay: the next physical
+        # cutoff must see and carry every plan fixed before that cutoff.
+        candidate.fixed_at = addition_fixed_at[int(candidate.run_id)]
         candidate.finished_at = accepted_at
     for snapshot in [
         *candidate_read_snapshots,

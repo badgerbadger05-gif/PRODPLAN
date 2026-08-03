@@ -286,7 +286,7 @@ def _batch(db, count=2, add_count=0):
     for index in range(add_count):
         plan = models.ProductionPlanHeader(
             name=f"added {index}", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
-            status="fixed",
+            status="fixed", fixed_at=cutoff,
         )
         db.add(plan)
         db.flush()
@@ -346,6 +346,23 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
         ledger_generation_id=target.id, consumer="mrp_result"
     ).all()
     assert snapshots == []
+
+
+def test_added_run_preserves_source_plan_historical_fixation_time(db_session):
+    cutoff, parent, target, _parents, candidates = _batch(
+        db_session, count=0, add_count=1
+    )
+    historical_fixed_at = cutoff.replace(day=cutoff.day - 5)
+    source_plan = db_session.get(
+        models.ProductionPlanHeader, int(candidates[0].source_plan_id)
+    )
+    source_plan.fixed_at = historical_fixed_at
+    db_session.commit()
+
+    _publish(db_session, parent, target, cutoff)
+
+    assert candidates[0].fixed_at.replace(tzinfo=timezone.utc) == historical_fixed_at
+    assert candidates[0].finished_at.replace(tzinfo=timezone.utc) == cutoff
 
 
 def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
