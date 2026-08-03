@@ -234,7 +234,6 @@ def materialize_assembly_queue_lines(
         db.query(models.AssemblyQueueLine)
         .filter(
             models.AssemblyQueueLine.ledger_generation_id == int(generation.id),
-            models.AssemblyQueueLine.line_status == "open",
         )
         .order_by(models.AssemblyQueueLine.sort_key.asc(), models.AssemblyQueueLine.id.asc())
         .all()
@@ -246,7 +245,7 @@ def materialize_assembly_queue_lines(
                 "persisted assembly queue lacks frozen eligible_from for plan lines "
                 + ",".join(str(value) for value in missing)
             )
-        return rows
+        return [row for row in rows if str(row.line_status or "") == "open"]
 
     payload_rows: list[models.AssemblyQueueLine] = []
     for row in _build_rows(db, int(generation.id)):

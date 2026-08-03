@@ -562,7 +562,8 @@ BEGIN
     SELECT count(*), coalesce(sum(assembly_remaining_qty), 0)
       INTO v_count, v_quantity
       FROM assembly_queue_line
-     WHERE ledger_generation_id = v_generation_id;
+     WHERE ledger_generation_id = v_generation_id
+       AND line_status = 'open';
     IF v_count = 0 OR v_quantity <= 0 THEN
         RAISE EXCEPTION
             'current assembly queue is empty or has no open quantity';
@@ -570,8 +571,9 @@ BEGIN
 
     SELECT count(*)
       INTO v_count
-      FROM assembly_queue_line
+     FROM assembly_queue_line
      WHERE ledger_generation_id = v_generation_id
+       AND line_status = 'open'
        AND assembly_remaining_qty <= 0;
     IF v_count <> 0 THEN
         RAISE EXCEPTION
@@ -642,6 +644,7 @@ BEGIN
                SELECT coalesce(sum(assembly_remaining_qty), 0)
                  FROM assembly_queue_line
                 WHERE ledger_generation_id = v_generation_id
+                  AND line_status = 'open'
            )
            OR schedule.total_slot_qty IS DISTINCT FROM (
                SELECT coalesce(sum(slot_qty), 0)
@@ -665,6 +668,7 @@ BEGIN
       INTO v_count
       FROM assembly_queue_line AS queue
      WHERE queue.ledger_generation_id = v_generation_id
+       AND queue.line_status = 'open'
        AND queue.assembly_remaining_qty IS DISTINCT FROM (
            SELECT
                coalesce(sum(piece.qty), 0)
@@ -760,9 +764,10 @@ queue AS (
     SELECT
         count(*) AS queue_row_count,
         coalesce(sum(line.assembly_remaining_qty), 0) AS open_qty
-      FROM assembly_queue_line AS line
+     FROM assembly_queue_line AS line
       CROSS JOIN current_generation AS generation
      WHERE line.ledger_generation_id = generation.id
+       AND line.line_status = 'open'
 ),
 drum AS (
     SELECT

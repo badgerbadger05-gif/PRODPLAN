@@ -139,7 +139,6 @@ def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandida
         db.query(models.AssemblyQueueLine)
         .filter(
             models.AssemblyQueueLine.ledger_generation_id == int(generation.id),
-            models.AssemblyQueueLine.line_status == "open",
         )
         .order_by(
             models.AssemblyQueueLine.sort_key.asc(),
@@ -739,6 +738,11 @@ def _apply_allocations_to_assembly_queue(
             _dec(row.planned_output_qty) - new_accepted,
             Decimal("0"),
         )
+        row.line_status = (
+            "fulfilled"
+            if _dec(row.assembly_remaining_qty) == Decimal("0")
+            else "open"
+        )
 
     db.flush()
 
@@ -808,6 +812,7 @@ def materialize_assembly_output_allocations(
         for row in rows:
             row.accepted_plan_output_qty = Decimal("0")
             row.assembly_remaining_qty = _dec(row.planned_output_qty)
+            row.line_status = "open"
         if rows:
             db.flush()
 

@@ -5,6 +5,7 @@ import pytest
 
 from app import models
 from app.services.item_ledger.assembly_output_persistence import materialize_assembly_output_allocations
+from app.services.item_ledger.assembly_queue_snapshot import build_assembly_queue_snapshot
 from app.services.item_ledger.drum_schedule_persistence import materialize_drum_schedule
 
 
@@ -819,3 +820,42 @@ def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
     assert Decimal(schedule["total_slot_qty"]) == Decimal("7")
     assert db_session.query(models.DrumSlot).count() == 1
     assert db_session.query(models.DrumSlot).one().slot_qty == Decimal("7")
+
+
+def test_fully_allocated_queue_line_is_fulfilled_and_excluded_from_snapshot(
+    db_session,
+):
+    cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="fulfilled-queue", cutoff=cutoff)
+    item = _item(db_session, "ASM-FULFILLED")
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("3"),
+        period_from=date(2026, 8, 1),
+    )
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+
+    materialize_assembly_output_allocations(db_session, generation.id)
+    queue = db_session.query(models.AssemblyQueueLine).filter_by(
+        ledger_generation_id=generation.id,
+        plan_line_id=line.id,
+    ).one()
+    assert queue.assembly_remaining_qty == Decimal("0")
+    assert queue.line_status == "fulfilled"
+
+    snapshot = build_assembly_queue_snapshot(db_session, generation.id)
+    assert snapshot.payload["rows"] == []
+    assert snapshot.payload["total_rows"] == 0
+    assert snapshot.payload["total_queue_qty"] == 0.0
+
+    repeated = materialize_assembly_output_allocations(db_session, generation.id)
+    assert repeated["allocations"] == 1
