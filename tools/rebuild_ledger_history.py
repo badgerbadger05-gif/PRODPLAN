@@ -57,6 +57,7 @@ class ReplayManifest:
     replay_from: datetime
     bootstrap_cutoff: datetime
     bootstrap_key: str
+    material_custody_baseline_cells: tuple[dict[str, Any], ...]
     required_assembly_item_codes: tuple[str, ...]
     plans: tuple[PlanReplay, ...]
 
@@ -67,6 +68,7 @@ class ReplayManifest:
             "replay_from",
             "bootstrap_cutoff",
             "bootstrap_key",
+            "material_custody_baseline_cells",
             "required_assembly_item_codes",
             "plans",
         }
@@ -81,6 +83,14 @@ class ReplayManifest:
         replay_from = _timestamp(raw["replay_from"], "replay_from")
         bootstrap_cutoff = _timestamp(raw["bootstrap_cutoff"], "bootstrap_cutoff")
         bootstrap_key = _key(raw["bootstrap_key"], "bootstrap_key")
+        custody_cells_raw = raw["material_custody_baseline_cells"]
+        if not isinstance(custody_cells_raw, list) or any(
+            not isinstance(value, Mapping) for value in custody_cells_raw
+        ):
+            raise ReplayError(
+                "material_custody_baseline_cells must be an array of objects"
+            )
+        custody_cells = tuple(dict(value) for value in custody_cells_raw)
         required_codes_raw = raw["required_assembly_item_codes"]
         if not isinstance(required_codes_raw, list) or not required_codes_raw:
             raise ReplayError("required_assembly_item_codes must be a non-empty array")
@@ -159,6 +169,7 @@ class ReplayManifest:
             replay_from=replay_from,
             bootstrap_cutoff=bootstrap_cutoff,
             bootstrap_key=bootstrap_key,
+            material_custody_baseline_cells=custody_cells,
             required_assembly_item_codes=required_codes,
             plans=tuple(plans),
         )
@@ -209,6 +220,13 @@ class ReplayRuntime(Protocol):
     def balance_is_valid(self, generation_id: int) -> bool: ...
 
     def verify_balance(self, generation_id: int) -> bool: ...
+
+    def initialize_custody_baseline(
+        self,
+        generation_id: int,
+        cells: Sequence[dict[str, Any]],
+        observed_at: datetime,
+    ) -> None: ...
 
     def accept_bootstrap(self, generation_id: int, replay_from: datetime) -> None: ...
 
@@ -331,6 +349,11 @@ def replay_history(
         if not runtime.balance_is_valid(bootstrap.generation_id):
             if not runtime.verify_balance(bootstrap.generation_id):
                 raise ReplayError("historical balance convergence failed")
+        runtime.initialize_custody_baseline(
+            bootstrap.generation_id,
+            manifest.material_custody_baseline_cells,
+            manifest.bootstrap_cutoff,
+        )
         runtime.accept_bootstrap(bootstrap.generation_id, manifest.replay_from)
         bootstrap = runtime.generation(manifest.bootstrap_key)
         if bootstrap is None or bootstrap.status != "accepted":
@@ -785,6 +808,32 @@ class DatabaseRuntime:
                 expected_parent_generation_id=None,
             ),
             self.db,
+        )
+
+    def initialize_custody_baseline(
+        self,
+        generation_id: int,
+        cells: Sequence[dict[str, Any]],
+        observed_at: datetime,
+    ) -> None:
+        from app import models
+        from app.services.production_material_custody_projection import (
+            initialize_material_custody_baseline,
+        )
+
+        existing = self.db.get(
+            models.ProductionMaterialCustodyProjectionManifest,
+            int(generation_id),
+        )
+        if existing is not None:
+            raise ReplayError(
+                "bootstrap custody baseline already exists before acceptance"
+            )
+        initialize_material_custody_baseline(
+            self.db,
+            ledger_generation_id=int(generation_id),
+            cells=cells,
+            observed_at=observed_at,
         )
 
     def fixed_snapshot_exists(self, generation_id: int, plan_id: int) -> bool:

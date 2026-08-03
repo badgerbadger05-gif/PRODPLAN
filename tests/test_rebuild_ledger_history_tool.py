@@ -26,6 +26,7 @@ def _raw_manifest():
         "replay_from": "2026-06-02T00:00:00+03:00",
         "bootstrap_cutoff": "2026-06-02T17:12:50+03:00",
         "bootstrap_key": "bootstrap",
+        "material_custody_baseline_cells": [],
         "required_assembly_item_codes": ["SKU-1", "SKU-11"],
         "plans": [
             {
@@ -130,6 +131,9 @@ class FakeRuntime:
         self.valid_balance = True
         return True
 
+    def initialize_custody_baseline(self, generation_id, cells, observed_at):
+        self.calls.append(("custody_baseline", generation_id, tuple(cells), observed_at))
+
     def accept_bootstrap(self, generation_id, replay_from):
         self.calls.append(("accept", generation_id))
         old = self.states["bootstrap"]
@@ -187,6 +191,7 @@ def test_replay_sequences_bootstrap_then_plans_and_is_idempotent():
         ("import", 1),
         ("import", 1),
         ("verify", 1),
+        ("custody_baseline", 1, (), manifest.bootstrap_cutoff),
         ("accept", 1),
         ("snapshot", 1, "obligation-1"),
         ("commit",),

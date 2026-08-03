@@ -49,6 +49,9 @@ manifest="$repo/config/ledger_rebuild_history_20260729.json"
    cutoff. Do not infer or backfill a historical baseline from current mutable
    material-issue statuses. Later generations fold only append-only custody
    events and fail closed when the baseline/manifest is absent.
+   The reviewed cells are sealed in the replay manifest under
+   `material_custody_baseline_cells`; an empty array is an explicit empty
+   baseline, not an inferred default.
 
 Create and verify the backup without relying on a host PostgreSQL install:
 
