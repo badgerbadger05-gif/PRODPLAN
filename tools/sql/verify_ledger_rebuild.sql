@@ -645,7 +645,39 @@ BEGIN
                  FROM assembly_queue_line
                 WHERE ledger_generation_id = v_generation_id
                   AND line_status = 'open'
-           )
+           ) - coalesce((schedule.metrics::jsonb ->> 'excluded_open_qty')::numeric, 0)
+           OR coalesce((schedule.metrics::jsonb ->> 'excluded_lines')::bigint, 0)
+              IS DISTINCT FROM (
+                  SELECT count(*)
+                    FROM assembly_queue_line AS queue
+                   WHERE queue.ledger_generation_id = v_generation_id
+                     AND queue.line_status = 'open'
+                     AND queue.item_id IN (
+                         SELECT value::bigint
+                           FROM jsonb_array_elements_text(
+                               coalesce(
+                                   schedule.metrics::jsonb -> 'excluded_item_ids',
+                                   '[]'::jsonb
+                               )
+                           ) AS excluded(value)
+                     )
+              )
+           OR coalesce((schedule.metrics::jsonb ->> 'excluded_open_qty')::numeric, 0)
+              IS DISTINCT FROM (
+                  SELECT coalesce(sum(queue.assembly_remaining_qty), 0)
+                    FROM assembly_queue_line AS queue
+                   WHERE queue.ledger_generation_id = v_generation_id
+                     AND queue.line_status = 'open'
+                     AND queue.item_id IN (
+                         SELECT value::bigint
+                           FROM jsonb_array_elements_text(
+                               coalesce(
+                                   schedule.metrics::jsonb -> 'excluded_item_ids',
+                                   '[]'::jsonb
+                               )
+                           ) AS excluded(value)
+                     )
+              )
            OR schedule.total_slot_qty IS DISTINCT FROM (
                SELECT coalesce(sum(slot_qty), 0)
                  FROM drum_slot
@@ -672,6 +704,21 @@ BEGIN
        AND queue.assembly_remaining_qty IS DISTINCT FROM (
            SELECT
                coalesce(sum(piece.qty), 0)
+               + CASE
+                   WHEN queue.item_id IN (
+                       SELECT value::bigint
+                         FROM drum_schedule AS schedule
+                         CROSS JOIN LATERAL jsonb_array_elements_text(
+                             coalesce(
+                                 schedule.metrics::jsonb -> 'excluded_item_ids',
+                                 '[]'::jsonb
+                             )
+                         ) AS excluded(value)
+                        WHERE schedule.ledger_generation_id = v_generation_id
+                   )
+                   THEN queue.assembly_remaining_qty
+                   ELSE 0
+                 END
              FROM (
                  SELECT slot.slot_qty AS qty
                    FROM drum_slot AS slot
