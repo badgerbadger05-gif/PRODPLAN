@@ -107,11 +107,11 @@ def _world(
         db.add(plan)
         db.flush()
         old = models.PlanningRun(
-            status="FIXED_SNAPSHOT", ledger_generation_id=parent.id, source_plan_id=plan.id,
+            status="FIXED_SNAPSHOT", ledger_generation_id=parent.id, source_plan_id=None,
             period_from=plan.period_from, period_to=plan.period_to, config_snapshot={},
         )
         run = models.PlanningRun(
-            status="BUILDING_SNAPSHOT", ledger_generation_id=target.id, prior_run=old,
+            status="BUILDING_SNAPSHOT", ledger_generation_id=target.id,
             source_plan_id=plan.id, period_from=plan.period_from, period_to=plan.period_to,
             config_snapshot={},
         )
@@ -144,7 +144,7 @@ def _world(
         parent_reservations.append(old_reservation)
     db.flush()
     _seal(target, [
-        {"action": "refresh", "plan_id": plan.id, "parent_run_id": old.run_id, "candidate_run_id": run.run_id}
+        {"action": "add", "plan_id": plan.id, "parent_run_id": None, "candidate_run_id": run.run_id}
         for run, plan, old in candidate_runs
     ], parent_id=parent.id, replay_from=parent_replay_from)
     # A pre-period fact and two candidate-period facts.  All are visible through
@@ -339,9 +339,9 @@ def test_retained_and_candidate_replay_partition_one_sle_and_keep_open_output(
                 "candidate_run_id": None,
             },
             {
-                "action": "refresh",
+                "action": "add",
                 "plan_id": candidate_plan.id,
-                "parent_run_id": old_candidate.run_id,
+                "parent_run_id": None,
                 "candidate_run_id": candidate.run_id,
             },
         ],
@@ -384,7 +384,7 @@ def test_candidate_replay_rejects_empty_manifest_and_cross_generation_reservatio
         replay_candidate_realizations(db_session, target.id)
 
     _seal(target, [
-        {"action": "refresh", "plan_id": plan.id, "parent_run_id": old.run_id, "candidate_run_id": run.run_id}
+        {"action": "add", "plan_id": plan.id, "parent_run_id": None, "candidate_run_id": run.run_id}
         for run, plan, old in candidates
     ], parent_id=parent.id)
     rogue = db_session.query(models.ReservationEntry).filter_by(

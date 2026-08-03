@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from dataclasses import replace
 from decimal import Decimal
 
@@ -7,9 +7,11 @@ from sqlalchemy import text
 
 from app import models
 from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
     FutureSupplyCaptureError,
     FutureSupplyEvidence,
     future_supply_evidence_hash,
+    verify_future_supply_capture,
     replace_future_supply_capture,
 )
 
@@ -29,8 +31,10 @@ def _context(db, suffix="one"):
     db.add_all([generation, item])
     db.flush()
     batch = models.LedgerBuildBatch(
-        ledger_generation_id=generation.id, stage="snapshot_build", status="building",
-        batch_key=f"future-snapshot-{suffix}", algorithm_version="test", metrics={},
+        ledger_generation_id=generation.id, stage="future_supply_capture", status="building",
+        batch_key=f"future-snapshot-{suffix}",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+        metrics={},
     )
     db.add(batch)
     db.flush()
@@ -66,6 +70,27 @@ def test_captures_exact_wip_and_supplier_evidence(db_session):
     assert metrics["open_qty"] == Decimal("9")
     assert metrics["surplus_qty"] == Decimal("2")
     assert batch.status == "building"
+
+
+def test_exact_evidence_carries_source_requirement_id_into_persisted_row(db_session):
+    generation, batch, item = _context(db_session, "requirement")
+    rows = [_evidence(generation, item, source_requirement_id="77")]
+
+    replace_future_supply_capture(db_session, generation.id, batch.id, rows)
+
+    row = db_session.query(models.LedgerFutureSupply).one()
+    assert row.source_requirement_id == 77
+    assert row.source_content_hash == rows[0].source_content_hash
+
+
+def test_source_requirement_id_rejects_non_integer_value(db_session):
+    generation, _batch, item = _context(db_session, "requirement-invalid")
+
+    with pytest.raises(FutureSupplyCaptureError, match="source_requirement_id must be an integer"):
+        _evidence(generation, item, source_requirement_id="bad-id")
+
+    with pytest.raises(FutureSupplyCaptureError, match="source_requirement_id must be a positive integer"):
+        _evidence(generation, item, source_requirement_id="0")
 
 
 @pytest.mark.parametrize("status", ["rejected", "ambiguous", "unmatched"])
@@ -147,7 +172,7 @@ def test_sealed_snapshot_batch_is_re_read_but_never_overwritten(db_session):
     """A BUILDING generation may be resumed after its snapshot batch was sealed.
 
     ``close_fixed_plan`` replays every stage from the top, so the capture is
-    re-entered once ``snapshot_build`` is already COMPLETED.  Insisting on a
+    re-entered once ``future_supply_capture`` is already COMPLETED.  Insisting on a
     BUILDING batch killed that resume outright.  A completed batch is now
     accepted as a re-read only: identical evidence returns the same metrics and
     touches nothing, while a changed capture is a conflict, not an overwrite.
@@ -195,7 +220,7 @@ def test_capture_batch_of_another_stage_or_generation_is_still_refused(db_sessio
     db_session.add(other)
     db_session.flush()
 
-    with pytest.raises(FutureSupplyCaptureError, match="snapshot_build batch"):
+    with pytest.raises(FutureSupplyCaptureError, match="future_supply_capture batch"):
         replace_future_supply_capture(
             db_session, generation.id, other.id, [_evidence(generation, item)]
         )
@@ -213,3 +238,120 @@ def test_outer_rollback_removes_capture(db_session):
     outer.rollback()
 
     assert db_session.query(models.LedgerFutureSupply).count() == 0
+
+
+def _captured_batch(db, *, rows=None, status="completed"):
+    generation, batch, item = _context(db, suffix="verify")
+    if rows is None:
+        rows = []
+    replace_future_supply_capture(
+        db,
+        int(generation.id),
+        int(batch.id),
+        rows,
+    )
+    batch.status = status
+    if status == "completed":
+        batch.completed_at = generation.cutoff
+    return generation, batch, item
+
+
+def test_verify_future_supply_capture_allows_zero_rows(db_session):
+    generation, batch, _item = _captured_batch(db_session, rows=[])
+    assert batch.metrics["rows"] == 0
+    assert batch.metrics["content_hash"] is not None
+
+    generation.status = "accepted"
+    db_session.flush()
+
+    assert verify_future_supply_capture(db_session, generation.id)["rows"] == 0
+
+
+def test_capture_hash_is_sealed_from_persisted_numeric_scale(db_session):
+    generation, batch, item = _context(db_session, suffix="persisted-scale")
+    evidence = _evidence(
+        generation,
+        item,
+        ordered="10.12345",
+        realized="4.00004",
+    )
+
+    replace_future_supply_capture(
+        db_session,
+        int(generation.id),
+        int(batch.id),
+        [evidence],
+    )
+    batch.status = "completed"
+    batch.completed_at = generation.cutoff
+    db_session.flush()
+
+    assert verify_future_supply_capture(db_session, generation.id)["rows"] == 1
+
+
+def test_verify_future_supply_capture_missing_batch_is_rejected(db_session):
+    generation, batch, _ = _captured_batch(db_session, rows=[], status="completed")
+    db_session.delete(batch)
+    db_session.flush()
+
+    with pytest.raises(FutureSupplyCaptureError, match="future supply capture is missing"):
+        verify_future_supply_capture(db_session, generation.id)
+
+
+def test_verify_future_supply_capture_incomplete_batch_is_rejected(db_session):
+    generation, batch, _ = _captured_batch(db_session, rows=[], status="building")
+
+    with pytest.raises(FutureSupplyCaptureError, match="must be completed"):
+        verify_future_supply_capture(db_session, generation.id)
+
+
+def test_verify_future_supply_capture_rejects_bad_generation_id(db_session):
+    generation, batch, _ = _captured_batch(db_session, rows=[], status="completed")
+    bad = dict(batch.metrics)
+    bad["generation_id"] = int(generation.id) + 1
+    batch.metrics = bad
+    db_session.flush()
+
+    with pytest.raises(FutureSupplyCaptureError, match="generation_id does not match"):
+        verify_future_supply_capture(db_session, generation.id)
+
+
+def test_verify_future_supply_capture_rejects_bad_cutoff(db_session):
+    generation, batch, _ = _captured_batch(db_session, rows=[], status="completed")
+    bad = dict(batch.metrics)
+    bad["cutoff"] = (generation.cutoff + timedelta(days=1)).isoformat()
+    batch.metrics = bad
+    db_session.flush()
+
+    with pytest.raises(FutureSupplyCaptureError, match="does not match target generation"):
+        verify_future_supply_capture(db_session, generation.id)
+
+
+def test_verify_future_supply_capture_rejects_bad_checksum(db_session):
+    generation, batch, item = _context(db_session, suffix="verify-checksum")
+    replace_future_supply_capture(
+        db_session,
+        int(generation.id),
+        int(batch.id),
+        [_evidence(generation, item)],
+    )
+    batch.status = "completed"
+    batch.completed_at = generation.cutoff
+    bad = dict(batch.metrics)
+    bad["content_hash"] = "bad-hash"
+    batch.metrics = bad
+    db_session.flush()
+
+    with pytest.raises(FutureSupplyCaptureError, match="content hash does not match"):
+        verify_future_supply_capture(db_session, generation.id)
+
+
+def test_verify_future_supply_capture_rejects_bad_algorithm_version(db_session):
+    generation, batch, _ = _captured_batch(db_session, rows=[], status="completed")
+    bad = dict(batch.metrics)
+    bad["algorithm_version"] = "changed"
+    batch.metrics = bad
+    db_session.flush()
+
+    with pytest.raises(FutureSupplyCaptureError, match="algorithm_version does not match batch"):
+        verify_future_supply_capture(db_session, generation.id)

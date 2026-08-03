@@ -26,11 +26,12 @@ from app.services.item_ledger.assembly_output_core import (
     allocate_output_fact,
 )
 from app.services.item_ledger.physical_visibility import visible_sle_query
-from app.services.item_ledger.live_plan_scope import live_plan_run_ids
-from app.services.item_ledger.production_fact_projection import _build_recorder_index
+from app.services.item_ledger.recorder_identity import build_recorder_identity_index
+from app.services.item_ledger.assembly_queue_snapshot import materialize_assembly_queue_lines
 
 _STAGE = "assembly_output_allocation"
 _ALGORITHM_VERSION = "assembly-output-allocation/2"
+_BATCH_INTERNAL_KEYS = {"batch_version", "fact_signature", "allocation_signature"}
 
 
 def _dec(value: Any) -> Decimal:
@@ -134,48 +135,37 @@ def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandida
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None:
         raise ValueError(f"ledger generation {generation_id} does not exist")
-    run_ids = live_plan_run_ids(db, generation)
     rows = (
-        db.query(models.PlanningRun, models.ProductionPlanHeader, models.ProductionPlanLine)
-        .join(
-            models.ProductionPlanHeader,
-            models.PlanningRun.source_plan_id == models.ProductionPlanHeader.id,
-        )
-        .join(
-            models.ProductionPlanLine,
-            models.ProductionPlanLine.plan_id == models.ProductionPlanHeader.id,
-        )
+        db.query(models.AssemblyQueueLine)
         .filter(
-            models.PlanningRun.run_id.in_(run_ids),
-            models.ProductionPlanHeader.status == "fixed",
-            models.ProductionPlanLine.qty > 0,
-            models.ProductionPlanLine.bucket_date >= models.ProductionPlanHeader.period_from,
+            models.AssemblyQueueLine.ledger_generation_id == int(generation.id),
+            models.AssemblyQueueLine.line_status == "open",
         )
         .order_by(
-            models.ProductionPlanHeader.period_from.asc(),
-            models.ProductionPlanHeader.period_to.asc(),
-            models.ProductionPlanHeader.id.asc(),
-            models.ProductionPlanLine.id.asc(),
+            models.AssemblyQueueLine.sort_key.asc(),
+            models.AssemblyQueueLine.id.asc(),
         )
         .all()
     )
 
     candidates: list[QueueCandidate] = []
-    for run, plan, line in rows:
-        # A nullable boundary exists only for migrated legacy rows. Treat it as
-        # unavailable, never as “eligible since the beginning of history”.
-        eligible_from = plan.fixed_at or run.fixed_at
+    for row in rows:
+        eligible_from = row.eligible_from
         if eligible_from is None:
-            continue
+            raise ValueError(
+                f"assembly queue line {int(row.plan_line_id)} lacks frozen eligible_from"
+            )
+
         candidates.append(
             QueueCandidate(
-                plan_id=int(plan.id),
-                plan_line_id=int(line.id),
-                item_id=int(line.item_id),
-                open_qty=_dec(line.qty),
+                plan_id=int(row.plan_id),
+                plan_line_id=int(row.plan_line_id),
+                item_id=int(row.item_id),
+                open_qty=_dec(row.assembly_remaining_qty),
                 eligible_from=eligible_from,
             )
         )
+
     return tuple(candidates)
 
 
@@ -191,7 +181,7 @@ def _fact_provenance(
     run has one eligible live candidate line for the same item. Older/direct
     1C orders do not retain a plan-line id and remain FIFO fallback.
     """
-    recorder_index = _build_recorder_index(
+    recorder_index = build_recorder_identity_index(
         db, [_text(fact.recorder_ref) for fact in facts]
     )
     product_ids = sorted(
@@ -328,8 +318,11 @@ def _fact_provenance(
             result[int(fact.stock_ledger_entry_id)] = _FactProvenance(
                 exact_plan_line_ids=line_ids,
                 link_kind="exact_plan_line",
-                status="ambiguous",
-                reason="top-level MRP requirement maps to multiple live plan lines",
+                # All candidates come from the one plan selected by the exact
+                # top-level requirement.  Their order is the frozen assembly
+                # queue order, so this is deterministic addressed allocation,
+                # not ambiguous provenance.
+                status="exact",
                 exact_product_ids=exact_product_ids,
             )
         else:
@@ -590,6 +583,62 @@ def _signature_allocations(
     )
 
 
+def _verify_existing_batch_replay(
+    facts: tuple[_OutputFact, ...],
+    existing_decisions: list[models.AssemblyOutputFactDecision],
+    existing_allocations: list[models.AssemblyOutputAllocation],
+    existing_batch: models.LedgerBuildBatch | None,
+) -> bool:
+    if existing_batch is None:
+        return False
+
+    if existing_batch.metrics is None:
+        return False
+
+    batch_metrics = _canonical(dict(existing_batch.metrics))
+    if _canonical(_signature_decisions(existing_decisions)) != _canonical(
+        batch_metrics.get("fact_signature", [])
+    ):
+        return False
+    if _canonical(_signature_allocations(existing_allocations)) != _canonical(
+        batch_metrics.get("allocation_signature", [])
+    ):
+        return False
+
+    facts_by_sle = _facts_by_sle(facts)
+    allocations_by_sle: dict[int, Decimal] = {}
+    for row in existing_allocations:
+        sle_id = int(row.stock_ledger_entry_id)
+        allocations_by_sle[sle_id] = allocations_by_sle.get(sle_id, Decimal("0")) + _dec(
+            row.allocated_qty
+        )
+
+    decision_rows = _signature_decisions(existing_decisions)
+    if len(decision_rows) != len(facts_by_sle):
+        return False
+    for decision_row in decision_rows:
+        sle_id = int(decision_row["stock_ledger_entry_id"])
+        fact = facts_by_sle.get(sle_id)
+        if fact is None:
+            return False
+        if _text(fact.source_content_hash) != _text(decision_row["source_content_hash"]):
+            return False
+        if _dec(fact.qty) != _dec(decision_row["surplus_qty"]) + _dec(
+            allocations_by_sle.get(sle_id, Decimal("0"))
+        ):
+            return False
+
+    return True
+
+
+def _public_batch_metrics(raw_metrics: Any) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in (_canonical(dict(raw_metrics or {}))).items()
+        if key not in _BATCH_INTERNAL_KEYS
+    }
+
+
 def _decision_payload_by_fact(
     current_fact: _OutputFact,
     provenance: _FactProvenance,
@@ -652,6 +701,48 @@ def _persist_rows(
     db.flush()
 
 
+def _apply_allocations_to_assembly_queue(
+    db: Session,
+    generation: models.LedgerGeneration,
+    allocation_signature: list[dict[str, Any]],
+) -> None:
+    if not allocation_signature:
+        return
+
+    allocated_by_line: dict[int, Decimal] = {}
+    for row in allocation_signature:
+        line_id = int(row["plan_line_id"])
+        allocated_by_line[line_id] = allocated_by_line.get(line_id, Decimal("0")) + _dec(
+            row["allocated_qty"]
+        )
+
+    rows = (
+        db.query(models.AssemblyQueueLine)
+        .filter(
+            models.AssemblyQueueLine.ledger_generation_id == int(generation.id),
+            models.AssemblyQueueLine.plan_line_id.in_(allocated_by_line.keys()),
+            models.AssemblyQueueLine.line_status == "open",
+        )
+        .all()
+    )
+    by_line = {int(row.plan_line_id): row for row in rows}
+    for line_id, allocated_qty in sorted(allocated_by_line.items()):
+        if line_id not in by_line:
+            raise ValueError(
+                "allocation references plan line not materialized in assembly queue"
+            )
+
+        row = by_line[line_id]
+        new_accepted = max(_dec(row.accepted_plan_output_qty), _dec(allocated_qty))
+        row.accepted_plan_output_qty = new_accepted
+        row.assembly_remaining_qty = max(
+            _dec(row.planned_output_qty) - new_accepted,
+            Decimal("0"),
+        )
+
+    db.flush()
+
+
 def materialize_assembly_output_allocations(
     db: Session,
     generation_id: int,
@@ -668,24 +759,10 @@ def materialize_assembly_output_allocations(
         raise ValueError("assembly output allocation requires physical import batch")
     if str(generation.physical_import_batch.status) != "completed":
         raise ValueError("assembly output allocation requires completed physical import batch")
+    materialize_assembly_queue_lines(db, int(generation.id))
 
     facts = _load_visible_facts(db, generation)
-    ordered_candidates = _load_live_candidates(db, int(generation.id))
-    provenance_by_sle = _fact_provenance(db, facts, ordered_candidates)
-
-    fact_signature, allocation_signature, metrics, fact_by_sle = _expected_signatures(
-        facts,
-        ordered_candidates,
-        provenance_by_sle,
-    )
-
     batch_key = _build_batch_key(generation)
-    expected_batch_metrics = _expected_batch_metrics(
-        metrics,
-        fact_signature,
-        allocation_signature,
-    )
-
     existing_decisions = (
         db.query(models.AssemblyOutputFactDecision)
         .filter(models.AssemblyOutputFactDecision.ledger_generation_id == int(generation.id))
@@ -715,6 +792,54 @@ def materialize_assembly_output_allocations(
         .one_or_none()
     )
 
+    if (
+        existing_batch is not None
+        and not existing_decisions
+        and not existing_allocations
+    ):
+        rows = (
+            db.query(models.AssemblyQueueLine)
+            .filter(
+                models.AssemblyQueueLine.ledger_generation_id == int(generation.id),
+                models.AssemblyQueueLine.line_status == "open",
+            )
+            .all()
+        )
+        for row in rows:
+            row.accepted_plan_output_qty = Decimal("0")
+            row.assembly_remaining_qty = _dec(row.planned_output_qty)
+        if rows:
+            db.flush()
+
+    if _verify_existing_batch_replay(
+        facts=facts,
+        existing_decisions=existing_decisions,
+        existing_allocations=existing_allocations,
+        existing_batch=existing_batch,
+    ):
+        if existing_batch is None:
+            raise ValueError("assembly output allocation batch drift")
+        return {
+            "ledger_generation_id": int(generation.id),
+            "batch_id": int(existing_batch.id),
+            **_public_batch_metrics(existing_batch.metrics),
+        }
+
+    ordered_candidates = _load_live_candidates(db, int(generation.id))
+    provenance_by_sle = _fact_provenance(db, facts, ordered_candidates)
+
+    fact_signature, allocation_signature, metrics, fact_by_sle = _expected_signatures(
+        facts,
+        ordered_candidates,
+        provenance_by_sle,
+    )
+
+    expected_batch_metrics = _expected_batch_metrics(
+        metrics,
+        fact_signature,
+        allocation_signature,
+    )
+
     expected_fact_signature = _canonical(fact_signature)
     expected_allocation_signature = _canonical(allocation_signature)
 
@@ -735,7 +860,7 @@ def materialize_assembly_output_allocations(
         return {
             "ledger_generation_id": int(generation.id),
             "batch_id": int(existing_batch.id),
-            **metrics,
+            **_public_batch_metrics(expected_batch_metrics),
         }
 
     if existing_batch is not None:
@@ -759,6 +884,7 @@ def materialize_assembly_output_allocations(
             fact_by_sle,
             provenance_by_sle,
         )
+        _apply_allocations_to_assembly_queue(db, generation, allocation_signature)
         return {
             "ledger_generation_id": int(generation.id),
             "batch_id": int(existing_batch.id),
@@ -773,6 +899,7 @@ def materialize_assembly_output_allocations(
         fact_by_sle,
         provenance_by_sle,
     )
+    _apply_allocations_to_assembly_queue(db, generation, allocation_signature)
 
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(generation.id),

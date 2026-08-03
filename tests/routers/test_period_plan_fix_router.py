@@ -16,7 +16,9 @@ from app.database import get_db
 from app.models import (
     AssemblyRate,
     Item,
+    ProductionMaterialCustodyProjectionManifest,
     LedgerGeneration,
+    PlannedOrder,
     PhysicalImportBatch,
     PlanningRun,
     PlanningTruthState,
@@ -40,6 +42,110 @@ def client(db_session):
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+def test_execution_journal_openapi_exposes_server_query_contract(client):
+    operation = client.app.openapi()["paths"][
+        "/api/v1/plan/period-plans/{plan_id}/execution-journal"
+    ]["get"]
+    params = {row["name"]: row for row in operation["parameters"]}
+    response = operation["responses"]["200"]["content"]["application/json"]["schema"]
+
+    assert {
+        "bom_level",
+        "status",
+        "include_net_zero",
+        "sort_by",
+        "sort_dir",
+        "limit",
+        "offset",
+    }.issubset(params)
+    assert response == {"$ref": "#/components/schemas/ExecutionJournalResponse"}
+    assert client.app.openapi()["components"]["schemas"]["ExecutionJournalResponse"]["additionalProperties"] is False
+    assert params["include_net_zero"]["schema"]["default"] is True
+    assert params["limit"]["schema"]["default"] == 100
+    assert params["offset"]["schema"]["default"] == 0
+
+
+def test_execution_journal_route_returns_typed_payload_after_fix(client, db_session, accepted_generation):
+    plan = _plan_with_line(db_session)
+
+    fix_result = client.post(
+        f"/api/v1/plan/period-plans/{plan.id}/fix",
+        json={"fixed_by": "erp-shell"},
+    )
+    assert fix_result.status_code == 200, fix_result.text
+    run_id = fix_result.json()["mrp"]["run_id"]
+
+    response = client.get(
+        f"/api/v1/plan/period-plans/{plan.id}/execution-journal",
+        params={"run_id": run_id},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert isinstance(body["rows"], list)
+    assert body["run_id"] == int(run_id)
+
+
+def test_matrix_route_returns_server_totals_for_draft_plans(client, db_session, accepted_generation):
+    plan = _plan_with_line(db_session, status="draft", qty=4.0)
+    item = db_session.query(Item).filter(Item.item_name == "Деталь").first()
+    assert item is not None
+    db_session.add(ProductionPlanLine(
+        plan_id=plan.id,
+        item_id=item.item_id,
+        bucket_date=date(2026, 8, 14),
+        qty=6.0,
+    ))
+    db_session.commit()
+
+    response = client.get(f"/api/v1/plan/period-plans/{plan.id}/matrix")
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["bucket_totals"] == {
+        "2026-08-07": 4.0,
+        "2026-08-14": 6.0,
+        "2026-08-21": 0.0,
+        "2026-08-28": 0.0,
+    }
+    assert body["grand_total"] == 10.0
+    assert body["total_qty"] == 10.0
+    assert body["total"] == 1
+
+
+def test_matrix_route_hides_forecasts_for_fixed_plans(client, db_session, accepted_generation):
+    plan = _plan_with_line(db_session, status="fixed", qty=4.0)
+    line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    item = db_session.get(Item, line.item_id)
+    assert item is not None
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(PlannedOrder(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=4.0,
+        planned_qty=4.0,
+        qty=4.0,
+        need_date=date(2026, 8, 7),
+        bucket_date=date(2026, 8, 7),
+        start_date=date(2026, 8, 7),
+        finish_date=date(2026, 8, 10),
+    ))
+    db_session.commit()
+
+    response = client.get(f"/api/v1/plan/period-plans/{plan.id}/matrix")
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["rows"][0]["bucket_forecasts"] == {}
 
 
 @pytest.fixture()
@@ -70,6 +176,17 @@ def accepted_generation(db_session):
     db_session.add(generation)
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=generation.cutoff,
+            built_at=generation.cutoff,
+        )
+    )
     db_session.add(StockWarehouse(
         warehouse_ref1c="fix-router-warehouse",
         warehouse_code="FIX-ROUTER",
@@ -94,8 +211,7 @@ def _plan_with_line(db, *, status: str = "draft", qty: float = 7.0) -> Productio
         item_code=f"ROUTER-FIX-{status}-{qty}",
         item_name="Деталь",
         unit="шт",
-        stock_qty=0.0,
-        replenishment_method="Покупка",
+                replenishment_method="Покупка",
         replenishment_time=2,
         status="active",
     )
@@ -110,6 +226,11 @@ def _plan_with_line(db, *, status: str = "draft", qty: float = 7.0) -> Productio
     plan = ProductionPlanHeader(
         name="Август", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
         status=status, created_by="test",
+        fixed_at=(
+            datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+            if status == "fixed"
+            else None
+        ),
     )
     db.add(plan)
     db.flush()
@@ -168,6 +289,17 @@ def test_mrp_snapshot_route_accepts_a_body_without_generation_key(
         f"fix-period-plan:{int(plan.id)}:{int(accepted_generation.id)}"
     )
     assert body["run_id"] > 0
+
+
+def test_mrp_snapshot_route_request_contract_is_keyless(client):
+    operation = client.app.openapi()["paths"][
+        "/api/v1/plan/period-plans/{plan_id}/mrp-snapshot"
+    ]["post"]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    if "$ref" in schema:
+        components = client.app.openapi()["components"]["schemas"]
+        schema = components[schema["$ref"].split("/")[-1]]
+    assert "generation_key" not in (schema.get("properties") or {})
 
 
 def test_mrp_snapshot_route_is_an_idempotent_recovery_path(

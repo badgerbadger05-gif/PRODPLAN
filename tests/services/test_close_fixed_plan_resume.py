@@ -66,6 +66,15 @@ def _accepted_world(db):
     ])
     db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(accepted.id),
+        cutoff=accepted.cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=accepted.cutoff,
+        built_at=accepted.cutoff,
+    ))
     resource = models.ProductionResource(
         resource_name="Close resume assembly",
         planning_range=30,

@@ -1,6 +1,8 @@
 import type { MrpProductionRow, MrpPurchaseRow } from '../../../domain/planning'
 
 export type MrpResultTab = 'production' | 'purchases' | 'rework' | 'capacity'
+export const PURCHASE_FILTER_MISSING_SUPPLIER = '__missing_supplier_name'
+export const PURCHASE_FILTER_MISSING_CATEGORY = '__missing_category'
 
 export function parseMrpResultTab(value: string | null): MrpResultTab | null {
   if (value === 'production' || value === 'purchases' || value === 'rework' || value === 'capacity') return value
@@ -19,13 +21,13 @@ export function supplierDisplayName(row: MrpPurchaseRow) {
 export function supplierFilterKey(row: MrpPurchaseRow) {
   return (row.supplier_name || '').trim()
     ? (row.supplier_ref1c || row.supplier_name || '')
-    : '__missing_supplier_name'
+    : PURCHASE_FILTER_MISSING_SUPPLIER
 }
 
 export function categoryFilterKey(row: MrpPurchaseRow) {
   return row.category_id !== null && row.category_id !== undefined
     ? String(row.category_id)
-    : (row.category_ref1c || row.category_name || '')
+    : (row.category_ref1c || PURCHASE_FILTER_MISSING_CATEGORY)
 }
 
 export function purchaseFilterOptions(rows: MrpPurchaseRow[]) {
@@ -45,11 +47,13 @@ export function purchaseFilterOptions(rows: MrpPurchaseRow[]) {
   return { suppliers: toOptions(suppliers), categories: toOptions(categories) }
 }
 
-export function filterPurchaseRows(rows: MrpPurchaseRow[], supplier: string, category: string) {
-  return rows.filter((row) => (
-    (!supplier || supplierFilterKey(row) === supplier)
-    && (!category || categoryFilterKey(row) === category)
-  ))
+export function buildPurchaseCategoryFilterParam(categoryFilter: string): { category_id?: number; category_ref1c?: string } {
+  if (!categoryFilter) return {}
+  if (/^\d+$/.test(categoryFilter)) {
+    const categoryId = Number(categoryFilter)
+    return Number.isFinite(categoryId) ? { category_id: categoryId } : {}
+  }
+  return { category_ref1c: categoryFilter }
 }
 
 export function toggleMany(set: Set<number>, ids: number[], checked: boolean) {

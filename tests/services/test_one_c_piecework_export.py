@@ -35,8 +35,7 @@ def _mk_item(db, *, code: str, ref1c: str | None = None) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(it)
     db.flush()

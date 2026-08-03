@@ -126,6 +126,19 @@ describe('SyncPage characterization', () => {
     expect(listNomenclatureGroups).toHaveBeenCalledOnce()
   })
 
+  it('keeps saved group selection visible when the 1C cache is unavailable', async () => {
+    vi.mocked(listNomenclatureGroups).mockResolvedValue({
+      items: [],
+      selected_ids: ['old-id'],
+    })
+    render(<SyncPage />)
+
+    expect(await panel('Группы номенклатуры').findByText(
+      /Список групп не загружен\. Сохранено 1 позиций/,
+    )).toBeVisible()
+    expect(panel('Группы номенклатуры').getByText('Всего: 0 · Выбрано: 1')).toBeVisible()
+  })
+
   it('saves connection settings and runs connection and metadata diagnostics', async () => {
     const user = userEvent.setup()
     render(<SyncPage />)

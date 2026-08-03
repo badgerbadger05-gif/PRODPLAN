@@ -20,6 +20,8 @@ type Props = {
 }
 
 export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, sort, onSelectPurchaseRowKeys, onActivate, onToggleSort }: Props) {
+  const formatCoveragePercent = (value: number | null | undefined) => (value == null ? 'н/д' : `${qty(value)}%`)
+
   return (
     <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(purchaseOrderColumns) }}>
       <colgroup>
@@ -48,7 +50,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
           return (
           <tr key={row.row_key} className={row.row_key === activeRow?.row_key ? 'activeRow' : ''} onClick={() => onActivate(row.row_key)}>
             <td className="checkCol">
-              {row.line_status === 'to_order' && row.row_generator === 'mrp_reservation' && (row.to_order_qty ?? row.remaining_qty) > 0 && (
+              {row.can_materialize && (
                 <input
                   type="checkbox"
                   aria-label={`Выбрать строку ${row.row_key}`}
@@ -92,7 +94,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                 / {qty(row.remaining_qty)}
                 {row.unit ? ` ${row.unit}` : ''}
                 {row.row_generator === 'mrp_reservation'
-                  ? ` · оформлено ${qty(row.open_order_covered_pct ?? 0)}% · к заказу ${qty(row.to_order_pct ?? 0)}%`
+                  ? ` · оформлено ${formatCoveragePercent(row.open_order_covered_pct)} · к заказу ${formatCoveragePercent(row.to_order_pct)}`
                   : ''}
               </span>
             </td>

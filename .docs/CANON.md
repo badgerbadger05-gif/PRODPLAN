@@ -52,7 +52,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Свободный S0 нового плана | принятый физический остаток минус динамические удержания старших живых резервов; удержание освобождает только назначенный физический расход (§16) |
 | Срок пополнения MRP | `Item.replenishment_time`, синхронизированный из `СрокПополнения` 1С; ноль валиден (§17) |
 | Защитное окно полки | отдельный `ShelfPolicy.replenishment_time_days`; не подменяет срок MRP (§17) |
-| Маршрут пополнения | только явно распознанный поддерживаемый маршрут; пустое и неизвестное значение даёт `unavailable`; судьба явной «Переработки» ожидает решения владельца (§18) |
+| Маршрут пополнения | только явно распознанный маршрут; пустое и неизвестное дают `unavailable` и блокируют публикацию. Явная «Переработка» создаёт сохранённый `rework`-резерв без `PlannedOrder`/`PlannedPurchase`/журнальной строки; маршрут и исполнение показываются `unavailable`, но принятый `assembly_in` адресно, затем FIFO закрывает такой резерв (§18) |
 
 ## Реестр канонических модулей
 
@@ -64,14 +64,20 @@ PRODPLAN состоит из четырёх последовательно св�
 | События и fold резервов | `backend/app/services/item_ledger/reservation_ledger.py` |
 | Атрибуция фактов (пополнение: точный живой резерв первым, излишек и безадресные факты FIFO; расход: адресное удержание первым, иначе FIFO; агрегированная закупка и возвраты по §§14–15) | `backend/app/services/item_ledger/historical_replay_core.py`, `historical_replay_persistence.py`, `supplier_receipt_allocation.py` |
 | Выпуск производственной строки (`produced`, `remaining`) | `backend/app/services/production_output_truth.py`; `remaining_qty` в таблице — только compatibility cache и никогда не читается как факт |
+| Обеспеченность производственной строки материалами | чистый расчёт `production_control_material_availability.py`, сохранённый только внутри generation-scoped `production_control_journal_snapshot.py`; operational `ProductionOrderLineState` не владеет coverage |
+| Custody материалов производства | generation-scoped `production_material_custody_projection.py`; live fold текущих документов и статусов не является источником чтения или fallback |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py`; пул строится ОДИН раз, базис — исторический SLE-баланс, net после заморозки неизменяем; единственная точка расширения пулов — `pool_key_for` |
 | Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
 | Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
-| Read-model | `PlanningReadSnapshot` и специализированные `*_snapshot.py` |
+| Read-model | `PlanningReadSnapshot` и специализированные `*_snapshot.py`; публичный GET не пересчитывает и не обновляет снимок |
 | Frontend | OpenAPI + `src/services`; UI только отображает read-model |
-| Запись в 1С | санкционированные `one_c_*_export.py` |
+| Запись в 1С | санкционированные `one_c_*_export.py`; запись состава спецификации — только `spec_writeback_1c.py` по явной команде редактора |
+
+Агрегированной колонки физического остатка на `Item` нет. `items.stock_qty`
+удалена как второе legacy-хранилище; синхронизация 1С публикует физику только
+через жизненный цикл Item Ledger.
 
 Команда `Произвести` является каноническим исполнительным контуром: одним
 действием она создаёт в 1С `СборкаЗапасов` и `СдельныйНаряд`. Создание

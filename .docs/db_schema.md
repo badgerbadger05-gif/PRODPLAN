@@ -57,6 +57,11 @@
 Плавающая таблица `reservation_coverage` и её cache-поля удалены миграцией
 `20260726_09`.
 
+Поля `material_coverage_*` в `production_order_line_states` удалены миграцией
+`20260731_03`. Обеспеченность материалами хранится в строке принятого
+`PlanningReadSnapshot` производственного журнала и публикуется атомарно вместе
+с Ledger generation; отдельного изменяемого кеша и POST-refresh больше нет.
+
 ## Барабан
 
 Ручная программа, график с `program_id` и переходные таблицы
@@ -99,8 +104,11 @@ Ledger generation и не рассчитывается на GET.
 | есть | `production_order_line_states` | оперативное состояние строки |
 | есть | `supplier_orders`, `supplier_order_items` | зеркало заказов поставщикам |
 | есть | `production_material_issues`, `production_material_issue_lines` | перемещения материалов |
+| есть | `production_material_custody_event` | append-only изменения удержания материалов; физические переходы ссылаются на видимый SLE |
+| есть | `production_material_custody_projection_manifest`, `production_material_custody_projection` | неизменяемая custody-проекция одного Ledger generation/cutoff с явным `baseline_generation_id` |
 | есть | `sync_link` | связь локальной сущности с документом 1С |
 | есть | `replenishment_work_item` | единая рабочая проекция резерва `make/buy` |
+| есть | `ledger_future_supply` | неизменяемый снимок будущих WIP/BUY поставок поколения; WIP несёт точный `source_requirement_id`, используемый полочной проекцией без чтения живых заказов |
 | есть | `purchase_export_obligation_allocation` | точные доли `allocated_qty` резервов в агрегированной строке заказа поставщику |
 
 Заказ не является источником физического выполнения.

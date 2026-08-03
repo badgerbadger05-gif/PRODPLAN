@@ -9,10 +9,9 @@ rows are summed per key and a row whose item cannot be resolved locally is
 dropped (``strict=True`` raises instead, for the physical-refresh callers that
 must not silently lose stock).
 
-Widening the Balance Dimensions with Характеристика was rejected: the same
-query feeds the stock-sum compatibility projection (``Item.stock_qty``), so
-per-characteristic rows would change its granularity without verified live-1С
-evidence. Consumers therefore compare on the char='' aggregate.
+Widening the Balance Dimensions with Характеристика was rejected without
+verified live-1С evidence. Consumers therefore compare on the char=''
+aggregate.
 
 The physical truth is owned by the ``physical_refresh_*`` lifecycle
 (:mod:`physical_refresh_orchestrator`, :mod:`opening_balance_reconcile`); this

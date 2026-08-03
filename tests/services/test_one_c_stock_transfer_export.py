@@ -54,8 +54,7 @@ def _mk_item(db, *, code: str, ref1c: str) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit=f"unit-ref-{code}",
-        stock_qty=100,
-        status="active",
+                status="active",
     )
     db.add(it)
     db.flush()
@@ -614,8 +613,7 @@ def test_skipped_invalid_inputs(db_session, monkeypatch):
         item_article="NOREF",
         item_ref1c=None,
         unit="шт",
-        stock_qty=10,
-        status="active",
+                status="active",
     )
     db.add(comp_no_ref)
     db.flush()

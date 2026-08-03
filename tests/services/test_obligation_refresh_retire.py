@@ -63,6 +63,15 @@ def _accepted_world(db):
     db.add_all([physical, accepted, item, warehouse])
     db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(accepted.id),
+        cutoff=accepted.cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=accepted.cutoff,
+        built_at=accepted.cutoff,
+    ))
     resource = models.ProductionResource(
         resource_name="Retire assembly",
         planning_range=30,
@@ -207,10 +216,12 @@ def test_refresh_can_retire_one_plan_while_adding_another(db_session):
     accepted, item = _accepted_world(db_session)
     retired_plan = _draft_plan(db_session, item, name="retired")
     retired_plan.status = "fixed"
+    retired_plan.fixed_at = CUTOFF
     db_session.commit()
     retired_run = _parent_run(db_session, accepted, retired_plan)
     added_plan = _draft_plan(db_session, item, name="added", qty="7")
     added_plan.status = "fixed"
+    added_plan.fixed_at = CUTOFF
     db_session.commit()
 
     result = workflow.run_obligation_refresh(

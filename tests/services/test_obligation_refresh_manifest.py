@@ -119,7 +119,7 @@ def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lin
     db_session.add(plan)
     item = models.Item(
         item_code="RESH-PLAN", item_name="Item", unit="шт", replenishment_method="Покупка",
-        replenishment_time=3, stock_qty=0, status="active",
+        replenishment_time=3, status="active",
     )
     db_session.add(item)
     db_session.flush()

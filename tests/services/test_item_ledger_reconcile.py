@@ -22,8 +22,8 @@ from app.services.item_ledger import (
 )
 
 
-def _item(db, code, ref, name=None, stock_qty=0.0):
-    it = models.Item(item_code=code, item_name=name or code, item_ref1c=ref, stock_qty=stock_qty)
+def _item(db, code, ref, name=None):
+    it = models.Item(item_code=code, item_name=name or code, item_ref1c=ref)
     db.add(it)
     db.flush()
     return it

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List
 
 from ..database import get_db
@@ -31,6 +31,24 @@ router = APIRouter(prefix="/v1/sync", tags=["sync"])
 
 class WarehouseSelectionPayload(BaseModel):
     selected_refs: List[str] = []
+
+
+class StockWarehouseResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    warehouse_id: int
+    warehouse_ref1c: str
+    warehouse_code: str
+    warehouse_name: str
+    is_selected: bool
+
+
+class StockWarehouseListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[StockWarehouseResponse]
+    total: int
+    selected_total: int
 
 
 class SyncJobConfigPatch(BaseModel):
@@ -86,7 +104,7 @@ def sync_warehouses_odata(payload: ODataSyncRequest, db: Session = Depends(get_d
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
 
 
-@router.get("/warehouses", response_model=dict)
+@router.get("/warehouses", response_model=StockWarehouseListResponse)
 def get_stock_warehouses(db: Session = Depends(get_db)):
     rows = (
         db.query(models.StockWarehouse)

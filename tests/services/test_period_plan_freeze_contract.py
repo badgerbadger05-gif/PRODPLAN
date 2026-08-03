@@ -22,6 +22,7 @@ from app.models import (
     Item,
     LedgerGeneration,
     MrpRequirement,
+    ProductionMaterialCustodyProjectionManifest,
     PhysicalImportBatch,
     PlannedOrder,
     PlanningRun,
@@ -76,6 +77,17 @@ def _accepted_planning_truth(db_session):
     ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=generation.cutoff,
+            built_at=generation.cutoff,
+        )
+    )
     resource = ProductionResource(
         resource_name="Freeze contract assembly",
         planning_range=30,
@@ -92,7 +104,7 @@ def _accepted_planning_truth(db_session):
 def _item(db, code, *, method="Производство") -> Item:
     item = Item(
         item_code=code, item_name=code, item_article=code, unit="шт",
-        stock_qty=0.0, replenishment_method=method, replenishment_time=3,
+replenishment_method=method, replenishment_time=3,
         status="active",
     )
     db.add(item)

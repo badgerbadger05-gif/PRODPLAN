@@ -213,6 +213,7 @@ def collect_wip_future_supply_evidence(
             source_ref=order_ref or None,
             source_line_ref=line_ref or None,
             source_local_id=f"production_product:{product_id}",
+            source_requirement_id=product.source_mrp_requirement_id,
             ordered_qty_at_cutoff=_decimal(product.quantity),
             realized_qty_at_cutoff=realized[product_id],
             eta_date=eta,

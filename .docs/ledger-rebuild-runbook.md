@@ -38,11 +38,17 @@ manifest="$repo/config/ledger_rebuild_history_20260729.json"
    SHA-256 digest and pass `pg_restore --list`.
 4. The first physical boundary is
    `2026-05-31T23:59:59.999999+03:00`. Do not replace it with UTC midnight.
-5. Every SKU in `required_assembly_item_codes` has exactly one approved,
-   positive `dbr_assembly_rate` and an existing resource. Synthetic candidate
-   rates are forbidden in production.
+5. Ambiguous assembly rates are absent. A SKU without an approved rate remains
+   in the assembly queue and is excluded from the drum until a rate is entered;
+   this does not block Ledger/MRP rebuild or physical-output attribution.
+   Synthetic candidate rates are forbidden in production.
 6. The preflight command below returns `preflight-ok` before maintenance
    begins.
+7. The first post-migration Ledger generation has an explicitly reviewed
+   material-custody baseline. Its `observed_at` must equal the generation
+   cutoff. Do not infer or backfill a historical baseline from current mutable
+   material-issue statuses. Later generations fold only append-only custody
+   events and fail closed when the baseline/manifest is absent.
 
 Create and verify the backup without relying on a host PostgreSQL install:
 
@@ -160,10 +166,12 @@ The script runs in one transaction and must end with `CLEAR PASS`. It:
 
 - preserves items, specifications, plans and plan lines;
 - preserves 1C `sync_link` idempotency rows;
-- preserves `shelf_policy`, `dbr_assembly_rate` and manual
-  `forced_order_request`;
+- preserves `shelf_policy` and `dbr_assembly_rate`;
 - detaches their obsolete generation/run pointers;
 - truncates only Ledger/MRP generations and generation-bound projections;
+- clears custody events and projections whose physical provenance names the
+  cleared SLE identity space; the replay must establish a new explicit custody
+  baseline before publishing its first production journal;
 - uses no `TRUNCATE ... CASCADE`;
 - rolls back if a new unreviewed FK, wrong database/key or active writer is
   detected.
@@ -236,6 +244,9 @@ have been reviewed.
 ## Abort and recovery
 
 - Before `CLEAR PASS`, any SQL failure rolls the transaction back.
+- Downgrade across `20260731_01`–`20260731_04` recreates only an empty
+  compatibility schema for retired tables. Deleted forced-order, legacy-plan
+  and root-product rows can be recovered only from the verified database dump.
 - After clear, prefer rerunning the same idempotent manifest.
 - If replay cannot be resumed, keep all services stopped. Restore only the
   verified pre-rebuild dump under an explicit recovery decision; never patch a

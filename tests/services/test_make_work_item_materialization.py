@@ -2,7 +2,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from app import models
-from app.services.production_control_journal import materialize_make_work_items
+from app.services.production_control_journal import cancel_local_order, materialize_make_work_items
 
 
 def _scope(db):
@@ -116,6 +116,39 @@ def test_materialize_make_work_item_is_idempotent_and_does_not_mutate_truth(db_s
     assert [row["qty"] for row in first["created"]] == [4.0, 4.0]
     assert second["created"] == []
     assert len(second["reused"]) == 2
+    db_session.refresh(work)
+    db_session.refresh(requirement)
+    db_session.refresh(reservation)
+    assert Decimal(work.replenishment_remaining_qty) == Decimal("8")
+    assert Decimal(requirement.net_required_qty) == Decimal("10")
+    assert Decimal(reservation.replenishment_required_qty) == Decimal("10")
+
+
+def test_materialize_make_work_items_can_rematerialize_after_full_cancel(db_session):
+    work, requirement, reservation = _scope(db_session)
+
+    first = materialize_make_work_items(db_session, [work.id])
+    assert [row["qty"] for row in first["created"]] == [4.0, 4.0]
+
+    for row in first["created"]:
+        cancel_local_order(db_session, int(row["product_id"]))
+
+    second = materialize_make_work_items(db_session, [work.id])
+    assert second["created"][0]["order_number"] == f"MRP-R-{requirement.id}-3"
+    assert second["created"][1]["order_number"] == f"MRP-R-{requirement.id}-4"
+    assert second["created"][0]["work_item_id"] == work.id
+    assert second["created"][1]["work_item_id"] == work.id
+    assert second["reused"] == []
+    assert [row["qty"] for row in second["created"]] == [4.0, 4.0]
+    assert len(second["created"]) == 2
+
+    for row in first["created"]:
+        product = db_session.get(models.ProductionProduct, int(row["product_id"]))
+        assert product is not None
+        order = db_session.get(models.ProductionOrder, int(product.order_id))
+        assert order is not None
+        assert order.deletion_mark is True
+
     db_session.refresh(work)
     db_session.refresh(requirement)
     db_session.refresh(reservation)

@@ -8,6 +8,9 @@ import pytest
 from app import models
 from app.services import obligation_refresh_orchestrator as workflow
 from app.services.mrp_result_snapshot import read_mrp_result_manifest
+from app.services.item_ledger.generation_lifecycle import (
+    RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+)
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
 from app.services.planning_pool_resolver import PlanningPoolConfigurationError
@@ -50,8 +53,17 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
         qty_per_capacity=Decimal("1"),
     ))
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=accepted.id,
+        cutoff=cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=cutoff,
+        built_at=cutoff,
+    ))
     plan = models.ProductionPlanHeader(name="orchestrator plan", status="fixed",
-        period_from=period_from, period_to=date(2026, 8, 31))
+        period_from=period_from, period_to=date(2026, 8, 31), fixed_at=cutoff)
     db.add(plan); db.flush()
     line = models.ProductionPlanLine(plan_id=plan.id, item_id=item.item_id,
         bucket_date=period_from, qty=Decimal(str(qty)))
@@ -91,7 +103,8 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target.id
     assert target.capabilities == {
         "physical_ledger": True, "reservation_replay": True,
-        "execution_allocations": True, "supplier_receipt_coverage": True,
+        "execution_allocations": True, "reservation_consumption_allocation": True,
+        "supplier_receipt_coverage": True,
         "planning_snapshots": True,
         "replenishment_work_item": True,
         "assembly_output_allocation": True,
@@ -105,15 +118,18 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert {
         "physical_import",
         "reservation_materialize",
+        "execution_allocation",
         "replenishment_work_item",
         "reservation_replay",
         "assembly_output_allocation",
         "drum_schedule",
         "shelf_projection",
+        "future_supply_capture",
         "snapshot_build",
     } == set(by_stage)
     assert all(row.status == "completed" for row in by_stage.values())
     assert by_stage["snapshot_build"].metrics["future_supply_captured"] is True
+    assert by_stage["future_supply_capture"].metrics["rows"] == 0
     snapshot_id = by_stage["snapshot_build"].metrics["candidate_read_snapshot_ids"][str(candidate.run_id)]
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
     production_journal_id = by_stage["snapshot_build"].metrics[
@@ -139,6 +155,23 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     ).one()
     assert queue.payload["total_rows"] == 1
     assert queue.payload["total_queue_qty"] == 5.0
+
+
+def test_single_stage_reuses_execution_batch_with_reservation_consumption_algorithm_version(
+    db_session,
+):
+    accepted, plan, _line, _item, _old, _cutoff = _world(
+        db_session,
+        with_parent=False,
+    )
+    result = _run(db_session, accepted, "orch-single-stage-execution-version", add=[plan.id])
+    target = db_session.get(models.LedgerGeneration, result.target_generation_id)
+    execution_batch = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id,
+        stage="execution_allocation",
+    ).one()
+
+    assert str(execution_batch.algorithm_version) == RESERVATION_CONSUMPTION_ALGORITHM_VERSION
 
 
 def test_production_refresh_resolves_live_pool_for_supplier_and_wip(db_session):
@@ -349,7 +382,9 @@ def test_production_refresh_rejects_only_lines_outside_the_live_contour(db_sessi
 
     capture = (
         db_session.query(models.LedgerBuildBatch)
-        .filter_by(ledger_generation_id=result.target_generation_id, stage="snapshot_build")
+        .filter_by(
+            ledger_generation_id=result.target_generation_id, stage="future_supply_capture"
+        )
         .one()
         .metrics["future_supply_capture"]
     )
@@ -414,7 +449,7 @@ def test_add_retains_existing_fixed_obligation_without_refreeze(db_session):
         .order_by(models.MrpRequirement.id)
     ]
     extra = models.ProductionPlanHeader(name="new", status="fixed",
-        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30))
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30), fixed_at=_cutoff)
     db_session.add(extra); db_session.flush()
     item = db_session.query(models.Item).filter_by(item_code="ORCH-PURCHASE").one()
     db_session.add(models.ProductionPlanLine(plan_id=extra.id, item_id=item.item_id,

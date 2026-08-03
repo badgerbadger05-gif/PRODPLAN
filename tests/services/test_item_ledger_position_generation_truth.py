@@ -200,7 +200,7 @@ def _future_supply(
     """One captured future-supply row scoped to a generation."""
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(generation.id),
-        stage="snapshot_build",
+        stage="future_supply_capture",
         batch_key=f"capture-{generation.id}-{source_ref}",
         status="completed",
         algorithm_version="tests/1",

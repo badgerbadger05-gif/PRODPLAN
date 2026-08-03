@@ -5,14 +5,6 @@ import io
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy.orm import Session
-
-from .planning_service import (
-    get_run_purchases_grouped_by_category,
-    get_run_rework_grouped_by_category,
-)
-
-
 def _require_openpyxl():
     try:
         from openpyxl import Workbook
@@ -133,35 +125,6 @@ def _build_grouped_workbook(
     return _encode_workbook(wb), total_rows
 
 
-def export_purchases_results_xlsx(
-    db: Session,
-    run_id: int,
-    *,
-    item_id: Optional[int] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    sort_by: Optional[str] = None,
-    sort_dir: Optional[str] = None,
-) -> Dict[str, Any]:
-    grouped = get_run_purchases_grouped_by_category(
-        db=db,
-        run_id=int(run_id),
-        item_id=item_id,
-        date_from=date_from,
-        date_to=date_to,
-        limit=1000,
-        offset=0,
-        sort_by=sort_by,
-        sort_dir=sort_dir,
-    )
-    groups = _sort_groups_for_export((grouped or {}).get("groups", []) or [])
-    return export_purchases_snapshot_groups_xlsx(
-        run_id=int(run_id),
-        groups=groups,
-        total_groups=int((grouped or {}).get("total_groups", 0) or 0),
-    )
-
-
 def export_purchases_snapshot_groups_xlsx(
     *,
     run_id: int,
@@ -215,35 +178,6 @@ def export_purchases_snapshot_groups_xlsx(
         "total_rows": int(total_rows),
         "total_groups": int(len(groups) if total_groups is None else total_groups),
     }
-
-
-def export_rework_results_xlsx(
-    db: Session,
-    run_id: int,
-    *,
-    item_id: Optional[int] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    sort_by: Optional[str] = None,
-    sort_dir: Optional[str] = None,
-) -> Dict[str, Any]:
-    grouped = get_run_rework_grouped_by_category(
-        db=db,
-        run_id=int(run_id),
-        item_id=item_id,
-        date_from=date_from,
-        date_to=date_to,
-        limit=1000,
-        offset=0,
-        sort_by=sort_by,
-        sort_dir=sort_dir,
-    )
-    groups = _sort_groups_for_export((grouped or {}).get("groups", []) or [])
-    return export_rework_snapshot_groups_xlsx(
-        run_id=int(run_id),
-        groups=groups,
-        total_groups=int((grouped or {}).get("total_groups", 0) or 0),
-    )
 
 
 def export_rework_snapshot_groups_xlsx(

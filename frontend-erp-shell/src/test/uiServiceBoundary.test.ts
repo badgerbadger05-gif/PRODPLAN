@@ -7,7 +7,6 @@ import { describe, expect, it } from 'vitest'
 const sourceRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const uiRoot = join(sourceRoot, 'ui')
 const transportInfrastructureImports: Readonly<Record<string, readonly string[]>> = {
-  'ui/pages/DbrFeederPage.tsx': ['ApiError'],
   'ui/session/SessionContext.tsx': ['onApiUnauthorized'],
 }
 

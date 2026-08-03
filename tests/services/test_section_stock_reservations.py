@@ -16,6 +16,8 @@ from app.models import (
     Item,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
+    ProductionMaterialCustodyEvent,
+    ProductionMaterialCustodyProjection,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -28,9 +30,9 @@ from app.models import (
 )
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues
-from app.services.production_material_custody import (
-    load_material_custody,
-    committed_material_by_item,
+from app.services.production_material_custody_projection import (
+    MaterialCustodySnapshotUnavailable,
+    initialize_material_custody_baseline,
 )
 from app.services.planning_truth import publish_generation
 
@@ -42,8 +44,29 @@ SOURCE_WH = "wh-metal"
 def accepted_material_truth(db_session):
     cutoff = datetime(2026, 6, 1)
     batch = PhysicalImportBatch(batch_key="section-stock-truth", status="completed", cutoff=cutoff, source_watermarks={})
-    generation = LedgerGeneration(generation_key="section-stock-truth", status="accepted", cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test")
-    db_session.add_all((batch, generation)); db_session.flush(); publish_generation(db_session, generation)
+    generation = LedgerGeneration(
+        generation_key="section-stock-truth",
+        status="building",
+        cutoff=cutoff,
+        accepted_at=None,
+        physical_import_batch=batch,
+        source_watermarks={},
+        capabilities={"physical_ledger": True, "future_supply": True},
+        algorithm_version="test",
+    )
+    db_session.add_all((batch, generation))
+    db_session.flush()
+    initialize_material_custody_baseline(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        cells=[],
+        observed_at=cutoff,
+    )
+    generation.status = "accepted"
+    generation.accepted_at = cutoff
+    publish_generation(db_session, generation)
+    db_session.flush()
+    db_session.expire_all()
     db_session.info["section_stock_generation"] = generation.id
     return generation
 
@@ -63,11 +86,8 @@ def _add_warehouses(db, *, selected=(WORKSHOP_WH, SOURCE_WH)):
 
 def _set_stock(db, item: Item, breakdown: dict[str, float]):
     db.query(StockBin).filter(StockBin.ledger_generation_id == db.info["section_stock_generation"], StockBin.item_id == item.item_id).delete()
-    total = 0.0
     for ref, qty in breakdown.items():
         db.add(StockBin(ledger_generation_id=db.info["section_stock_generation"], item_id=item.item_id, characteristic_ref="", organization_ref="", warehouse_ref1c=ref, on_hand=qty))
-        total += qty
-    item.stock_qty = total
     db.commit()
 
 
@@ -109,16 +129,14 @@ def _setup(db, *, qty_per_unit=1.0, order_qty=8.0, suffix="A"):
         item_name=f"Parent {suffix}",
         item_article=f"P-{suffix}",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     comp = Item(
         item_code=f"C-{suffix}",
         item_name=f"Comp {suffix}",
         item_article=f"C-{suffix}",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add_all([parent, comp])
     db.flush()
@@ -164,41 +182,28 @@ def _post_full_transfer(db, product, comp, *, qty, source_wh=SOURCE_WH, dest_wh=
     return issue
 
 
-# ---------------------------------------------------------------------------
-# Reservation lifecycle
-# ---------------------------------------------------------------------------
-
-
-def test_transit_reserves_at_source_posted_reserves_at_workshop(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db)
-
-    issue = ProductionMaterialIssue(
-        document_number="MT-TR",
-        product_id=product.product_id,
-        order_id=product.order_id,
-        status="exported",
-        direction="issue",
-        warehouse_ref1c=WORKSHOP_WH,
-        source_warehouse_ref1c=SOURCE_WH,
-    )
-    db.add(issue)
-    db.flush()
+def _seed_accepted_custody_projection(db, *, product, component, qty: float) -> None:
+    generation_id = int(db.info["section_stock_generation"])
+    generation = db.get(LedgerGeneration, generation_id)
     db.add(
-        ProductionMaterialIssueLine(
-            issue_id=issue.issue_id,
-            component_item_id=comp.item_id,
-            required_qty=8.0,
-            issued_qty=0.0,
-            line_status="planned",
+        ProductionMaterialCustodyProjection(
+            ledger_generation_id=generation_id,
+            product_id=int(product.product_id),
+            component_item_id=int(component.item_id),
+            location_kind="workshop",
+            warehouse_ref1c=WORKSHOP_WH,
+            reserved_qty=qty,
+            source_event_high_watermark_id=0,
+            built_at=generation.cutoff,
         )
     )
     db.commit()
+    db.expire_all()
 
-    state = load_material_custody(db, item_ids=[comp.item_id])
-    assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(8.0)
-    assert state.reserved_at_warehouse(WORKSHOP_WH, comp.item_id) == pytest.approx(0.0)
+
+# ---------------------------------------------------------------------------
+# Reservation lifecycle
+# ---------------------------------------------------------------------------
 
 
 def test_finished_production_line_releases_exported_transfer_reservations(db_session):
@@ -236,32 +241,12 @@ def test_finished_production_line_releases_exported_transfer_reservations(db_ses
         )
     db.commit()
 
-    state = load_material_custody(db, item_ids=[comp.item_id])
-    assert state.for_product(product.product_id).total(comp.item_id) == pytest.approx(0.0)
-    assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(0.0)
-
     retry = create_material_issues(db, [product.product_id], initiated_by="op")
     assert retry["created"] == []
     assert retry["errors"] == [
         f"product_id={product.product_id}: строка заказа уже закрыта или завершена в 1С; "
         "новые перемещения не создаются"
     ]
-
-
-def test_posted_without_issued_qty_still_reserves(db_session):
-    """Legacy rows: sync marked the issue posted but never stamped issued_qty."""
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db)
-    issue = _post_full_transfer(db, product, comp, qty=8.0)
-    for line in issue.lines:
-        line.issued_qty = 0.0
-    db.commit()
-
-    reserved = committed_material_by_item(db, [comp.item_id])
-    assert reserved[comp.item_id] == pytest.approx(8.0)
-
-
 # ---------------------------------------------------------------------------
 # Coverage: the original double-count scenario
 # ---------------------------------------------------------------------------
@@ -279,6 +264,12 @@ def test_second_order_cannot_be_covered_by_first_orders_kit(db_session):
     # 8 pcs physically on the workshop (moved for order A), nothing else.
     _set_stock(db, comp, {WORKSHOP_WH: 8.0})
     _post_full_transfer(db, product_a, comp, qty=8.0)
+    _seed_accepted_custody_projection(
+        db,
+        product=product_a,
+        component=comp,
+        qty=8.0,
+    )
 
     preview_b = preview_materials(db, product_b.product_id)
     comp_row = preview_b["components"][0]
@@ -351,6 +342,22 @@ def test_create_issues_claims_destination_stock_and_moves_only_delta(db_session)
     )
     assert state.issue_status == "requested"
     assert state.status == "to_move"
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.product_id == product.product_id)
+        .all()
+    )
+    assert len(events) == 2
+    workshop_events = [e for e in events if e.location_kind == "workshop"]
+    transit_events = [e for e in events if e.location_kind == "transit"]
+    assert len(workshop_events) == 1
+    assert len(transit_events) == 1
+    assert workshop_events[0].source_kind == "issue_created"
+    assert transit_events[0].source_kind == "issue_created"
+    assert workshop_events[0].delta_qty == pytest.approx(4.0)
+    assert transit_events[0].delta_qty == pytest.approx(4.0)
+    assert claim_issue.lines[0].custody_event_revision == 1
+    assert transfer_issue.lines[0].custody_event_revision == 1
 
 
 def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_session):
@@ -374,22 +381,16 @@ def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_sess
     assert state.issue_status == "posted"
     assert state.status == "assembled"
 
-    # And the second order for the same item cannot claim the same pieces:
+    # The accepted projection is now stale. A second order cannot claim from a
+    # live reconstruction; it must wait for the next physical refresh.
     product_b = _make_order_line(db, parent, order_qty=8.0, suffix="B2")
-    result_b = create_material_issues(
-        db, [product_b.product_id], warehouse_ref1c=WORKSHOP_WH
-    )
-    created_b = result_b["created"]
-    workshop_b = [
-        row for row in created_b if str(row.get("source_warehouse_ref1c") or "") == WORKSHOP_WH
-    ]
-    # only 2 left free on the workshop (10 - 8 claimed)
-    assert len(workshop_b) == 1
-    issue_b = db.get(ProductionMaterialIssue, workshop_b[0]["issue_id"])
-    assert issue_b.lines[0].required_qty == pytest.approx(2.0)
+    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
+        create_material_issues(
+            db, [product_b.product_id], warehouse_ref1c=WORKSHOP_WH
+        )
 
 
-def test_create_issues_is_idempotent(db_session):
+def test_create_issues_rejects_retry_after_custody_watermark_changes(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -397,9 +398,8 @@ def test_create_issues_is_idempotent(db_session):
 
     first = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
     assert len(first["created"]) == 2
-    second = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
-    assert second["created"] == []
-    assert len(second["reused"]) == 2
+    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
+        create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
 
     issues = (
         db.query(ProductionMaterialIssue)
@@ -407,9 +407,15 @@ def test_create_issues_is_idempotent(db_session):
         .all()
     )
     assert len(issues) == 2
+    assert (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.product_id == product.product_id)
+        .count()
+        == 2
+    )
 
 
-def test_quantity_increase_creates_delta_transfer(db_session):
+def test_quantity_increase_waits_for_refreshed_custody_projection(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -420,17 +426,17 @@ def test_quantity_increase_creates_delta_transfer(db_session):
     product.remaining_qty = 10.0
     db.commit()
 
-    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
-    assert result["errors"] == []
+    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
+        create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
     issue = (
         db.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
         .one()
     )
-    assert issue.lines[0].required_qty == pytest.approx(10.0)
+    assert issue.lines[0].required_qty == pytest.approx(8.0)
 
 
-def test_quantity_decrease_releases_open_reservation(db_session):
+def test_quantity_decrease_waits_for_refreshed_custody_projection(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -441,13 +447,14 @@ def test_quantity_decrease_releases_open_reservation(db_session):
     product.remaining_qty = 5.0
     db.commit()
 
-    create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
+        create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
     issue = (
         db.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
         .one()
     )
-    assert issue.lines[0].required_qty == pytest.approx(5.0)
+    assert issue.lines[0].required_qty == pytest.approx(8.0)
 
 
 # ---------------------------------------------------------------------------

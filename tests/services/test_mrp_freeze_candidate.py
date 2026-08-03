@@ -53,6 +53,7 @@ def _candidate_world(db, quantities=(10, 20)):
             "physical_ledger": True,
             "reservation_replay": True,
             "execution_allocations": True,
+            "reservation_consumption_allocation": True,
         },
         physical_import_batch=physical,
         algorithm_version="tests", accepted_at=cutoff,
@@ -118,19 +119,36 @@ def _candidate_world(db, quantities=(10, 20)):
             started_at=cutoff, fixed_at=cutoff, finished_at=cutoff, pinned=True, active_freeze_version=7,
         )
         db.add_all([line, parent]); db.flush()
+        candidate_plan = models.ProductionPlanHeader(
+            name=f"candidate plan {index}", period_from=plan.period_from, period_to=plan.period_to,
+            status="fixed",
+        )
+        db.add(candidate_plan); db.flush()
+        db.add(
+            models.ProductionPlanLine(
+                plan_id=candidate_plan.id, item_id=item.item_id,
+                bucket_date=plan.period_from, qty=qty,
+            )
+        )
         candidate = models.PlanningRun(
-            status="BUILDING_SNAPSHOT", ledger_generation_id=target.id, prior_run_id=parent.run_id,
-            source_plan_id=plan.id, period_from=plan.period_from, period_to=plan.period_to,
+            status="BUILDING_SNAPSHOT", ledger_generation_id=target.id, prior_run_id=None,
+            source_plan_id=candidate_plan.id, period_from=plan.period_from, period_to=plan.period_to,
             config_snapshot={}, started_at=cutoff, pinned=False,
         )
         db.add(candidate); db.flush()
         parents.append(parent); candidates.append(candidate); lines.append(line)
     _seal_manifest(target, [
         {
-            "action": "refresh", "plan_id": parent.source_plan_id,
-            "parent_run_id": parent.run_id, "candidate_run_id": candidate.run_id,
+            "action": "retain", "plan_id": parent.source_plan_id,
+            "parent_run_id": parent.run_id, "candidate_run_id": None,
         }
-        for parent, candidate in zip(parents, candidates)
+        for parent in parents
+    ] + [
+        {
+            "action": "add", "plan_id": candidate.source_plan_id,
+            "parent_run_id": None, "candidate_run_id": candidate.run_id,
+        }
+        for candidate in candidates
     ])
     return accepted, target, item, parents, candidates, lines
 
@@ -309,7 +327,7 @@ def test_first_candidate_freeze_clamps_negative_physical_pool_without_inflating_
     ]
 
 
-def test_retained_stock_shortage_fails_instead_of_inflating_new_plan(db_session):
+def test_retained_stock_shortage_only_clips_to_zero_free_s0(db_session):
     accepted, target, item, parents, old_candidates, _lines = _candidate_world(
         db_session, (20,)
     )
@@ -331,22 +349,27 @@ def test_retained_stock_shortage_fails_instead_of_inflating_new_plan(db_session)
     )
     db_session.add(retained_requirement)
     db_session.flush()
-    db_session.add(models.MrpFreezeAllocation(
-        run_id=retained.run_id,
-        freeze_version=retained.active_freeze_version,
-        requirement_id=retained_requirement.id,
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=target.id,
         item_id=item.item_id,
         characteristic_ref="",
         organization_ref="",
         planning_stock_pool="default",
-        source_type="stock",
-        source_ref="",
-        source_line_ref="",
-        alloc_qty=Decimal("20"),
-        fact_at_freeze=Decimal("20"),
-        realized_qty=0,
-        evaporated_qty=0,
+        run_id=retained.run_id,
+        freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id,
+        priority_period_from=retained.period_from,
+        priority_period_to=retained.period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("20"),
+        replenishment_required_qty=Decimal("0"),
+        lifecycle_status="active",
     ))
+    for row in db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=target.id,
+        evidence_status="exact",
+    ).all():
+        row.open_qty_at_cutoff = Decimal("0")
     plan, _line, candidate = _add_candidate(db_session, target, item)
     _seal_manifest(
         target,
@@ -369,20 +392,144 @@ def test_retained_stock_shortage_fails_instead_of_inflating_new_plan(db_session)
         horizon_days=45,
     )
 
-    with pytest.raises(
-        LedgerPoolUnavailable,
-        match=r"retained stock allocation exceeds physical baseline.*retained=20.0, available=15.0",
-    ):
-        freeze_candidate_snapshots(
-            db_session,
-            parent_generation_id=accepted.id,
-            target_generation_id=target.id,
-            candidate_run_ids=[candidate.run_id],
-        )
+    freeze_candidate_snapshots(
+        db_session,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[candidate.run_id],
+    )
 
-    assert db_session.query(models.MrpRequirement).filter_by(
-        run_id=candidate.run_id
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id, item_id=item.item_id
+    ).one()
+    assert float(requirement.total_required_qty) == pytest.approx(3)
+    assert float(requirement.net_required_qty) == pytest.approx(3)
+    assert db_session.query(models.MrpFreezeAllocation).filter_by(
+        run_id=candidate.run_id, item_id=item.item_id, source_type="stock",
     ).count() == 0
+    assert db_session.query(models.PlannedPurchase).filter_by(run_id=candidate.run_id).count() == 1
+    assert float(db_session.query(models.PlannedPurchase).filter_by(
+        run_id=candidate.run_id
+    ).one().qty) == pytest.approx(3)
+
+
+def test_dynamic_retained_hold_releases_stock_when_consumption_arrives(db_session):
+    accepted, target, item, parents, old_candidates, _lines = _candidate_world(
+        db_session, (100,)
+    )
+    db_session.delete(old_candidates[0])
+    db_session.flush()
+    retained = parents[0]
+    physical_row = db_session.query(models.StockLedgerEntry).filter_by(
+        item_id=item.item_id
+    ).one()
+    physical_row.qty = Decimal("100")
+
+    retained_requirement = models.MrpRequirement(
+        run_id=retained.run_id,
+        item_id=item.item_id,
+        total_required_qty=Decimal("100"),
+        net_required_qty=Decimal("100"),
+        period_from=retained.period_from,
+        period_to=retained.period_to,
+        bom_level=0,
+        freeze_version=retained.active_freeze_version,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+    )
+    db_session.add(retained_requirement)
+    db_session.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=target.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=retained.run_id,
+        freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id,
+        priority_period_from=retained.period_from,
+        priority_period_to=retained.period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("100"),
+        replenishment_required_qty=Decimal("0"),
+        lifecycle_status="active",
+    )
+    db_session.add(reservation)
+    db_session.flush()
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=target.id,
+        reservation_id=reservation.id,
+        sle_id=physical_row.id,
+        requirement_id=retained_requirement.id,
+        allocated_qty=Decimal("40"),
+        match_rule="fifo",
+        fact_ref=physical_row.recorder_ref,
+        fact_line_ref=physical_row.line_no,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        idempotency_key=f"hold-{item.item_id}-40",
+    ))
+    for row in db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=target.id,
+        evidence_status="exact",
+    ).all():
+        row.open_qty_at_cutoff = Decimal("0")
+    plan, _line, candidate = _add_candidate(db_session, target, item)
+    plan.period_from = date(2026, 9, 20)
+    plan.period_to = date(2026, 9, 30)
+    candidate.period_from = plan.period_from
+    candidate.period_to = plan.period_to
+    line = db_session.get(models.ProductionPlanLine, _line.id)
+    line.qty = Decimal("40")
+    db_session.flush()
+
+    _seal_manifest(
+        target,
+        [
+            {
+                "action": "retain",
+                "plan_id": retained.source_plan_id,
+                "parent_run_id": retained.run_id,
+                "candidate_run_id": None,
+            },
+            {
+                "action": "add",
+                "plan_id": plan.id,
+                "parent_run_id": None,
+                "candidate_run_id": candidate.run_id,
+            },
+        ],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=45,
+    )
+
+    freeze_candidate_snapshots(
+        db_session,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[candidate.run_id],
+    )
+
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id, item_id=item.item_id
+    ).one()
+    assert float(requirement.total_required_qty) == pytest.approx(40)
+    assert float(requirement.net_required_qty) == pytest.approx(0)
+    assert sum(
+        float(row.qty)
+        for row in db_session.query(models.PlannedPurchase).filter_by(run_id=candidate.run_id)
+    ) == pytest.approx(0)
+    assert sum(
+        float(row.alloc_qty)
+        for row in db_session.query(models.MrpFreezeAllocation).filter_by(
+            run_id=candidate.run_id, source_type="stock"
+        )
+    ) == pytest.approx(40)
 
 
 def test_add_candidate_cannot_reuse_supplier_supply_claimed_by_retained_run(db_session):
@@ -508,19 +655,30 @@ def test_add_candidate_cannot_reuse_supplier_supply_claimed_by_retained_run(db_s
     assert purchase_qty == pytest.approx(13)
 
 
-def test_candidate_freeze_supports_sealed_refresh_and_add(db_session):
+def test_candidate_freeze_supports_sealed_retain_and_add(db_session):
     accepted, target, item, parents, candidates, _lines = _candidate_world(db_session)
     plan, line, added = _add_candidate(db_session, target, item)
+    for candidate in candidates:
+        candidate.horizon_days = 45
+        candidate.config_version_id = None
+        candidate.config_snapshot = {"first": True}
+    add_plan_ids = [candidate.source_plan_id for candidate in candidates] + [plan.id]
     _seal_manifest(
         target,
         [
             {
-                "action": "refresh", "plan_id": parent.source_plan_id,
-                "parent_run_id": parent.run_id, "candidate_run_id": candidate.run_id,
+                "action": "retain", "plan_id": parent.source_plan_id,
+                "parent_run_id": parent.run_id, "candidate_run_id": None,
             }
-            for parent, candidate in zip(parents, candidates)
+            for parent in parents
+        ] + [
+            {
+                "action": "add", "plan_id": candidate.source_plan_id,
+                "parent_run_id": None, "candidate_run_id": candidate.run_id,
+            }
+            for candidate in candidates
         ] + [{"action": "add", "plan_id": plan.id, "parent_run_id": None, "candidate_run_id": added.run_id}],
-        add_plan_ids=[plan.id], add_config={"first": True}, horizon_days=45,
+        add_plan_ids=add_plan_ids, add_config={"first": True}, horizon_days=45,
     )
 
     freeze_candidate_snapshots(
@@ -530,6 +688,45 @@ def test_candidate_freeze_supports_sealed_refresh_and_add(db_session):
 
     assert db_session.get(models.ProductionPlanLine, line.id).locked_by_run_id is None
     assert db_session.query(models.MrpRequirement).filter_by(run_id=added.run_id).count() == 1
+
+
+def test_candidate_freeze_rejects_sealed_refresh_manifest_before_derivation(db_session):
+    accepted, target, _item, _parents, candidates, _lines = _candidate_world(db_session)
+    _seal_manifest(
+        target,
+        [
+            {
+                "action": "refresh", "plan_id": int(candidates[0].source_plan_id),
+                "parent_run_id": int(candidates[0].run_id), "candidate_run_id": int(candidates[0].run_id),
+            }
+        ] + [
+            {
+                "action": "add", "plan_id": int(candidate.source_plan_id),
+                "parent_run_id": None, "candidate_run_id": int(candidate.run_id),
+            }
+            for candidate in candidates[1:]
+        ],
+    )
+
+    with pytest.raises(LedgerPoolUnavailable, match="unsupported action"):
+        freeze_candidate_snapshots(
+            db_session,
+            parent_generation_id=accepted.id,
+            target_generation_id=target.id,
+            candidate_run_ids=[row.run_id for row in candidates],
+        )
+
+    run_ids = [row.run_id for row in candidates]
+    assert db_session.query(models.MrpRequirement).filter(
+        models.MrpRequirement.run_id.in_(run_ids)
+    ).count() == 0
+    assert db_session.query(models.PlannedPurchase).filter(
+        models.PlannedPurchase.run_id.in_(run_ids)
+    ).count() == 0
+    assert db_session.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == target.id,
+        models.ReservationEntry.run_id.in_(run_ids),
+    ).count() == 0
 
 
 def test_candidate_freeze_rejects_non_building_target(db_session):
@@ -562,6 +759,114 @@ def test_candidate_freeze_rejects_missing_required_capabilities(db_session):
         freeze_candidate_snapshots(
             db_session, parent_generation_id=accepted.id,
             target_generation_id=target.id, candidate_run_ids=[row.run_id for row in candidates],
+        )
+
+
+def test_candidate_freeze_rejects_retained_reservation_with_pool_qualifier(db_session):
+    accepted, target, item, parents, old_candidates, _lines = _candidate_world(
+        db_session, (1,)
+    )
+    db_session.delete(old_candidates[0])
+    db_session.flush()
+
+    retained = parents[0]
+    retained_requirement = models.MrpRequirement(
+        run_id=retained.run_id,
+        item_id=item.item_id,
+        total_required_qty=1,
+        net_required_qty=1,
+        period_from=retained.period_from,
+        period_to=retained.period_to,
+        bom_level=0,
+        freeze_version=retained.active_freeze_version,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+    )
+    db_session.add(retained_requirement)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=target.id,
+        item_id=item.item_id,
+        characteristic_ref="reserved-dimension",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=retained.run_id,
+        freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id,
+        priority_period_from=retained.period_from,
+        priority_period_to=retained.period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("1"),
+        replenishment_required_qty=Decimal("0"),
+        lifecycle_status="active",
+    ))
+    db_session.flush()
+
+    plan, _line, candidate = _add_candidate(db_session, target, item)
+    _seal_manifest(
+        target,
+        [
+            {
+                "action": "retain",
+                "plan_id": retained.source_plan_id,
+                "parent_run_id": retained.run_id,
+                "candidate_run_id": None,
+            },
+            {
+                "action": "add",
+                "plan_id": plan.id,
+                "parent_run_id": None,
+                "candidate_run_id": candidate.run_id,
+            },
+        ],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=45,
+    )
+
+    with pytest.raises(LedgerPoolUnavailable, match="pool qualifier unavailable"):
+        freeze_candidate_snapshots(
+            db_session, parent_generation_id=accepted.id, target_generation_id=target.id,
+            candidate_run_ids=[candidate.run_id],
+        )
+
+
+def test_candidate_freeze_rejects_candidate_requirement_with_pool_qualifier(db_session):
+    accepted, target, item, _parents, _candidates, _lines = _candidate_world(db_session, ())
+    plan, _line, candidate = _add_candidate(db_session, target, item)
+    _seal_manifest(
+        target,
+        [{
+            "action": "add",
+            "plan_id": plan.id,
+            "parent_run_id": None,
+            "candidate_run_id": candidate.run_id,
+        }],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=45,
+    )
+    db_session.add(models.MrpRequirement(
+        run_id=candidate.run_id,
+        item_id=item.item_id,
+        total_required_qty=Decimal("1"),
+        net_required_qty=Decimal("1"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+        characteristic_ref="",
+        organization_ref="org",
+        planning_stock_pool="default",
+    ))
+    db_session.flush()
+
+    with pytest.raises(LedgerPoolUnavailable, match="pool qualifier unavailable"):
+        freeze_candidate_snapshots(
+            db_session,
+            parent_generation_id=accepted.id,
+            target_generation_id=target.id,
+            candidate_run_ids=[candidate.run_id],
         )
 
 

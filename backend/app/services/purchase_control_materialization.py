@@ -414,6 +414,144 @@ def _row_key(row: Any) -> str:
     return _normalize_text(row.get("row_key"))
 
 
+def _materialization_slice_items(
+    slice_row: Any,
+    *,
+    row_key: str,
+    field: str,
+) -> dict[str, Any]:
+    if not isinstance(slice_row, dict):
+        raise PurchaseControlMaterializationError(f"row {row_key}: {field} contains malformed slice")
+
+    reservation_id = _to_int(slice_row.get("reservation_id"), field=f"{field}.reservation_id")
+    work_item_id = _to_int(slice_row.get("work_item_id"), field=f"{field}.work_item_id")
+    requirement_id = _to_int(slice_row.get("requirement_id"), field=f"{field}.requirement_id")
+    run_id = _to_int(slice_row.get("run_id"), field=f"{field}.run_id")
+    to_order_qty = round(
+        _to_float(slice_row.get("to_order_qty"), field=f"{field}.to_order_qty"),
+        6,
+    )
+
+    return {
+        "reservation_id": reservation_id,
+        "work_item_id": work_item_id,
+        "requirement_id": requirement_id,
+        "run_id": run_id,
+        "plan_period_from": _normalize_text(slice_row.get("plan_period_from")),
+        "plan_period_to": _normalize_text(slice_row.get("plan_period_to")),
+        "need_date": _normalize_text(slice_row.get("need_date")),
+        "need_period_to": _normalize_text(slice_row.get("need_period_to")),
+        "to_order_qty": to_order_qty,
+    }
+
+
+def _materialization_input_slices(
+    row: dict[str, Any],
+    *,
+    row_key: str,
+) -> list[dict[str, Any]]:
+    source = "slices"
+    raw_slices: Any = row.get("slices")
+    materialization_input = row.get("materialization_input")
+    if isinstance(materialization_input, dict):
+        source = "materialization_input.slices"
+        raw_slices = materialization_input.get("slices")
+        if not isinstance(raw_slices, list):
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: materialization_input.slices is malformed"
+            )
+        if row.get("slices") is not None and isinstance(row.get("slices"), list):
+            input_fingerprint = sorted(
+                (
+                    _materialization_slice_items(
+                        item,
+                        row_key=row_key,
+                        field="materialization_input.slices",
+                    )
+                    for item in raw_slices
+                ),
+                key=lambda item: (
+                    item["reservation_id"],
+                    item["work_item_id"],
+                    item["requirement_id"],
+                ),
+            )
+            legacy_fingerprint = sorted(
+                (
+                    _materialization_slice_items(
+                        item,
+                        row_key=row_key,
+                        field="slices",
+                    )
+                    for item in row.get("slices", [])
+                ),
+                key=lambda item: (
+                    item["reservation_id"],
+                    item["work_item_id"],
+                    item["requirement_id"],
+                ),
+            )
+            if input_fingerprint != legacy_fingerprint:
+                raise PurchaseControlMaterializationError(
+                    f"row {row_key}: materialization_input no longer matches legacy slices"
+                )
+
+    if not isinstance(raw_slices, list):
+        raise PurchaseControlMaterializationError(
+            f"row {row_key}: {source} is malformed"
+        )
+
+    normalized: list[dict[str, Any]] = []
+    for slice_row in raw_slices:
+        normalized_slice = _materialization_slice_items(
+            slice_row,
+            row_key=row_key,
+            field=source,
+        )
+        if normalized_slice["to_order_qty"] > 0:
+            normalized.append(normalized_slice)
+
+    if not normalized:
+        raise PurchaseControlMaterializationError(f"row {row_key} has no line slices")
+    return normalized
+
+
+def _materialization_input_identity(row: dict[str, Any], *, row_key: str) -> dict[str, str]:
+    raw = row.get("materialization_input")
+    if not isinstance(raw, dict):
+        raise PurchaseControlMaterializationError(
+            f"row {row_key}: materialization_input is missing"
+        )
+
+    supplier_ref1c = clean_ref1c(raw.get("supplier_ref1c"))
+    if not supplier_ref1c:
+        raise PurchaseControlMaterializationError(
+            f"row {row_key}: materialization_input supplier_ref1c is missing"
+        )
+    item_ref1c = clean_ref1c(raw.get("item_ref1c"))
+    if not item_ref1c:
+        raise PurchaseControlMaterializationError(
+            f"row {row_key}: materialization_input item_ref1c is missing"
+        )
+    unit_ref1c = _normalize_text(raw.get("unit_ref1c"))
+    if not unit_ref1c:
+        raise PurchaseControlMaterializationError(
+            f"row {row_key}: materialization_input unit_ref1c is missing"
+        )
+    destination_warehouse_ref1c = clean_ref1c(raw.get("destination_warehouse_ref1c"))
+    if not destination_warehouse_ref1c:
+        raise PurchaseControlMaterializationError(
+            f"row {row_key}: materialization_input destination_warehouse_ref1c is missing"
+        )
+
+    return {
+        "supplier_ref1c": supplier_ref1c,
+        "item_ref1c": item_ref1c,
+        "unit_ref1c": unit_ref1c,
+        "destination_warehouse_ref1c": destination_warehouse_ref1c,
+    }
+
+
 def _line_signature(rows: list[dict[str, Any]]) -> str:
     """Stable hash over requested lineages and allocation quantities."""
 
@@ -422,22 +560,14 @@ def _line_signature(rows: list[dict[str, Any]]) -> str:
         row_key = _row_key(row)
         if not row_key:
             raise PurchaseControlMaterializationError("row_key is missing")
-        slices = row.get("slices")
-        if not isinstance(slices, list):
-            raise PurchaseControlMaterializationError(f"row {row_key}: slices are malformed")
-        for slice_row in slices:
-            reservation_id = _to_int(
-                slice_row.get("reservation_id"),
-                field="reservation_id",
-            )
-            alloc_qty = round(_to_float(slice_row.get("to_order_qty"), field="to_order_qty"), 6)
-            if alloc_qty <= 0:
-                continue
+        for slice_row in _materialization_input_slices(row, row_key=row_key):
             signature_items.append(
                 {
                     "row_key": row_key,
-                    "reservation_id": reservation_id,
-                    "allocated_qty": alloc_qty,
+                    "reservation_id": int(slice_row["reservation_id"]),
+                    "allocated_qty": float(slice_row["to_order_qty"]),
+                    "work_item_id": int(slice_row["work_item_id"]),
+                    "need_date": str(slice_row.get("need_date") or ""),
                 }
             )
 
@@ -536,26 +666,36 @@ def _load_groups_and_lineages(
 
     for row in selected_rows:
         row_key = _row_key(row)
+        frozen = _materialization_input_identity(row, row_key=row_key)
+
         supplier_id = _to_int(row.get("supplier_id"), field="supplier_id")
         supplier = db.get(models.Supplier, supplier_id)
         if supplier is None:
             raise PurchaseControlMaterializationError(
                 f"row {row_key}: supplier {supplier_id} not found"
             )
-        supplier_ref1c = _normalize_text(supplier.supplier_ref1c)
+        supplier_ref1c = clean_ref1c(supplier.supplier_ref1c)
         if not supplier_ref1c:
             raise PurchaseControlMaterializationError(
                 f"row {row_key}: supplier {supplier_id} missing supplier_ref1c"
+            )
+        if clean_ref1c(frozen["supplier_ref1c"]).lower() != supplier_ref1c.lower():
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: supplier_ref1c changed since snapshot"
             )
 
         item_id = _to_int(row.get("item_id"), field="item_id")
         item = db.get(models.Item, item_id)
         if item is None:
             raise PurchaseControlMaterializationError(f"row {row_key}: item {item_id} not found")
-        item_ref1c = _normalize_text(item.item_ref1c)
+        item_ref1c = clean_ref1c(item.item_ref1c)
         if not item_ref1c:
             raise PurchaseControlMaterializationError(
                 f"row {row_key}: item {item_id} missing item_ref1c"
+            )
+        if clean_ref1c(frozen["item_ref1c"]).lower() != item_ref1c.lower():
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: item_ref1c changed since snapshot"
             )
 
         unit_ref1c = _normalize_text(item.unit)
@@ -563,18 +703,26 @@ def _load_groups_and_lineages(
             raise PurchaseControlMaterializationError(
                 f"row {row_key}: item {item_id} missing unit"
             )
+        if frozen["unit_ref1c"] != unit_ref1c:
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: unit_ref1c changed since snapshot"
+            )
         planning_stock_pool = _normalize_text(row.get("planning_stock_pool"))
         if not planning_stock_pool:
             raise PurchaseControlMaterializationError(
                 f"row {row_key}: planning_stock_pool is missing"
             )
-        destination_warehouse_ref1c = clean_ref1c(
-            row.get("destination_warehouse_ref1c")
-        ) or configured_destination
+        if not configured_destination:
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: configured purchase destination is missing"
+            )
+        destination_warehouse_ref1c = frozen["destination_warehouse_ref1c"]
+        if destination_warehouse_ref1c.lower() != configured_destination.lower():
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: destination_warehouse_ref1c changed since snapshot"
+            )
 
-        slices = row.get("slices")
-        if not isinstance(slices, list) or not slices:
-            raise PurchaseControlMaterializationError(f"row {row_key} has no line slices")
+        slices = _materialization_input_slices(row, row_key=row_key)
 
         need_date = _normalize_text(row.get("need_date")) or None
         order_date = _normalize_text(row.get("plan_period_from")) or _normalize_text(row.get("order_date")) or None
@@ -723,6 +871,13 @@ def _build_request_payload(
         ),
         "row_count": len(selected_rows),
         "row_keys": sorted(set(_normalize_text(k) for k in requested_keys)),
+        "materialization_input": [
+            {
+                "row_key": _row_key(row),
+                "slices": _materialization_input_slices(row, row_key=_row_key(row)),
+            }
+            for row in selected_rows
+        ],
         "groups": [
             {
                 "supplier_id": int(group.supplier_id),
@@ -983,21 +1138,16 @@ def _materialize_purchase_control_orders_to_1c(
     configured_destination = clean_ref1c(
         _load_odata_config().get("purchase_destination_warehouse_ref1c")
     )
+    if not configured_destination:
+        raise PurchaseControlMaterializationError(
+            "configured purchase destination warehouse is missing"
+        )
     for group in groups:
         for line in group.lines:
-            if not clean_ref1c(line.destination_warehouse_ref1c):
-                line.destination_warehouse_ref1c = configured_destination
-    missing_destination = [
-        int(line.reservation_id)
-        for group in groups
-        for line in group.lines
-        if not clean_ref1c(line.destination_warehouse_ref1c)
-    ]
-    if missing_destination:
-        raise PurchaseControlMaterializationError(
-            "purchase_destination_warehouse_ref1c is required for BUY materialization; "
-            f"reservations={sorted(missing_destination)}"
-        )
+            if clean_ref1c(line.destination_warehouse_ref1c) != configured_destination:
+                raise PurchaseControlMaterializationError(
+                    f"row {line.row_key}: destination_warehouse_ref1c is missing or changed"
+                )
     for group in groups:
         _stamp_group_lines(group)
 
@@ -1042,7 +1192,7 @@ def _materialize_purchase_control_orders_to_1c(
             PURCHASE_ORDER_ENTITY,
             filter_query=f"substringof('{token}', Комментарий)",
             select_fields=["Ref_Key", "Контрагент_Key", "Запасы"],
-            top=1,
+            top=2,
             max_records=2,
             max_pages=1,
             order_by=None,
@@ -1310,6 +1460,10 @@ def materialize_rows(
             .filter_by(idempotency_key=key)
             .one_or_none()
         )
+        if batch is not None and batch.payload_hash and str(batch.payload_hash) != request_hash:
+            raise PurchaseControlMaterializationError(
+                "materialization request payload changed since batch was built"
+            )
         if batch is not None and batch.status == "completed":
             return {
                 **preview,

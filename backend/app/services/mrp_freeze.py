@@ -31,6 +31,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha256
 import json
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
@@ -40,25 +41,30 @@ from sqlalchemy.orm import Session
 
 from ..models import (
     DefaultSpecification,
-    IgnoredWarehouse,
     LedgerGeneration,
     LedgerFutureSupply,
     MrpFreezeAllocation,
     MrpFreezeBaseline,
     MrpFreezeComponent,
+    MrpFreezeComponentCumulative,
     MrpRequirement,
     PlanningRun,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
+    ReservationConsumptionAllocation,
+    ReservationEntry,
     SpecComponent,
     Specification,
     StockBin,
     StockLedgerEntry,
-    StockWarehouse,
 )
-from .mrp_stock_helpers import WipSupplyLine
-from .planning_run_candidate import PlanningRunCandidateError, _resolve_parent_generation_id
+from .mrp_stock_helpers import (
+    WipSupplyLine,
+    apply_planning_warehouse_scope,
+    planning_stock_by_item,
+    planning_warehouse_scope,
+)
 from .planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -66,7 +72,6 @@ from .planning_truth import (
     PlanningTruthUnavailable,
     require_accepted_truth,
 )
-from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from .bom_specification_resolver import BomSpecificationResolver
 from .planning_pool_resolver import DEFAULT_STOCK_POOL
 
@@ -94,6 +99,23 @@ MRP_REQUIRED_CAPABILITIES = (
     CAPABILITY_RESERVATION_REPLAY,
     CAPABILITY_EXECUTION_ALLOCATIONS,
 )
+
+
+def _assert_full_pool_qualifiers_default(
+    *, row: Any, kind: str, context: str
+) -> None:
+    item_id = row.item_id if hasattr(row, "item_id") else None
+    if (
+        str(getattr(row, "characteristic_ref", "") or EMPTY_REF) != EMPTY_REF
+        or str(getattr(row, "organization_ref", "") or EMPTY_REF) != EMPTY_REF
+        or str(getattr(row, "planning_stock_pool", "") or DEFAULT_STOCK_POOL)
+        != DEFAULT_STOCK_POOL
+    ):
+        suffix = f" run {int(row.run_id)}" if getattr(row, "run_id", None) is not None else ""
+        suffix_item = f" item {int(item_id)}" if item_id else ""
+        raise LedgerPoolUnavailable(
+            f"ledger_pool_unavailable: {kind} {context} has pool qualifier unavailable{suffix}{suffix_item}"
+        )
 
 
 class LedgerPoolUnavailable(RuntimeError):
@@ -168,63 +190,21 @@ class FreezeTrace:
     by_item: Dict[int, ItemFreezeTrace] = field(
         default_factory=lambda: defaultdict(ItemFreezeTrace)
     )
+    root_item_ids: Set[int] = field(default_factory=set)
     # (parent_item_id, component_item_id, spec_id, norm_per_unit)
     component_norms: List[Tuple[int, int, int, float]] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class _MrpWarehouseScope:
-    has_warehouse_rows: bool
-    selected_refs: Set[str]
-    ignored_refs: Set[str]
-    finished_refs: Set[str]
-    organization_ref: str = DEFAULT_ORGANIZATION_REF1C
-
-
-def _mrp_warehouse_scope(db: Session) -> _MrpWarehouseScope:
-    ignored_refs = {
-        str(ref)
-        for (ref,) in db.query(IgnoredWarehouse.warehouse_ref1c).all()
-        if ref
-    }
-    warehouse_rows = db.query(
-        StockWarehouse.warehouse_ref1c,
-        StockWarehouse.is_selected,
-        StockWarehouse.is_finished_goods,
-    ).all()
-    selected_refs = {
-        str(ref)
-        for ref, selected, finished in warehouse_rows
-        if ref and bool(selected) and not bool(finished)
-    }
-    finished_refs = {
-        str(ref) for ref, _selected, finished in warehouse_rows if ref and bool(finished)
-    }
-    return _MrpWarehouseScope(
-        has_warehouse_rows=bool(warehouse_rows),
-        selected_refs=selected_refs,
-        ignored_refs=ignored_refs,
-        finished_refs=finished_refs,
-        organization_ref=DEFAULT_ORGANIZATION_REF1C,
-    )
-
-
-def _apply_mrp_warehouse_scope(
-    query: Any,
-    scope: _MrpWarehouseScope,
-):
-    if scope.has_warehouse_rows:
-        query = (
-            query.filter(StockBin.warehouse_ref1c.in_(scope.selected_refs))
-            if scope.selected_refs
-            else query.filter(False)
+def _raise_unavailable_if_characteristics_present(
+    rows: list[Any],
+    *,
+    context: str,
+) -> None:
+    if rows:
+        raise LedgerPoolUnavailable(
+            "ledger_pool_unavailable: physical pool qualifier unavailable "
+            f"in {context}"
         )
-    if scope.ignored_refs:
-        query = query.filter(~StockBin.warehouse_ref1c.in_(scope.ignored_refs))
-    if scope.finished_refs:
-        query = query.filter(~StockBin.warehouse_ref1c.in_(scope.finished_refs))
-    query = query.filter(StockBin.organization_ref == scope.organization_ref)
-    return query
 
 
 # ---------------------------------------------------------------------------
@@ -253,10 +233,59 @@ def build_shared_pools(
             f"ledger_pool_unavailable: generation {ledger_generation_id} is missing"
         )
     if stock_baseline_at is not None:
+        from .item_ledger.physical_visibility import visible_sle_query
+
+        baseline_scope = planning_warehouse_scope(db)
+        baseline_query = visible_sle_query(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=stock_baseline_at,
+        ).filter(func.abs(func.coalesce(StockLedgerEntry.qty, 0)) > EPS).with_entities(
+            StockLedgerEntry.id, StockLedgerEntry.item_id, StockLedgerEntry.characteristic_ref
+        )
+        baseline_query = apply_planning_warehouse_scope(
+            baseline_query,
+            baseline_scope,
+            warehouse_column=StockLedgerEntry.warehouse_ref1c,
+            organization_column=StockLedgerEntry.organization_ref,
+        )
+        if relevant_ids:
+            baseline_query = baseline_query.filter(StockLedgerEntry.item_id.in_(relevant_ids))
+        _raise_unavailable_if_characteristics_present(
+            [
+                row
+                for row in baseline_query.all()
+                if str(getattr(row, "characteristic_ref", "") or "").strip()
+            ],
+            context="historical physical rows",
+        )
         _assert_baseline_within_physical_history(
             db,
             physical_import_batch_id=int(generation.physical_import_batch_id),
             baseline_at=stock_baseline_at,
+        )
+    else:
+        current_scope = planning_warehouse_scope(db)
+        current_query = (
+            db.query(StockBin.id, StockBin.item_id, StockBin.characteristic_ref)
+            .filter(StockBin.ledger_generation_id == int(ledger_generation_id))
+            .filter(func.abs(func.coalesce(StockBin.on_hand, 0)) > EPS)
+        )
+        current_query = apply_planning_warehouse_scope(
+            current_query,
+            current_scope,
+            warehouse_column=StockBin.warehouse_ref1c,
+            organization_column=StockBin.organization_ref,
+        )
+        if relevant_ids:
+            current_query = current_query.filter(StockBin.item_id.in_(relevant_ids))
+        _raise_unavailable_if_characteristics_present(
+            [
+                row
+                for row in current_query.all()
+                if str(getattr(row, "characteristic_ref", "") or "").strip()
+            ],
+            context="current physical stock",
         )
     stock = (
         _ledger_stock_by_item_at(
@@ -392,15 +421,7 @@ def _assert_baseline_within_physical_history(
 
 def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[int, float]:
     """Read planning stock from one exact accepted generation, with no fallback."""
-    scope = _mrp_warehouse_scope(db)
-    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
-        StockBin.ledger_generation_id == int(ledger_generation_id)
-    )
-    query = _apply_mrp_warehouse_scope(query, scope)
-    return {
-        int(item_id): _to_float(qty)
-        for item_id, qty in query.group_by(StockBin.item_id).all()
-    }
+    return planning_stock_by_item(db, int(ledger_generation_id))
 
 
 def _ledger_stock_by_item_at(
@@ -412,7 +433,7 @@ def _ledger_stock_by_item_at(
     """Signed physical stock at one immutable business-time boundary."""
     from .item_ledger.physical_visibility import visible_sle_query
 
-    scope = _mrp_warehouse_scope(db)
+    scope = planning_warehouse_scope(db)
     query = visible_sle_query(
         db,
         physical_import_batch_id=int(physical_import_batch_id),
@@ -421,18 +442,11 @@ def _ledger_stock_by_item_at(
         StockLedgerEntry.item_id,
         func.sum(StockLedgerEntry.qty),
     )
-    if scope.has_warehouse_rows:
-        query = (
-            query.filter(StockLedgerEntry.warehouse_ref1c.in_(scope.selected_refs))
-            if scope.selected_refs
-            else query.filter(False)
-        )
-    if scope.ignored_refs:
-        query = query.filter(~StockLedgerEntry.warehouse_ref1c.in_(scope.ignored_refs))
-    if scope.finished_refs:
-        query = query.filter(~StockLedgerEntry.warehouse_ref1c.in_(scope.finished_refs))
-    query = query.filter(
-        StockLedgerEntry.organization_ref == scope.organization_ref
+    query = apply_planning_warehouse_scope(
+        query,
+        scope,
+        warehouse_column=StockLedgerEntry.warehouse_ref1c,
+        organization_column=StockLedgerEntry.organization_ref,
     )
     return {
         int(item_id): _to_float(qty)
@@ -677,6 +691,78 @@ def _write_freeze_component(
     return count
 
 
+def _write_freeze_component_cumulative(
+    db: Session,
+    run: PlanningRun,
+    new_version: int,
+    trace: FreezeTrace,
+) -> int:
+    """Write cumulative root->component BOM norms for one freeze run/version."""
+    if not trace.component_norms or not trace.root_item_ids:
+        return 0
+
+    # Trace data is immediate parent->child norms from the BOM explosion.
+    # Build it into an adjacency list before propagating to cumulative values.
+    zero = Decimal("0")
+    immediate_norm_by_edge: Dict[Tuple[int, int], Decimal] = {}
+    graph: Dict[int, list[tuple[int, Decimal]]] = defaultdict(list)
+    for parent, component, _spec_id, norm in trace.component_norms:
+        decimal_norm = Decimal(str(norm))
+        if decimal_norm <= zero:
+            continue
+        parent_id = int(parent)
+        child_id = int(component)
+        key = (parent_id, child_id)
+        immediate_norm_by_edge[key] = immediate_norm_by_edge.get(key, zero) + decimal_norm
+
+    for (parent_id, component_id), norm in sorted(immediate_norm_by_edge.items()):
+        graph[parent_id].append((component_id, norm))
+
+    for parent_id, edges in graph.items():
+        graph[parent_id] = sorted(edges, key=lambda item: item[0])
+
+    cumulative_norm_by_root_component: Dict[Tuple[int, int], Decimal] = {}
+
+    for root_id in sorted(trace.root_item_ids):
+        stack: list[tuple[int, Decimal, set[int]]] = [
+            (int(root_id), Decimal("1"), {int(root_id)})
+        ]
+        while stack:
+            parent_id, path_factor, ancestors = stack.pop()
+            for component_id, parent_norm in graph.get(parent_id, []):
+                if component_id in ancestors:
+                    continue
+                cumulative_norm = path_factor * parent_norm
+                if cumulative_norm <= zero:
+                    continue
+                key = (int(root_id), int(component_id))
+                cumulative_norm_by_root_component[key] = (
+                    cumulative_norm_by_root_component.get(key, zero) + cumulative_norm
+                )
+                next_ancestors = set(ancestors)
+                next_ancestors.add(int(component_id))
+                stack.append((int(component_id), cumulative_norm, next_ancestors))
+
+    if not cumulative_norm_by_root_component:
+        return 0
+
+    count = 0
+    for (root_id, component_id), norm in sorted(cumulative_norm_by_root_component.items()):
+        if norm <= zero:
+            continue
+        db.add(
+            MrpFreezeComponentCumulative(
+                run_id=int(run.run_id),
+                freeze_version=int(new_version),
+                root_item_id=int(root_id),
+                component_item_id=int(component_id),
+                cumulative_norm_qty_per_root_unit=norm,
+            )
+        )
+        count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 #  — orchestrator
 # ---------------------------------------------------------------------------
@@ -775,7 +861,8 @@ def freeze_candidate_snapshots(
 
     # A build is a closed set.  Do this validation before deriving anything so
     # a worker cannot select only the convenient candidates from a sealed
-    # refresh/add batch (or slip an unsealed candidate into it).
+    # manifest batch for a candidate freeze build (or slip an unsealed
+    # candidate into it).
     from .obligation_refresh_manifest import MANIFEST_HASH_KEY, MANIFEST_KEY
 
     watermarks = dict(target.source_watermarks or {})
@@ -821,13 +908,15 @@ def freeze_candidate_snapshots(
                 retained_entries.append(entry)
             manifest_plan_ids.add(plan_id)
             continue
+        if action != "add":
+            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
+        if plan_id <= 0:
+            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
         try:
             candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise LedgerPoolUnavailable("candidate freeze candidate identity is malformed") from exc
-        if action not in {"refresh", "add"} or plan_id <= 0 or candidate_id <= 0:
-            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
-        if candidate_id in manifest_entries or plan_id in manifest_plan_ids:
+        if candidate_id in manifest_entries or candidate_id <= 0 or plan_id in manifest_plan_ids:
             raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest has duplicate candidate or plan")
         manifest_entries[candidate_id] = entry
         manifest_plan_ids.add(plan_id)
@@ -849,55 +938,42 @@ def freeze_candidate_snapshots(
     }
     if set(runs) != set(requested_ids):
         raise LedgerPoolUnavailable("candidate freeze manifest names missing PlanningRun rows")
-    parent_run_ids: Set[int] = set()
     for run in runs.values():
         if str(run.status) != "BUILDING_SNAPSHOT" or int(run.ledger_generation_id or 0) != target_id:
             raise LedgerPoolUnavailable("candidate freeze runs must be BUILDING_SNAPSHOT rows on target")
         entry = manifest_entries[int(run.run_id)]
-        action = str(entry["action"])
         if int(run.source_plan_id or -1) != int(entry["plan_id"]):
             raise LedgerPoolUnavailable("candidate freeze source plan conflicts with sealed manifest")
-        if action == "refresh":
-            try:
-                parent_run_id = int(entry["parent_run_id"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise LedgerPoolUnavailable("candidate freeze refresh manifest lacks parent run") from exc
-            if run.prior_run_id is None or int(run.prior_run_id) != parent_run_id:
-                raise LedgerPoolUnavailable("candidate freeze refresh candidate parent conflicts with manifest")
-            old = db.get(PlanningRun, parent_run_id)
-            if old is None or str(old.status) != FIXED_SNAPSHOT_STATUS:
-                raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
-            try:
-                old_parent_generation_id = _resolve_parent_generation_id(db, old)
-            except PlanningRunCandidateError as exc:
-                raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot") from exc
-            if old_parent_generation_id != parent_id:
-                raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
-            if old.source_plan_id != run.source_plan_id:
-                raise LedgerPoolUnavailable("candidate freeze source plan differs from parent")
-            parent_run_ids.add(int(old.run_id))
-        else:
-            if entry.get("parent_run_id") is not None or run.prior_run_id is not None:
-                raise LedgerPoolUnavailable("candidate freeze add candidate must not have a parent run")
-            plan = db.get(ProductionPlanHeader, int(run.source_plan_id))
-            if plan is None or str(plan.status) != "fixed":
-                raise LedgerPoolUnavailable("candidate freeze add plan must be fixed")
-            if run.period_from != plan.period_from or run.period_to != plan.period_to:
-                raise LedgerPoolUnavailable("candidate freeze add candidate period conflicts with fixed plan")
-            if (
-                run.horizon_days != add_request.get("horizon_days")
-                or run.config_version_id != add_request.get("config_version_id")
-                or run.config_snapshot != add_request["config_snapshot"]
-            ):
-                raise LedgerPoolUnavailable("candidate freeze add candidate config conflicts with manifest")
-            if db.query(ProductionPlanLine.id).filter(
-                ProductionPlanLine.plan_id == int(plan.id),
-                ProductionPlanLine.locked_by_run_id.isnot(None),
-            ).first() is not None:
-                raise LedgerPoolUnavailable("candidate freeze add plan lines must be unlocked")
+        if entry.get("parent_run_id") is not None or run.prior_run_id is not None:
+            raise LedgerPoolUnavailable("candidate freeze add candidate must not have a parent run")
+        plan = db.get(ProductionPlanHeader, int(run.source_plan_id))
+        if plan is None or str(plan.status) != "fixed":
+            raise LedgerPoolUnavailable("candidate freeze add plan must be fixed")
+        if run.period_from != plan.period_from or run.period_to != plan.period_to:
+            raise LedgerPoolUnavailable("candidate freeze add candidate period conflicts with fixed plan")
+        if (
+            run.horizon_days != add_request.get("horizon_days")
+            or run.config_version_id != add_request.get("config_version_id")
+            or run.config_snapshot != add_request["config_snapshot"]
+        ):
+            raise LedgerPoolUnavailable("candidate freeze add candidate config conflicts with manifest")
+        if db.query(ProductionPlanLine.id).filter(
+            ProductionPlanLine.plan_id == int(plan.id),
+            ProductionPlanLine.locked_by_run_id.isnot(None),
+        ).first() is not None:
+            raise LedgerPoolUnavailable("candidate freeze add plan lines must be unlocked")
         # Rebuild is deliberately only for an empty candidate.  Retrying a
         # partial candidate risks preserving stale derived rows.
-        if db.query(MrpRequirement.id).filter(MrpRequirement.run_id == int(run.run_id)).first():
+        existing_requirements = (
+            db.query(MrpRequirement)
+            .filter(MrpRequirement.run_id == int(run.run_id))
+            .all()
+        )
+        for req in existing_requirements:
+            _assert_full_pool_qualifiers_default(
+                row=req, kind="candidate", context="MrpRequirement",
+            )
+        if existing_requirements:
             raise LedgerPoolUnavailable("candidate freeze run already has derived requirements")
 
     plans = {
@@ -946,36 +1022,59 @@ def freeze_candidate_snapshots(
                 PlanningRun.run_id.in_(retained_run_ids)
             ).all()
         }
-        retained_stock = db.query(
-            MrpFreezeAllocation.run_id,
-            MrpFreezeAllocation.item_id,
-            func.sum(MrpFreezeAllocation.alloc_qty),
-        ).filter(
-            MrpFreezeAllocation.run_id.in_(retained_run_ids),
-            MrpFreezeAllocation.source_type == "stock",
-        ).group_by(
-            MrpFreezeAllocation.run_id,
-            MrpFreezeAllocation.item_id,
-        ).all()
-        for run_id, item_id, qty in retained_stock:
-            # Only the immutable active freeze version may reserve the pool.
-            version = retained_runs.get(int(run_id), 0)
-            active_qty = db.query(func.coalesce(func.sum(MrpFreezeAllocation.alloc_qty), 0)).filter(
-                MrpFreezeAllocation.run_id == int(run_id),
-                MrpFreezeAllocation.freeze_version == version,
-                MrpFreezeAllocation.item_id == int(item_id),
-                MrpFreezeAllocation.source_type == "stock",
-            ).scalar()
-            item_id = int(item_id)
-            retained_qty = _to_float(active_qty)
-            available_qty = pools.stock.get(item_id, 0.0)
-            if retained_qty > available_qty + EPS:
-                raise LedgerPoolUnavailable(
-                    "ledger_pool_unavailable: retained stock allocation exceeds "
-                    f"physical baseline for run={int(run_id)}, item={item_id}: "
-                    f"retained={retained_qty}, available={available_qty}"
+        retained_reservations = [
+            row
+            for row in db.query(ReservationEntry).filter(
+                ReservationEntry.run_id.in_(retained_run_ids),
+                ReservationEntry.ledger_generation_id == target_id,
+                ReservationEntry.lifecycle_status == "active",
+            ).all()
+        ]
+        if retained_reservations:
+            allocated = {
+                int(row.reservation_id): _to_float(row.allocated_qty)
+                for row in db.query(
+                    ReservationConsumptionAllocation.reservation_id,
+                    func.coalesce(
+                        func.sum(ReservationConsumptionAllocation.allocated_qty), 0,
+                    ).label("allocated_qty"),
                 )
-            pools.stock[item_id] = available_qty - retained_qty
+                .filter(
+                    ReservationConsumptionAllocation.ledger_generation_id == target_id,
+                    ReservationConsumptionAllocation.reservation_id.in_(
+                        [int(row.id) for row in retained_reservations]
+                    ),
+                )
+                .group_by(ReservationConsumptionAllocation.reservation_id)
+                .all()
+            }
+            retained_stock_by_key: Dict[Tuple[int, str, str, str], float] = defaultdict(float)
+            for reservation in retained_reservations:
+                # Only the immutable active freeze version may reserve the pool.
+                if int(reservation.freeze_version or 0) != retained_runs.get(
+                    int(reservation.run_id), 0
+                ):
+                    continue
+                _assert_full_pool_qualifiers_default(
+                    row=reservation, kind="retained", context="ReservationEntry",
+                )
+                reserved_qty = _to_float(reservation.reserved_qty)
+                attributed_qty = allocated.get(int(reservation.id), 0.0)
+                senior_hold_qty = max(reserved_qty - attributed_qty, 0.0)
+                if senior_hold_qty <= EPS:
+                    continue
+                key = (
+                    int(reservation.item_id),
+                    str(reservation.characteristic_ref or EMPTY_REF),
+                    str(reservation.organization_ref or EMPTY_REF),
+                    str(reservation.planning_stock_pool or DEFAULT_STOCK_POOL),
+                )
+                retained_stock_by_key[key] += senior_hold_qty
+            for (item_id, characteristic_ref, organization_ref, planning_stock_pool), hold_qty in (
+                retained_stock_by_key.items()
+            ):
+                available_qty = pools.stock.get(item_id, 0.0)
+                pools.stock[item_id] = max(available_qty - hold_qty, 0.0)
         retained_future = db.query(MrpFreezeAllocation).filter(
             MrpFreezeAllocation.run_id.in_(retained_run_ids),
             MrpFreezeAllocation.source_type.in_(("wip_order", "supplier_order")),
@@ -1075,12 +1174,18 @@ def freeze_candidate_snapshots(
         )
         results.append(result)
 
+    # Reservation stock coverage is derived from the frozen allocation rows.
+    # Test and worker sessions may disable autoflush, so make the allocation
+    # checkpoint visible before materializing ReservationEntry.
+    db.flush()
     from .item_ledger.reservation_ledger import materialize_reservations_for_freeze
     materialize_reservations_for_freeze(
         db, requested_ids, ledger_generation_id=target_id,
     )
     try:
-        readiness = require_accepted_truth(db, "candidate freeze")
+        readiness = require_accepted_truth(
+            db, "candidate freeze", required_capabilities=MRP_REQUIRED_CAPABILITIES
+        )
     except PlanningTruthUnavailable as exc:
         raise LedgerPoolUnavailable("accepted Ledger pointer changed during candidate freeze") from exc
     if int(readiness.generation_id or 0) != parent_id:
@@ -1111,4 +1216,3 @@ def _relevant_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
     }
     descendants = BomSpecificationResolver(db).descendant_ids_by_root(relevant)
     return set().union(*descendants.values()) if descendants else relevant
-

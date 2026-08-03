@@ -15,6 +15,7 @@ def test_ledger_future_supply_metadata_contract():
 
     nullable_identity = {column.name for column in table.columns if column.nullable}
     assert {"source_ref", "source_line_ref", "source_local_id", "eta_date", "source_updated_at", "reason"} <= nullable_identity
+    assert {"source_requirement_id"} <= nullable_identity
     assert not table.c.ledger_generation_id.nullable
     assert not table.c.capture_batch_id.nullable
     assert not table.c.capture_cutoff.nullable
@@ -26,6 +27,7 @@ def test_ledger_future_supply_metadata_contract():
     assert ("ledger_generation_id", "ledger_generation.id", "RESTRICT") in foreign_keys
     assert ("capture_batch_id", "ledger_build_batch.id", "RESTRICT") in foreign_keys
     assert ("item_id", "items.item_id", None) in foreign_keys
+    assert ("source_requirement_id", "mrp_requirement.id", "RESTRICT") in foreign_keys
 
     unique = {
         tuple(column.name for column in constraint.columns)
@@ -46,6 +48,7 @@ def test_ledger_future_supply_metadata_contract():
     assert {
         "ix_ledger_future_supply_generation_kind_item_eta",
         "ix_ledger_future_supply_generation_item_eta",
+        "ix_ledger_future_supply_source_requirement_id",
     } <= indexes
 
 
@@ -61,11 +64,11 @@ def test_ledger_future_supply_sqlite_schema_has_constraints():
 def test_ledger_future_supply_migration_follows_shared_head():
     path = (
         Path(__file__).resolve().parents[2]
-        / "backend/alembic/versions/20260723_14_ledger_future_supply.py"
+        / "backend/alembic/versions/20260731_07_add_source_requirement_to_ledger_future_supply.py"
     )
     spec = importlib.util.spec_from_file_location("ledger_future_supply_migration", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    assert module.revision == "20260723_14"
-    assert module.down_revision == "20260723_13"
+    assert module.revision == "20260731_07"
+    assert module.down_revision == "20260731_06"

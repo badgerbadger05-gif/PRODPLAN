@@ -10,6 +10,7 @@ from itertools import count
 import pytest
 
 from app import models
+from app.services.item_ledger.reservation import replenishment_execution_pct
 from app.services import planning_truth
 from app.services import purchase_control_materialization as pcm
 from app.services.purchase_control_materialization import (
@@ -27,7 +28,32 @@ CAPABILITIES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _materialization_purchase_odata_config(monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
+
+
 _fixture_seq = count(1)
+_BASE_URL = "http://mtzdock/unf_demo/odata/standard.odata"
+_MATERIALIZATION_DESTINATION = "00000000-0000-0000-0000-000000000001"
+
+
+def _set_purchase_odata_config(
+    monkeypatch,
+    *,
+    destination: str = _MATERIALIZATION_DESTINATION,
+) -> dict[str, str]:
+    config = {
+        "base_url": _BASE_URL,
+        "purchase_destination_warehouse_ref1c": destination,
+    }
+    monkeypatch.setattr(pcm, "_load_odata_config", lambda: config)
+    monkeypatch.setattr(
+        pcm.purchase_control_snapshot,
+        "_load_odata_config",
+        lambda: config,
+    )
+    return config
 
 
 def _accepted_generation(db) -> tuple[models.LedgerGeneration, models.PlanningReadSnapshot]:
@@ -327,6 +353,9 @@ def _materialization_row_from_slice(
     run_id = int(slice_row.get("run_id"))
 
     row = dict(base_row)
+    base_materialization_input = base_row.get("materialization_input")
+    if not isinstance(base_materialization_input, dict):
+        base_materialization_input = {}
     row["row_key"] = f"{base_row['row_key']}:{suffix}"
     row["supplier_id"] = int(supplier_id) if supplier_id is not None else int(base_row["supplier_id"])
     row["reservation_ids"] = [reservation_id]
@@ -340,20 +369,84 @@ def _materialization_row_from_slice(
     row["quantity"] = required_qty
     row["received_qty"] = realized_qty
     row["remaining_qty"] = to_order_qty
-    row["to_order_pct"] = 0.0 if required_qty == 0 else round(
-        to_order_qty / required_qty * 100.0,
-        6,
+    to_order_pct = replenishment_execution_pct(required_qty, to_order_qty)
+    open_order_covered_pct = replenishment_execution_pct(
+        required_qty,
+        open_order_covered_qty,
     )
-    row["open_order_covered_pct"] = 0.0 if required_qty == 0 else round(
-        open_order_covered_qty / required_qty * 100.0,
-        6,
+    row["to_order_pct"] = float(to_order_pct) if to_order_pct is not None else None
+    row["open_order_covered_pct"] = (
+        float(open_order_covered_pct)
+        if open_order_covered_pct is not None
+        else None
     )
     row["slices"] = [dict(slice_row)]
     row["horizon_buckets"] = [dict(slice_row)]
+    row["materialization_input"] = {
+        "version": base_materialization_input.get("version", 1),
+        "supplier_ref1c": base_materialization_input.get("supplier_ref1c", ""),
+        "item_ref1c": base_materialization_input.get("item_ref1c", ""),
+        "unit_ref1c": base_materialization_input.get("unit_ref1c", ""),
+        "destination_warehouse_ref1c": base_materialization_input.get(
+            "destination_warehouse_ref1c",
+            "",
+        ),
+        "slices": [dict(slice_row)],
+    }
     row["plan_period_from"] = str(slice_row.get("plan_period_from") or base_row.get("plan_period_from"))
     row["plan_period_to"] = str(slice_row.get("plan_period_to") or base_row.get("plan_period_to"))
 
     return row
+
+
+def test_materialization_row_from_slice_zero_required_pcts_are_none():
+    row = _materialization_row_from_slice(
+        {
+            "row_key": "purchase-batch",
+            "supplier_id": 1,
+            "materialization_input": {},
+        },
+        {
+            "required_qty": 0,
+            "realized_qty": 0,
+            "open_order_covered_qty": 0,
+            "to_order_qty": 0,
+            "run_id": 1,
+            "reservation_id": 11,
+            "requirement_id": 22,
+            "plan_period_from": "2026-07-01",
+            "plan_period_to": "2026-07-31",
+        },
+        suffix="zero-required",
+    )
+
+    assert row["to_order_pct"] is None
+    assert row["open_order_covered_pct"] is None
+
+
+def test_materialization_row_from_slice_over_coverage_is_capped():
+    row = _materialization_row_from_slice(
+        {
+            "row_key": "purchase-batch",
+            "supplier_id": 1,
+            "materialization_input": {},
+        },
+        {
+            "required_qty": 10,
+            "realized_qty": 0,
+            "open_order_covered_qty": 20,
+            "to_order_qty": 50,
+            "run_id": 1,
+            "reservation_id": 11,
+            "requirement_id": 22,
+            "plan_period_from": "2026-07-01",
+            "plan_period_to": "2026-07-31",
+        },
+        suffix="over-covered",
+    )
+
+    assert row["to_order_pct"] == 100.0
+    assert row["open_order_covered_pct"] == 100.0
 
 
 def test_materialize_rows_rejects_stale_snapshot_id(db_session):
@@ -426,6 +519,7 @@ def test_materialize_rows_aggregates_duplicate_reservation_ids_in_expected(db_se
     duplicated["reservation_id"] = reservation_id
     slices.append(duplicated)
     row["slices"] = slices
+    row["materialization_input"]["slices"] = [dict(item) for item in slices]
     expected_line_count = sum(
         1
         for slice_row in slices
@@ -452,6 +546,29 @@ def test_materialize_rows_aggregates_duplicate_reservation_ids_in_expected(db_se
         rid = int(alloc.reservation_id)
         by_reservation[rid] = round(by_reservation.get(rid, 0.0) + float(alloc.allocated_qty), 6)
     assert by_reservation == expected_allocs
+
+
+def test_materialize_rows_rejects_tampered_materialization_input(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    materialization_input = row.get("materialization_input")
+    if not isinstance(materialization_input, dict):
+        raise AssertionError("snapshot row has no materialization_input")
+    materialization_slices = materialization_input.get("slices")
+    if not isinstance(materialization_slices, list) or not materialization_slices:
+        raise AssertionError("snapshot row has no materialization_input.slices")
+
+    materialization_slices[0]["need_date"] = "2099-12-31"
+
+    with pytest.raises(PurchaseControlMaterializationError, match="materialization_input no longer matches legacy slices"):
+        materialize_rows(
+            db_session,
+            snapshot_id=snapshot.id,
+            row_keys=[row["row_key"]],
+            dry_run=False,
+            materializer=lambda *_args, **_kwargs: _materializer_with_records(*_args, **_kwargs),
+        )
 
 
 def test_materialize_rows_idempotent_retry_and_durable_lineage(db_session, monkeypatch):
@@ -498,13 +615,13 @@ def test_materialize_rows_idempotent_retry_and_durable_lineage(db_session, monke
 
 
 def test_materialize_rows_default_writer_posts_and_verifies_payload(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
     _, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
     expected_allocs = _as_expected_alloc_map(row)
 
     client = _FakePurchaseControlODataClient()
 
-    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata", "purchase_destination_warehouse_ref1c": "00000000-0000-0000-0000-000000000001"})
     monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
 
     result = materialize_rows(
@@ -526,7 +643,7 @@ def test_materialize_rows_default_writer_posts_and_verifies_payload(db_session, 
 
 
 def test_materialize_rows_default_writer_recovers_existing_order_without_post(db_session, monkeypatch):
-    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata", "purchase_destination_warehouse_ref1c": "00000000-0000-0000-0000-000000000001"})
+    _set_purchase_odata_config(monkeypatch)
     generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
     accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
@@ -568,7 +685,7 @@ def test_materialize_rows_default_writer_recovers_existing_order_without_post(db
 
 
 def test_materialize_rows_default_writer_rejects_line_payload_mismatch(db_session, monkeypatch):
-    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata", "purchase_destination_warehouse_ref1c": "00000000-0000-0000-0000-000000000001"})
+    _set_purchase_odata_config(monkeypatch)
     _, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
     accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
@@ -607,7 +724,7 @@ def test_materialize_rows_default_writer_rejects_line_payload_mismatch(db_sessio
 
 
 def test_materialize_rows_default_writer_rejects_duplicate_marker_search_result(db_session, monkeypatch):
-    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata", "purchase_destination_warehouse_ref1c": "00000000-0000-0000-0000-000000000001"})
+    _set_purchase_odata_config(monkeypatch)
     _, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
     accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
@@ -633,6 +750,62 @@ def test_materialize_rows_default_writer_rejects_duplicate_marker_search_result(
     monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
 
     with pytest.raises(RuntimeError, match="несколько документов"):
+        pcm._materialize_purchase_control_orders_to_1c(
+            db_session,
+            groups,
+            request,
+            1,
+            False,
+        )
+
+
+def test_materialize_rows_default_writer_rejects_marker_recovery_ambiguity(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
+        db_session, accepted_snapshot, [row["row_key"]]
+    )
+    request = pcm._build_request_payload(
+        snapshot=accepted_snapshot,
+        requested_keys=[row["row_key"]],
+        selected_rows=selected_rows,
+        groups=groups,
+        ledger_generation_id=ledger_generation_id,
+    )
+    for group in groups:
+        pcm._stamp_group_lines(group)
+
+    duplicate_recovery_docs = [
+        {
+            "Ref_Key": "po-ref-recovery-1",
+            "Контрагент_Key": groups[0].supplier_ref1c,
+            "Запасы": pcm._order_lines_payload("po-ref-recovery-1", groups[0]),
+        },
+        {
+            "Ref_Key": "po-ref-recovery-2",
+            "Контрагент_Key": groups[0].supplier_ref1c,
+            "Запасы": pcm._order_lines_payload("po-ref-recovery-2", groups[0]),
+        },
+    ]
+
+    class _TwoStepClient(_FakePurchaseControlODataClient):
+        def __init__(self):
+            super().__init__(existing_docs=[])
+            self.calls = 0
+
+        def get_all(self, entity: str, *, filter_query: str | None = None, **kwargs):
+            del entity, filter_query, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return list(duplicate_recovery_docs)
+
+    client = _TwoStepClient()
+    monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
+
+    with pytest.raises(RuntimeError, match="origin marker is ambiguous"):
         pcm._materialize_purchase_control_orders_to_1c(
             db_session,
             groups,
@@ -670,6 +843,9 @@ def test_materialize_rows_partial_batch_recovery_per_group(db_session):
             supplier_id=int(second_supplier.supplier_id),
         ),
     ]
+    snapshot_rows[1]["materialization_input"][
+        "supplier_ref1c"
+    ] = second_supplier.supplier_ref1c
     snapshot.payload = {**snapshot.payload, "rows": snapshot_rows}
     db_session.flush()
 
@@ -829,3 +1005,82 @@ def test_materialize_rows_recovers_after_external_post_before_local_persistence(
     assert db_session.query(models.PurchaseExportObligationAllocation).count() == len(
         row["reservation_ids"]
     )
+
+
+def test_materialize_rows_rejects_supplier_ref1c_drift(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+
+    supplier = db_session.get(models.Supplier, int(row["supplier_id"]))
+    if supplier is None:
+        raise AssertionError("snapshot row supplier is missing")
+    supplier.supplier_ref1c = f"{supplier.supplier_ref1c}-drift"
+    db_session.flush()
+
+    with pytest.raises(PurchaseControlMaterializationError, match="supplier_ref1c changed"):
+        materialize_rows(
+            db_session,
+            snapshot_id=snapshot.id,
+            row_keys=[row["row_key"]],
+            dry_run=False,
+            materializer=lambda *_args, **_kwargs: _materializer_with_records(*_args, **_kwargs),
+        )
+
+
+def test_materialize_rows_rejects_item_ref1c_drift(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+
+    item = db_session.get(models.Item, int(row["item_id"]))
+    if item is None:
+        raise AssertionError("snapshot row item is missing")
+    item.item_ref1c = f"{item.item_ref1c}-drift"
+    db_session.flush()
+
+    with pytest.raises(PurchaseControlMaterializationError, match="item_ref1c changed"):
+        materialize_rows(
+            db_session,
+            snapshot_id=snapshot.id,
+            row_keys=[row["row_key"]],
+            dry_run=False,
+            materializer=lambda *_args, **_kwargs: _materializer_with_records(*_args, **_kwargs),
+        )
+
+
+def test_materialize_rows_rejects_unit_ref1c_drift(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch)
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+
+    item = db_session.get(models.Item, int(row["item_id"]))
+    if item is None:
+        raise AssertionError("snapshot row item is missing")
+    item.unit = f"{item.unit}-drift"
+    db_session.flush()
+
+    with pytest.raises(PurchaseControlMaterializationError, match="unit_ref1c changed"):
+        materialize_rows(
+            db_session,
+            snapshot_id=snapshot.id,
+            row_keys=[row["row_key"]],
+            dry_run=False,
+            materializer=lambda *_args, **_kwargs: _materializer_with_records(*_args, **_kwargs),
+        )
+
+
+def test_materialize_rows_rejects_destination_warehouse_ref1c_drift(db_session, monkeypatch):
+    _set_purchase_odata_config(monkeypatch, destination="00000000-0000-0000-0000-000000000001")
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+
+    _set_purchase_odata_config(monkeypatch, destination="00000000-0000-0000-0000-000000000002")
+    with pytest.raises(PurchaseControlMaterializationError, match="destination_warehouse_ref1c changed"):
+        materialize_rows(
+            db_session,
+            snapshot_id=snapshot.id,
+            row_keys=[row["row_key"]],
+            dry_run=False,
+            materializer=lambda *_args, **_kwargs: _materializer_with_records(*_args, **_kwargs),
+        )

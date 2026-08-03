@@ -163,13 +163,17 @@ def _mirrored_order_line(
     state="В пути",
     destination="warehouse-1",
     characteristic=None,
+    delivery_date=datetime(2026, 8, 10),
 ):
+    mirror_timestamp = datetime(2026, 7, 30)
     order = models.SupplierOrder(
         order_number="ЗП-1",
         order_date=datetime(2026, 7, 20),
         order_ref1c=order_ref,
         order_state_name=state,
         deletion_mark=False,
+        created_at=mirror_timestamp,
+        updated_at=mirror_timestamp,
     )
     db.add(order)
     db.flush()
@@ -182,7 +186,9 @@ def _mirrored_order_line(
         quantity=Decimal(quantity),
         received_qty=Decimal("999"),
         remaining_qty=Decimal("999"),
-        delivery_date=datetime(2026, 8, 10),
+        delivery_date=delivery_date,
+        created_at=mirror_timestamp,
+        updated_at=mirror_timestamp,
     )
     db.add(line)
     db.flush()
@@ -276,32 +282,39 @@ def test_direct_1c_order_outside_live_contour_is_rejected_not_fatal(db_session):
     assert by_ref["outside"].planning_stock_pool == ""
 
 
-def test_direct_order_changed_after_cutoff_fails_closed(db_session):
+def test_direct_order_resync_timestamp_does_not_change_cutoff_evidence(db_session):
     generation, item, _allocation = _context(db_session)
     db_session.query(models.PurchaseExportLineAllocation).delete()
     db_session.query(models.SyncLink).delete()
     order, line = _mirrored_order_line(db_session, item)
-    order.updated_at = datetime(2026, 8, 1, 0, 1)
-    line.updated_at = datetime(2026, 8, 1, 0, 1)
-    db_session.flush()
-
-    row = supplier_future_supply_evidence(
+    before = supplier_future_supply_evidence(
         db_session,
         generation.id,
         planning_pool_by_warehouse={"warehouse-1": "main"},
     )[0]
 
-    assert row.evidence_status == "rejected"
-    assert row.reason == "supplier_order_changed_after_capture_cutoff"
+    # A later mirror synchronization is not a later business fact.
+    order.updated_at = datetime(2026, 8, 1, 0, 1)
+    line.updated_at = datetime(2026, 8, 1, 0, 1)
+    db_session.flush()
+
+    after = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert after.evidence_status == "exact"
+    assert after.reason is None
+    assert after.source_updated_at is None
+    assert after.source_content_hash == before.source_content_hash
 
 
 def test_direct_order_without_eta_fails_closed(db_session):
     generation, item, _allocation = _context(db_session)
     db_session.query(models.PurchaseExportLineAllocation).delete()
     db_session.query(models.SyncLink).delete()
-    _order, line = _mirrored_order_line(db_session, item)
-    line.delivery_date = None
-    db_session.flush()
+    _order, line = _mirrored_order_line(db_session, item, delivery_date=None)
 
     row = supplier_future_supply_evidence(
         db_session,

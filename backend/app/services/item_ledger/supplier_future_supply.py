@@ -328,16 +328,13 @@ def supplier_future_supply_evidence(
             status, reason = "rejected", "supplier_order_deleted"
         elif mirror_order is not None and (
             _after_cutoff(mirror_order.order_date, generation.cutoff)
-            or _after_cutoff(mirror_order.updated_at, generation.cutoff)
+            or _after_cutoff(mirror_order.created_at, generation.cutoff)
             or (
                 mirror_line is not None
-                and _after_cutoff(mirror_line.updated_at, generation.cutoff)
+                and _after_cutoff(mirror_line.created_at, generation.cutoff)
             )
         ):
-            # SupplierOrder* is a mutable mirror, not a versioned source.  A
-            # state/line observed after the physical cutoff cannot be projected
-            # backwards into that historical generation.
-            status, reason = "rejected", "supplier_order_changed_after_capture_cutoff"
+            status, reason = "rejected", "supplier_order_created_after_capture_cutoff"
         elif mirror_order is not None and phase is SupplyPhase.TERMINAL:
             status, reason = "rejected", "supplier_order_terminal"
         elif mirror_order is not None and phase is SupplyPhase.NO_GOODS:
@@ -393,11 +390,10 @@ def supplier_future_supply_evidence(
             "realized_qty_at_cutoff": realized_by_line[(order_ref, line_no)],
             "eta_date": eta,
             "source_state_key": raw_state,
-            "source_updated_at": (
-                mirror_order.updated_at or mirror_line.updated_at
-                if mirror_order is not None and mirror_line is not None
-                else link.updated_at if link else None
-            ),
+            # Mirror timestamps are synchronization metadata, not versioned 1C
+            # business facts. They neither gate cutoff visibility nor enter
+            # the evidence hash.
+            "source_updated_at": None,
             "capture_cutoff": generation.cutoff,
             "evidence_status": status,
             "reason": reason,

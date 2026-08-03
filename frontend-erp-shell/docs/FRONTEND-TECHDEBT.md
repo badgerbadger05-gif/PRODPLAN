@@ -2,11 +2,11 @@
 
 Статус: РЕЕСТР. Приоритеты P0 (несущее) → P3 (косметика). Обновлять по мере закрытия.
 
-Состояние на 2026-07-20:
+Состояние на 2026-07-31:
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests`,
   `Purchase Control` и `Workshop Binding Review`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 289 frontend-тестов проходят.
+- OpenAPI-типы генерируются, lint чистый, frontend CI запускает unit, build и Playwright smoke.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,10 +43,12 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 289 Vitest-тестами; есть hermetic
+Ledger и критичные custom pages покрыты 252 Vitest-тестами; есть hermetic
 Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control,
 Production Control, Period Plan (list/detail), Workshop Binding Review и
-Stage Distribution, Resources, Specification, Sync, MRP Result и весь DBR-контур.
+Resources, Specification, Sync и MRP Result. Отдельный Stage Distribution
+удалён вместе с параллельным вычислителем; распределение ведётся каноническими
+журналами и настройками ресурсов.
 Не хватает отдельного
 backend-contract E2E.
 
@@ -71,22 +73,10 @@ baseline, без массового редизайна.
 
 Sync разделён на controller и presentation-компоненты: операции сериализованы,
 полная синхронизация выполняется последовательно, ошибки не создают unhandled
-rejection, а диагностические данные рекурсивно очищаются от учётных данных. DBR
-Feeder получил characterization-покрытие, чистую модель и latest-wins защиту
-для позиций и сигналов. Критические сценарии MRP Result зафиксированы тестами
-до дальнейшей декомпозиции страницы.
-
-MRP Result получил чистую модель, latest-wins защиту при смене прогона, mutex
-production/purchase-команд и visual baseline. DBR Drum Board покрыт рабочими
-сценариями и модельными тестами; его диалоги имеют связанные подписи, доступные
-имена и управляемый фокус. DBR Settings покрыт загрузкой и командами, защищён
-от поздних ответов и повторных конкурентных сохранений.
-
-DBR Programs, Purchase, Settings, Drum Board и Feeder разделены на чистые
-модели, controller hooks и presentation-страницы. Для всех пяти экранов
-добавлены детерминированные visual baselines. Асинхронные чтения защищены от
-поздних ответов, мутирующие команды — от повторного запуска; общие DBR-диалоги,
-таблицы и ItemPicker получили keyboard/ARIA-контракты без изменения рабочего UX.
+rejection, а диагностические данные рекурсивно очищаются от учётных данных.
+Критические сценарии MRP Result зафиксированы тестами и visual baseline.
+Удалённые DBR-экраны не являются частью текущей архитектуры; очередь мехцеха и
+полки представлены режимами канонического производственного журнала.
 
 Production Control получил чистую модель фильтров, сортировки, selection и
 payload, latest-wins защиту списка и material detail, а также единый mutex для
@@ -96,15 +86,17 @@ payload, latest-wins защиту списка и material detail, а также
 
 ## P2 — Протечки прямых `api()`/`fetch` мимо сервисов
 
-**Проблема.** Часть страниц ходит в API напрямую из компонента (исторически `ProductionControlPage` — 30 инлайновых вызовов + сырой `fetch`; вынесено в `services/productionControl.ts` на ветке рефакторинга; `TransferRequestsPage` и др. ещё содержат инлайновые вызовы).
+**Состояние.** Прямые `api()`/`fetch` из UI-модулей удалены; транспорт проходит
+через `src/services/*`, а границу фиксирует `uiServiceBoundary.test.ts`.
 
-**Цель.** Правило Doctype: данные только через `src/services/*`. Дочистить оставшиеся инлайновые вызовы; закрепить lint-правилом/ревью.
+**Цель.** Сохранять правило Doctype: данные только через `src/services/*`, не
+ослаблять механический boundary-тест при добавлении новых экранов.
 
-## P2 — Типизация границы API (`any`)
+## P2 — Типизация границы API
 
-**Проблема.** eslint показывает ошибки `@typescript-eslint/no-explicit-any` (напр. `chainPreview`, piecework-cast). Граница API типизирована не до конца.
-
-**Цель.** Типизировать ответы сервисов в `domain/*`; убрать `any`; включить правило в CI.
+**Состояние.** Явный `any` в production-коде запрещён lint. Оставшийся долг —
+заменить ручные DTO типами из OpenAPI там, где backend уже публикует строгую
+response schema, и расширять такие схемы вместо вычислений на frontend.
 
 ## P2 — Копипаст-архитектура journal'ов
 

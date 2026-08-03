@@ -162,9 +162,11 @@ def test_missing_pinned_child_spec_fails_closed_in_mrp_and_exports(db_session):
         BomSpecificationResolver(db_session).descendant_ids_by_root([root.item_id])
 
 
-def test_conflicting_pins_for_aggregated_child_fail_closed(db_session):
+def test_distinct_pinned_specs_for_aggregated_child_explode_as_branches(db_session):
     root = _item(db_session, "PIN-CONFLICT-ROOT")
     child = _item(db_session, "PIN-CONFLICT-CHILD")
+    leaf_x = _item(db_session, "PIN-CONFLICT-LEAF-X", flow="Закупка")
+    leaf_y = _item(db_session, "PIN-CONFLICT-LEAF-Y", flow="Закупка")
     root_spec = _spec(db_session, "spec-conflict-root")
     child_x = _spec(db_session, "spec-conflict-x")
     child_y = _spec(db_session, "spec-conflict-y")
@@ -182,26 +184,43 @@ def test_conflicting_pins_for_aggregated_child_fail_closed(db_session):
         models.SpecComponent(
             spec_id=root_spec.spec_id,
             item_id=child.item_id,
-            quantity=1,
+            quantity=2,
             component_type="Сборка",
             component_spec_ref1c=child_y.spec_ref1c,
+        ),
+        models.SpecComponent(
+            spec_id=child_x.spec_id,
+            item_id=leaf_x.item_id,
+            quantity=3,
+            component_type="Материал",
+        ),
+        models.SpecComponent(
+            spec_id=child_y.spec_id,
+            item_id=leaf_y.item_id,
+            quantity=5,
+            component_type="Материал",
         ),
     ])
     db_session.flush()
 
-    with pytest.raises(
-        BomSpecificationResolutionError,
-        match="conflicting specification selections",
-    ):
-        _explode_bom_net_first(
-            db_session,
-            {root.item_id: {date(2026, 7, 30): 1.0}},
-            shared_pools=FreezeSharedPools(
-                stock={},
-                stock_initial={},
-                wip={},
-                supplier={},
-            ),
-            trace=FreezeTrace(),
-            need_date_floor=date(2026, 7, 1),
-        )
+    gross, net, levels, warnings = _explode_bom_net_first(
+        db_session,
+        {root.item_id: {date(2026, 7, 30): 1.0}},
+        shared_pools=FreezeSharedPools(
+            stock={},
+            stock_initial={},
+            wip={},
+            supplier={},
+        ),
+        trace=FreezeTrace(),
+        need_date_floor=date(2026, 7, 1),
+    )
+
+    # The child is one physical item for stock/WIP netting and output totals,
+    # but its two pinned structures both have to contribute their own leaves.
+    assert gross[child.item_id][date(2026, 7, 30)] == 3.0
+    assert net[child.item_id][date(2026, 7, 30)] == 3.0
+    assert gross[leaf_x.item_id][date(2026, 7, 30)] == 3.0
+    assert gross[leaf_y.item_id][date(2026, 7, 30)] == 10.0
+    assert levels[child.item_id] == 1
+    assert warnings == []

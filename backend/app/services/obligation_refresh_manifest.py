@@ -216,6 +216,10 @@ def _existing_result(
                     f"target {action} manifest lineage conflicts"
                 )
             continue
+        if action != "add":
+            raise ObligationRefreshManifestError(
+                "target refresh manifest contains unsupported action"
+            )
         try:
             candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -228,15 +232,7 @@ def _existing_result(
             or str(candidate.status) != "BUILDING_SNAPSHOT"
             or int(candidate.ledger_generation_id or -1) != int(target.id)
             or int(candidate.source_plan_id or -1) != plan_id
-            or (
-                entry.get("action") == "refresh"
-                and int(candidate.prior_run_id or -1) != int(expected_parent or -1)
-            )
-            or (
-                entry.get("action") == "add"
-                and candidate.prior_run_id is not None
-            )
-            or action not in {"refresh", "add"}
+            or candidate.prior_run_id is not None
         ):
             raise ObligationRefreshManifestError(
                 "target refresh manifest candidate lineage conflicts"

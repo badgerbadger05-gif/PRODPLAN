@@ -3,6 +3,7 @@ from decimal import Decimal
 import asyncio
 from hashlib import sha256
 import json
+import inspect
 
 import pytest
 
@@ -129,6 +130,25 @@ def _seal_candidate_manifest(generation, run):
     }
 
 
+def _publish_read_snapshot_with_rows(db_session, run):
+    snapshot = models.PlanningReadSnapshot(
+        consumer="mrp_result",
+        snapshot_key=f"run:{run.run_id}",
+        ledger_generation_id=run.ledger_generation_id,
+        cutoff=run.ledger_cutoff,
+        truth_status="accepted",
+        payload={
+            "run_id": run.run_id,
+            "row_counts": {"purchase": 3},
+            "total_qty": {"purchase": 12.0},
+        },
+        published_at=datetime.now(timezone.utc),
+    )
+    db_session.add(snapshot)
+    db_session.flush()
+    return snapshot
+
+
 def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session):
     generation = _accepted_generation(db_session)
     item = models.Item(item_code="MISSING-SNAPSHOT", item_name="Legacy-looking row")
@@ -213,7 +233,7 @@ def test_candidate_builder_is_idempotent_and_rejects_changed_persisted_snapshot(
         build_mrp_result_candidate_snapshot(db_session, run.run_id)
 
 
-def test_candidate_builder_resolves_legacy_parent_generation_in_manifest(db_session):
+def test_candidate_builder_rejects_retired_refresh_manifest_action(db_session):
     accepted = _accepted_generation(db_session)
     candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
     candidate_generation.source_watermarks = {
@@ -270,10 +290,8 @@ def test_candidate_builder_resolves_legacy_parent_generation_in_manifest(db_sess
         ).hexdigest(),
     }
 
-    snapshot = build_mrp_result_candidate_snapshot(db_session, run.run_id)
-
-    assert snapshot.ledger_generation_id == candidate_generation.id
-    assert snapshot.truth_status == "building"
+    with pytest.raises(ValueError, match="invalid entries"):
+        build_mrp_result_candidate_snapshot(db_session, run.run_id)
 
 
 def test_candidate_builder_savepoint_rolls_back_partial_snapshot(db_session, monkeypatch):
@@ -656,3 +674,308 @@ def test_purchase_export_reads_shared_snapshot_not_legacy_getter(
     assert result["snapshot_id"] == snapshot.id
     assert result["total_rows"] == 1
     assert "Snapshot item" in result["data"]
+
+
+def test_grouped_endpoints_read_snapshot_rows_not_legacy_group_getters(
+    db_session, monkeypatch
+):
+    generation = _accepted_generation(db_session)
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+    snapshot = models.PlanningReadSnapshot(
+        consumer="mrp_result",
+        snapshot_key=f"run:{run.run_id}",
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload={
+            "run_id": run.run_id,
+            "row_counts": {"purchase": 1, "rework": 1},
+            "total_qty": {"purchase": 4.0, "rework": 3.0},
+        },
+        published_at=datetime.now(timezone.utc),
+    )
+    db_session.add(snapshot)
+    db_session.flush()
+    db_session.add_all(
+        [
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase:one",
+                row_kind="purchase",
+                sort_key="2026-08-01|000000000001|000000000000",
+                payload={
+                    "item_id": 1,
+                    "item_name": "Snapshot purchase",
+                    "item_article": "P-1",
+                    "qty": 4.0,
+                    "unit": "шт.",
+                    "bucket_date": "2026-08-01",
+                },
+            ),
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="rework:one",
+                row_kind="rework",
+                sort_key="2026-08-01|000000000002|000000000001",
+                payload={
+                    "item_id": 2,
+                    "item_name": "Snapshot rework",
+                    "item_article": "R-1",
+                    "qty": 3.0,
+                    "unit": "шт.",
+                    "bucket_date": "2026-08-01",
+                },
+            ),
+        ]
+    )
+    db_session.flush()
+
+    calls = {"snapshot_reads": 0}
+
+    def _counting_snapshot_reader(*args, **kwargs):
+        calls["snapshot_reads"] += 1
+        return mrp_result_snapshot.read_mrp_result_rows(*args, **kwargs)
+
+    def _legacy_group_getter_called(*_args, **_kwargs):
+        raise AssertionError("legacy grouped getter was called")
+
+    monkeypatch.setattr(plan_router, "read_mrp_result_rows", _counting_snapshot_reader)
+    monkeypatch.setattr(
+        plan_router,
+        "get_run_purchases_grouped_by_category",
+        _legacy_group_getter_called,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        plan_router,
+        "get_run_rework_grouped_by_category",
+        _legacy_group_getter_called,
+        raising=False,
+    )
+
+    # Static guard: grouped result endpoints in public plan router must stay
+    # snapshot-only and avoid dead legacy grouped live getters.
+    assert "get_run_purchases_grouped_by_category" not in inspect.getsource(
+        plan_router.get_planning_result_purchases_grouped_by_category
+    )
+    assert "get_run_rework_grouped_by_category" not in inspect.getsource(
+        plan_router.get_planning_result_rework_grouped_by_category
+    )
+
+    purchase_payload = asyncio.run(
+        plan_router.get_planning_result_purchases_grouped_by_category(
+            run_id=run.run_id,
+            item_id=None,
+            date_from=None,
+            date_to=None,
+            limit=100,
+            offset=0,
+            sort_by=None,
+            sort_dir="asc",
+            db=db_session,
+        )
+    )
+    rework_payload = asyncio.run(
+        plan_router.get_planning_result_rework_grouped_by_category(
+            run_id=run.run_id,
+            item_id=None,
+            date_from=None,
+            date_to=None,
+            limit=100,
+            offset=0,
+            sort_by=None,
+            sort_dir="asc",
+            db=db_session,
+        )
+    )
+
+    assert purchase_payload["snapshot_id"] == snapshot.id
+    assert purchase_payload["ledger_generation"] == generation.id
+    assert purchase_payload["total_groups"] == 1
+    assert purchase_payload["total_orders"] == 1
+    assert rework_payload["snapshot_id"] == snapshot.id
+    assert rework_payload["ledger_generation"] == generation.id
+    assert rework_payload["total_groups"] == 1
+    assert rework_payload["total_orders"] == 1
+    assert calls["snapshot_reads"] >= 2
+
+
+def test_read_mrp_result_rows_supports_supplier_filter_and_missing_supplier_filter(
+    db_session,
+):
+    generation = _accepted_generation(db_session)
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    item_a = models.Item(item_code="SUP-A", item_name="A")
+    item_b = models.Item(item_code="SUP-B", item_name="B")
+    item_c = models.Item(item_code="SUP-C", item_name="C")
+    db_session.add_all([item_a, item_b, item_c])
+    db_session.flush()
+
+    snapshot = _publish_read_snapshot_with_rows(db_session, run)
+    db_session.add_all(
+        [
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase-a",
+                row_kind="purchase",
+                sort_key="2026-01-01|000000000001|000000000000",
+                payload={
+                    "item_id": item_a.item_id,
+                    "item_name": "A",
+                    "supplier_ref1c": "supp-a",
+                    "supplier_name": "Поставщик A",
+                    "qty": 4,
+                },
+            ),
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase-b",
+                row_kind="purchase",
+                sort_key="2026-01-01|000000000002|000000000000",
+                payload={
+                    "item_id": item_b.item_id,
+                    "item_name": "B",
+                    "supplier_ref1c": "supp-b",
+                    "supplier_name": "   ",
+                    "qty": 3,
+                },
+            ),
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase-c",
+                row_kind="purchase",
+                sort_key="2026-01-02|000000000003|000000000000",
+                payload={
+                    "item_id": item_c.item_id,
+                    "item_name": "C",
+                    "supplier_ref1c": "supp-c",
+                    "supplier_name": "",
+                    "qty": 5,
+                },
+            ),
+        ]
+    )
+    db_session.flush()
+
+    supplier_rows = read_mrp_result_rows(
+        db_session,
+        run.run_id,
+        row_kind="purchase",
+        supplier_ref1c="supp-b",
+    )
+    missing_rows = read_mrp_result_rows(
+        db_session,
+        run.run_id,
+        row_kind="purchase",
+        supplier_ref1c="__missing_supplier_name",
+    )
+
+    assert supplier_rows["total"] == 1
+    assert supplier_rows["rows"][0]["item_name"] == "B"
+    assert supplier_rows["rows"][0]["supplier_name"] == "   "
+    assert missing_rows["total"] == 2
+    assert {row["item_name"] for row in missing_rows["rows"]} == {"B", "C"}
+
+
+def test_read_mrp_result_rows_supports_category_filters_and_missing_category(
+    db_session,
+):
+    generation = _accepted_generation(db_session)
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    snapshot = _publish_read_snapshot_with_rows(db_session, run)
+    db_session.add_all(
+        [
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase-cat-a",
+                row_kind="purchase",
+                sort_key="2026-01-01|000000000001|000000000000",
+                payload={
+                    "item_id": 1,
+                    "item_name": "Category A",
+                    "category_id": 11,
+                    "category_ref1c": "cat-a",
+                    "qty": 2,
+                },
+            ),
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase-cat-b",
+                row_kind="purchase",
+                sort_key="2026-01-01|000000000002|000000000000",
+                payload={
+                    "item_id": 2,
+                    "item_name": "Category B",
+                    "category_id": 12,
+                    "category_ref1c": "cat-b",
+                    "qty": 4,
+                },
+            ),
+            models.PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key="purchase-missing-cat",
+                row_kind="purchase",
+                sort_key="2026-01-01|000000000003|000000000000",
+                payload={
+                    "item_id": 3,
+                    "item_name": "Missing category",
+                    "category_id": None,
+                    "category_ref1c": None,
+                    "qty": 6,
+                },
+            ),
+        ]
+    )
+    db_session.flush()
+
+    category_rows = read_mrp_result_rows(
+        db_session,
+        run.run_id,
+        row_kind="purchase",
+        category_id=11,
+    )
+    ref_rows = read_mrp_result_rows(
+        db_session,
+        run.run_id,
+        row_kind="purchase",
+        category_ref1c="cat-b",
+    )
+    missing_category_rows = read_mrp_result_rows(
+        db_session,
+        run.run_id,
+        row_kind="purchase",
+        category_ref1c="__missing_category",
+    )
+
+    assert category_rows["total"] == 1
+    assert category_rows["rows"][0]["item_name"] == "Category A"
+    assert ref_rows["total"] == 1
+    assert ref_rows["rows"][0]["item_name"] == "Category B"
+    assert missing_category_rows["total"] == 1
+    assert missing_category_rows["rows"][0]["item_name"] == "Missing category"

@@ -40,12 +40,7 @@ export interface paths {
         head?: never;
         /**
          * Patch Item Endpoint
-         * @description Update only the sent planning attributes of an item.
-         *
-         *     Editing one attribute must not require the client to resend the whole
-         *     record: `stock_qty` is a physical value owned by the 1C sync / Item Ledger,
-         *     and echoing a just-read copy of it back races the sync. PATCH refuses it
-         *     (422) instead.
+         * @description Update only the sent master-data attributes of an item.
          */
         patch: operations["patch_item_endpoint_api_v1_items__item_id__patch"];
         trace?: never;
@@ -625,7 +620,7 @@ export interface paths {
         };
         /**
          * Get Saved Groups
-         * @description Возвращает сохранённые группы номенклатуры из файла.
+         * @description Canonical UI view over the independent 1C cache and manual selection.
          */
         get: operations["get_saved_groups_api_v1_odata_groups_get"];
         put?: never;
@@ -822,7 +817,7 @@ export interface paths {
          *     Основной сценарий — атомарный `POST /period-plans/{id}/fix`. Этот маршрут
          *     остаётся идемпотентным повтором: если у плана уже есть снимок в текущем
          *     принятом поколении, он возвращается как есть и ничего не форкается.
-         *     `generation_key` необязателен — сервер выводит его из текущего принятого
+         *     Ключ формируется сервером автоматически из плана и текущего принятого
          *     поколения.
          */
         post: operations["period_plans_mrp_snapshot_api_v1_plan_period_plans__plan_id__mrp_snapshot_post"];
@@ -1182,70 +1177,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/forced_orders": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List Forced Orders
-         * @description Список заявок на принудительные заказы
-         */
-        get: operations["list_forced_orders_api_v1_plan_forced_orders_get"];
-        put?: never;
-        /**
-         * Create Forced Order
-         * @description Создать заявку на «принудительный заказ» (не влияет на основной MRP run)
-         */
-        post: operations["create_forced_order_api_v1_plan_forced_orders_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/forced_orders/{request_id}/process": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Process Forced Order
-         * @description Посчитать принудительный заказ (комплектующие не блокируют, но дефицит фиксируется в diagnostics)
-         */
-        post: operations["process_forced_order_api_v1_plan_forced_orders__request_id__process_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/forced_orders/{request_id}/export": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Export Forced Order
-         * @description Экспорт принудительного заказа в XLSX (base64)
-         */
-        get: operations["export_forced_order_api_v1_plan_forced_orders__request_id__export_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/plan/stages": {
         parameters: {
             query?: never;
@@ -1417,64 +1348,6 @@ export interface paths {
         get: operations["get_nomenclature_stats_api_v1_nomenclature_stats_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/stages/calculate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Calculate
-         * @description Рассчитать этапы производства.
-         *
-         *     Алгоритм:
-         *     - Берёт все изделия из строк плана (root_products)
-         *     - Находит для них спецификации по умолчанию
-         *     - Рекурсивно разворачивает состав (учитывая множители родителей)
-         *     - Группирует по этапам появления (stage_id из строк состава)
-         *     - Оставляет только детали с методом пополнения 'Производство'
-         *     - Возвращает структуру: этап -> изделия -> детали
-         *
-         *     Возврат:
-         *     {
-         *       "asOf": "ISO-время последней синхронизации остатков или null",
-         *       "stages": [
-         *         {
-         *           "stage_id": int,
-         *           "stage_name": str,
-         *           "products": [
-         *             {
-         *               "root_item_id": int,
-         *               "root_item_code": str,
-         *               "root_item_name": str,
-         *               "components": [
-         *                 {
-         *                   "item_id": int,
-         *                   "item_code": str,
-         *                   "item_name": str,
-         *                   "qty_per_unit": float,
-         *                   "stock_qty": float,
-         *                   "replenishment_method": str | null,
-         *                   "min_batch": float | null,
-         *                   "max_batch": float | null
-         *                 }
-         *               ]
-         *             }
-         *           ]
-         *         }
-         *       ]
-         *     }
-         */
-        post: operations["calculate_api_v1_stages_calculate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1795,26 +1668,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/resources/calculate_distribution": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Get Resource Distribution
-         * @description Рассчитать распределение компонентов по производственным участкам.
-         */
-        post: operations["get_resource_distribution_api_v1_resources_calculate_distribution_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/resources/": {
         parameters: {
             query?: never;
@@ -2074,6 +1927,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/orders/root-products": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Root Products */
+        get: operations["list_root_products_api_v1_production_control_orders_root_products_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/orders": {
         parameters: {
             query?: never;
@@ -2089,28 +1959,6 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
-        trace?: never;
-    };
-    "/api/v1/production-control/orders/{product_id}/quantity": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        /**
-         * Patch Order Line Quantity
-         * @description Adjust the planned quantity of a production line.
-         *     Cannot be set below already-produced qty.
-         *     Recalculates remaining_qty automatically.
-         */
-        patch: operations["patch_order_line_quantity_api_v1_production_control_orders__product_id__quantity_patch"];
         trace?: never;
     };
     "/api/v1/production-control/orders/{product_id}/state": {
@@ -2147,30 +1995,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/production-control/orders/dedupe-mrp": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Post Dedupe Mrp Orders
-         * @description Repair local MRP production-order overcoverage.
-         *
-         *     Dry-run by default. The applied mode only touches local PRODPLAN MRP rows
-         *     that are not linked to 1C: duplicates are cancelled, and a single oversized
-         *     row is reduced to the latest MRP requirement.
-         */
-        post: operations["post_dedupe_mrp_orders_api_v1_production_control_orders_dedupe_mrp_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/production-control/orders/{product_id}/materials": {
         parameters: {
             query?: never;
@@ -2182,23 +2006,6 @@ export interface paths {
         get: operations["get_order_line_materials_api_v1_production_control_orders__product_id__materials_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/production-control/orders/{product_id}/materials/refresh": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Post Order Line Materials Refresh */
-        post: operations["post_order_line_materials_refresh_api_v1_production_control_orders__product_id__materials_refresh_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2222,6 +2029,23 @@ export interface paths {
          *     these document writes is itself a production fact.
          */
         post: operations["post_produce_line_api_v1_production_control_orders__product_id__produce_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/production-control/orders/{product_id}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post Close Production Order */
+        post: operations["post_close_production_order_api_v1_production_control_orders__product_id__close_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3352,6 +3176,94 @@ export interface components {
             /** Updated */
             updated: number;
         };
+        /** BindingReviewItemResponse */
+        BindingReviewItemResponse: {
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code: string;
+            /** Item Name */
+            item_name: string;
+            /** Item Article */
+            item_article: string;
+            /** Active Lines */
+            active_lines: number;
+            /**
+             * Reason Code
+             * @enum {string}
+             */
+            reason_code: "NO_SPEC" | "NO_PRODUCTION_KIND" | "KIND_NOT_BOUND" | "NO_WAREHOUSE_BINDING";
+            /** Reason Text */
+            reason_text: string;
+            /** Recommendation */
+            recommendation: string;
+            /** Workshop Id */
+            workshop_id?: number | null;
+            /** Spec Id */
+            spec_id?: number | null;
+            /** Spec Name */
+            spec_name?: string | null;
+            /** Production Kind Id */
+            production_kind_id?: number | null;
+            /** Production Kind Name */
+            production_kind_name?: string | null;
+            /** Suggested Resource Id */
+            suggested_resource_id?: number | null;
+            /** Suggested Resource Name */
+            suggested_resource_name?: string | null;
+            /** Suggested Stage Id */
+            suggested_stage_id?: number | null;
+            /** Suggested Stage Name */
+            suggested_stage_name?: string | null;
+        };
+        /** BindingReviewItemsResponse */
+        BindingReviewItemsResponse: {
+            /** Items */
+            items: components["schemas"]["BindingReviewItemResponse"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "active" | "catalog";
+            /** Counts By Reason */
+            counts_by_reason: {
+                [key: string]: number;
+            };
+        };
+        /** BindingReviewLineResponse */
+        BindingReviewLineResponse: {
+            /** Product Id */
+            product_id: number;
+            /** Order Id */
+            order_id: number;
+            /** Order Number */
+            order_number: string;
+            /** Quantity */
+            quantity: number;
+            /** Remaining Qty */
+            remaining_qty: number;
+            /** Status */
+            status: string;
+            /** Workshop Id */
+            workshop_id?: number | null;
+            /** Planned Start Date */
+            planned_start_date?: string | null;
+        };
+        /** BindingReviewLinesResponse */
+        BindingReviewLinesResponse: {
+            /** Item Id */
+            item_id: number;
+            /** Rows */
+            rows: components["schemas"]["BindingReviewLineResponse"][];
+            /** Total */
+            total: number;
+        };
         /**
          * ChainClosePayload
          * @description Закрытие цепочки из окна журнала (этап 4): любая сторона цепочки.
@@ -3422,8 +3334,8 @@ export interface components {
             /** Planned Finish */
             planned_finish?: string | null;
         };
-        /** DedupeMrpOrdersPayload */
-        DedupeMrpOrdersPayload: {
+        /** CloseProductionOrderPayload */
+        CloseProductionOrderPayload: {
             /**
              * Dry Run
              * @default true
@@ -3503,6 +3415,304 @@ export interface components {
             /** Original Priority */
             original_priority: (string | number)[];
         };
+        /** ExecutionJournalInformationLinkEvent */
+        ExecutionJournalInformationLinkEvent: {
+            /** Reservation Id */
+            reservation_id: number;
+            /** Url */
+            url: string;
+        };
+        /** ExecutionJournalInformationLinks */
+        ExecutionJournalInformationLinks: {
+            /**
+             * Reservation Events
+             * @default []
+             */
+            reservation_events: components["schemas"]["ExecutionJournalInformationLinkEvent"][];
+        };
+        /** ExecutionJournalLedgerEvent */
+        ExecutionJournalLedgerEvent: {
+            /** Event Id */
+            event_id: number;
+            /** Reservation Id */
+            reservation_id: number;
+            /** Sle Id */
+            sle_id?: number | null;
+            /** Fact Ref */
+            fact_ref?: string | null;
+            /** Fact Line Ref */
+            fact_line_ref?: string | null;
+            /** Match Rule */
+            match_rule?: string | null;
+        };
+        /** ExecutionJournalLedgerLinks */
+        ExecutionJournalLedgerLinks: {
+            /** Item Id */
+            item_id: number;
+            /**
+             * Reservation Ids
+             * @default []
+             */
+            reservation_ids: number[];
+            /**
+             * Events
+             * @default []
+             */
+            events: components["schemas"]["ExecutionJournalLedgerEvent"][];
+        };
+        /** ExecutionJournalResponse */
+        ExecutionJournalResponse: {
+            /** Plan */
+            plan: {
+                [key: string]: unknown;
+            };
+            /** Run Id */
+            run_id: number;
+            /** Rows */
+            rows: components["schemas"]["ExecutionJournalRow"][];
+            summary: components["schemas"]["ExecutionJournalSummary"];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            /** Truth Status */
+            truth_status?: string | null;
+            /** Ledger Generation */
+            ledger_generation?: string | number | null;
+            /** Truth Generation Id */
+            truth_generation_id?: number | null;
+            /** Cutoff */
+            cutoff?: string | null;
+            /** Truth Cutoff */
+            truth_cutoff?: string | null;
+            /** Truth Meta */
+            truth_meta?: components["schemas"]["ExecutionJournalTruthMeta"] | {
+                [key: string]: unknown;
+            } | null;
+            /** Truth Reason */
+            truth_reason?: string | null;
+            /** Reason */
+            reason?: string | null;
+            /** Facets */
+            facets?: {
+                [key: string]: number[];
+            } | null;
+        };
+        /** ExecutionJournalRow */
+        ExecutionJournalRow: {
+            /** Req Id */
+            req_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code: string;
+            /** Item Name */
+            item_name: string;
+            /**
+             * Flow
+             * @enum {string}
+             */
+            flow: "production" | "purchase" | "rework";
+            /** Bom Level */
+            bom_level: number;
+            /** Gross Qty */
+            gross_qty: number;
+            /** Net Qty */
+            net_qty: number;
+            /** Ordered Qty */
+            ordered_qty: number;
+            /** Completed Qty */
+            completed_qty: number | null;
+            /** Coverage Pct */
+            coverage_pct: number | null;
+            /** Remaining Qty */
+            remaining_qty: number | null;
+            /** Work Items */
+            work_items: components["schemas"]["ExecutionJournalWorkItem"][];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "net_zero" | "covered" | "partial" | "ordered" | "none" | "execution_unavailable";
+            /**
+             * Root Item Ids
+             * @default []
+             */
+            root_item_ids: number[];
+            information_links: components["schemas"]["ExecutionJournalInformationLinks"];
+            /**
+             * Reservation Ids
+             * @default []
+             */
+            reservation_ids: number[];
+            /**
+             * Execution Events
+             * @default []
+             */
+            execution_events: {
+                [key: string]: unknown;
+            }[];
+            /**
+             * Execution Allocations
+             * @default []
+             */
+            execution_allocations: {
+                [key: string]: unknown;
+            }[];
+            ledger_links?: components["schemas"]["ExecutionJournalLedgerLinks"] | null;
+            /** Item Article */
+            item_article?: string | null;
+            /** Stock Qty */
+            stock_qty?: number | null;
+            /** Covered Qty */
+            covered_qty?: number | null;
+            /** Progress Base Qty */
+            progress_base_qty?: number | null;
+            /** Execution Available */
+            execution_available?: boolean | null;
+            /** Execution Unavailable Reason */
+            execution_unavailable_reason?: string | null;
+            /** Execution Source */
+            execution_source?: string | null;
+            /** Need Date */
+            need_date?: string | null;
+            /** Status Label */
+            status_label?: string | null;
+            /** Forecast Date */
+            forecast_date?: string | null;
+            /** Forecast Shift Days */
+            forecast_shift_days?: number | null;
+            /** Forecast Reason */
+            forecast_reason?: string | null;
+            /** Forecast Status */
+            forecast_status?: ("early" | "on_time" | "delayed" | "critical" | "unavailable") | null;
+            /** Purchase Covered Qty */
+            purchase_covered_qty?: number | null;
+            /** Purchase To Order Qty */
+            purchase_to_order_qty?: number | null;
+            /** Unassigned Qty */
+            unassigned_qty?: number | null;
+        };
+        /** ExecutionJournalSummary */
+        ExecutionJournalSummary: {
+            /** Truth Status */
+            truth_status: string;
+            /** Total Items */
+            total_items: number;
+            /** Execution Completed Qty */
+            execution_completed_qty?: number | null;
+            /** Execution Base Qty */
+            execution_base_qty?: number | null;
+            /** Execution Available Base Qty */
+            execution_available_base_qty?: number | null;
+            /** Execution Pct */
+            execution_pct?: number | null;
+            /** Execution Confirmed Pct */
+            execution_confirmed_pct?: number | null;
+            /** Execution Partial */
+            execution_partial?: boolean | null;
+            /** Fully Covered */
+            fully_covered?: number | null;
+            /** Partially Covered */
+            partially_covered?: number | null;
+            /** Not Covered */
+            not_covered?: number | null;
+            /** Net Zero */
+            net_zero?: number | null;
+            /** Execution By Flow */
+            execution_by_flow?: {
+                [key: string]: components["schemas"]["ExecutionJournalSummaryByFlow"];
+            } | null;
+        };
+        /** ExecutionJournalSummaryByFlow */
+        ExecutionJournalSummaryByFlow: {
+            /** Completed Qty */
+            completed_qty: number;
+            /** Base Qty */
+            base_qty: number;
+            /** Execution Pct */
+            execution_pct: number | null;
+            /**
+             * Available
+             * @default true
+             */
+            available: boolean;
+            /** Total Base Qty */
+            total_base_qty?: number | null;
+            /** Confirmed Pct */
+            confirmed_pct?: number | null;
+            /** Covered Pct */
+            covered_pct?: number | null;
+            /** To Order Pct */
+            to_order_pct?: number | null;
+            /** Purchase Covered Qty */
+            purchase_covered_qty?: number | null;
+            /** Purchase To Order Qty */
+            purchase_to_order_qty?: number | null;
+        };
+        /** ExecutionJournalTruthMeta */
+        ExecutionJournalTruthMeta: {
+            /** Accepted At */
+            accepted_at?: string | null;
+            /** Accepted By */
+            accepted_by?: string | null;
+            /** Truth Source */
+            truth_source?: string | null;
+            /** Unavailable Sections */
+            unavailable_sections?: string[] | null;
+            /** Unavailable Reason */
+            unavailable_reason?: string | null;
+        };
+        /** ExecutionJournalWorkItem */
+        ExecutionJournalWorkItem: {
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "production_order" | "planned_order" | "planned_purchase" | "planned_rework";
+            /** Qty */
+            qty: number;
+            /** Product Id */
+            product_id?: number | null;
+            /** Order Id */
+            order_id?: number | null;
+            /** Order Number */
+            order_number?: string | null;
+            /** Order Ref1C */
+            order_ref1c?: string | null;
+            /** Order Source */
+            order_source?: string | null;
+            /** One C Opened */
+            one_c_opened?: boolean | null;
+            /** Opened At */
+            opened_at?: string | null;
+            /** Order State */
+            order_state?: string | null;
+            /** Purchase Id */
+            purchase_id?: number | null;
+            /** Rework Id */
+            rework_id?: number | null;
+            /** Completed Qty */
+            completed_qty?: number | null;
+            /** Remaining Qty */
+            remaining_qty?: number | null;
+            /** Need Date */
+            need_date?: string | null;
+            /** Order Date */
+            order_date?: string | null;
+            /** Lead Time Days */
+            lead_time_days?: number | null;
+            /** Forecast Date */
+            forecast_date?: string | null;
+            /** Forecast Shift Days */
+            forecast_shift_days?: number | null;
+            /** Forecast Reason */
+            forecast_reason?: string | null;
+            /** Forecast Status */
+            forecast_status?: ("early" | "on_time" | "delayed" | "critical" | "unavailable") | null;
+        };
         /** ExportManufacturesPayload */
         ExportManufacturesPayload: {
             /** Manufacture Ids */
@@ -3580,21 +3790,6 @@ export interface components {
              * @default false
              */
             allow_production: boolean;
-        };
-        /** ForcedOrderCreateRequest */
-        ForcedOrderCreateRequest: {
-            /** Run Id */
-            run_id?: number | null;
-            /** Item Id */
-            item_id: number;
-            /** Need Date */
-            need_date: string;
-            /** Requested Qty */
-            requested_qty: number;
-            /** Created By */
-            created_by?: string | null;
-            /** Reason */
-            reason?: string | null;
         };
         /** GenerationAcceptRequest */
         GenerationAcceptRequest: {
@@ -3707,11 +3902,6 @@ export interface components {
             unit?: string | null;
             /** Category Id */
             category_id?: number | null;
-            /**
-             * Stock Qty
-             * @default 0
-             */
-            stock_qty: number;
             /** Optimal Batch */
             optimal_batch?: number | null;
             /**
@@ -3750,11 +3940,6 @@ export interface components {
             unit?: string | null;
             /** Category Id */
             category_id?: number | null;
-            /**
-             * Stock Qty
-             * @default 0
-             */
-            stock_qty: number;
             /** Optimal Batch */
             optimal_batch?: number | null;
             /**
@@ -3931,14 +4116,7 @@ export interface components {
         };
         /**
          * ItemPatch
-         * @description Partial item update: only the fields actually sent are written.
-         *
-         *     `stock_qty` is deliberately absent. Physical stock belongs to the 1C sync and
-         *     the Item Ledger, so a browser form must never be able to carry it — with a
-         *     full-record PUT an editor of one planning attribute had to resend the stock
-         *     it had read a moment earlier and could silently overwrite a fresher sync
-         *     value. `extra="forbid"` plus the explicit check below turn such an attempt
-         *     into 422 instead of a silent write.
+         * @description Partial item update containing master-data fields only.
          */
         ItemPatch: {
             /** Item Code */
@@ -3980,11 +4158,6 @@ export interface components {
             unit?: string | null;
             /** Category Id */
             category_id?: number | null;
-            /**
-             * Stock Qty
-             * @default 0
-             */
-            stock_qty: number;
             /** Optimal Batch */
             optimal_batch?: number | null;
             /**
@@ -4062,6 +4235,49 @@ export interface components {
              * @default true
              */
             dry_run: boolean;
+        };
+        /** NomenclatureGroupResponse */
+        NomenclatureGroupResponse: {
+            /** Id */
+            id: string;
+            /** Code */
+            code: string;
+            /** Name */
+            name: string;
+        };
+        /** NomenclatureGroupsResponse */
+        NomenclatureGroupsResponse: {
+            /** Items */
+            items: components["schemas"]["NomenclatureGroupResponse"][];
+            /** Selected Ids */
+            selected_ids: string[];
+        };
+        /** NomenclatureSearchItemResponse */
+        NomenclatureSearchItemResponse: {
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code: string;
+            /** Item Name */
+            item_name: string;
+            /** Item Article */
+            item_article: string | null;
+            /** Similarity */
+            similarity: number;
+        };
+        /** NomenclatureSearchResponse */
+        NomenclatureSearchResponse: {
+            /** Items */
+            items: components["schemas"]["NomenclatureSearchItemResponse"][];
+            /** Total */
+            total: number;
+            /** Query */
+            query: string;
+            /**
+             * Search Type
+             * @constant
+             */
+            search_type: "text";
         };
         /** ODataConfig */
         ODataConfig: {
@@ -4180,8 +4396,6 @@ export interface components {
         };
         /** PeriodPlanMrpSnapshotRequest */
         PeriodPlanMrpSnapshotRequest: {
-            /** Generation Key */
-            generation_key?: string | null;
             /** Started By */
             started_by?: string | null;
         };
@@ -4242,7 +4456,7 @@ export interface components {
         /** ProduceLinePayload */
         ProduceLinePayload: {
             /** Qty */
-            qty: number;
+            qty?: number | null;
             /** Executor */
             executor?: string | null;
             /** Operation Executors */
@@ -4251,6 +4465,47 @@ export interface components {
             }[] | null;
             /** Comment */
             comment?: string | null;
+        };
+        /** ProductionControlRootProductOption */
+        ProductionControlRootProductOption: {
+            /** Item Id */
+            item_id: number;
+            /** Item Name */
+            item_name: string;
+            /** Item Article */
+            item_article?: string | null;
+            /** Item Code */
+            item_code?: string | null;
+        };
+        /** ProductionControlRootProductOptionsResponse */
+        ProductionControlRootProductOptionsResponse: {
+            /** Rows */
+            rows: components["schemas"]["ProductionControlRootProductOption"][];
+            /** Total */
+            total: number;
+        };
+        /** ProductionEmployeeListResponse */
+        ProductionEmployeeListResponse: {
+            /** Rows */
+            rows: components["schemas"]["ProductionEmployeeOptionResponse"][];
+            /** Total */
+            total: number;
+        };
+        /** ProductionEmployeeOptionResponse */
+        ProductionEmployeeOptionResponse: {
+            /** Employee Id */
+            employee_id: number;
+            /** Employee Ref1C */
+            employee_ref1c: string;
+            /**
+             * Employee Type
+             * @enum {string}
+             */
+            employee_type: "employee" | "brigade";
+            /** Employee Code */
+            employee_code?: string | null;
+            /** Employee Name */
+            employee_name: string;
         };
         /** ProductionGroup */
         ProductionGroup: {
@@ -4350,6 +4605,67 @@ export interface components {
              */
             updated_at: string;
         };
+        /** ProductionMaterialsResponse */
+        ProductionMaterialsResponse: {
+            /** Ledger Generation Id */
+            ledger_generation_id: number;
+            /** Truth Status */
+            truth_status: string;
+            /** Cutoff */
+            cutoff: string;
+            /** Product Id */
+            product_id: number;
+            /** Order Number */
+            order_number: string;
+            /** Item Name */
+            item_name: string;
+            /** Item Article */
+            item_article: string;
+            /** Qty */
+            qty: number;
+            /** Spec Id */
+            spec_id: number | null;
+            /** Components */
+            components: {
+                [key: string]: unknown;
+            }[];
+            /** Coverage */
+            coverage: string;
+            /** Coverage Status */
+            coverage_status: string;
+            /** Coverage Label */
+            coverage_label: string;
+        };
+        /** ProductionOperationOptionResponse */
+        ProductionOperationOptionResponse: {
+            /** Line Number */
+            line_number: number;
+            /** Spec Id */
+            spec_id: number;
+            /** Spec Ref1C */
+            spec_ref1c?: string | null;
+            /** Spec Operation Id */
+            spec_operation_id: number;
+            /** Operation Id */
+            operation_id: number;
+            /** Operation Ref1C */
+            operation_ref1c: string;
+            /** Operation Name */
+            operation_name?: string | null;
+            /** Stage Id */
+            stage_id?: number | null;
+            /** Stage Name */
+            stage_name?: string | null;
+            /** Time Norm */
+            time_norm: number;
+        };
+        /** ProductionOperationsResponse */
+        ProductionOperationsResponse: {
+            /** Rows */
+            rows: components["schemas"]["ProductionOperationOptionResponse"][];
+            /** Total */
+            total: number;
+        };
         /** ProductionOrderJournalResponse */
         ProductionOrderJournalResponse: {
             /** Rows */
@@ -4433,6 +4749,8 @@ export interface components {
             forecast_shift_days?: number | null;
             /** Forecast Reason */
             forecast_reason?: string | null;
+            /** Forecast Status */
+            forecast_status?: ("early" | "on_time" | "delayed" | "critical" | "unavailable") | null;
             /** Opened At */
             opened_at?: string | null;
             /** Workshop Id */
@@ -4473,6 +4791,11 @@ export interface components {
             mrp_req_covered_qty?: number | null;
             /** Mrp Req Remaining Qty */
             mrp_req_remaining_qty?: number | null;
+            /**
+             * Available Actions
+             * @default []
+             */
+            available_actions: string[];
             /**
              * Launch Source
              * @default mrp_remaining
@@ -5204,6 +5527,74 @@ export interface components {
                 [key: string]: unknown;
             }[];
         };
+        /** SpecificationSearchItemResponse */
+        SpecificationSearchItemResponse: {
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code: string;
+            /** Item Name */
+            item_name: string;
+            /** Item Article */
+            item_article: string | null;
+            /** Item Ref1C */
+            item_ref1c: string | null;
+            /** Unit */
+            unit: string | null;
+            /** Unit Ref1C */
+            unit_ref1c: string | null;
+            /** Replenishment Method */
+            replenishment_method: string | null;
+            /** Spec Id */
+            spec_id: number | null;
+            /** Spec Code */
+            spec_code: string | null;
+            /** Spec Name */
+            spec_name: string | null;
+            /** Spec Ref1C */
+            spec_ref1c: string | null;
+            /** Default Spec Count */
+            default_spec_count: number;
+            /** Has Children */
+            has_children: boolean;
+        };
+        /** SpecificationSearchMetaResponse */
+        SpecificationSearchMetaResponse: {
+            /** Q */
+            q: string;
+            /** Count */
+            count: number;
+            /** Limit */
+            limit: number;
+        };
+        /** SpecificationSearchResponse */
+        SpecificationSearchResponse: {
+            /** Items */
+            items: components["schemas"]["SpecificationSearchItemResponse"][];
+            meta: components["schemas"]["SpecificationSearchMetaResponse"];
+        };
+        /** StockWarehouseListResponse */
+        StockWarehouseListResponse: {
+            /** Rows */
+            rows: components["schemas"]["StockWarehouseResponse"][];
+            /** Total */
+            total: number;
+            /** Selected Total */
+            selected_total: number;
+        };
+        /** StockWarehouseResponse */
+        StockWarehouseResponse: {
+            /** Warehouse Id */
+            warehouse_id: number;
+            /** Warehouse Ref1C */
+            warehouse_ref1c: string;
+            /** Warehouse Code */
+            warehouse_code: string;
+            /** Warehouse Name */
+            warehouse_name: string;
+            /** Is Selected */
+            is_selected: boolean;
+        };
         /** SyncAutoConfigPayload */
         SyncAutoConfigPayload: {
             /**
@@ -5244,11 +5635,6 @@ export interface components {
             truth_status: string;
             /** Truth Reason */
             truth_reason?: string | null;
-        };
-        /** UpdateQuantityPayload */
-        UpdateQuantityPayload: {
-            /** Quantity */
-            quantity: number;
         };
         /** ValidationError */
         ValidationError: {
@@ -5567,9 +5953,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["StockWarehouseListResponse"];
                 };
             };
         };
@@ -6446,7 +6830,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["NomenclatureGroupsResponse"];
                 };
             };
         };
@@ -6950,6 +7334,12 @@ export interface operations {
                 root_item_id?: number | null;
                 bom_level?: number | null;
                 flow?: string | null;
+                status?: string | null;
+                include_net_zero?: boolean;
+                sort_by?: "bom_level" | "item_article" | "item_code" | "item_name" | "flow" | "gross_qty" | "net_qty" | "ordered_qty" | "completed_qty" | "remaining_qty" | "need_date" | "coverage_pct" | "status";
+                sort_dir?: "asc" | "desc";
+                limit?: number;
+                offset?: number;
             };
             header?: never;
             path: {
@@ -6965,7 +7355,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["ExecutionJournalResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7268,6 +7658,9 @@ export interface operations {
                 item_id?: number | null;
                 root_item_id?: number | null;
                 bucket_type?: string | null;
+                supplier_ref1c?: string | null;
+                category_id?: number | null;
+                category_ref1c?: string | null;
                 date_from?: string | null;
                 date_to?: string | null;
                 limit?: number;
@@ -7538,133 +7931,6 @@ export interface operations {
             };
         };
     };
-    list_forced_orders_api_v1_plan_forced_orders_get: {
-        parameters: {
-            query?: {
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    create_forced_order_api_v1_plan_forced_orders_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ForcedOrderCreateRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    process_forced_order_api_v1_plan_forced_orders__request_id__process_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                request_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    export_forced_order_api_v1_plan_forced_orders__request_id__export_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                request_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     get_stages_api_v1_plan_stages_get: {
         parameters: {
             query?: never;
@@ -7731,6 +7997,9 @@ export interface operations {
                 format?: string;
                 root_item_id?: number | null;
                 bucket_type?: string | null;
+                supplier_ref1c?: string | null;
+                category_id?: number | null;
+                category_ref1c?: string | null;
                 date_from?: string | null;
                 date_to?: string | null;
                 sort_by?: string | null;
@@ -7895,7 +8164,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["NomenclatureSearchResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7925,28 +8194,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
-                };
-            };
-        };
-    };
-    calculate_api_v1_stages_calculate_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
                 };
             };
         };
@@ -8144,9 +8391,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["SpecificationSearchResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8514,28 +8759,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_resource_distribution_api_v1_resources_calculate_distribution_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
                 };
             };
         };
@@ -9034,9 +9257,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["ProductionEmployeeListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9067,9 +9288,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["ProductionOperationsResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9079,6 +9298,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_root_products_api_v1_production_control_orders_root_products_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProductionControlRootProductOptionsResponse"];
                 };
             };
         };
@@ -9115,43 +9354,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProductionOrderJournalResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    patch_order_line_quantity_api_v1_production_control_orders__product_id__quantity_patch: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                product_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateQuantityPayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
                 };
             };
             /** @description Validation Error */
@@ -9235,78 +9437,8 @@ export interface operations {
             };
         };
     };
-    post_dedupe_mrp_orders_api_v1_production_control_orders_dedupe_mrp_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DedupeMrpOrdersPayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     get_order_line_materials_api_v1_production_control_orders__product_id__materials_get: {
         parameters: {
-            query?: {
-                refresh?: boolean;
-            };
-            header?: never;
-            path: {
-                product_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    post_order_line_materials_refresh_api_v1_production_control_orders__product_id__materials_refresh_post: {
-        parameters: {
             query?: never;
             header?: never;
             path: {
@@ -9322,9 +9454,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["ProductionMaterialsResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9350,6 +9480,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ProduceLinePayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_close_production_order_api_v1_production_control_orders__product_id__close_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CloseProductionOrderPayload"];
             };
         };
         responses: {
@@ -10247,9 +10414,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["BindingReviewItemsResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10280,9 +10445,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["BindingReviewLinesResponse"];
                 };
             };
             /** @description Validation Error */

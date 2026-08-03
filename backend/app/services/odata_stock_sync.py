@@ -238,12 +238,11 @@ def sync_stock_from_odata(
     req: ODataSyncRequest,
 ) -> dict:
     """
-    Синхронизация остатков из 1С через OData.
-    Алгоритм аналогичен PRODPLANOLD/src/odata_stock_sync.py:
-      - чтение всех item_code из БД и нормализация
-      - загрузка остатков из 1С и агрегация по нормализованным кодам
-      - безопасное обновление stock_qty в одной транзакции
-      - флаги dry_run / zero_missing
+    Read-only OData stock diagnostic plus warehouse-catalog refresh.
+
+    Physical quantity is published exclusively by the Item Ledger physical
+    refresh lifecycle. This compatibility endpoint never stores an aggregate
+    quantity on ``Item``.
     """
     stats = _Stats(
         dry_run=bool(req.dry_run),
@@ -328,8 +327,8 @@ def sync_stock_from_odata(
                 filtered_rows.append(rec)
         stock_data = filtered_rows
 
-    # 3) Aggregate by normalized code or GUID and update Item.stock_qty.
-    #    per-warehouse breakdown mirrors were removed from the runtime sync.
+    # 3) Aggregate only for diagnostic matching. Physical publication belongs
+    #    to the accepted Item Ledger generation.
 
     # Агрегируем по нормализованным кодам И по Ref_Key (GUID) — GUID имеет приоритет для сопоставления
     odata_map_norm_to_qty: Dict[str, float] = {}
@@ -382,103 +381,20 @@ def sync_stock_from_odata(
         matched = sum(1 for norm in db_code_to_norm.values() if norm in odata_map_norm_to_qty)
     stats.matched_in_odata = matched
 
-    # IMPORTANT POLICY:
-    # If an item is absent in OData response, we treat its stock as 0.
-    # Rationale: many 1C Balance endpoints return only non-zero rows.
-    # Leaving old stock values causes false availability and wrong MRP orders.
-    # NOTE: we still keep the global guard above: if 1C returned 0 rows total, we do NOT update anything.
-    effective_zero_missing = True
-
-    zeroed_count = 0
-    updated = 0
-    unchanged = 0
-
-    # Обновим все записи items
-    items: List[Item] = db.query(Item).all()
-    total = len(items)
-
-    # Инициализация прогресса перед долгой секцией обновления БД (обновим total)
+    stats.items_unchanged = stats.items_total
+    if req.dry_run:
+        db.rollback()
+    else:
+        db.commit()
     if progress:
         try:
-            progress.update("stock", total=total or 0, processed=0, message="Обновление остатков в БД")
+            progress.finish(
+                "stock",
+                error=None,
+                message="Остатки проверены; публикация выполняется Item Ledger",
+            )
         except Exception:
             pass
-
-    processed = 0
-    try:
-        for it in items:
-            raw_code = str(it.item_code or "").strip()
-            ref1c = str(it.item_ref1c or "").strip()
-            norm_code = db_code_to_norm.get(raw_code, _norm_code(raw_code))
-            old_qty = float(it.stock_qty or 0.0)
-
-            # Приоритет сопоставления:
-            # 1) по GUID (item_ref1c)
-            # 2) по нормализованному коду
-            if ref1c and ref1c in odata_map_ref_to_qty:
-                new_qty = float(odata_map_ref_to_qty[ref1c])
-            elif norm_code in odata_map_norm_to_qty:
-                new_qty = float(odata_map_norm_to_qty[norm_code])
-            else:
-                # Missing in OData -> stock must become 0.
-                # (effective_zero_missing is always True by policy)
-                if effective_zero_missing:
-                    new_qty = 0.0
-                else:
-                    new_qty = old_qty
-
-            if abs(old_qty - new_qty) > 1e-9:
-                if new_qty == 0.0 and old_qty != 0.0 and effective_zero_missing:
-                    zeroed_count += 1
-                it.stock_qty = new_qty
-                updated += 1
-            else:
-                unchanged += 1
-
-            processed += 1
-            if progress:
-                try:
-                    # Обновляем чаще для малых объёмов
-                    if total and total <= 50:
-                        do_update = True
-                    else:
-                        update_every = 10 if (total and total > 0) else 50
-                        do_update = (processed % update_every == 0)
-                    if do_update or processed == total:
-                        msg = f"Обработано {processed}" + (f"/{total}" if total > 0 else "")
-                        progress.update("stock", processed=processed, message=msg)
-                except Exception:
-                    pass
-
-        stats.unmatched_zeroed = zeroed_count
-        stats.items_updated = updated
-        stats.items_unchanged = unchanged
-
-        # Ledger writes are owned by the BUILDING physical_refresh lifecycle
-        # (physical_refresh_orchestrator / opening_balance_reconcile). This
-        # scheduled stock sweep is a legacy/read staging update only: it never
-        # creates a PhysicalImportBatch and never touches stock_bin/SLE.
-
-        if req.dry_run:
-            db.rollback()
-        else:
-            db.commit()
-
-        if progress:
-            try:
-                done = processed or total
-                progress.update("stock", processed=done, message=f"Готово: {done}/{total or done}")
-                progress.finish("stock", error=None, message="Синхронизация остатков завершена")
-            except Exception:
-                pass
-    except Exception as e:
-        db.rollback()
-        if progress:
-            try:
-                progress.finish("stock", error=str(e), message="Синхронизация остатков завершилась ошибкой")
-            except Exception:
-                pass
-        raise
 
     return asdict(stats)
 
@@ -486,7 +402,7 @@ def sync_stock_from_odata(
 def sync_stock_warehouses_from_odata(db: Session, req: ODataSyncRequest) -> dict:
     """
     Синхронизирует только справочник складов из регистра остатков 1С.
-    Не изменяет остатки items.stock_qty.
+    Не публикует физические остатки.
     """
     stats = _WarehouseStats(
         dry_run=bool(req.dry_run),

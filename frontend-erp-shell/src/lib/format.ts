@@ -1,5 +1,8 @@
 export function qty(value: unknown) {
-  return Number(value || 0).toLocaleString('ru-RU', { maximumFractionDigits: 3 })
+  if (value == null || value === '') return '—'
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return numeric.toLocaleString('ru-RU', { maximumFractionDigits: 3 })
 }
 
 export function dateRu(value?: string | null) {

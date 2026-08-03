@@ -5,10 +5,17 @@ from typing import List, Dict, Any
 import pytest
 
 from backend.app.services.planning_service import (
+    capacity_status,
     get_run_production,
     get_run_purchases,
     get_run_summary,
 )
+
+
+def test_capacity_status_is_server_owned():
+    assert capacity_status(0) == "within_capacity"
+    assert capacity_status("0.0000000001") == "within_capacity"
+    assert capacity_status("0.01") == "overloaded"
 
 
 class FakeQuery:

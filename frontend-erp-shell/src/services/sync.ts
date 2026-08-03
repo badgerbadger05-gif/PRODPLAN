@@ -1,5 +1,8 @@
-import type { NomenclatureGroupItem, ODataConfig, SyncAction, WarehouseItem } from '../domain/sync'
+import type { ODataConfig, SyncAction } from '../domain/sync'
 import { api } from '../lib/api'
+import type { components } from '../lib/apiTypes'
+
+type ApiSchemas = components['schemas']
 
 function syncPayload(config: ODataConfig, action: SyncAction) {
   return {
@@ -43,7 +46,7 @@ export function runSyncAction(config: ODataConfig, action: SyncAction) {
 }
 
 export function listWarehouses() {
-  return api<{ rows: WarehouseItem[]; total: number; selected_total: number }>('/v1/sync/warehouses')
+  return api<ApiSchemas['StockWarehouseListResponse']>('/v1/sync/warehouses')
 }
 
 export function saveWarehouseSelection(selected_refs: string[]) {
@@ -54,7 +57,7 @@ export function saveWarehouseSelection(selected_refs: string[]) {
 }
 
 export function listNomenclatureGroups() {
-  return api<{ items?: NomenclatureGroupItem[]; rows?: NomenclatureGroupItem[]; selected_ids?: string[] }>('/v1/odata/groups')
+  return api<ApiSchemas['NomenclatureGroupsResponse']>('/v1/odata/groups')
 }
 
 export function saveNomenclatureGroupSelection(ids: string[]) {

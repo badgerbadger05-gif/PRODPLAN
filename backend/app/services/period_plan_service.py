@@ -45,7 +45,6 @@ from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
     get_active_planning_config,
 )
-from .capacity_scheduler import CapacityScheduler
 from .mrp_stock_helpers import (
     active_wip_eta_by_item as _active_wip_eta_by_item,
     consume_wip_at_or_before as _consume_wip_at_or_before,
@@ -53,7 +52,12 @@ from .mrp_stock_helpers import (
     effective_stock_by_item_all as _effective_stock_by_item_all,
 )
 from .planning_run_candidate import _resolve_parent_generation_id
-from .item_ledger.reservation import replenishment_remaining
+from .forecast import forecast_payload as _forecast_payload
+from .item_ledger.reservation import (
+    replenishment_execution_pct,
+    replenishment_execution_status,
+    replenishment_remaining,
+)
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -65,6 +69,12 @@ from .bom_specification_resolver import (
     BomSpecificationResolutionError,
     BomSpecificationResolver,
 )
+
+
+def _rounded_replenishment_pct(required_qty: Any, received_qty: Any) -> float | None:
+    """Presentation precision only; the reservation core owns the formula."""
+    value = replenishment_execution_pct(required_qty, received_qty)
+    return None if value is None else round(float(value), 1)
 
 
 # Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
@@ -172,28 +182,6 @@ def _date_to_iso(value: Any) -> Optional[str]:
     if isinstance(value, date):
         return value.isoformat()
     return str(value)[:10] if value else None
-
-
-def _forecast_payload(
-    forecast_date: Optional[date],
-    due_date: Optional[date],
-    *,
-    reason: str = "capacity",
-) -> Dict[str, Any]:
-    if not forecast_date or not due_date:
-        return {"forecast_date": _date_to_iso(forecast_date), "forecast_shift_days": None, "forecast_reason": None}
-    shift = (forecast_date - due_date).days
-    if shift > 0:
-        reason_text = "смещение по мощностям" if reason == "capacity" else reason
-    elif shift < 0:
-        reason_text = "раньше плановой даты"
-    else:
-        reason_text = "в срок"
-    return {
-        "forecast_date": forecast_date.isoformat(),
-        "forecast_shift_days": shift,
-        "forecast_reason": reason_text,
-    }
 
 
 def _fridays_between(start: date, finish: date) -> List[date]:
@@ -341,6 +329,11 @@ def list_period_plans(
                     "execution_partial": bool(
                         summary.get("execution_partial", False)
                     ),
+                    "execution_progress_status": replenishment_execution_status(
+                        summary.get("execution_base_qty") or 0,
+                        summary.get("execution_completed_qty") or 0,
+                        partial_truth=bool(summary.get("execution_partial", False)),
+                    ),
                     "execution_completed_qty": summary.get("execution_completed_qty"),
                     "execution_base_qty": summary.get("execution_base_qty"),
                     "execution_by_flow": summary.get("execution_by_flow") or {},
@@ -361,6 +354,7 @@ def list_period_plans(
                     {
                         "execution_pct": None,
                         "execution_partial": False,
+                        "execution_progress_status": "unavailable",
                         "execution_completed_qty": None,
                         "execution_base_qty": None,
                         "execution_by_flow": {},
@@ -636,8 +630,8 @@ def _explode_bom_net_first(
     """
     # --- Pre-load BOM data in bulk (avoid N+1 per item) ---
     # Effective stock with ignored warehouses (e.g., brak isolator) excluded;
-    # using Item.stock_qty directly would let MRP "see" stock that production
-    # control then refuses as a material-issue source.
+    # The Item model has no physical quantity. Stock comes only from accepted,
+    # generation-scoped warehouse bins.
     #
     # Freeze v2: alias the queue-wide consume-once stock ledger instead of
     # re-reading, so an earlier run's consumption persists to this one.
@@ -658,6 +652,8 @@ def _explode_bom_net_first(
         )
         if classify_replenishment_flow(replenishment_method) == REPLENISHMENT_FLOW_PRODUCTION
     }
+    if trace is not None:
+        trace.root_item_ids = set(root_production_item_ids)
 
     spec_resolver = BomSpecificationResolver(db)
     default_spec_map: Dict[int, int] = {
@@ -751,20 +747,25 @@ def _explode_bom_net_first(
         avail_wip = {
             int(iid): list(entries) for iid, entries in wip_eta_by_item.items()
         }
-    # Per-path cycle guard: every item that led to this one, unioned over the
-    # paths that carried demand into it. An edge is refused only when the child
-    # is already its own ancestor, so a convergent sub-assembly keeps exploding.
-    ancestors_by_item: Dict[int, Set[int]] = {}
+    # A queued branch carries both the selected specification and its own
+    # ancestry.  An item may be reached in the same BFS level through two
+    # explicitly pinned specifications; those are two legitimate material
+    # structures, not an ambiguity.  Keeping the ancestry on the branch also
+    # makes the cycle guard genuinely per-path (rather than accidentally
+    # combining ancestors from convergent paths).
+    #
+    # The first two fields are the logical demand-branch key requested by the
+    # BOM contract: (item_id, spec_id).  The frozen ancestor set is only the
+    # traversal context for that branch.
+    DemandBranch = Tuple[int, int | None, frozenset[int]]
     explosion_warnings: List[Dict[str, Any]] = []
     reported_cycle_edges: Set[Tuple[int, int]] = set()
     reported_negative_stock_items: Set[int] = set()
 
     # Level 0: demand from plan lines
-    demand_map: Dict[int, Dict[date, float]] = {
-        int(iid): dict(buckets) for iid, buckets in plan_demands.items()
-    }
-    demand_spec_map: Dict[int, int | None] = {
-        int(iid): default_spec_map.get(int(iid)) for iid in demand_map
+    demand_map: Dict[DemandBranch, Dict[date, float]] = {
+        (int(iid), default_spec_map.get(int(iid)), frozenset()): dict(buckets)
+        for iid, buckets in plan_demands.items()
     }
     traced_spec_scopes: Set[Tuple[int, int]] = set()
 
@@ -773,10 +774,16 @@ def _explode_bom_net_first(
         if not demand_map:
             break
 
-        next_demand: Dict[int, Dict[date, float]] = {}
-        next_demand_spec_map: Dict[int, int | None] = {}
+        next_demand: Dict[DemandBranch, Dict[date, float]] = {}
 
-        for iid, buckets in sorted(demand_map.items()):
+        for (iid, spec_id, own_ancestors), buckets in sorted(
+            demand_map.items(),
+            key=lambda row: (
+                row[0][0],
+                -1 if row[0][1] is None else row[0][1],
+                tuple(sorted(row[0][2])),
+            ),
+        ):
             if not buckets:
                 continue
 
@@ -889,7 +896,6 @@ def _explode_bom_net_first(
                 for bucket_date, net_q in net_buckets:
                     net_map[iid][bucket_date] = net_map[iid].get(bucket_date, 0.0) + float(net_q)
 
-            spec_id = demand_spec_map.get(iid)
             if not spec_id:
                 continue  # Leaf item (purchased material or item without BOM)
 
@@ -919,7 +925,6 @@ def _explode_bom_net_first(
             if not explode_buckets:
                 continue  # Nothing to propagate
 
-            own_ancestors = ancestors_by_item.get(iid, set())
             child_ancestors = own_ancestors | {iid}
             for bucket_date, exp_q in explode_buckets:
                 for comp in comps:
@@ -948,16 +953,6 @@ def _explode_bom_net_first(
                         continue
                     child_qty = exp_q * per_unit
                     child_spec_id = spec_resolver.child_spec_id(comp)
-                    if child_id in next_demand_spec_map:
-                        existing_spec_id = next_demand_spec_map[child_id]
-                        if existing_spec_id != child_spec_id:
-                            raise BomSpecificationResolutionError(
-                                "BOM component receives conflicting specification "
-                                f"selections in one expansion level: item_id={child_id}, "
-                                f"spec_ids={sorted({existing_spec_id, child_spec_id}, key=lambda value: -1 if value is None else value)}"
-                            )
-                    else:
-                        next_demand_spec_map[child_id] = child_spec_id
                     # Classical MRP lead-time offset: shift the child's
                     # need_date back by the PARENT's production time
                     # (`resolve_buffer_days(iid)`), so the components are
@@ -972,15 +967,17 @@ def _explode_bom_net_first(
                     buf = resolve_buffer_days(iid, spec_id)
                     child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
                     child_date = clamp_to_floor(child_date)
-                    if child_id not in next_demand:
-                        next_demand[child_id] = {}
-                    next_demand[child_id][child_date] = (
-                        next_demand[child_id].get(child_date, 0.0) + child_qty
+                    child_branch: DemandBranch = (
+                        child_id,
+                        child_spec_id,
+                        frozenset(child_ancestors),
                     )
-                    ancestors_by_item.setdefault(child_id, set()).update(child_ancestors)
+                    next_demand.setdefault(child_branch, {})[child_date] = (
+                        next_demand.setdefault(child_branch, {}).get(child_date, 0.0)
+                        + child_qty
+                    )
 
         demand_map = next_demand
-        demand_spec_map = next_demand_spec_map
 
     if any(
         float(qty or 0.0) > 1e-9
@@ -993,7 +990,8 @@ def _explode_bom_net_first(
         raise ValueError(
             "Развёртка BOM превысила предел вложенности "
             f"({MAX_BOM_DEPTH}): потребность нижних уровней осталась "
-            f"неразвёрнутой для номенклатур {sorted(demand_map)[:10]}"
+            "неразвёрнутой для номенклатур "
+            f"{sorted({item_id for item_id, _spec_id, _ancestors in demand_map})[:10]}"
         )
 
     return gross_map, net_map, bom_level_map, explosion_warnings
@@ -1283,6 +1281,7 @@ def _freeze_one_run(
         _write_freeze_baseline,
         _write_freeze_allocation,
         _write_freeze_component,
+        _write_freeze_component_cumulative,
     )
 
     lines = (
@@ -1293,40 +1292,17 @@ def _freeze_one_run(
         .all()
     )
 
-    # A plan keeps one fixed run. Rebuilding it retains MrpRequirement ids so
-    # already created production orders stay linked to this plan and visible
-    # in its execution journal; only derived bucket/proposal rows are rebuilt.
+    # Candidate fixation is add-only.  An existing requirement means this run
+    # was already derived, and rebuilding it would mutate frozen obligations
+    # and could delete purchase proposals without confirmed 1C read-back.
     existing_req_by_item: Dict[int, MrpRequirement] = {
         int(req.item_id): req
         for req in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
     }
-    # Own already-exported PlannedPurchase survive the rebuild (v2 ): their 1C
-    # supplier order is self-excluded from the pool, so the exported qty is this
-    # run's own coverage — consume it before booking any fresh purchase, and do
-    # not delete it. Unexported local recommendations are rebuilt as before.
     if existing_req_by_item:
-        exported_purchase_ids = {
-            int(source_id)
-            for (source_id,) in (
-                db.query(SyncLink.source_id)
-                .join(PlannedPurchase, PlannedPurchase.purchase_id == SyncLink.source_id)
-                .filter(PlannedPurchase.run_id == int(run.run_id))
-                .filter(SyncLink.source_system == "PRODPLAN")
-                .filter(SyncLink.source_doctype == "planned_purchase")
-                .filter(SyncLink.target_entity == "Document_ЗаказПоставщику")
-                .filter(SyncLink.status == "success")
-                .filter(SyncLink.target_ref_key.isnot(None))
-                .all()
-            )
-        }
-        db.query(PlannedOrderStage).filter(PlannedOrderStage.run_id == int(run.run_id)).delete(synchronize_session=False)
-        db.query(PlannedOrder).filter(PlannedOrder.run_id == int(run.run_id)).delete(synchronize_session=False)
-        purchase_delete = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == int(run.run_id))
-        if exported_purchase_ids:
-            purchase_delete = purchase_delete.filter(PlannedPurchase.purchase_id.notin_(exported_purchase_ids))
-        purchase_delete.delete(synchronize_session=False)
-        db.query(PlannedRework).filter(PlannedRework.run_id == int(run.run_id)).delete(synchronize_session=False)
-        db.query(MrpRequirementBucket).filter(MrpRequirementBucket.run_id == int(run.run_id)).delete(synchronize_session=False)
+        raise LedgerPoolUnavailable(
+            "candidate freeze is add-only; run already has derived requirements"
+        )
 
     # --- Collect plan-level (level 0) demand and lock plan lines ---
     buckets_by_item: Dict[int, Dict[date, float]] = {}
@@ -1451,7 +1427,6 @@ def _freeze_one_run(
     rework_count = 0
     production_count = 0
     stage_count = 0
-    frozen_schedule_warnings: List[Dict[str, Any]] = []
     created_production_orders: List[PlannedOrder] = []
     if allocatable_item_ids:
         items_by_id: Dict[int, Item] = {
@@ -1528,33 +1503,7 @@ def _freeze_one_run(
                         ))
                         purchase_count += 1
 
-            elif flow == REPLENISHMENT_FLOW_REWORK:
-                spec_id = spec_id_by_item.get(iid)
-                for bucket_date, net_qty in sorted(net_map[iid].items()):
-                    net_qty = float(net_qty)
-                    if net_qty <= 1e-9:
-                        continue
-                    need_date = bucket_date
-                    order_date = max(cutoff_date, need_date - timedelta(days=lead_time))
-                    db.add(PlannedRework(
-                        run_id=int(run.run_id),
-                        item_id=int(iid),
-                        spec_id=spec_id,
-                        requested_qty=net_qty,
-                        planned_qty=net_qty,
-                        qty=net_qty,
-                        need_date=need_date,
-                        order_date=order_date,
-                        lead_time_days=lead_time,
-                        bucket_date=need_date,
-                        component_blocked=False,
-                        component_partial=False,
-                        ledger_generation_id=int(run.ledger_generation_id),
-                    ))
-                    rework_count += 1
-                    alloc_total_qty += net_qty
-
-            else:
+            elif flow == REPLENISHMENT_FLOW_PRODUCTION:
                 req_id = int(req_by_item[iid].id) if iid in req_by_item else None
                 for bucket_date, net_qty in sorted(net_map[iid].items()):
                     net_qty = float(net_qty)
@@ -1578,6 +1527,17 @@ def _freeze_one_run(
                     created_production_orders.append(order)
                     production_count += 1
                     alloc_total_qty += net_qty
+            elif flow == REPLENISHMENT_FLOW_REWORK:
+                # Preserve the frozen MRP requirement, but do not invent a
+                # production, purchase, or legacy rework executor.  The
+                # reservation materializer records it as unavailable and an
+                # accepted assembly receipt may still close it.
+                continue
+            else:
+                raise ValueError(
+                    "Unsupported replenishment flow for period planning "
+                    f"(item={int(iid)}, method={item.replenishment_method!r}, flow={flow})"
+                )
 
         if created_production_orders:
             db.flush()
@@ -1669,50 +1629,6 @@ def _freeze_one_run(
                     stage_count += 1
 
             db.flush()
-            scheduler = CapacityScheduler(db, run.config_snapshot)
-            schedule_warnings: List[Dict[str, Any]] = []
-            for order in sorted(created_production_orders, key=lambda o: (o.need_date, int(o.order_id))):
-                stages = (
-                    db.query(PlannedOrderStage)
-                    .filter(PlannedOrderStage.order_id == int(order.order_id))
-                    .all()
-                )
-                if not stages:
-                    continue
-                stage_hours = {int(stage.stage_id): _to_float(stage.hours) for stage in stages}
-                stage_areas = {
-                    int(stage.stage_id): (int(stage.area_id) if stage.area_id is not None else None)
-                    for stage in stages
-                }
-                schedule_result, warnings = scheduler.schedule_backward(
-                    int(order.item_id),
-                    _to_float(order.qty),
-                    order.need_date,
-                    stage_hours,
-                    stage_areas_by_stage=stage_areas,
-                )
-                for warning in warnings:
-                    warning["run_id"] = int(run.run_id)
-                    warning["order_id"] = int(order.order_id)
-                schedule_warnings.extend(warnings)
-
-                start_dt = schedule_result.get("order_start_date")
-                finish_dt = schedule_result.get("order_finish_date")
-                if isinstance(start_dt, datetime):
-                    order.start_date = start_dt.date()
-                elif isinstance(start_dt, date):
-                    order.start_date = start_dt
-                if isinstance(finish_dt, datetime):
-                    order.finish_date = finish_dt.date()
-                elif isinstance(finish_dt, date):
-                    order.finish_date = finish_dt
-
-            frozen_schedule_warnings = schedule_warnings
-            # Only the include run records scheduler warnings on run.warnings
-            # (legacy single-snapshot behaviour). Other runs report them in the
-            # refreeze result only, never mutating their own header (v2 d).
-            if schedule_warnings and is_include:
-                run.warnings = list(run.warnings or []) + schedule_warnings
 
     # --- Freeze v2 ledger writers (per-run, per-version, frozen_at=now) ---
     frozen_item_ids = sorted(
@@ -1734,6 +1650,7 @@ def _freeze_one_run(
         db, run, new_version, trace, req_by_item, shared_pools.stock_initial, now
     )
     component_rows = _write_freeze_component(db, run, new_version, trace, now)
+    component_rows += _write_freeze_component_cumulative(db, run, new_version, trace)
     run.active_freeze_version = int(new_version)
 
     # No commit here — the orchestrator owns the queue transaction.
@@ -1751,7 +1668,7 @@ def _freeze_one_run(
         "baseline_rows": int(baseline_rows),
         "allocation_rows": int(allocation_rows),
         "component_rows": int(component_rows),
-        "schedule_warnings": len(frozen_schedule_warnings),
+        "schedule_warnings": 0,
     }
 
 
@@ -2131,6 +2048,7 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
     plan = _get_plan(db, plan_id)
     buckets = _fridays_between(plan.period_from, plan.period_to)
     bucket_keys = [dt.isoformat() for dt in buckets]
+    include_forecasts = str(plan.status).lower() == "draft"
 
     rows = (
         db.query(
@@ -2148,7 +2066,11 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         .all()
     )
 
-    forecast_by_cell = _plan_matrix_forecasts(db, int(plan.id), [int(row.item_id) for row in rows], bucket_keys)
+    forecast_by_cell = (
+        _plan_matrix_forecasts(db, int(plan.id), [int(row.item_id) for row in rows], bucket_keys)
+        if include_forecasts else {}
+    )
+    bucket_totals: Dict[str, float] = {key: 0.0 for key in bucket_keys}
 
     by_item: Dict[int, Dict[str, Any]] = {}
     for row in rows:
@@ -2175,11 +2097,19 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         forecast = forecast_by_cell.get((item_id, key))
         if forecast:
             rec["bucket_forecasts"][key] = forecast
+        bucket_totals[key] += q
+
+    grand_total = 0.0
+    for bucket_key in bucket_keys:
+        grand_total += bucket_totals[bucket_key]
 
     return {
         "plan": _serialize_plan(plan),
         "buckets": bucket_keys,
         "rows": list(by_item.values()),
+        "bucket_totals": bucket_totals,
+        "grand_total": grand_total,
+        "total_qty": grand_total,
         "total": len(by_item),
     }
 
@@ -2232,49 +2162,10 @@ def _execution_unavailable_payload(
     truth_state: Any,
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    reqs_with_items = (
-        db.query(MrpRequirement, Item)
-        .join(Item, Item.item_id == MrpRequirement.item_id)
-        .filter(MrpRequirement.run_id == int(run.run_id))
-        .order_by(MrpRequirement.bom_level.asc(), Item.item_name.asc())
-        .all()
-    )
-    if root_item_id is not None:
-        related_ids = _bom_descendants_by_item(db, [int(root_item_id)]).get(
-            int(root_item_id), {int(root_item_id)}
-        )
-        reqs_with_items = [
-            (req, item) for req, item in reqs_with_items if int(req.item_id) in related_ids
-        ]
+    # Fail closed without consulting mutable requirements, items, or BOM.
+    # A public GET may expose only the persisted execution snapshot; when it is
+    # absent there are deliberately no quantitative rows to filter or page.
     rows: List[Dict[str, Any]] = []
-    for req, item in reqs_with_items:
-        item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-        if bom_level is not None and int(req.bom_level or 0) != bom_level:
-            continue
-        if flow is not None and item_flow != flow:
-            continue
-        rows.append({
-            "req_id": int(req.id),
-            "item_id": int(req.item_id),
-            "item_code": str(item.item_code or ""),
-            "item_article": str(item.item_article or "") if item.item_article else None,
-            "item_name": str(item.item_name or ""),
-            "flow": item_flow,
-            "bom_level": int(req.bom_level or 0),
-            "gross_qty": _to_float(req.total_required_qty),
-            "net_qty": _to_float(req.net_required_qty),
-            "completed_qty": None,
-            "covered_qty": None,
-            "remaining_qty": None,
-            "progress_base_qty": None,
-            "coverage_pct": None,
-            "status": "execution_unavailable",
-            "execution_available": False,
-            "execution_unavailable_reason": (
-                reason or "Execution snapshot is not published"
-            ),
-            "work_items": [],
-        })
     state_value = lambda name: (
         truth_state.get(name) if isinstance(truth_state, dict) else getattr(truth_state, name, None)
     )
@@ -2292,7 +2183,7 @@ def _execution_unavailable_payload(
         "rows": rows,
         "summary": {
             "truth_status": truth_status,
-            "total_items": len(rows),
+            "total_items": 0,
             "execution_completed_qty": None,
             "execution_base_qty": None,
             "execution_pct": None,
@@ -2360,6 +2251,154 @@ def _filter_execution_rows(
     return filtered
 
 
+_EXECUTION_STATUS_LABELS = {
+    "execution_unavailable": "Исполнение недоступно",
+    "covered": "Закрыто",
+    "partial": "Частично",
+    "ordered": "Оформлено",
+    "none": "Не оформлено",
+    "net_zero": "Покрыто складом",
+}
+_EXECUTION_INCOMPLETE_STATUSES = {"partial", "ordered", "none"}
+_EXECUTION_SORT_FIELDS = {
+    "bom_level",
+    "item_article",
+    "item_code",
+    "item_name",
+    "flow",
+    "gross_qty",
+    "net_qty",
+    "ordered_qty",
+    "completed_qty",
+    "remaining_qty",
+    "need_date",
+    "coverage_pct",
+    "status",
+}
+
+
+def _query_execution_rows(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    status: Optional[str],
+    include_net_zero: bool,
+    sort_by: str,
+    sort_dir: str,
+    limit: int,
+    offset: int,
+) -> tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    status_filter = str(status or "").strip().lower()
+    allowed_statuses = set(_EXECUTION_STATUS_LABELS) | {"incomplete"}
+    if status_filter and status_filter not in allowed_statuses:
+        raise ValueError(f"Unsupported execution journal status: {status_filter}")
+    sort_field = str(sort_by or "bom_level").strip().lower()
+    if sort_field not in _EXECUTION_SORT_FIELDS:
+        raise ValueError(f"Unsupported execution journal sort field: {sort_field}")
+    direction = str(sort_dir or "asc").strip().lower()
+    if direction not in {"asc", "desc"}:
+        raise ValueError(f"Unsupported execution journal sort direction: {direction}")
+    page_limit = max(1, min(int(limit or 100), 500))
+    page_offset = max(0, int(offset or 0))
+
+    prepared: List[Dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        row_status = str(row.get("status") or "execution_unavailable")
+        row["status"] = row_status
+        row["status_label"] = _EXECUTION_STATUS_LABELS.get(
+            row_status, row_status
+        )
+        if not include_net_zero and row_status == "net_zero":
+            continue
+        if status_filter == "incomplete" and row_status not in _EXECUTION_INCOMPLETE_STATUSES:
+            continue
+        if status_filter and status_filter != "incomplete" and row_status != status_filter:
+            continue
+        prepared.append(row)
+
+    def sort_value(row: Dict[str, Any]) -> tuple[bool, Any]:
+        if sort_field == "status":
+            value: Any = str(row.get("status_label") or "").casefold()
+        else:
+            value = row.get(sort_field)
+            if isinstance(value, str):
+                value = value.casefold()
+        return value is None, value
+
+    prepared.sort(
+        key=lambda row: (
+            sort_value(row),
+            int(row.get("bom_level") or 0),
+            int(row.get("item_id") or 0),
+            int(row.get("req_id") or 0),
+        ),
+        reverse=direction == "desc",
+    )
+    total = len(prepared)
+    return prepared[page_offset:page_offset + page_limit], total, prepared
+
+
+def _finalize_execution_payload(
+    db: Session,
+    payload: Dict[str, Any],
+    *,
+    root_item_id: Optional[int],
+    bom_level: Optional[int],
+    flow: Optional[str],
+    status: Optional[str],
+    include_net_zero: bool,
+    sort_by: str,
+    sort_dir: str,
+    limit: int,
+    offset: int,
+) -> Dict[str, Any]:
+    result = dict(payload)
+    facet_rows = _filter_execution_rows(
+        db,
+        list(result.get("rows") or []),
+        root_item_id=root_item_id,
+        bom_level=None,
+        flow=flow,
+    )
+    result["facets"] = {
+        "bom_levels": sorted({
+            int(row.get("bom_level") or 0) for row in facet_rows
+        }),
+    }
+    filtered = _filter_execution_rows(
+        db,
+        facet_rows,
+        root_item_id=None,
+        bom_level=bom_level,
+        flow=None,
+    )
+    filtered = _attach_execution_information_links(filtered)
+    page_rows, total, summary_rows = _query_execution_rows(
+        filtered,
+        status=status,
+        include_net_zero=include_net_zero,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=limit,
+        offset=offset,
+    )
+    summary_payload = dict(result.get("summary") or {})
+    if str(result.get("truth_status") or "") == "accepted":
+        summary_payload.update(_execution_row_summary(summary_rows))
+    else:
+        # Unknown execution stays unknown. Filtering may change the row count,
+        # but must never turn unavailable quantities into numeric zeroes.
+        summary_payload["total_items"] = total
+    result.update({
+        "rows": page_rows,
+        "total": total,
+        "limit": max(1, min(int(limit or 100), 500)),
+        "offset": max(0, int(offset or 0)),
+        "summary": summary_payload,
+    })
+    return result
+
+
 def _execution_row_summary(
     rows: Iterable[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -2420,61 +2459,39 @@ def _execution_row_summary(
     # `replenishment_execution_pct` returns None for a zero base; the plan-level
     # aggregates must not invent a full bar for an empty or fully stock-covered
     # selection (the UI renders null as «недоступно»).
-    execution_confirmed_pct = (
-        round(execution_completed_qty / execution_total_base_qty * 100.0, 1)
-        if execution_total_base_qty > 1e-9
-        else None
+    execution_confirmed_pct = _rounded_replenishment_pct(
+        execution_total_base_qty,
+        execution_completed_qty,
     )
     execution_pct = (
         None
         if execution_has_unavailable
         else (
-            round(execution_completed_qty / execution_base_qty * 100.0, 1)
-            if execution_base_qty > 1e-9
-            else None
+            _rounded_replenishment_pct(execution_base_qty, execution_completed_qty)
         )
     )
     for details in execution_by_flow.values():
         if not bool(details.get("available", True)):
             total_base_qty = _to_float(details.get("total_base_qty"))
-            details["confirmed_pct"] = (
-                round(
-                    _to_float(details.get("completed_qty"))
-                    / total_base_qty
-                    * 100.0,
-                    1,
-                )
-                if total_base_qty > 1e-9
-                else None
+            details["confirmed_pct"] = _rounded_replenishment_pct(
+                total_base_qty,
+                _to_float(details.get("completed_qty")),
             )
             details["execution_pct"] = None
             continue
         base_qty = _to_float(details.get("base_qty"))
-        details["execution_pct"] = (
-            round(_to_float(details.get("completed_qty")) / base_qty * 100.0, 1)
-            if base_qty > 1e-9
-            else None
+        details["execution_pct"] = _rounded_replenishment_pct(
+            base_qty,
+            _to_float(details.get("completed_qty")),
         )
         total_base_qty = _to_float(details.get("total_base_qty"))
-        details["covered_pct"] = (
-            round(
-                _to_float(details.get("purchase_covered_qty"))
-                / total_base_qty
-                * 100.0,
-                1,
-            )
-            if total_base_qty > 1e-9
-            else None
+        details["covered_pct"] = _rounded_replenishment_pct(
+            total_base_qty,
+            _to_float(details.get("purchase_covered_qty")),
         )
-        details["to_order_pct"] = (
-            round(
-                _to_float(details.get("purchase_to_order_qty"))
-                / total_base_qty
-                * 100.0,
-                1,
-            )
-            if total_base_qty > 1e-9
-            else None
+        details["to_order_pct"] = _rounded_replenishment_pct(
+            total_base_qty,
+            _to_float(details.get("purchase_to_order_qty")),
         )
     return {
         "truth_status": "accepted",
@@ -2904,13 +2921,20 @@ def _build_execution_snapshot_rows(
         # unknown — reporting a zero (and netting it against the frozen
         # requirement as a legacy fallback) fabricates progress. Fail closed to
         # `unavailable`, exactly like the truth-level payload does.
-        execution_available = reservation_row is not None
+        execution_available = (
+            reservation_row is not None
+            and flow in (REPLENISHMENT_FLOW_PURCHASE, REPLENISHMENT_FLOW_PRODUCTION)
+        )
         execution_unavailable_reason = (
             None
             if execution_available
             else (
-                "Резерв этой потребности отсутствует в поколении "
-                f"{int(generation_id)}: факт выполнения неизвестен"
+                "Поток replenishment этого требования не поддерживается"
+                if flow not in (REPLENISHMENT_FLOW_PURCHASE, REPLENISHMENT_FLOW_PRODUCTION)
+                else (
+                    "Резерв этой потребности отсутствует в поколении "
+                    f"{int(generation_id)}: факт выполнения неизвестен"
+                )
             )
         )
         progress_base_qty = (
@@ -3000,13 +3024,7 @@ def _build_execution_snapshot_rows(
             status = "net_zero"
             completed_qty = 0.0
         remaining_qty = max(0.0, progress_base_qty - completed_qty)
-        coverage_pct = (
-            round(completed_qty / progress_base_qty * 100.0, 1)
-            if progress_base_qty > 1e-9
-            # Nothing to replenish — the canonical `replenishment_execution_pct`
-            # returns None for a zero base rather than inventing 100%.
-            else None
-        )
+        coverage_pct = _rounded_replenishment_pct(progress_base_qty, completed_qty)
         ordered_qty = ordered_by_requirement.get(req_id, 0.0)
         purchase_covered_qty, purchase_to_order_qty = (
             purchase_coverage_by_req.get(req_id, (0.0, 0.0))
@@ -3030,7 +3048,11 @@ def _build_execution_snapshot_rows(
             "execution_source": (
                 "supplier_receipt_coverage"
                 if flow == REPLENISHMENT_FLOW_PURCHASE
-                else "reservation_realization"
+                else (
+                    "reservation_realization"
+                    if flow == REPLENISHMENT_FLOW_PRODUCTION
+                    else None
+                )
             ),
             "remaining_qty": remaining_qty,
             "coverage_pct": coverage_pct,
@@ -3080,6 +3102,12 @@ def get_period_plan_execution_journal(
     root_item_id: Optional[int] = None,
     bom_level: Optional[int] = None,
     flow: Optional[str] = None,
+    status: Optional[str] = None,
+    include_net_zero: bool = True,
+    sort_by: str = "bom_level",
+    sort_dir: str = "asc",
+    limit: int = 100,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """Read the immutable execution snapshot. Never computes or publishes."""
     from .planning_truth import get_truth_state
@@ -3105,16 +3133,18 @@ def get_period_plan_execution_journal(
             .one_or_none()
         )
         if closed_snapshot is None:
-            return _execution_unavailable_payload(
+            return _finalize_execution_payload(db, _execution_unavailable_payload(
                 db,
                 plan=plan,
                 run=run,
-                root_item_id=root_item_id,
-                bom_level=bom_level,
-                flow=flow,
+                root_item_id=None,
+                bom_level=None,
+                flow=None,
                 truth_state=get_truth_state(db),
                 reason="Execution snapshot is missing for the closed plan",
-            )
+            ), root_item_id=root_item_id, bom_level=bom_level, flow=flow,
+                status=status, include_net_zero=include_net_zero,
+                sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
         payload = dict(closed_snapshot.payload or {})
     else:
         snapshot_key = _execution_snapshot_key(
@@ -3139,39 +3169,40 @@ def get_period_plan_execution_journal(
                 required_capabilities=capabilities,
             )
         except PlanningTruthUnavailable as exc:
-            return _execution_unavailable_payload(
+            return _finalize_execution_payload(db, _execution_unavailable_payload(
                 db,
                 plan=plan,
                 run=run,
-                root_item_id=root_item_id,
-                bom_level=bom_level,
-                flow=flow,
+                root_item_id=None,
+                bom_level=None,
+                flow=None,
                 truth_state=exc.state,
-            )
+            ), root_item_id=root_item_id, bom_level=bom_level, flow=flow,
+                status=status, include_net_zero=include_net_zero,
+                sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
         if snapshot is None:
-            return _execution_unavailable_payload(
-                db, plan=plan, run=run, root_item_id=root_item_id,
-                bom_level=bom_level, flow=flow, truth_state=get_truth_state(db),
+            return _finalize_execution_payload(db, _execution_unavailable_payload(
+                db, plan=plan, run=run, root_item_id=None,
+                bom_level=None, flow=None, truth_state=get_truth_state(db),
                 reason="Execution snapshot is missing for the accepted Ledger generation",
-            )
+            ), root_item_id=root_item_id, bom_level=bom_level, flow=flow,
+                status=status, include_net_zero=include_net_zero,
+                sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
         payload = dict(snapshot.payload)
 
-    if root_item_id is None and bom_level is None and flow is None:
-        return payload
-    rows = _filter_execution_rows(
+    return _finalize_execution_payload(
         db,
-        list(payload.get("rows") or []),
+        payload,
         root_item_id=root_item_id,
         bom_level=bom_level,
         flow=flow,
+        status=status,
+        include_net_zero=include_net_zero,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=limit,
+        offset=offset,
     )
-    rows = _attach_execution_information_links(rows)
-    summary = _execution_row_summary(rows)
-    payload["rows"] = rows
-    summary_payload = dict(payload.get("summary") or {})
-    summary_payload.update(summary)
-    payload["summary"] = summary_payload
-    return payload
 
 
 def build_period_plan_execution_snapshot(

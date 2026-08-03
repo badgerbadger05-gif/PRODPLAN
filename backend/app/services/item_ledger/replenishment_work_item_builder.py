@@ -83,6 +83,7 @@ def _build_rows(
 
     work_items: list[dict[str, Any]] = []
     method_counts = {"make": 0, "buy": 0}
+    executorless_rework_count = 0
     for row in reservations:
         run_id = int(row.run_id)
         plan_id = plan_by_run.get(run_id)
@@ -99,10 +100,16 @@ def _build_rows(
             raise ReplenishmentWorkItemBuilderError(
                 f"reservation {int(row.id)} has invalid replenishment execution"
             )
-        if method not in method_counts:
+        if method not in {*method_counts, "rework"}:
             raise ReplenishmentWorkItemBuilderError(
                 f"reservation {int(row.id)} has unsupported realization mode {method!r}"
             )
+        # Known rework is deliberately executor-less.  The reservation remains
+        # in the immutable Ledger and replay can still close it, but it must
+        # not acquire a purchase/production journal line.
+        if method == "rework":
+            executorless_rework_count += 1
+            continue
         method_counts[method] += 1
         remaining = replenishment_remaining(required, fulfilled)
         work_items.append({
@@ -120,6 +127,7 @@ def _build_rows(
     return {
         "rows": work_items,
         "method_counts": method_counts,
+        "executorless_rework_reservations": executorless_rework_count,
     }, len(reservations)
 
 
@@ -249,6 +257,7 @@ def materialize_replenishment_work_items(
         "source_reservation_rows": int(source_rows),
         "replenishment_work_items": len(rows),
         "replenishment_work_item_methods": method_counts,
+        "executorless_rework_reservations": payload["executorless_rework_reservations"],
         "replenishment_required_total": str(required_sum),
         "replenishment_fulfilled_total": str(fulfilled_sum),
         "replenishment_remaining_total": str(remaining_sum),

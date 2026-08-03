@@ -90,8 +90,7 @@ FROM (
         ('production_order_line_states', (SELECT count(*) FROM production_order_line_states)),
         ('sync_link', (SELECT count(*) FROM sync_link)),
         ('shelf_policy', (SELECT count(*) FROM shelf_policy)),
-        ('dbr_assembly_rate', (SELECT count(*) FROM dbr_assembly_rate)),
-        ('forced_order_request', (SELECT count(*) FROM forced_order_request))
+        ('dbr_assembly_rate', (SELECT count(*) FROM dbr_assembly_rate))
 ) AS counts(table_name, row_count);
 
 -- KEEP -> CLEAR references.  The kept business rows remain, but their pointers
@@ -117,9 +116,7 @@ BEGIN
                   ('production_products', 'ledger_generation_id', 'ledger_generation'),
                   ('production_products', 'source_mrp_requirement_id', 'mrp_requirement'),
                   ('production_products', 'source_planned_order_id', 'planned_order'),
-                  ('production_order_line_states', 'material_coverage_ledger_generation_id', 'ledger_generation'),
-                  ('sync_link', 'ledger_generation_id', 'ledger_generation'),
-                  ('forced_order_request', 'run_id', 'planning_run')
+                  ('sync_link', 'ledger_generation_id', 'ledger_generation')
           ) AS expected_fk(table_name, column_name, target_table)
     LOOP
         SELECT count(*), min(constraint_row.conname)
@@ -171,29 +168,9 @@ UPDATE production_material_issues
 SET ledger_generation_id = NULL
 WHERE ledger_generation_id IS NOT NULL;
 
--- Material coverage is a generation-bound read projection kept on an
--- operational line.  Detach both its FK and the derived payload so no status
--- from the retired generation can survive the rebuild.
-UPDATE production_order_line_states
-SET
-    material_coverage_ledger_generation_id = NULL,
-    material_coverage_status = NULL,
-    material_coverage_label = NULL,
-    material_coverage_calculated_at = NULL,
-    material_coverage_snapshot = NULL
-WHERE material_coverage_ledger_generation_id IS NOT NULL
-   OR material_coverage_status IS NOT NULL
-   OR material_coverage_label IS NOT NULL
-   OR material_coverage_calculated_at IS NOT NULL
-   OR material_coverage_snapshot IS NOT NULL;
-
 UPDATE sync_link
 SET ledger_generation_id = NULL
 WHERE ledger_generation_id IS NOT NULL;
-
-UPDATE forced_order_request
-SET run_id = NULL
-WHERE run_id IS NOT NULL;
 
 UPDATE planning_truth_state
 SET current_generation_id = NULL;
@@ -205,8 +182,12 @@ TRUNCATE
     stock_ledger_anchor,
     stock_ledger_fact_supersession,
     stock_ledger_supplier_receipt_provenance,
+    reservation_consumption_allocation,
     stock_bin,
     ledger_future_supply,
+    production_material_custody_projection,
+    production_material_custody_projection_manifest,
+    production_material_custody_event,
     ledger_build_batch,
     ledger_generation,
     physical_import_batch,
@@ -216,6 +197,7 @@ TRUNCATE
     pegging_link,
     mrp_freeze_allocation,
     mrp_freeze_component,
+    mrp_freeze_component_cumulative,
     mrp_freeze_baseline,
     mrp_requirement_bucket,
     mrp_requirement,
@@ -224,7 +206,6 @@ TRUNCATE
     planned_purchase,
     planned_rework,
     capacity_load,
-    forced_order_result,
     replenishment_work_item,
     planning_run_bucket_modes,
     mrp_bucket_type_legacy,
@@ -280,22 +261,11 @@ ALTER TABLE production_products
     FOREIGN KEY (source_planned_order_id)
     REFERENCES planned_order(order_id)
     ON DELETE SET NULL;
-ALTER TABLE production_order_line_states
-    ADD CONSTRAINT fk_prod_line_state_coverage_generation
-    FOREIGN KEY (material_coverage_ledger_generation_id)
-    REFERENCES ledger_generation(id)
-    ON DELETE RESTRICT;
 ALTER TABLE sync_link
     ADD CONSTRAINT fk_sync_link_ledger_generation
     FOREIGN KEY (ledger_generation_id)
     REFERENCES ledger_generation(id)
     ON DELETE RESTRICT;
-ALTER TABLE forced_order_request
-    ADD CONSTRAINT forced_order_request_run_id_fkey
-    FOREIGN KEY (run_id)
-    REFERENCES planning_run(run_id)
-    ON DELETE SET NULL;
-
 DO $verify$
 DECLARE
     changed_count integer;
@@ -316,7 +286,6 @@ BEGIN
             WHEN 'sync_link' THEN (SELECT count(*) FROM sync_link)
             WHEN 'shelf_policy' THEN (SELECT count(*) FROM shelf_policy)
             WHEN 'dbr_assembly_rate' THEN (SELECT count(*) FROM dbr_assembly_rate)
-            WHEN 'forced_order_request' THEN (SELECT count(*) FROM forced_order_request)
         END AS row_count
     ) actual ON true
     WHERE actual.row_count <> expected.row_count;

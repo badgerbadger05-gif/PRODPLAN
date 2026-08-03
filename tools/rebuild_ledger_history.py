@@ -461,16 +461,8 @@ class DatabaseRuntime:
                 and qty > 0
             ):
                 by_code[code].append(rate_id)
-        missing_items = [code for code in item_codes if code not in found_items]
-        invalid = [code for code in item_codes if code in found_items and not by_code[code]]
         ambiguous = [code for code in item_codes if len(by_code[code]) > 1]
         problems = []
-        if missing_items:
-            problems.append(f"items not found: {', '.join(missing_items)}")
-        if invalid:
-            problems.append(
-                "missing positive rate with existing resource: " + ", ".join(invalid)
-            )
         if ambiguous:
             problems.append(f"ambiguous assembly rates: {', '.join(ambiguous)}")
         if problems:

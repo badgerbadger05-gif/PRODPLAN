@@ -26,12 +26,16 @@ from app.services.production_control_journal_snapshot import (
     SNAPSHOT_KEY as _PRODUCTION_JOURNAL_SNAPSHOT_KEY,
     validate_candidate_snapshot as validate_production_journal_candidate,
 )
+from app.services.production_material_custody_projection import (
+    validate_material_custody_projection,
+)
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
 from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
     MANIFEST_KEY,
     _current_parents,
 )
+from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
 from app.services.planning_run_candidate import _resolve_parent_generation_id
 
 
@@ -51,11 +55,13 @@ class ObligationRefreshPublishResult:
 _REQUIRED_BUILD_STAGES = (
     "physical_import",
     "reservation_materialize",
+    "execution_allocation",
     "replenishment_work_item",
     "reservation_replay",
     "assembly_output_allocation",
     "drum_schedule",
     "shelf_projection",
+    "future_supply_capture",
     "snapshot_build",
 )
 
@@ -65,6 +71,7 @@ _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
     "reservation_replay",
     "execution_allocations",
+    "reservation_consumption_allocation",
     "replenishment_work_item",
     "supplier_receipt_coverage",
     "planning_snapshots",
@@ -92,23 +99,6 @@ def _lock(query):
     return query.with_for_update()
 
 
-def _candidate_matches(parent: models.PlanningRun, candidate: models.PlanningRun, target_id: int) -> bool:
-    return (
-        str(candidate.status) == "BUILDING_SNAPSHOT"
-        and int(candidate.ledger_generation_id or -1) == int(target_id)
-        and int(candidate.prior_run_id or -1) == int(parent.run_id)
-        and candidate.source_plan_id == parent.source_plan_id
-        and candidate.period_from == parent.period_from
-        and candidate.period_to == parent.period_to
-        and candidate.horizon_days == parent.horizon_days
-        and candidate.config_version_id == parent.config_version_id
-        and candidate.config_snapshot == parent.config_snapshot
-        and candidate.fixed_at is None
-        and candidate.finished_at is None
-        and candidate.pinned is False
-    )
-
-
 def _manifest_hash(value: Any) -> str:
     return sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -123,7 +113,6 @@ def _require_manifest(
     candidates: list[models.PlanningRun],
     candidate_status: str,
 ) -> tuple[
-    list[tuple[models.PlanningRun, models.PlanningRun]],
     list[models.PlanningRun],
     list[models.PlanningRun],
     list[models.PlanningRun],
@@ -155,7 +144,6 @@ def _require_manifest(
 
     declared_candidate_ids: set[int] = set()
     declared_plans: set[int] = set()
-    refreshes: list[tuple[models.PlanningRun, models.PlanningRun]] = []
     additions: list[models.PlanningRun] = []
     retained: list[models.PlanningRun] = []
     retired: list[models.PlanningRun] = []
@@ -167,7 +155,7 @@ def _require_manifest(
             plan_id = int(entry["plan_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ObligationRefreshPublishError("obligation_refresh_manifest entry identity is malformed") from exc
-        if action not in {"refresh", "add", "retain", "retire"} or plan_id <= 0:
+        if action not in {"add", "retain", "retire"} or plan_id <= 0:
             raise ObligationRefreshPublishError("obligation_refresh_manifest contains unsupported action")
         if plan_id in declared_plans:
             raise ObligationRefreshPublishError("obligation_refresh_manifest has duplicate candidate or plan")
@@ -233,50 +221,28 @@ def _require_manifest(
             raise ObligationRefreshPublishError("obligation_refresh_manifest has missing or extra candidates")
         declared_candidate_ids.add(candidate_id)
 
-        if action == "refresh":
-            try:
-                parent_id = int(entry["parent_run_id"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ObligationRefreshPublishError("refresh manifest entry lacks parent run") from exc
-            parent = parent_by_id.get(parent_id)
-            if parent is None or parent_by_plan.get(plan_id) is not parent:
-                raise ObligationRefreshPublishError("refresh manifest omits or changes current parent")
-            if candidate.prior_run_id != parent.run_id:
-                raise ObligationRefreshPublishError("refresh candidate prior_run_id conflicts with manifest")
-            refreshes.append((parent, candidate))
+        if entry.get("parent_run_id") is not None or candidate.prior_run_id is not None:
+            raise ObligationRefreshPublishError("add candidate must not have a parent run")
+        if plan_id in parent_by_plan:
+            raise ObligationRefreshPublishError("add manifest repeats a current parent plan")
+        plan = db.get(models.ProductionPlanHeader, plan_id)
+        if plan is None or str(plan.status) != "fixed":
+            raise ObligationRefreshPublishError("add manifest plan must be fixed")
+        if candidate.period_from != plan.period_from or candidate.period_to != plan.period_to:
+            raise ObligationRefreshPublishError("add candidate period conflicts with fixed plan")
+        if candidate_status == "BUILDING_SNAPSHOT":
+            if candidate.fixed_at is not None or candidate.finished_at is not None or candidate.pinned is not False:
+                raise ObligationRefreshPublishError("add candidate has terminal lifecycle before publication")
+        elif candidate_status == "FIXED_SNAPSHOT":
+            if candidate.fixed_at is None or candidate.finished_at is None or candidate.pinned is not True:
+                raise ObligationRefreshPublishError("published add candidate has incomplete lifecycle")
         else:
-            if entry.get("parent_run_id") is not None or candidate.prior_run_id is not None:
-                raise ObligationRefreshPublishError("add candidate must not have a parent run")
-            if plan_id in parent_by_plan:
-                raise ObligationRefreshPublishError("add manifest repeats a current parent plan")
-            plan = db.get(models.ProductionPlanHeader, plan_id)
-            if plan is None or str(plan.status) != "fixed":
-                raise ObligationRefreshPublishError("add manifest plan must be fixed")
-            if candidate.period_from != plan.period_from or candidate.period_to != plan.period_to:
-                raise ObligationRefreshPublishError("add candidate period conflicts with fixed plan")
-            if candidate_status == "BUILDING_SNAPSHOT":
-                if (
-                    candidate.fixed_at is not None
-                    or candidate.finished_at is not None
-                    or candidate.pinned is not False
-                ):
-                    raise ObligationRefreshPublishError("add candidate has terminal lifecycle before publication")
-            elif candidate_status == "FIXED_SNAPSHOT":
-                if (
-                    candidate.fixed_at is None
-                    or candidate.finished_at is None
-                    or candidate.pinned is not True
-                ):
-                    raise ObligationRefreshPublishError("published add candidate has incomplete lifecycle")
-            else:  # defensive: this helper has exactly two valid publication phases
-                raise ObligationRefreshPublishError("unsupported add candidate lifecycle phase")
-            additions.append(candidate)
+            raise ObligationRefreshPublishError("unsupported add candidate lifecycle phase")
+        additions.append(candidate)
 
     if declared_candidate_ids != set(candidate_by_id):
         raise ObligationRefreshPublishError("obligation_refresh_manifest has missing or extra candidates")
     covered_parent_ids = {
-        int(parent.run_id) for parent, _candidate in refreshes
-    } | {
         int(parent.run_id) for parent in [*retained, *retired]
     }
     if covered_parent_ids != set(parent_by_id):
@@ -324,7 +290,7 @@ def _require_manifest(
             or candidate.config_snapshot != add_request["config_snapshot"]
         ):
             raise ObligationRefreshPublishError("add candidate config conflicts with manifest")
-    return refreshes, additions, retained, retired
+    return additions, retained, retired
 
 
 def _source_export_links_exist(db: Session, candidate_ids: list[int]) -> bool:
@@ -392,6 +358,30 @@ def _require_refresh_lineage(
     return pointer, parent, target
 
 
+def _require_future_supply_capture(
+    db: Session,
+    target: models.LedgerGeneration,
+    snapshot_metrics: Mapping[str, Any],
+) -> None:
+    batch_id = snapshot_metrics.get("future_supply_capture_batch_id")
+    try:
+        capture_batch_id = int(batch_id)
+    except (TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError(
+            "snapshot_build lacks future_supply_capture_batch_id"
+        ) from exc
+    try:
+        verify_future_supply_capture(
+            db,
+            int(target.id),
+            capture_batch_id=capture_batch_id,
+        )
+    except Exception as exc:
+        raise ObligationRefreshPublishError(
+            "snapshot_build future-supply proof is incomplete or malformed"
+        ) from exc
+
+
 def _require_sealed_build(
     db: Session,
     *,
@@ -436,6 +426,11 @@ def _require_sealed_build(
         raise ObligationRefreshPublishError(
             "snapshot_build lacks a complete future-supply candidate manifest"
         )
+    _require_future_supply_capture(
+        db,
+        target=target,
+        snapshot_metrics=snapshot_metrics,
+    )
     _require_candidate_read_snapshots(
         db,
         target=target,
@@ -589,7 +584,7 @@ def _exact_retry(
     else:
         parents = []
     try:
-        refreshes, additions, retained, retired = _require_manifest(
+        additions, retained, retired = _require_manifest(
             db, target=target, parents=parents, candidates=candidates,
             candidate_status="FIXED_SNAPSHOT",
         )
@@ -602,8 +597,17 @@ def _exact_retry(
     ).one_or_none()
     if snapshot_batch is None:
         return None
+    snapshot_metrics = dict(snapshot_batch.metrics or {})
     try:
-        journal_id = int(dict(snapshot_batch.metrics or {})["purchase_control_journal_snapshot_id"])
+        _require_future_supply_capture(
+            db,
+            target=target,
+            snapshot_metrics=snapshot_metrics,
+        )
+    except ObligationRefreshPublishError:
+        return None
+    try:
+        journal_id = int(snapshot_metrics["purchase_control_journal_snapshot_id"])
     except (KeyError, TypeError, ValueError):
         return None
     journal = db.get(models.PlanningReadSnapshot, journal_id)
@@ -679,22 +683,6 @@ def _exact_retry(
         models.PlanningReadRow.row_kind == "production_order",
     ).count():
         return None
-    by_parent = {int(old.run_id): candidate for old, candidate in refreshes}
-    if len(by_parent) != len(refreshes):
-        return None
-    for parent_run, candidate in refreshes:
-        if (
-            candidate.source_plan_id != parent_run.source_plan_id
-            or candidate.period_from != parent_run.period_from
-            or candidate.period_to != parent_run.period_to
-            or candidate.horizon_days != parent_run.horizon_days
-            or candidate.config_version_id != parent_run.config_version_id
-            or candidate.config_snapshot != parent_run.config_snapshot
-            or candidate.pinned is not True
-            or candidate.fixed_at is None
-            or candidate.finished_at is None
-        ):
-            return None
     fixed_parents = _lock(db.query(models.PlanningRun)).filter(
         models.PlanningRun.status == "FIXED_SNAPSHOT",
         models.PlanningRun.source_plan_id.isnot(None),
@@ -717,13 +705,6 @@ def _exact_retry(
         )
     except ObligationRefreshPublishError:
         return None
-    for parent_run, candidate in refreshes:
-        locked_rows = _lock(db.query(models.ProductionPlanLine)).filter(
-            models.ProductionPlanLine.plan_id == int(parent_run.source_plan_id),
-            models.ProductionPlanLine.locked_by_run_id.is_not(None),
-        ).all()
-        if any(int(row.locked_by_run_id) != int(candidate.run_id) for row in locked_rows):
-            return None
     for candidate in additions:
         locked_rows = _lock(db.query(models.ProductionPlanLine)).filter(
             models.ProductionPlanLine.plan_id == int(candidate.source_plan_id),
@@ -734,8 +715,7 @@ def _exact_retry(
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
         parent_run_ids=tuple(sorted(
-            [int(row.run_id) for row, _candidate in refreshes]
-            + [int(row.run_id) for row in retained]
+            [int(row.run_id) for row in retained]
             + [int(row.run_id) for row in retired]
         )),
         candidate_run_ids=tuple(sorted(candidate_ids)), published=False,
@@ -793,15 +773,10 @@ def publish_obligation_refresh_batch(
         models.PlanningRun.ledger_generation_id == int(target.id),
         models.PlanningRun.status == "BUILDING_SNAPSHOT",
     ).all()
-    refreshes, additions, retained, retired = _require_manifest(
+    additions, retained, retired = _require_manifest(
         db, target=target, parents=parents, candidates=candidates,
         candidate_status="BUILDING_SNAPSHOT",
     )
-    by_parent = {int(parent.run_id): candidate for parent, candidate in refreshes}
-    for parent_run, candidate in refreshes:
-        if not _candidate_matches(parent_run, candidate, int(target.id)):
-            raise ObligationRefreshPublishError("candidate has conflicting parent/config/period lineage")
-
     candidate_ids = sorted(int(row.run_id) for row in candidates)
     _require_sealed_build(
         db, target=target, candidate_ids=candidate_ids,
@@ -880,6 +855,9 @@ def publish_obligation_refresh_batch(
             "production control journal candidate is missing or stale"
         )
     try:
+        validate_material_custody_projection(
+            db, ledger_generation_id=int(target.id)
+        )
         validate_production_journal_candidate(
             db,
             candidate_production_journal,
@@ -891,15 +869,6 @@ def publish_obligation_refresh_batch(
         raise ObligationRefreshPublishError("candidate has external export links")
 
     # A source plan must not be half-transferred by an earlier/manual mutation.
-    for parent_run, candidate in refreshes:
-        rows = _lock(db.query(models.ProductionPlanLine)).filter(
-            models.ProductionPlanLine.plan_id == int(parent_run.source_plan_id),
-            models.ProductionPlanLine.locked_by_run_id.is_not(None),
-        ).all()
-        if any(int(row.locked_by_run_id) != int(parent_run.run_id) for row in rows):
-            raise ObligationRefreshPublishError("source plan line lock is not held by its parent snapshot")
-        for row in rows:
-            row.locked_by_run_id = int(candidate.run_id)
     for candidate in additions:
         locked_rows = _lock(db.query(models.ProductionPlanLine)).filter(
             models.ProductionPlanLine.plan_id == int(candidate.source_plan_id),
@@ -935,12 +904,6 @@ def publish_obligation_refresh_batch(
         # truth projection advances to the new generation.
         retained_run.ledger_generation_id = int(target.id)
         retained_run.ledger_cutoff = target.cutoff
-    for parent_run, candidate in refreshes:
-        parent_run.status = "SUPERSEDED"
-        candidate.status = "FIXED_SNAPSHOT"
-        candidate.pinned = True
-        candidate.fixed_at = accepted_at
-        candidate.finished_at = accepted_at
     for candidate in additions:
         candidate.status = "FIXED_SNAPSHOT"
         candidate.pinned = True
@@ -970,8 +933,7 @@ def publish_obligation_refresh_batch(
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
         parent_run_ids=tuple(sorted(
-            [int(row.run_id) for row, _candidate in refreshes]
-            + [int(row.run_id) for row in retained]
+            [int(row.run_id) for row in retained]
         )),
         candidate_run_ids=tuple(candidate_ids), published=True,
     )

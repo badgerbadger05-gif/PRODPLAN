@@ -85,6 +85,10 @@ def _manifest_replay_runs(
             retired_ids.add(retired_id)
             plan_ids.add(plan_id)
             continue
+        if action != "add":
+            raise CandidateRealizationReplayError(
+                "obligation_refresh_manifest contains unsupported action"
+            )
         try:
             candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:

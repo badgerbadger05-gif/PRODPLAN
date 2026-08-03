@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboa
 import type {
   BomFlattenedItem,
   BomItem,
+  BomItemIdentity,
   BomQualityIssue,
   BomWhereUsedItem,
   SpecFlatRow,
@@ -35,7 +36,7 @@ import {
 } from './specification/model'
 
 type LoadedBom = {
-  item: BomItem
+  item: BomItemIdentity
   nodes: SpecNode[]
   flattened: BomFlattenedItem[]
   whereUsed: BomWhereUsedItem[]
@@ -145,7 +146,7 @@ export function SpecificationPage() {
     }
   }
 
-  async function loadItem(item: BomItem) {
+  async function loadItem(item: BomItemIdentity) {
     const sequence = ++loadSequence.current
     setLoading(true)
     setError('')
@@ -307,7 +308,6 @@ export function SpecificationPage() {
                     <th>Код</th>
                     <th>Спецификация</th>
                     <th>Метод</th>
-                    <th>Остаток</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -323,11 +323,10 @@ export function SpecificationPage() {
                         <span className={`miniPill ${item.spec_id ? 'ready' : 'failed'}`}>{item.spec_id ? `#${item.spec_id}` : 'нет'}</span>
                       </td>
                       <td>{item.replenishment_method || ''}</td>
-                      <td className="numCell"><strong>{qty(item.stock_qty)}</strong><span>{item.unit || ''}</span></td>
                     </tr>
                   ))}
                   {!searchItems.length && (
-                    <tr><td colSpan={5} className="emptyDetail">Введите артикул, код или часть названия и нажмите Найти</td></tr>
+                    <tr><td colSpan={4} className="emptyDetail">Введите артикул, код или часть названия и нажмите Найти</td></tr>
                   )}
                 </tbody>
               </table>

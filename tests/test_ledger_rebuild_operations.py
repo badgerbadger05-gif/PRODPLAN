@@ -124,6 +124,9 @@ def test_clear_script_is_guarded_and_preserves_non_rebuildable_inputs():
         "mrp_requirement",
         "planning_run",
         "planning_read_snapshot",
+        "production_material_custody_event",
+        "production_material_custody_projection_manifest",
+        "production_material_custody_projection",
         "assembly_queue_line",
         "drum_schedule",
         "shelf_projection",
@@ -137,7 +140,6 @@ def test_clear_script_is_guarded_and_preserves_non_rebuildable_inputs():
         "sync_link",
         "shelf_policy",
         "dbr_assembly_rate",
-        "forced_order_request",
     }.isdisjoint(targets)
 
 
@@ -193,42 +195,6 @@ def test_truncate_set_is_closed_over_migrated_schema_foreign_keys(tmp_path):
         "planning_run_bucket_modes",
         "mrp_bucket_type_legacy",
     } <= targets
-
-
-def test_clear_script_clears_current_material_coverage_projection_payload():
-    source = CLEAR_SQL.read_text(encoding="utf-8")
-    column = models.ProductionOrderLineState.__table__.c[
-        "material_coverage_ledger_generation_id"
-    ]
-    foreign_key = next(iter(column.foreign_keys))
-    assert foreign_key.target_fullname == "ledger_generation.id"
-    assert foreign_key.ondelete == "RESTRICT"
-
-    update = re.search(
-        r"UPDATE\s+production_order_line_states\s+SET(.*?)\s+WHERE",
-        source,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    assert update is not None
-    for field in (
-        "material_coverage_ledger_generation_id",
-        "material_coverage_status",
-        "material_coverage_label",
-        "material_coverage_calculated_at",
-        "material_coverage_snapshot",
-    ):
-        assert re.search(rf"\b{field}\s*=\s*NULL\b", update.group(1))
-
-    assert (
-        "'production_order_line_states', "
-        "(SELECT count(*) FROM production_order_line_states)"
-    ) in source
-    assert (
-        "WHEN 'production_order_line_states' "
-        "THEN (SELECT count(*) FROM production_order_line_states)"
-    ) in source
-
-
 def test_verifier_is_read_only_fail_closed_and_covers_publication_invariants():
     source = VERIFY_SQL.read_text(encoding="utf-8")
 

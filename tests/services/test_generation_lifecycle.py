@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 
@@ -13,11 +13,26 @@ from app.services.item_ledger.generation_lifecycle import (
     accept_generation_build,
     OBLIGATION_ALGORITHM_VERSION,
     materialize_generation_stock_bins,
+    RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
     validate_generation_build,
     REPLAY_ALGORITHM_VERSION,
 )
+from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+)
+from app.services.item_ledger.reservation_consumption_persistence import (
+    materialize_reservation_consumption_allocations,
+)
+from app.services.purchase_control_snapshot import (
+    CONSUMER as PURCHASE_JOURNAL_CONSUMER,
+    SNAPSHOT_KEY as PURCHASE_JOURNAL_SNAPSHOT_KEY,
+)
 from app.services.item_ledger.assembly_output_persistence import (
     materialize_assembly_output_allocations,
+)
+from app.services.production_control_journal_snapshot import (
+    CONSUMER as PRODUCTION_JOURNAL_CONSUMER,
+    SNAPSHOT_KEY as PRODUCTION_JOURNAL_SNAPSHOT_KEY,
 )
 from app.services.item_ledger.supplier_receipt_odata import (
     SupplierEvidenceDiagnostic,
@@ -50,6 +65,13 @@ def _generation(
     source_watermarks = dict(source_watermarks or {})
     if empty:
         source_watermarks.setdefault("explicit_empty_prefix", True)
+    if not db.query(models.StockWarehouse).count():
+        db.add(models.StockWarehouse(
+            warehouse_ref1c="WH",
+            warehouse_name="Synthetic planning warehouse",
+            is_selected=True,
+            is_finished_goods=False,
+        ))
     generation = models.LedgerGeneration(
         generation_key=f"generation-{key}",
         status="building",
@@ -62,10 +84,24 @@ def _generation(
     )
     db.add(generation)
     db.flush()
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=generation.id,
+        cutoff=cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=cutoff,
+        built_at=cutoff,
+    ))
     return generation
 
 
-def _add_checkpoint_stages(db_session, generation: models.LedgerGeneration) -> None:
+def _add_checkpoint_stages(
+    db_session,
+    generation: models.LedgerGeneration,
+    *,
+    add_execution_allocation: bool = True,
+) -> None:
     batch_cutoff = datetime(2026, 7, 31, 23, 58)
     for stage, algorithm_version in (
         ("reservation_materialize", OBLIGATION_ALGORITHM_VERSION),
@@ -82,6 +118,74 @@ def _add_checkpoint_stages(db_session, generation: models.LedgerGeneration) -> N
         ))
     db_session.flush()
     materialize_assembly_output_allocations(db_session, int(generation.id))
+    if add_execution_allocation:
+        _add_execution_allocation_batch(db_session, generation)
+
+
+def _add_execution_allocation_batch(
+    db_session,
+    generation: models.LedgerGeneration,
+    *,
+    algorithm_version: str = RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+):
+    if not db_session.query(models.StockWarehouse).filter(
+        models.StockWarehouse.is_selected.is_(True),
+        models.StockWarehouse.is_finished_goods.is_(False),
+    ).count():
+        db_session.add(models.StockWarehouse(
+            warehouse_ref1c="WH-PLAN",
+            warehouse_name="Planning warehouse",
+            is_selected=True,
+            is_finished_goods=False,
+        ))
+        db_session.flush()
+    for reservation in db_session.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == generation.id,
+        models.ReservationEntry.lifecycle_status == "active",
+    ).all():
+        baseline_query = db_session.query(models.MrpFreezeBaseline).filter_by(
+            run_id=int(reservation.run_id),
+            freeze_version=int(reservation.freeze_version),
+            item_id=int(reservation.item_id),
+            characteristic_ref=str(reservation.characteristic_ref or ""),
+            organization_ref=str(reservation.organization_ref or ""),
+            planning_stock_pool=str(reservation.planning_stock_pool or ""),
+        )
+        if baseline_query.count() == 0:
+            db_session.add(models.MrpFreezeBaseline(
+                run_id=int(reservation.run_id),
+                freeze_version=int(reservation.freeze_version),
+                item_id=int(reservation.item_id),
+                characteristic_ref=str(reservation.characteristic_ref or ""),
+                organization_ref=str(reservation.organization_ref or ""),
+                planning_stock_pool=str(reservation.planning_stock_pool or ""),
+                baseline_at=generation.cutoff,
+                physical_import_batch_id=int(generation.physical_import_batch_id),
+                stock_qty=Decimal("0"),
+                produced_total=Decimal("0"),
+                received_total=Decimal("0"),
+            ))
+    db_session.flush()
+    batch = models.LedgerBuildBatch(
+        ledger_generation_id=generation.id,
+        stage="execution_allocation",
+        batch_key=f"execution-allocation-{generation.id}",
+        status="building",
+        algorithm_version=algorithm_version,
+        metrics={},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    metrics = materialize_reservation_consumption_allocations(
+        db_session,
+        int(generation.id),
+        int(batch.id),
+    )
+    batch.status = "completed"
+    batch.metrics = dict(metrics)
+    batch.completed_at = datetime(2026, 7, 31, 23, 58, tzinfo=timezone.utc)
+    db_session.flush()
+    return batch
 
 
 def _bootstrap_gate_watermarks(
@@ -174,12 +278,13 @@ def _physical_refresh_gate_ready(
 
 def _synthetic(db, key: str = "ok", replenishment_method: str = "Производство"):
     generation = _generation(db, key)
-    db.add(models.StockWarehouse(
-        warehouse_ref1c="WH",
-        warehouse_name="Outside planning contour",
-        is_selected=False,
-        is_finished_goods=False,
-    ))
+    if not db.query(models.StockWarehouse).filter_by(warehouse_ref1c="WH").count():
+        db.add(models.StockWarehouse(
+            warehouse_ref1c="WH",
+            warehouse_name="Outside planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ))
     item = models.Item(
         item_code=f"ITEM-{key}",
         item_name=key,
@@ -226,13 +331,26 @@ def _synthetic(db, key: str = "ok", replenishment_method: str = "Произво�
         gross_qty=5,
         net_qty=5,
     ))
+    db.add(models.MrpFreezeBaseline(
+        run_id=run.run_id,
+        freeze_version=1,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        baseline_at=plan.period_from,
+        physical_import_batch_id=generation.physical_import_batch_id,
+        stock_qty=Decimal("0"),
+        produced_total=Decimal("0"),
+        received_total=Decimal("0"),
+    ))
     db.add(models.StockLedgerEntry(
         ingest_batch_id=generation.physical_import_batch_id,
         source_content_hash=sha256(f"hash-{key}".encode()).hexdigest(),
         item_id=item.item_id,
         characteristic_ref="",
         organization_ref=DEFAULT_ORGANIZATION_REF1C,
-        warehouse_ref1c="WH",
+        warehouse_ref1c="WH-OUT",
         qty=Decimal("5"),
         qty_after=Decimal("999999"),
         posting_at=datetime(2026, 7, 20, 10),
@@ -255,8 +373,13 @@ def _configure_obligation_checkpoint(
     *,
     allow_unphased: bool,
     replay_allocated: Decimal | str = "5",
+    add_execution_allocation: bool = True,
 ):
-    _add_checkpoint_stages(db_session, generation)
+    _add_checkpoint_stages(
+        db_session,
+        generation,
+        add_execution_allocation=add_execution_allocation,
+    )
     obligation_batch = (
         db_session.query(models.LedgerBuildBatch)
         .filter(
@@ -367,6 +490,86 @@ def test_successful_synthetic_pipeline_publishes_only_after_validation(db_sessio
         ledger_generation_id=generation.id,
         requirement_id=requirement.id,
     ).count() == 1
+
+
+def test_acceptance_marks_journal_snapshots_as_accepted_truth(db_session):
+    generation, _requirement = _synthetic(db_session, "journal-truth")
+
+    accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+    )
+
+    db_session.refresh(generation)
+    assert generation.status == "accepted"
+    assert generation.accepted_at is not None
+
+    purchase_snapshot = (
+        db_session.query(models.PlanningReadSnapshot)
+        .filter_by(
+            consumer=PURCHASE_JOURNAL_CONSUMER,
+            snapshot_key=PURCHASE_JOURNAL_SNAPSHOT_KEY,
+            ledger_generation_id=generation.id,
+            truth_status="accepted",
+        )
+        .one()
+    )
+    production_snapshot = (
+        db_session.query(models.PlanningReadSnapshot)
+        .filter_by(
+            consumer=PRODUCTION_JOURNAL_CONSUMER,
+            snapshot_key=PRODUCTION_JOURNAL_SNAPSHOT_KEY,
+            ledger_generation_id=generation.id,
+            truth_status="accepted",
+        )
+        .one()
+    )
+    assert purchase_snapshot.published_at == generation.accepted_at
+    assert production_snapshot.published_at == generation.accepted_at
+
+
+def test_acceptance_fails_closed_when_claimed_journal_candidate_is_missing(
+    db_session, monkeypatch
+):
+    generation, _requirement = _synthetic(db_session, "journal-missing")
+
+    def no_purchase_candidate(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle.build_purchase_journal_candidate",
+        no_purchase_candidate,
+    )
+    with pytest.raises(
+        GenerationValidationError,
+        match="no journal candidate to publish",
+    ):
+        accept_generation_build(
+            db_session,
+            generation.id,
+            replay_from=datetime(2026, 7, 1),
+        )
+
+    db_session.expire_all()
+    assert db_session.get(models.LedgerGeneration, generation.id).status == "building"
+    assert (
+        db_session.query(models.PlanningTruthState)
+        .filter_by(id=1)
+        .count()
+        == 0
+    )
+    assert (
+        db_session.query(models.PlanningReadSnapshot)
+        .filter_by(
+            ledger_generation_id=generation.id,
+            consumer=PURCHASE_JOURNAL_CONSUMER,
+            truth_status="accepted",
+            snapshot_key=PURCHASE_JOURNAL_SNAPSHOT_KEY,
+        )
+        .count()
+        == 0
+    )
 
 
 def test_failure_rolls_back_every_build_write_and_pointer(db_session, monkeypatch):
@@ -530,7 +733,106 @@ def test_foreign_generation_rows_are_isolated(db_session):
     result = validate_generation_build(db_session, generation.id)
 
     assert result["allocated_qty"] == "5.000"
-    assert result["execution_allocations"] == 0
+    assert result["execution_allocations"]["allocations"] == 0
+
+
+def test_validation_rejects_generation_without_execution_allocation_batch(db_session):
+    generation, requirement = _synthetic(db_session, "missing-execution-batch")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        add_execution_allocation=False,
+    )
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="execution_allocation",
+    ):
+        validate_generation_build(db_session, generation.id)
+
+
+def test_validation_rejects_wrong_execution_allocation_algorithm_version(db_session):
+    generation, requirement = _synthetic(db_session, "wrong-execution-version")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        add_execution_allocation=False,
+    )
+    _add_execution_allocation_batch(
+        db_session,
+        generation,
+        algorithm_version="wrong/version",
+    )
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="unexpected reservation consumption allocation algorithm",
+    ):
+        validate_generation_build(db_session, generation.id)
+
+
+def test_validation_allows_zero_execution_allocation_rows_with_proven_batch(db_session):
+    generation, requirement = _synthetic(db_session, "zero-execution-rows")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        add_execution_allocation=False,
+    )
+    _add_matching_reservation_event(
+        db_session,
+        generation,
+        requirement,
+    )
+    _add_execution_allocation_batch(
+        db_session,
+        generation,
+    )
+
+    result = validate_generation_build(db_session, generation.id)
+
+    assert result["valid"] is True
+    assert result["execution_allocations"] == {
+        "facts": 0,
+        "allocations": 0,
+        "fact_qty": "0",
+        "allocated_qty": "0",
+        "surplus_qty": "0",
+        "allocation_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    }
+
+
+def test_validation_rejects_execution_metric_row_drift(db_session):
+    generation, requirement = _synthetic(db_session, "execution-metric-drift")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        add_execution_allocation=False,
+    )
+    _add_matching_reservation_event(
+        db_session,
+        generation,
+        requirement,
+    )
+    batch = _add_execution_allocation_batch(
+        db_session,
+        generation,
+    )
+    batch.metrics["allocations"] = "1"
+    db_session.flush()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="execution allocation metric does not match allocation row count",
+    ):
+        validate_generation_build(db_session, generation.id)
 
 
 def test_validation_accepts_current_generation_supplier_reservation_cycle(db_session):
@@ -637,7 +939,7 @@ def test_validation_rejects_unphased_allocation_for_nonlegacy_make_requirement(d
 
     result = validate_generation_build(db_session, generation.id)
     assert result["valid"] is True
-    assert result["execution_allocations"] == 0
+    assert result["execution_allocations"]["allocations"] == 0
 
 
 def test_validation_allows_unphased_allocation_for_legacy_flagged_make_requirement(db_session):
@@ -677,7 +979,7 @@ def test_validation_allows_unphased_allocation_for_legacy_flagged_make_requireme
     result = validate_generation_build(db_session, generation.id)
 
     assert result["valid"] is True
-    assert result["execution_allocations"] == 0
+    assert result["execution_allocations"]["allocations"] == 0
 
 
 def test_validation_allows_bucketless_allocation_without_legacy_flag(
@@ -726,7 +1028,7 @@ def test_validation_allows_bucketless_allocation_without_legacy_flag(
     result = validate_generation_build(db_session, generation.id)
 
     assert result["valid"] is True
-    assert result["execution_allocations"] == 0
+    assert result["execution_allocations"]["allocations"] == 0
 
 
 def test_validation_rejects_non_make_legacy_bucketless_flag(
@@ -771,7 +1073,7 @@ def test_validation_rejects_non_make_legacy_bucketless_flag(
 
     result = validate_generation_build(db_session, generation.id)
     assert result["valid"] is True
-    assert result["execution_allocations"] == 0
+    assert result["execution_allocations"]["allocations"] == 0
 
 
 def test_validation_rejects_malformed_legacy_metric_ids(db_session):
@@ -824,19 +1126,10 @@ def test_validation_rejects_malformed_legacy_metric_ids(db_session):
 
     result = validate_generation_build(db_session, generation.id)
     assert result["valid"] is True
-    assert result["execution_allocations"] == 0
+    assert result["execution_allocations"]["allocations"] == 0
 
 
-@pytest.mark.parametrize(
-    "ambiguous_pool,ambiguous_identity,pattern",
-    [
-        ("1", "0", "unresolved planning-stock pools"),
-        ("0", "1", "unresolved provenance identities"),
-    ],
-)
-def test_validation_rejects_replay_ambiguity_metrics(
-    db_session, ambiguous_pool, ambiguous_identity, pattern
-):
+def test_validation_rejects_replay_ambiguous_pool_metrics(db_session):
     generation, requirement = _synthetic(
         db_session,
         "ambiguous-replay-metrics",
@@ -861,13 +1154,48 @@ def test_validation_rejects_replay_ambiguity_metrics(
         "fact_qty": "0",
         "allocated_qty": "0",
         "unplanned_qty": "0",
-        "ambiguous_pool_facts": ambiguous_pool,
-        "ambiguous_identity_facts": ambiguous_identity,
+        "ambiguous_pool_facts": "1",
+        "ambiguous_identity_facts": "0",
     }
     db_session.flush()
 
-    with pytest.raises(GenerationValidationError, match=pattern):
+    with pytest.raises(GenerationValidationError, match="unresolved planning-stock pools"):
         validate_generation_build(db_session, generation.id)
+
+
+def test_validation_allows_replay_ambiguous_identity_metrics(db_session):
+    generation, _requirement = _synthetic(
+        db_session,
+        "ambiguous-identity-replay-metrics",
+        replenishment_method="Покупка",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        _requirement,
+        allow_unphased=False,
+        replay_allocated="0",
+    )
+    replay_batch = (
+        db_session.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == generation.id,
+            models.LedgerBuildBatch.stage == "reservation_replay",
+        )
+        .one()
+    )
+    replay_batch.metrics = {
+        "fact_qty": "0",
+        "allocated_qty": "0",
+        "unplanned_qty": "0",
+        "ambiguous_pool_facts": "0",
+        "ambiguous_identity_facts": "1",
+    }
+    db_session.flush()
+
+    result = validate_generation_build(db_session, generation.id)
+
+    assert result["valid"] is True
 
 
 def test_empty_prefix_requires_explicit_declaration(db_session):
@@ -890,6 +1218,27 @@ def test_empty_prefix_requires_explicit_declaration(db_session):
 
     assert result["physical_facts"] == 0
     assert result["status"] == "accepted"
+
+
+def test_accept_generation_with_no_future_supply_parent_creates_zero_capture(db_session):
+    generation, _requirement = _synthetic(db_session, "zero-future-supply")
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+    )
+
+    assert result["capabilities"]["future_supply"] is True
+    assert result["future_supply"]["rows"] == 0
+    batch = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=int(generation.id),
+        stage="future_supply_capture",
+    ).one()
+    assert batch.status == "completed"
+    assert batch.algorithm_version == FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION
+    assert batch.metrics["rows"] == 0
+    db_session.refresh(generation)
+    assert generation.capabilities["future_supply"] is True
 
 
 def test_bootstrap_validation_gate_requires_opening_balance_and_convergence_fields(

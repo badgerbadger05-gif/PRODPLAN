@@ -1,4 +1,4 @@
-"""Schema contract for generation-pinned material coverage snapshots."""
+"""Schema contract for canonical material coverage ownership."""
 
 import importlib.util
 from pathlib import Path
@@ -24,56 +24,28 @@ def _load_migration(filename: str, module_name: str):
     return module
 
 
-def test_material_coverage_snapshot_has_nullable_generation_lineage():
-    table = models.ProductionOrderLineState.__table__
-    column = table.c.material_coverage_ledger_generation_id
-    assert column.nullable
-    assert {
-        (foreign_key.target_fullname, foreign_key.ondelete)
-        for foreign_key in column.foreign_keys
-    } == {("ledger_generation.id", "RESTRICT")}
-    assert (
-        "ix_prod_line_state_coverage_generation"
-        in {index.name for index in table.indexes}
-    )
+def test_line_state_no_longer_owns_material_coverage():
+    columns = set(models.ProductionOrderLineState.__table__.c.keys())
+    assert not {
+        "material_coverage_status",
+        "material_coverage_label",
+        "material_coverage_calculated_at",
+        "material_coverage_ledger_generation_id",
+        "material_coverage_snapshot",
+    } & columns
 
 
-def test_material_coverage_generation_migration_follows_head():
+def test_material_cache_drop_migration_is_linear_head():
     module = _load_migration(
-        "20260730_01_material_coverage_generation.py",
-        "material_coverage_generation_migration",
+        "20260731_03_drop_material_coverage_cache.py",
+        "drop_material_coverage_cache",
     )
-    assert module.revision == "20260730_01"
-    assert module.down_revision == "20260726_14"
+    assert module.revision == "20260731_03"
+    assert module.down_revision == "20260731_02"
 
-
-def test_ownership_migration_names_fit_postgresql_limit():
-    material = _load_migration(
-        "20260730_01_material_coverage_generation.py",
-        "material_coverage_generation_names",
-    )
-    spec_index = _load_migration(
-        "20260730_02_spec_components_spec_index.py",
-        "spec_components_index_names",
-    )
-
-    names = [
-        material.INDEX_NAME,
-        material.FK_NAME,
-        material.LEGACY_INDEX_NAME,
-        material.LEGACY_FK_NAME,
-        spec_index.INDEX_NAME,
-    ]
-    assert all(len(name.encode("utf-8")) <= 63 for name in names)
-
-
-def test_alembic_has_one_head():
     config = Config(str(REPO_ROOT / "backend" / "alembic.ini"))
-    config.set_main_option(
-        "script_location",
-        str(REPO_ROOT / "backend" / "alembic"),
-    )
-    assert ScriptDirectory.from_config(config).get_heads() == ["20260730_02"]
+    config.set_main_option("script_location", str(REPO_ROOT / "backend" / "alembic"))
+    assert ScriptDirectory.from_config(config).get_heads() == ["20260802_01"]
 
 
 def test_ownership_migrations_round_trip_on_disposable_sqlite(tmp_path):
@@ -93,79 +65,3 @@ def test_ownership_migrations_round_trip_on_disposable_sqlite(tmp_path):
     )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
     assert "---JSON---" in result.stdout
-
-
-class _Inspector:
-    def __init__(self, *, legacy: bool):
-        self.legacy = legacy
-
-    def get_table_names(self):
-        return ["production_order_line_states"]
-
-    def get_columns(self, _table):
-        return [{"name": "material_coverage_ledger_generation_id"}]
-
-    def get_indexes(self, _table):
-        if not self.legacy:
-            return []
-        return [{
-            "name": "ix_production_order_line_states_material_coverage_ledger_genera",
-            "column_names": ["material_coverage_ledger_generation_id"],
-        }]
-
-    def get_foreign_keys(self, _table):
-        if not self.legacy:
-            return []
-        return [{
-            "name": "fk_production_order_line_states_material_coverage_ledger_genera",
-            "constrained_columns": ["material_coverage_ledger_generation_id"],
-            "referred_table": "ledger_generation",
-            "referred_columns": ["id"],
-        }]
-
-
-class _Operations:
-    def __init__(self):
-        self.calls = []
-
-    def get_bind(self):
-        return object()
-
-    def __getattr__(self, name):
-        def record(*args, **kwargs):
-            self.calls.append((name, args, kwargs))
-        return record
-
-
-def test_upgrade_accepts_postgresql_truncated_legacy_objects(monkeypatch):
-    module = _load_migration(
-        "20260730_01_material_coverage_generation.py",
-        "material_coverage_generation_legacy_upgrade",
-    )
-    operations = _Operations()
-    monkeypatch.setattr(module, "op", operations)
-    monkeypatch.setattr(module.sa, "inspect", lambda _bind: _Inspector(legacy=True))
-
-    module.upgrade()
-
-    assert operations.calls == []
-
-
-def test_downgrade_drops_postgresql_truncated_legacy_objects(monkeypatch):
-    module = _load_migration(
-        "20260730_01_material_coverage_generation.py",
-        "material_coverage_generation_legacy_downgrade",
-    )
-    operations = _Operations()
-    monkeypatch.setattr(module, "op", operations)
-    monkeypatch.setattr(module.sa, "inspect", lambda _bind: _Inspector(legacy=True))
-
-    module.downgrade()
-
-    assert [call[0] for call in operations.calls] == [
-        "drop_constraint",
-        "drop_index",
-        "drop_column",
-    ]
-    assert operations.calls[0][1][0] == module.LEGACY_FK_NAME
-    assert operations.calls[1][1][0] == module.LEGACY_INDEX_NAME

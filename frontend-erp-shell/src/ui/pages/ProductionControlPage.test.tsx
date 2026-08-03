@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { act, fireEvent, render, screen, within, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 
 import { ProductionControlPage } from './ProductionControlPage'
+import { ApiError } from '../../lib/api'
 import type { MaterialsResponse, OrderRow } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
 
@@ -16,30 +17,20 @@ vi.mock('../../services/productionControl', () => ({
   listProductionEmployees: vi.fn(),
   listProductionOperations: vi.fn(),
   getProductionControlSettings: vi.fn(),
+  listRootProductOptions: vi.fn(),
   saveProductionControlSettings: vi.fn(),
   getOrderMaterials: vi.fn(),
-  refreshOrderMaterials: vi.fn(),
   updateOrderStatus: vi.fn(),
   postMaterialIssues: vi.fn(),
   fetchRouteSheetsPrintHtml: vi.fn(),
+  closeProductionOrder: vi.fn(),
   exportMaterialIssuesTo1C: vi.fn(),
   markMaterialIssueAssembled: vi.fn(),
   syncPostedTransfers: vi.fn(),
-  closePaintWeldChain: vi.fn(),
-  updateOrderQuantity: vi.fn(),
   produceOrderLine: vi.fn(),
-  exportManufacturesTo1C: vi.fn(),
-  exportManufacturesPieceworkTo1C: vi.fn(),
-  rollbackManufactureLocal: vi.fn(),
-  createOrdersFromMrpRequirements: vi.fn(),
   getItem: vi.fn(),
   updateItem: vi.fn(),
   deleteProductionOrder: vi.fn(),
-}))
-
-vi.mock('../../services/periodPlan', () => ({
-  listPeriodPlans: vi.fn(),
-  getPeriodPlanMatrix: vi.fn(),
 }))
 
 vi.mock('../../services/resources', () => ({
@@ -51,7 +42,6 @@ import {
   listProductionEmployees,
   listProductionOperations,
   getOrderMaterials,
-  refreshOrderMaterials,
   updateOrderStatus,
   postMaterialIssues,
   exportMaterialIssuesTo1C,
@@ -59,8 +49,9 @@ import {
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
   produceOrderLine,
+  closeProductionOrder,
+  listRootProductOptions,
 } from '../../services/productionControl'
-import { listPeriodPlans, getPeriodPlanMatrix } from '../../services/periodPlan'
 import { listResources } from '../../services/resources'
 
 // --- Fake data shaped to the domain types ---------------------------------
@@ -71,14 +62,16 @@ function fakeRows(): OrderRow[] {
   return [
     {
       product_id: 101,
+      order_id: 101,
       item_id: 201,
+      item_code: 'ART-1',
+      item_article: 'ART-1',
       order_number: 'ORD-1',
       order_prodplan_number: 'PP-1',
       order_source: 'mrp',
       source: 'mrp',
       order_ref1c: null,
       item_name: 'Кронштейн',
-      item_article: 'ART-1',
       unit: 'шт',
       quantity: 10,
       produced_qty: 0,
@@ -87,24 +80,37 @@ function fakeRows(): OrderRow[] {
       coverage_status: 'assembled',
       coverage_label: 'Собрано',
       issue_status: 'posted',
+      issue_count: 0,
       workshop_name: 'Цех 1',
+      launch_source: 'mrp_remaining',
+      available_actions: ['close_1c'],
+      comment: '',
     },
     {
       product_id: 102,
+      order_id: 102,
       item_id: 202,
+      item_code: 'ART-2',
+      item_article: 'ART-2',
       order_number: 'ORD-2',
       order_source: '1c',
+      source: '1c',
       order_ref1c: 'REF-2',
       order_one_c_number: '1C-2',
       item_name: 'Вал',
-      item_article: 'ART-2',
       unit: 'шт',
       quantity: 5,
       produced_qty: 0,
       remaining_qty: 5,
       status: 'shortage',
       coverage_status: 'shortage',
+      coverage_label: 'Дефицит',
       workshop_name: 'Цех 2',
+      issue_status: 'missing',
+      issue_count: 0,
+      launch_source: 'mrp_remaining',
+      available_actions: [],
+      comment: '',
     },
   ]
 }
@@ -112,8 +118,15 @@ function fakeRows(): OrderRow[] {
 function fakeMaterials(): MaterialsResponse {
   return {
     ledger_generation_id: 77,
+    truth_status: 'accepted',
+    cutoff: '2026-07-31T12:00:00+00:00',
+    product_id: 1,
     order_number: 'ORD-1',
     item_name: 'Кронштейн',
+    item_article: 'BRACKET-1',
+    qty: 10,
+    spec_id: null,
+    coverage: 'assembled',
     coverage_status: 'assembled',
     coverage_label: 'Собрано',
     components: [
@@ -126,6 +139,8 @@ function fakeMaterials(): MaterialsResponse {
         required_qty: 40,
         missing_qty: 0,
         unit: 'шт',
+        coverage_status: 'assembled',
+        coverage_label: 'Собрано',
       },
     ],
   }
@@ -136,12 +151,30 @@ const fakeResources: ProductionResource[] = [
   { resource_id: 2, resource_name: 'Цех 2' },
 ]
 
+const fakeRootOptions = [
+  { item_id: 301, item_name: 'Корень 1', item_article: 'R-001', item_code: 'R1' },
+  { item_id: 302, item_name: 'Корень 2', item_article: 'R-002', item_code: 'R2' },
+]
+
+const fakeTruthMeta = {
+  ledger_generation: 77,
+  cutoff: '2026-07-31T00:00:00Z',
+  truth_status: 'finalized',
+  truth_reason: null,
+}
+
 function renderPage(initialEntries: string[] = ['/production-control']) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
       <ProductionControlPage />
+      <LocationProbe />
     </MemoryRouter>,
   )
+}
+
+function LocationProbe() {
+  const location = useLocation()
+  return <span hidden data-testid="location-search">{location.search}</span>
 }
 
 // Grab the orders table (not the column-filter table, which shares a class).
@@ -184,14 +217,16 @@ beforeEach(() => {
     limit: 100,
     offset: 0,
     latest_run_id: 77,
+    truth_meta: fakeTruthMeta,
   })
   vi.mocked(getOrderMaterials).mockResolvedValue(fakeMaterials())
-  vi.mocked(refreshOrderMaterials).mockResolvedValue(fakeMaterials())
   vi.mocked(listResources).mockResolvedValue(fakeResources)
-  vi.mocked(listPeriodPlans).mockResolvedValue({ rows: [] } as never)
-  vi.mocked(getPeriodPlanMatrix).mockResolvedValue({ rows: [] } as never)
+  vi.mocked(listRootProductOptions).mockResolvedValue({
+    rows: fakeRootOptions,
+    total: fakeRootOptions.length,
+  })
   vi.mocked(listProductionEmployees).mockResolvedValue({
-    rows: [{ employee_id: 1, employee_ref1c: 'E1', employee_name: 'Иванов' }],
+    rows: [{ employee_id: 1, employee_ref1c: 'E1', employee_type: 'employee', employee_name: 'Иванов' }],
     total: 1,
   })
   vi.mocked(listProductionOperations).mockResolvedValue({ rows: [], total: 0 })
@@ -216,6 +251,10 @@ beforeEach(() => {
     entries: [],
     skipped_rows: [],
   })
+  vi.mocked(closeProductionOrder).mockResolvedValue({
+    status: 'ok', dry_run: false, orders_requested: 1, orders_eligible: 1,
+    orders_closed: 1, orders_error: 0,
+  })
   vi.mocked(syncPostedTransfers).mockResolvedValue({ candidates: 2, advanced: 0, errors: [] } as never)
 })
 
@@ -227,11 +266,13 @@ describe('ProductionControlPage — characterization', () => {
     // Breadcrumb + document heading
     expect(screen.getByRole('heading', { name: 'Журнал заказов на производство' })).toBeInTheDocument()
     expect(screen.getByText('Производство / Журнал заказов на производство')).toBeInTheDocument()
+    expect(screen.getByText(/Истина недоступна: finalized · Ledger 77/)).toBeVisible()
 
     // Command bar buttons
     for (const label of [
       'Запустить в 1С',
       'Произвести',
+      'Закрыть в 1С',
       'Синхронизировать',
       'Печать маршрутных',
       'Удалить',
@@ -277,7 +318,53 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.getByText('MRP run: 77')).toBeInTheDocument()
   })
 
-  it('uses the existing journal endpoint for the mechshop DBR view', async () => {
+  it('hydrates filters, paging, sort, and active detail from the URL', async () => {
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: fakeRows(),
+      total: 202,
+      limit: 100,
+      offset: 100,
+      latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    renderPage([
+      '/production-control?search=%D0%B2%D0%B0%D0%BB&status=ready&sort_dir=desc&offset=100&active_product_id=102',
+    ])
+    await screen.findByText('MRP run: 77')
+
+    const params = vi.mocked(listProductionOrders).mock.calls[0][0]
+    expect(params.get('search')).toBe('вал')
+    expect(params.get('status')).toBe('ready')
+    expect(params.get('sort_dir')).toBe('desc')
+    expect(params.get('offset')).toBe('100')
+    expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('writes active detail to the URL without removing external focus params', async () => {
+    const user = userEvent.setup()
+    renderPage(['/production-control?product_id=101&order_id=5'])
+    await screen.findByText('MRP run: 77')
+
+    await user.click(rowFor('Вал'))
+    await waitFor(() => {
+      const params = new URLSearchParams(
+        screen.getByTestId('location-search').textContent ?? '',
+      )
+      expect(params.get('product_id')).toBe('101')
+      expect(params.get('order_id')).toBe('5')
+      expect(params.get('active_product_id')).toBe('102')
+    })
+  })
+
+  it('loads production root products from a single snapshot-driven endpoint', async () => {
+    renderPage()
+    await screen.findByText('Вал')
+
+    expect(listRootProductOptions).toHaveBeenCalledWith()
+    expect(listRootProductOptions).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses the backend-supported journal endpoint for the mechshop view', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
@@ -287,41 +374,36 @@ describe('ProductionControlPage — characterization', () => {
 
     await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(2))
     const params = vi.mocked(listProductionOrders).mock.calls[1][0]
-    expect(params.get('planning_contour')).toBe('dbr_feeder')
-    expect(params.get('sort_by')).toBe('dbr_priority')
-    expect(params.get('sort_dir')).toBe('desc')
+    expect(params.get('planning_contour')).toBe('mrp')
+    expect(params.get('sort_by')).toBe('planned_start_date')
+    expect(params.get('sort_dir')).toBe('asc')
     expect(screen.getByRole('button', { name: 'Очередь мехцеха' })).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByText('Приоритет DBR · единый журнал запуска')).toBeInTheDocument()
+    expect(screen.getByText('Очередь мехцеха · единый журнал запуска')).toBeInTheDocument()
   })
 
-  it('shows DBR priority in a journal row and planning provenance in its card', async () => {
+  it('shows shelf launch metadata in a journal row and its card', async () => {
     vi.mocked(listProductionOrders).mockResolvedValue({
       rows: [{
         ...fakeRows()[0],
-        source: 'dbr',
-        source_dbr_signal_id: 431,
-        planning: {
-          contour: 'dbr_feeder',
-          slot_id: 912,
-          signal_type: 'Цепочка',
-          priority: 1.42,
-          zone: 'red',
-          required_date: '2026-07-24',
-          queue_state: 'ready',
-          reason: 'Запуск по слоту барабана',
-        },
+        source: 'mrp',
+        launch_source: 'shelf_pull',
+        shelf_warehouse_ref1c: 'WH-SHELF-1',
+        shelf_pull_qty: 18,
+        shelf_materialized_qty: 11,
+        shelf_latest_start_date: '2026-07-24T07:00:00',
       }],
       total: 1,
       limit: 100,
       offset: 0,
+      latest_run_id: null,
+      truth_meta: fakeTruthMeta,
     })
     renderPage()
 
-    expect(await screen.findByText('DBR 1.42')).toBeInTheDocument()
-    expect(screen.getByText('Планирование DBR')).toBeInTheDocument()
-    expect(screen.getByText('#431')).toBeInTheDocument()
-    expect(screen.getByText('#912')).toBeInTheDocument()
-    expect(screen.getByText('Запуск по слоту барабана')).toBeInTheDocument()
+    expect(await screen.findByText('Запуск с полки')).toBeInTheDocument()
+    expect(screen.getByText('WH-SHELF-1')).toBeInTheDocument()
+    expect(screen.getByText('18 шт')).toBeInTheDocument()
+    expect(screen.getByText('11 шт')).toBeInTheDocument()
   })
 
   it('auto-loads materials for the first (active) row into the detail pane', async () => {
@@ -333,6 +415,22 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByText('Болт М8')).toBeInTheDocument()
   })
 
+  it('does not invent warehouse coverage when material truth is unavailable', async () => {
+    vi.mocked(getOrderMaterials).mockResolvedValue({
+      ...fakeMaterials(),
+      components: [{
+        ...fakeMaterials().components[0],
+        missing_qty: 0,
+        coverage_status: null,
+        coverage_label: null,
+      }],
+    })
+    renderPage()
+
+    expect(await screen.findByText('Недоступно')).toBeInTheDocument()
+    expect(screen.queryByText('На складе')).not.toBeInTheDocument()
+  })
+
   it('double-clicking a row opens saved materials without requesting a refresh', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -340,21 +438,19 @@ describe('ProductionControlPage — characterization', () => {
 
     await user.dblClick(rowFor('Кронштейн'))
     await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
-    expect(refreshOrderMaterials).not.toHaveBeenCalled()
   })
 
-  it('refreshes material coverage only from the explicit action', async () => {
+  it('retries the immutable material snapshot with GET', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
     await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
 
     vi.mocked(getOrderMaterials).mockClear()
-    await user.click(screen.getByRole('button', { name: 'Обновить материалы' }))
+    await user.click(screen.getByRole('button', { name: 'Повторить загрузку' }))
 
-    await waitFor(() => expect(refreshOrderMaterials).toHaveBeenCalledTimes(1))
-    expect(refreshOrderMaterials).toHaveBeenCalledWith(101)
-    expect(getOrderMaterials).not.toHaveBeenCalled()
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledTimes(1))
+    expect(getOrderMaterials).toHaveBeenCalledWith(101)
   })
 
   it('keeps the newest list response when an older refresh resolves last', async () => {
@@ -364,10 +460,10 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
     fireEvent.click(screen.getByRole('button', { name: 'Сформировать' }))
 
-    await act(async () => { newList.resolve({ rows: [fakeRows()[1]], total: 1, limit: 100, offset: 0, latest_run_id: 88 }) })
+    await act(async () => { newList.resolve({ rows: [fakeRows()[1]], total: 1, limit: 100, offset: 0, latest_run_id: 88, truth_meta: fakeTruthMeta }) })
     expect(await within(ordersTable(document.body)).findByText('Вал')).toBeInTheDocument()
     expect(screen.getByText('MRP run: 88')).toBeInTheDocument()
-    await act(async () => { oldList.resolve({ rows: [fakeRows()[0]], total: 1, limit: 100, offset: 0, latest_run_id: 77 }) })
+    await act(async () => { oldList.resolve({ rows: [fakeRows()[0]], total: 1, limit: 100, offset: 0, latest_run_id: 77, truth_meta: fakeTruthMeta }) })
     expect(screen.queryByText('Кронштейн')).not.toBeInTheDocument()
     expect(screen.getByText('MRP run: 88')).toBeInTheDocument()
   })
@@ -431,8 +527,43 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(produceBtn)
     await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(
       101,
-      { qty: 10, executor: 'erp-shell' },
+      { executor: 'erp-shell' },
     ))
+  })
+
+  it('runs sanctioned close-to-1C action for selected row', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+
+    const closeBtn = screen.getByRole('button', { name: 'Закрыть в 1С' })
+    expect(closeBtn).toBeDisabled()
+
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    expect(closeBtn).toBeEnabled()
+
+    await user.click(closeBtn)
+    await waitFor(() => expect(closeProductionOrder).toHaveBeenCalledWith(
+      101,
+      { dry_run: false },
+    ))
+    expect(screen.getByText(/Заказ закрыт в 1С по кнопке/)).toBeInTheDocument()
+  })
+
+  it('does not confirm close when 1C export reports a partial error', async () => {
+    vi.mocked(closeProductionOrder).mockResolvedValueOnce({
+      status: 'partial_error', dry_run: false, orders_requested: 1, orders_eligible: 1,
+      orders_closed: 0, orders_error: 1,
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Закрыть в 1С' }))
+
+    expect(await screen.findByText(/Закрытие заказа в 1С не подтверждено/)).toBeInTheDocument()
+    expect(screen.queryByText(/Заказ закрыт в 1С по кнопке/)).not.toBeInTheDocument()
   })
 
   it('"Синхронизировать" calls syncPostedTransfers and shows a summary message', async () => {
@@ -460,7 +591,6 @@ describe('ProductionControlPage — characterization', () => {
 
     fireEvent.keyDown(shaftRow, { key: 'Enter' })
     await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(102))
-    expect(refreshOrderMaterials).not.toHaveBeenCalled()
     expect(shaftRow).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('combobox', { name: 'Статус заказа ORD-2' })).toBeInTheDocument()
   })
@@ -511,10 +641,17 @@ describe('ProductionControlPage — characterization', () => {
     const params = vi.mocked(listProductionOrders).mock.calls.at(-1)![0]
     expect(params.get('status')).toBe('done')
     expect(params.get('offset')).toBe('0')
+    await waitFor(() => {
+      const locationParams = new URLSearchParams(
+        screen.getByTestId('location-search').textContent ?? '',
+      )
+      expect(locationParams.get('status')).toBe('done')
+      expect(locationParams.get('active_product_id')).toBe('101')
+    })
   })
 
   it('renders an empty state when no orders are returned', async () => {
-    vi.mocked(listProductionOrders).mockResolvedValue({ rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null })
+    vi.mocked(listProductionOrders).mockResolvedValue({ rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null, truth_meta: fakeTruthMeta })
     renderPage()
 
     expect(await screen.findByText('В журнале производства нет заказов')).toBeVisible()
@@ -533,6 +670,26 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('boom-load-failed')
     expect(screen.getByText('Не удалось загрузить данные')).toBeVisible()
     expect(screen.getByText('MRP run: недоступен')).toBeVisible()
+    expect(screen.getByText(/Статус истины не получен/)).toBeVisible()
+    expect(screen.queryByText(/Истина недоступна/)).not.toBeInTheDocument()
+  })
+
+  it('shows stale truth only for a structured planning-truth failure', async () => {
+    vi.mocked(listProductionOrders).mockRejectedValue(new ApiError(
+      'accepted truth is stale',
+      503,
+      {
+        code: 'planning_truth_unavailable',
+        truth_status: 'stale',
+        ledger_generation: 7,
+        cutoff: '2026-08-02T08:00:00Z',
+        reason: 'refresh required',
+      },
+    ))
+    renderPage()
+
+    expect(await screen.findByText(/Истина устарела · Ledger 7/)).toBeVisible()
+    expect(screen.getByRole('alert')).toHaveTextContent('accepted truth is stale')
   })
 
   it('shows an explicit initial loading state before the production response arrives', async () => {
@@ -546,7 +703,7 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByRole('table', { name: 'Заказы на производство' })).not.toBeInTheDocument()
 
     await act(async () => {
-      request.resolve({ rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null })
+      request.resolve({ rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null, truth_meta: fakeTruthMeta })
     })
     expect(await screen.findByText('В журнале производства нет заказов')).toBeVisible()
   })

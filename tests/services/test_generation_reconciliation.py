@@ -125,6 +125,18 @@ def test_buy_target_ignores_legacy_uncovered_cache(db_session):
     assert targets[(requirement.id, "buy")].target_qty == Decimal("10")
 
 
+def test_known_rework_is_reconciled_but_remains_its_own_mode(db_session):
+    generation, run, requirement, _reservation = _scope(
+        db_session, "rework", mode="rework", reserved="10", realized="4", uncovered="0"
+    )
+
+    targets = build_generation_targets(
+        db_session, ledger_generation_id=generation.id, run_id=run.run_id
+    )
+
+    assert targets[(requirement.id, "rework")].target_qty == Decimal("6")
+
+
 def test_two_generations_are_isolated_and_accepted_rows_remain_unchanged(db_session):
     first = _scope(
         db_session, "g1", mode="make", reserved="10", realized="4", uncovered="0"

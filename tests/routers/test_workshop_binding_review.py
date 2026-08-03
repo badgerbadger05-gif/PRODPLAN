@@ -64,8 +64,7 @@ def _mk_item(db, code: str, *, name: str | None = None) -> Item:
         item_name=name or f"Item {code}",
         item_article=f"ART-{code}",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()
@@ -182,6 +181,38 @@ def test_active_scope_lists_problem_items_with_counts(client, db_session):
     row_b = by_id[item_b.item_id]
     assert row_b["production_kind_name"] == "Сварка WBR"
     assert "Ресурсы" in row_b["recommendation"]
+
+
+def test_openapi_exposes_strict_review_contract(client):
+    schema = client.app.openapi()
+    items_response = schema["paths"]["/api/v1/workshop-binding-review/items"][
+        "get"
+    ]["responses"]["200"]["content"]["application/json"]["schema"]
+    lines_response = schema["paths"][
+        "/api/v1/workshop-binding-review/items/{item_id}/lines"
+    ]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert items_response == {"$ref": "#/components/schemas/BindingReviewItemsResponse"}
+    assert lines_response == {"$ref": "#/components/schemas/BindingReviewLinesResponse"}
+
+    schemas = schema["components"]["schemas"]
+    for name in (
+        "BindingReviewItemResponse",
+        "BindingReviewItemsResponse",
+        "BindingReviewLineResponse",
+        "BindingReviewLinesResponse",
+    ):
+        assert schemas[name]["additionalProperties"] is False
+    assert schemas["BindingReviewItemResponse"]["properties"]["reason_code"][
+        "enum"
+    ] == [
+        "NO_SPEC",
+        "NO_PRODUCTION_KIND",
+        "KIND_NOT_BOUND",
+        "NO_WAREHOUSE_BINDING",
+    ]
+    assert schemas["BindingReviewItemsResponse"]["properties"]["scope"][
+        "enum"
+    ] == ["active", "catalog"]
 
 
 def test_catalog_scope_skips_items_without_spec(client, db_session):

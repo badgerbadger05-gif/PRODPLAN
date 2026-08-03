@@ -53,7 +53,7 @@ def client(db_session):
 def _item(db, code, name, method="Производство"):
     item = Item(
         item_code=code, item_name=name, item_article=code, unit="шт",
-        stock_qty=0, replenishment_method=method, replenishment_time=0, status="active",
+replenishment_method=method, replenishment_time=0, status="active",
     )
     db.add(item)
     db.flush()
@@ -153,7 +153,6 @@ def test_delete_unknown_pair_returns_404(client):
 
 def test_guard_endpoint_fails_closed_without_accepted_ledger(client, db_session):
     painted, welded = _seed_pair(db_session)
-    welded.stock_qty = 20
     db_session.commit()
     client.post("/api/v1/paint-weld/pairs/rebuild")
 

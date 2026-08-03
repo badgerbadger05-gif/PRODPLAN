@@ -14,11 +14,13 @@ from app.models import (
     ProductionProduct,
     StockWarehouse,
 )
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.planning_truth import PlanningTruthUnavailable
 from app.services.mrp_stock_helpers import (
     active_wip_eta_by_item,
     consume_wip_at_or_before,
     effective_stock_by_item_all,
+    planning_stock_by_item,
 )
 
 
@@ -28,8 +30,7 @@ def _mk_item(db, *, code: str, stock: float = 0.0) -> Item:
         item_name=f"Item {code}",
         item_article=code,
         unit="шт",
-        stock_qty=stock,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()
@@ -85,12 +86,14 @@ def test_effective_stock_reads_only_accepted_generation_and_contour(
         models.StockBin(
             ledger_generation_id=building_ledger_generation.id,
             item_id=item.item_id,
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c="wh-normal",
             on_hand=30,
         ),
         models.StockBin(
             ledger_generation_id=building_ledger_generation.id,
             item_id=item.item_id,
+            organization_ref="7f9a3a7a-c7f1-11ed-a8cd-0242ac100014",
             warehouse_ref1c="wh-isolator",
             on_hand=70,
         ),
@@ -104,6 +107,66 @@ def test_effective_stock_reads_only_accepted_generation_and_contour(
 
     result = effective_stock_by_item_all(db)
     assert result[item.item_id] == 30.0
+
+
+def test_effective_stock_excludes_foreign_organization_stock(db_session, building_ledger_generation):
+    db = db_session
+    item = _mk_item(db, code="STK-FORG", stock=0.0)
+    db.add(StockWarehouse(warehouse_ref1c="wh-normal", warehouse_name="Normal", is_selected=True))
+    db.add_all([
+        models.StockBin(
+            ledger_generation_id=building_ledger_generation.id,
+            item_id=item.item_id,
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="wh-normal",
+            on_hand=12,
+        ),
+        models.StockBin(
+            ledger_generation_id=building_ledger_generation.id,
+            item_id=item.item_id,
+            organization_ref="7f9a3a7a-c7f1-11ed-a8cd-0242ac100015",
+            warehouse_ref1c="wh-normal",
+            on_hand=99,
+        ),
+    ])
+    building_ledger_generation.status = "accepted"
+    building_ledger_generation.accepted_at = datetime(2026, 7, 26)
+    building_ledger_generation.cutoff = datetime(2026, 7, 26)
+    pointer = db.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = building_ledger_generation.id
+    db.flush()
+
+    result = effective_stock_by_item_all(db)
+    assert result[item.item_id] == 12.0
+
+
+def test_planning_stock_is_empty_when_warehouse_policy_selects_nothing(
+    db_session,
+    building_ledger_generation,
+):
+    item = _mk_item(db_session, code="STK-NONE", stock=0.0)
+    db_session.add(
+        StockWarehouse(
+            warehouse_ref1c="wh-unselected",
+            warehouse_name="Not in contour",
+            is_selected=False,
+        )
+    )
+    db_session.add(
+        models.StockBin(
+            ledger_generation_id=building_ledger_generation.id,
+            item_id=item.item_id,
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="wh-unselected",
+            on_hand=25,
+        )
+    )
+    db_session.flush()
+
+    assert planning_stock_by_item(
+        db_session,
+        int(building_ledger_generation.id),
+    ) == {}
 
 
 def test_effective_stock_fails_closed_without_published_ledger(db_session):

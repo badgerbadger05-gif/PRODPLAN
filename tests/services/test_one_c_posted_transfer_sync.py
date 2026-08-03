@@ -8,15 +8,21 @@ import pytest
 
 from app.models import (
     Item,
+    PhysicalImportBatch,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionMaterialCustodyEvent,
+    StockLedgerEntry,
     SyncLink,
 )
 from app.services import one_c_posted_transfer_sync as posted_sync
 from app.services.one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
+from app.services.production_material_custody_events import (
+    project_transfer_custody_events_for_recorder,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +37,9 @@ def _mk_issue_with_link(
     issue_status: str = "exported",
     target_ref_key: str = "transfer-ref-key",
     link_status: str = "success",
+    direction: str = "issue",
+    source_warehouse_ref1c: str | None = None,
+    warehouse_ref1c: str | None = None,
 ) -> tuple[ProductionMaterialIssue, SyncLink]:
     """Build an item + order + product + state + material_issue + sync_link
     chain matching what a successful export leaves behind."""
@@ -40,8 +49,7 @@ def _mk_issue_with_link(
         item_article=f"ART-{target_ref_key}",
         item_ref1c=f"item-ref-{target_ref_key}",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()
@@ -76,9 +84,13 @@ def _mk_issue_with_link(
         product_id=product.product_id,
         order_id=order.order_id,
         status=issue_status,
-        direction="issue",
+        direction=direction,
         exported_ref1c=target_ref_key,
     )
+    if source_warehouse_ref1c is not None:
+        issue.source_warehouse_ref1c = source_warehouse_ref1c
+    if warehouse_ref1c is not None:
+        issue.warehouse_ref1c = warehouse_ref1c
     db.add(issue)
     db.flush()
     db.add(
@@ -104,6 +116,47 @@ def _mk_issue_with_link(
     db.add(link)
     db.commit()
     return issue, link
+
+
+def _mk_transfer_batch(db, *, batch_key: str) -> PhysicalImportBatch:
+    batch = PhysicalImportBatch(
+        batch_key=batch_key,
+        status="completed",
+        source_watermarks={},
+        completed_at=datetime(2026, 5, 20),
+    )
+    db.add(batch)
+    db.flush()
+    return batch
+
+
+def _add_transfer_sle(
+    db,
+    *,
+    batch: PhysicalImportBatch,
+    transfer_ref: str,
+    item_id: int,
+    movement_kind: str,
+    warehouse_ref1c: str,
+    qty: float,
+    posting_at: datetime,
+    line_no: int,
+) -> StockLedgerEntry:
+    row = StockLedgerEntry(
+        ingest_batch_id=int(batch.id),
+        source_content_hash="a" * 64,
+        item_id=int(item_id),
+        warehouse_ref1c=warehouse_ref1c,
+        qty=float(qty),
+        posting_at=posting_at,
+        movement_kind=movement_kind,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref=transfer_ref,
+        line_no=str(line_no),
+    )
+    db.add(row)
+    db.flush()
+    return row
 
 
 class _FakeOData:
@@ -197,6 +250,222 @@ def test_advances_to_assembled_when_1c_says_posted(db_session, monkeypatch):
     assert state.issue_status == "posted"
 
 
+def test_ledger_projector_posts_transfer_custody_events(db_session, monkeypatch):
+    db = db_session
+    issue, link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-ledger",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    batch = _mk_transfer_batch(db, batch_key="batch-ledger-ref-ledger")
+    posting_at = datetime(2026, 7, 30, 12, 0, 0)
+    _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="ref-ledger",
+        item_id=int(issue.lines[0].component_item_id),
+        movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC",
+        qty=-1.0,
+        posting_at=posting_at,
+        line_no=1,
+    )
+    _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="ref-ledger",
+        item_id=int(issue.lines[0].component_item_id),
+        movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST",
+        qty=1.0,
+        posting_at=posting_at,
+        line_no=2,
+    )
+    assert (
+        db.query(StockLedgerEntry)
+        .filter(StockLedgerEntry.recorder_ref == "ref-ledger")
+        .count()
+        == 2
+    )
+    db.flush()
+    db.commit()
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _FakeOData({"ref-ledger"})
+    )
+
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-ledger").all()
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-ledger",
+        stock_ledger_entries=rows,
+    ) == 3
+    first = posted_sync.sync_posted_transfers(db)
+    assert first["advanced"] == 1
+    assert first["posted_found"] == 1
+    db.refresh(issue)
+    assert issue.status == "posted"
+
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id))
+        .order_by(ProductionMaterialCustodyEvent.location_kind.asc())
+        .all()
+    )
+    assert len(events) == 3
+    opening = next(
+        e
+        for e in events
+        if e.source_kind == "issue_created" and e.location_kind == "transit"
+    )
+    outbound = next(e for e in events if e.source_kind == "transfer_posted" and e.location_kind == "transit")
+    inbound = next(e for e in events if e.location_kind == "workshop")
+    assert opening.source_sle_id is None
+    assert opening.delta_qty == pytest.approx(1.0)
+    assert opening.effective_at == posting_at
+    assert opening.warehouse_ref1c == "WH-SRC"
+    assert outbound.source_kind == "transfer_posted"
+    assert inbound.source_kind == "transfer_posted"
+    assert outbound.source_sle_id is not None
+    assert inbound.source_sle_id is not None
+    assert outbound.delta_qty == pytest.approx(-1.0)
+    assert inbound.delta_qty == pytest.approx(1.0)
+    assert outbound.effective_at == posting_at
+    assert inbound.effective_at == posting_at
+    assert outbound.warehouse_ref1c == "WH-SRC"
+    assert inbound.warehouse_ref1c == "WH-DEST"
+
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-ledger",
+        stock_ledger_entries=rows,
+    ) == 0
+    second = posted_sync.sync_posted_transfers(db)
+    assert second["advanced"] == 0
+    events_after = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id))
+        .all()
+    )
+    assert len(events_after) == 3
+
+
+def test_ledger_projector_dedupes_same_physical_transfer_reimport(db_session):
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-ledger-reimport",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    posting_at = datetime(2026, 7, 30, 12, 0, 0)
+    old_batch = _mk_transfer_batch(db, batch_key="batch-ledger-reimport-old")
+    old_outbound = _add_transfer_sle(
+        db, batch=old_batch, transfer_ref="ref-ledger-reimport",
+        item_id=int(issue.lines[0].component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-1.0, posting_at=posting_at, line_no=1,
+    )
+    old_inbound = _add_transfer_sle(
+        db, batch=old_batch, transfer_ref="ref-ledger-reimport",
+        item_id=int(issue.lines[0].component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=1.0, posting_at=posting_at, line_no=2,
+    )
+    assert project_transfer_custody_events_for_recorder(
+        db, recorder_type=STOCK_TRANSFER_ENTITY, recorder_ref="ref-ledger-reimport",
+        stock_ledger_entries=[old_outbound, old_inbound],
+    ) == 3
+    old_outbound.active = False
+    old_inbound.active = False
+    new_batch = _mk_transfer_batch(db, batch_key="batch-ledger-reimport-new")
+    new_outbound = _add_transfer_sle(
+        db, batch=new_batch, transfer_ref="ref-ledger-reimport",
+        item_id=int(issue.lines[0].component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-1.0, posting_at=posting_at, line_no=1,
+    )
+    new_inbound = _add_transfer_sle(
+        db, batch=new_batch, transfer_ref="ref-ledger-reimport",
+        item_id=int(issue.lines[0].component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=1.0, posting_at=posting_at, line_no=2,
+    )
+
+    assert project_transfer_custody_events_for_recorder(
+        db, recorder_type=STOCK_TRANSFER_ENTITY, recorder_ref="ref-ledger-reimport",
+        stock_ledger_entries=[new_outbound, new_inbound],
+    ) == 0
+    assert (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter_by(issue_id=issue.issue_id)
+        .count()
+        == 3
+    )
+
+
+def test_ledger_projector_posts_return_transfer_custody_event(db_session, monkeypatch):
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-return-ledger",
+        direction="return",
+        source_warehouse_ref1c="WH-WORKSHOP",
+        warehouse_ref1c="WH-RAW",
+    )
+    batch = _mk_transfer_batch(db, batch_key="batch-ledger-ref-return")
+    posting_at = datetime(2026, 7, 30, 12, 30, 0)
+    _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="ref-return-ledger",
+        item_id=int(issue.lines[0].component_item_id),
+        movement_kind="transfer_out",
+        warehouse_ref1c="WH-WORKSHOP",
+        qty=-1.0,
+        posting_at=posting_at,
+        line_no=1,
+    )
+    db.commit()
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _FakeOData({"ref-return-ledger"})
+    )
+
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-return-ledger").all()
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-return-ledger",
+        stock_ledger_entries=rows,
+    ) == 1
+    result = posted_sync.sync_posted_transfers(db)
+    assert result["advanced"] == 1
+
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id))
+        .all()
+    )
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.source_kind == "transfer_returned"
+    assert ev.location_kind == "workshop"
+    assert ev.delta_qty == pytest.approx(-1.0)
+    assert ev.source_sle_id is not None
+    assert ev.warehouse_ref1c == "WH-WORKSHOP"
+    assert ev.effective_at == posting_at
+
+
 def test_keeps_line_to_move_until_all_delivery_issues_are_posted(db_session, monkeypatch):
     db = db_session
     issue_posted, link_posted = _mk_issue_with_link(
@@ -211,8 +480,7 @@ def test_keeps_line_to_move_until_all_delivery_issues_are_posted(db_session, mon
         item_article="ART-ref-two",
         item_ref1c="item-ref-two",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()
@@ -293,6 +561,71 @@ def test_idempotent_repeat_run(db_session, monkeypatch):
     assert second["advanced"] == 0
 
 
+def test_posted_sync_does_not_project_existing_ledger_rows(db_session, monkeypatch):
+    db = db_session
+    issue, link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="posted",
+        target_ref_key="ref-posted-no-changes",
+        link_status="posted",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    db.refresh(issue)
+    issue.lines[0].required_qty = 1.0
+    issue.lines[0].issued_qty = 1.0
+    db.flush()
+
+    batch = _mk_transfer_batch(db, batch_key="batch-posted-no-changes")
+    posting_at = datetime(2026, 7, 30, 13, 0, 0)
+    _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="ref-posted-no-changes",
+        item_id=int(issue.lines[0].component_item_id),
+        movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC",
+        qty=-1.0,
+        posting_at=posting_at,
+        line_no=1,
+    )
+    _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="ref-posted-no-changes",
+        item_id=int(issue.lines[0].component_item_id),
+        movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST",
+        qty=1.0,
+        posting_at=posting_at,
+        line_no=2,
+    )
+    db.commit()
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _FakeOData({"ref-posted-no-changes"})
+    )
+
+    first = posted_sync.sync_posted_transfers(db)
+    # The fake posted document also normalizes the line quantity, so the
+    # administrative sync may advance its own state. It must not write custody.
+    assert first["advanced"] == 1
+    assert first["posted_found"] == 1
+
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id))
+        .all()
+    )
+    assert events == []
+
+    second = posted_sync.sync_posted_transfers(db)
+    assert second["advanced"] == 0
+
+
 def test_repeat_run_updates_quantity_changed_in_1c(db_session, monkeypatch):
     db = db_session
     issue, link = _mk_issue_with_link(
@@ -343,8 +676,7 @@ def test_repeat_run_adds_component_line_added_in_1c(db_session, monkeypatch):
         item_article="ART-added",
         item_ref1c="item-ref-added-extra",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(added_item)
     db.commit()
@@ -394,8 +726,7 @@ def test_only_lines_present_in_posted_doc_are_marked_issued(db_session, monkeypa
         item_article="ART-not-in-1c",
         item_ref1c="item-ref-not-in-1c",
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(extra_item)
     db.flush()

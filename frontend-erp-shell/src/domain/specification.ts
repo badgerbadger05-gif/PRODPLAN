@@ -25,28 +25,10 @@ export type SpecFlatRow = SpecNode & {
   path?: string[]
 }
 
-export type BomItem = {
-  item_id: number
-  item_code: string
-  item_name: string
-  item_article?: string | null
-  item_ref1c?: string | null
-  unit?: string | null
-  unit_ref1c?: string | null
-  replenishment_method?: string | null
-  stock_qty?: number | null
-  spec_id?: number | null
-  spec_code?: string | null
-  spec_name?: string | null
-  spec_ref1c?: string | null
-  default_spec_count?: number
-  has_children?: boolean
-}
-
-export type BomSearchResponse = {
-  items: BomItem[]
-  meta: { q?: string; count?: number; limit?: number }
-}
+export type BomItem = ApiSchemas['SpecificationSearchItemResponse']
+export type BomSearchResponse = ApiSchemas['SpecificationSearchResponse']
+export type BomItemIdentity = Pick<BomItem, 'item_id' | 'item_code' | 'item_name'>
+  & Partial<Omit<BomItem, 'item_id' | 'item_code' | 'item_name'>>
 
 export type BomFlattenedItem = {
   item_id: number
@@ -92,7 +74,7 @@ export type BomWhereUsedResponse = {
 
 export type BomQualityIssue = {
   code: string
-  severity: 'error' | 'warning' | 'info' | string
+  severity: 'error' | 'warning' | 'info'
   message: string
   item?: {
     item_id: number
@@ -107,3 +89,6 @@ export type BomQualityResponse = {
   issues: BomQualityIssue[]
   meta: { root?: BomItem; count?: number }
 }
+import type { components } from '../lib/apiTypes'
+
+type ApiSchemas = components['schemas']

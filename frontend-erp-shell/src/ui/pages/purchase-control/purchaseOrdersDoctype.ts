@@ -163,7 +163,10 @@ export function createPurchaseOrdersDoctype(
             dry_run: false,
           })
           const rowsTotal = Number((result as { rows_total?: number }).rows_total ?? selectedRowKeys.length)
-          await syncSupplierOrdersFrom1C().catch(() => undefined)
+          // Materialization creates the 1C command, but the journal is not
+          // authoritative again until its readback succeeds.  Propagate a
+          // failed sync instead of presenting a false completed state.
+          await syncSupplierOrdersFrom1C()
           return {
             message: `Сформировано заказов по ${rowsTotal} строкам снапшота`,
             clearSelection: true,
@@ -191,9 +194,7 @@ export function createPurchaseOrdersDoctype(
         sync_1c: 'purchase.sync_1c',
       },
     },
-    selectable: (row) => row.line_status === 'to_order'
-      && row.row_generator === 'mrp_reservation'
-      && Number(row.to_order_qty ?? row.remaining_qty) > 0,
-    selectionDisabledReason: () => 'К заказу можно выбирать только строки MRP-снабжения (row_generator = mrp_reservation)',
+    selectable: (row) => row.can_materialize,
+    selectionDisabledReason: (row) => row.materialize_disabled_reason || 'Строка недоступна для формирования заказа',
   }
 }

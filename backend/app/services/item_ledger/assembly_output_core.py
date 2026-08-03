@@ -29,6 +29,7 @@ class QueueCandidate:
     plan_line_id: int
     item_id: int
     open_qty: Decimal
+    sort_key: str = ""
     eligible_from: datetime | None = None
 
 
@@ -71,32 +72,13 @@ def allocate_output_fact(
     ordered = tuple(candidates)
     by_id = {row.plan_line_id: row for row in ordered}
     exact_ids = tuple(dict.fromkeys(int(value) for value in fact.exact_plan_line_ids))
-    if fact.provenance_status in {"ambiguous", "invalid"}:
-        return OutputDecision(
-            stock_ledger_entry_id=fact.stock_ledger_entry_id,
-            decision_status=fact.provenance_status,
-            link_kind=fact.link_kind,
-            allocations=(),
-            surplus_qty=fact_qty,
-            reason=fact.provenance_reason,
-        )
-    if len(exact_ids) > 1:
-        return OutputDecision(
-            stock_ledger_entry_id=fact.stock_ledger_entry_id,
-            decision_status="ambiguous",
-            link_kind=fact.link_kind,
-            allocations=(),
-            surplus_qty=fact_qty,
-            reason="multiple exact plan-line candidates",
-        )
-
+    allocations: list[OutputAllocation] = []
     remaining = fact_qty
     open_by_line = {
         row.plan_line_id: max(Decimal(row.open_qty), ZERO)
         for row in ordered
         if row.item_id == fact.item_id and _eligible_for_fact(fact, row)
     }
-    allocations: list[OutputAllocation] = []
 
     def take(row: QueueCandidate, rule: str) -> None:
         nonlocal remaining
@@ -114,6 +96,58 @@ def allocate_output_fact(
         ))
         open_by_line[row.plan_line_id] = available - qty
         remaining -= qty
+
+    if fact.provenance_status in {"ambiguous", "invalid"}:
+        return OutputDecision(
+            stock_ledger_entry_id=fact.stock_ledger_entry_id,
+            decision_status=fact.provenance_status,
+            link_kind=fact.link_kind,
+            allocations=(),
+            surplus_qty=fact_qty,
+            reason=fact.provenance_reason,
+        )
+    if len(exact_ids) > 1:
+        exact_rows = tuple(
+            row
+            for row in ordered
+            if row.item_id == fact.item_id
+            and int(row.plan_line_id) in exact_ids
+        )
+        exact_rows = tuple(
+            row
+            for row in exact_rows
+            if _eligible_for_fact(fact, row)
+        )
+        exact_plan_ids = {int(row.plan_id) for row in exact_rows}
+        if len(exact_rows) > 0 and len(exact_plan_ids) == 1:
+            for row in exact_rows:
+                take(row, "exact")
+            return OutputDecision(
+                stock_ledger_entry_id=fact.stock_ledger_entry_id,
+                decision_status="allocatable",
+                link_kind=fact.link_kind,
+                allocations=tuple(allocations),
+                surplus_qty=remaining,
+            )
+        exact_rows_present = any(int(value) in by_id for value in exact_ids)
+        if not exact_rows_present:
+            return OutputDecision(
+                stock_ledger_entry_id=fact.stock_ledger_entry_id,
+                decision_status="invalid",
+                link_kind=fact.link_kind,
+                allocations=(),
+                surplus_qty=fact_qty,
+                reason="exact plan lines are not in the live-plan scope",
+            )
+        else:
+            return OutputDecision(
+                stock_ledger_entry_id=fact.stock_ledger_entry_id,
+                decision_status="ambiguous",
+                link_kind=fact.link_kind,
+                allocations=(),
+                surplus_qty=fact_qty,
+                reason="multiple exact plan-line candidates",
+            )
 
     exact_id = exact_ids[0] if exact_ids else None
     exact = by_id.get(exact_id) if exact_id is not None else None

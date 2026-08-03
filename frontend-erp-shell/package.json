@@ -13,7 +13,8 @@
     "api:types": "openapi-typescript ../docs/api/openapi.json -o src/lib/apiTypes.ts",
     "build": "tsc -b && vite build",
     "bundle:check": "node scripts/check-bundle-budget.mjs",
-    "preview": "vite preview --host 0.0.0.0 --port 9301"
+    "preview": "vite preview --host 0.0.0.0 --port 9301",
+    "api:types:check": "npm run api:types && git diff --exit-code -- src/lib/apiTypes.ts"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.5.0",

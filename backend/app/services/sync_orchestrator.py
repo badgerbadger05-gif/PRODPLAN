@@ -45,7 +45,6 @@ from .operations_sync import sync_operations_from_odata
 from .employee_sync import sync_employees_from_odata
 from .odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_odata
 from .production_order_sync import sync_production_orders_from_odata, sync_production_facts
-from .production_control_material_availability import recalculate_production_coverage
 from .supplier_order_sync import sync_supplier_orders_from_odata
 from .processing_stock_sync import (
     processing_stock_status,
@@ -124,8 +123,7 @@ def _run_nomenclature_groups(db: Session, config: Dict[str, Any]) -> Dict[str, A
 
 def _run_stock(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
     stock = sync_stock_from_odata(db, _build_payload(config, "AccumulationRegister_ЗапасыНаСкладах"))
-    coverage = recalculate_production_coverage(db)
-    return {"stock": stock, "production_coverage": coverage}
+    return {"stock": stock}
 
 
 def _single(entity: str, service: Callable[[Session, ODataSyncRequest], Any]) -> Callable[[Session, Dict[str, Any]], Any]:

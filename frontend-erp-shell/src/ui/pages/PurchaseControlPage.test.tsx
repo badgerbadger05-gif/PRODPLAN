@@ -41,6 +41,8 @@ const purchaseRow: PurchaseRow = {
   received_qty: 0,
   remaining_qty: 12,
   row_generator: 'mrp_reservation',
+  can_materialize: true,
+  materialize_disabled_reason: null,
   to_order_qty: 12,
   required_qty: 12,
   realized_qty: 0,
@@ -75,6 +77,8 @@ const orderedRow: PurchaseRow = {
   order_ref1c: 'order-ref',
   order_state_name: 'К поступлению',
   row_generator: 'ledger_future_supply',
+  can_materialize: false,
+  materialize_disabled_reason: 'Строка не является MRP-снабжением',
   received_qty: null,
   line_status: 'unavailable',
   supply_phase: 'in_transit',
@@ -94,11 +98,22 @@ const expectedMrpRow: PurchaseRow = {
   ...purchaseRow,
   row_key: 'buy:9:covered',
   line_status: 'expected',
+  can_materialize: false,
+  materialize_disabled_reason: 'Строка не требует нового заказа',
   to_order_qty: 0,
   remaining_qty: 12,
   open_order_covered_qty: 12,
   open_order_covered_pct: 100,
   to_order_pct: 0,
+}
+
+const missingPctRow: PurchaseRow = {
+  ...purchaseRow,
+  row_key: 'buy:9:missing-pct',
+  to_order_qty: 12,
+  open_order_covered_qty: 4,
+  open_order_covered_pct: null,
+  to_order_pct: null,
 }
 
 function deferred<T>() {
@@ -217,6 +232,18 @@ describe('PurchaseControlPage Doctype migration', () => {
     await waitFor(() => expect(syncSupplierOrdersFrom1C).toHaveBeenCalled())
   })
 
+  it('does not report materialization as complete when 1C readback fails', async () => {
+    vi.mocked(syncSupplierOrdersFrom1C).mockRejectedValueOnce(new Error('readback unavailable'))
+    renderPage()
+    await screen.findAllByText('Под заказ (MRP)')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Выбрать строку buy:9:default' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Сформировать заказы (1)' }))
+
+    expect(await screen.findByText(/readback unavailable/)).toBeInTheDocument()
+    expect(screen.queryByText('Сформировано заказов по 1 строкам снапшота')).not.toBeInTheDocument()
+  })
+
   it('delegates sorting and instant filters to the runtime data source', async () => {
     renderPage()
     await screen.findAllByText('Под заказ (MRP)')
@@ -280,14 +307,14 @@ describe('PurchaseControlPage Doctype migration', () => {
 
     expect(await screen.findByText('Не удалось загрузить данные')).toBeVisible()
     expect(screen.getByRole('alert')).toHaveTextContent('VPN timeout')
-    expect(screen.getByText('Снимок: недоступен · Ledger: недоступен')).toBeVisible()
+    expect(screen.getByText(/Снимок: недоступен · Ledger: недоступен · Истина:/)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Повторить' })).toBeEnabled()
   })
 
   it('keeps snapshot identity and scroll-safe geometry during a refresh', async () => {
     renderPage()
     await screen.findAllByText('Под заказ (MRP)')
-    expect(screen.getByText('Снимок: 51 · Ledger: 23')).toBeVisible()
+    expect(screen.getByText(/Снимок: 51/)).toBeVisible()
     expect(document.querySelector('.split')).toHaveClass('purchaseJournalSplit')
 
     const refresh = deferred<Awaited<ReturnType<typeof listPurchaseJournal>>>()
@@ -295,7 +322,7 @@ describe('PurchaseControlPage Doctype migration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Обновить' }))
 
     await waitFor(() => expect(listPurchaseJournal).toHaveBeenCalledTimes(2))
-    expect(screen.getByText('Снимок: 51 · Ledger: 23')).toBeVisible()
+    expect(screen.getByText(/Снимок: 51 · Ledger: 23 · Истина: accepted/)).toBeVisible()
     expect(document.querySelector('.asyncStateContent')).toHaveAttribute('aria-busy', 'true')
   })
 
@@ -336,5 +363,53 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(screen.getAllByText('Ожидается').some((element) => element.matches('.pill'))).toBe(true)
     expect(screen.queryByRole('checkbox', { name: /Выбрать строку buy:9:covered/ })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Сформировать заказы' })).toBeDisabled()
+  })
+
+  it('shows missing coverage percentages as н/д and keeps explicit 0% when present', async () => {
+    vi.mocked(listPurchaseJournal).mockResolvedValueOnce({
+      rows: [missingPctRow, { ...purchaseRow, row_key: 'buy:9:zero-zero', to_order_pct: 0, open_order_covered_pct: 100 }],
+      total: 2,
+      limit: 100,
+      offset: 0,
+      run_id: 17,
+      run_ids: [17],
+      truth_status: 'accepted',
+      ledger_generation_id: 23,
+      summary: {
+        total_rows: 2,
+        by_status: { to_order: 2 },
+        by_phase: { no_goods: 2 },
+        to_order: 2,
+        overdue: 0,
+        expected_7d: 0,
+        in_transit_amount: 2400,
+        fact_status: 'available',
+      },
+      meta: {
+        snapshot_id: 51,
+        ledger_generation: 23,
+        ledger_generation_id: 23,
+        cutoff: '2026-07-23T12:00:00+00:00',
+        truth_status: 'accepted',
+        fact_source: 'ledger',
+        received_qty_status: 'available',
+        read_only: true,
+      },
+    })
+
+    renderPage()
+    await screen.findAllByText('Под заказ (MRP)')
+    const missingRowCheckbox = screen.queryByRole('checkbox', { name: 'Выбрать строку buy:9:missing-pct' })
+    const realZeroRowCheckbox = screen.queryByRole('checkbox', { name: 'Выбрать строку buy:9:zero-zero' })
+    const missingRow = missingRowCheckbox?.closest('tr')
+    const realZeroRow = realZeroRowCheckbox?.closest('tr')
+    expect(missingRowCheckbox).not.toBeNull()
+    expect(realZeroRowCheckbox).not.toBeNull()
+    expect(missingRow).toBeTruthy()
+    expect(realZeroRow).toBeTruthy()
+    expect(missingRow?.textContent).toContain('н/д')
+    expect(realZeroRow?.textContent).toContain('оформлено 100%')
+    expect(missingRow?.textContent).not.toContain('оформлено 0%')
+    expect(realZeroRow?.textContent).toContain('к заказу 0%')
   })
 })

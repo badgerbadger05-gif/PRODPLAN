@@ -28,6 +28,8 @@ const buyRow = {
   fact_status: 'available',
   fact_source: 'ledger',
   row_generator: 'mrp_reservation',
+  can_materialize: true,
+  materialize_disabled_reason: null,
   supply_phase: 'no_goods',
   counts_in_mrp: true,
   price: 100,

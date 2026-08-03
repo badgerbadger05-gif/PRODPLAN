@@ -5,7 +5,6 @@ import type {
   MaterialIssueCreateResponse,
   MaterialIssueCreatePayload,
   MaterialsResponse,
-  OrdersResponse,
   ProductionOperationsResponse,
   ProduceLinePayload,
   ProduceLineResult,
@@ -27,18 +26,13 @@ export type ControlSettingsUpdate = {
   ignored_warehouses: Array<{ warehouse_ref1c: string }>
 }
 
-export type OrderQuantityUpdateResult = {
-  quantity: number
-  remaining_qty: number
-  mrp_req_net_qty?: number | null
-  mrp_req_covered_qty?: number | null
-  mrp_req_remaining_qty?: number | null
-}
+export type RootProductOption = ApiSchemas['ProductionControlRootProductOption']
+export type RootProductOptionsResponse = ApiSchemas['ProductionControlRootProductOptionsResponse']
 
 // Loosely-typed side of the paint↔weld chain preview/close response. The
 // endpoint returns a heterogeneous document the page reads field-by-field.
 export function listProductionOrders(params: URLSearchParams) {
-  return api<OrdersResponse>(`/v1/production-control/orders?${params.toString()}`)
+  return api<ApiSchemas['ProductionOrderJournalResponse']>(`/v1/production-control/orders?${params.toString()}`)
 }
 
 export function listProductionEmployees() {
@@ -53,6 +47,10 @@ export function getProductionControlSettings() {
   return api<ControlSettings>('/v1/production-control/settings')
 }
 
+export function listRootProductOptions() {
+  return api<RootProductOptionsResponse>('/v1/production-control/orders/root-products')
+}
+
 export function saveProductionControlSettings(payload: ControlSettingsUpdate) {
   const request: ApiSchemas['SettingsPayload'] = payload
   return api<ControlSettings>('/v1/production-control/settings', {
@@ -63,12 +61,6 @@ export function saveProductionControlSettings(payload: ControlSettingsUpdate) {
 
 export function getOrderMaterials(productId: number) {
   return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
-}
-
-export function refreshOrderMaterials(productId: number) {
-  return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials/refresh`, {
-    method: 'POST',
-  })
 }
 
 export function updateOrderStatus(productId: number, status: string) {
@@ -134,14 +126,6 @@ export function syncPostedTransfers() {
   })
 }
 
-export function updateOrderQuantity(productId: number, quantity: number) {
-  const payload: ApiSchemas['UpdateQuantityPayload'] = { quantity }
-  return api<OrderQuantityUpdateResult>(`/v1/production-control/orders/${productId}/quantity`, {
-    method: 'PATCH',
-    body: JSON.stringify(payload),
-  })
-}
-
 export function produceOrderLine(productId: number, payload: ProduceLinePayload) {
   return api<ProduceLineResult>(`/v1/production-control/orders/${productId}/produce`, {
     method: 'POST',
@@ -176,4 +160,20 @@ export function createMaterialIssues(payload: MaterialIssueCreatePayload) {
 
 export function deleteProductionOrder(productId: number) {
   return api(`/v1/production-control/orders/${productId}`, { method: 'DELETE' })
+}
+
+export type CloseProductionOrderResult = {
+  status: string
+  dry_run: boolean
+  orders_requested: number
+  orders_eligible: number
+  orders_closed: number
+  orders_error: number
+}
+
+export function closeProductionOrder(productId: number, payload: { dry_run?: boolean } = {}) {
+  return api<CloseProductionOrderResult>(`/v1/production-control/orders/${productId}/close`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
 }

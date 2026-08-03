@@ -94,7 +94,7 @@ def client(db_session):
 # ---------------------------------------------------------------------------
 def _item(db, code, method="Производство"):
     it = models.Item(item_code=code, item_name=f"Item {code}", item_ref1c=f"ref-{code}",
-                     replenishment_method=method, stock_qty=0)
+                     replenishment_method=method)
     db.add(it)
     db.flush()
     return it

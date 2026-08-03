@@ -13,15 +13,12 @@ from sqlalchemy.orm import Session
 
 from app import models
 
-from .production_output_cache import accepted_product_output
 from .reservation import replenishment_remaining
 from .shelf_projection_core import ShelfDemand, ShelfReceipt, project_shelf
 
 
 STAGE = "shelf_projection"
 ALGORITHM_VERSION = "shelf-projection/2"
-_TERMINAL_LINE_STATUSES = {"completed", "cancelled"}
-_DONE_ORDER_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _d(value: Any) -> Decimal:
@@ -47,7 +44,7 @@ def _demands_by_policy(
         db.query(
             models.DrumSlot,
             models.AssemblyQueueLine,
-            models.MrpFreezeComponent,
+            models.MrpFreezeComponentCumulative,
         )
         .join(
             models.DrumSchedule,
@@ -62,17 +59,17 @@ def _demands_by_policy(
             models.PlanningRun.run_id == models.AssemblyQueueLine.planning_run_id,
         )
         .join(
-            models.MrpFreezeComponent,
+            models.MrpFreezeComponentCumulative,
             and_(
-                models.MrpFreezeComponent.run_id
+                models.MrpFreezeComponentCumulative.run_id
                 == models.AssemblyQueueLine.planning_run_id,
                 # Refreezing one run keeps every older frozen norm row alive.
                 # Without the active version the same component demand would be
                 # summed once per freeze version and inflate the shelf target.
-                models.MrpFreezeComponent.freeze_version
+                models.MrpFreezeComponentCumulative.freeze_version
                 == models.PlanningRun.active_freeze_version,
-                models.MrpFreezeComponent.parent_item_id == models.DrumSlot.item_id,
-                models.MrpFreezeComponent.component_item_id.in_(sorted(by_item)),
+                models.MrpFreezeComponentCumulative.root_item_id == models.DrumSlot.item_id,
+                models.MrpFreezeComponentCumulative.component_item_id.in_(sorted(by_item)),
             ),
         )
         .filter(models.DrumSchedule.ledger_generation_id == int(generation_id))
@@ -80,13 +77,13 @@ def _demands_by_policy(
             models.DrumSlot.slot_date,
             models.AssemblyQueueLine.sort_key,
             models.DrumSlot.id,
-            models.MrpFreezeComponent.id,
+            models.MrpFreezeComponentCumulative.id,
         )
         .all()
     )
     for slot, queue, component in rows:
         policy_id = by_item[int(component.component_item_id)]
-        qty = _d(slot.slot_qty) * _d(component.norm_qty_per_unit)
+        qty = _d(slot.slot_qty) * _d(component.cumulative_norm_qty_per_root_unit)
         if qty <= 0:
             continue
         result[policy_id].append(
@@ -99,6 +96,8 @@ def _demands_by_policy(
                 "plan_line_id": int(queue.plan_line_id),
                 "drum_slot_id": int(slot.id),
                 "freeze_component_id": int(component.id),
+                "root_item_id": int(component.root_item_id),
+                "component_cumulative_norm": str(_d(component.cumulative_norm_qty_per_root_unit)),
             }
         )
     return result
@@ -177,65 +176,37 @@ def _stock(
 
 def _confirmed_receipts(
     db: Session,
+    generation_id: int,
+    item_id: int,
     requirement_ids: list[int],
     warehouse_ref1c: str,
 ) -> tuple[ShelfReceipt, ...]:
-    """Confirmed production for this shelf, kept as dated receipts.
-
-    This used to collapse into one scalar under a ``planned_finish_date <=
-    protection_until`` filter, which made every in-window order cover every
-    in-window need date — including the ones it lands after.  The canon counts
-    a confirmed order as coverage only when it arrives *before the need date*,
-    so every date is handed to the core untouched and the core decides: a late
-    receipt no longer silently closes an early shortage and suppresses the pull.
-    An order with no planned finish date stays out entirely — it cannot be
-    time-phased, and treating it as already on the shelf would be the same
-    over-coverage in a different disguise.
-    """
+    """Read dated WIP receipts only from this generation's sealed capture."""
     if not requirement_ids:
         return ()
     rows = (
         db.query(
-            models.ProductionProduct,
-            models.ProductionOrderLineState,
-            models.ProductionOrder,
-        )
-        .join(
-            models.ProductionOrder,
-            models.ProductionOrder.order_id == models.ProductionProduct.order_id,
-        )
-        .outerjoin(
-            models.ProductionOrderLineState,
-            models.ProductionOrderLineState.product_id
-            == models.ProductionProduct.product_id,
+            models.LedgerFutureSupply.eta_date,
+            models.LedgerFutureSupply.open_qty_at_cutoff,
         )
         .filter(
-            models.ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
-            models.ProductionProduct.destination_warehouse_ref1c == warehouse_ref1c,
-            models.ProductionProduct.quantity > models.ProductionProduct.produced_qty,
-            models.ProductionOrder.deletion_mark.is_(False),
-            func.lower(func.coalesce(models.ProductionOrder.order_state_key, ""))
-            != _DONE_ORDER_STATE_KEY,
-            func.lower(
-                func.coalesce(models.ProductionOrderLineState.status, "shortage")
-            ).notin_(tuple(_TERMINAL_LINE_STATUSES)),
+            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
+            models.LedgerFutureSupply.supply_kind == "wip_order",
+            models.LedgerFutureSupply.evidence_status == "exact",
+            models.LedgerFutureSupply.item_id == int(item_id),
+            models.LedgerFutureSupply.source_requirement_id.in_(requirement_ids),
+            models.LedgerFutureSupply.destination_warehouse_ref1c
+            == str(warehouse_ref1c),
+            models.LedgerFutureSupply.open_qty_at_cutoff > 0,
+            models.LedgerFutureSupply.eta_date.is_not(None),
         )
+        .order_by(models.LedgerFutureSupply.eta_date, models.LedgerFutureSupply.id)
         .all()
     )
-    receipts: list[ShelfReceipt] = []
-    for product, state, _order in rows:
-        if state is None or state.planned_finish_date is None:
-            continue
-        remaining = accepted_product_output(product).remaining_qty
-        if remaining <= 0:
-            continue
-        receipts.append(
-            ShelfReceipt(
-                available_from=state.planned_finish_date,
-                qty=remaining,
-            )
-        )
-    return tuple(receipts)
+    return tuple(
+        ShelfReceipt(available_from=eta_date, qty=_d(open_qty))
+        for eta_date, open_qty in rows
+    )
 
 
 def _payload(row: models.ShelfProjection) -> dict[str, Any]:
@@ -346,6 +317,8 @@ def materialize_shelf_projections(
             other_stock_qty=other_qty,
             confirmed_receipts=_confirmed_receipts(
                 db,
+                int(generation.id),
+                int(policy.item_id),
                 requirement_ids,
                 str(policy.warehouse_ref1c),
             ),

@@ -16,7 +16,6 @@ const ProductionControlPage = lazy(() => import('./pages/ProductionControlPage')
 const PurchaseControlPage = lazy(() => import('./pages/PurchaseControlPage').then((module) => ({ default: module.PurchaseControlPage })))
 const ResourcesPage = lazy(() => import('./pages/ResourcesPage').then((module) => ({ default: module.ResourcesPage })))
 const SpecificationPage = lazy(() => import('./pages/SpecificationPage').then((module) => ({ default: module.SpecificationPage })))
-const StageDistributionPage = lazy(() => import('./pages/StageDistributionPage').then((module) => ({ default: module.StageDistributionPage })))
 const SyncPage = lazy(() => import('./pages/SyncPage').then((module) => ({ default: module.SyncPage })))
 const TransferRequestsPage = lazy(() => import('./pages/TransferRequestsPage').then((module) => ({ default: module.TransferRequestsPage })))
 const WorkshopBindingReviewPage = lazy(() => import('./pages/WorkshopBindingReviewPage').then((module) => ({ default: module.WorkshopBindingReviewPage })))
@@ -98,7 +97,6 @@ export function App() {
             <Route path="/ledger/items/:itemId" element={guard('ledger', <LedgerWorkspaceRoute />)} />
             <Route path="/resources" element={guard('resources', <ResourcesPage />)} />
             <Route path="/workshop-binding-review" element={guard('workshop_binding', <WorkshopBindingReviewPage />)} />
-            <Route path="/stage-distribution" element={guard('stage_distribution', <StageDistributionPage />)} />
             <Route path="/specification" element={guard('specification', <SpecificationPage />)} />
             <Route path="/sync" element={guard('sync', <SyncPage />)} />
             <Route

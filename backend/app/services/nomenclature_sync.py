@@ -245,7 +245,6 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                     replenishment_method=replenishment_method,
                                     replenishment_time=replenishment_time,
                                     unit=unit_key,
-                                    stock_qty=0.0,
                                     status='active'
                                 )
                                 db.add(new_item)
@@ -350,7 +349,6 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             replenishment_method=replenishment_method or None,
                             replenishment_time=replenishment_time,
                             unit=unit_key or None,
-                            stock_qty=0.0,
                             status='active'
                         )
                         db.add(new_item)

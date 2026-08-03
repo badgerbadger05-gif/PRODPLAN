@@ -7,6 +7,7 @@ from sqlalchemy import text
 from app import models
 from app.services.item_ledger import candidate_future_supply as stage
 from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
     FutureSupplyEvidence,
     future_supply_evidence_hash,
 )
@@ -35,8 +36,10 @@ def _scope(db, suffix="one"):
         "generation_kind": "obligation_refresh", "parent_generation_id": source.id,
     }
     batch = models.LedgerBuildBatch(
-        ledger_generation_id=target.id, stage="snapshot_build", status="building",
-        batch_key=f"candidate-snapshot-{suffix}", algorithm_version="test", metrics={},
+        ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+        batch_key=f"candidate-snapshot-{suffix}",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+        metrics={},
     )
     db.add(batch)
     db.flush()
@@ -103,12 +106,15 @@ def test_combined_stage_keeps_wip_and_supplier_in_one_replace(db_session, monkey
 
 def test_candidate_captures_direct_1c_supplier_order_without_export_link(db_session):
     source, target, batch, item = _scope(db_session, "direct-supplier")
+    history_timestamp = datetime(2026, 7, 30)
     order = models.SupplierOrder(
         order_number="DIRECT-1",
         order_date=datetime(2026, 7, 25),
         order_ref1c="direct-supplier-ref",
         order_state_name="В пути",
         deletion_mark=False,
+        created_at=history_timestamp,
+        updated_at=history_timestamp,
     )
     db_session.add(order)
     db_session.flush()
@@ -122,6 +128,8 @@ def test_candidate_captures_direct_1c_supplier_order_without_export_link(db_sess
             received_qty=Decimal("0"),
             remaining_qty=Decimal("9"),
             delivery_date=datetime(2026, 8, 5),
+            created_at=history_timestamp,
+            updated_at=history_timestamp,
         )
     )
     db_session.flush()

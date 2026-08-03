@@ -1,74 +1,10 @@
-export type OrderRow = {
-  product_id: number
-  order_id?: number | null
-  order_source?: string | null  // 'mrp' | '1c'
-  order_ref1c?: string | null
-  order_one_c_number?: string | null
-  order_prodplan_number?: string | null
-  item_id?: number | null
-  order_number: string
-  order_date?: string | null
-  line_number?: number | string | null
-  item_name: string
-  item_article?: string | null
-  item_code?: string | null
-  unit?: string | null
-  quantity: number
-  produced_qty: number
-  remaining_qty: number
-  status: string
-  coverage_status?: string | null
-  coverage_label?: string | null
-  material_coverage_status?: string | null
-  material_coverage_label?: string | null
-  material_coverage_calculated_at?: string | null
-  issue_status?: string | null
-  issue_count?: number
-  workshop_name?: string | null
-  stage_name?: string | null
-  planned_start_date?: string | null
-  planned_finish_date?: string | null
-  forecast_date?: string | null
-  forecast_shift_days?: number | null
-  forecast_reason?: string | null
-  route_sheet_printed_at?: string | null
-  comment?: string | null
-  optimal_batch?: number | null
-  source?: string | null
-  source_run_id?: number | null
-  source_plan_id?: number | null
-  source_plan_name?: string | null
-  source_plan_period_from?: string | null
-  source_plan_period_to?: string | null
-  source_planned_order_id?: number | null
-  source_mrp_requirement_id?: number | null
-  source_mrp_allocation_key?: string | null
-  mrp_req_net_qty?: number | null
-  mrp_req_covered_qty?: number | null
-  mrp_req_remaining_qty?: number | null
-  failed_manufacture_id?: number | null
-  failed_manufacture_error?: string | null
-  paint_weld_chain?: PaintWeldChainInfo | null
-  source_dbr_signal_id?: number | null
-  planning?: ProductionPlanningInfo | null
-}
+import type { components } from '../lib/apiTypes'
 
-export type ProductionPlanningInfo = {
-  contour?: 'mrp' | 'dbr_drum' | 'dbr_feeder' | 'manual' | '1c' | string | null
-  source_id?: number | null
-  program_id?: number | null
-  schedule_id?: number | null
-  slot_id?: number | null
-  signal_type?: string | null
-  priority?: number | null
-  zone?: 'red' | 'yellow' | 'green' | string | null
-  need_date?: string | null
-  required_date?: string | null
-  queue_state?: 'ready' | 'blocked' | 'not_due' | 'diagnostic' | string | null
-  chain_depth?: number | null
-  parent_signal_id?: number | null
-  reason?: string | null
-}
+type ApiSchemas = components['schemas']
+
+export type OrderRow = ApiSchemas['ProductionOrderJournalRowResponse']
+export type OrdersResponse = ApiSchemas['ProductionOrderJournalResponse']
+export type TruthMeta = OrdersResponse['truth_meta']
 
 // Цепочка «окраска↔сварка»: строка входит в связанную пару заказов.
 export type PaintWeldChainInfo = {
@@ -109,53 +45,13 @@ export type MaterialRow = {
   eta_dates?: Array<{ source: string; ref?: string; date?: string; qty?: number }>
 }
 
-export type OrdersResponse = {
-  rows: OrderRow[]
-  total: number
-  limit: number
-  offset: number
-  latest_run_id?: number | null
-  latest_source_plan_id?: number | null
-}
+export type EmployeeOption = ApiSchemas['ProductionEmployeeOptionResponse']
 
-export type EmployeeOption = {
-  employee_id: number
-  employee_ref1c: string
-  employee_type?: 'employee' | 'brigade' | string
-  employee_code?: string | null
-  employee_name: string
-}
+export type ProductionOperationOption = ApiSchemas['ProductionOperationOptionResponse']
+export type ProductionOperationsResponse = ApiSchemas['ProductionOperationsResponse']
+export type EmployeesResponse = ApiSchemas['ProductionEmployeeListResponse']
 
-export type ProductionOperationOption = {
-  line_number: number
-  spec_id?: number | null
-  spec_ref1c?: string | null
-  spec_operation_id: number
-  operation_id: number
-  operation_ref1c?: string | null
-  operation_name?: string | null
-  stage_id?: number | null
-  stage_name?: string | null
-  time_norm?: number | null
-}
-
-export type ProductionOperationsResponse = {
-  rows: ProductionOperationOption[]
-  total: number
-}
-
-export type EmployeesResponse = {
-  rows: EmployeeOption[]
-  total: number
-}
-
-export type MaterialsResponse = {
-  ledger_generation_id: number
-  order_number?: string
-  item_name?: string
-  item_article?: string
-  coverage_status?: string
-  coverage_label?: string
+export type MaterialsResponse = Omit<ApiSchemas['ProductionMaterialsResponse'], 'components'> & {
   components: MaterialRow[]
 }
 
@@ -255,7 +151,7 @@ export type MaterialIssueCreatePayload = {
 }
 
 export type ProduceLinePayload = {
-  qty: number
+  qty?: number
   executor?: string | null
   operation_executors?: Array<{
     line_number?: number
@@ -389,8 +285,8 @@ export type ProductionFilters = {
   workshop_id: string
   coverage_status: string
   root_item_id: string
-  planning_contour: string
-  sort_by: 'planned_start_date' | 'dbr_priority'
+  planning_contour: '' | 'mrp'
+  sort_by: 'planned_start_date'
   sort_dir: 'asc' | 'desc'
 }
 

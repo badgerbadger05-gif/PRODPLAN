@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -38,8 +38,8 @@ from .production_control_common import (
     to_float as _to_float,
 )
 from .production_control_domain import ensure_state as _ensure_state
+from .forecast import forecast_payload as _forecast_payload
 from .planning_truth import PlanningTruthReadiness, require_accepted_truth
-from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .paint_weld_pairs import is_welded_blocked
 from .mrp_mutation_guard import (
     MrpMutationLineageError,
@@ -48,8 +48,8 @@ from .mrp_mutation_guard import (
 from .bom_specification_resolver import BomSpecificationResolver
 from .item_ledger.production_output_cache import (
     accepted_product_output,
-    update_accepted_product_output_cache,
 )
+from .production_material_custody_events import append_material_issue_custody_event
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -176,12 +176,6 @@ def _journal_coverage_status(
     issue_status: str,
     material_coverage_status: Optional[str] = None,
 ) -> str:
-    if issue_status == "posted" and material_coverage_status in {"shortage", "partial"}:
-        return material_coverage_status
-    if issue_status == "posted":
-        return "assembled"
-    if issue_status in {"requested", "issued", "exported"}:
-        return "to_move"
     if material_coverage_status in ACTIVE_COVERAGE_STATUSES:
         return material_coverage_status
     return line_status
@@ -208,6 +202,7 @@ def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> Li
             == int(current_run.ledger_generation_id)
         )
         .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.deletion_mark.is_(False))
         .all()
         )
     ]
@@ -265,201 +260,6 @@ def _prodplan_order_display_number(product: ProductionProduct, order: Production
     return str(order.order_number or "")
 
 
-def _mrp_duplicate_scope_key(req: MrpRequirement, run: Optional[PlanningRun]) -> Tuple[Any, ...]:
-    source_plan_id = int(run.source_plan_id) if run and run.source_plan_id is not None else None
-    if source_plan_id is not None:
-        return ("plan", source_plan_id, int(req.item_id))
-    return ("period", int(req.item_id), req.period_from, req.period_to)
-
-
-def _production_order_1c_linked_order_ids(db: Session, order_ids: Sequence[int]) -> set[int]:
-    ids = sorted({int(order_id) for order_id in order_ids if order_id is not None})
-    if not ids:
-        return set()
-    return {
-        int(row.source_id)
-        for row in (
-            db.query(SyncLink.source_id)
-            .filter(
-                SyncLink.source_system == "PRODPLAN",
-                SyncLink.source_doctype == "production_order",
-                SyncLink.source_id.in_(ids),
-                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
-                SyncLink.status == "success",
-                SyncLink.target_ref_key.isnot(None),
-            )
-            .all()
-        )
-    }
-
-
-def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[str, Any]:
-    """
-    Cancel local MRP duplicates left by earlier non-idempotent recalculations.
-
-    Hard rule: production orders already opened in 1C are immutable. They are
-    counted as coverage and never cancelled; only local PRODPLAN MRP rows
-    without a 1C ref/success sync-link can be cancelled.
-    """
-    rows = (
-        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, MrpRequirement, PlanningRun)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .join(MrpRequirement, MrpRequirement.id == ProductionProduct.source_mrp_requirement_id)
-        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
-        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
-        .filter(ProductionOrder.source == "mrp")
-        .filter(ProductionOrder.deletion_mark == False)
-        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(
-            func.coalesce(ProductionProduct.quantity, 0)
-            > func.coalesce(ProductionProduct.produced_qty, 0)
-        )
-        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
-        .all()
-    )
-    linked_order_ids = _production_order_1c_linked_order_ids(db, [int(order.order_id) for _p, order, _s, _r, _run in rows])
-
-    groups: Dict[Tuple[Any, ...], List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]]] = {}
-    for row in rows:
-        _product, _order, _state, req, run = row
-        groups.setdefault(_mrp_duplicate_scope_key(req, run), []).append(row)
-
-    repaired: List[Dict[str, Any]] = []
-    untouched: List[Dict[str, Any]] = []
-    cancelled_count = 0
-    reduced_count = 0
-    released_qty_total = 0.0
-    reduced_qty_total = 0.0
-
-    for key, group_rows in groups.items():
-        latest_req = max(group_rows, key=lambda row: (row[4].started_at or row[3].created_at, int(row[4].run_id), int(row[3].id)))[3]
-        required_qty = _to_float(latest_req.net_required_qty)
-
-        def keep_priority(row: Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]) -> Tuple[int, int, int, Any, int]:
-            product, order, state, req, _run = row
-            is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
-            status = str(state.status if state else "shortage")
-            is_work_started = status not in ACTIVE_COVERAGE_STATUSES
-            is_latest = int(req.id) == int(latest_req.id)
-            return (
-                1 if is_1c else 0,
-                1 if is_work_started else 0,
-                1 if is_latest else 0,
-                order.order_date,
-                -int(product.product_id),
-            )
-
-        kept: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
-        cancelled: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
-        reduced: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun, float, float]] = []
-        kept_qty = 0.0
-        protected_qty = 0.0
-        editable_target_qty = required_qty
-        for row in sorted(group_rows, key=keep_priority, reverse=True):
-            product, order, state, _req, _run = row
-            qty = _to_float(accepted_product_output(product).remaining_qty)
-            is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
-            if is_1c:
-                kept.append(row)
-                kept_qty += qty
-                protected_qty += qty
-                editable_target_qty = max(0.0, required_qty - protected_qty)
-                continue
-
-            editable_kept_qty = max(0.0, kept_qty - protected_qty)
-            remaining_editable_target = max(0.0, editable_target_qty - editable_kept_qty)
-            if remaining_editable_target <= 1e-9:
-                cancelled.append(row)
-                continue
-            if qty <= remaining_editable_target + 1e-9:
-                kept.append(row)
-                kept_qty += qty
-            else:
-                new_qty = remaining_editable_target
-                kept.append(row)
-                kept_qty += new_qty
-                reduced.append((product, order, state, _req, _run, qty, new_qty))
-
-        if not cancelled and not reduced:
-            if protected_qty > required_qty + 1e-9:
-                untouched.append({
-                    "scope": list(key),
-                    "item_id": int(latest_req.item_id),
-                    "required_qty": required_qty,
-                    "protected_qty": protected_qty,
-                    "reason": "1C-заказы покрывают больше потребности; локальных дублей для отмены нет",
-                })
-            continue
-
-        cancelled_payload: List[Dict[str, Any]] = []
-        for product, order, state, req, _run in cancelled:
-            qty = _to_float(accepted_product_output(product).remaining_qty)
-            cancelled_payload.append({
-                "product_id": int(product.product_id),
-                "order_id": int(order.order_id),
-                "order_number": str(order.order_number or ""),
-                "requirement_id": int(req.id),
-                "qty": qty,
-            })
-            if not dry_run:
-                actual_state = state or _ensure_state(db, product)
-                if actual_state.status not in _TERMINAL_LINE_STATUSES:
-                    actual_state.status = "cancelled"
-            cancelled_count += 1
-            released_qty_total += qty
-
-        reduced_payload: List[Dict[str, Any]] = []
-        for product, order, _state, req, _run, old_qty, new_qty in reduced:
-            delta = max(0.0, old_qty - new_qty)
-            reduced_payload.append({
-                "product_id": int(product.product_id),
-                "order_id": int(order.order_id),
-                "order_number": str(order.order_number or ""),
-                "requirement_id": int(req.id),
-                "old_qty": old_qty,
-                "new_qty": new_qty,
-                "delta_qty": delta,
-            })
-            if not dry_run and delta > 1e-9:
-                produced_qty = _to_float(product.produced_qty)
-                product.quantity = max(produced_qty + new_qty, produced_qty)
-                update_accepted_product_output_cache(
-                    product,
-                    produced_qty=product.produced_qty,
-                )
-            if delta > 1e-9:
-                reduced_count += 1
-                reduced_qty_total += delta
-
-        repaired.append({
-            "scope": list(key),
-            "item_id": int(latest_req.item_id),
-            "latest_requirement_id": int(latest_req.id),
-            "required_qty": required_qty,
-            "kept_qty": kept_qty,
-            "protected_1c_qty": protected_qty,
-            "cancelled_qty": sum(row["qty"] for row in cancelled_payload),
-            "cancelled": cancelled_payload,
-            "reduced_qty": sum(row["delta_qty"] for row in reduced_payload),
-            "reduced": reduced_payload,
-        })
-
-    if not dry_run:
-        db.commit()
-
-    return {
-        "status": "ok",
-        "dry_run": bool(dry_run),
-        "groups_repaired": len(repaired),
-        "cancelled_count": cancelled_count,
-        "reduced_count": reduced_count,
-        "released_qty": released_qty_total,
-        "reduced_qty": reduced_qty_total,
-        "repaired": repaired,
-        "untouched": untouched,
-    }
-
-
 def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
     return BomSpecificationResolver(db).descendant_ids_by_root(
         [int(root_item_id)]
@@ -501,21 +301,6 @@ def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[i
         .all()
     )
     return [int(row[0]) for row in rows]
-
-
-def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
-    if not forecast_date or not due_date:
-        return {
-            "forecast_date": _date_to_iso(forecast_date),
-            "forecast_shift_days": None,
-            "forecast_reason": None,
-        }
-    shift = (forecast_date - due_date).days
-    return {
-        "forecast_date": forecast_date.isoformat(),
-        "forecast_shift_days": shift,
-        "forecast_reason": "смещение по мощностям" if shift > 0 else ("раньше плановой даты" if shift < 0 else "в срок"),
-    }
 
 
 def _default_spec_ids_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, int]:
@@ -876,27 +661,16 @@ def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:
     return int(row.spec_id) if row else None
 
 
-def _planned_dates_by_item(
-    db: Session,
-    run_ids: Sequence[int],
-    item_ids: Optional[Sequence[int]] = None,
-) -> Dict[int, Tuple[Optional[date], Optional[date]]]:
-    ids_for_runs = sorted({int(value) for value in run_ids if value is not None})
-    if not ids_for_runs:
-        return {}
-    q = (
-        db.query(
-            PlannedOrder.item_id,
-            func.min(PlannedOrder.start_date).label("start_date"),
-            func.max(PlannedOrder.finish_date).label("finish_date"),
-        )
-        .filter(PlannedOrder.run_id.in_(ids_for_runs))
-    )
-    ids = sorted({int(item_id) for item_id in (item_ids or []) if item_id is not None})
-    if ids:
-        q = q.filter(PlannedOrder.item_id.in_(ids))
-    rows = q.group_by(PlannedOrder.item_id).all()
-    return {int(r.item_id): (r.start_date, r.finish_date) for r in rows}
+def _available_actions_for_journal_row(
+    *,
+    order: ProductionOrder,
+    status: str,
+    has_1c_link: bool,
+) -> list[str]:
+    if has_1c_link and str(order.source or "1c").lower() == "mrp":
+        if status not in {"completed", "produced_partial", "produced", "cancelled", "done"}:
+            return ["close_1c"]
+    return []
 
 
 def list_journal(
@@ -904,6 +678,7 @@ def list_journal(
     *,
     truth: PlanningTruthReadiness | None = None,
     _accepted_run_ids_override: Optional[Sequence[int]] = None,
+    _material_coverage_by_product: Optional[Dict[int, Dict[str, Any]]] = None,
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
@@ -1016,21 +791,23 @@ def list_journal(
         max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
         effective_offset = min(requested_offset, max_offset)
         if sort_field in {"planned_start_date", "planned_finish_date"}:
-            planned_dates_sq = (
+            planning_dates_sq = (
                 db.query(
-                    PlannedOrder.item_id.label("item_id"),
-                    func.min(PlannedOrder.start_date).label("start_date"),
-                    func.max(PlannedOrder.finish_date).label("finish_date"),
+                    PlanningRun.run_id.label("run_id"),
+                    func.coalesce(PlanningRun.period_from, ProductionPlanHeader.period_from).label("start_date"),
+                    func.coalesce(PlanningRun.period_to, ProductionPlanHeader.period_to).label("finish_date"),
                 )
-                .filter(PlannedOrder.run_id == run_id)
-                .group_by(PlannedOrder.item_id)
+                .outerjoin(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+                .filter(PlanningRun.run_id.in_(accepted_run_ids))
                 .subquery()
             )
-            query = query.outerjoin(planned_dates_sq, planned_dates_sq.c.item_id == ProductionProduct.item_id)
+            query = query.outerjoin(
+                planning_dates_sq, planning_dates_sq.c.run_id == ProductionOrder.source_run_id
+            )
             date_expr = (
-                func.coalesce(ProductionOrderLineState.planned_finish_date, planned_dates_sq.c.finish_date)
+                func.coalesce(ProductionOrderLineState.planned_finish_date, planning_dates_sq.c.finish_date)
                 if sort_field == "planned_finish_date"
-                else func.coalesce(ProductionOrderLineState.planned_start_date, planned_dates_sq.c.start_date)
+                else func.coalesce(ProductionOrderLineState.planned_start_date, planning_dates_sq.c.start_date)
             )
             if (sort_dir or "").strip().lower() == "desc":
                 query = query.order_by(date_expr.is_(None), date_expr.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
@@ -1046,10 +823,9 @@ def list_journal(
         effective_offset = max(0, int(offset or 0))
 
     page_item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
-    plan_dates = _planned_dates_by_item(db, accepted_run_ids, page_item_ids)
     # The shelf projection of the accepted generation owns the launch date of a
-    # shelf-managed item; the legacy CapacityScheduler dates stay as fallback
-    # only for items without a shelf.
+    # shelf-managed item; otherwise only explicit state or frozen-plan period
+    # dates are used.
     shelf_by_item = _shelf_pull_by_item(
         db,
         ledger_generation_id=int(truth.generation_id) if truth.generation_id is not None else None,
@@ -1062,19 +838,24 @@ def list_journal(
         if product.order and product.order.source_run_id is not None
     })
     order_one_c_number_by_id: Dict[int, str] = {}
+    truth_ledger_generation_id = int(truth.generation_id)
     if order_ids:
         for row in (
             db.query(SyncLink.source_id, SyncLink.target_number)
             .filter(
+                SyncLink.source_system == "PRODPLAN",
                 SyncLink.source_doctype == "production_order",
                 SyncLink.source_id.in_(order_ids),
                 SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+                SyncLink.ledger_generation_id == truth_ledger_generation_id,
+                SyncLink.status == "success",
                 SyncLink.target_number.isnot(None),
             )
             .all()
         ):
             order_one_c_number_by_id[int(row.source_id)] = str(row.target_number or "")
     source_plan_by_run_id: Dict[int, Dict[str, Any]] = {}
+    source_plan_dates_by_run_id: Dict[int, Tuple[Optional[date], Optional[date]]] = {}
     if run_ids:
         run_rows = (
             db.query(PlanningRun, ProductionPlanHeader)
@@ -1091,6 +872,7 @@ def list_journal(
                 "source_plan_period_from": _date_to_iso(period_from),
                 "source_plan_period_to": _date_to_iso(period_to),
             }
+            source_plan_dates_by_run_id[int(run.run_id)] = (period_from, period_to)
     planned_order_ids = sorted({
         int(product.source_planned_order_id)
         for product in rows
@@ -1230,7 +1012,14 @@ def list_journal(
         if workshop_id and resolved_workshop_id != int(workshop_id):
             continue
 
-        planned_start, planned_finish = plan_dates.get(int(product.item_id), (None, None))
+        planned_start = None
+        planned_finish = None
+        source_plan_dates = source_plan_dates_by_run_id.get(
+            int(product.order.source_run_id) if product.order and product.order.source_run_id is not None else 0,
+            (None, None),
+        )
+        if source_plan_dates:
+            planned_start, planned_finish = source_plan_dates
         shelf = shelf_by_item.get(int(product.item_id))
         if shelf is not None and shelf.latest_start_date is not None:
             planned_start = shelf.latest_start_date
@@ -1259,13 +1048,20 @@ def list_journal(
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
-        material_coverage_status = str(getattr(state, "material_coverage_status", "") or "")
-        material_coverage_label = str(getattr(state, "material_coverage_label", "") or "")
+        material_snapshot = (_material_coverage_by_product or {}).get(int(product.product_id))
+        material_coverage_status = str((material_snapshot or {}).get("coverage_status") or "")
+        material_coverage_label = str((material_snapshot or {}).get("coverage_label") or "")
         row_coverage_status = _journal_coverage_status(line_status, issue_status, material_coverage_status)
         if issue_status in {"", "not_requested"} and row_coverage_status in ACTIVE_COVERAGE_STATUSES:
             work_status = _journal_work_status(row_coverage_status)
         else:
             work_status = _journal_work_status(line_status)
+        has_1c_link = _production_order_has_1c_link(db, product.order)
+        available_actions = _available_actions_for_journal_row(
+            order=product.order,
+            status=work_status,
+            has_1c_link=has_1c_link,
+        )
         coverage_label = (
             material_coverage_label
             if row_coverage_status == material_coverage_status and material_coverage_label
@@ -1301,7 +1097,8 @@ def list_journal(
                 "issue_status": issue_status,
                 "material_coverage_status": material_coverage_status or None,
                 "material_coverage_label": material_coverage_label or None,
-                "material_coverage_calculated_at": _date_to_iso(getattr(state, "material_coverage_calculated_at", None)) if state else None,
+                "material_coverage_calculated_at": _date_to_iso(truth.cutoff),
+                "material_coverage_snapshot": material_snapshot,
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
                 **forecast,
@@ -1319,6 +1116,7 @@ def list_journal(
                 "source_planned_order_id": source_planned_order_id,
                 "source_mrp_requirement_id": source_mrp_requirement_id,
                 "source_mrp_allocation_key": str(product.source_mrp_allocation_key or "") if product.source_mrp_allocation_key else None,
+                "available_actions": available_actions,
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
                 "mrp_req_covered_qty": req_meta.get("covered_qty"),
                 "mrp_req_remaining_qty": req_meta.get("remaining_qty"),
@@ -1421,6 +1219,7 @@ def _production_order_has_1c_link(db: Session, order: ProductionOrder) -> bool:
             SyncLink.source_doctype == "production_order",
             SyncLink.source_id == int(order.order_id),
             SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+            SyncLink.status == "success",
         )
         .first()
         is not None
@@ -1476,6 +1275,32 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
 
     deleted_issues = 0
     for issue in issues:
+        for line in issue.lines or []:
+            status = str(issue.status or "")
+            if status == "posted":
+                held_qty = _to_float(line.required_qty)
+                warehouse = str(issue.warehouse_ref1c or "")
+                location_kind = "workshop"
+            else:
+                held_qty = max(
+                    0.0,
+                    _to_float(line.required_qty) - _to_float(line.issued_qty),
+                )
+                warehouse = str(issue.source_warehouse_ref1c or issue.warehouse_ref1c or "")
+                location_kind = "transit"
+
+            if held_qty > 1e-9 and warehouse:
+                append_material_issue_custody_event(
+                    db,
+                    issue=issue,
+                    line=line,
+                    delta_qty=-held_qty,
+                    source_kind="terminal_release",
+                    location_kind=location_kind,
+                    warehouse_ref1c=warehouse,
+                    source_ref1c=str(issue.source_warehouse_ref1c or ""),
+                )
+
         db.delete(issue)
         deleted_issues += 1
 
@@ -1500,44 +1325,3 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
         "deleted_issues": deleted_issues,
         "released_qty": released_qty,
     }
-
-
-def update_product_quantity(db: Session, product_id: int, quantity: float) -> Dict[str, Any]:
-    """
-    Adjust the planned quantity on a ProductionProduct line.
-
-    Rules:
-    - quantity must be > 0.
-    - quantity cannot be set below already produced_qty (can't un-produce).
-    - remaining_qty is recalculated as max(0, quantity - produced_qty).
-    """
-    product = db.query(ProductionProduct).filter(ProductionProduct.product_id == int(product_id)).one_or_none()
-    if product is None:
-        raise ValueError(f"product_id={product_id}: строка заказа не найдена")
-
-    qty = float(quantity)
-    if qty <= 0:
-        raise ValueError("quantity должен быть положительным")
-
-    produced = _to_float(product.produced_qty)
-    if qty < produced - 1e-9:
-        raise ValueError(
-            f"quantity={qty} меньше уже выпущенного ({produced}). "
-            "Нельзя уменьшить заказ ниже факта."
-        )
-
-    product.quantity = qty
-    update_accepted_product_output_cache(
-        product,
-        produced_qty=product.produced_qty,
-    )
-    material_issues_refresh = refresh_existing_material_issues_for_product(db, product)
-    db.commit()
-    payload: Dict[str, Any] = {
-        "status": "ok",
-        "product_id": int(product_id),
-        "quantity": float(qty),
-        "remaining_qty": float(accepted_product_output(product).remaining_qty),
-        "material_issues_refresh": material_issues_refresh,
-    }
-    return payload

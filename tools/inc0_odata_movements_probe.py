@@ -15,10 +15,9 @@
   (ж) даёт ли Document_ЗаказНаПроизводство движения по этому регистру;
   (з) грубую стоимость запроса по одному Recorder.
 
-Запуск (из backend/, чтобы импортировался app):
-  DATABASE_URL=... PYTHONPATH=/home/ivan/PRODPLAN/repo/backend \
-    /home/ivan/PRODPLAN/repo/.venv/bin/python \
-    /home/ivan/PRODPLAN/repo/tools/inc0_odata_movements_probe.py
+Запуск из корня репозитория:
+  DATABASE_URL=... PYTHONPATH=backend \
+    .venv/bin/python tools/inc0_odata_movements_probe.py
 
 Требует заполненного config/odata_config.json (base_url + username/password|token).
 """

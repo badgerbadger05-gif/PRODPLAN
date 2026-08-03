@@ -49,6 +49,13 @@ def _chunked(seq: List[str], size: int) -> Iterable[List[str]]:
         yield seq[i : i + size]
 
 
+def _require_not_truncated(client, entity_name: str, *, context: str = "read") -> None:
+    if getattr(client, "last_result_truncated", False):
+        raise RuntimeError(
+            f"OData {entity_name} {context} is truncated; refusing to sync"
+        )
+
+
 def _parse_1c_datetime(val) -> Optional[datetime]:
     if not val:
         return None
@@ -268,6 +275,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             max_pages=1000,
             order_by="Ref_Key",
         )
+        _require_not_truncated(client, req.entity_name, context="header read")
 
         # Дублируем фильтр на уровне приложения: 1С / прокси иногда игнорируют часть условий.
         removed_by_dm = 0
@@ -275,6 +283,12 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         removed_by_missing_filter_fields = 0
         filtered_orders = []
         for rec in order_data:
+            if "СостояниеЗаказа_Key" not in rec:
+                raise RuntimeError(
+                    "Order synchronization payload is missing required field "
+                    "'СостояниеЗаказа_Key'"
+                )
+
             # Проверяем наличие обязательных полей
             if rec.get("СостояниеЗаказа_Key") is None:
                 removed_by_missing_filter_fields += 1
@@ -330,7 +344,8 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         products_entity = "Document_ЗаказНаПроизводство_Продукция"
         # Важно: 1С OData может не содержать некоторых полей (например, "Этап_Key"),
         # и тогда запрос с $select падает с 400.
-        # Поэтому для MVP берём минимально-надёжный набор полей (как в `.docs/production_orders_odata_queries.md`).
+        # Поэтому берём минимально-надёжный набор полей; общая политика
+        # чтения OData зафиксирована в `.docs/odata.md`.
         products_select = [
             "Ref_Key",
             "LineNumber",
@@ -378,6 +393,11 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                             max_pages=1000,
                             order_by="LineNumber",
                         )
+                        _require_not_truncated(
+                            client,
+                            products_entity,
+                            context=f"line read for {len(batch_keys)} orders",
+                        )
                     except Exception:
                         if not use_extended_products_select:
                             raise
@@ -392,12 +412,19 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                             max_pages=1000,
                             order_by="LineNumber",
                         )
+                        _require_not_truncated(
+                            client,
+                            products_entity,
+                            context=f"fallback line read for {len(batch_keys)} orders",
+                        )
                     for pr in rows:
                         rk = str((pr.get("Ref_Key") or "")).strip()
                         if rk:
                             products_by_order[rk].append(pr)
                 except Exception as e:
                     # Если пакет не загрузился, помечаем все заказы из пакета как failed
+                    if isinstance(e, RuntimeError):
+                        raise
                     for ok in batch_keys:
                         stats.products_failed += 1
                         stats.errors.append(f"Products load failed for order_ref1c={ok}: {e}")
@@ -528,29 +555,31 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                             db, prod_data, record, existing_product
                         )
 
+                        sync_product_fields = getattr(current_order, "source", "1c") != "mrp"
                         if existing_product:
-                            # Нечего подставить — оставляем как есть, иначе каждая
-                            # синхронизация обнуляла бы привязку спецификации/этапа.
-                            target_spec_id = (
-                                spec_id if spec_id is not None else existing_product.spec_id
-                            )
-                            target_stage_id = (
-                                stage_id if stage_id is not None else existing_product.stage_id
-                            )
-                            if (existing_product.quantity != quantity or
-                                existing_product.spec_id != target_spec_id or
-                                existing_product.stage_id != target_stage_id or
-                                getattr(existing_product, "line_number", None) != line_number or
-                                getattr(existing_product, "characteristic_ref1c", None) != characteristic_key or
-                                existing_product.destination_warehouse_ref1c != destination_ref):
-                                existing_product.quantity = quantity
-                                existing_product.spec_id = target_spec_id
-                                existing_product.stage_id = target_stage_id
-                                existing_product.line_number = line_number
-                                existing_product.characteristic_ref1c = characteristic_key
-                                existing_product.destination_warehouse_ref1c = destination_ref
-                                products_updated += 1
-                        else:
+                            if sync_product_fields:
+                                # Нечего подставить — оставляем как есть, иначе каждая
+                                # синхронизация обнуляла бы привязку спецификации/этапа.
+                                target_spec_id = (
+                                    spec_id if spec_id is not None else existing_product.spec_id
+                                )
+                                target_stage_id = (
+                                    stage_id if stage_id is not None else existing_product.stage_id
+                                )
+                                if (existing_product.quantity != quantity or
+                                    existing_product.spec_id != target_spec_id or
+                                    existing_product.stage_id != target_stage_id or
+                                    getattr(existing_product, "line_number", None) != line_number or
+                                    getattr(existing_product, "characteristic_ref1c", None) != characteristic_key or
+                                    existing_product.destination_warehouse_ref1c != destination_ref):
+                                    existing_product.quantity = quantity
+                                    existing_product.spec_id = target_spec_id
+                                    existing_product.stage_id = target_stage_id
+                                    existing_product.line_number = line_number
+                                    existing_product.characteristic_ref1c = characteristic_key
+                                    existing_product.destination_warehouse_ref1c = destination_ref
+                                    products_updated += 1
+                        elif sync_product_fields:
                             # Создаём новую строку продукции
                             # remaining_qty = quantity т.к. produced_qty = 0 для новой строки
                             new_product = ProductionProduct(
@@ -587,23 +616,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         if req.dry_run:
             db.rollback()
         else:
-            # Правило: "отсутствует в загрузке = закрыт" действует только в
-            # синхронизируемом горизонте. Старые локальные заказы до 2026-05-01
-            # не трогаем, иначе date-фильтр превращает их в ложные удаления.
-            loaded_order_refs = set(order_keys)
-            orders_to_close = []
-            for order in db.query(ProductionOrder).filter(
-                ProductionOrder.deletion_mark == False,
-                ProductionOrder.order_date >= PRODUCTION_ORDER_SYNC_FROM,
-            ).all():
-                if order.order_ref1c and order.order_ref1c not in loaded_order_refs:
-                    orders_to_close.append(order)
-            
-            if orders_to_close:
-                print(f"[SYNC] Closing {len(orders_to_close)} orders not found in 1C load")
-                for order in orders_to_close:
-                    order.deletion_mark = True
-            
             db.commit()
 
             # Новые/изменённые строки заказа сдвигают плановое количество, а

@@ -15,6 +15,7 @@ from app.models import (
     Item,
     LedgerGeneration,
     MrpRequirement,
+    ProductionMaterialCustodyProjectionManifest,
     PhysicalImportBatch,
     PlanningRun,
     PlanningTruthState,
@@ -68,6 +69,17 @@ def _accepted_planning_truth(db_session):
     ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=generation.cutoff,
+            built_at=generation.cutoff,
+        )
+    )
     resource = ProductionResource(
         resource_name="Fixation assembly",
         planning_range=30,
@@ -87,8 +99,7 @@ def _purchased_item(db, code: str) -> Item:
         item_name=f"Деталь {code}",
         item_article=code,
         unit="шт",
-        stock_qty=0.0,
-        replenishment_method="Покупка",
+                replenishment_method="Покупка",
         replenishment_time=3,
         status="active",
     )
@@ -245,6 +256,7 @@ def test_snapshot_helper_resolves_the_generation_key_without_a_caller(db_session
     item = _purchased_item(db_session, "FIX-KEYLESS")
     plan = _draft_plan(db_session, item, qty=6.0)
     plan.status = "fixed"
+    plan.fixed_at = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
     db_session.commit()
 
     result = create_mrp_snapshot_for_plan(db_session, plan.id, started_by="test")

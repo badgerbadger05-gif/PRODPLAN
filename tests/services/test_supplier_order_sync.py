@@ -17,8 +17,7 @@ def test_supplier_order_sync_stores_state_deletion_and_item_rows(db_session, mon
         item_article="SUP-SYNC-ITEM",
         item_ref1c="item-ref-1",
         replenishment_method="Покупка",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()
@@ -458,8 +457,7 @@ def test_supplier_order_sync_applies_receipts_from_incoming_invoices(db_session,
         item_article="SUP-RECEIPT-ITEM",
         item_ref1c="item-ref-1",
         replenishment_method="Покупка",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()

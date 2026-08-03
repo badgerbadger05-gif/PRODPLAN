@@ -2,7 +2,6 @@ from datetime import datetime, timezone
 
 from app import models
 from app.services.planning_service import _bom_descendant_ids_for_roots
-from app.services.resource_calculator import calculate_resource_distribution
 
 
 def _item(db, code: str) -> models.Item:
@@ -107,7 +106,6 @@ def test_production_readers_follow_pinned_child_spec(
                 item_id=default_leaf.item_id,
                 quantity=5,
             ),
-            models.RootProduct(item_id=root.item_id),
         ]
     )
     db_session.flush()
@@ -115,15 +113,3 @@ def test_production_readers_follow_pinned_child_spec(
     descendants = _bom_descendant_ids_for_roots(db_session, [root.item_id])
     assert pinned_leaf.item_id in descendants
     assert default_leaf.item_id not in descendants
-
-    distribution = calculate_resource_distribution(db_session)
-    component_ids_by_resource = {
-        int(resource["resource_id"]): {
-            int(component["item_id"])
-            for product in resource["products"]
-            for component in product["components"]
-        }
-        for resource in distribution["resources"]
-    }
-    assert child.item_id in component_ids_by_resource[pinned_resource.resource_id]
-    assert default_resource.resource_id not in component_ids_by_resource

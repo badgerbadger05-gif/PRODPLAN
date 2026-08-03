@@ -1,8 +1,8 @@
 """Схема должна воспроизводиться из Alembic, а не из ``Base.metadata.create_all``.
 
 Исторически десяток таблиц (units, default_specifications, production_stages,
-production_components, production_operations, production_plan_entries,
-resource_stages, root_products, spec_operations, item_embeddings) плюс базовые
+production_components, production_operations,
+resource_stages, spec_operations, item_embeddings) плюс базовые
 справочники (items, item_categories, specifications, spec_components,
 operations, production_orders, production_products, production_resources)
 не создавались ни одной миграцией и жили только за счёт ``create_all`` в
@@ -52,10 +52,8 @@ BASELINE_TABLES = (
     "production_components",
     "production_operations",
     "default_specifications",
-    "root_products",
     "production_resources",
     "resource_stages",
-    "production_plan_entries",
     "item_embeddings",
 )
 

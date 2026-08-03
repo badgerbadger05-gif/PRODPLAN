@@ -62,6 +62,7 @@ async function mockMrpResultApi(page: Page) {
               finish_date: '2026-07-23',
               forecast_date: '2026-07-23',
               forecast_shift_days: 0,
+              forecast_status: 'on_time',
               main_area_name: 'Механический участок',
               main_stage_name: 'Мехобработка',
               norm_hours_total: 72,
@@ -79,6 +80,7 @@ async function mockMrpResultApi(page: Page) {
               finish_date: '2026-07-24',
               forecast_date: '2026-07-27',
               forecast_shift_days: 3,
+              forecast_status: 'delayed',
               forecast_reason: 'Ожидание поковки',
               main_area_name: 'Токарный участок',
               norm_hours_total: 45,
@@ -96,6 +98,7 @@ async function mockMrpResultApi(page: Page) {
               finish_date: '2026-07-25',
               forecast_date: '2026-08-01',
               forecast_shift_days: 7,
+              forecast_status: 'critical',
               forecast_reason: 'Дефицит подшипников',
               main_area_name: 'Сборочный участок',
               norm_hours_total: 31.5,
@@ -172,7 +175,9 @@ test('MRP result production cockpit visual baseline', async ({ page }) => {
   await expect(page.locator('.runBadge')).toHaveText('Успешно')
   await expect(page.getByRole('row', { name: /Корпус редуктора/ })).toBeVisible()
   await expect(page.getByRole('row', { name: /Узел подшипниковый/ })).toContainText('+7 дн · 01.08')
-  await expect(page.getByRole('button', { name: 'Создать заказы (0)' })).toBeDisabled()
+  // Production creation belongs to the generation-bound production journal;
+  // the MRP result is a read-only snapshot workspace.
+  await expect(page.getByRole('button', { name: /Создать заказы/ })).toHaveCount(0)
   await expect(page.locator('.statusBar')).toContainText('Строки 1-4 из 4')
   await expect(page.locator('.statusBar')).not.toContainText('Загрузка')
 

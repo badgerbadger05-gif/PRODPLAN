@@ -8,7 +8,7 @@ export type PurchaseLineStatus =
   | 'closed'
   | 'unavailable'
 
-export type PurchaseFactStatus = 'available' | 'unavailable' | string
+export type PurchaseFactStatus = 'available' | 'unavailable'
 
 // Фаза движения товара по модели снабжения (группировка состояний 1С).
 export type SupplyPhase = 'no_goods' | 'in_transit' | 'in_stock' | 'terminal' | 'unknown'
@@ -70,8 +70,8 @@ export type PurchaseRow = {
   realized_qty?: number
   open_order_covered_qty?: number
   to_order_qty?: number
-  to_order_pct?: number
-  open_order_covered_pct?: number
+  to_order_pct?: number | null
+  open_order_covered_pct?: number | null
   plan_period_from?: string | null
   plan_period_to?: string | null
   period_label?: string | null
@@ -79,6 +79,8 @@ export type PurchaseRow = {
   horizon_buckets?: PurchaseHorizonBucket[]
   slices?: PurchaseCoverageSlice[]
   row_generator?: string | null
+  can_materialize: boolean
+  materialize_disabled_reason?: string | null
   fact_status: PurchaseFactStatus
   fact_source: string
 }

@@ -34,7 +34,6 @@ def test_production_order_sync_includes_completed_orders(db_session, monkeypatch
         item_name="Production Sync Item",
         item_article="PROD-SYNC-ITEM",
         item_ref1c="item-ref-1",
-        stock_qty=0,
         status="active",
     )
     db.add(item)
@@ -108,7 +107,7 @@ def test_production_order_sync_includes_completed_orders(db_session, monkeypatch
     assert product.destination_warehouse_ref1c == "warehouse-header"
 
 
-def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db_session, monkeypatch):
+def test_production_order_sync_missing_orders_remain_unchanged(db_session, monkeypatch):
     db = db_session
 
     old_order = ProductionOrder(
@@ -116,6 +115,7 @@ def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db
         order_date=datetime.datetime(2026, 4, 20),
         order_ref1c="order-ref-april",
         is_posted=True,
+        source="1c",
         deletion_mark=False,
     )
     may_order = ProductionOrder(
@@ -123,9 +123,17 @@ def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db
         order_date=datetime.datetime(2026, 5, 10),
         order_ref1c="order-ref-may",
         is_posted=True,
+        source="mrp",
         deletion_mark=False,
     )
-    db.add_all([old_order, may_order])
+    local_order = ProductionOrder(
+        order_number="LOCAL-ONLY",
+        order_date=datetime.datetime(2026, 5, 11),
+        order_ref1c="order-ref-local",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add_all([old_order, may_order, local_order])
     db.commit()
 
     class FakeODataClient:
@@ -162,8 +170,324 @@ def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db
 
     db.refresh(old_order)
     db.refresh(may_order)
+    db.refresh(local_order)
     assert old_order.deletion_mark is False
-    assert may_order.deletion_mark is True
+    assert may_order.deletion_mark is False
+    assert local_order.deletion_mark is False
+    assert old_order.order_number == "APR-OLD"
+    assert may_order.order_number == "MAY-MISSING"
+    assert local_order.order_number == "LOCAL-ONLY"
+
+
+def test_production_order_sync_respects_truncation_and_preserves_orders(db_session, monkeypatch):
+    db = db_session
+
+    mrp_order = ProductionOrder(
+        order_number="MRP-KEEP",
+        order_date=datetime.datetime(2026, 5, 12),
+        order_ref1c="order-ref-mrp",
+        is_posted=True,
+        source="mrp",
+        deletion_mark=False,
+    )
+    one_c_order = ProductionOrder(
+        order_number="1C-OLD",
+        order_date=datetime.datetime(2026, 5, 13),
+        order_ref1c="order-ref-1c",
+        is_posted=True,
+        source="1c",
+        deletion_mark=False,
+    )
+    db.add_all([mrp_order, one_c_order])
+    db.flush()
+    db.commit()
+
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            self.last_result_truncated = False
+
+        def get_all(self, entity_name, filter_query=None, select_fields=None, **_kwargs):
+            if entity_name == "Document_ЗаказНаПроизводство":
+                self.last_result_truncated = True
+                return [
+                    {
+                        "Ref_Key": "order-ref-1c-loaded",
+                        "Number": "NEW-1C",
+                        "Date": "2026-05-14T00:00:00",
+                        "Posted": True,
+                        "DeletionMark": False,
+                        "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                    }
+                ]
+            if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                return []
+            raise AssertionError(f"Unexpected OData entity: {entity_name}")
+
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", FakeODataClient)
+
+    with pytest.raises(Exception):
+        sync_production_orders_from_odata(
+            db,
+            ODataSyncRequest(
+                base_url="http://1c.example/odata",
+                entity_name="Document_ЗаказНаПроизводство",
+            ),
+        )
+
+    db.refresh(mrp_order)
+    db.refresh(one_c_order)
+    assert mrp_order.order_number == "MRP-KEEP"
+    assert one_c_order.order_number == "1C-OLD"
+    assert mrp_order.deletion_mark is False
+    assert one_c_order.deletion_mark is False
+
+
+def test_production_order_sync_fails_when_state_field_is_missing_from_payload(db_session, monkeypatch):
+    db = db_session
+
+    preserved = ProductionOrder(
+        order_number="PRESERVE",
+        order_date=datetime.datetime(2026, 5, 12),
+        order_ref1c="order-ref-present",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add(preserved)
+    db.commit()
+
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            self.last_result_truncated = False
+
+        def get_all(self, entity_name, filter_query=None, select_fields=None, **_kwargs):
+            if entity_name == "Document_ЗаказНаПроизводство":
+                return [
+                    {
+                        "Ref_Key": "order-ref-bad",
+                        "Number": "BAD",
+                        "Date": "2026-05-14T00:00:00",
+                        "Posted": True,
+                        "DeletionMark": False,
+                    }
+                ]
+            if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                return []
+            return []
+
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", FakeODataClient)
+
+    with pytest.raises(Exception):
+        sync_production_orders_from_odata(
+            db,
+            ODataSyncRequest(
+                base_url="http://1c.example/odata",
+                entity_name="Document_ЗаказНаПроизводство",
+            ),
+        )
+
+    assert (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_ref1c == "order-ref-present")
+        .one()
+        .deletion_mark
+        is False
+    )
+    assert (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_ref1c == "order-ref-present")
+        .one()
+        .order_number
+        == "PRESERVE"
+    )
+
+
+def test_production_order_sync_fails_when_product_lines_read_is_truncated(db_session, monkeypatch):
+    db = db_session
+
+    preserved = ProductionOrder(
+        order_number="PRESERVE-LINE",
+        order_date=datetime.datetime(2026, 5, 12),
+        order_ref1c="order-ref-preserve-lines",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add(preserved)
+    db.commit()
+
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            self.last_result_truncated = False
+
+        def get_all(self, entity_name, filter_query=None, select_fields=None, **_kwargs):
+            if entity_name == "Document_ЗаказНаПроизводство":
+                self.last_result_truncated = False
+                return [
+                    {
+                        "Ref_Key": "order-ref-preserve-lines",
+                        "Number": "LINES",
+                        "Date": "2026-05-12T00:00:00",
+                        "Posted": True,
+                        "DeletionMark": False,
+                        "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                    }
+                ]
+            if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                self.last_result_truncated = True
+                return []
+            return []
+
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", FakeODataClient)
+
+    with pytest.raises(Exception):
+        sync_production_orders_from_odata(
+            db,
+            ODataSyncRequest(
+                base_url="http://1c.example/odata",
+                entity_name="Document_ЗаказНаПроизводство",
+            ),
+        )
+
+    assert (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_ref1c == "order-ref-preserve-lines")
+        .one()
+        .deletion_mark
+        is False
+    )
+    assert (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_ref1c == "order-ref-preserve-lines")
+        .one()
+        .order_number
+        == "PRESERVE-LINE"
+    )
+
+
+def test_production_order_sync_allows_present_null_state_and_skips_record(db_session, monkeypatch):
+    db = db_session
+
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            self.last_result_truncated = False
+
+        def get_all(self, entity_name, filter_query=None, select_fields=None, **_kwargs):
+            if entity_name == "Document_ЗаказНаПроизводство":
+                return [
+                    {
+                        "Ref_Key": "order-ref-null",
+                        "Number": "NULL-STATE",
+                        "Date": "2026-05-14T00:00:00",
+                        "Posted": True,
+                        "DeletionMark": False,
+                        "СостояниеЗаказа_Key": None,
+                    }
+                ]
+            if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                return []
+            return []
+
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", FakeODataClient)
+
+    stats = sync_production_orders_from_odata(
+        db,
+        ODataSyncRequest(
+            base_url="http://1c.example/odata",
+            entity_name="Document_ЗаказНаПроизводство",
+        ),
+    )
+
+    assert stats["dry_run"] is True
+    assert stats["orders_total"] == 0
+
+
+def test_production_order_sync_skips_product_fields_for_mrp_source(db_session, monkeypatch):
+    db = db_session
+
+    item = Item(item_code="MRP-ITEM", item_name="MRP Item", item_ref1c="mrp-item")
+    spec = Specification(
+        spec_code="MRP-SPEC",
+        spec_name="MRP Spec",
+        spec_ref1c="mrp-spec",
+    )
+    stage = ProductionStage(stage_name="MRP Stage", stage_ref1c="mrp-stage")
+    db.add_all([item, spec, stage])
+    db.flush()
+
+    order = ProductionOrder(
+        order_number="MRP-ORIG",
+        order_date=datetime.datetime(2026, 5, 12),
+        order_ref1c="order-ref-mrp-sync",
+        is_posted=True,
+        source="mrp",
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=2.0,
+        produced_qty=0.0,
+        remaining_qty=2.0,
+        spec_id=spec.spec_id,
+        stage_id=stage.stage_id,
+        characteristic_ref1c="old-char",
+        destination_warehouse_ref1c="old-warehouse",
+    )
+    db.add(product)
+    db.commit()
+
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            self.last_result_truncated = False
+
+        def get_all(self, entity_name, filter_query=None, select_fields=None, **_kwargs):
+            if entity_name == "Document_ЗаказНаПроизводство":
+                return [
+                    {
+                        "Ref_Key": "order-ref-mrp-sync",
+                        "Number": "MRP-SYNC",
+                        "Date": "2026-05-12T00:00:00",
+                        "Posted": True,
+                        "DeletionMark": False,
+                        "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                    }
+                ]
+            if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                return [
+                    {
+                        "Ref_Key": "order-ref-mrp-sync",
+                        "LineNumber": 2,
+                        "Номенклатура_Key": "mrp-item",
+                        "Количество": 9.0,
+                        "Спецификация_Key": "missing",
+                        "Этап_Key": "missing-stage",
+                        "Характеристика_Key": "new-char",
+                        "СтруктурнаяЕдиница_Key": "new-warehouse",
+                    }
+                ]
+            return []
+
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", FakeODataClient)
+
+    sync_production_orders_from_odata(
+        db,
+        ODataSyncRequest(
+            base_url="http://1c.example/odata",
+            entity_name="Document_ЗаказНаПроизводство",
+        ),
+    )
+
+    db.refresh(order)
+    db.refresh(product)
+    assert order.order_number == "MRP-SYNC"
+    assert float(product.quantity) == 2.0
+    assert product.spec_id == spec.spec_id
+    assert product.stage_id == stage.stage_id
+    assert product.line_number == 1
+    assert product.characteristic_ref1c == "old-char"
+    assert product.destination_warehouse_ref1c == "old-warehouse"
 
 
 CUTOFF = datetime.datetime(2026, 7, 25)
@@ -331,6 +655,44 @@ def test_production_fact_cache_uses_exact_manufacture_link(db_session, monkeypat
     assert float(product.produced_qty) == 4.0
     assert float(other_product.produced_qty) == 0.0
     assert other_order.order_id != order.order_id
+
+
+def test_exact_manufacture_output_overflow_stays_surplus(db_session, monkeypatch):
+    db = db_session
+    _no_odata(monkeypatch)
+    _generation, batch = _accepted_generation(db)
+    item = _fact_item(db, code="ASM-EXACT-OVER")
+    order, product = _order_with_line(
+        db,
+        item=item,
+        order_ref1c="asm-exact-over-order",
+        qty=10,
+    )
+    db.add(
+        models.ProductionManufacture(
+            product_id=product.product_id,
+            order_id=order.order_id,
+            qty=10,
+            status="exported",
+            exported_ref1c="asm-exact-over-doc",
+        )
+    )
+    _assembly_fact(
+        db,
+        batch=batch,
+        item=item,
+        recorder_ref="asm-exact-over-doc",
+        qty=12,
+    )
+    db.commit()
+
+    stats = sync_production_facts(db)
+
+    assert stats["exact_link_facts"] == 1
+    assert stats["surplus_qty"] == 2.0
+    db.refresh(product)
+    assert float(product.produced_qty) == 10.0
+    assert float(product.remaining_qty) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -539,6 +901,39 @@ def test_production_fact_cache_spreads_order_fact_across_lines_oldest_first(
     assert float(second.remaining_qty) == 3.0
 
 
+def test_production_fact_cache_keeps_order_overflow_as_surplus(db_session, monkeypatch):
+    """Order output never exceeds its obligations; physical excess stays explicit."""
+    db = db_session
+    _no_odata(monkeypatch)
+    _generation, batch = _accepted_generation(db)
+    item = _fact_item(db)
+    order, first = _order_with_line(db, item=item, order_ref1c="asm-order", qty=4.0)
+    second = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=2,
+        quantity=5.0,
+        produced_qty=0,
+        remaining_qty=5.0,
+    )
+    db.add(second)
+    db.flush()
+    _assembly_fact(db, batch=batch, item=item, recorder_ref="asm-doc-over", qty=12)
+    _recorder_pull(db, recorder_ref="asm-doc-over", order_ref="asm-order")
+    db.commit()
+
+    stats = sync_production_facts(db)
+
+    assert stats["order_scope_facts"] == 1
+    assert stats["surplus_qty"] == 3.0
+    db.refresh(first)
+    db.refresh(second)
+    assert float(first.produced_qty) == 4.0
+    assert float(second.produced_qty) == 5.0
+    assert float(first.produced_qty) <= float(first.quantity)
+    assert float(second.produced_qty) <= float(second.quantity)
+
+
 def test_production_fact_cache_dry_run_does_not_persist(db_session, monkeypatch):
     db = db_session
     _no_odata(monkeypatch)
@@ -615,8 +1010,7 @@ def _spec_stage_fixture(db):
         item_name="Spec Sync Item",
         item_article="SPEC-SYNC-ITEM",
         item_ref1c="item-ref-spec",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     spec = Specification(
         spec_code="SP-1",

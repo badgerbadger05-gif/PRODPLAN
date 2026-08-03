@@ -16,6 +16,8 @@ type Props = {
 }
 
 export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
+  const formatCoveragePercent = (value: number | null | undefined) => (value == null ? 'н/д' : `${qty(value)}%`)
+
   const [card, setCard] = useState<PurchaseOrderCard | null>(null)
   const [cardError, setCardError] = useState('')
   const [cardLoading, setCardLoading] = useState(false)
@@ -64,9 +66,9 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
             <span>Поступило сейчас</span>
             <strong>{activeRow.realized_qty == null ? '—' : qty(activeRow.realized_qty)}</strong>
             <span>Покрыто заказами</span>
-            <strong>{activeRow.open_order_covered_qty == null ? '—' : `${qty(activeRow.open_order_covered_qty)} (${qty(activeRow.open_order_covered_pct ?? 0)}%)`}</strong>
+            <strong>{activeRow.open_order_covered_qty == null ? '—' : `${qty(activeRow.open_order_covered_qty)} (${formatCoveragePercent(activeRow.open_order_covered_pct)})`}</strong>
             <span>К заказу</span>
-            <strong>{activeRow.to_order_qty == null ? '—' : `${qty(activeRow.to_order_qty)} (${qty(activeRow.to_order_pct ?? 0)}%)`}</strong>
+            <strong>{activeRow.to_order_qty == null ? '—' : `${qty(activeRow.to_order_qty)} (${formatCoveragePercent(activeRow.to_order_pct)})`}</strong>
           </>
         ) : (
           <>

@@ -69,6 +69,20 @@ def _setup_items(db):
     return i1, i2
 
 
+def _explicit_empty_custody_baseline(db, generation_id: int) -> None:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(generation.id),
+        cutoff=generation.cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=generation.cutoff,
+        built_at=generation.cutoff,
+    ))
+    db.commit()
+
+
 def _rows(qty1=10, qty2=4):
     # converted get_stock_from_1c_odata shape (code/ref/organization_ref/warehouse_ref/qty)
     return [
@@ -348,6 +362,7 @@ def test_seeded_generation_reaches_first_accepted_truth_through_operator_endpoin
     )
     assert seeded.status_code == 200
     generation_id = seeded.json()["ledger_generation_id"]
+    _explicit_empty_custody_baseline(db_session, generation_id)
 
     accepted = client.post(
         "/api/v1/item-ledger/admin/generations/accept",
@@ -406,6 +421,7 @@ def test_historical_phase0_e2e_bootstrap_import_verify_and_accept(
     )
     assert bootstrapped.status_code == 200
     generation_id = bootstrapped.json()["ledger_generation_id"]
+    _explicit_empty_custody_baseline(db_session, generation_id)
     assert bootstrapped.json()["opening"]["entries_created"] == 2
 
     imported = client.post(

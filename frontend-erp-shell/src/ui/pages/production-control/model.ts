@@ -1,5 +1,4 @@
 import {
-  coverageLabels,
   type EmployeeOption,
   type OrderRow,
   type ProductionFilters,
@@ -7,7 +6,86 @@ import {
   type WorkshopWarehouse,
 } from '../../../domain/productionControl'
 import type { ProductionOrderSortKey } from './productionOrdersDoctype'
-import { coverageDrivenStatuses } from './helpers'
+
+export const DEFAULT_PRODUCTION_FILTERS: ProductionFilters = {
+  search: '',
+  status: '',
+  workshop_id: '',
+  coverage_status: '',
+  root_item_id: '',
+  planning_contour: '',
+  sort_by: 'planned_start_date',
+  sort_dir: 'asc',
+}
+
+export type ProductionControlUrlState = {
+  filters: ProductionFilters
+  offset: number
+  activeProductId: number | null
+}
+
+const URL_FILTER_KEYS = [
+  'search',
+  'status',
+  'workshop_id',
+  'coverage_status',
+  'root_item_id',
+  'planning_contour',
+  'sort_by',
+  'sort_dir',
+] as const
+
+function nonNegativeInteger(value: string | null): number {
+  if (!value || !/^\d+$/u.test(value)) return 0
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) ? parsed : 0
+}
+
+function positiveInteger(value: string | null): number | null {
+  const parsed = nonNegativeInteger(value)
+  return parsed > 0 ? parsed : null
+}
+
+export function parseProductionControlUrlState(
+  params: URLSearchParams,
+): ProductionControlUrlState {
+  return {
+    filters: {
+      search: params.get('search') ?? '',
+      status: params.get('status') ?? '',
+      workshop_id: params.get('workshop_id') ?? '',
+      coverage_status: params.get('coverage_status') ?? '',
+      root_item_id: params.get('root_item_id') ?? '',
+      planning_contour: params.get('planning_contour') === 'mrp' ? 'mrp' : '',
+      sort_by: 'planned_start_date',
+      sort_dir: params.get('sort_dir') === 'desc' ? 'desc' : 'asc',
+    },
+    offset: nonNegativeInteger(params.get('offset')),
+    activeProductId: positiveInteger(params.get('active_product_id')),
+  }
+}
+
+export function writeProductionControlUrlState(
+  current: URLSearchParams,
+  state: ProductionControlUrlState,
+): URLSearchParams {
+  const next = new URLSearchParams(current)
+  for (const key of URL_FILTER_KEYS) next.delete(key)
+  next.delete('offset')
+  next.delete('active_product_id')
+
+  for (const [key, value] of Object.entries(state.filters)) {
+    if (!value) continue
+    if (key === 'sort_by' && value === DEFAULT_PRODUCTION_FILTERS.sort_by) continue
+    if (key === 'sort_dir' && value === DEFAULT_PRODUCTION_FILTERS.sort_dir) continue
+    next.set(key, value)
+  }
+  if (state.offset > 0) next.set('offset', String(state.offset))
+  if (state.activeProductId != null) {
+    next.set('active_product_id', String(state.activeProductId))
+  }
+  return next
+}
 
 export function buildProductionOrderParams({
   filters,
@@ -65,26 +143,6 @@ export function deletableProductionRows(
   selectedIds: ReadonlySet<number>,
 ): OrderRow[] {
   return selectedProductionRows(rows, selectedIds).filter((row) => !row.order_ref1c)
-}
-
-export function applyMaterialCoverage(
-  rows: readonly OrderRow[],
-  productId: number,
-  coverageStatus: string,
-  coverageLabel?: string | null,
-): OrderRow[] {
-  return rows.map((row) => {
-    if (row.product_id !== productId) return row
-    const canApply = (!row.issue_status || row.issue_status === 'not_requested')
-      && coverageDrivenStatuses.has(String(row.coverage_status || row.status || ''))
-    if (!canApply) return row
-    return {
-      ...row,
-      status: coverageDrivenStatuses.has(String(row.status || '')) ? coverageStatus : row.status,
-      coverage_status: coverageStatus,
-      coverage_label: coverageLabel || coverageLabels[coverageStatus] || coverageStatus,
-    }
-  })
 }
 
 export function buildProductionSettingsPayload(

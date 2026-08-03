@@ -1,13 +1,7 @@
 """Shared stock helpers for MRP.
 
-Both `period_plan_service._explode_bom_net_first` and
-`planning_service.compute_planning_preview` need per-item effective stock
-that applies the warehouse availability settings.
-
-`Item.stock_qty` can lag behind the detailed warehouse settings. Using it
-directly in MRP may let the planner see stock parked in unchecked warehouses
-or in `IgnoredWarehouse`, then production control later blocks the material
-issue because the source warehouse cannot be picked.
+Both `period_plan_service._explode_bom_net_first` and MRP entry points
+need per-item effective stock that applies the warehouse availability settings.
 
 This helper mirrors the policy used in
 `production_control_material_availability._stock_by_item`, but returns the
@@ -18,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -32,10 +26,94 @@ from ..models import (
     StockBin,
     StockWarehouse,
 )
+from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from .production_output_truth import accepted_product_remaining_expr
 
 
 _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+@dataclass(frozen=True)
+class PlanningWarehouseScope:
+    has_warehouse_rows: bool
+    selected_refs: Set[str]
+    ignored_refs: Set[str]
+    finished_refs: Set[str]
+    organization_ref: str = DEFAULT_ORGANIZATION_REF1C
+
+
+def planning_warehouse_scope(db: Session) -> PlanningWarehouseScope:
+    ignored_refs = {
+        str(ref) for (ref,) in db.query(IgnoredWarehouse.warehouse_ref1c).all() if ref
+    }
+    warehouse_rows = db.query(
+        StockWarehouse.warehouse_ref1c,
+        StockWarehouse.is_selected,
+        StockWarehouse.is_finished_goods,
+    ).all()
+    return PlanningWarehouseScope(
+        has_warehouse_rows=bool(warehouse_rows),
+        selected_refs={
+            str(ref) for ref, selected, finished in warehouse_rows
+            if ref and bool(selected) and not bool(finished)
+        },
+        ignored_refs=ignored_refs,
+        finished_refs={
+            str(ref) for ref, _selected, finished in warehouse_rows
+            if ref and bool(finished)
+        },
+    )
+
+
+def apply_planning_warehouse_scope(
+    query: Any,
+    scope: PlanningWarehouseScope,
+    *,
+    warehouse_column: Any,
+    organization_column: Any,
+    organization_ref: Optional[str] = DEFAULT_ORGANIZATION_REF1C,
+) -> Any:
+    if scope.has_warehouse_rows:
+        query = (
+            query.filter(warehouse_column.in_(scope.selected_refs))
+            if scope.selected_refs
+            else query.filter(False)
+        )
+    if scope.ignored_refs:
+        query = query.filter(~warehouse_column.in_(scope.ignored_refs))
+    if scope.finished_refs:
+        query = query.filter(~warehouse_column.in_(scope.finished_refs))
+    if organization_ref is not None:
+        query = query.filter(organization_column == organization_ref)
+    return query
+
+
+def planning_stock_by_item(
+    db: Session,
+    ledger_generation_id: int,
+    *,
+    item_ids: Optional[Set[int]] = None,
+    organization_ref: Optional[str] = DEFAULT_ORGANIZATION_REF1C,
+) -> Dict[int, float]:
+    if item_ids is not None and not item_ids:
+        return {}
+    scope = planning_warehouse_scope(db)
+    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
+        StockBin.ledger_generation_id == int(ledger_generation_id)
+    )
+    if item_ids is not None:
+        query = query.filter(StockBin.item_id.in_(sorted(item_ids)))
+    query = apply_planning_warehouse_scope(
+        query,
+        scope,
+        warehouse_column=StockBin.warehouse_ref1c,
+        organization_column=StockBin.organization_ref,
+        organization_ref=organization_ref,
+    )
+    return {
+        int(item_id): float(quantity or 0)
+        for item_id, quantity in query.group_by(StockBin.item_id).all()
+    }
 
 
 def _production_supply_qty_expr():
@@ -52,46 +130,10 @@ def _production_supply_qty_expr():
 
 def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
     """Read the accepted physical Item Ledger; no mutable-stock fallback."""
-    return _effective_stock_by_item_all_from_bin(db)
-
-
-def _effective_stock_by_item_all_from_bin(db: Session) -> Dict[int, float]:
-    """Aggregate StockBin from the current accepted generation and contour."""
     from .planning_truth import require_accepted
 
     truth = require_accepted(db)
-    generation_id = int(truth.generation_id)
-    ignored_refs = {
-        str(r[0]) for r in db.query(IgnoredWarehouse.warehouse_ref1c).all() if r and r[0]
-    }
-    warehouse_rows = db.query(
-        StockWarehouse.warehouse_ref1c,
-        StockWarehouse.is_selected,
-        StockWarehouse.is_finished_goods,
-    ).all()
-    # selected minus finished_goods — ГП stays out of the pool even if selected.
-    selected_refs = {
-        str(ref) for ref, sel, fg in warehouse_rows if ref and bool(sel) and not bool(fg)
-    }
-    finished_goods_refs = {str(ref) for ref, _sel, fg in warehouse_rows if ref and bool(fg)}
-    sum_query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
-        StockBin.ledger_generation_id == generation_id
-    )
-    if warehouse_rows:
-        if selected_refs:
-            sum_query = sum_query.filter(StockBin.warehouse_ref1c.in_(selected_refs))
-        else:
-            sum_query = sum_query.filter(False)
-    if ignored_refs:
-        sum_query = sum_query.filter(~StockBin.warehouse_ref1c.in_(ignored_refs))
-    if finished_goods_refs:
-        sum_query = sum_query.filter(~StockBin.warehouse_ref1c.in_(finished_goods_refs))
-    sum_rows = sum_query.group_by(StockBin.item_id).all()
-    breakdown_stocks: Dict[int, float] = {
-        int(iid): float(qty or 0.0) for iid, qty in sum_rows
-    }
-
-    return breakdown_stocks
+    return planning_stock_by_item(db, int(truth.generation_id))
 
 
 def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], float]]]:

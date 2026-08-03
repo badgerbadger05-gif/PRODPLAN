@@ -20,6 +20,7 @@ from app.models import (
     PlannedPurchase,
     PlannedRework,
     PlanningRun,
+    PlanningReadRow,
     PlanningReadSnapshot,
     PlanningTruthState,
     ProductionResource,
@@ -89,6 +90,39 @@ def _publish_result_snapshot(db, run: PlanningRun) -> PlanningReadSnapshot:
     return build_mrp_result_snapshot(db, run.run_id)
 
 
+def _publish_manual_purchase_snapshot(db, run: PlanningRun, rows: list[dict]) -> PlanningReadSnapshot:
+    db.flush()
+    snapshot = PlanningReadSnapshot(
+        consumer="mrp_result",
+        snapshot_key=f"run:{run.run_id}",
+        ledger_generation_id=run.ledger_generation_id,
+        cutoff=run.ledger_cutoff,
+        truth_status="accepted",
+        payload={
+            "run_id": run.run_id,
+            "row_counts": {"purchase": len(rows)},
+            "total_qty": {
+                "purchase": float(sum(float(row.get("qty") or 0) for row in rows)),
+            },
+        },
+        published_at=datetime.datetime.now(timezone.utc),
+    )
+    db.add(snapshot)
+    db.flush()
+    for index, source_row in enumerate(rows):
+        db.add(
+            PlanningReadRow(
+                snapshot_id=snapshot.id,
+                row_key=f"purchase-{index}",
+                row_kind="purchase",
+                sort_key=f"2025-01-1{index}|00000000000{index}|000000000000",
+                payload=source_row,
+            )
+        )
+    db.flush()
+    return snapshot
+
+
 @pytest.fixture()
 def client(db_session):
     app = FastAPI()
@@ -118,8 +152,7 @@ def test_rework_list_endpoint_returns_rows_with_shortage_fields(client, db_sessi
         item_article="RW-API-1",
         replenishment_method="Переработка",
         unit="u-api-rw",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     spec = Specification(spec_code="SPEC-API-RW", spec_name="Spec API RW", spec_ref1c="spec-api-rw")
     db.add_all([unit, item, spec])
@@ -309,6 +342,233 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
     assert group["partial_orders"] == 1
 
 
+def test_purchases_endpoint_supports_supplier_and_category_filters(
+    client,
+    db_session,
+):
+    run = _mk_run(db_session)
+    purchase_1 = Item(
+        item_code="PUR-API-1",
+        item_name="Purchase with supplier",
+        item_article="PUR-API-1",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+        category_id=None,
+    )
+    purchase_2 = Item(
+        item_code="PUR-API-2",
+        item_name="Purchase with supplier B",
+        item_article="PUR-API-2",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+    )
+    purchase_3 = Item(
+        item_code="PUR-API-3",
+        item_name="Purchase no supplier",
+        item_article="PUR-API-3",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+    )
+    category_a = ItemCategory(
+        category_name="Категория A API",
+        category_ref1c="cat-a-api",
+    )
+    category_b = ItemCategory(
+        category_name="Категория B API",
+        category_ref1c="cat-b-api",
+    )
+    db_session.add_all([purchase_1, purchase_2, purchase_3, category_a, category_b])
+    db_session.flush()
+
+    purchase_4 = Item(
+        item_code="PUR-API-4",
+        item_name="Purchase category A",
+        item_article="PUR-API-4",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+        category_id=category_a.category_id,
+    )
+    purchase_5 = Item(
+        item_code="PUR-API-5",
+        item_name="Purchase category B",
+        item_article="PUR-API-5",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+        category_id=category_b.category_id,
+    )
+    db_session.add_all(
+        [
+            purchase_4,
+            purchase_5,
+        ]
+    )
+    db_session.flush()
+    _publish_manual_purchase_snapshot(
+        db_session,
+        run,
+        [
+            {
+                "item_id": purchase_1.item_id,
+                "item_name": "Purchase with supplier",
+                "supplier_ref1c": "supp-1",
+                "supplier_name": "Поставщик",
+                "qty": 1,
+            },
+            {
+                "item_id": purchase_2.item_id,
+                "item_name": "Purchase with supplier B",
+                "supplier_ref1c": "supp-2",
+                "supplier_name": "Поставщик 2",
+                "qty": 2,
+            },
+            {
+                "item_id": purchase_3.item_id,
+                "item_name": "Purchase no supplier",
+                "supplier_ref1c": None,
+                "supplier_name": "",
+                "qty": 3,
+            },
+            {
+                "item_id": purchase_4.item_id,
+                "item_name": "Purchase category A",
+                "supplier_ref1c": "supp-a-category",
+                "supplier_name": "Кат",
+                "category_id": category_a.category_id,
+                "category_ref1c": "cat-a-api",
+                "qty": 4,
+            },
+            {
+                "item_id": purchase_5.item_id,
+                "item_name": "Purchase category B",
+                "supplier_ref1c": "supp-b-category",
+                "supplier_name": "Кат",
+                "category_id": category_b.category_id,
+                "category_ref1c": "cat-b-api",
+                "qty": 5,
+            },
+        ],
+    )
+    db_session.commit()
+
+    filtered = client.get(
+        f"/api/v1/plan/results/{run.run_id}/purchases?supplier_ref1c=supp-2"
+    )
+    assert filtered.status_code == 200
+    payload = filtered.json()
+    assert payload["total"] == 1
+    assert payload["rows"][0]["supplier_ref1c"] == "supp-2"
+    assert payload["rows"][0]["item_name"] == "Purchase with supplier B"
+
+    filtered_by_category = client.get(
+        f"/api/v1/plan/results/{run.run_id}/purchases?category_id={category_a.category_id}"
+    )
+    assert filtered_by_category.status_code == 200
+    payload = filtered_by_category.json()
+    assert payload["total"] == 1
+    assert payload["rows"][0]["item_name"] == "Purchase category A"
+
+    filtered_by_ref = client.get(
+        f"/api/v1/plan/results/{run.run_id}/purchases?category_ref1c=cat-b-api"
+    )
+    assert filtered_by_ref.status_code == 200
+    payload = filtered_by_ref.json()
+    assert payload["total"] == 1
+    assert payload["rows"][0]["item_name"] == "Purchase category B"
+
+    missing_supplier = client.get(
+        f"/api/v1/plan/results/{run.run_id}/purchases?supplier_ref1c=__missing_supplier_name"
+    )
+    assert missing_supplier.status_code == 200
+    payload = missing_supplier.json()
+    assert payload["total"] == 1
+    assert payload["rows"][0]["item_name"] == "Purchase no supplier"
+
+
+def test_purchases_endpoint_supports_missing_category_filter(
+    client,
+    db_session,
+):
+    run = _mk_run(db_session)
+    missing_item = Item(
+        item_code="PUR-MISS-1",
+        item_name="Purchase missing category",
+        item_article="PUR-MISS-1",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+    )
+    category_item = Item(
+        item_code="PUR-MISS-2",
+        item_name="Purchase with category",
+        item_article="PUR-MISS-2",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+    )
+    db_session.add_all([missing_item, category_item])
+    category = ItemCategory(category_name="Категория для контроля", category_ref1c="cat-keep")
+    db_session.add(category)
+    db_session.flush()
+    category_row = Item(
+        item_code="PUR-MISS-3",
+        item_name="Purchase category",
+        item_article="PUR-MISS-3",
+        replenishment_method="Покупка",
+        unit="шт",
+        status="active",
+        category_id=category.category_id,
+    )
+    db_session.add(category_row)
+    db_session.flush()
+
+    _publish_manual_purchase_snapshot(
+        db_session,
+        run,
+        [
+            {
+                "item_id": missing_item.item_id,
+                "item_name": "Purchase missing category",
+                "supplier_ref1c": None,
+                "supplier_name": "",
+                "qty": 1,
+            },
+            {
+                "item_id": category_item.item_id,
+                "item_name": "Purchase with category",
+                "supplier_ref1c": "supp-x",
+                "supplier_name": "X",
+                "category_id": category.category_id,
+                "category_ref1c": "cat-keep",
+                "qty": 2,
+            },
+            {
+                "item_id": category_row.item_id,
+                "item_name": "Purchase category",
+                "supplier_ref1c": "supp-y",
+                "supplier_name": "Y",
+                "category_id": category.category_id,
+                "category_ref1c": "cat-keep",
+                "qty": 3,
+            },
+        ],
+    )
+    db_session.flush()
+    db_session.commit()
+
+    missing_category_response = client.get(
+        f"/api/v1/plan/results/{run.run_id}/purchases?category_ref1c=__missing_category"
+    )
+    assert missing_category_response.status_code == 200
+    payload = missing_category_response.json()
+    assert payload["total"] == 1
+    assert payload["rows"][0]["item_name"] == "Purchase missing category"
+
+
 def test_export_endpoints_return_xlsx_payloads(client, db_session):
     db = db_session
 
@@ -420,8 +680,7 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
         item_article="PROD-API-1",
         replenishment_method="Производство",
         unit="u-api-prod",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add_all([unit, stage, area, item])
     db.flush()

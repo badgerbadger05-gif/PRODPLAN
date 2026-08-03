@@ -2,6 +2,7 @@ import { coverageLabels, productionStatusOptions, productionStatusSelectValue, t
 import { dateRu, qty } from '../../../lib/format'
 import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from '../../tableDoctype'
 import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
+import { ForecastShift } from '../period-plan/ForecastShift'
 
 type Props = {
   rows: OrderRow[]
@@ -17,17 +18,6 @@ type Props = {
 
 const manualProductionStatusOptions = productionStatusOptions.filter(([value]) => value !== 'completed')
 
-function ForecastShift({ row }: { row: OrderRow }) {
-  if (row.forecast_shift_days === null || row.forecast_shift_days === undefined) return null
-  const days = Number(row.forecast_shift_days)
-  if (!Number.isFinite(days) || days === 0) return null
-  const cls = days > 5 ? 'late' : days > 0 ? 'warn' : 'early'
-  const label = `${days > 0 ? '+' : ''}${days} дн`
-  const dateText = row.forecast_date ? dateRu(row.forecast_date).slice(0, 5) : ''
-  const title = [row.forecast_reason, row.forecast_date ? `прогноз ${dateRu(row.forecast_date)}` : null].filter(Boolean).join(' · ')
-  return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
-}
-
 function orderSubline(row: OrderRow) {
   if (row.order_ref1c) return row.order_one_c_number || (row.order_source === '1c' ? row.order_number : 'Открыт в 1С')
   return `${dateRu(row.order_date)} · стр. ${row.line_number || '—'}`
@@ -35,13 +25,6 @@ function orderSubline(row: OrderRow) {
 
 function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
-}
-
-function planningZoneLabel(zone?: string | null) {
-  if (zone === 'red') return 'Красная зона'
-  if (zone === 'yellow') return 'Жёлтая зона'
-  if (zone === 'green') return 'Зелёная зона'
-  return zone || 'DBR'
 }
 
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
@@ -133,18 +116,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               </strong>
               <span title={row.item_article || row.item_code || ''}>
                 {row.item_article || row.item_code || ''}
-                {row.planning?.contour === 'dbr_feeder' && (
-                  <span
-                    className={`planningBadge ${row.planning.zone || 'dbr'}`}
-                    title={[
-                      planningZoneLabel(row.planning.zone),
-                      row.planning.priority != null ? `приоритет ${row.planning.priority}` : null,
-                      row.planning.signal_type,
-                    ].filter(Boolean).join(' · ')}
-                  >
-                    DBR{row.planning.priority != null ? ` ${row.planning.priority}` : ''}
-                  </span>
-                )}
+                {row.source === 'mrp' && <span className="planningBadge mrp">MRP</span>}
               </span>
             </td>
             <td className="numCell">
@@ -153,10 +125,10 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             </td>
             <td className="dateCell">
               <span>
-                {row.planning?.contour === 'dbr_feeder' ? 'Нужно' : 'С'}: {dateRu(row.planning?.required_date || row.planned_start_date) || '—'}
+                {row.source === 'mrp' ? 'Нужно' : 'С'}: {dateRu(row.planned_start_date) || '—'}
               </span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
-              <ForecastShift row={row} />
+              <ForecastShift forecast={row} />
             </td>
             <td>
               <strong>{row.workshop_name || 'Не назначен'}</strong>

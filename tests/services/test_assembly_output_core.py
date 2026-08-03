@@ -12,6 +12,10 @@ def _line(line_id: int, qty: str, *, item_id: int = 1):
     return QueueCandidate(10 + line_id, line_id, item_id, Decimal(qty))
 
 
+def _line_with_plan(plan_id: int, line_id: int, qty: str, *, item_id: int = 1):
+    return QueueCandidate(plan_id, line_id, item_id, Decimal(qty))
+
+
 def test_exact_never_spills_into_another_plan():
     result = allocate_output_fact(
         OutputFact(100, 1, Decimal("9"), (2,), "exact_plan_line"),
@@ -45,8 +49,24 @@ def test_ambiguous_exact_never_allocates():
     assert result.surplus_qty == Decimal("5")
 
 
+def test_multiple_exact_rows_of_same_plan_allocate_fifo_and_not_spill():
+    result = allocate_output_fact(
+        OutputFact(107, 1, Decimal("9"), (1, 2), "exact_plan_line"),
+        [
+            _line_with_plan(11, 1, "4"),
+            _line_with_plan(11, 2, "5"),
+            _line_with_plan(11, 3, "7"),
+        ],
+    )
+    assert [(row.plan_line_id, row.qty) for row in result.allocations] == [
+        (1, Decimal("4")),
+        (2, Decimal("5")),
+    ]
+    assert result.surplus_qty == Decimal("0")
+
+
 def test_other_items_and_exhausted_lines_are_ignored_deterministically():
-    fact = OutputFact(103, 1, Decimal("4"))
+    fact = OutputFact(108, 1, Decimal("4"))
     rows = [_line(1, "0"), _line(2, "7", item_id=2), _line(3, "4")]
     first = allocate_output_fact(fact, rows)
     second = allocate_output_fact(fact, rows)

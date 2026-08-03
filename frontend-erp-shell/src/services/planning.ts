@@ -6,7 +6,6 @@ import type {
   MrpReworkRow,
   MrpSummary,
   PlanningRunsResponse,
-  StartPlanningRunResponse,
 } from '../domain/planning'
 import { api } from '../lib/api'
 
@@ -15,13 +14,6 @@ export function listPlanningRuns(params: { limit?: number; offset?: number } = {
   if (params.limit) search.set('limit', String(params.limit))
   if (typeof params.offset === 'number') search.set('offset', String(params.offset))
   return api<PlanningRunsResponse>(`/v1/plan/runs?${search.toString()}`)
-}
-
-export function startPlanningRun(body: { horizon_days?: number; started_by?: string } = {}) {
-  return api<StartPlanningRunResponse>('/v1/plan/calc', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
 }
 
 export function getPlanningRunSummary(runId: number) {
@@ -34,6 +26,9 @@ type MrpSnapshotQuery = {
   date_from?: string
   date_to?: string
   root_item_id?: number | null
+  supplier_ref1c?: string | null
+  category_id?: number | null
+  category_ref1c?: string | null
   limit?: number
   offset?: number
 }
@@ -45,6 +40,9 @@ function buildResultQuery(params: MrpSnapshotQuery) {
   if (params.date_from) search.set('date_from', params.date_from)
   if (params.date_to) search.set('date_to', params.date_to)
   if (params.root_item_id) search.set('root_item_id', String(params.root_item_id))
+  if (params.supplier_ref1c) search.set('supplier_ref1c', params.supplier_ref1c)
+  if (params.category_id) search.set('category_id', String(params.category_id))
+  if (params.category_ref1c) search.set('category_ref1c', params.category_ref1c)
   if (params.limit) search.set('limit', String(params.limit))
   if (typeof params.offset === 'number') search.set('offset', String(params.offset))
   return search.toString()
@@ -82,25 +80,6 @@ export function exportPlanningResultRework(runId: number, params: MrpSnapshotQue
   return api<{ data_base64?: string; filename?: string; content_type?: string }>(
     `/v1/plan/results/${runId}/rework/export?${buildResultQuery(params)}`,
   )
-}
-
-export function getShortageReport(runId: number) {
-  return api<{ data_base64?: string; filename?: string; content_type?: string; message?: string }>(
-    `/v1/plan/results/${runId}/shortage-report`,
-  )
-}
-
-export function createProductionControlOrdersFromMrp(body: {
-  run_id: number
-  date_from?: string
-  date_to?: string
-  planned_order_ids?: number[]
-  dry_run?: boolean
-}) {
-  return api<Record<string, unknown>>('/v1/production-control/orders/from-mrp', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
 }
 
 export function exportPurchasesTo1C(runId: number, body: {

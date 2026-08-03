@@ -11,9 +11,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app import models
-from app.database import Base, get_db
+from app.database import get_db
 from app.routers.purchase_control import router as purchase_control_router
 from app.services import planning_truth
+from app.services import purchase_control_materialization as pcm
+from app.routers import purchase_control as purchase_control_router_module
 from app.services.purchase_control_snapshot import build_candidate_snapshot
 
 
@@ -26,6 +28,26 @@ CAPABILITIES = {
 
 
 _fixture_seq = count(1)
+_BASE_URL = "http://mtzdock/unf_demo/odata/standard.odata"
+_MATERIALIZATION_DESTINATION = "00000000-0000-0000-0000-000000000001"
+
+
+@pytest.fixture(autouse=True)
+def _materialization_purchase_odata_config(monkeypatch):
+    config = {
+        "base_url": _BASE_URL,
+        "purchase_destination_warehouse_ref1c": _MATERIALIZATION_DESTINATION,
+    }
+    monkeypatch.setattr(
+        pcm,
+        "_load_odata_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        pcm.purchase_control_snapshot,
+        "_load_odata_config",
+        lambda: config,
+    )
 
 
 def _accepted_generation(db) -> tuple[models.LedgerGeneration, models.Item, models.Supplier]:
@@ -237,7 +259,22 @@ def test_materialize_endpoint_dry_run_preview(client, db_session):
     assert db_session.query(models.PurchaseExportObligationAllocation).count() == 0
 
 
-def test_materialize_endpoint_returns_not_configured_when_materializer_missing(client, db_session):
+def test_materialize_endpoint_returns_not_configured_when_materializer_missing(
+    client,
+    db_session,
+    monkeypatch,
+):
+    def _missing_writer(
+        _db,
+        *_args,
+        **_kwargs,
+    ):
+        raise pcm.PurchaseControlMaterializerNotConfigured(
+            "purchase-control materialization writer is not configured"
+        )
+
+    monkeypatch.setattr(purchase_control_router_module, "materialize_rows", _missing_writer)
+
     _generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
 

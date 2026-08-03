@@ -48,8 +48,7 @@ def _item(db, code: str, name: str, *, method: str = "Производство",
         item_name=name,
         item_article=code,
         unit="шт",
-        stock_qty=stock,
-        replenishment_method=method,
+                replenishment_method=method,
         replenishment_time=0,
         status="active",
     )
@@ -340,6 +339,15 @@ def _publish_stock(db, generation, item_id: int, quantity: float) -> None:
     generation.accepted_at = datetime(2026, 7, 26)
     pointer = db.get(models.PlanningTruthState, 1)
     pointer.current_generation_id = generation.id
+    db.add(
+        models.ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=generation.id,
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+        )
+    )
     db.flush()
 
 

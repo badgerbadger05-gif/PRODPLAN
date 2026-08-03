@@ -298,16 +298,13 @@ def _database_runtime(db_session):
     )
 
 
-def test_database_preflight_rejects_missing_item_and_missing_rate(db_session):
+def test_database_preflight_allows_items_outside_the_drum(db_session):
     from app import models
 
     db_session.add(models.Item(item_code="NO-RATE", item_name="No rate"))
     db_session.commit()
 
-    with pytest.raises(ReplayError, match="items not found: UNKNOWN"):
-        _database_runtime(db_session).preflight_assembly_rates(["UNKNOWN"])
-    with pytest.raises(ReplayError, match="missing positive rate.*NO-RATE"):
-        _database_runtime(db_session).preflight_assembly_rates(["NO-RATE"])
+    _database_runtime(db_session).preflight_assembly_rates(["UNKNOWN", "NO-RATE"])
 
 
 def test_database_preflight_rejects_ambiguous_positive_rates(db_session):

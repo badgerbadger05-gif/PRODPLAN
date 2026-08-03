@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type {
   BomFlattenedItem,
-  BomItem,
+  BomItemIdentity,
   SpecFlatRow,
   SpecNode,
 } from '../../../domain/specification'
@@ -103,7 +103,7 @@ describe('specification model', () => {
       item_code: 'PUMP',
       item_name: 'Насос',
       item_article: 'НАС-01',
-    } satisfies BomItem
+    } satisfies BomItemIdentity
 
     expect(itemTitle(item)).toBe('НАС-01 · Насос')
     expect(itemTitle({ ...item, item_article: null })).toBe('Насос')
@@ -118,6 +118,7 @@ describe('specification model', () => {
     expect(qualitySeverityClass('error')).toBe('failed')
     expect(qualitySeverityClass('warning')).toBe('partial')
     expect(qualitySeverityClass('info')).toBe('ready')
+    expect(qualitySeverityClass('future-severity')).toBe('failed')
   })
 
   it('normalizes filters and combines exact method with case-insensitive text search', () => {

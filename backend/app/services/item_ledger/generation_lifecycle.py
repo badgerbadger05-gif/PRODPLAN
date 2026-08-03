@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
+import json
 import re
 from typing import Any, Callable
 
@@ -27,7 +29,14 @@ from .historical_replay_persistence import (
     _ALGORITHM_VERSION as REPLAY_ALGORITHM_VERSION,
     run_historical_replay,
 )
-from .future_supply_capture import carry_forward_future_supply
+from .future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+    FUTURE_SUPPLY_CAPTURE_STAGE,
+    FutureSupplyCaptureError,
+    replace_future_supply_capture,
+    carry_forward_future_supply,
+    verify_future_supply_capture,
+)
 from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
@@ -40,14 +49,26 @@ from .assembly_output_persistence import (
 from .drum_schedule_persistence import materialize_drum_schedule
 from .shelf_projection_persistence import materialize_shelf_projections
 from .replenishment_work_item_builder import materialize_replenishment_work_items
+from .reservation_consumption_persistence import (
+    ALGORITHM_VERSION as RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+    materialize_reservation_consumption_allocations,
+)
 from .reservation import replenishment_remaining
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.purchase_control_snapshot import (
+    PurchaseJournalPromotionError,
     build_candidate_snapshot as build_purchase_journal_candidate,
+    promote_candidate_snapshot as promote_purchase_journal_candidate,
 )
 from app.services.production_control_journal_snapshot import (
+    ProductionControlJournalPromotionError,
     build_candidate_snapshot as build_production_journal_candidate,
+    promote_candidate_snapshot as promote_production_journal_candidate,
 )
+from app.services.production_material_custody_projection import (
+    build_material_custody_projection,
+)
+from app.services.mrp_result_snapshot import build_mrp_result_snapshot
 
 
 CAPABILITIES = {
@@ -67,6 +88,9 @@ CAPABILITIES = {
     # advertise this: consumers of "ordered"/"in transit" must fail closed
     # rather than read a fabricated zero out of an empty projection.
     "future_supply": True,
+    # §16 requires explicit physical consumption assignment records for each
+    # generation before exposing free-S0 semantics to downstream consumers.
+    "reservation_consumption_allocation": True,
 }
 PHYSICAL_REFRESH_KIND = "physical_refresh"
 _REPLENISHMENT_WORK_ITEM_ALGORITHM_VERSION = "physical-refresh-replenishment-work-item/1"
@@ -81,6 +105,38 @@ class GenerationValidationError(ValueError):
 
 def _d(value: Any) -> Decimal:
     return Decimal(str(value or 0))
+
+
+def _d_int(value: Any, field: str) -> int:
+    parsed = _d(value)
+    if parsed != parsed.to_integral():
+        raise GenerationValidationError(f"execution allocation metric {field} must be an integer")
+    return int(parsed)
+
+
+def _qty_text(value: Any) -> str:
+    number = _d(value)
+    return "0" if number == 0 else format(number.normalize(), "f")
+
+
+def _allocation_signature(rows: tuple[models.ReservationConsumptionAllocation, ...]) -> list[dict[str, Any]]:
+    return sorted([
+        {
+            "sle_id": int(row.sle_id),
+            "reservation_id": int(row.reservation_id),
+            "requirement_id": int(row.requirement_id),
+            "qty": _qty_text(row.allocated_qty),
+            "match_rule": str(row.match_rule or ""),
+            "idempotency_key": str(row.idempotency_key or ""),
+        }
+        for row in rows
+    ], key=lambda row: (row["sle_id"], row["reservation_id"]))
+
+
+def _allocation_checksum(rows: tuple[models.ReservationConsumptionAllocation, ...]) -> str:
+    signature = _allocation_signature(rows)
+    raw = json.dumps(signature, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _parse_iso_datetime(value: Any, field: str) -> datetime:
@@ -307,6 +363,69 @@ def _completed_stage(
     return completed[0]
 
 
+def _execution_allocation_checkpoint(
+    db: Session,
+    generation: models.LedgerGeneration,
+) -> dict[str, Any]:
+    execution_batch = _completed_stage(
+        db, int(generation.id), "execution_allocation"
+    )
+    if execution_batch.algorithm_version != RESERVATION_CONSUMPTION_ALGORITHM_VERSION:
+        raise GenerationValidationError(
+            "unexpected reservation consumption allocation algorithm"
+        )
+    execution_metrics = dict(execution_batch.metrics or {})
+    required_execution_metrics = {
+        "facts",
+        "allocations",
+        "fact_qty",
+        "allocated_qty",
+        "surplus_qty",
+        "allocation_checksum",
+    }
+    missing = sorted(
+        key for key in required_execution_metrics if key not in execution_metrics
+    )
+    if missing:
+        raise GenerationValidationError(
+            f"execution allocation metrics missing: {', '.join(missing)}"
+        )
+    execution_facts = _d_int(execution_metrics["facts"], "facts")
+    execution_allocations = _d_int(execution_metrics["allocations"], "allocations")
+    execution_fact_qty = _d(execution_metrics["fact_qty"])
+    execution_allocated_qty = _d(execution_metrics["allocated_qty"])
+    execution_surplus_qty = _d(execution_metrics["surplus_qty"])
+    if execution_fact_qty != execution_allocated_qty + execution_surplus_qty:
+        raise GenerationValidationError(
+            "execution allocation conservation failed"
+        )
+
+    allocation_rows = tuple(
+        row
+        for row in db.query(models.ReservationConsumptionAllocation)
+        .filter(
+            models.ReservationConsumptionAllocation.ledger_generation_id
+            == int(generation.id)
+        )
+        .order_by(models.ReservationConsumptionAllocation.id.asc())
+        .all()
+    )
+    if len(allocation_rows) != execution_allocations:
+        raise GenerationValidationError(
+            "execution allocation metric does not match allocation row count"
+        )
+    if _allocation_checksum(allocation_rows) != str(execution_metrics["allocation_checksum"]):
+        raise GenerationValidationError("execution allocation checksum mismatch")
+    return {
+        "facts": execution_facts,
+        "allocations": execution_allocations,
+        "fact_qty": str(execution_fact_qty),
+        "allocated_qty": str(execution_allocated_qty),
+        "surplus_qty": str(execution_surplus_qty),
+        "allocation_checksum": str(execution_metrics["allocation_checksum"]),
+    }
+
+
 def _supplier_candidates(
     db: Session, generation_id: int
 ) -> tuple[models.StockLedgerEntry, ...]:
@@ -470,7 +589,20 @@ def _reservation_fold_checkpoint(
             raise GenerationValidationError(
                 f"reservation {entry.id} cache differs from event fold"
             )
-        if realized > _d(entry.replenishment_required_qty):
+        covered = _d(entry.covered_from_stock_at_freeze_qty)
+        replenishment_required = _d(entry.replenishment_required_qty)
+        if (
+            reserved < 0
+            or covered < 0
+            or replenishment_required < 0
+            or covered + replenishment_required != reserved
+        ):
+            raise GenerationValidationError(
+                f"reservation {entry.id} frozen quantities must satisfy "
+                "reserved >= 0, covered >= 0, replenishment_required >= 0, "
+                "and covered + replenishment_required == reserved"
+            )
+        if realized > replenishment_required:
             raise GenerationValidationError(
                 f"reservation {entry.id} replenishment exceeds frozen demand"
             )
@@ -535,6 +667,7 @@ def _replenishment_work_item_checkpoint(
         if str(entry.lifecycle_status) == "active"
         and entry.run_id is not None
         and _d(entry.replenishment_required_qty) > 0
+        and str(entry.realization_mode) in ("make", "buy")
     }
     actual_rows = (
         db.query(models.ReplenishmentWorkItem)
@@ -753,6 +886,7 @@ def validate_obligation_refresh_build(
         raise GenerationValidationError(
             "obligation-refresh validation requires an obligation_refresh generation"
         )
+    _execution_allocation_checkpoint(db, generation)
     _physical_boundary_checkpoint(db, generation)
     requirement_count = _mrp_quantity_checkpoint(db, generation)
     visible = visible_sles_for_generation(db, int(generation.id))
@@ -825,6 +959,7 @@ def validate_generation_build(
     assembly_output_batch = _completed_stage(
         db, int(generation.id), "assembly_output_allocation"
     )
+    execution_allocations = _execution_allocation_checkpoint(db, generation)
     obligation_metrics = dict(obligation_batch.metrics or {})
     replay_metrics = dict(replay_batch.metrics or {})
     if obligation_batch.algorithm_version != OBLIGATION_ALGORITHM_VERSION:
@@ -894,8 +1029,6 @@ def validate_generation_build(
         raise GenerationValidationError("replay metrics disagree with reservation events")
     if _d(replay_metrics.get("ambiguous_pool_facts")) != Decimal("0"):
         raise GenerationValidationError("historical replay has unresolved planning-stock pools")
-    if _d(replay_metrics.get("ambiguous_identity_facts")) != Decimal("0"):
-        raise GenerationValidationError("historical replay has unresolved provenance identities")
 
     (
         provenance,
@@ -928,7 +1061,14 @@ def validate_generation_build(
         "selected_requirements": len(selected_requirement_ids),
         "reservation_entries": len(entries),
         "reservation_events": len(events),
-        "execution_allocations": 0,
+        "execution_allocations": {
+            "facts": execution_allocations["facts"],
+            "allocations": execution_allocations["allocations"],
+            "fact_qty": execution_allocations["fact_qty"],
+            "allocated_qty": execution_allocations["allocated_qty"],
+            "surplus_qty": execution_allocations["surplus_qty"],
+            "allocation_checksum": execution_allocations["allocation_checksum"],
+        },
         "supplier_receipt_evidence": len(provenance),
         "supplier_receipt_ignored_count": len(excluded_ids),
         "supplier_receipt_ignored_qty": str(supplier_ignored_qty),
@@ -977,6 +1117,132 @@ def _carry_forward_parent_future_supply(
     ))
 
 
+def _zero_future_supply_capture(db: Session, generation: models.LedgerGeneration) -> dict[str, Any]:
+    """Create a canonical zero-row future-supply proof for no-parent generations."""
+    batch_key = f"future-supply-capture:g{int(generation.id)}"
+    batch = db.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
+        models.LedgerBuildBatch.stage == FUTURE_SUPPLY_CAPTURE_STAGE,
+        models.LedgerBuildBatch.batch_key == batch_key,
+    ).one_or_none()
+    if batch is None:
+        batch = models.LedgerBuildBatch(
+            ledger_generation_id=int(generation.id),
+            stage=FUTURE_SUPPLY_CAPTURE_STAGE,
+            batch_key=batch_key,
+            status="building",
+            algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+            metrics={},
+        )
+        db.add(batch)
+        db.flush()
+    if str(batch.algorithm_version) != FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION:
+        raise GenerationValidationError(
+            "future supply proof requires the canonical capture algorithm"
+        )
+    if str(batch.status) == "completed":
+        try:
+            return dict(verify_future_supply_capture(
+                db,
+                int(generation.id),
+                capture_batch_id=int(batch.id),
+            ))
+        except FutureSupplyCaptureError as exc:
+            raise GenerationValidationError(
+                f"future supply proof is malformed: {exc}"
+            ) from exc
+
+    try:
+        metrics = replace_future_supply_capture(
+            db,
+            int(generation.id),
+            int(batch.id),
+            (),
+        )
+    except FutureSupplyCaptureError as exc:
+        raise GenerationValidationError(
+            f"future supply direct capture failed: {exc}"
+        ) from exc
+
+    batch.status = "completed"
+    batch.completed_at = datetime.now(timezone.utc)
+    return dict(metrics, created=True)
+
+
+def _promote_accepted_generation_read_snapshots(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    accepted_at: datetime,
+    fixed_run_ids: tuple[int, ...],
+    expected_parent_id: int | None,
+) -> None:
+    capabilities = dict(generation.capabilities or {})
+
+    try:
+        if capabilities.get("purchase_control_journal"):
+            purchase_snapshot = promote_purchase_journal_candidate(
+                db,
+                generation=generation,
+                accepted_at=accepted_at,
+            )
+            if purchase_snapshot is None:
+                raise GenerationValidationError(
+                    f"generation {generation.id} claims the purchase_control_journal "
+                    "capability but has no journal candidate to publish"
+                )
+        else:
+            promote_purchase_journal_candidate(
+                db,
+                generation=generation,
+                accepted_at=accepted_at,
+            )
+
+        if capabilities.get("production_control_journal"):
+            production_snapshot = promote_production_journal_candidate(
+                db,
+                generation=generation,
+                accepted_at=accepted_at,
+            )
+            if production_snapshot is None:
+                raise GenerationValidationError(
+                    f"generation {generation.id} claims the production_control_journal "
+                    "capability but has no journal candidate to publish"
+                )
+        else:
+            promote_production_journal_candidate(
+                db,
+                generation=generation,
+                accepted_at=accepted_at,
+            )
+    except (PurchaseJournalPromotionError, ProductionControlJournalPromotionError) as exc:
+        raise GenerationValidationError(
+            f"generation {generation.id} cannot publish read snapshots: {exc}"
+        ) from exc
+
+    publish_generation(
+        db,
+        generation,
+        expected_parent_id=expected_parent_id,
+    )
+
+    for run_id in fixed_run_ids:
+        run = db.get(models.PlanningRun, int(run_id))
+        if run is None:
+            continue
+        if (
+            int(run.ledger_generation_id or 0) != int(generation.id)
+            or run.ledger_cutoff != generation.cutoff
+        ):
+            continue
+        try:
+            build_mrp_result_snapshot(db, int(run_id))
+        except ValueError as exc:
+            raise GenerationValidationError(
+                f"MRP result snapshot for run {run_id} could not be published: {exc}"
+            ) from exc
+
+
 def accept_generation_build(
     db: Session,
     generation_id: int,
@@ -996,10 +1262,33 @@ def accept_generation_build(
         generation = _building_generation(db, generation_id)
         physical = materialize_generation_stock_bins(db, int(generation.id))
         future_supply = _carry_forward_parent_future_supply(db, generation)
+        if future_supply is None:
+            future_supply = _zero_future_supply_capture(db, generation)
         obligations = materialize_historical_obligations(db, int(generation.id))
         replay = run_historical_replay(
             db, int(generation.id), replay_from=replay_from
         )
+        try:
+            consumption_batch = models.LedgerBuildBatch(
+                ledger_generation_id=int(generation.id),
+                stage="execution_allocation",
+                batch_key=f"g{generation.id}:execution_allocation",
+                status="building",
+                algorithm_version=RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+                metrics={},
+            )
+            db.add(consumption_batch)
+            db.flush()
+            reservation_consumption = materialize_reservation_consumption_allocations(
+                db, int(generation.id), int(consumption_batch.id)
+            )
+            consumption_batch.status = "completed"
+            consumption_batch.metrics = reservation_consumption
+            consumption_batch.completed_at = datetime.now(timezone.utc)
+        except ValueError as exc:
+            raise GenerationValidationError(
+                f"reservation consumption allocation build failed: {exc}"
+            ) from exc
         supplier_candidates = _supplier_candidates(db, int(generation.id))
         if supplier_candidates and odata_client is None:
             raise GenerationValidationError(
@@ -1103,6 +1392,9 @@ def accept_generation_build(
                 .order_by(models.PlanningRun.run_id.asc())
                 .all()
             ]
+            build_material_custody_projection(
+                db, ledger_generation_id=int(generation.id)
+            )
             production_journal_snapshot = build_production_journal_candidate(
                 db,
                 int(generation.id),
@@ -1120,9 +1412,11 @@ def accept_generation_build(
         generation.status = "accepted"
         generation.accepted_at = datetime.now(timezone.utc)
         generation.reason = None
-        publish_generation(
+        _promote_accepted_generation_read_snapshots(
             db,
-            generation,
+            generation=generation,
+            accepted_at=generation.accepted_at,
+            fixed_run_ids=tuple(fixed_run_ids),
             expected_parent_id=(
                 expected_parent_id
                 if expected_parent_id is not None
@@ -1137,6 +1431,7 @@ def accept_generation_build(
         "physical": physical,
         "obligations": obligations,
         "replay": replay,
+        "reservation_consumption": reservation_consumption,
         "assembly_outputs": assembly_outputs,
         "drum_schedule": drum_schedule,
         "shelf_projection": shelf_projection,

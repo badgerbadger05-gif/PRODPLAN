@@ -262,6 +262,41 @@ def test_fold_reservation_entry_materializes_cache(db_session):
     assert _f(entry.reserved_qty) == 5 and _f(entry.realized_qty) == 4  # INV-RES-fold
 
 
+def test_fold_reservation_entry_filters_to_same_generation(db_session):
+    item, entry = _mk_reservation(db_session)
+    other_generation = _generation(db_session, "reservation-older")
+    db_session.add(
+        models.ReservationEvent(
+            ledger_generation_id=entry.ledger_generation_id,
+            reservation_id=entry.id, item_id=item.item_id, event_kind="open",
+            reserved_delta=D("5"), realized_delta=D("0"), idempotency_key="ev:main",
+        )
+    )
+    db_session.add(
+        models.ReservationEvent(
+            ledger_generation_id=entry.ledger_generation_id,
+            reservation_id=entry.id, item_id=item.item_id, event_kind="realize",
+            reserved_delta=D("0"), realized_delta=D("2"), idempotency_key="ev:main-real",
+        )
+    )
+    db_session.add(
+        models.ReservationEvent(
+            ledger_generation_id=other_generation.id,
+            reservation_id=entry.id, item_id=item.item_id, event_kind="open",
+            reserved_delta=D("100"), realized_delta=D("0"), idempotency_key="ev:other-gen",
+        ),
+    )
+    db_session.flush()
+
+    fold = fold_reservation_entry(db_session, entry.id)
+    db_session.commit()
+    db_session.refresh(entry)
+
+    assert _f(fold.reserved_qty) == 5 and _f(fold.realized_qty) == 2
+    assert _f(fold.outstanding) == 3
+    assert _f(entry.reserved_qty) == 5 and _f(entry.realized_qty) == 2
+
+
 def test_reservation_event_idempotency_key_unique(db_session):
     import pytest
     from sqlalchemy.exc import IntegrityError

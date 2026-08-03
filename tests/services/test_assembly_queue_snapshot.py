@@ -5,6 +5,7 @@ import pytest
 
 from app import models
 from app.services.item_ledger import assembly_queue_snapshot
+from app.services.item_ledger import drum_schedule_persistence
 from app.services.item_ledger.drum_schedule_persistence import (
     materialize_drum_schedule,
 )
@@ -43,6 +44,7 @@ def _production_plan(db, *, start: date, end: date, status: str = "fixed"):
         period_from=start,
         period_to=end,
         status=status,
+        fixed_at=(datetime(2026, 7, 1, tzinfo=timezone.utc) if status == "fixed" else None),
     )
 
 
@@ -90,6 +92,27 @@ def _stock_ledger_entry(db, *, generation, item, tag: str):
     db.add(row)
     db.flush()
     return row
+
+
+def test_assembly_queue_rejects_divergent_run_and_plan_periods(db_session):
+    cutoff = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="period-mismatch", cutoff=cutoff)
+    item = models.Item(item_code="FG-PERIOD", item_name="Period mismatch")
+    plan = _production_plan(
+        db_session,
+        start=date(2026, 8, 1),
+        end=date(2026, 8, 31),
+    )
+    db_session.add_all((item, plan))
+    db_session.flush()
+    run = _run(db_session, generation=generation, plan=plan)
+    run.period_from = date(2026, 9, 1)
+    run.period_to = date(2026, 9, 30)
+    _plan_line(db_session, plan=plan, item=item, bucket_date=date(2026, 8, 5), qty=1)
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="assembly queue period mismatch"):
+        assembly_queue_snapshot._build_rows(db_session, int(generation.id))
 
 
 def _allocation(
@@ -283,7 +306,7 @@ def test_assembly_queue_snapshot_excludes_zero_or_negative_remaining_rows(db_ses
     assert snapshot.payload["total_queue_qty"] == 5.0
 
 
-def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session):
+def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monkeypatch):
     cutoff = datetime(2026, 7, 27, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="drum", cutoff=cutoff)
     item = models.Item(item_code="FG-DRUM", item_name="Drum item")
@@ -345,14 +368,21 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session):
                 reserved_qty=Decimal("12"),
                 replenishment_required_qty=Decimal("12"),
             ),
-            models.MrpFreezeComponent(
+                models.MrpFreezeComponent(
                 run_id=run.run_id,
                 freeze_version=1,
                 parent_item_id=item.item_id,
                 component_item_id=component.item_id,
                 spec_ref="test",
-                norm_qty_per_unit=Decimal("2"),
-            ),
+                    norm_qty_per_unit=Decimal("2"),
+                ),
+                models.MrpFreezeComponentCumulative(
+                    run_id=run.run_id,
+                    freeze_version=1,
+                    root_item_id=item.item_id,
+                    component_item_id=component.item_id,
+                    cumulative_norm_qty_per_root_unit=Decimal("2"),
+                ),
             models.ShelfPolicy(
                 item_id=component.item_id,
                 warehouse_ref1c="SHELF",
@@ -378,6 +408,13 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session):
     db_session.flush()
 
     first = materialize_drum_schedule(db_session, generation.id)
+    monkeypatch.setattr(
+        drum_schedule_persistence,
+        "materialize_assembly_queue_lines",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed drum checkpoint must not rebuild its input")
+        ),
+    )
     second = materialize_drum_schedule(db_session, generation.id)
     shelf = materialize_shelf_projections(db_session, generation.id)
 
@@ -399,9 +436,42 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session):
     shelf_row = db_session.query(models.ShelfProjection).one()
     assert shelf_row.target_qty == Decimal("12")
     assert shelf_row.projected_qty == Decimal("3")
-    assert shelf_row.transfer_qty == Decimal("4")
-    assert shelf_row.pull_qty == Decimal("5")
-    assert shelf_row.materialized_qty == Decimal("8")
+    assert shelf_row.transfer_qty == Decimal("0")
+    assert shelf_row.pull_qty == Decimal("9")
+    assert shelf_row.materialized_qty == Decimal("12")
+
+
+def test_queue_line_without_rate_is_excluded_from_drum_only(db_session):
+    cutoff = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="no-drum-rate", cutoff=cutoff)
+    item = models.Item(item_code="FG-NO-RATE", item_name="Queue only")
+    plan = _production_plan(
+        db_session,
+        start=date(2026, 8, 1),
+        end=date(2026, 8, 31),
+    )
+    db_session.add_all([item, plan])
+    db_session.flush()
+    _run(db_session, generation=generation, plan=plan)
+    _plan_line(
+        db_session,
+        plan=plan,
+        item=item,
+        bucket_date=date(2026, 8, 3),
+        qty="4",
+    )
+    db_session.flush()
+
+    result = materialize_drum_schedule(db_session, generation.id)
+
+    queue = db_session.query(models.AssemblyQueueLine).one()
+    assert queue.assembly_remaining_qty == Decimal("4")
+    assert db_session.query(models.DrumSlot).count() == 0
+    assert db_session.query(models.DrumCapacityGap).count() == 0
+    assert result["excluded_lines"] == 1
+    assert Decimal(result["excluded_open_qty"]) == Decimal("4")
+    assert result["excluded_item_ids"] == [item.item_id]
+    assert Decimal(result["total_open_qty"]) == Decimal("0")
 
 
 def test_assembly_queue_snapshot_is_idempotent_for_same_inputs(db_session):
@@ -430,7 +500,7 @@ def test_assembly_queue_snapshot_is_idempotent_for_same_inputs(db_session):
     )
 
 
-def test_assembly_queue_snapshot_conflict_if_source_data_changes(db_session):
+def test_assembly_queue_snapshot_ignores_live_plan_changes_after_materialization(db_session):
     cutoff = datetime(2026, 7, 30, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="conflict", cutoff=cutoff)
 
@@ -450,8 +520,8 @@ def test_assembly_queue_snapshot_conflict_if_source_data_changes(db_session):
         {models.ProductionPlanLine.qty: Decimal("20")}
     )
     db_session.flush()
-    with pytest.raises(ValueError, match="conflicts"):
-        assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
+    repeated = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
+    assert repeated.id == first.id
 
     row = (
         db_session.query(models.PlanningReadRow)

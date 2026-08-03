@@ -260,6 +260,16 @@ input:focus, select:focus {
   padding: 3px 8px;
 }
 
+.truthBadge {
+  border: 1px solid rgba(255,255,255,.25);
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+
+.truthBadge.accepted { color: #c7efcf; }
+.truthBadge.unavailable { color: #ffd1c7; }
+.truthBadge.neutral { color: #d7dde5; }
+
 .documentWindow {
   min-height: 0;
   flex: 1;
@@ -869,13 +879,13 @@ input:focus, select:focus {
 .planningBadge.yellow { border-color: #c5a44a; background: #fff5d2; color: #765a00; }
 .planningBadge.green { border-color: #6ca47d; background: #e5f4e9; color: #28643a; }
 
-.dbrPlanningBlock {
+.shelfLaunchBlock {
   margin: 10px;
   border: 1px solid var(--line);
   background: #f7f9fb;
 }
 
-.dbrPlanningTitle {
+.shelfLaunchTitle {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -884,7 +894,7 @@ input:focus, select:focus {
   font-weight: 800;
 }
 
-.dbrPlanningTitle .planningBadge { margin-left: 8px; }
+.shelfLaunchTitle .planningBadge { margin-left: 8px; }
 
 .runsTable td {
   height: 38px;

@@ -15,21 +15,8 @@ from ..schemas import (
     ResourceProductionKindCreate,
     ProductionKind as ProductionKindSchema,
 )
-from ..services.resource_calculator import calculate_resource_distribution
 
 router = APIRouter(prefix="/v1/resources", tags=["resources"])
-
-
-@router.post("/calculate_distribution", response_model=Dict[str, Any])
-def get_resource_distribution(db: Session = Depends(get_db)):
-    """
-    Рассчитать распределение компонентов по производственным участкам.
-    """
-    try:
-        return calculate_resource_distribution(db)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Resource distribution calculation error: {e}")
-
 
 @router.get("/", response_model=List[ProductionResourceSchema])
 def get_resources(

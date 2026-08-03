@@ -3,6 +3,7 @@ from decimal import Decimal
 from app.services.item_ledger.reservation import (
     freeze_reservation_amounts,
     replenishment_execution_pct,
+    replenishment_execution_status,
     replenishment_remaining,
 )
 
@@ -34,3 +35,11 @@ def test_no_replenishment_has_no_percentage() -> None:
 def test_execution_is_capped_at_one_hundred_percent() -> None:
     assert replenishment_execution_pct("30", "50") == Decimal("100")
     assert replenishment_remaining("30", "50") == Decimal("0")
+
+
+def test_execution_progress_status_is_owned_next_to_the_formula() -> None:
+    assert replenishment_execution_status("0", "0") == "unavailable"
+    assert replenishment_execution_status("10", "0") == "not_started"
+    assert replenishment_execution_status("10", "5") == "in_progress"
+    assert replenishment_execution_status("10", "12") == "complete"
+    assert replenishment_execution_status("10", "10", partial_truth=True) == "lower_bound"

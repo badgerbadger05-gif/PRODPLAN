@@ -22,7 +22,6 @@ prodplan-db-1
 prodplan-backend-1
 prodplan-frontend-1
 prodplan-sync-worker-1
-prodplan-reconcile-worker-1
 ```
 
 ## Important Rule
@@ -86,13 +85,12 @@ cd /home/barsukov/prodplan
 docker compose -f docker-compose.test.yml logs --tail=200 backend
 docker compose -f docker-compose.test.yml logs --tail=200 frontend
 docker compose -f docker-compose.test.yml logs --tail=200 sync-worker
-docker compose -f docker-compose.test.yml logs --tail=200 reconcile-worker
 ```
 
 For an incident window:
 
 ```bash
-docker compose -f docker-compose.test.yml logs --since=2026-06-15T08:00:00 backend sync-worker reconcile-worker
+docker compose -f docker-compose.test.yml logs --since=2026-06-15T08:00:00 backend sync-worker
 ```
 
 ## Database
@@ -138,7 +136,7 @@ force-reset production without an explicit decision.
 
 ```bash
 cd /home/barsukov/prodplan
-docker compose -f docker-compose.test.yml restart backend frontend sync-worker reconcile-worker
+docker compose -f docker-compose.test.yml restart backend frontend sync-worker
 docker compose -f docker-compose.test.yml ps
 ```
 
@@ -148,8 +146,8 @@ Backend:
 
 ```bash
 cd /home/barsukov/prodplan
-docker compose -f docker-compose.test.yml build backend sync-worker reconcile-worker
-docker compose -f docker-compose.test.yml up -d backend sync-worker reconcile-worker
+docker compose -f docker-compose.test.yml build backend sync-worker
+docker compose -f docker-compose.test.yml up -d backend sync-worker
 docker compose -f docker-compose.test.yml exec backend alembic upgrade head
 ```
 
@@ -179,9 +177,11 @@ the Dockerfile normalizes permissions under `/usr/share/nginx/html`.
 
 - `sync-worker`: calls `/api/v1/sync/auto/tick` about every 120 seconds and
   runs at most one due 1C sync job per tick.
-- `reconcile-worker`: calls `/api/v1/plan/reconcile` about every 10800 seconds.
 
-Both workers use the backend service URL inside the compose network:
+Legacy `reconcile-worker` is retired (`backend/reconcile_worker.py` remains as a
+tombstone) and is not part of live compose.
+
+The sync worker uses the backend service URL inside the compose network:
 
 ```text
 http://backend:8000

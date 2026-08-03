@@ -91,3 +91,47 @@ def test_child_node_carries_component_id(client, db_session):
     assert child["componentId"] == comp.component_id
     # у детали нет своей спеки -> specId пустой (нечего разворачивать/дополнять)
     assert child["specId"] is None
+
+
+def test_search_returns_strict_item_and_meta_contract(client, db_session):
+    root, _, spec, _ = _seed(db_session)
+
+    response = client.get(f"{API}/search", params={"q": "ROOT", "limit": 10})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "item_id": root.item_id,
+                "item_code": "ROOT",
+                "item_name": "Изделие",
+                "item_article": None,
+                "item_ref1c": "root",
+                "unit": None,
+                "unit_ref1c": None,
+                "replenishment_method": None,
+                "spec_id": spec.spec_id,
+                "spec_code": "ROOT",
+                "spec_name": "Изделие",
+                "spec_ref1c": "s-root",
+                "default_spec_count": 1,
+                "has_children": True,
+            }
+        ],
+        "meta": {"q": "ROOT", "count": 1, "limit": 10},
+    }
+
+
+def test_search_openapi_response_is_closed(client):
+    schema = client.app.openapi()
+    response = schema["paths"]["/api/v1/specification/search"]["get"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"]
+    assert response == {"$ref": "#/components/schemas/SpecificationSearchResponse"}
+    schemas = schema["components"]["schemas"]
+    for name in (
+        "SpecificationSearchItemResponse",
+        "SpecificationSearchMetaResponse",
+        "SpecificationSearchResponse",
+    ):
+        assert schemas[name]["additionalProperties"] is False

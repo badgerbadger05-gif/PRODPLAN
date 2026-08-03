@@ -17,6 +17,7 @@ def _generation(**overrides):
             "reservation_replay": True,
             "execution_allocations": False,
             "planning_snapshots": False,
+            planning_truth.CAPABILITY_RESERVATION_CONSUMPTION_ALLOCATION: False,
         },
         "algorithm_version": "ledger-replay/1",
         "replay_version": "historical/1",
@@ -80,6 +81,10 @@ def test_publish_and_require_return_complete_accepted_identity(db_session):
     assert required.algorithm_version == "ledger-replay/1"
     assert required.replay_version == "historical/1"
     assert required.capabilities["physical_ledger"] is True
+    assert (
+        required.capabilities[planning_truth.CAPABILITY_RESERVATION_CONSUMPTION_ALLOCATION]
+        is False
+    )
     assert required.accepted_at is not None
 
 

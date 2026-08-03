@@ -5,6 +5,7 @@ import pytest
 
 from app import models
 from app.services.item_ledger.assembly_output_persistence import materialize_assembly_output_allocations
+from app.services.item_ledger.drum_schedule_persistence import materialize_drum_schedule
 
 
 def _building_generation(db, *, key: str, cutoff):
@@ -253,6 +254,7 @@ def test_historical_output_before_plan_fixation_cannot_close_new_plan(db_session
     allocations = (
         db_session.query(models.AssemblyOutputAllocation)
         .filter_by(ledger_generation_id=generation.id)
+        .order_by(models.AssemblyOutputAllocation.allocation_ordinal.asc())
         .all()
     )
     decisions = {
@@ -294,13 +296,11 @@ def test_fixed_plan_without_fixation_boundary_fails_closed(db_session):
         recorder="missing-boundary",
     )
 
-    result = materialize_assembly_output_allocations(db_session, generation.id)
-
-    assert result["allocations"] == 0
-    assert Decimal(result["surplus_total"]) == Decimal("5")
+    with pytest.raises(ValueError, match="lacks fixed_at"):
+        materialize_assembly_output_allocations(db_session, generation.id)
 
 
-def test_exact_manufacture_provenance_never_spills_to_older_plan(db_session):
+def test_exact_manufacture_provenance_allocates_oldest_first_inside_plan(db_session):
     cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="exact", cutoff=cutoff)
     item = _item(db_session, "ASM-EXACT")
@@ -322,6 +322,14 @@ def test_exact_manufacture_provenance_never_spills_to_older_plan(db_session):
         period_from=date(2026, 7, 1),
         fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
     )
+    second_exact_line = models.ProductionPlanLine(
+        plan_id=int(exact_plan.id),
+        item_id=int(item.item_id),
+        bucket_date=date(2026, 7, 2),
+        qty=Decimal("2"),
+    )
+    db_session.add(second_exact_line)
+    db_session.flush()
     requirement = models.MrpRequirement(
         run_id=int(exact_run.run_id),
         item_id=int(item.item_id),
@@ -380,6 +388,7 @@ def test_exact_manufacture_provenance_never_spills_to_older_plan(db_session):
     allocations = (
         db_session.query(models.AssemblyOutputAllocation)
         .filter_by(ledger_generation_id=generation.id)
+        .order_by(models.AssemblyOutputAllocation.allocation_ordinal.asc())
         .all()
     )
     decision = (
@@ -392,14 +401,23 @@ def test_exact_manufacture_provenance_never_spills_to_older_plan(db_session):
     )
 
     assert second == first
-    assert len(allocations) == 1
-    assert int(allocations[0].plan_line_id) == int(exact_line.id)
-    assert int(allocations[0].plan_line_id) != int(old_line.id)
-    assert allocations[0].match_rule == "exact"
-    assert Decimal(allocations[0].allocated_qty) == Decimal("3")
+    assert [int(row.plan_line_id) for row in allocations] == [
+        int(exact_line.id),
+        int(second_exact_line.id),
+    ]
+    assert int(old_line.id) not in {int(row.plan_line_id) for row in allocations}
+    assert [row.match_rule for row in allocations] == ["exact", "exact"]
+    assert [Decimal(row.allocated_qty) for row in allocations] == [
+        Decimal("3"),
+        Decimal("2"),
+    ]
     assert decision.link_kind == "exact_plan_line"
-    assert Decimal(decision.surplus_qty) == Decimal("2")
-    assert decision.evidence_payload["exact_plan_line_ids"] == [int(exact_line.id)]
+    assert decision.decision_status == "allocatable"
+    assert Decimal(decision.surplus_qty) == Decimal("0")
+    assert decision.evidence_payload["exact_plan_line_ids"] == [
+        int(exact_line.id),
+        int(second_exact_line.id),
+    ]
     assert Decimal(first["fact_qty"]) == (
         Decimal(first["allocated_qty"]) + Decimal(first["surplus_total"])
     )
@@ -747,3 +765,57 @@ def test_live_plan_allocation_is_rebuilt_in_next_generation_without_mutating_his
     assert sum((row.allocated_qty for row in current), Decimal("0")) == Decimal("7")
     assert historical.allocated_qty == Decimal("5")
     assert {row.ledger_generation_id for row in current} == {generation_b.id}
+
+
+def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
+    cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="drum-from-queue", cutoff=cutoff)
+    item = _item(db_session, "ASM-DRUM")
+    resource = models.ProductionResource(
+        resource_name="Assembly",
+        planning_range=1,
+        capacity=Decimal("10"),
+    )
+    db_session.add(resource)
+    db_session.flush()
+    db_session.add(
+        models.AssemblyRate(
+            resource_id=resource.resource_id,
+            item_id=item.item_id,
+            qty_per_capacity=Decimal("1"),
+        )
+    )
+    db_session.flush()
+
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("10"),
+        period_from=date(2026, 8, 1),
+    )
+
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+
+    result = materialize_assembly_output_allocations(db_session, generation.id)
+    queue = (
+        db_session.query(models.AssemblyQueueLine)
+        .filter_by(ledger_generation_id=generation.id, plan_line_id=line.id)
+        .one()
+    )
+    assert queue.accepted_plan_output_qty == Decimal("3")
+    assert queue.assembly_remaining_qty == Decimal("7")
+    assert result["allocations"] == 1
+
+    schedule = materialize_drum_schedule(db_session, generation.id)
+    assert Decimal(schedule["total_open_qty"]) == Decimal("7")
+    assert Decimal(schedule["total_slot_qty"]) == Decimal("7")
+    assert db_session.query(models.DrumSlot).count() == 1
+    assert db_session.query(models.DrumSlot).one().slot_qty == Decimal("7")

@@ -27,6 +27,7 @@ from app.services.item_ledger.generation_lifecycle import (
     GenerationValidationError,
     validate_obligation_refresh_build,
 )
+from app.services.item_ledger.future_supply_capture import _as_utc
 from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
     fork_obligation_generation,
@@ -37,6 +38,9 @@ from app.services.item_ledger.supplier_receipt_allocation import (
 from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
 from app.services.production_control_journal_snapshot import (
     build_candidate_snapshot as build_production_journal_candidate,
+)
+from app.services.production_material_custody_projection import (
+    build_material_custody_projection,
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import (
@@ -61,6 +65,13 @@ from app.services.item_ledger.drum_schedule_persistence import (
 from app.services.item_ledger.replenishment_work_item_builder import (
     materialize_replenishment_work_items,
 )
+from app.services.item_ledger.reservation_consumption_persistence import (
+    ALGORITHM_VERSION as RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+    materialize_reservation_consumption_allocations,
+)
+from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+)
 from app.services.item_ledger.shelf_projection_persistence import (
     materialize_shelf_projections,
 )
@@ -72,6 +83,7 @@ _CORE_CAPABILITIES = {
     "reservation_replay": True,
     "replenishment_work_item": True,
     "execution_allocations": True,
+    "reservation_consumption_allocation": True,
     "supplier_receipt_coverage": True,
     "planning_snapshots": True,
     "assembly_output_allocation": True,
@@ -124,6 +136,13 @@ def _single_stage(
     db: Session, target_id: int, stage: str, generation_key: str
 ) -> models.LedgerBuildBatch:
     key = _batch_key(generation_key, stage)
+    expected_algorithm_version = (
+        RESERVATION_CONSUMPTION_ALGORITHM_VERSION
+        if stage == "execution_allocation"
+        else FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION
+        if stage == "future_supply_capture"
+        else _VERSION
+    )
     rows = db.query(models.LedgerBuildBatch).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target_id),
         models.LedgerBuildBatch.stage == stage,
@@ -132,12 +151,14 @@ def _single_stage(
         raise ObligationRefreshOrchestratorError(f"target has duplicate {stage} batches")
     if rows:
         row = rows[0]
-        if str(row.batch_key) != key or str(row.algorithm_version) != _VERSION:
+        if str(row.batch_key) != key:
             raise ObligationRefreshOrchestratorError(f"target {stage} batch conflicts")
+        if str(row.algorithm_version) != expected_algorithm_version:
+            row.algorithm_version = expected_algorithm_version
         return row
     row = models.LedgerBuildBatch(
         ledger_generation_id=int(target_id), stage=stage, batch_key=key,
-        status="building", algorithm_version=_VERSION, metrics={},
+        status="building", algorithm_version=expected_algorithm_version, metrics={},
     )
     db.add(row)
     db.flush()
@@ -145,6 +166,15 @@ def _single_stage(
 
 
 def _complete(batch: models.LedgerBuildBatch, metrics: Mapping[str, Any]) -> None:
+    if batch.stage == "future_supply_capture":
+        generation = getattr(batch, "ledger_generation", None)
+        if generation is not None and generation.cutoff is not None:
+            metrics = {
+                **dict(metrics),
+                "generation_id": int(generation.id),
+                "cutoff": _as_utc(generation.cutoff).isoformat(),
+                "algorithm_version": str(batch.algorithm_version),
+            }
     if str(batch.status) == "completed":
         if dict(batch.metrics or {}) != dict(metrics):
             raise ObligationRefreshOrchestratorError(
@@ -381,13 +411,36 @@ def run_obligation_refresh(
     )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
+    execution_batch = _single_stage(db, target_id, "execution_allocation", key)
     replenishment_batch = _single_stage(db, target_id, "replenishment_work_item", key)
+    future_supply_capture_batch = _single_stage(db, target_id, "future_supply_capture", key)
     snapshot_batch = _single_stage(db, target_id, "snapshot_build", key)
     capture = capture_candidate_future_supply(
-        db, int(parent_generation_id), target_id, int(snapshot_batch.id),
+        db,
+        int(parent_generation_id),
+        target_id,
+        int(future_supply_capture_batch.id),
         planning_pool_by_warehouse=pool_mapping,
         explicit_make_transfer_recorders=explicit_make_transfer_recorders,
     )
+    future_supply_capture = _json_value(capture)
+    _complete(
+        future_supply_capture_batch,
+        {
+            "future_supply_capture": future_supply_capture,
+            **future_supply_capture,
+        },
+    )
+    reservation_count = db.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.ledger_generation_id == target_id,
+        models.ReservationEntry.run_id.in_(candidate_ids),
+    ).count()
+    reservation_consumption = materialize_reservation_consumption_allocations(
+        db,
+        target_id,
+        int(execution_batch.id),
+    )
+    _complete(execution_batch, reservation_consumption)
     freeze = (
         freeze_candidate_snapshots(
             db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
@@ -400,10 +453,6 @@ def run_obligation_refresh(
             "frozen": 0,
         }
     )
-    reservation_count = db.query(models.ReservationEntry.id).filter(
-        models.ReservationEntry.ledger_generation_id == target_id,
-        models.ReservationEntry.run_id.in_(candidate_ids),
-    ).count()
     reservation_metrics = {
         "candidate_run_ids": list(candidate_ids),
         "retained_run_ids": list(retained_run_ids),
@@ -434,6 +483,9 @@ def run_obligation_refresh(
     shelf_projection = materialize_shelf_projections(db, target_id)
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
+    custody_projection = build_material_custody_projection(
+        db, ledger_generation_id=target_id
+    )
     production_journal_snapshot = build_production_journal_candidate(
         db,
         target_id,
@@ -455,9 +507,12 @@ def run_obligation_refresh(
         "candidate_run_ids": list(candidate_ids),
         "candidate_read_snapshot_ids": snapshots,
         "future_supply_captured": True,
-        "future_supply_capture": _json_value(capture),
+        "future_supply_capture_batch_id": int(future_supply_capture_batch.id),
+        "future_supply_capture": future_supply_capture,
+        "material_custody_projection": _json_value(custody_projection),
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
+        "reservation_consumption_summary": _json_value(reservation_consumption),
         "assembly_output_summary": _json_value(assembly_outputs),
         "drum_schedule_summary": _json_value(drum_schedule),
         "shelf_projection_summary": _json_value(shelf_projection),

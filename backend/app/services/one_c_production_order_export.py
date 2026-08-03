@@ -21,7 +21,6 @@ from datetime import date, datetime
 from decimal import Decimal
 import hashlib
 import json
-from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
@@ -140,11 +139,31 @@ class ProductionOrderExportEntry:
 
 
 @dataclass
+class ProductionOrderCloseEntry:
+    order_id: int
+    number: str
+    order_ref1c: str
+    source_run_id: Optional[int] = None
+    ledger_generation_id: Optional[int] = None
+    freeze_version: Optional[int] = None
+    target_ref_key: Optional[str] = None
+    status: str = "planned"
+    error: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@dataclass
 class ProductionOrderExportDefaults:
     organization_ref1c: str = ""
     structural_unit_ref1c: str = ""
     product_structural_unit_ref1c: str = ""
     operation_structural_unit_ref1c: str = ""
+
+
+@dataclass
+class ProductionOrderCloseDefaults:
+    close_state_ref1c: str = ""
+    close_variant_ref1c: str = ""
 
 
 def _export_defaults(config: Dict[str, Any]) -> ProductionOrderExportDefaults:
@@ -170,6 +189,13 @@ def _export_defaults(config: Dict[str, Any]) -> ProductionOrderExportDefaults:
             "default_operation_structural_unit_ref1c",
             structural_unit,
         ),
+    )
+
+
+def _close_defaults(config: Dict[str, Any]) -> ProductionOrderCloseDefaults:
+    return ProductionOrderCloseDefaults(
+        close_state_ref1c=_config_ref1c(config, "default_production_order_done_state_ref1c"),
+        close_variant_ref1c=_config_ref1c(config, "default_production_order_done_variant_ref1c"),
     )
 
 
@@ -315,13 +341,6 @@ def _combine_planned_date_with_time(value: Optional[Any], time_source: str) -> O
         except Exception:
             return None
     return datetime.combine(planned_date, source_dt.time()).replace(microsecond=0).isoformat()
-
-
-def _current_moscow_datetime() -> str:
-    try:
-        return datetime.now(ZoneInfo("Europe/Moscow")).replace(microsecond=0).isoformat()
-    except Exception:
-        return datetime.now().replace(microsecond=0).isoformat()
 
 
 def _collect_export_entries(
@@ -489,6 +508,100 @@ def _collect_export_entries(
     return entries, skipped, warnings
 
 
+def _collect_close_entries(
+    db: Session,
+    generation_id: int,
+    order_ids: List[int],
+) -> Tuple[List[ProductionOrderCloseEntry], List[Dict[str, Any]]]:
+    """
+    Select candidate MRP orders for 1C close.
+    Returns (entries, skipped) where skipped has diagnostic reasons to present in
+    dry-run and fail-closed payloads.
+    """
+    entries: List[ProductionOrderCloseEntry] = []
+    skipped: List[Dict[str, Any]] = []
+
+    ids = [int(x) for x in order_ids if x is not None]
+    if not ids:
+        return entries, skipped
+
+    rows = (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_id.in_(ids))
+        .all()
+    )
+    found_ids = {int(order.order_id) for order in rows}
+    for missing_id in [x for x in ids if x not in found_ids]:
+        skipped.append({"order_id": missing_id, "reason": "ProductionOrder не найден"})
+
+    for order in rows:
+        if str(order.source or "1c").lower() != "mrp":
+            skipped.append(
+                {
+                    "order_id": int(order.order_id),
+                    "reason": f"source='{order.source}', закрываем только MRP-source",
+                }
+            )
+            continue
+        if bool(order.deletion_mark):
+            skipped.append({"order_id": int(order.order_id), "reason": "deletion_mark=true"})
+            continue
+        order_ref1c = _clean_ref1c(order.order_ref1c)
+        if not order_ref1c:
+            skipped.append(
+                {
+                    "order_id": int(order.order_id),
+                    "reason": "order_ref1c пустой, export in 1C отсутствует",
+                }
+            )
+            continue
+        link = _existing_link(db, int(order.order_id))
+        if link is None:
+            skipped.append(
+                {
+                    "order_id": int(order.order_id),
+                    "reason": "SyncLink не найден для Document_ЗаказНаПроизводство",
+                }
+            )
+            continue
+        if str(link.status or "") != "success":
+            skipped.append(
+                {
+                    "order_id": int(order.order_id),
+                    "reason": f"SyncLink status='{link.status}', для закрытия нужен success",
+                }
+            )
+            continue
+        link_ref = _clean_ref1c(link.target_ref_key)
+        if link_ref and link_ref != order_ref1c:
+            skipped.append(
+                {
+                    "order_id": int(order.order_id),
+                    "reason": "order_ref1c не совпадает с SyncLink.target_ref_key",
+                }
+            )
+            continue
+        if link.ledger_generation_id is not None and int(link.ledger_generation_id) != int(generation_id):
+            skipped.append(
+                {
+                    "order_id": int(order.order_id),
+                    "reason": "SyncLink принадлежит другой Ledger-цепи",
+                }
+            )
+            continue
+
+        entries.append(
+            ProductionOrderCloseEntry(
+                order_id=int(order.order_id),
+                number=production_order_number(order),
+                order_ref1c=order_ref1c,
+                source_run_id=int(order.source_run_id) if order.source_run_id else None,
+                ledger_generation_id=int(generation_id),
+            )
+        )
+    return entries, skipped
+
+
 def _export_line_token(entry: ProductionOrderExportEntry, kind: str, axes: Dict[str, Any]) -> int:
     """Versioned deterministic positive Int64 for 1C ``КлючСвязи``."""
     if (
@@ -651,6 +764,137 @@ def _build_header_payload(
         if len(tokens) != len(set(tokens)):
             raise MrpMutationLineageError(f"1C КлючСвязи collision in {table_name}")
     return payload
+
+
+def _build_close_payload(
+    entry: ProductionOrderCloseEntry | ProductionOrderExportEntry,
+    close_defaults: ProductionOrderCloseDefaults,
+) -> Dict[str, Any]:
+    state_ref = _clean_ref1c(close_defaults.close_state_ref1c)
+    if not state_ref:
+        raise MrpMutationLineageError(
+            "default_production_order_done_state_ref1c is not set in OData config"
+        )
+    close_variant_ref = _clean_ref1c(close_defaults.close_variant_ref1c)
+    if not close_variant_ref:
+        raise MrpMutationLineageError(
+            "default_production_order_done_variant_ref1c is not set in OData config"
+        )
+    payload: Dict[str, Any] = {
+        "СостояниеЗаказа_Key": state_ref,
+        "ВариантЗавершения": close_variant_ref,
+    }
+    return payload
+
+
+def close_production_orders_to_1c(
+    db: Session,
+    order_ids: List[int],
+    *,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Close the given MRP production orders in 1C as Document_ЗаказНаПроизводство.
+
+    Default is `dry_run=True`; pass `dry_run=False` for actual PATCH.
+    Fail-closed: all lineage and link checks must pass before any remote I/O.
+    """
+    selected_ids = sorted({int(order_id) for order_id in order_ids})
+    selected_orders = (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_id.in_(selected_ids))
+        .all()
+    )
+    if {int(order.order_id) for order in selected_orders} != set(selected_ids):
+        raise MrpMutationLineageError("one or more selected production orders do not exist")
+    generation_id = require_materialized_orders(
+        db, selected_orders, consumer="one_c_production_order_close"
+    )
+    if not selected_orders:
+        return {
+            "status": "ok",
+            "dry_run": True,
+            "entity": PRODUCTION_ORDER_ENTITY,
+            "orders_requested": 0,
+            "orders_eligible": 0,
+            "orders_closed": 0,
+            "orders_error": 0,
+            "skipped_rows": [],
+            "entries": [],
+        }
+
+    run_id = int(selected_orders[0].source_run_id) if selected_orders else None
+    run = db.get(PlanningRun, run_id) if run_id else None
+    if run is None or run.active_freeze_version is None:
+        raise MrpMutationLineageError("production close has no active planning freeze")
+
+    entries, skipped = _collect_close_entries(db, generation_id=generation_id, order_ids=selected_ids)
+
+    for entry in entries:
+        entry.freeze_version = int(run.active_freeze_version)
+
+    config = _load_odata_config()
+    close_defaults = _close_defaults(config)
+
+    payloads_by_order: Dict[int, Dict[str, Any]] = {}
+    for entry in entries:
+        payload = _build_close_payload(entry, close_defaults)
+        payloads_by_order[int(entry.order_id)] = {
+            "order_id": entry.order_id,
+            "payload": payload,
+        }
+
+    summary: Dict[str, Any] = {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "entity": PRODUCTION_ORDER_ENTITY,
+        "orders_requested": len(order_ids),
+        "orders_eligible": len(entries),
+        "orders_closed": 0,
+        "orders_error": 0,
+        "skipped_rows": skipped,
+        "payloads": list(payloads_by_order.values()),
+        "entries": [],
+    }
+
+    if dry_run:
+        summary["entries"] = [asdict(entry) for entry in entries]
+        return summary
+
+    if not entries:
+        summary["entries"] = []
+        return summary
+
+    client = _create_odata_client(config, OData1CClient)
+    closed = 0
+    errored = 0
+    for entry in entries:
+        payload_envelope = payloads_by_order.get(int(entry.order_id), {})
+        payload = payload_envelope.get("payload", {})
+        try:
+            order_ref1c = _clean_ref1c(entry.order_ref1c)
+            if not order_ref1c:
+                raise ValueError("order_ref1c is missing")
+
+            link = _existing_link(db, int(entry.order_id))
+            if link is None or str(link.status or "") != "success":
+                raise ValueError("SyncLink lost or no longer successful before close write")
+            link_ref = _clean_ref1c(link.target_ref_key)
+            if link_ref and link_ref != order_ref1c:
+                raise ValueError("SyncLink target_ref_key diverged before close write")
+
+            client.patch(f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref1c}')", payload)
+            closed += 1
+        except Exception as exc:
+            entry.status = "error"
+            entry.error = str(exc)
+            errored += 1
+
+    summary["orders_closed"] = closed
+    summary["orders_error"] = errored
+    summary["status"] = "ok" if errored == 0 else "partial_error"
+    summary["entries"] = [asdict(entry) for entry in entries]
+    return summary
 
 
 def _entry_origin_token(db: Session, entry: ProductionOrderExportEntry) -> str:

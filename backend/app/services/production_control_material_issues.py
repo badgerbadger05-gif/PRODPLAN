@@ -38,7 +38,10 @@ from .production_material_custody import (
     MaterialCustodyState,
     TRANSIT_STATUSES,
     is_product_custody_active,
-    load_material_custody,
+)
+from .production_material_custody_events import append_material_issue_custody_event
+from .production_material_custody_projection import (
+    load_current_accepted_material_custody,
 )
 from .planning_truth import require_accepted_truth
 from .production_output_truth import accepted_product_output
@@ -516,7 +519,11 @@ def refresh_existing_material_issues_for_product(
 def delete_local_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     issue = (
         db.query(ProductionMaterialIssue)
-        .options(joinedload(ProductionMaterialIssue.product).joinedload(ProductionProduct.control_state))
+        .options(
+            joinedload(ProductionMaterialIssue.lines),
+            joinedload(ProductionMaterialIssue.product).joinedload(ProductionProduct.control_state),
+        )
+        .populate_existing()
         .filter(ProductionMaterialIssue.issue_id == int(issue_id))
         .one_or_none()
     )
@@ -524,6 +531,32 @@ def delete_local_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
         raise ValueError("Заявка на перемещение не найдена")
     if _material_issue_has_1c_link(db, issue):
         raise ValueError("Заявка уже открыта в 1С, локальное удаление запрещено")
+    for line in issue.lines or []:
+        if str(issue.direction or "") != "issue":
+            continue
+        if str(issue.status or "") == "posted" and _clean_ref1c(issue.source_warehouse_ref1c) == _clean_ref1c(issue.warehouse_ref1c):
+            held = _to_float(line.issued_qty) if _to_float(line.issued_qty) > 0 else _to_float(line.required_qty)
+            warehouse = _clean_ref1c(issue.warehouse_ref1c)
+            location = "workshop"
+        else:
+            held = max(0.0, _to_float(line.required_qty) - _to_float(line.issued_qty))
+            warehouse = _clean_ref1c(issue.source_warehouse_ref1c or issue.warehouse_ref1c)
+            location = "transit"
+        if held <= 1e-9 or not warehouse:
+            continue
+        append_material_issue_custody_event(
+            db,
+            issue=issue,
+            line=line,
+            delta_qty=-held,
+            source_kind="terminal_release",
+            location_kind=location,
+            warehouse_ref1c=warehouse,
+            source_ref1c=str(issue.source_warehouse_ref1c or ""),
+        )
+    # Persist compensating append-only events before deleting their mutable
+    # source document; the FK is then changed to NULL by ON DELETE SET NULL.
+    db.flush()
     product_id = int(issue.product_id)
     db.delete(issue)
     state = issue.product.control_state if issue.product else None
@@ -657,20 +690,30 @@ def _claim_components_from_workshop(
             continue
         line = lines_by_component.get(cid)
         if line is None:
-            db.add(
-                ProductionMaterialIssueLine(
-                    issue_id=int(issue.issue_id),
-                    component_item_id=cid,
-                    required_qty=qty,
-                    issued_qty=qty,
-                    unit=comp.get("unit"),
-                    source_spec_id=spec_id,
-                    line_status="issued",
-                )
+            line = ProductionMaterialIssueLine(
+                issue_id=int(issue.issue_id),
+                component_item_id=cid,
+                required_qty=qty,
+                issued_qty=qty,
+                unit=comp.get("unit"),
+                source_spec_id=spec_id,
+                line_status="issued",
             )
+            db.add(line)
         else:
             line.required_qty = _to_float(line.required_qty) + qty
             line.issued_qty = _to_float(line.issued_qty) + qty
+        if issue.warehouse_ref1c:
+            append_material_issue_custody_event(
+                db,
+                issue=issue,
+                line=line,
+                delta_qty=qty,
+                source_kind="issue_created",
+                location_kind="workshop",
+                warehouse_ref1c=issue.warehouse_ref1c,
+                source_ref1c=str(issue.source_warehouse_ref1c or ""),
+            )
     return issue
 
 
@@ -690,21 +733,34 @@ def _add_delta_to_issue(
         delta = _to_float(comp["required_qty"])
         if delta <= 1e-9:
             continue
+        warehouse = _clean_ref1c(issue.source_warehouse_ref1c)
+        if not warehouse:
+            warehouse = _clean_ref1c(issue.warehouse_ref1c)
         line = lines_by_component.get(cid)
         if line is None:
-            db.add(
-                ProductionMaterialIssueLine(
-                    issue_id=int(issue.issue_id),
-                    component_item_id=cid,
-                    required_qty=delta,
-                    issued_qty=0.0,
-                    unit=comp.get("unit"),
-                    source_spec_id=spec_id,
-                    line_status="planned",
-                )
+            line = ProductionMaterialIssueLine(
+                issue_id=int(issue.issue_id),
+                component_item_id=cid,
+                required_qty=delta,
+                issued_qty=0.0,
+                unit=comp.get("unit"),
+                source_spec_id=spec_id,
+                line_status="planned",
             )
+            db.add(line)
         else:
             line.required_qty = _to_float(line.required_qty) + delta
+        if warehouse:
+            append_material_issue_custody_event(
+                db,
+                issue=issue,
+                line=line,
+                delta_qty=delta,
+                source_kind="issue_created",
+                location_kind="transit",
+                warehouse_ref1c=warehouse,
+                source_ref1c=str(issue.source_warehouse_ref1c or ""),
+            )
 
 
 def _shrink_transit_reservations(
@@ -729,10 +785,36 @@ def _shrink_transit_reservations(
                 take = min(current, excess)
                 line.issued_qty = current - take
                 line.required_qty = max(0.0, _to_float(line.required_qty) - take)
+                if take > 1e-9:
+                    warehouse = _clean_ref1c(issue.warehouse_ref1c)
+                    if warehouse:
+                        append_material_issue_custody_event(
+                            db,
+                            issue=issue,
+                            line=line,
+                            delta_qty=-take,
+                            source_kind="terminal_release",
+                            location_kind="workshop",
+                            warehouse_ref1c=warehouse,
+                            source_ref1c=str(issue.source_warehouse_ref1c or ""),
+                        )
             else:
                 current = max(0.0, _to_float(line.required_qty) - _to_float(line.issued_qty))
                 take = min(current, excess)
                 line.required_qty = _to_float(line.required_qty) - take
+                if take > 1e-9:
+                    warehouse = _clean_ref1c(issue.source_warehouse_ref1c)
+                    if warehouse:
+                        append_material_issue_custody_event(
+                            db,
+                            issue=issue,
+                            line=line,
+                            delta_qty=-take,
+                            source_kind="terminal_release",
+                            location_kind="transit",
+                            warehouse_ref1c=warehouse,
+                            source_ref1c=str(issue.source_warehouse_ref1c or ""),
+                        )
             excess_by_component[cid] = excess - take
 
     ordered = sorted(issues, key=lambda i: i.issue_id, reverse=True)
@@ -802,11 +884,25 @@ def create_material_issues(
     existing documents in `reused`. After the order quantity shrinks, open
     (non-posted) reservations are released down to the requirement.
     """
-    truth = require_accepted_truth(db, "production_material_issue_create")
-    generation_id = int(truth.generation_id)
+    require_accepted_truth(db, "production_material_issue_create")
     # Hold a transaction-scoped lock for the whole read-modify-write below so
     # concurrent callers cannot both claim the same free workshop stock.
     _lock_material_issue_pool(db)
+
+    if not product_ids:
+        return {
+            "status": "ok",
+            "created": [],
+            "reused": [],
+            "selection_required": [],
+            "already_on_destination": [],
+            "errors": [],
+        }
+
+    generation_id, reservation_state = load_current_accepted_material_custody(
+        db,
+        consumer="production_material_issue_create",
+    )
 
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
@@ -878,7 +974,6 @@ def create_material_issues(
             continue
 
         comp_ids = [int(c["component_item_id"]) for c in components]
-        reservation_state = load_material_custody(db, item_ids=comp_ids)
         own = reservation_state.for_product(int(product.product_id))
 
         outstanding: Dict[int, float] = {}
@@ -1038,17 +1133,30 @@ def create_material_issues(
             db.flush()
             issue.document_number = material_issue_number(db, issue)
             for comp in grouped_components:
-                db.add(
-                    ProductionMaterialIssueLine(
-                        issue_id=int(issue.issue_id),
-                        component_item_id=int(comp["component_item_id"]),
-                        required_qty=float(comp["required_qty"]),
-                        issued_qty=0.0,
-                        unit=comp.get("unit"),
-                        source_spec_id=spec_id,
-                        line_status="planned",
-                    )
+                line = ProductionMaterialIssueLine(
+                    issue_id=int(issue.issue_id),
+                    component_item_id=int(comp["component_item_id"]),
+                    required_qty=float(comp["required_qty"]),
+                    issued_qty=0.0,
+                    unit=comp.get("unit"),
+                    source_spec_id=spec_id,
+                    line_status="planned",
                 )
+                db.add(line)
+                warehouse = _clean_ref1c(issue.source_warehouse_ref1c)
+                if not warehouse:
+                    warehouse = _clean_ref1c(issue.warehouse_ref1c)
+                if warehouse and line.required_qty > 1e-9:
+                    append_material_issue_custody_event(
+                        db,
+                        issue=issue,
+                        line=line,
+                        delta_qty=float(comp["required_qty"]),
+                        source_kind="issue_created",
+                        location_kind="transit",
+                        warehouse_ref1c=warehouse,
+                        source_ref1c=str(issue.source_warehouse_ref1c or ""),
+                    )
             entry: Dict[str, Any] = {
                 "issue_id": int(issue.issue_id),
                 "document_number": issue.document_number,

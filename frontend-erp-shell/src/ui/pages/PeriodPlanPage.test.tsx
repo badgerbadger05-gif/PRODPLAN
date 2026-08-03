@@ -17,19 +17,14 @@ vi.mock('../../services/periodPlan', () => ({
   listPeriodPlans: vi.fn(),
   createPeriodPlan: vi.fn(),
   updatePeriodPlanHeader: vi.fn(),
-  archivePeriodPlan: vi.fn(),
-  unarchivePeriodPlan: vi.fn(),
   listPeriodPlanRuns: vi.fn(),
   fixPeriodPlan: vi.fn(),
-  createMrpSnapshot: vi.fn(),
   getPeriodPlanMatrix: vi.fn(),
   bulkUpsertPeriodPlanLines: vi.fn(),
   getExecutionJournal: vi.fn(),
   deletePeriodPlan: vi.fn(),
   addItemToPeriodPlan: vi.fn(),
   deleteItemFromPeriodPlan: vi.fn(),
-  reconcileRun: vi.fn(),
-  createProductionOrdersFromRequirements: vi.fn(),
 }))
 vi.mock('../../services/productionPlan', () => ({
   searchNomenclature: vi.fn(),
@@ -56,10 +51,18 @@ const fixedPlan: PeriodPlan = {
   fixed_by: 'ivan',
 }
 
+const closedPlan: PeriodPlan = {
+  ...fixedPlan,
+  status: 'closed',
+  id: 321,
+  name: 'АВГУСТ 2026',
+}
+
 function makeMatrix(plan: PeriodPlan): PeriodPlanMatrix {
   return {
     plan,
     buckets: ['2026-05-01', '2026-05-08'],
+    bucket_totals: { '2026-05-01': 4, '2026-05-08': 6 },
     rows: [
       {
         item_id: 501,
@@ -71,6 +74,8 @@ function makeMatrix(plan: PeriodPlan): PeriodPlanMatrix {
         locked_buckets: {},
       },
     ],
+    total_qty: 10,
+    grand_total: 10,
     total: 10,
   }
 }
@@ -81,6 +86,9 @@ const journalResponse: ExecutionJournalResponse = {
   truth_status: 'accepted',
   ledger_generation: 7,
   cutoff: '2026-05-31T23:59:59Z',
+  total: 1,
+  limit: 100,
+  offset: 0,
   rows: [
     {
       req_id: 1,
@@ -91,7 +99,6 @@ const journalResponse: ExecutionJournalResponse = {
       flow: 'production',
       bom_level: 0,
       gross_qty: 10,
-      stock_qty: 0,
       net_qty: 10,
       ordered_qty: 4,
       completed_qty: 2,
@@ -133,6 +140,9 @@ const journalResponse: ExecutionJournalResponse = {
 
 const journalResponseWithLedgerLinks: ExecutionJournalResponse = {
   ...journalResponse,
+  total: 1,
+  limit: 100,
+  offset: 0,
   rows: [
     {
       ...journalResponse.rows[0],
@@ -168,6 +178,9 @@ const journalResponseWithLedgerLinks: ExecutionJournalResponse = {
 
 const journalResponseMixed: ExecutionJournalResponse = {
   ...journalResponse,
+  total: 3,
+  limit: 100,
+  offset: 0,
   rows: [
     {
       req_id: 1,
@@ -178,7 +191,6 @@ const journalResponseMixed: ExecutionJournalResponse = {
       flow: 'production',
       bom_level: 0,
       gross_qty: 10,
-      stock_qty: 0,
       net_qty: 10,
       ordered_qty: 4,
       completed_qty: 10,
@@ -199,15 +211,14 @@ const journalResponseMixed: ExecutionJournalResponse = {
       flow: 'production',
       bom_level: 0,
       gross_qty: 12,
-      stock_qty: 0,
       net_qty: 12,
-      ordered_qty: 0,
-      completed_qty: 0,
+      ordered_qty: 2,
+      completed_qty: 3,
       covered_qty: 0,
-      remaining_qty: 12,
-      unassigned_qty: 12,
-      coverage_pct: 0,
-      status: 'none',
+      remaining_qty: 9,
+      unassigned_qty: 9,
+      coverage_pct: 25,
+      status: 'partial',
       need_date: '2026-05-16',
       work_items: [],
     },
@@ -220,7 +231,6 @@ const journalResponseMixed: ExecutionJournalResponse = {
       flow: 'purchase',
       bom_level: 0,
       gross_qty: 8,
-      stock_qty: 0,
       net_qty: 8,
       ordered_qty: 3,
       completed_qty: 0,
@@ -236,8 +246,8 @@ const journalResponseMixed: ExecutionJournalResponse = {
   summary: {
     total_items: 3,
     fully_covered: 1,
-    partially_covered: 0,
-    not_covered: 2,
+    partially_covered: 1,
+    not_covered: 1,
     net_zero: 0,
   },
 }
@@ -255,12 +265,13 @@ const listPlanA: PeriodPlan = {
   fixed_by: null,
   line_count: 3,
   execution_pct: 62.9,
+  execution_progress_status: 'in_progress',
 }
 const listPlanB: PeriodPlan = {
   ...listPlanA,
   id: 102,
   name: 'МАРТ 2026',
-  status: 'archived',
+  status: 'closed',
   execution_pct: null,
   execution_reason: 'Нет данных',
 }
@@ -294,17 +305,22 @@ beforeEach(() => {
     total: 2,
   })
   vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockResolvedValue(makeMatrix(draftPlan))
-  vi.mocked(periodPlanSvc.listPeriodPlanRuns).mockResolvedValue({ rows: [], total: 0 })
+  vi.mocked(periodPlanSvc.listPeriodPlanRuns).mockResolvedValue({
+    rows: [{
+      run_id: 900,
+      status: 'success',
+      started_at: '2026-05-01T10:00:00',
+      finished_at: '2026-05-01T10:05:00',
+    }],
+    total: 1,
+  })
   vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponse)
   vi.mocked(periodPlanSvc.createPeriodPlan).mockResolvedValue({ ...draftPlan, id: 555 })
   vi.mocked(periodPlanSvc.deletePeriodPlan).mockResolvedValue({ status: 'ok', id: 101, name: 'АПРЕЛЬ 2026' })
   vi.mocked(periodPlanSvc.deleteItemFromPeriodPlan).mockResolvedValue({ status: 'ok', plan_id: 123, item_id: 501, deleted: 1 })
   vi.mocked(periodPlanSvc.addItemToPeriodPlan).mockResolvedValue({ status: 'ok', plan_id: 123, item_id: 777 })
-  vi.mocked(periodPlanSvc.createMrpSnapshot).mockResolvedValue({
-    status: 'ok', run_id: 900, plan_id: 123, requirement_count: 5, purchase_count: 2, rework_count: 1,
-  })
   vi.mocked(productionPlanSvc.searchNomenclature).mockResolvedValue({
-    items: [searchItem], total: 1, query: '', search_type: 'trgm',
+    items: [searchItem], total: 1, query: '', search_type: 'text',
   })
 })
 
@@ -330,6 +346,14 @@ describe('PeriodPlanPage — list view', () => {
     expect(screen.getByText('Выполнение')).toBeInTheDocument()
     expect(screen.getByText('62,9%')).toBeInTheDocument()
     expect(screen.getByText('Недоступно: Нет данных')).toBeInTheDocument()
+  })
+
+  it('shows closed status in list filtering and rows', async () => {
+    renderAt('/period-plan')
+
+    expect(await screen.findByText('МАРТ 2026')).toBeInTheDocument()
+    expect(screen.getAllByText('Закрыт').length).toBeGreaterThan(0)
+    expect(screen.getByRole('option', { name: 'Закрыт' })).toBeInTheDocument()
   })
 
   it('breaks execution down by flow with labels and shows a dash for draft plans', async () => {
@@ -381,6 +405,7 @@ describe('PeriodPlanPage — list view', () => {
         ...listPlanA,
         status: 'fixed',
         execution_pct: 125.4,
+        execution_progress_status: 'in_progress',
         execution_by_flow: {
           production: {
             completed_qty: 12.54,
@@ -395,7 +420,7 @@ describe('PeriodPlanPage — list view', () => {
 
     renderAt('/period-plan')
 
-    expect(await screen.findByText('125,4%')).toBeInTheDocument()
+    expect(await screen.findByText('125,4%')).toHaveClass('partial')
     expect(screen.getByText(/Пр 125,4%/)).toBeInTheDocument()
     expect(screen.queryByText('100%')).not.toBeInTheDocument()
   })
@@ -584,7 +609,6 @@ describe('PeriodPlanPage — detail view', () => {
       rows: [{
         ...journalResponse.rows[0],
         gross_qty: 10,
-        stock_qty: undefined,
         net_qty: 12,
         status: 'execution_unavailable',
         execution_available: false,
@@ -602,7 +626,7 @@ describe('PeriodPlanPage — detail view', () => {
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
 
     expect(await screen.findByText('Исполнение недоступно')).toBeInTheDocument()
-    expect(screen.getByTitle(/Остаток склада: н\/д/)).toBeInTheDocument()
+    expect(screen.getByTitle(/Потребность с припусками: 10/)).toBeInTheDocument()
     expect(screen.queryByText(/Общее выполнение:/)).not.toBeInTheDocument()
   })
 
@@ -636,34 +660,104 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.queryByText(/часть н\/д/)).not.toBeInTheDocument()
   })
 
-  it('filters journal rows by incomplete status via button and dropdown', async () => {
+  it('filters journal rows by status via button and dropdown via backend params', async () => {
     const user = userEvent.setup()
-    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponseMixed)
+    const partialRows = journalResponseMixed.rows.filter((row) => row.status === 'partial')
+    const orderedRows = journalResponseMixed.rows.filter((row) => row.status === 'ordered')
+    const partialSummary = {
+      ...journalResponseMixed.summary,
+      fully_covered: 1,
+      partially_covered: partialRows.length,
+      not_covered: orderedRows.length + (journalResponseMixed.summary.not_covered - orderedRows.length),
+      net_zero: 0,
+    }
+    const orderedSummary = {
+      ...journalResponseMixed.summary,
+      fully_covered: 1,
+      partially_covered: 0,
+      not_covered: orderedRows.length,
+      net_zero: 0,
+    }
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockImplementation(async (_, params) => {
+      if (!params) return journalResponseMixed
+      if (params.status === 'partial') {
+        return { ...journalResponseMixed, rows: partialRows, summary: partialSummary }
+      }
+      if (params.status === 'ordered') {
+        return { ...journalResponseMixed, rows: orderedRows, summary: orderedSummary }
+      }
+      return journalResponseMixed
+    })
     renderAt('/period-plan/123')
 
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
     expect(await screen.findByText('Фильтр ГА-2')).toBeInTheDocument()
     expect(screen.getByText('Клапан ГА-3')).toBeInTheDocument()
 
-    const incompleteButton = screen.getByRole('button', { name: /Невыполнено: 2/ })
-    await user.click(incompleteButton)
+    const partialButton = screen.getByRole('button', { name: /Частично: 1/ })
+    await user.click(partialButton)
 
     expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
     expect(screen.getByText('Фильтр ГА-2')).toBeInTheDocument()
-    expect(screen.getByText('Клапан ГА-3')).toBeInTheDocument()
+    expect(screen.queryByText('Клапан ГА-3')).not.toBeInTheDocument()
 
-    await user.click(incompleteButton)
+    await user.click(partialButton)
 
-    const statusSelect = screen.getAllByRole('combobox').find((node) => (
-      Array.from((node as HTMLSelectElement).options).some((option) => option.value === 'incomplete')
-    )) as HTMLSelectElement | undefined
+    const statusSelect = screen.getAllByRole('combobox').find((node) => {
+      return Array.from((node as HTMLSelectElement).options).some((option) => option.value === 'ordered')
+    }) as HTMLSelectElement | undefined
     expect(statusSelect).toBeDefined()
     if (statusSelect) {
-      await user.selectOptions(statusSelect, 'incomplete')
+      await user.selectOptions(statusSelect, 'ordered')
     }
-    expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
-    expect(screen.getByText('Фильтр ГА-2')).toBeInTheDocument()
+    expect(screen.queryByText('Фильтр ГА-2')).not.toBeInTheDocument()
     expect(screen.getByText('Клапан ГА-3')).toBeInTheDocument()
+    expect(periodPlanSvc.getExecutionJournal).toHaveBeenCalledWith(
+      123,
+      expect.objectContaining({ status: 'ordered' }),
+    )
+  })
+
+  it('requests journal next page using offset parameter', async () => {
+    const user = userEvent.setup()
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockImplementation(async (_, params) => {
+      if (params?.offset === 100) {
+        return {
+          ...journalResponse,
+          offset: 100,
+          total: 250,
+          limit: 100,
+          rows: [
+            {
+              ...journalResponse.rows[0],
+              req_id: 11,
+              item_name: 'Резервный насос',
+            },
+          ],
+          summary: {
+            ...journalResponse.summary,
+            total_items: 1,
+            fully_covered: 0,
+            partially_covered: 1,
+            not_covered: 0,
+            net_zero: 0,
+          },
+        }
+      }
+      return { ...journalResponse, total: 250, limit: 100, offset: 0 }
+    })
+
+    renderAt('/period-plan/123')
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+
+    const nextButton = await screen.findByRole('button', { name: 'Следующая →' })
+    await user.click(nextButton)
+
+    await waitFor(() => expect(vi.mocked(periodPlanSvc.getExecutionJournal)).toHaveBeenCalledWith(
+      123,
+      expect.objectContaining({ offset: 100 }),
+    ))
+    expect(await screen.findByText('Резервный насос')).toBeInTheDocument()
   })
 
   it('fails closed when execution truth is unavailable', async () => {
@@ -684,7 +778,6 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.getByText(/Исторические движения Ledger не загружены/)).toBeInTheDocument()
     expect(screen.queryByText(/Общее выполнение:/)).not.toBeInTheDocument()
     expect(screen.queryByText('20%')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Создать заказы производства' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'CSV' })).toBeDisabled()
   })
 
@@ -735,6 +828,32 @@ describe('PeriodPlanPage — detail view', () => {
 
   })
 
+  it('fails a flow closed when the execution snapshot omits available', async () => {
+    const malformedProduction = {
+      completed_qty: 2,
+      base_qty: 10,
+      execution_pct: 20,
+    } as unknown as NonNullable<typeof journalResponse.summary.execution_by_flow>['production']
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue({
+      ...journalResponse,
+      summary: {
+        ...journalResponse.summary,
+        execution_by_flow: {
+          ...journalResponse.summary.execution_by_flow,
+          production: malformedProduction,
+        },
+      },
+    })
+
+    const user = userEvent.setup()
+    renderAt('/period-plan/123')
+    await screen.findByText('Насос ГА-1')
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+
+    expect(screen.getByText('Производство: недоступно')).toBeInTheDocument()
+    expect(screen.queryByText('Производство: 20%')).not.toBeInTheDocument()
+  })
+
   it('deletes a matrix row (draft) via deleteItemFromPeriodPlan after confirm', async () => {
     const user = userEvent.setup()
     renderAt('/period-plan/123')
@@ -748,16 +867,22 @@ describe('PeriodPlanPage — detail view', () => {
     await waitFor(() => expect(periodPlanSvc.deleteItemFromPeriodPlan).toHaveBeenCalledWith(123, 501))
   })
 
-  it('shows MRP snapshot action for a fixed plan and calls createMrpSnapshot', async () => {
+  it('does not show archive/snapshot actions in normal fixed-plan detail UI', async () => {
     vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockResolvedValue(makeMatrix(fixedPlan))
-    const user = userEvent.setup()
     renderAt('/period-plan/123')
 
-    const snapshotBtn = await screen.findByRole('button', { name: 'MRP снимок' })
-    await user.click(snapshotBtn)
+    expect(await screen.findByText('Насос ГА-1')).toBeInTheDocument()
 
-    await waitFor(() => expect(periodPlanSvc.createMrpSnapshot).toHaveBeenCalledWith(123))
-    expect(await screen.findByText(/MRP-снимок создан/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'MRP снимок' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'В архив' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Из архива' })).not.toBeInTheDocument()
+  })
+
+  it('renders closed plan status in detail view', async () => {
+    vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockResolvedValue(makeMatrix(closedPlan))
+    renderAt('/period-plan/123')
+
+    expect((await screen.findAllByText('Закрыт')).length).toBeGreaterThan(0)
   })
 
   it('returns to the list via the "back" button (useNavigate)', async () => {

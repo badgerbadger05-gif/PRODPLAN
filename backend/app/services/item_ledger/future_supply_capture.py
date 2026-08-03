@@ -14,15 +14,25 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import models
 from .physical import canonical_content_hash, canonical_decimal
+from .physical_visibility import visible_sle_query
 
 
 _KINDS = frozenset({"wip_order", "supplier_order"})
 _STATUSES = frozenset({"exact", "ambiguous", "unmatched", "rejected"})
 CARRY_FORWARD_ALGORITHM_VERSION = "ledger-future-supply-carry-forward/1"
+FUTURE_SUPPLY_CAPTURE_STAGE = "future_supply_capture"
+FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION = "ledger-future-supply-capture/1"
+_SUPPLIER_REALIZATION_KINDS = frozenset({
+    "supplier_receipt",
+    "correction",
+    "supplier_return",
+})
+_WIP_REALIZATION_KINDS = frozenset({"assembly_in", "transfer_in"})
 
 
 class FutureSupplyCaptureError(ValueError):
@@ -47,6 +57,7 @@ class FutureSupplyEvidence:
     source_ref: str | None = None
     source_line_ref: str | None = None
     source_local_id: str | None = None
+    source_requirement_id: int | None = None
     ordered_qty_at_cutoff: Decimal | int | float | str = Decimal("0")
     realized_qty_at_cutoff: Decimal | int | float | str = Decimal("0")
     eta_date: date | None = None
@@ -72,6 +83,29 @@ def _norm(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str):
+        raise FutureSupplyCaptureError(
+            "future supply capture metrics cutoff must be an iso timestamp"
+        )
+    try:
+        return _as_utc(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise FutureSupplyCaptureError(
+            "future supply capture metrics cutoff must be an iso timestamp"
+        ) from exc
+
+
 def _item_id(value: Any) -> int:
     try:
         result = int(value)
@@ -79,6 +113,21 @@ def _item_id(value: Any) -> int:
         raise FutureSupplyCaptureError("future supply evidence requires item_id") from exc
     if result <= 0:
         raise FutureSupplyCaptureError("future supply evidence requires item_id")
+    return result
+
+
+def _requirement_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        result = int(text)
+    except (TypeError, ValueError) as exc:
+        raise FutureSupplyCaptureError("source_requirement_id must be an integer") from exc
+    if result <= 0:
+        raise FutureSupplyCaptureError("source_requirement_id must be a positive integer")
     return result
 
 
@@ -94,6 +143,9 @@ def _canonical_payload(evidence: FutureSupplyEvidence) -> dict[str, Any]:
         "source_ref": _norm(evidence.source_ref) or None,
         "source_line_ref": _norm(evidence.source_line_ref) or None,
         "source_local_id": _norm(evidence.source_local_id) or None,
+        "source_requirement_id": (
+            _requirement_id(evidence.source_requirement_id)
+        ),
         "ordered_qty_at_cutoff": canonical_decimal(evidence.ordered_qty_at_cutoff),
         "realized_qty_at_cutoff": canonical_decimal(evidence.realized_qty_at_cutoff),
         "eta_date": evidence.eta_date.isoformat() if evidence.eta_date else None,
@@ -123,11 +175,29 @@ def _row_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
 
 def _row_hash_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     """JSON-safe canonical persisted projection (not its DB identity/timestamps)."""
+    quantity_fields = {
+        "ordered_qty_at_cutoff",
+        "realized_qty_at_cutoff",
+        "open_qty_at_cutoff",
+    }
+
+    def _normalize_value(key: str, value: Any) -> Any:
+        if key in quantity_fields and value is not None:
+            # These columns are DECIMAL(15,3).  The hash represents their
+            # declared storage form both before and after PostgreSQL INSERT.
+            value = Decimal(str(value)).quantize(Decimal("0.001"))
+        if isinstance(value, datetime):
+            normalized = value.astimezone(timezone.utc) if value.tzinfo is not None else value
+            return normalized.replace(tzinfo=None).isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return canonical_decimal(value)
+        return value
+
     return {
         key: (
-            canonical_decimal(value) if isinstance(value, Decimal)
-            else value.isoformat() if isinstance(value, (date, datetime))
-            else value
+            _normalize_value(key, value)
         )
         for key, value in row.items()
     }
@@ -144,6 +214,7 @@ def _stored_row_payload(row: models.LedgerFutureSupply) -> dict[str, Any]:
         "source_ref": row.source_ref,
         "source_line_ref": row.source_line_ref,
         "source_local_id": row.source_local_id,
+        "source_requirement_id": row.source_requirement_id,
         "ordered_qty_at_cutoff": row.ordered_qty_at_cutoff,
         "realized_qty_at_cutoff": row.realized_qty_at_cutoff,
         "open_qty_at_cutoff": row.open_qty_at_cutoff,
@@ -225,10 +296,11 @@ def _validated_rows(
             "source_ref": source_ref,
             "source_line_ref": source_line_ref,
             "source_local_id": _norm(item.source_local_id) or None,
+            "source_requirement_id": _requirement_id(item.source_requirement_id),
             "ordered_qty_at_cutoff": ordered,
             "realized_qty_at_cutoff": realized,
             "open_qty_at_cutoff": open_qty,
-            "eta_date": item.eta_date,
+            "eta_date": item.eta_date.date() if isinstance(item.eta_date, datetime) else item.eta_date,
             "source_state_key": _norm(item.source_state_key),
             "source_updated_at": item.source_updated_at,
             "capture_cutoff": item.capture_cutoff,
@@ -257,6 +329,7 @@ _CARRY_FORWARD_FIELDS = (
     "source_ref",
     "source_line_ref",
     "source_local_id",
+    "source_requirement_id",
     "ordered_qty_at_cutoff",
     "realized_qty_at_cutoff",
     "open_qty_at_cutoff",
@@ -270,25 +343,271 @@ _CARRY_FORWARD_FIELDS = (
 )
 
 
+def _supplier_receipt_realized_delta(
+    db: Session,
+    *,
+    target_generation_cutoff: datetime,
+    parent_cutoff: datetime,
+    target_physical_import_batch_id: int,
+    supplier_order_ref: str,
+    supplier_order_line_no: str,
+) -> Decimal:
+    if target_generation_cutoff <= parent_cutoff:
+        return Decimal("0")
+    visible_sle_ids = visible_sle_query(
+        db,
+        physical_import_batch_id=int(target_physical_import_batch_id),
+        cutoff=target_generation_cutoff,
+    ).with_entities(models.StockLedgerEntry.id).subquery()
+    return sum(
+        (
+            Decimal(str(qty))
+        for (qty,) in db.query(models.StockLedgerEntry.qty).join(
+            models.StockLedgerSupplierReceiptProvenance,
+            models.StockLedgerEntry.id
+            == models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id,
+        ).filter(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
+                select(visible_sle_ids.c.id),
+            ),
+                models.StockLedgerSupplierReceiptProvenance.operation_kind.in_(
+            _SUPPLIER_REALIZATION_KINDS
+            ),
+            models.StockLedgerSupplierReceiptProvenance.supplier_order_ref
+            == supplier_order_ref,
+            models.StockLedgerSupplierReceiptProvenance.supplier_order_line_no
+            == supplier_order_line_no,
+            models.StockLedgerEntry.posting_at > parent_cutoff,
+        )
+    ),
+    Decimal("0"),
+)
+
+
+def _wip_realized_delta(
+    db: Session,
+    *,
+    target_generation_cutoff: datetime,
+    parent_cutoff: datetime,
+    target_physical_import_batch_id: int,
+    source_ref: str,
+    source_line_ref: str,
+) -> Decimal:
+    if target_generation_cutoff <= parent_cutoff:
+        return Decimal("0")
+    return sum(
+        (
+            Decimal(str(qty))
+            for (qty,) in visible_sle_query(
+                db,
+                physical_import_batch_id=int(target_physical_import_batch_id),
+                cutoff=target_generation_cutoff,
+            ).filter(
+                models.StockLedgerEntry.recorder_ref == source_ref,
+                models.StockLedgerEntry.line_no == source_line_ref,
+                models.StockLedgerEntry.movement_kind.in_(_WIP_REALIZATION_KINDS),
+                models.StockLedgerEntry.qty > Decimal("0"),
+                models.StockLedgerEntry.posting_at > parent_cutoff,
+            ).with_entities(models.StockLedgerEntry.qty)
+        ),
+        Decimal("0"),
+    )
+
+
+def _carry_forward_rows(
+    db: Session,
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+) -> list[dict[str, Any]]:
+    parent_cutoff = _as_utc(parent.cutoff)
+    target_cutoff = _as_utc(target.cutoff)
+    if parent_cutoff is None or target_cutoff is None:
+        raise FutureSupplyCaptureError("future supply carry-forward requires parent and target cutoffs")
+
+    carried: list[dict[str, Any]] = []
+    for source in _generation_rows(db, int(parent.id)):
+        row = {
+            field: getattr(source, field)
+            for field in _CARRY_FORWARD_FIELDS
+        }
+        ordered = Decimal(str(row["ordered_qty_at_cutoff"] or 0))
+        realized = Decimal(str(row["realized_qty_at_cutoff"] or 0))
+        if str(row["evidence_status"]) == "exact":
+            if str(row["supply_kind"]) == "supplier_order":
+                realized += _supplier_receipt_realized_delta(
+                    db,
+                    target_generation_cutoff=target_cutoff,
+                    parent_cutoff=parent_cutoff,
+                    target_physical_import_batch_id=int(target.physical_import_batch_id),
+                    supplier_order_ref=_norm(row["source_ref"] or ""),
+                    supplier_order_line_no=_norm(row["source_line_ref"] or ""),
+                )
+            else:
+                realized += _wip_realized_delta(
+                    db,
+                    target_generation_cutoff=target_cutoff,
+                    parent_cutoff=parent_cutoff,
+                    target_physical_import_batch_id=int(target.physical_import_batch_id),
+                    source_ref=_norm(row["source_ref"] or ""),
+                    source_line_ref=_norm(row["source_line_ref"] or ""),
+                )
+            if ordered <= 0:
+                raise FutureSupplyCaptureError("parent future-supply capture has invalid ordered qty")
+            row["realized_qty_at_cutoff"] = realized
+            row["open_qty_at_cutoff"] = max(ordered - realized, Decimal("0"))
+        else:
+            row["open_qty_at_cutoff"] = max(Decimal(str(row["open_qty_at_cutoff"] or 0)), Decimal("0"))
+        # Persist an aware timestamp.  Passing the naive UTC helper result into
+        # PostgreSQL timestamptz makes the session timezone reinterpret it and
+        # shifts the evidence cutoff (Europe/Moscow used to subtract 3 hours).
+        row["capture_cutoff"] = target.cutoff
+        carried.append(row)
+    carried.sort(key=_row_sort_key)
+    return carried
+
+
 def _generation_rows(db: Session, generation_id: int) -> list[models.LedgerFutureSupply]:
     return db.query(models.LedgerFutureSupply).filter(
         models.LedgerFutureSupply.ledger_generation_id == int(generation_id)
     ).all()
 
 
-def _capture_summary(rows: list[models.LedgerFutureSupply]) -> dict[str, Any]:
+def _capture_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    normalized = list(rows)
     payloads = sorted(
-        (_stored_row_payload(row) for row in rows), key=_row_sort_key
+        (_row_hash_payload(row) for row in normalized), key=_row_sort_key
     )
     open_qty = sum(
-        (Decimal(str(row.open_qty_at_cutoff or 0)) for row in rows), Decimal("0")
+        (Decimal(str(row["open_qty_at_cutoff"] or 0)) for row in normalized),
+        Decimal("0"),
     )
     return {
-        "rows": len(rows),
-        "exact_rows": sum(1 for row in rows if str(row.evidence_status) == "exact"),
+        "rows": len(normalized),
+        "exact_rows": sum(1 for row in normalized if str(row["evidence_status"]) == "exact"),
         "open_qty": canonical_decimal(open_qty),
         "content_hash": canonical_content_hash(payloads),
     }
+
+
+def _bound_capture_metrics(
+    generation: models.LedgerGeneration,
+    batch: models.LedgerBuildBatch,
+    metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    if generation.cutoff is None:
+        raise FutureSupplyCaptureError("future supply capture requires generation cutoff")
+    return {
+        **dict(metrics),
+        "open_qty": canonical_decimal(metrics.get("open_qty", 0)),
+        "surplus_qty": canonical_decimal(metrics.get("surplus_qty", 0)),
+        "generation_id": int(generation.id),
+        "cutoff": _as_utc(generation.cutoff).isoformat(),
+        "algorithm_version": str(batch.algorithm_version),
+    }
+
+
+def _result_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep service quantity results numeric while stored JSON stays canonical."""
+    result = dict(metrics)
+    for key in ("open_qty", "surplus_qty"):
+        if key in result:
+            result[key] = Decimal(str(result[key] or 0))
+    return result
+
+
+def verify_future_supply_capture(
+    db: Session,
+    generation_id: int,
+    *,
+    capture_batch_id: int | None = None,
+) -> Mapping[str, Any]:
+    """Verify completed future-supply capture proof for a building generation.
+
+    The future-supply stage must be closed and its persisted rows must match the
+    stored digest and count to prevent silent proof drift.
+    """
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status) not in {"building", "accepted"}:
+        raise FutureSupplyCaptureError(
+            "future supply capture verification requires a building or accepted generation"
+        )
+    expected_batch_id = int(capture_batch_id) if capture_batch_id is not None else None
+    batches = db.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
+        models.LedgerBuildBatch.stage == FUTURE_SUPPLY_CAPTURE_STAGE,
+    ).all()
+    if not batches:
+        raise FutureSupplyCaptureError("future supply capture is missing")
+    if len(batches) != 1:
+        raise FutureSupplyCaptureError(
+            "future supply generation must have exactly one future_supply_capture batch"
+        )
+    batch = batches[0]
+    if expected_batch_id is not None and int(batch.id) != expected_batch_id:
+        raise FutureSupplyCaptureError(
+            "future supply capture batch id does not match manifest evidence"
+        )
+    if str(batch.algorithm_version) not in {
+        FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+        CARRY_FORWARD_ALGORITHM_VERSION,
+    }:
+        raise FutureSupplyCaptureError(
+            "future supply capture batch algorithm_version is unsupported"
+        )
+    if str(batch.status) != "completed":
+        raise FutureSupplyCaptureError(
+            "future supply capture batch must be completed before publication"
+        )
+    if generation.cutoff is None:
+        raise FutureSupplyCaptureError("future supply capture verification requires generation cutoff")
+
+    rows = db.query(models.LedgerFutureSupply).filter(
+        models.LedgerFutureSupply.ledger_generation_id == int(generation.id),
+        models.LedgerFutureSupply.capture_batch_id == int(batch.id),
+    ).all()
+    payloads = [_stored_row_payload(row) for row in rows]
+    expected_hash = canonical_content_hash(
+        sorted(payloads, key=_row_sort_key)
+    )
+    metrics = dict(batch.metrics or {})
+    try:
+        metric_generation_id = int(metrics.get("generation_id"))
+    except (TypeError, ValueError) as exc:
+        raise FutureSupplyCaptureError(
+            "future supply capture generation_id is missing or malformed"
+        ) from exc
+    if metric_generation_id != int(generation.id):
+        raise FutureSupplyCaptureError(
+            "future supply capture generation_id does not match target generation"
+        )
+    try:
+        metric_cutoff = _parse_utc(metrics.get("cutoff"))
+    except (TypeError, ValueError) as exc:
+        raise FutureSupplyCaptureError(
+            "future supply capture metrics cutoff is missing or malformed"
+        ) from exc
+    if metric_cutoff != _as_utc(generation.cutoff):
+        raise FutureSupplyCaptureError(
+            "future supply capture cutoff does not match target generation"
+        )
+    if str(metrics.get("algorithm_version") or "") != str(batch.algorithm_version):
+        raise FutureSupplyCaptureError(
+            "future supply capture algorithm_version does not match batch"
+        )
+    try:
+        expected_rows = int(metrics.get("rows", -1))
+    except (TypeError, ValueError) as exc:
+        raise FutureSupplyCaptureError("future supply capture metrics are malformed") from exc
+    if expected_rows != len(rows):
+        raise FutureSupplyCaptureError("future supply capture rows do not match persisted facts")
+    if str(metrics.get("content_hash") or "") != expected_hash:
+        raise FutureSupplyCaptureError("future supply capture content hash does not match persisted facts")
+
+    generation_cutoff = _as_utc(generation.cutoff)
+    for row in rows:
+        if _as_utc(row.capture_cutoff) != generation_cutoff:
+            raise FutureSupplyCaptureError("future supply capture rows have stale cutoff")
+    return _result_metrics(metrics)
 
 
 def carry_forward_future_supply(
@@ -299,13 +618,11 @@ def carry_forward_future_supply(
 ) -> Mapping[str, Any]:
     """Copy the accepted parent's future-supply capture into a refresh target.
 
-    A physical refresh advances *facts*, not obligations: it re-reads no
-    supplier or WIP order, so recapturing here would fabricate evidence, while
-    capturing nothing leaves the purchase journal reporting zero ordered and
-    zero in transit after every three-hour cycle.  The rows are therefore
-    carried verbatim, keeping the ``capture_cutoff`` at which the evidence was
-    really observed, under one dedicated carry-forward batch so their origin
-    stays auditable.  Idempotent: an exact repeat returns the existing summary.
+    A physical refresh advances facts without re-reading mutable supplier or
+    WIP orders.  Their accepted quantities are carried under one dedicated
+    batch, physical realizations between the two cutoffs are applied, and every
+    carried row is rebound to the target generation cutoff.  Idempotent: an
+    exact repeat returns the existing summary.
     """
     target = db.get(models.LedgerGeneration, int(target_generation_id))
     if target is None or str(target.status) != "building":
@@ -320,26 +637,32 @@ def carry_forward_future_supply(
     if int(parent.id) == int(target.id):
         raise FutureSupplyCaptureError("future supply carry-forward requires two generations")
 
-    parent_rows = _generation_rows(db, int(parent.id))
-    expected = _capture_summary(parent_rows)
+    carried_rows = _carry_forward_rows(db, parent=parent, target=target)
+    expected = _capture_summary(carry_forward_rows := carried_rows)
     existing_rows = _generation_rows(db, int(target.id))
     if existing_rows:
-        if _capture_summary(existing_rows) != expected:
+        if _capture_summary(
+            _stored_row_payload(row) for row in existing_rows
+        ) != expected:
             raise FutureSupplyCaptureError(
                 "target already carries a conflicting future-supply capture"
             )
-        return {**expected, "created": False, "source_generation_id": int(parent.id)}
+        return _result_metrics({
+            **expected,
+            "created": False,
+            "source_generation_id": int(parent.id),
+        })
 
     batch_key = f"future-supply-carry-forward:g{int(target.id)}"
     batch = db.query(models.LedgerBuildBatch).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
-        models.LedgerBuildBatch.stage == "snapshot_build",
+        models.LedgerBuildBatch.stage == FUTURE_SUPPLY_CAPTURE_STAGE,
         models.LedgerBuildBatch.batch_key == batch_key,
     ).one_or_none()
     if batch is None:
         batch = models.LedgerBuildBatch(
             ledger_generation_id=int(target.id),
-            stage="snapshot_build",
+            stage=FUTURE_SUPPLY_CAPTURE_STAGE,
             batch_key=batch_key,
             status="building",
             algorithm_version=CARRY_FORWARD_ALGORITHM_VERSION,
@@ -347,24 +670,54 @@ def carry_forward_future_supply(
         )
         db.add(batch)
         db.flush()
-    for source in parent_rows:
+    for source in carry_forward_rows:
         db.add(models.LedgerFutureSupply(
             ledger_generation_id=int(target.id),
             capture_batch_id=int(batch.id),
-            **{field: getattr(source, field) for field in _CARRY_FORWARD_FIELDS},
+            **{field: source[field] for field in _CARRY_FORWARD_FIELDS},
         ))
     db.flush()
-    if _capture_summary(_generation_rows(db, int(target.id))) != expected:
-        raise FutureSupplyCaptureError("carried-forward future supply conflicts")
+    persisted_payloads = sorted(
+        (_stored_row_payload(row) for row in _generation_rows(db, int(target.id))),
+        key=_row_sort_key,
+    )
+    expected_payloads = sorted(
+        (_row_hash_payload(row) for row in carry_forward_rows),
+        key=_row_sort_key,
+    )
+    if persisted_payloads != expected_payloads:
+        differing_fields: list[str] = []
+        for expected_row, persisted_row in zip(expected_payloads, persisted_payloads):
+            differing_fields = sorted(
+                key
+                for key in set(expected_row) | set(persisted_row)
+                if expected_row.get(key) != persisted_row.get(key)
+            )
+            if differing_fields:
+                break
+        if len(expected_payloads) != len(persisted_payloads):
+            differing_fields.append("row_count")
+        raise FutureSupplyCaptureError(
+            "carried-forward future supply conflicts; differing_fields="
+            f"{sorted(set(differing_fields))}"
+        )
+    expected = _capture_summary(persisted_payloads)
     batch.status = "completed"
     batch.metrics = {
         **expected,
+        "generation_id": int(target.id),
+        "cutoff": _as_utc(target.cutoff).isoformat(),
+        "algorithm_version": str(batch.algorithm_version),
         "source_generation_id": int(parent.id),
         "carried_forward": True,
     }
     batch.completed_at = datetime.now(timezone.utc)
     db.flush()
-    return {**expected, "created": True, "source_generation_id": int(parent.id)}
+    return _result_metrics({
+        **expected,
+        "created": True,
+        "source_generation_id": int(parent.id),
+    })
 
 
 def replace_future_supply_capture(
@@ -391,15 +744,21 @@ def replace_future_supply_capture(
     if (
         batch is None
         or int(batch.ledger_generation_id) != int(generation.id)
-        or str(batch.stage) != "snapshot_build"
+        or str(batch.stage) != FUTURE_SUPPLY_CAPTURE_STAGE
         or str(batch.status) not in {"building", "completed"}
     ):
         raise FutureSupplyCaptureError(
             "capture batch must be this generation's BUILDING or own COMPLETED "
-            "snapshot_build batch"
+            "future_supply_capture batch"
         )
 
-    rows, metrics = _validated_rows(generation, evidence)
+    if str(batch.algorithm_version) != FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION:
+        raise FutureSupplyCaptureError(
+            "direct future supply capture requires the canonical capture algorithm"
+        )
+    rows, raw_metrics = _validated_rows(generation, evidence)
+    stored_metrics = _bound_capture_metrics(generation, batch, raw_metrics)
+    metrics = dict(stored_metrics)
     with db.begin_nested():
         # A capture may be rerun, but must not overwrite another batch's facts.
         existing = db.query(models.LedgerFutureSupply).filter(
@@ -429,7 +788,9 @@ def replace_future_supply_capture(
         if sorted((_stored_row_payload(row) for row in replaced_rows), key=_row_sort_key) == [
             _row_hash_payload(row) for row in rows
         ]:
-            return metrics
+            if str(batch.status) != "completed":
+                batch.metrics = dict(stored_metrics)
+            return _result_metrics(metrics)
         if str(batch.status) == "completed":
             raise FutureSupplyCaptureError(
                 "completed capture batch conflicts with the recaptured future supply"
@@ -448,4 +809,24 @@ def replace_future_supply_capture(
                 **row,
             ))
         db.flush()
-    return metrics
+        # Seal the digest from the values PostgreSQL actually persisted.  The
+        # quantity columns have scale=3, so hashing the higher-precision input
+        # would create a manifest that can never verify after the INSERT has
+        # rounded it to the declared storage representation.
+        persisted_rows = db.query(models.LedgerFutureSupply).filter(
+            models.LedgerFutureSupply.ledger_generation_id == int(generation.id),
+            models.LedgerFutureSupply.capture_batch_id == int(batch.id),
+        ).all()
+        for persisted_row in persisted_rows:
+            db.refresh(persisted_row)
+        persisted_summary = _capture_summary(
+            _stored_row_payload(row) for row in persisted_rows
+        )
+        stored_metrics = _bound_capture_metrics(
+            generation,
+            batch,
+            {**raw_metrics, **persisted_summary},
+        )
+        metrics = dict(stored_metrics)
+        batch.metrics = dict(stored_metrics)
+    return _result_metrics(metrics)

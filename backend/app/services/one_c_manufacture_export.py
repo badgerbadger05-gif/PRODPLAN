@@ -66,6 +66,7 @@ from .bom_specification_resolver import BomSpecificationResolver
 
 
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
+ORDER_BASIS_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 
 
@@ -641,14 +642,16 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     if material_structural_unit:
         payload["СтруктурнаяЕдиницаЗапасов_Key"] = material_structural_unit
     # 1C UNF links assembly to production order through this dedicated field.
-    # The generic composite ДокументОснование on Document_СборкаЗапасов does
-    # not accept Document_ЗаказНаПроизводство in the current OData metadata.
+    # Still send the generic basis fields too, as canonical contract requires
+    # Document_СборкаЗапасов to carry an explicit parent link.
     if not entry.order_ref1c:
         raise ValueError(
             f"manufacture_id={entry.manufacture_id}: нет order_ref1c — "
             "СборкаЗапасов не может быть создана без основания-заказа"
         )
     payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
+    payload["ДокументОснование"] = entry.order_ref1c
+    payload["ДокументОснование_Type"] = ORDER_BASIS_TYPE
     return payload
 
 

@@ -544,6 +544,15 @@ def pull_recorder_movements(
         if header_order_ref:
             pull_row.order_ref = header_order_ref
         result.touched_keys = []
+        from app.services.production_material_custody_events import (
+            project_transfer_custody_events_for_recorder,
+        )
+        project_transfer_custody_events_for_recorder(
+            session,
+            recorder_type=recorder_type,
+            recorder_ref=recorder_ref,
+            stock_ledger_entries=active_rows,
+        )
         session.flush()
         return result
 
@@ -576,6 +585,7 @@ def pull_recorder_movements(
         old.active = False
 
     new_by_line: Dict[str, models.StockLedgerEntry] = {}
+    new_entries: List[models.StockLedgerEntry] = []
     for key, signed_qty, record_type, line_no, posting_at in normalized:
         entry = models.StockLedgerEntry(
                 ingest_batch_id=import_batch.id,
@@ -595,9 +605,19 @@ def pull_recorder_movements(
                 ingest_source=INGEST_SOURCE,
             )
         session.add(entry)
+        new_entries.append(entry)
         new_by_line[line_no] = entry
         touched[key] = None
     session.flush()
+    from app.services.production_material_custody_events import (
+        project_transfer_custody_events_for_recorder,
+    )
+    project_transfer_custody_events_for_recorder(
+        session,
+        recorder_type=recorder_type,
+        recorder_ref=recorder_ref,
+        stock_ledger_entries=new_entries,
+    )
 
     for old in active_rows:
         new = new_by_line.get(str(old.line_no or ""))

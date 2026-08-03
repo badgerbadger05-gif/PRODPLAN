@@ -31,6 +31,23 @@ jobs:
   backend:
     needs: canon-invariants
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: prodplan
+          POSTGRES_PASSWORD: prodplan
+          POSTGRES_DB: prodplan_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U prodplan -d prodplan_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PRODPLAN_TEST_PG_URL: postgresql://prodplan:prodplan@localhost:5432/prodplan_test
+      PRODPLAN_PG_CHECK_DSN: postgresql://prodplan:prodplan@localhost:5432/prodplan_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +58,7 @@ jobs:
             backend/requirements.txt
             backend/requirements-dev.txt
       - run: python -m pip install -r backend/requirements-dev.txt
+      - run: sudo apt-get update && sudo apt-get install --yes postgresql-client
       - run: pytest -q
       - run: cd backend && alembic heads
 
@@ -58,6 +76,9 @@ jobs:
           cache: npm
           cache-dependency-path: frontend-erp-shell/package-lock.json
       - run: npm ci
+      - run: npm run api:types:check
       - run: npm run lint
       - run: npm run test
       - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run smoke

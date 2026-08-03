@@ -12,6 +12,7 @@ the next read model.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
@@ -21,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.bom_specification_resolver import BomSpecificationResolver
+from app.services.production_control_printing import build_route_sheet_snapshot_payloads
+from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -57,8 +60,174 @@ class ProductionControlJournalSnapshotUnavailable(RuntimeError):
         return dict(self.detail)
 
 
+class RouteSheetSnapshotUnavailable(RuntimeError):
+    def __init__(self, detail: dict[str, Any]):
+        self.detail = detail
+        super().__init__(detail["reason"])
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self.detail)
+
+
 class ProductionControlJournalPromotionError(RuntimeError):
     """A building journal candidate cannot be exposed as accepted truth."""
+
+
+def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
+    row = dict(payload)
+    row.pop("material_coverage_snapshot", None)
+    row.pop("_route_sheet_snapshot", None)
+    return row
+
+
+def _route_sheet_payload_value(row: Mapping[str, Any], *, product_id: int) -> dict[str, Any]:
+    route_payload = row.get("_route_sheet_snapshot")
+    if not isinstance(route_payload, dict):
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate route-sheet snapshot is malformed"
+        )
+
+    try:
+        version = int(route_payload["version"])
+        if version <= 0:
+            raise TypeError
+
+        anchor_product_id = int(route_payload["anchor_product_id"])
+        sheet = route_payload["sheet"]
+        if not isinstance(sheet, dict):
+            raise TypeError
+
+        chain = sheet.get("chain") or {}
+        if not isinstance(chain, dict):
+            raise TypeError
+
+        sheet_product_id = int(sheet["product_id"])
+        if sheet_product_id <= 0 or anchor_product_id <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate route-sheet snapshot is malformed"
+        ) from exc
+
+    components = sheet.get("components")
+    if not isinstance(components, list):
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate route-sheet snapshot is malformed"
+        )
+    for component in components:
+        if not isinstance(component, Mapping):
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate route-sheet snapshot is malformed"
+            )
+        try:
+            required_qty = float(component.get("required_qty"))
+            qty_per_unit = float(component.get("qty_per_unit"))
+        except (TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate route-sheet snapshot is malformed"
+            ) from exc
+        if required_qty < 0 or qty_per_unit < 0:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate route-sheet snapshot is malformed"
+            )
+
+    if chain:
+        try:
+            weld_product_id = int(chain.get("weld_product_id"))
+            weld_qty = float(chain.get("weld_qty"))
+        except (TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate route-sheet snapshot is malformed"
+            ) from exc
+        if weld_qty < 0 or weld_product_id <= 0:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate route-sheet snapshot is malformed"
+            )
+        if product_id not in {anchor_product_id, weld_product_id}:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate route-sheet snapshot is malformed"
+            )
+    elif anchor_product_id != product_id:
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate route-sheet snapshot is malformed"
+        )
+
+    try:
+        remaining_qty = float(sheet.get("remaining_qty"))
+    except (TypeError, ValueError) as exc:
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate route-sheet snapshot is malformed"
+        ) from exc
+    if remaining_qty < 0:
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate route-sheet snapshot is malformed"
+        )
+
+    return dict(deepcopy(route_payload))
+
+
+def list_root_product_options(
+    db: Session,
+) -> list[dict[str, Any]]:
+    try:
+        snapshot = get_latest_read_snapshot(
+            db,
+            consumer=CONSUMER,
+            snapshot_key=SNAPSHOT_KEY,
+            required_capabilities=REQUIRED,
+        )
+    except PlanningTruthUnavailable as exc:
+        raise _unavailable(db, str(exc), exc.as_dict()) from exc
+    if snapshot is None:
+        raise _unavailable(db, "accepted production-control journal snapshot is missing")
+
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else None
+    meta = payload.get("meta") if payload else None
+    if (
+        not isinstance(meta, dict)
+        or meta.get("read_only") is not True
+        or int(meta.get("ledger_generation_id") or -1) != int(snapshot.ledger_generation_id)
+    ):
+        raise _unavailable(
+            db,
+            "accepted production-control journal snapshot is malformed",
+        )
+
+    options = meta.get("root_product_options")
+    if not isinstance(options, list) or any(not isinstance(row, dict) for row in options):
+        raise _unavailable(db, "accepted production-control root options are malformed")
+    return [dict(row) for row in options]
+
+
+def _root_product_options(
+    db: Session,
+    roots_by_product: Mapping[int, set[int]],
+) -> list[dict[str, Any]]:
+    root_ids = sorted({root_id for values in roots_by_product.values() for root_id in values})
+    if not root_ids:
+        return []
+    items = db.query(models.Item).filter(models.Item.item_id.in_(root_ids)).all()
+    by_id = {int(item.item_id): item for item in items}
+    if set(by_id) != set(root_ids):
+        raise ValueError("production-control root product display identity is missing")
+    options = [
+        {
+            "item_id": item_id,
+            "item_name": str(by_id[item_id].item_name or ""),
+            "item_article": by_id[item_id].item_article,
+            "item_code": by_id[item_id].item_code,
+        }
+        for item_id in root_ids
+    ]
+    options.sort(
+        key=lambda row: (
+            str(row.get("item_article") or row.get("item_name") or row.get("item_code") or ""),
+            str(row.get("item_name") or ""),
+            str(row.get("item_code") or ""),
+            int(row["item_id"]),
+        )
+    )
+    return options
 
 
 def _unavailable(
@@ -79,6 +248,26 @@ def _unavailable(
     if truth is not None:
         detail["truth"] = jsonable_encoder(dict(truth))
     return ProductionControlJournalSnapshotUnavailable(detail)
+
+
+def _route_sheet_unavailable(
+    db: Session,
+    reason: str,
+    truth: Mapping[str, Any] | None = None,
+) -> RouteSheetSnapshotUnavailable:
+    state = get_truth_state(db)
+    detail: dict[str, Any] = {
+        "code": "route_sheet_snapshot_unavailable",
+        "consumer": CONSUMER,
+        "status": "unavailable",
+        "truth_status": state.status,
+        "ledger_generation": state.generation_id,
+        "cutoff": state.cutoff.isoformat() if state.cutoff else None,
+        "reason": reason,
+    }
+    if truth is not None:
+        detail["truth"] = jsonable_encoder(dict(truth))
+    return RouteSheetSnapshotUnavailable(detail)
 
 
 def _candidate_truth(generation: models.LedgerGeneration) -> PlanningTruthReadiness:
@@ -107,6 +296,19 @@ def _build_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     truth = _candidate_truth(generation)
     run_ids = tuple(sorted({int(value) for value in accepted_run_ids}))
+    from app.services.production_control_material_availability import (
+        _active_product_ids,
+        preview_materials,
+    )
+
+    material_coverage_by_product = {
+        product_id: preview_materials(
+            db,
+            product_id,
+            ledger_generation_id=int(generation.id),
+        )
+        for product_id in _active_product_ids(db)
+    }
     rows: list[dict[str, Any]] = []
     offset = 0
     total = 0
@@ -117,6 +319,7 @@ def _build_rows(
             db,
             truth=truth,
             _accepted_run_ids_override=run_ids,
+            _material_coverage_by_product=material_coverage_by_product,
             limit=_PAGE_SIZE,
             offset=offset,
         )
@@ -139,6 +342,18 @@ def _build_rows(
     product_ids = [int(row["product_id"]) for row in rows]
     if len(product_ids) != len(set(product_ids)):
         raise ValueError("production-control journal candidate has duplicate products")
+
+    route_snapshots = build_route_sheet_snapshot_payloads(
+        db,
+        product_ids=product_ids,
+        ledger_generation_id=int(generation.id),
+    )
+    for row in rows:
+        product_id = int(row["product_id"])
+        row_snapshot = route_snapshots.get(product_id)
+        if not isinstance(row_snapshot, Mapping):
+            raise ValueError("production-control journal candidate is missing route-sheet snapshot")
+        row["_route_sheet_snapshot"] = deepcopy(row_snapshot)
     return rows, {
         "latest_run_id": latest_run_id,
         "latest_source_plan_id": latest_source_plan_id,
@@ -250,6 +465,10 @@ def build_candidate_snapshot(
         raise ValueError(
             "production-control journal candidate requires BUILDING Ledger generation"
         )
+    verify_future_supply_capture(
+        db,
+        int(generation.id),
+    )
     run_ids = tuple(sorted({int(value) for value in accepted_run_ids}))
     rows, journal_meta = _build_rows(db, generation, run_ids)
     roots_by_product = _root_membership_by_product(
@@ -257,6 +476,7 @@ def build_candidate_snapshot(
         rows=rows,
         accepted_run_ids=run_ids,
     )
+    root_product_options = _root_product_options(db, roots_by_product)
     payload = {
         "meta": {
             "ledger_generation_id": int(generation.id),
@@ -265,6 +485,7 @@ def build_candidate_snapshot(
             "read_only": True,
             "row_count": len(rows),
             "accepted_run_ids": list(run_ids),
+            "root_product_options": root_product_options,
             **journal_meta,
         }
     }
@@ -369,6 +590,11 @@ def validate_candidate_snapshot(
             raise ProductionControlJournalPromotionError(
                 "production-control journal candidate row is malformed"
             ) from exc
+        if "_route_sheet_snapshot" not in payload_row:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is missing route-sheet snapshot"
+            )
+        _route_sheet_payload_value(payload_row, product_id=product_id)
         if (
             product_id <= 0
             or item_id <= 0
@@ -407,6 +633,114 @@ def promote_candidate_snapshot(
     candidate.published_at = accepted_at
     db.flush()
     return candidate
+
+
+def read_route_sheet_snapshot_rows(
+    db: Session,
+    product_ids: Sequence[int],
+) -> list[dict[str, Any]]:
+    ids = [int(product_id) for product_id in product_ids if product_id is not None]
+    if not ids:
+        return []
+
+    try:
+        snapshot = get_latest_read_snapshot(
+            db,
+            consumer=CONSUMER,
+            snapshot_key=SNAPSHOT_KEY,
+            required_capabilities=REQUIRED,
+        )
+    except PlanningTruthUnavailable as exc:
+        raise _route_sheet_unavailable(db, str(exc), exc.as_dict()) from exc
+
+    if snapshot is None:
+        raise _route_sheet_unavailable(
+            db,
+            "accepted production-control route-sheets snapshot is missing",
+        )
+
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else None
+    meta = payload.get("meta") if payload else None
+    if (
+        not isinstance(meta, dict)
+        or meta.get("read_only") is not True
+        or int(meta.get("ledger_generation_id") or -1) != int(snapshot.ledger_generation_id)
+    ):
+        raise _route_sheet_unavailable(
+            db,
+            "accepted production-control route-sheets snapshot is malformed",
+        )
+
+    product_ids_sorted = sorted(set(ids))
+    row_keys = [f"product:{product_id}" for product_id in product_ids_sorted]
+    rows = (
+        db.query(models.PlanningReadRow)
+        .filter(
+            models.PlanningReadRow.snapshot_id == int(snapshot.id),
+            models.PlanningReadRow.row_kind == ROW_KIND,
+            models.PlanningReadRow.row_key.in_(row_keys),
+        )
+        .all()
+    )
+
+    route_snapshot_by_product_id: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        row_payload = row.payload if isinstance(row.payload, dict) else None
+        if not isinstance(row_payload, dict):
+            raise _route_sheet_unavailable(
+                db,
+                "accepted production-control route-sheets snapshot rows are malformed",
+            )
+        try:
+            route_product_id = int(row_payload["product_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _route_sheet_unavailable(
+                db,
+                "accepted production-control route-sheets snapshot rows are malformed",
+            ) from exc
+        if "_route_sheet_snapshot" not in row_payload:
+            raise _route_sheet_unavailable(
+                db,
+                "accepted production-control route-sheets snapshot rows are missing payload",
+            )
+        try:
+            route_snapshot = _route_sheet_payload_value(
+                row_payload,
+                product_id=route_product_id,
+            )
+        except ProductionControlJournalPromotionError as exc:
+            raise _route_sheet_unavailable(
+                db,
+                "accepted production-control route-sheets snapshot rows are malformed",
+            ) from exc
+        route_snapshot_by_product_id[route_product_id] = route_snapshot
+
+    missing_ids = sorted(set(ids) - set(route_snapshot_by_product_id))
+    if missing_ids:
+        raise _route_sheet_unavailable(
+            db,
+            "accepted production-control route-sheets snapshot does not contain "
+            + ", ".join(str(product_id) for product_id in missing_ids),
+        )
+
+    ordered: list[dict[str, Any]] = []
+    seen_anchors: set[int] = set()
+    for product_id in ids:
+        route_snapshot = route_snapshot_by_product_id.get(product_id)
+        if route_snapshot is None:
+            continue
+        try:
+            anchor_product_id = int(route_snapshot.get("anchor_product_id"))
+        except (TypeError, ValueError) as exc:
+            raise _route_sheet_unavailable(
+                db,
+                "accepted production-control route-sheets snapshot rows are malformed",
+            ) from exc
+        if anchor_product_id in seen_anchors:
+            continue
+        seen_anchors.add(anchor_product_id)
+        ordered.append(route_snapshot)
+    return ordered
 
 
 def read_snapshot(
@@ -529,8 +863,15 @@ def read_snapshot(
             row_payload["line_number"].as_integer().asc(),
         )
     records = query.offset(effective_offset).limit(effective_limit).all()
+    public_rows = []
+    for record in records:
+        row = _public_journal_row(record.payload)
+        # Internal generation-scoped material details are consumed by the
+        # dedicated /materials reader.  They are not part of the public journal
+        # row contract and must never leak through its strict response model.
+        public_rows.append(row)
     return {
-        "rows": [dict(record.payload) for record in records],
+        "rows": public_rows,
         "total": total,
         "limit": effective_limit,
         "offset": effective_offset,

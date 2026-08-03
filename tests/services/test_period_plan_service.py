@@ -17,6 +17,7 @@ from app.models import (
     MrpRequirement,
     PlannedOrder,
     PlannedPurchase,
+    ProductionMaterialCustodyProjectionManifest,
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
@@ -43,9 +44,18 @@ from app.services.period_plan_service import (
     _build_execution_snapshot_rows,
     build_period_plan_execution_snapshot,
     create_mrp_snapshot_from_period_plan,
+    get_period_plan_matrix,
     get_period_plan_execution_journal,
     list_period_plans,
 )
+
+
+def test_period_plan_percent_adapter_uses_canonical_clamp_and_zero_base():
+    assert period_plan_service._rounded_replenishment_pct(0, 0) is None
+    assert period_plan_service._rounded_replenishment_pct(10, 5) == 50.0
+    assert period_plan_service._rounded_replenishment_pct(10, 12) == 100.0
+
+
 @pytest.fixture(autouse=True)
 def _accepted_planning_truth(db_session):
     """Planning calculations run against one explicit accepted Ledger."""
@@ -83,6 +93,17 @@ def _accepted_planning_truth(db_session):
     ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=generation.cutoff,
+            built_at=generation.cutoff,
+        )
+    )
     resource = ProductionResource(
         resource_name="Period plan assembly",
         planning_range=30,
@@ -104,8 +125,7 @@ def _make_purchased_item(db, code: str, stock: float = 0.0) -> Item:
         item_name=f"Закупаемая деталь {code}",
         item_article=code,
         unit="шт",
-        stock_qty=stock,
-        replenishment_method="Покупка",
+                replenishment_method="Покупка",
         replenishment_time=3,
         status="active",
     )
@@ -175,8 +195,8 @@ def test_execution_journal_is_explicitly_unavailable_without_accepted_truth(
     assert result["truth_status"] == "uninitialized"
     assert result["summary"]["execution_pct"] is None
     assert result["summary"]["execution_completed_qty"] is None
-    assert result["rows"][0]["completed_qty"] is None
-    assert result["rows"][0]["coverage_pct"] is None
+    assert result["rows"] == []
+    assert result["total"] == 0
 
 
 def test_execution_journal_repeated_get_reads_snapshot_without_computation_or_writes(
@@ -212,10 +232,73 @@ def test_execution_journal_repeated_get_reads_snapshot_without_computation_or_wr
     first = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
     second = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
 
-    assert first == payload
-    assert second == payload
+    assert first["truth_status"] == payload["truth_status"]
+    assert first["total"] == 1
+    assert first["limit"] == 100
+    assert first["offset"] == 0
+    assert first["rows"][0]["req_id"] == 11
+    assert first["rows"][0]["status"] == "execution_unavailable"
+    assert first["rows"][0]["status_label"] == "Исполнение недоступно"
+    assert second == first
     assert set(db_session.new) == before_new
     assert not db_session.dirty
+
+
+def test_execution_journal_filters_sorts_and_pages_on_backend(
+    db_session, monkeypatch
+):
+    from app.services import planning_truth
+
+    item = _make_purchased_item(db_session, "SERVER-QUERY")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=3.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.commit()
+    rows = [
+        {"req_id": 1, "item_id": 1, "bom_level": 0, "status": "net_zero", "remaining_qty": 0},
+        {"req_id": 2, "item_id": 2, "bom_level": 1, "status": "none", "remaining_qty": 9},
+        {"req_id": 3, "item_id": 3, "bom_level": 1, "status": "ordered", "remaining_qty": 5},
+        {"req_id": 4, "item_id": 4, "bom_level": 2, "status": "partial", "remaining_qty": 2},
+        {"req_id": 5, "item_id": 5, "bom_level": 2, "status": "covered", "remaining_qty": 0},
+    ]
+    monkeypatch.setattr(
+        planning_truth,
+        "get_latest_read_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(payload={
+            "plan": {"id": plan.id},
+            "run_id": run.run_id,
+            "truth_status": "accepted",
+            "ledger_generation": 7,
+            "cutoff": "2026-07-23T12:00:00",
+            "rows": rows,
+            "summary": {},
+        }),
+    )
+
+    result = get_period_plan_execution_journal(
+        db_session,
+        plan.id,
+        run_id=run.run_id,
+        status="incomplete",
+        include_net_zero=False,
+        sort_by="remaining_qty",
+        sort_dir="desc",
+        limit=1,
+        offset=1,
+    )
+
+    assert result["total"] == 3
+    assert result["limit"] == 1
+    assert result["offset"] == 1
+    assert [row["req_id"] for row in result["rows"]] == [3]
+    assert result["rows"][0]["status_label"] == "Оформлено"
+    assert result["summary"]["total_items"] == 3
+    assert result["facets"]["bom_levels"] == [0, 1, 2]
 
 
 def test_execution_journal_missing_current_snapshot_is_unavailable(
@@ -567,6 +650,7 @@ def _make_fixed_plan(
         period_to=period_to,
         status="fixed",
         created_by="test",
+        fixed_at=datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc),
     )
     db.add(plan)
     db.flush()
@@ -619,6 +703,29 @@ def _make_supplier_order(
 # Tests
 # ---------------------------------------------------------------------------
 
+def test_known_rework_freezes_requirement_without_creating_an_executor(db_session):
+    item = _make_purchased_item(db_session, "KNOWN-REWORK")
+    item.replenishment_method = "Переработка"
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 28), qty=7.0)
+
+    result = _publish_plan(db_session, plan)
+
+    run_id = result["run_id"]
+    requirement = db_session.query(MrpRequirement).filter_by(run_id=run_id).one()
+    assert requirement.net_required_qty == 7
+    assert db_session.query(PlannedOrder).filter_by(run_id=run_id).count() == 0
+    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id).count() == 0
+    assert db_session.query(models.PlannedRework).filter_by(run_id=run_id).count() == 0
+
+
+def test_unknown_replenishment_method_still_blocks_publication(db_session):
+    item = _make_purchased_item(db_session, "UNKNOWN-ROUTE")
+    item.replenishment_method = "неизвестный маршрут"
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 28), qty=7.0)
+
+    with pytest.raises(ValueError, match="Unsupported replenishment flow"):
+        _publish_plan(db_session, plan)
+
 def test_root_production_plan_is_not_netted_by_finished_goods_stock_or_wip(db_session):
     """A fixed release plan must create the full top-level production task."""
     bucket = date(2026, 9, 4)
@@ -627,8 +734,7 @@ def test_root_production_plan_is_not_netted_by_finished_goods_stock_or_wip(db_se
         item_name="Готовая техника по плану",
         item_article="FG-PLAN-FULL",
         unit="шт",
-        stock_qty=20.0,
-        replenishment_method="Производство",
+                replenishment_method="Производство",
         status="active",
     )
     db_session.add(finished_good)
@@ -669,3 +775,72 @@ def test_root_production_plan_is_not_netted_by_finished_goods_stock_or_wip(db_se
     assert float(req.total_required_qty) == pytest.approx(75.0)
     assert float(req.net_required_qty) == pytest.approx(75.0)
     assert float(proposal.qty) == pytest.approx(75.0)
+
+
+def test_get_period_plan_matrix_returns_server_totals(db_session):
+    item = _make_purchased_item(db_session, "MATRIX-SUMS")
+    plan = _make_fixed_plan(
+        db_session,
+        item,
+        date(2026, 8, 7),
+        qty=4.0,
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+    )
+    db_session.add(ProductionPlanLine(
+        plan_id=plan.id,
+        item_id=item.item_id,
+        bucket_date=date(2026, 8, 14),
+        qty=6.0,
+    ))
+    db_session.commit()
+
+    result = get_period_plan_matrix(db_session, plan.id)
+    row = result["rows"][0]
+
+    assert result["bucket_totals"] == {
+        "2026-08-07": 4.0,
+        "2026-08-14": 6.0,
+        "2026-08-21": 0.0,
+        "2026-08-28": 0.0,
+    }
+    assert row["total_qty"] == pytest.approx(10.0)
+    assert result["grand_total"] == pytest.approx(10.0)
+    assert result["total_qty"] == pytest.approx(10.0)
+    assert result["total"] == 1
+
+
+def test_get_period_plan_matrix_hides_forecasts_for_fixed_plans(db_session):
+    item = _make_purchased_item(db_session, "MATRIX-FORECAST")
+    plan = _make_fixed_plan(
+        db_session,
+        item,
+        date(2026, 8, 7),
+        qty=4.0,
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+    )
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(PlannedOrder(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=4.0,
+        planned_qty=4.0,
+        qty=4.0,
+        need_date=date(2026, 8, 7),
+        bucket_date=date(2026, 8, 7),
+        start_date=date(2026, 8, 7),
+        finish_date=date(2026, 8, 10),
+    ))
+    db_session.commit()
+
+    result = get_period_plan_matrix(db_session, plan.id)
+
+    assert result["rows"][0]["bucket_forecasts"] == {}

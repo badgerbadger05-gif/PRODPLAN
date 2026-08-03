@@ -25,13 +25,19 @@ from app import models
 from ..mrp_freeze import PoolKey, pool_key_for
 from ..replenishment import (
     REPLENISHMENT_FLOW_PURCHASE,
+    REPLENISHMENT_FLOW_PRODUCTION,
+    REPLENISHMENT_FLOW_REWORK,
+    REPLENISHMENT_FLOW_UNAVAILABLE,
     classify_replenishment_flow,
 )
 from .reservation import (
     BUY,
     MAKE,
+    REWORK,
     append_realization_event,
+    fold_reservation_entry,
     fold_reservation_events,
+    freeze_reservation_amounts,
     replenishment_remaining,
 )
 
@@ -99,54 +105,42 @@ def _ledger_on_hand_by_generation(
     *,
     item_ids: Optional[Set[int]] = None,
 ) -> Dict[int, float]:
-    if item_ids is not None and not item_ids:
-        return {}
-    ignored_refs = {
-        str(ref)
-        for (ref,) in db.query(models.IgnoredWarehouse.warehouse_ref1c).all()
-        if ref
-    }
-    warehouse_rows = db.query(
-        models.StockWarehouse.warehouse_ref1c,
-        models.StockWarehouse.is_selected,
-        models.StockWarehouse.is_finished_goods,
-    ).all()
-    selected_refs = {
-        str(ref)
-        for ref, selected, finished in warehouse_rows
-        if ref and bool(selected) and not bool(finished)
-    }
-    finished_refs = {
-        str(ref)
-        for ref, _selected, finished in warehouse_rows
-        if ref and bool(finished)
-    }
-    query = db.query(
-        models.StockBin.item_id,
-        func.sum(models.StockBin.on_hand),
-    ).filter(models.StockBin.ledger_generation_id == ledger_generation_id)
-    if item_ids is not None:
-        query = query.filter(models.StockBin.item_id.in_(sorted(item_ids)))
-    if selected_refs:
-        query = query.filter(models.StockBin.warehouse_ref1c.in_(selected_refs))
-    if ignored_refs:
-        query = query.filter(~models.StockBin.warehouse_ref1c.in_(ignored_refs))
-    if finished_refs:
-        query = query.filter(~models.StockBin.warehouse_ref1c.in_(finished_refs))
-    return {
-        int(item_id): float(quantity or 0)
-        for item_id, quantity in query.group_by(models.StockBin.item_id).all()
-    }
+    from ..mrp_stock_helpers import planning_stock_by_item
+
+    return planning_stock_by_item(
+        db,
+        int(ledger_generation_id),
+        item_ids=item_ids,
+        # Item Ledger position is cross-organization unless its pool key
+        # explicitly narrows organization. MRP callers use the default-org
+        # policy through the same owner.
+        organization_ref=None,
+    )
 
 
-def _is_produced(item: Optional[models.Item]) -> bool:
+def _resolve_reservation_mode(item: Optional[models.Item]) -> str:
     method = getattr(item, "replenishment_method", None) if item is not None else None
-    return classify_replenishment_flow(method) != REPLENISHMENT_FLOW_PURCHASE
+    flow = classify_replenishment_flow(method)
+    if flow == REPLENISHMENT_FLOW_PURCHASE:
+        return BUY
+    if flow == REPLENISHMENT_FLOW_PRODUCTION:
+        return MAKE
+    if flow == REPLENISHMENT_FLOW_REWORK:
+        return REWORK
+    if flow == REPLENISHMENT_FLOW_UNAVAILABLE:
+        raise ValueError(
+            "Unsupported replenishment flow in reservation materialization "
+            f"(item={int(item.item_id) if item is not None else None}, method={method!r})"
+        )
+    raise ValueError(
+        f"Unsupported replenishment flow '{flow}' in reservation materialization "
+        f"(item={int(item.item_id) if item is not None else None}, method={method!r})"
+    )
 
 
 def mode_targets(req: models.MrpRequirement, item: Optional[models.Item]) -> List[Tuple[str, Decimal]]:
     """Assign each requirement to one canonical mode: make or buy."""
-    flow = MAKE if _is_produced(item) else BUY
+    flow = _resolve_reservation_mode(item)
     return [(flow, _dec(req.total_required_qty))]
 
 
@@ -179,7 +173,19 @@ def _get_or_create_entry(
     freeze_version = int(
         req.freeze_version
         if req.freeze_version is not None
-        else (run.active_freeze_version if run and run.active_freeze_version is not None else 0)
+        else (run.active_freeze_version if run and run.active_freeze_version is not None else 1)
+    )
+    frozen_stock_allocation = (
+        db.query(func.coalesce(func.sum(models.MrpFreezeAllocation.alloc_qty), 0))
+        .filter(models.MrpFreezeAllocation.requirement_id == int(req.id))
+        .filter(models.MrpFreezeAllocation.run_id == int(req.run_id))
+        .filter(models.MrpFreezeAllocation.freeze_version == freeze_version)
+        .filter(models.MrpFreezeAllocation.source_type == "stock")
+        .scalar()
+    )
+    frozen = freeze_reservation_amounts(
+        req.total_required_qty,
+        _dec(frozen_stock_allocation),
     )
     entry = models.ReservationEntry(
         ledger_generation_id=ledger_generation_id,
@@ -194,11 +200,8 @@ def _get_or_create_entry(
         priority_period_to=pt,
         realization_mode=mode,
         reserved_qty=Decimal("0"),
-        covered_from_stock_at_freeze_qty=max(
-            _dec(req.total_required_qty) - _dec(req.net_required_qty),
-            Decimal("0"),
-        ),
-        replenishment_required_qty=max(_dec(req.net_required_qty), Decimal("0")),
+        covered_from_stock_at_freeze_qty=frozen.covered_from_stock_at_freeze_qty,
+        replenishment_required_qty=frozen.replenishment_required_qty,
         replenishment_received_qty=Decimal("0"),
         realized_qty=Decimal("0"),
         lifecycle_status="active",
@@ -244,22 +247,8 @@ def _fold_entry(
     db: Session,
     entry: models.ReservationEntry,
 ) -> Tuple[Decimal, Decimal, Decimal]:
-    """Fold events into one reserve cache row."""
-    events = (
-        db.query(models.ReservationEvent)
-        .filter(models.ReservationEvent.reservation_id == int(entry.id))
-        .filter(models.ReservationEvent.ledger_generation_id == int(entry.ledger_generation_id))
-        .order_by(models.ReservationEvent.id.asc())
-        .all()
-    )
-    fold = fold_reservation_events(events)
-    entry.reserved_qty = fold.reserved_qty
-    entry.realized_qty = fold.realized_qty
-    entry.replenishment_received_qty = min(
-        fold.realized_qty,
-        _dec(entry.replenishment_required_qty),
-    )
-    db.flush()
+    """Fold through the canonical reservation-entry projector."""
+    fold = fold_reservation_entry(db, int(entry.id))
     remaining = replenishment_remaining(
         entry.replenishment_required_qty,
         entry.replenishment_received_qty,

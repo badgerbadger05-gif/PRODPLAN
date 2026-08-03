@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 import logging
@@ -24,6 +25,40 @@ from ..models import (
 )
 
 router = APIRouter(prefix="/v1/specification", tags=["specification"])
+
+
+class SpecificationSearchItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    item_code: str
+    item_name: str
+    item_article: str | None
+    item_ref1c: str | None
+    unit: str | None
+    unit_ref1c: str | None
+    replenishment_method: str | None
+    spec_id: int | None
+    spec_code: str | None
+    spec_name: str | None
+    spec_ref1c: str | None
+    default_spec_count: int
+    has_children: bool
+
+
+class SpecificationSearchMetaResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    q: str
+    count: int
+    limit: int
+
+
+class SpecificationSearchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[SpecificationSearchItemResponse]
+    meta: SpecificationSearchMetaResponse
 
 
 # ------- helpers
@@ -153,7 +188,6 @@ def _item_payload(db: Session, item: Item, units_map: Optional[Dict[str, str]] =
         "unit": _unit_label(units, item.unit),
         "unit_ref1c": str(item.unit or "") if item.unit else None,
         "replenishment_method": str(item.replenishment_method or "") if item.replenishment_method else None,
-        "stock_qty": _round_qty(_to_float(item.stock_qty), 3),
         "spec_id": int(spec_id) if spec_id else None,
         "spec_code": str(spec.spec_code or "") if spec else None,
         "spec_name": str(spec.spec_name or "") if spec else None,
@@ -1024,14 +1058,14 @@ def get_specification_full(
         raise HTTPException(status_code=500, detail=f"Specification full error: {e}")
 
 
-@router.get("/search")
+@router.get("/search", response_model=SpecificationSearchResponse)
 def search_specification_items(
     q: str = Query("", description="Поиск по артикулу, коду, названию или GUID"),
     has_spec: Optional[bool] = Query(None, description="Фильтр по наличию разрешаемой спецификации"),
     quality: Optional[str] = Query(None, description="Фильтр качества: no_spec|multiple_defaults"),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-) -> Dict[str, Any]:
+) -> SpecificationSearchResponse:
     term = str(q or "").strip()
     units_map = _build_units_map(db)
     query = db.query(Item)
@@ -1059,7 +1093,9 @@ def search_specification_items(
         rows.append(payload)
         if len(rows) >= int(limit):
             break
-    return {"items": rows, "meta": {"q": term, "count": len(rows), "limit": int(limit)}}
+    return SpecificationSearchResponse.model_validate(
+        {"items": rows, "meta": {"q": term, "count": len(rows), "limit": int(limit)}}
+    )
 
 
 @router.get("/flattened")

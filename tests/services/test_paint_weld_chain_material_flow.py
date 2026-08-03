@@ -28,6 +28,9 @@ from app.models import (
     PlanningTruthState,
 )
 from app.services.production_control_material_issues import create_material_issues
+from app.services.production_material_custody_projection import (
+    initialize_material_custody_baseline,
+)
 from app.services.planning_truth import publish_generation
 
 PAINT_WH = "wh-paint"      # склад-получатель окрасочного участка
@@ -41,8 +44,7 @@ def _item(db, *, code: str, name: str) -> Item:
         item_article=code,
         item_ref1c=f"ref-{code}",
         unit="шт",
-        stock_qty=0,
-        replenishment_method="Производство",
+                replenishment_method="Производство",
         status="active",
     )
     db.add(it)
@@ -54,8 +56,20 @@ def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session
     db = db_session
     cutoff = datetime(2026, 8, 1)
     batch = PhysicalImportBatch(batch_key="paint-material-truth", status="completed", cutoff=cutoff, source_watermarks={})
-    generation = LedgerGeneration(generation_key="paint-material-truth", status="accepted", cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test")
-    db.add_all((batch, generation)); db.flush(); publish_generation(db, generation)
+    generation = LedgerGeneration(generation_key="paint-material-truth", status="building", cutoff=cutoff, accepted_at=None, physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test")
+    db.add_all((batch, generation))
+    db.flush()
+    initialize_material_custody_baseline(
+        db,
+        ledger_generation_id=int(generation.id),
+        cells=[],
+        observed_at=cutoff,
+    )
+    generation.status = "accepted"
+    generation.accepted_at = cutoff
+    publish_generation(db, generation)
+    db.flush()
+    db.expire_all()
     for idx, ref in enumerate((PAINT_WH, WELD_WH), start=1):
         db.add(StockWarehouse(warehouse_ref1c=ref, warehouse_code=f"W{idx}", warehouse_name=ref, is_selected=True))
     db.flush()
@@ -71,7 +85,6 @@ def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session
 
     # сварная деталь лежит только на складе сварных остатков
     db.add(StockBin(ledger_generation_id=generation.id, item_id=welded.item_id, characteristic_ref="", organization_ref="", warehouse_ref1c=WELD_WH, on_hand=50))
-    welded.stock_qty = 50
 
     order = ProductionOrder(
         order_number="PWC-P-paint",

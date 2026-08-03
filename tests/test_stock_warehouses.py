@@ -1,4 +1,11 @@
+from fastapi import FastAPI
+
 from app.models import Item, PhysicalImportBatch, StockWarehouse
+from app.routers.sync import (
+    StockWarehouseListResponse,
+    get_stock_warehouses,
+    router as sync_router,
+)
 from app.schemas import ODataSyncRequest
 from app.services import odata_stock_sync as stock_sync
 
@@ -17,15 +24,14 @@ def _mk_req() -> ODataSyncRequest:
     )
 
 
-def test_sync_stock_uses_only_selected_warehouses(db_session, monkeypatch):
+def test_stock_diagnostic_does_not_create_item_level_quantity(db_session, monkeypatch):
     db = db_session
 
     item = Item(
         item_code="ITEM-001",
         item_name="Item 1",
         item_article="ITEM-001",
-        stock_qty=0.0,
-        status="active",
+                status="active",
     )
     db.add(item)
     db.flush()
@@ -59,25 +65,61 @@ def test_sync_stock_uses_only_selected_warehouses(db_session, monkeypatch):
     stats = stock_sync.sync_stock_from_odata(db, _mk_req())
 
     db.refresh(item)
-    assert float(item.stock_qty) == 5.0
+    assert not hasattr(item, "stock_qty")
+    assert int(stats.get("items_updated", 0)) == 0
     assert int(stats.get("warehouses_selected", 0)) == 1
+
+
+def test_stock_warehouse_list_has_strict_contract(db_session):
+    db_session.add_all(
+        [
+            StockWarehouse(
+                warehouse_ref1c="W2",
+                warehouse_code="02",
+                warehouse_name="Reserve",
+                is_selected=False,
+            ),
+            StockWarehouse(
+                warehouse_ref1c="W1",
+                warehouse_code="01",
+                warehouse_name="Main",
+                is_selected=True,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    response = StockWarehouseListResponse.model_validate(
+        get_stock_warehouses(db=db_session)
+    )
+    assert [(row.warehouse_name, row.is_selected) for row in response.rows] == [
+        ("Main", True),
+        ("Reserve", False),
+    ]
+    assert response.total == 2
+    assert response.selected_total == 1
+
+    app = FastAPI()
+    app.include_router(sync_router, prefix="/api")
+    schema = app.openapi()
+    openapi_response = schema["paths"]["/api/v1/sync/warehouses"]["get"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"]
+    assert openapi_response == {"$ref": "#/components/schemas/StockWarehouseListResponse"}
+    schemas = schema["components"]["schemas"]
+    assert schemas["StockWarehouseResponse"]["additionalProperties"] is False
+    assert schemas["StockWarehouseListResponse"]["additionalProperties"] is False
 
 
 def test_ordinary_stock_sync_mismatch_does_not_create_foreign_physical_batch(
     db_session, monkeypatch
 ):
-    """A legacy stock sweep must not materialize Ledger truth on its own.
-
-    The 1C Balance deliberately disagrees with the legacy quantity (10 -> 7),
-    which used to enter reconcile and create an adjustment/import batch.  The
-    BUILDING physical-refresh lifecycle is the sole owner of those writes.
-    """
+    """A diagnostic stock sweep must not materialize Ledger truth on its own."""
     item = Item(
         item_code="ITEM-MISMATCH",
         item_name="Mismatch",
         item_article="ITEM-MISMATCH",
-        stock_qty=10.0,
-        status="active",
+                status="active",
     )
     db_session.add(item)
     db_session.add(
@@ -108,7 +150,7 @@ def test_ordinary_stock_sync_mismatch_does_not_create_foreign_physical_batch(
     stock_sync.sync_stock_from_odata(db_session, _mk_req())
 
     db_session.refresh(item)
-    assert float(item.stock_qty) == 7.0
+    assert not hasattr(item, "stock_qty")
     assert db_session.query(PhysicalImportBatch).count() == 0
 
 

@@ -22,13 +22,7 @@ export type PlanChange = {
   stage_id?: number | null
 }
 
-export type NomenclatureSearchItem = {
-  item_id?: number
-  item_code: string
-  item_name: string
-  item_article?: string | null
-  similarity?: number | null
-}
+export type NomenclatureSearchItem = ApiSchemas['NomenclatureSearchItemResponse']
 
 export type WeekInfo = {
   key: string
@@ -36,3 +30,6 @@ export type WeekInfo = {
   friday: string
   dates: string[]
 }
+import type { components } from '../lib/apiTypes'
+
+type ApiSchemas = components['schemas']

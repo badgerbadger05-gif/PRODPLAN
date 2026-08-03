@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { BomItem, SpecFlatRow, SpecNode } from '../../../domain/specification'
+import type { BomItem, BomItemIdentity, SpecFlatRow, SpecNode } from '../../../domain/specification'
 import type {
   AddResult,
   KindChangePreviewResult,
@@ -52,7 +52,7 @@ type RepairResult = RestageResult | MoveResult | AddResult | SetQuantityResult |
 type Props = {
   action: RepairAction
   node: SpecFlatRow | null
-  rootItem: BomItem
+  rootItem: BomItemIdentity
   treeRows: SpecFlatRow[]
   onClose: () => void
   onApplied: (message: string) => void

@@ -5,7 +5,6 @@ import { planningStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
-  createProductionControlOrdersFromMrp,
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
   exportPlanningResultRework,
@@ -21,10 +20,10 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { RootProductFilterDialog } from '../RootProductFilterDialog'
 import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
+import { ForecastShift } from './period-plan/ForecastShift'
 import {
-  filterPurchaseRows,
+  buildPurchaseCategoryFilterParam,
   formatActionResult,
-  isProductionRowSelectable,
   parseMrpResultTab,
   parsePositiveId,
   productionSourceIds,
@@ -53,15 +52,11 @@ function metricQuantity(value: number | null | undefined, unit: string) {
     : 'н/д'
 }
 
-function ForecastShift({ forecast }: { forecast?: { forecast_date?: string | null; forecast_shift_days?: number | null; forecast_reason?: string | null } | null }) {
-  if (!forecast || forecast.forecast_shift_days === null || forecast.forecast_shift_days === undefined) return null
-  const days = Number(forecast.forecast_shift_days)
-  if (!Number.isFinite(days) || days === 0) return null
-  const cls = days > 5 ? 'late' : days > 0 ? 'warn' : 'early'
-  const label = `${days > 0 ? '+' : ''}${days} дн`
-  const dateText = forecast.forecast_date ? dateRu(forecast.forecast_date).slice(0, 5) : ''
-  const title = [forecast.forecast_reason, forecast.forecast_date ? `прогноз ${dateRu(forecast.forecast_date)}` : null].filter(Boolean).join(' · ')
-  return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
+function buildPurchaseApiFilters(supplierFilter: string, categoryFilter: string) {
+  return {
+    supplier_ref1c: supplierFilter || undefined,
+    ...buildPurchaseCategoryFilterParam(categoryFilter),
+  }
 }
 
 export function MrpResultPage() {
@@ -92,7 +87,6 @@ export function MrpResultPage() {
   const [draftDateTo, setDraftDateTo] = useState('')
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
-  const [selectedProductionIds, setSelectedProductionIds] = useState<Set<number>>(new Set())
   const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
   const [purchaseSupplierFilter, setPurchaseSupplierFilter] = useState('')
   const [purchaseCategoryFilter, setPurchaseCategoryFilter] = useState('')
@@ -114,16 +108,12 @@ export function MrpResultPage() {
   const purchaseOptions = useMemo(() => purchaseFilterOptions(purchaseRows), [purchaseRows])
   const purchaseSupplierOptions = purchaseOptions.suppliers
   const purchaseCategoryOptions = purchaseOptions.categories
-  const filteredPurchaseRows = useMemo(
-    () => filterPurchaseRows(purchaseRows, purchaseSupplierFilter, purchaseCategoryFilter),
-    [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter],
-  )
   const activeOffset = offsets[tab]
   const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? purchaseTotal : tab === 'rework' ? reworkTotal : capacityTotal
   const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
   const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
   const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
-  const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
+  const selectedCount = tab === 'purchases' ? selectedPurchaseIds.size : 0
 
   useEffect(() => {
     if (queryTab) setTab(queryTab)
@@ -142,7 +132,6 @@ export function MrpResultPage() {
     setPurchaseTotal(0)
     setReworkTotal(0)
     setCapacityTotal(0)
-    setSelectedProductionIds(new Set())
     setSelectedPurchaseIds(new Set())
     setPurchaseSupplierFilter('')
     setPurchaseCategoryFilter('')
@@ -178,7 +167,14 @@ export function MrpResultPage() {
       return
     }
     try {
-      const params = { snapshot_id: snapshotId, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId, limit, offset: nextOffset }
+      const params = {
+        snapshot_id: snapshotId,
+        date_from: dateFrom || undefined,
+        date_to: dateTo || undefined,
+        root_item_id: rootItemId,
+        limit,
+        offset: nextOffset,
+      }
       let data
       if (targetTab === 'production') {
         data = await getPlanningResultProduction(runId, params)
@@ -186,7 +182,10 @@ export function MrpResultPage() {
         setProductionRows(data.rows ?? [])
         setProductionTotal(data.total ?? 0)
       } else if (targetTab === 'purchases') {
-        data = await getPlanningResultPurchases(runId, params)
+        data = await getPlanningResultPurchases(runId, {
+          ...params,
+          ...buildPurchaseApiFilters(purchaseSupplierFilter, purchaseCategoryFilter),
+        })
         if (seq !== loadSeq.current) return
         setPurchaseRows(data.rows ?? [])
         setPurchaseTotal(data.total ?? 0)
@@ -224,7 +223,7 @@ export function MrpResultPage() {
     } finally {
       if (seq === loadSeq.current) setLoading(false)
     }
-  }, [dateFrom, dateTo, invalidateTabs, rootItemId, runId, snapshotId, summary, truthAccepted])
+  }, [dateFrom, dateTo, invalidateTabs, purchaseCategoryFilter, purchaseSupplierFilter, rootItemId, runId, snapshotId, summary, truthAccepted])
 
   useEffect(() => {
     if (previousRunId.current === runId) return
@@ -270,7 +269,10 @@ export function MrpResultPage() {
     setExporting(true)
     setError('')
     try {
-      const params = { snapshot_id: snapshotId, format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
+      const baseParams = { snapshot_id: snapshotId, format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
+      const params = tab === 'purchases'
+        ? { ...baseParams, ...buildPurchaseApiFilters(purchaseSupplierFilter, purchaseCategoryFilter) }
+        : baseParams
       const response = tab === 'production'
         ? await exportPlanningResultProduction(runId, params)
         : tab === 'purchases'
@@ -280,30 +282,6 @@ export function MrpResultPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setExporting(false)
-    }
-  }
-
-  async function createSelectedProductionOrders() {
-    if (!truthAccepted || !selectedProductionIds.size || mutationInFlight.current) return
-    mutationInFlight.current = true
-    setExporting(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await createProductionControlOrdersFromMrp({
-        run_id: runId,
-        date_from: dateFrom || undefined,
-        date_to: dateTo || undefined,
-        planned_order_ids: Array.from(selectedProductionIds),
-      })
-      setSelectedProductionIds(new Set())
-      await loadSummary()
-      setMessage(formatActionResult('Создание заказов', result))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      mutationInFlight.current = false
       setExporting(false)
     }
   }
@@ -336,6 +314,16 @@ export function MrpResultPage() {
     setDateFrom(draftDateFrom)
     setDateTo(draftDateTo)
     invalidateTabs()
+  }
+
+  function applyPurchaseFilters(nextSupplierFilter: string, nextCategoryFilter: string) {
+    setPurchaseSupplierFilter(nextSupplierFilter)
+    setPurchaseCategoryFilter(nextCategoryFilter)
+    setSelectedPurchaseIds(new Set())
+    setPurchaseRows([])
+    setPurchaseTotal(0)
+    setLoadedTabs((prev) => ({ ...prev, purchases: false }))
+    setOffsets((prev) => ({ ...prev, purchases: 0 }))
   }
 
   function applyRootFilter(value: number | null) {
@@ -385,7 +373,6 @@ export function MrpResultPage() {
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
           <button onClick={() => { void loadSummary() }} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={!truthAccepted || loading || exporting}>XLSX</button>}
-          {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!truthAccepted || !selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
           {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthAccepted || !selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />
           <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
@@ -424,18 +411,18 @@ export function MrpResultPage() {
 
         <div className="tablePane resultTablePane">
           {!truthAccepted && <div className="emptyState">Фактические данные MRP недоступны. Дождитесь принятого Ledger-снимка.</div>}
-          {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} highlightedId={highlightedProductionId} onSelectedIdsChange={setSelectedProductionIds} />}
+          {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} />}
           {tab === 'purchases' && (
             <PurchaseResultTable
-              rows={filteredPurchaseRows}
+              rows={purchaseRows}
               selectedIds={selectedPurchaseIds}
               highlightedId={highlightedPurchaseId}
               supplierFilter={purchaseSupplierFilter}
               categoryFilter={purchaseCategoryFilter}
               supplierOptions={purchaseSupplierOptions}
               categoryOptions={purchaseCategoryOptions}
-              onSupplierFilterChange={setPurchaseSupplierFilter}
-              onCategoryFilterChange={setPurchaseCategoryFilter}
+              onSupplierFilterChange={(value) => applyPurchaseFilters(value, purchaseCategoryFilter)}
+              onCategoryFilterChange={(value) => applyPurchaseFilters(purchaseSupplierFilter, value)}
               onSelectedIdsChange={setSelectedPurchaseIds}
             />
           )}
@@ -464,28 +451,14 @@ function Metric({ title, value, hint }: { title: string; value: string; hint?: s
   )
 }
 
-function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
+function ProductionResultTable({ rows, highlightedId }: {
   rows: MrpProductionRow[]
-  selectedIds: Set<number>
   highlightedId: number | null
-  onSelectedIdsChange: (ids: Set<number>) => void
 }) {
-  const visibleIds = rows.filter(isProductionRowSelectable).flatMap(productionSourceIds)
-  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
-
   return (
     <table className="journalTable resultTable">
       <thead>
         <tr>
-          <th className="checkCol">
-            <input
-              type="checkbox"
-              checked={allVisibleSelected}
-              disabled={!visibleIds.length}
-              onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, visibleIds, e.target.checked))}
-              aria-label="Выбрать все видимые производственные заказы"
-            />
-          </th>
           <th>Изделие</th>
           <th>Кол-во</th>
           <th>Потребность</th>
@@ -498,15 +471,6 @@ function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIds
       <tbody>
         {rows.map((row) => (
           <tr key={row.order_id} className={highlightedId && productionSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
-            <td className="checkCol">
-              <input
-                type="checkbox"
-                checked={productionSourceIds(row).every((id) => selectedIds.has(id))}
-                disabled={!isProductionRowSelectable(row)}
-                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, productionSourceIds(row), e.target.checked))}
-                aria-label={`Выбрать ${row.item_name || row.item_article || row.order_id}`}
-              />
-            </td>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''} {row.badge || ''}</span>
@@ -612,12 +576,8 @@ function PurchaseResultTable({
       </thead>
       <tbody>
         {rows.map((row) => {
-          const covered = Number(row.supplier_covered_qty ?? 0)
-          const requested = Number(row.requested_qty ?? row.qty)
-          const coveragePct = requested > 0 ? Math.round((covered / requested) * 100) : 0
-          const coverageLabel = covered > 0
-            ? `${qty(covered)} / ${qty(requested)} ${row.unit || ''} (${coveragePct}%)`
-            : '—'
+          const coverageLabel = row.supplier_coverage_label || '—'
+          const coverageStatus = row.supplier_coverage_status
           return (
           <tr key={row.purchase_id} className={highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
@@ -642,8 +602,8 @@ function PurchaseResultTable({
             <td>{dateRu(row.need_date) || '—'}</td>
             <td>{dateRu(row.order_date) || '—'}</td>
             <td className="numCell"><strong>{Number(row.lead_time_days || 0) || '—'}</strong>{Number(row.lead_time_days || 0) > 0 && <span>дн.</span>}</td>
-            <td className="numCell" title={`Покрыто активными заказами поставщику: ${coverageLabel}`} style={{ color: covered > 0 ? (coveragePct >= 100 ? 'var(--color-success, green)' : 'var(--color-warning, orange)') : undefined }}>
-              {covered > 0 ? coverageLabel : '—'}
+            <td className="numCell" title={`Покрыто активными заказами поставщику: ${coverageLabel}`} style={{ color: coverageStatus === 'full' ? 'var(--color-success, green)' : coverageStatus === 'partial' ? 'var(--color-warning, orange)' : undefined }}>
+              {coverageLabel}
             </td>
             <td>{row.badge || (row.late_supplier_order ? 'Покрыто заказом, но с опозданием' : '')}</td>
           </tr>
@@ -720,9 +680,11 @@ function CapacityResultTable({ rows }: { rows: MrpCapacityRow[] }) {
             <td className="numCell"><strong>{qty(row.hours_available)}</strong><span>н/ч</span></td>
             <td className="numCell"><strong>{qty(row.overload_hours)}</strong><span>н/ч</span></td>
             <td>
-              {Number(row.overload_hours || 0) > 0
+              {row.capacity_status === 'overloaded'
                 ? <span className="pill shortage">Перегруз</span>
-                : <span className="pill ready">ОК</span>}
+                : row.capacity_status === 'within_capacity'
+                  ? <span className="pill ready">ОК</span>
+                  : <span className="pill unavailable">Недоступно</span>}
             </td>
           </tr>
         ))}

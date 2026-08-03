@@ -103,6 +103,7 @@ def project_shelf(
     open_mrp_qty: Decimal,
     shelf_physical_qty: Decimal,
     other_stock_qty: Decimal,
+    saved_addressed_transfer_qty: Decimal = Decimal("0"),
     confirmed_receipts: tuple[ShelfReceipt, ...] = (),
 ) -> ShelfProjectionResult:
     """Calculate timing only; never create demand beyond frozen MRP."""
@@ -111,6 +112,7 @@ def project_shelf(
     open_qty = max(_d(open_mrp_qty), Decimal("0"))
     physical = _d(shelf_physical_qty)
     other = max(_d(other_stock_qty), Decimal("0"))
+    addressed_transfer = max(_d(saved_addressed_transfer_qty), Decimal("0"))
     dated_receipts = sorted(
         (row for row in confirmed_receipts if _d(row.qty) > 0),
         key=lambda row: row.available_from,
@@ -143,7 +145,10 @@ def project_shelf(
         receipts=dated_receipts,
     )
     gap = max(target - projected, Decimal("0"))
-    transfer = min(gap, other)
+    # Only a saved addressable transfer for this requirement may use free stock
+    # from another warehouse to reduce the pull. Unaddressed residue remains
+    # informational and cannot stop mech-shop production.
+    transfer = min(addressed_transfer, other)
     unlaunched = max(open_qty - confirmed, Decimal("0"))
     pull = min(max(gap - transfer, Decimal("0")), unlaunched)
     materialized = min(_round_up(pull, _d(batch_multiple)), unlaunched)

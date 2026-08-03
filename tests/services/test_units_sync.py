@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from app.models import Item, Unit
 from app.schemas import ODataSyncRequest
 from app.services import units_sync
-from app.services.order_quantity_calculator import OrderQuantityCalculator
 
 
 class _FakeUnitsClient:
@@ -74,8 +71,7 @@ def test_backfill_units_from_items_uses_classifier_without_broad_select(db_sessi
             item_code="METER-ITEM",
             item_name="Meter item",
             unit="unit-meter",
-            stock_qty=0,
-            status="active",
+                        status="active",
         )
     )
     db_session.commit()
@@ -90,19 +86,3 @@ def test_backfill_units_from_items_uses_classifier_without_broad_select(db_sessi
     assert stats["missing_after"] == 0
     meter = db_session.query(Unit).filter_by(unit_ref1c="unit-meter").one()
     assert meter.short_name == "м"
-
-
-def test_order_quantity_preserves_fractional_meter_qty_when_short_name_missing():
-    item = SimpleNamespace(item_id=1, unit="unit-meter")
-    unit = SimpleNamespace(unit_ref1c="unit-meter", unit_name="м", short_name=None, unit_code="006", precision=None)
-    calc = OrderQuantityCalculator(
-        snapshot={},
-        default_spec_map={},
-        spec_by_id={},
-        components_loader=lambda _spec_id: [],
-        item_by_id={1: item},
-        units_by_ref={"unit-meter": unit},
-    )
-
-    assert calc.is_discrete_item(1) is False
-    assert calc.normalize_qty_for_item(1, 2.75) == 2.75

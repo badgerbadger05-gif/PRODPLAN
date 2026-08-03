@@ -54,8 +54,7 @@ def _item(db, *, code: str, name: str, ref1c: str, stock: float = 0.0) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit=f"unit-{code}",
-        stock_qty=stock,
-        replenishment_method="Производство",
+                replenishment_method="Производство",
         status="active",
     )
     db.add(it)

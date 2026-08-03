@@ -9,7 +9,10 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.item_ledger.reservation import replenishment_remaining
+from app.services.item_ledger.reservation import (
+    replenishment_execution_pct,
+    replenishment_remaining,
+)
 from app.services.planning_truth import (
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_PLANNING_SNAPSHOTS,
@@ -19,6 +22,8 @@ from app.services.planning_truth import (
     get_latest_read_snapshot,
     get_truth_state,
 )
+from app.services.odata_config import load_odata_config as _load_odata_config
+from app.services.production_control_common import to_float_strict as _to_float
 
 
 CONSUMER = "purchase_control_journal"
@@ -74,13 +79,6 @@ def _unavailable(db: Session, reason: str, truth: dict[str, Any] | None = None):
     if truth:
         detail["truth"] = jsonable_encoder(truth)
     return PurchaseJournalSnapshotUnavailable(detail)
-
-
-def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        raise ValueError("numeric field is malformed")
 
 
 def validate_purchase_control_journal_buy_row(row: Any) -> None:
@@ -153,12 +151,6 @@ def _clean_ref(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
-
-
-def _coverage_percent(part: float, total: float) -> float:
-    if total <= 0:
-        return 0.0
-    return round(max(part, 0.0) / total * 100.0, 6)
 
 
 def _overdue_days(need_date_iso: Any, cutoff_date: date | None) -> int:
@@ -287,33 +279,32 @@ def open_supplier_coverage_by_reservation(
 
     requirement_ids = sorted(reservation_by_requirement)
     claims = (
-        db.query(models.MrpFreezeAllocation, models.PlanningRun)
-        .join(
-            models.PlanningRun,
-            models.PlanningRun.run_id == models.MrpFreezeAllocation.run_id,
-        )
+        db.query(models.MrpFreezeAllocation)
         .filter(
             models.MrpFreezeAllocation.requirement_id.in_(requirement_ids),
             models.MrpFreezeAllocation.source_type == "supplier_order",
-            models.MrpFreezeAllocation.freeze_version
-            == models.PlanningRun.active_freeze_version,
         )
         .all()
     )
     claims.sort(
-        key=lambda pair: (
-            reservation_by_requirement[int(pair[0].requirement_id)].priority_period_from,
-            reservation_by_requirement[int(pair[0].requirement_id)].priority_period_to,
-            int(pair[0].run_id),
-            int(pair[0].id),
+        key=lambda allocation: (
+            reservation_by_requirement[int(allocation.requirement_id)].priority_period_from,
+            reservation_by_requirement[int(allocation.requirement_id)].priority_period_to,
+            int(allocation.run_id),
+            int(allocation.id),
         )
     )
 
     covered_by_reservation: dict[int, float] = {}
     slices_by_reservation: dict[int, list[dict[str, Any]]] = {}
-    for allocation, _run in claims:
+    for allocation in claims:
         reservation = reservation_by_requirement.get(int(allocation.requirement_id))
         if reservation is None:
+            continue
+        if (
+            int(allocation.run_id) != int(reservation.run_id or -1)
+            or int(allocation.freeze_version) != int(reservation.freeze_version)
+        ):
             continue
         reservation_id = int(reservation.id)
         reservation_left = max(
@@ -547,6 +538,10 @@ def _build_buyer_rows(
     to_order_by_period: list[dict[str, Any]],
     cutoff_date: date | None = None,
 ) -> list[dict[str, Any]]:
+    configured_destination_warehouse_ref1c = _clean_ref(
+        _load_odata_config().get("purchase_destination_warehouse_ref1c")
+    )
+
     entries = (
         db.query(
             models.ReplenishmentWorkItem,
@@ -680,6 +675,12 @@ def _build_buyer_rows(
         need_from = reservation.priority_period_from or period_from
         need_to = reservation.priority_period_to or period_to
 
+        to_order_pct = replenishment_execution_pct(required, to_order)
+        open_order_covered_pct = replenishment_execution_pct(
+            required,
+            open_order_covered,
+        )
+
         target["slices"].append(
             {
                 "reservation_id": int(reservation.id),
@@ -695,8 +696,12 @@ def _build_buyer_rows(
                 "realized_qty": realized,
                 "open_order_covered_qty": open_order_covered,
                 "to_order_qty": to_order,
-                "to_order_pct": _coverage_percent(to_order, required),
-                "open_order_covered_pct": _coverage_percent(open_order_covered, required),
+                "to_order_pct": float(to_order_pct) if to_order_pct is not None else None,
+                "open_order_covered_pct": (
+                    float(open_order_covered_pct)
+                    if open_order_covered_pct is not None
+                    else None
+                ),
                 "coverage_slices": list(
                     open_coverage_slices.get(int(reservation.id), [])
                 ),
@@ -758,6 +763,12 @@ def _build_buyer_rows(
                 }
             )
 
+        to_order_pct = replenishment_execution_pct(required_qty, to_order_qty)
+        open_order_covered_pct = replenishment_execution_pct(
+            required_qty,
+            open_order_covered_qty,
+        )
+
         row = {
             "row_key": f"buy:{payload['item_id']}:{payload['planning_stock_pool']}",
             "line_id": None,
@@ -802,14 +813,39 @@ def _build_buyer_rows(
             "realized_qty": realized_qty,
             "open_order_covered_qty": open_order_covered_qty,
             "to_order_qty": to_order_qty,
-            "to_order_pct": _coverage_percent(to_order_qty, required_qty),
-            "open_order_covered_pct": _coverage_percent(open_order_covered_qty, required_qty),
+            "to_order_pct": float(to_order_pct) if to_order_pct is not None else None,
+            "open_order_covered_pct": (
+                float(open_order_covered_pct)
+                if open_order_covered_pct is not None
+                else None
+            ),
             "plan_period_from": first_bucket["plan_period_from"],
             "plan_period_to": last_bucket["plan_period_to"],
             "period_label": first_bucket["period_label"],
             "horizon_bucket_count": len(payload["horizon_buckets"]),
             "horizon_buckets": payload["horizon_buckets"],
             "slices": payload["slices"],
+            "materialization_input": {
+                "version": 1,
+                "supplier_ref1c": payload["supplier_ref1c"],
+                "item_ref1c": payload["item_ref1c"],
+                "unit_ref1c": _clean_ref(payload["unit"]),
+                "destination_warehouse_ref1c": configured_destination_warehouse_ref1c,
+                "slices": [
+                    {
+                        "reservation_id": int(slice_row["reservation_id"]),
+                        "work_item_id": int(slice_row["work_item_id"]),
+                        "requirement_id": int(slice_row["requirement_id"]),
+                        "run_id": int(slice_row["run_id"]),
+                        "plan_period_from": slice_row["plan_period_from"],
+                        "plan_period_to": slice_row["plan_period_to"],
+                        "need_date": slice_row["need_date"],
+                        "need_period_to": slice_row["need_period_to"],
+                        "to_order_qty": round(float(slice_row["to_order_qty"]), 6),
+                    }
+                    for slice_row in payload["slices"]
+                ],
+            },
             "row_generator": _BUY_ROW_GENERATOR,
             "fact_status": "available",
             "fact_source": "ledger",

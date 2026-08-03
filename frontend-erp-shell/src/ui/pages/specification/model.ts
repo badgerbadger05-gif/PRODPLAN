@@ -1,6 +1,6 @@
 import type {
   BomFlattenedItem,
-  BomItem,
+  BomItemIdentity,
   SpecFlatRow,
   SpecNode,
 } from '../../../domain/specification'
@@ -33,7 +33,7 @@ export function nodeItemId(node: SpecNode) {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-export function itemTitle(item?: BomItem | null) {
+export function itemTitle(item?: BomItemIdentity | null) {
   if (!item) return ''
   return [item.item_article, item.item_name].filter(Boolean).join(' · ') || item.item_code
 }
@@ -47,7 +47,8 @@ export function warningSeverity(warnings?: string[]) {
 export function qualitySeverityClass(severity: string) {
   if (severity === 'error') return 'failed'
   if (severity === 'warning') return 'partial'
-  return 'ready'
+  if (severity === 'info') return 'ready'
+  return 'failed'
 }
 
 export function normalizeFilterValue(value?: string | null) {

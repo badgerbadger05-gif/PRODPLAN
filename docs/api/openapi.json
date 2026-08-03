@@ -193,7 +193,7 @@
           "items"
         ],
         "summary": "Patch Item Endpoint",
-        "description": "Update only the sent planning attributes of an item.\n\nEditing one attribute must not require the client to resend the whole\nrecord: `stock_qty` is a physical value owned by the 1C sync / Item Ledger,\nand echoing a just-read copy of it back races the sync. PATCH refuses it\n(422) instead.",
+        "description": "Update only the sent master-data attributes of an item.",
         "operationId": "patch_item_endpoint_api_v1_items__item_id__patch",
         "parameters": [
           {
@@ -377,9 +377,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Get Stock Warehouses Api V1 Sync Warehouses Get"
+                  "$ref": "#/components/schemas/StockWarehouseListResponse"
                 }
               }
             }
@@ -1547,14 +1545,16 @@
           "odata"
         ],
         "summary": "Get Saved Groups",
-        "description": "Возвращает сохранённые группы номенклатуры из файла.",
+        "description": "Canonical UI view over the independent 1C cache and manual selection.",
         "operationId": "get_saved_groups_api_v1_odata_groups_get",
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/NomenclatureGroupsResponse"
+                }
               }
             }
           }
@@ -2225,7 +2225,7 @@
           "plan"
         ],
         "summary": "Period Plans Mrp Snapshot",
-        "description": "Совместимый путь восстановления снимка уже зафиксированного плана.\n\nОсновной сценарий — атомарный `POST /period-plans/{id}/fix`. Этот маршрут\nостаётся идемпотентным повтором: если у плана уже есть снимок в текущем\nпринятом поколении, он возвращается как есть и ничего не форкается.\n`generation_key` необязателен — сервер выводит его из текущего принятого\nпоколения.",
+        "description": "Совместимый путь восстановления снимка уже зафиксированного плана.\n\nОсновной сценарий — атомарный `POST /period-plans/{id}/fix`. Этот маршрут\nостаётся идемпотентным повтором: если у плана уже есть снимок в текущем\nпринятом поколении, он возвращается как есть и ничего не форкается.\nКлюч формируется сервером автоматически из плана и текущего принятого\nпоколения.",
         "operationId": "period_plans_mrp_snapshot_api_v1_plan_period_plans__plan_id__mrp_snapshot_post",
         "parameters": [
           {
@@ -2401,6 +2401,91 @@
               ],
               "title": "Flow"
             }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "include_net_zero",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": true,
+              "title": "Include Net Zero"
+            }
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "bom_level",
+                "item_article",
+                "item_code",
+                "item_name",
+                "flow",
+                "gross_qty",
+                "net_qty",
+                "ordered_qty",
+                "completed_qty",
+                "remaining_qty",
+                "need_date",
+                "coverage_pct",
+                "status"
+              ],
+              "type": "string",
+              "default": "bom_level",
+              "title": "Sort By"
+            }
+          },
+          {
+            "name": "sort_dir",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string",
+              "default": "asc",
+              "title": "Sort Dir"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
           }
         ],
         "responses": {
@@ -2408,7 +2493,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionJournalResponse"
+                }
               }
             }
           },
@@ -3117,6 +3204,54 @@
                 }
               ],
               "title": "Bucket Type"
+            }
+          },
+          {
+            "name": "supplier_ref1c",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Supplier Ref1C"
+            }
+          },
+          {
+            "name": "category_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Id"
+            }
+          },
+          {
+            "name": "category_ref1c",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Ref1C"
             }
           },
           {
@@ -4094,178 +4229,6 @@
         }
       }
     },
-    "/api/v1/plan/forced_orders": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Create Forced Order",
-        "description": "Создать заявку на «принудительный заказ» (не влияет на основной MRP run)",
-        "operationId": "create_forced_order_api_v1_plan_forced_orders_post",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ForcedOrderCreateRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "get": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "List Forced Orders",
-        "description": "Список заявок на принудительные заказы",
-        "operationId": "list_forced_orders_api_v1_plan_forced_orders_get",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 50,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 0,
-              "title": "Offset"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/forced_orders/{request_id}/process": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Process Forced Order",
-        "description": "Посчитать принудительный заказ (комплектующие не блокируют, но дефицит фиксируется в diagnostics)",
-        "operationId": "process_forced_order_api_v1_plan_forced_orders__request_id__process_post",
-        "parameters": [
-          {
-            "name": "request_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Request Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/forced_orders/{request_id}/export": {
-      "get": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Export Forced Order",
-        "description": "Экспорт принудительного заказа в XLSX (base64)",
-        "operationId": "export_forced_order_api_v1_plan_forced_orders__request_id__export_get",
-        "parameters": [
-          {
-            "name": "request_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Request Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/plan/stages": {
       "get": {
         "tags": [
@@ -4507,6 +4470,54 @@
                 }
               ],
               "title": "Bucket Type"
+            }
+          },
+          {
+            "name": "supplier_ref1c",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Supplier Ref1C"
+            }
+          },
+          {
+            "name": "category_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Id"
+            }
+          },
+          {
+            "name": "category_ref1c",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category Ref1C"
             }
           },
           {
@@ -4919,7 +4930,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/NomenclatureSearchResponse"
+                }
               }
             }
           },
@@ -4950,30 +4963,6 @@
             "content": {
               "application/json": {
                 "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/stages/calculate": {
-      "post": {
-        "tags": [
-          "stages"
-        ],
-        "summary": "Calculate",
-        "description": "Рассчитать этапы производства.\n\nАлгоритм:\n- Берёт все изделия из строк плана (root_products)\n- Находит для них спецификации по умолчанию\n- Рекурсивно разворачивает состав (учитывая множители родителей)\n- Группирует по этапам появления (stage_id из строк состава)\n- Оставляет только детали с методом пополнения 'Производство'\n- Возвращает структуру: этап -> изделия -> детали\n\nВозврат:\n{\n  \"asOf\": \"ISO-время последней синхронизации остатков или null\",\n  \"stages\": [\n    {\n      \"stage_id\": int,\n      \"stage_name\": str,\n      \"products\": [\n        {\n          \"root_item_id\": int,\n          \"root_item_code\": str,\n          \"root_item_name\": str,\n          \"components\": [\n            {\n              \"item_id\": int,\n              \"item_code\": str,\n              \"item_name\": str,\n              \"qty_per_unit\": float,\n              \"stock_qty\": float,\n              \"replenishment_method\": str | null,\n              \"min_batch\": float | null,\n              \"max_batch\": float | null\n            }\n          ]\n        }\n      ]\n    }\n  ]\n}",
-        "operationId": "calculate_api_v1_stages_calculate_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Calculate Api V1 Stages Calculate Post"
-                }
               }
             }
           }
@@ -5539,9 +5528,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Search Specification Items Api V1 Specification Search Get"
+                  "$ref": "#/components/schemas/SpecificationSearchResponse"
                 }
               }
             }
@@ -6229,30 +6216,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/resources/calculate_distribution": {
-      "post": {
-        "tags": [
-          "resources"
-        ],
-        "summary": "Get Resource Distribution",
-        "description": "Рассчитать распределение компонентов по производственным участкам.",
-        "operationId": "get_resource_distribution_api_v1_resources_calculate_distribution_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Get Resource Distribution Api V1 Resources Calculate Distribution Post"
                 }
               }
             }
@@ -7034,9 +6997,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response List Employees Api V1 Production Control Employees Get"
+                  "$ref": "#/components/schemas/ProductionEmployeeListResponse"
                 }
               }
             }
@@ -7078,9 +7039,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Order Line Operations Api V1 Production Control Orders  Product Id  Operations Get"
+                  "$ref": "#/components/schemas/ProductionOperationsResponse"
                 }
               }
             }
@@ -7091,6 +7050,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/production-control/orders/root-products": {
+      "get": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "List Root Products",
+        "operationId": "list_root_products_api_v1_production_control_orders_root_products_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductionControlRootProductOptionsResponse"
                 }
               }
             }
@@ -7345,61 +7325,6 @@
         }
       }
     },
-    "/api/v1/production-control/orders/{product_id}/quantity": {
-      "patch": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Patch Order Line Quantity",
-        "description": "Adjust the planned quantity of a production line.\nCannot be set below already-produced qty.\nRecalculates remaining_qty automatically.",
-        "operationId": "patch_order_line_quantity_api_v1_production_control_orders__product_id__quantity_patch",
-        "parameters": [
-          {
-            "name": "product_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Product Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateQuantityPayload"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Patch Order Line Quantity Api V1 Production Control Orders  Product Id  Quantity Patch"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/production-control/orders/{product_id}/state": {
       "patch": {
         "tags": [
@@ -7498,50 +7423,6 @@
         }
       }
     },
-    "/api/v1/production-control/orders/dedupe-mrp": {
-      "post": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Post Dedupe Mrp Orders",
-        "description": "Repair local MRP production-order overcoverage.\n\nDry-run by default. The applied mode only touches local PRODPLAN MRP rows\nthat are not linked to 1C: duplicates are cancelled, and a single oversized\nrow is reduced to the latest MRP requirement.",
-        "operationId": "post_dedupe_mrp_orders_api_v1_production_control_orders_dedupe_mrp_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DedupeMrpOrdersPayload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Post Dedupe Mrp Orders Api V1 Production Control Orders Dedupe Mrp Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/production-control/orders/{product_id}/materials": {
       "get": {
         "tags": [
@@ -7558,16 +7439,6 @@
               "type": "integer",
               "title": "Product Id"
             }
-          },
-          {
-            "name": "refresh",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Refresh"
-            }
           }
         ],
         "responses": {
@@ -7576,53 +7447,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Order Line Materials Api V1 Production Control Orders  Product Id  Materials Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/production-control/orders/{product_id}/materials/refresh": {
-      "post": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Post Order Line Materials Refresh",
-        "operationId": "post_order_line_materials_refresh_api_v1_production_control_orders__product_id__materials_refresh_post",
-        "parameters": [
-          {
-            "name": "product_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Product Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Post Order Line Materials Refresh Api V1 Production Control Orders  Product Id  Materials Refresh Post"
+                  "$ref": "#/components/schemas/ProductionMaterialsResponse"
                 }
               }
             }
@@ -7678,6 +7503,60 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Post Produce Line Api V1 Production Control Orders  Product Id  Produce Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/production-control/orders/{product_id}/close": {
+      "post": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Post Close Production Order",
+        "operationId": "post_close_production_order_api_v1_production_control_orders__product_id__close_post",
+        "parameters": [
+          {
+            "name": "product_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Product Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseProductionOrderPayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Post Close Production Order Api V1 Production Control Orders  Product Id  Close Post"
                 }
               }
             }
@@ -8375,7 +8254,7 @@
             "required": false,
             "schema": {
               "type": "boolean",
-              "default": true,
+              "default": false,
               "title": "Mark Printed"
             }
           },
@@ -9149,9 +9028,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Review Items Api V1 Workshop Binding Review Items Get"
+                  "$ref": "#/components/schemas/BindingReviewItemsResponse"
                 }
               }
             }
@@ -9193,9 +9070,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Review Item Lines Api V1 Workshop Binding Review Items  Item Id  Lines Get"
+                  "$ref": "#/components/schemas/BindingReviewLinesResponse"
                 }
               }
             }
@@ -11275,6 +11150,305 @@
         ],
         "title": "AssemblyRateUpsertResponse"
       },
+      "BindingReviewItemResponse": {
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "item_code": {
+            "type": "string",
+            "title": "Item Code"
+          },
+          "item_name": {
+            "type": "string",
+            "title": "Item Name"
+          },
+          "item_article": {
+            "type": "string",
+            "title": "Item Article"
+          },
+          "active_lines": {
+            "type": "integer",
+            "title": "Active Lines"
+          },
+          "reason_code": {
+            "type": "string",
+            "enum": [
+              "NO_SPEC",
+              "NO_PRODUCTION_KIND",
+              "KIND_NOT_BOUND",
+              "NO_WAREHOUSE_BINDING"
+            ],
+            "title": "Reason Code"
+          },
+          "reason_text": {
+            "type": "string",
+            "title": "Reason Text"
+          },
+          "recommendation": {
+            "type": "string",
+            "title": "Recommendation"
+          },
+          "workshop_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workshop Id"
+          },
+          "spec_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Id"
+          },
+          "spec_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Name"
+          },
+          "production_kind_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Production Kind Id"
+          },
+          "production_kind_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Production Kind Name"
+          },
+          "suggested_resource_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Resource Id"
+          },
+          "suggested_resource_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Resource Name"
+          },
+          "suggested_stage_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Stage Id"
+          },
+          "suggested_stage_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Stage Name"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item_id",
+          "item_code",
+          "item_name",
+          "item_article",
+          "active_lines",
+          "reason_code",
+          "reason_text",
+          "recommendation"
+        ],
+        "title": "BindingReviewItemResponse"
+      },
+      "BindingReviewItemsResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BindingReviewItemResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "active",
+              "catalog"
+            ],
+            "title": "Scope"
+          },
+          "counts_by_reason": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "NO_SPEC",
+                "NO_PRODUCTION_KIND",
+                "KIND_NOT_BOUND",
+                "NO_WAREHOUSE_BINDING"
+              ]
+            },
+            "type": "object",
+            "title": "Counts By Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "limit",
+          "offset",
+          "scope",
+          "counts_by_reason"
+        ],
+        "title": "BindingReviewItemsResponse"
+      },
+      "BindingReviewLineResponse": {
+        "properties": {
+          "product_id": {
+            "type": "integer",
+            "title": "Product Id"
+          },
+          "order_id": {
+            "type": "integer",
+            "title": "Order Id"
+          },
+          "order_number": {
+            "type": "string",
+            "title": "Order Number"
+          },
+          "quantity": {
+            "type": "number",
+            "title": "Quantity"
+          },
+          "remaining_qty": {
+            "type": "number",
+            "title": "Remaining Qty"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "workshop_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workshop Id"
+          },
+          "planned_start_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Start Date"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "product_id",
+          "order_id",
+          "order_number",
+          "quantity",
+          "remaining_qty",
+          "status"
+        ],
+        "title": "BindingReviewLineResponse"
+      },
+      "BindingReviewLinesResponse": {
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/BindingReviewLineResponse"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item_id",
+          "rows",
+          "total"
+        ],
+        "title": "BindingReviewLinesResponse"
+      },
       "ChainClosePayload": {
         "properties": {
           "product_id": {
@@ -11521,7 +11695,7 @@
         "type": "object",
         "title": "ChainPreviewPayload"
       },
-      "DedupeMrpOrdersPayload": {
+      "CloseProductionOrderPayload": {
         "properties": {
           "dry_run": {
             "type": "boolean",
@@ -11530,7 +11704,7 @@
           }
         },
         "type": "object",
-        "title": "DedupeMrpOrdersPayload"
+        "title": "CloseProductionOrderPayload"
       },
       "DeleteResponse": {
         "properties": {
@@ -11760,6 +11934,1190 @@
         ],
         "title": "DrumSlotRow"
       },
+      "ExecutionJournalInformationLinkEvent": {
+        "properties": {
+          "reservation_id": {
+            "type": "integer",
+            "title": "Reservation Id"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "reservation_id",
+          "url"
+        ],
+        "title": "ExecutionJournalInformationLinkEvent"
+      },
+      "ExecutionJournalInformationLinks": {
+        "properties": {
+          "reservation_events": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionJournalInformationLinkEvent"
+            },
+            "type": "array",
+            "title": "Reservation Events",
+            "default": []
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ExecutionJournalInformationLinks"
+      },
+      "ExecutionJournalLedgerEvent": {
+        "properties": {
+          "event_id": {
+            "type": "integer",
+            "title": "Event Id"
+          },
+          "reservation_id": {
+            "type": "integer",
+            "title": "Reservation Id"
+          },
+          "sle_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sle Id"
+          },
+          "fact_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fact Ref"
+          },
+          "fact_line_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fact Line Ref"
+          },
+          "match_rule": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Match Rule"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "event_id",
+          "reservation_id"
+        ],
+        "title": "ExecutionJournalLedgerEvent"
+      },
+      "ExecutionJournalLedgerLinks": {
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "reservation_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Reservation Ids",
+            "default": []
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionJournalLedgerEvent"
+            },
+            "type": "array",
+            "title": "Events",
+            "default": []
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item_id"
+        ],
+        "title": "ExecutionJournalLedgerLinks"
+      },
+      "ExecutionJournalResponse": {
+        "properties": {
+          "plan": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Plan"
+          },
+          "run_id": {
+            "type": "integer",
+            "title": "Run Id"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionJournalRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/ExecutionJournalSummary"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "truth_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Status"
+          },
+          "ledger_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ledger Generation"
+          },
+          "truth_generation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Generation Id"
+          },
+          "cutoff": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutoff"
+          },
+          "truth_cutoff": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Cutoff"
+          },
+          "truth_meta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionJournalTruthMeta"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Meta"
+          },
+          "truth_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Reason"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "facets": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Facets"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "plan",
+          "run_id",
+          "rows",
+          "summary",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "ExecutionJournalResponse"
+      },
+      "ExecutionJournalRow": {
+        "properties": {
+          "req_id": {
+            "type": "integer",
+            "title": "Req Id"
+          },
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "item_code": {
+            "type": "string",
+            "title": "Item Code"
+          },
+          "item_name": {
+            "type": "string",
+            "title": "Item Name"
+          },
+          "flow": {
+            "type": "string",
+            "enum": [
+              "production",
+              "purchase",
+              "rework"
+            ],
+            "title": "Flow"
+          },
+          "bom_level": {
+            "type": "integer",
+            "title": "Bom Level"
+          },
+          "gross_qty": {
+            "type": "number",
+            "title": "Gross Qty"
+          },
+          "net_qty": {
+            "type": "number",
+            "title": "Net Qty"
+          },
+          "ordered_qty": {
+            "type": "number",
+            "title": "Ordered Qty"
+          },
+          "completed_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed Qty"
+          },
+          "coverage_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Pct"
+          },
+          "remaining_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Qty"
+          },
+          "work_items": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionJournalWorkItem"
+            },
+            "type": "array",
+            "title": "Work Items"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "net_zero",
+              "covered",
+              "partial",
+              "ordered",
+              "none",
+              "execution_unavailable"
+            ],
+            "title": "Status"
+          },
+          "root_item_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Root Item Ids",
+            "default": []
+          },
+          "information_links": {
+            "$ref": "#/components/schemas/ExecutionJournalInformationLinks"
+          },
+          "reservation_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Reservation Ids",
+            "default": []
+          },
+          "execution_events": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Execution Events",
+            "default": []
+          },
+          "execution_allocations": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Execution Allocations",
+            "default": []
+          },
+          "ledger_links": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionJournalLedgerLinks"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "item_article": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Article"
+          },
+          "stock_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stock Qty"
+          },
+          "covered_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Covered Qty"
+          },
+          "progress_base_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Base Qty"
+          },
+          "execution_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Available"
+          },
+          "execution_unavailable_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Unavailable Reason"
+          },
+          "execution_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Source"
+          },
+          "need_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Need Date"
+          },
+          "status_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Label"
+          },
+          "forecast_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Date"
+          },
+          "forecast_shift_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Shift Days"
+          },
+          "forecast_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Reason"
+          },
+          "forecast_status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "early",
+                  "on_time",
+                  "delayed",
+                  "critical",
+                  "unavailable"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Status"
+          },
+          "purchase_covered_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purchase Covered Qty"
+          },
+          "purchase_to_order_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purchase To Order Qty"
+          },
+          "unassigned_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unassigned Qty"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "req_id",
+          "item_id",
+          "item_code",
+          "item_name",
+          "flow",
+          "bom_level",
+          "gross_qty",
+          "net_qty",
+          "ordered_qty",
+          "completed_qty",
+          "coverage_pct",
+          "remaining_qty",
+          "work_items",
+          "status",
+          "information_links"
+        ],
+        "title": "ExecutionJournalRow"
+      },
+      "ExecutionJournalSummary": {
+        "properties": {
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "total_items": {
+            "type": "integer",
+            "title": "Total Items"
+          },
+          "execution_completed_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Completed Qty"
+          },
+          "execution_base_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Base Qty"
+          },
+          "execution_available_base_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Available Base Qty"
+          },
+          "execution_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Pct"
+          },
+          "execution_confirmed_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Confirmed Pct"
+          },
+          "execution_partial": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Partial"
+          },
+          "fully_covered": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fully Covered"
+          },
+          "partially_covered": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partially Covered"
+          },
+          "not_covered": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Not Covered"
+          },
+          "net_zero": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Net Zero"
+          },
+          "execution_by_flow": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ExecutionJournalSummaryByFlow"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution By Flow"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "truth_status",
+          "total_items"
+        ],
+        "title": "ExecutionJournalSummary"
+      },
+      "ExecutionJournalSummaryByFlow": {
+        "properties": {
+          "completed_qty": {
+            "type": "number",
+            "title": "Completed Qty"
+          },
+          "base_qty": {
+            "type": "number",
+            "title": "Base Qty"
+          },
+          "execution_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Pct"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available",
+            "default": true
+          },
+          "total_base_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Base Qty"
+          },
+          "confirmed_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmed Pct"
+          },
+          "covered_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Covered Pct"
+          },
+          "to_order_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Order Pct"
+          },
+          "purchase_covered_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purchase Covered Qty"
+          },
+          "purchase_to_order_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purchase To Order Qty"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "completed_qty",
+          "base_qty",
+          "execution_pct"
+        ],
+        "title": "ExecutionJournalSummaryByFlow"
+      },
+      "ExecutionJournalTruthMeta": {
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "accepted_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted By"
+          },
+          "truth_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Source"
+          },
+          "unavailable_sections": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Sections"
+          },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ExecutionJournalTruthMeta"
+      },
+      "ExecutionJournalWorkItem": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "production_order",
+              "planned_order",
+              "planned_purchase",
+              "planned_rework"
+            ],
+            "title": "Type"
+          },
+          "qty": {
+            "type": "number",
+            "title": "Qty"
+          },
+          "product_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Id"
+          },
+          "order_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Id"
+          },
+          "order_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Number"
+          },
+          "order_ref1c": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Ref1C"
+          },
+          "order_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Source"
+          },
+          "one_c_opened": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "One C Opened"
+          },
+          "opened_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opened At"
+          },
+          "order_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order State"
+          },
+          "purchase_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Purchase Id"
+          },
+          "rework_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rework Id"
+          },
+          "completed_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed Qty"
+          },
+          "remaining_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remaining Qty"
+          },
+          "need_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Need Date"
+          },
+          "order_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Date"
+          },
+          "lead_time_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lead Time Days"
+          },
+          "forecast_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Date"
+          },
+          "forecast_shift_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Shift Days"
+          },
+          "forecast_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Reason"
+          },
+          "forecast_status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "early",
+                  "on_time",
+                  "delayed",
+                  "critical",
+                  "unavailable"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "type",
+          "qty"
+        ],
+        "title": "ExecutionJournalWorkItem"
+      },
       "ExportManufacturesPayload": {
         "properties": {
           "manufacture_ids": {
@@ -11917,62 +13275,6 @@
           "order_ids"
         ],
         "title": "ExportProductionOrdersPayload"
-      },
-      "ForcedOrderCreateRequest": {
-        "properties": {
-          "run_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run Id"
-          },
-          "item_id": {
-            "type": "integer",
-            "title": "Item Id"
-          },
-          "need_date": {
-            "type": "string",
-            "title": "Need Date"
-          },
-          "requested_qty": {
-            "type": "number",
-            "title": "Requested Qty"
-          },
-          "created_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created By"
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reason"
-          }
-        },
-        "type": "object",
-        "required": [
-          "item_id",
-          "need_date",
-          "requested_qty"
-        ],
-        "title": "ForcedOrderCreateRequest"
       },
       "GenerationAcceptRequest": {
         "properties": {
@@ -12248,11 +13550,6 @@
             ],
             "title": "Category Id"
           },
-          "stock_qty": {
-            "type": "number",
-            "title": "Stock Qty",
-            "default": 0.0
-          },
           "optimal_batch": {
             "anyOf": [
               {
@@ -12369,11 +13666,6 @@
               }
             ],
             "title": "Category Id"
-          },
-          "stock_qty": {
-            "type": "number",
-            "title": "Stock Qty",
-            "default": 0.0
           },
           "optimal_batch": {
             "anyOf": [
@@ -13016,7 +14308,7 @@
         "additionalProperties": false,
         "type": "object",
         "title": "ItemPatch",
-        "description": "Partial item update: only the fields actually sent are written.\n\n`stock_qty` is deliberately absent. Physical stock belongs to the 1C sync and\nthe Item Ledger, so a browser form must never be able to carry it — with a\nfull-record PUT an editor of one planning attribute had to resend the stock\nit had read a moment earlier and could silently overwrite a fresher sync\nvalue. `extra=\"forbid\"` plus the explicit check below turn such an attempt\ninto 422 instead of a silent write."
+        "description": "Partial item update containing master-data fields only."
       },
       "ItemUpdate": {
         "properties": {
@@ -13093,11 +14385,6 @@
               }
             ],
             "title": "Category Id"
-          },
-          "stock_qty": {
-            "type": "number",
-            "title": "Stock Qty",
-            "default": 0.0
           },
           "optimal_batch": {
             "anyOf": [
@@ -13349,6 +14636,129 @@
           "target_spec_id"
         ],
         "title": "MoveRequest"
+      },
+      "NomenclatureGroupResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "code",
+          "name"
+        ],
+        "title": "NomenclatureGroupResponse"
+      },
+      "NomenclatureGroupsResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NomenclatureGroupResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "selected_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Selected Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items",
+          "selected_ids"
+        ],
+        "title": "NomenclatureGroupsResponse"
+      },
+      "NomenclatureSearchItemResponse": {
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "item_code": {
+            "type": "string",
+            "title": "Item Code"
+          },
+          "item_name": {
+            "type": "string",
+            "title": "Item Name"
+          },
+          "item_article": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Article"
+          },
+          "similarity": {
+            "type": "number",
+            "title": "Similarity"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item_id",
+          "item_code",
+          "item_name",
+          "item_article",
+          "similarity"
+        ],
+        "title": "NomenclatureSearchItemResponse"
+      },
+      "NomenclatureSearchResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NomenclatureSearchItemResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "search_type": {
+            "type": "string",
+            "const": "text",
+            "title": "Search Type"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "query",
+          "search_type"
+        ],
+        "title": "NomenclatureSearchResponse"
       },
       "ODataConfig": {
         "properties": {
@@ -13712,17 +15122,6 @@
       },
       "PeriodPlanMrpSnapshotRequest": {
         "properties": {
-          "generation_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Generation Key"
-          },
           "started_by": {
             "anyOf": [
               {
@@ -13901,7 +15300,14 @@
       "ProduceLinePayload": {
         "properties": {
           "qty": {
-            "type": "number",
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Qty"
           },
           "executor": {
@@ -13943,10 +15349,136 @@
           }
         },
         "type": "object",
-        "required": [
-          "qty"
-        ],
         "title": "ProduceLinePayload"
+      },
+      "ProductionControlRootProductOption": {
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "item_name": {
+            "type": "string",
+            "title": "Item Name"
+          },
+          "item_article": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Article"
+          },
+          "item_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Code"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item_id",
+          "item_name"
+        ],
+        "title": "ProductionControlRootProductOption"
+      },
+      "ProductionControlRootProductOptionsResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ProductionControlRootProductOption"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rows",
+          "total"
+        ],
+        "title": "ProductionControlRootProductOptionsResponse"
+      },
+      "ProductionEmployeeListResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ProductionEmployeeOptionResponse"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rows",
+          "total"
+        ],
+        "title": "ProductionEmployeeListResponse"
+      },
+      "ProductionEmployeeOptionResponse": {
+        "properties": {
+          "employee_id": {
+            "type": "integer",
+            "title": "Employee Id"
+          },
+          "employee_ref1c": {
+            "type": "string",
+            "title": "Employee Ref1C"
+          },
+          "employee_type": {
+            "type": "string",
+            "enum": [
+              "employee",
+              "brigade"
+            ],
+            "title": "Employee Type"
+          },
+          "employee_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Employee Code"
+          },
+          "employee_name": {
+            "type": "string",
+            "title": "Employee Name"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "employee_id",
+          "employee_ref1c",
+          "employee_type",
+          "employee_name"
+        ],
+        "title": "ProductionEmployeeOptionResponse"
       },
       "ProductionGroup": {
         "properties": {
@@ -14223,6 +15755,196 @@
           "updated_at"
         ],
         "title": "ProductionKind"
+      },
+      "ProductionMaterialsResponse": {
+        "properties": {
+          "ledger_generation_id": {
+            "type": "integer",
+            "title": "Ledger Generation Id"
+          },
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "cutoff": {
+            "type": "string",
+            "title": "Cutoff"
+          },
+          "product_id": {
+            "type": "integer",
+            "title": "Product Id"
+          },
+          "order_number": {
+            "type": "string",
+            "title": "Order Number"
+          },
+          "item_name": {
+            "type": "string",
+            "title": "Item Name"
+          },
+          "item_article": {
+            "type": "string",
+            "title": "Item Article"
+          },
+          "qty": {
+            "type": "number",
+            "title": "Qty"
+          },
+          "spec_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Id"
+          },
+          "components": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Components"
+          },
+          "coverage": {
+            "type": "string",
+            "title": "Coverage"
+          },
+          "coverage_status": {
+            "type": "string",
+            "title": "Coverage Status"
+          },
+          "coverage_label": {
+            "type": "string",
+            "title": "Coverage Label"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ledger_generation_id",
+          "truth_status",
+          "cutoff",
+          "product_id",
+          "order_number",
+          "item_name",
+          "item_article",
+          "qty",
+          "spec_id",
+          "components",
+          "coverage",
+          "coverage_status",
+          "coverage_label"
+        ],
+        "title": "ProductionMaterialsResponse"
+      },
+      "ProductionOperationOptionResponse": {
+        "properties": {
+          "line_number": {
+            "type": "integer",
+            "title": "Line Number"
+          },
+          "spec_id": {
+            "type": "integer",
+            "title": "Spec Id"
+          },
+          "spec_ref1c": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Ref1C"
+          },
+          "spec_operation_id": {
+            "type": "integer",
+            "title": "Spec Operation Id"
+          },
+          "operation_id": {
+            "type": "integer",
+            "title": "Operation Id"
+          },
+          "operation_ref1c": {
+            "type": "string",
+            "title": "Operation Ref1C"
+          },
+          "operation_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Name"
+          },
+          "stage_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Id"
+          },
+          "stage_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Name"
+          },
+          "time_norm": {
+            "type": "number",
+            "title": "Time Norm"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "line_number",
+          "spec_id",
+          "spec_operation_id",
+          "operation_id",
+          "operation_ref1c",
+          "time_norm"
+        ],
+        "title": "ProductionOperationOptionResponse"
+      },
+      "ProductionOperationsResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ProductionOperationOptionResponse"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rows",
+          "total"
+        ],
+        "title": "ProductionOperationsResponse"
       },
       "ProductionOrderJournalResponse": {
         "properties": {
@@ -14509,6 +16231,24 @@
             ],
             "title": "Forecast Reason"
           },
+          "forecast_status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "early",
+                  "on_time",
+                  "delayed",
+                  "critical",
+                  "unavailable"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Forecast Status"
+          },
           "opened_at": {
             "anyOf": [
               {
@@ -14714,6 +16454,14 @@
               }
             ],
             "title": "Mrp Req Remaining Qty"
+          },
+          "available_actions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Available Actions",
+            "default": []
           },
           "launch_source": {
             "type": "string",
@@ -16748,6 +18496,254 @@
         ],
         "title": "ShelfProjectionRow"
       },
+      "SpecificationSearchItemResponse": {
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "item_code": {
+            "type": "string",
+            "title": "Item Code"
+          },
+          "item_name": {
+            "type": "string",
+            "title": "Item Name"
+          },
+          "item_article": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Article"
+          },
+          "item_ref1c": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Ref1C"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "unit_ref1c": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit Ref1C"
+          },
+          "replenishment_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replenishment Method"
+          },
+          "spec_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Id"
+          },
+          "spec_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Code"
+          },
+          "spec_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Name"
+          },
+          "spec_ref1c": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Ref1C"
+          },
+          "default_spec_count": {
+            "type": "integer",
+            "title": "Default Spec Count"
+          },
+          "has_children": {
+            "type": "boolean",
+            "title": "Has Children"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "item_id",
+          "item_code",
+          "item_name",
+          "item_article",
+          "item_ref1c",
+          "unit",
+          "unit_ref1c",
+          "replenishment_method",
+          "spec_id",
+          "spec_code",
+          "spec_name",
+          "spec_ref1c",
+          "default_spec_count",
+          "has_children"
+        ],
+        "title": "SpecificationSearchItemResponse"
+      },
+      "SpecificationSearchMetaResponse": {
+        "properties": {
+          "q": {
+            "type": "string",
+            "title": "Q"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "q",
+          "count",
+          "limit"
+        ],
+        "title": "SpecificationSearchMetaResponse"
+      },
+      "SpecificationSearchResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SpecificationSearchItemResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/SpecificationSearchMetaResponse"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "items",
+          "meta"
+        ],
+        "title": "SpecificationSearchResponse"
+      },
+      "StockWarehouseListResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/StockWarehouseResponse"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "selected_total": {
+            "type": "integer",
+            "title": "Selected Total"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rows",
+          "total",
+          "selected_total"
+        ],
+        "title": "StockWarehouseListResponse"
+      },
+      "StockWarehouseResponse": {
+        "properties": {
+          "warehouse_id": {
+            "type": "integer",
+            "title": "Warehouse Id"
+          },
+          "warehouse_ref1c": {
+            "type": "string",
+            "title": "Warehouse Ref1C"
+          },
+          "warehouse_code": {
+            "type": "string",
+            "title": "Warehouse Code"
+          },
+          "warehouse_name": {
+            "type": "string",
+            "title": "Warehouse Name"
+          },
+          "is_selected": {
+            "type": "boolean",
+            "title": "Is Selected"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "warehouse_id",
+          "warehouse_ref1c",
+          "warehouse_code",
+          "warehouse_name",
+          "is_selected"
+        ],
+        "title": "StockWarehouseResponse"
+      },
       "SyncAutoConfigPayload": {
         "properties": {
           "jobs": {
@@ -16865,19 +18861,6 @@
           "truth_status"
         ],
         "title": "TruthMeta"
-      },
-      "UpdateQuantityPayload": {
-        "properties": {
-          "quantity": {
-            "type": "number",
-            "title": "Quantity"
-          }
-        },
-        "type": "object",
-        "required": [
-          "quantity"
-        ],
-        "title": "UpdateQuantityPayload"
       },
       "ValidationError": {
         "properties": {
