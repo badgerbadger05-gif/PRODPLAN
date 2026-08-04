@@ -2268,36 +2268,3 @@ input:focus, select:focus {
   background: rgba(199,167,96,.18);
   color: #fff;
 }
-
-.deploymentContourBanner {
-  position: fixed;
-  z-index: 50;
-  right: 12px;
-  bottom: 8px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-height: 32px;
-  padding: 5px 8px 5px 11px;
-  border: 2px solid #7a3d00;
-  background: #ffd36a;
-  color: #3b2100;
-  box-shadow: 0 3px 12px rgba(0, 0, 0, .38);
-}
-
-.deploymentContourBanner strong {
-  letter-spacing: .06em;
-}
-
-.deploymentContourBanner span {
-  padding-left: 9px;
-  border-left: 1px solid rgba(59, 33, 0, .35);
-}
-
-.deploymentContourBanner a {
-  border: 1px solid #543000;
-  background: #fff8e3;
-  color: #4d2900;
-  padding: 3px 8px;
-  font-weight: 700;
-}

@@ -5,7 +5,6 @@ import { KeyboardShortcutShell, type KeyboardShortcut } from './platform'
 import { frontendResources } from './resourceRegistry'
 import { canAccessResource } from './resourceRegistry'
 import { LoginPage, useSession } from './session'
-import { DeploymentContourBanner } from './DeploymentContourBanner'
 
 const HomePage = lazy(() => import('./pages/HomePage').then((module) => ({ default: module.HomePage })))
 const LedgerWorkspaceRoute = lazy(() => import('./pages/LedgerWorkspacePage').then((module) => ({ default: module.LedgerWorkspaceRoute })))
@@ -51,7 +50,6 @@ export function App() {
 
   return (
     <div className="app">
-      <DeploymentContourBanner />
       <KeyboardShortcutShell shortcuts={navigationShortcuts} />
       <aside className="nav">
         <div className="brand">
