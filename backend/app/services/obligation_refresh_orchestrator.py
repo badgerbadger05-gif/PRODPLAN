@@ -242,9 +242,13 @@ def _publish_retained_mrp_snapshots(
     db: Session,
     generation_id: int,
     retained_run_ids: Iterable[int],
+    *,
+    allow_stale_truth: bool = False,
 ) -> None:
     for run_id in sorted({int(value) for value in retained_run_ids}):
-        build_mrp_result_snapshot(db, run_id)
+        build_mrp_result_snapshot(
+            db, run_id, allow_stale_truth=bool(allow_stale_truth)
+        )
 
 
 def _retry_published(
@@ -253,6 +257,7 @@ def _retry_published(
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
+    allow_stale_parent: bool = False,
 ) -> ObligationRefreshOrchestrationResult:
     _manifest_request_matches(
         target, add_plan_ids=add_plan_ids, retire_plan_ids=retire_plan_ids,
@@ -279,7 +284,12 @@ def _retry_published(
         if isinstance(manifest, dict)
         else []
     )
-    _publish_retained_mrp_snapshots(db, int(target.id), retained_ids)
+    _publish_retained_mrp_snapshots(
+        db,
+        int(target.id),
+        retained_ids,
+        allow_stale_truth=bool(allow_stale_parent),
+    )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
@@ -371,6 +381,7 @@ def run_obligation_refresh(
             add_plan_ids=add_ids, retire_plan_ids=retire_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
             planning_pool_by_warehouse=pool_mapping,
+            allow_stale_parent=bool(allow_stale_parent),
         )
     if existing is not None and str(existing.status) != "building":
         raise ObligationRefreshOrchestratorError("generation_key exists in non-retryable state")
@@ -548,7 +559,12 @@ def run_obligation_refresh(
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
     )
     _publish_execution_snapshots(db, target_id)
-    _publish_retained_mrp_snapshots(db, target_id, retained_run_ids)
+    _publish_retained_mrp_snapshots(
+        db,
+        target_id,
+        retained_run_ids,
+        allow_stale_truth=bool(allow_stale_parent),
+    )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,

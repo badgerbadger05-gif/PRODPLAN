@@ -474,7 +474,12 @@ def build_mrp_result_candidate_snapshot(
     return snapshot
 
 
-def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSnapshot:
+def build_mrp_result_snapshot(
+    db: Session,
+    run_id: int,
+    *,
+    allow_stale_truth: bool = False,
+) -> models.PlanningReadSnapshot:
     """Build and publish one immutable result snapshot for a fixed run.
 
     The run must already be bound to the currently accepted Ledger generation.
@@ -482,7 +487,10 @@ def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSn
     fields are consulted here.
     """
     truth = require_accepted_truth(
-        db, CONSUMER, required_capabilities=REQUIRED_CAPABILITIES
+        db,
+        CONSUMER,
+        required_capabilities=REQUIRED_CAPABILITIES,
+        allow_stale=bool(allow_stale_truth),
     )
     run = db.get(models.PlanningRun, int(run_id))
     if run is None:

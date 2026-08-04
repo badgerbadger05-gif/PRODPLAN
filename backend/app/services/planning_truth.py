@@ -231,10 +231,15 @@ def require_accepted_truth(
     db: Session,
     consumer: str,
     required_capabilities: Iterable[str] = (),
+    *,
+    allow_stale: bool = False,
 ) -> PlanningTruthReadiness:
     """Fail closed for a named report, planner, DBR or mutation consumer."""
     readiness = get_truth_state(db)
-    if not readiness.ready:
+    stale_but_explicitly_allowed = (
+        bool(allow_stale) and str(readiness.truth_status) == "stale"
+    )
+    if not readiness.ready and not stale_but_explicitly_allowed:
         raise PlanningTruthUnavailable(readiness, consumer=consumer)
     missing = sorted({
         str(capability)

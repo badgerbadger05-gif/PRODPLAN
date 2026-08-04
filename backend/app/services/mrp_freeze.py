@@ -845,25 +845,17 @@ def freeze_candidate_snapshots(
         raise LedgerPoolUnavailable("candidate freeze requires candidate run ids")
     try:
         readiness = require_accepted_truth(
-            db, consumer="mrp_freeze.candidate", required_capabilities=MRP_REQUIRED_CAPABILITIES
+            db,
+            consumer="mrp_freeze.candidate",
+            required_capabilities=MRP_REQUIRED_CAPABILITIES,
+            allow_stale=bool(allow_stale_parent),
         )
     except PlanningTruthUnavailable as exc:
-        stale_replay_parent = (
-            bool(allow_stale_parent)
-            and str(getattr(exc.readiness, "truth_status", "")) == "stale"
-            and int(getattr(exc.readiness, "ledger_generation", 0) or 0) == parent_id
-            and all(
-                bool(getattr(exc.readiness, "capabilities", {}).get(capability))
-                for capability in MRP_REQUIRED_CAPABILITIES
-            )
-        )
-        if not stale_replay_parent:
-            reason = getattr(exc.readiness, "reason", None) or str(exc)
-            raise LedgerPoolUnavailable(
-                "candidate freeze parent is not the current accepted Ledger generation: "
-                f"{reason}"
-            ) from exc
-        readiness = exc.readiness
+        reason = getattr(exc.readiness, "reason", None) or str(exc)
+        raise LedgerPoolUnavailable(
+            "candidate freeze parent is not the current accepted Ledger generation: "
+            f"{reason}"
+        ) from exc
     if int(readiness.ledger_generation or 0) != parent_id:
         raise LedgerPoolUnavailable("candidate freeze parent is not the current accepted Ledger generation")
 
@@ -1208,23 +1200,13 @@ def freeze_candidate_snapshots(
     )
     try:
         readiness = require_accepted_truth(
-            db, "candidate freeze", required_capabilities=MRP_REQUIRED_CAPABILITIES
+            db,
+            "candidate freeze",
+            required_capabilities=MRP_REQUIRED_CAPABILITIES,
+            allow_stale=bool(allow_stale_parent),
         )
     except PlanningTruthUnavailable as exc:
-        stale_replay_parent = (
-            bool(allow_stale_parent)
-            and str(getattr(exc.readiness, "truth_status", "")) == "stale"
-            and int(getattr(exc.readiness, "ledger_generation", 0) or 0) == parent_id
-            and all(
-                bool(getattr(exc.readiness, "capabilities", {}).get(capability))
-                for capability in MRP_REQUIRED_CAPABILITIES
-            )
-        )
-        if not stale_replay_parent:
-            raise LedgerPoolUnavailable(
-                "accepted Ledger pointer changed during candidate freeze"
-            ) from exc
-        readiness = exc.readiness
+        raise LedgerPoolUnavailable("accepted Ledger pointer changed during candidate freeze") from exc
     if int(readiness.generation_id or 0) != parent_id:
         raise LedgerPoolUnavailable("accepted Ledger pointer changed during candidate freeze")
     # The refresh coordinator owns the outer atomic transaction: this executor
