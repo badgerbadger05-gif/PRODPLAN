@@ -111,6 +111,13 @@ def test_registry_covers_employees_warehouses_and_groups():
     assert orch._ORDER_INDEX["nomenclatureGroups"] == orch._ORDER_INDEX["nomenclature"] + 1
 
 
+def test_specification_rebase_is_enabled_hourly_by_default():
+    job = next(job for job in orch.SYNC_JOBS if job.id == "specificationRebase")
+
+    assert job.default_interval_s == 3_600
+    assert orch._is_enabled({}, job.id) is True
+
+
 def test_status_reports_all_jobs(tmp_state, monkeypatch):
     monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
     snap = orch.status()

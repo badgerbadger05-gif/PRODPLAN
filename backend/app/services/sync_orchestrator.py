@@ -159,8 +159,9 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("brigades", "Бригады", 86_400, _single("Catalog_Бригады", sync_employees_from_odata)),
     SyncJob("operations", "Операции", 43_200, _single("Catalog_Спецификации_Операции", sync_operations_from_odata)),
     SyncJob("specifications", "Спецификации", 43_200, _single("Catalog_Спецификации", sync_specifications_from_odata)),
-    # Sync always fills the durable queue. The heavy consumer stays disabled
-    # until the first shadow benchmark establishes a safe interval/window.
+    # Sync always fills the durable queue.  The shadow benchmark completed in
+    # about 11 minutes, so the consumer safely drains one affected MRP per hour
+    # without overlapping itself (the orchestrator runs only one job at a time).
     SyncJob(
         "specificationRebase",
         "Пересчёт MRP по изменённым спецификациям",
@@ -275,7 +276,7 @@ def _interval_for(state: Dict[str, Any], job: SyncJob) -> int:
 def _is_enabled(state: Dict[str, Any], job_id: str) -> bool:
     val = _job_state(state, job_id).get("enabled")
     if val is None:
-        return job_id != "specificationRebase"
+        return True
     return bool(val)
 
 
