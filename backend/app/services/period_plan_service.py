@@ -1003,6 +1003,7 @@ def create_mrp_snapshot_from_period_plan(
     *,
     generation_key: str,
     started_by: Optional[str] = None,
+    allow_stale_parent: bool = False,
 ) -> Dict[str, Any]:
     """Publish this fixed plan through the atomic Ledger obligation refresh.
 
@@ -1074,6 +1075,7 @@ def create_mrp_snapshot_from_period_plan(
         horizon_days=max(1, (plan.period_to - plan.period_from).days + 1),
         config_version_id=cfg_id,
         config_snapshot=dict(cfg),
+        allow_stale_parent=bool(allow_stale_parent),
     )
     run = db.query(PlanningRun).filter(
         PlanningRun.run_id.in_(report.candidate_run_ids),

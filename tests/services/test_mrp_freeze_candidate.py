@@ -751,6 +751,24 @@ def test_candidate_freeze_rejects_stale_truth(db_session, monkeypatch):
         )
 
 
+def test_candidate_freeze_allows_stale_current_parent_only_for_historical_replay(
+    db_session, monkeypatch
+):
+    accepted, target, _item, _parents, candidates, _lines = _candidate_world(db_session)
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "1")
+
+    report = freeze_candidate_snapshots(
+        db_session,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[row.run_id for row in candidates],
+        allow_stale_parent=True,
+    )
+
+    assert report["order"] == [row.run_id for row in candidates]
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
+
+
 def test_candidate_freeze_rejects_missing_required_capabilities(db_session):
     accepted, target, item, _parents, candidates, _lines = _candidate_world(db_session)
     accepted.capabilities = {"physical_ledger": True}

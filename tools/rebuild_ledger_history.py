@@ -861,7 +861,11 @@ class DatabaseRuntime:
         from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
 
         result = create_mrp_snapshot_from_period_plan(
-            self.db, plan_id, generation_key=key, started_by="historical-replay-cli"
+            self.db,
+            plan_id,
+            generation_key=key,
+            started_by="historical-replay-cli",
+            allow_stale_parent=True,
         )
         if not result.get("published") and not result.get("immutable"):
             raise ReplayError(f"obligation refresh {key!r} was not published")

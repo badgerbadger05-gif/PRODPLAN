@@ -300,6 +300,7 @@ def run_obligation_refresh(
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
     explicit_make_transfer_recorders: set[str] | None = None,
     accepted_at: datetime | None = None,
+    allow_stale_parent: bool = False,
 ) -> ObligationRefreshOrchestrationResult:
     """Build and atomically publish every refresh/add candidate.
 
@@ -445,6 +446,7 @@ def run_obligation_refresh(
         freeze_candidate_snapshots(
             db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
             candidate_run_ids=candidate_ids,
+            allow_stale_parent=bool(allow_stale_parent),
         )
         if candidate_ids
         else {
