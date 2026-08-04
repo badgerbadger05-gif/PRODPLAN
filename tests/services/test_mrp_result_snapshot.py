@@ -215,6 +215,30 @@ def test_candidate_builder_persists_unpublished_rows_but_current_reads_cannot_se
     assert stored.payload["item_id"] == item.item_id
 
 
+def test_candidate_builder_accepts_successor_run_lineage(db_session):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    predecessor = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=accepted.id,
+        ledger_cutoff=accepted.cutoff,
+        active_freeze_version=1,
+    )
+    db_session.add(predecessor)
+    db_session.flush()
+    run, _item = _candidate_purchase_run(db_session, candidate_generation)
+    plan = db_session.get(models.ProductionPlanHeader, int(run.source_plan_id))
+    plan.predecessor_run_id = int(predecessor.run_id)
+    run.prior_run_id = int(predecessor.run_id)
+    _seal_candidate_manifest(candidate_generation, run)
+
+    snapshot = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+    assert snapshot.truth_status == "building"
+    assert run.prior_run_id == plan.predecessor_run_id == predecessor.run_id
+
+
 def test_candidate_builder_is_idempotent_and_rejects_changed_persisted_snapshot(db_session):
     accepted = _accepted_generation(db_session)
     candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)

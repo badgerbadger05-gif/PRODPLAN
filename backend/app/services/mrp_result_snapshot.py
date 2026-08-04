@@ -359,12 +359,13 @@ def _require_sealed_candidate_manifest(
             or int(candidate.source_plan_id or -1) != plan_id
         ):
             raise ValueError("candidate snapshot manifest candidate lineage conflicts")
-        if entry.get("parent_run_id") is not None or candidate.prior_run_id is not None:
-            raise ValueError("candidate snapshot add entry must not have a parent run")
+        if entry.get("parent_run_id") is not None:
+            raise ValueError("candidate snapshot add entry must not claim a parent run")
         plan = db.get(models.ProductionPlanHeader, plan_id)
         if (
             plan is None
             or str(plan.status or "") != "fixed"
+            or candidate.prior_run_id != plan.predecessor_run_id
             or candidate.period_from != plan.period_from
             or candidate.period_to != plan.period_to
         ):
