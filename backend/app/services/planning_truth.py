@@ -384,6 +384,7 @@ def publish_read_snapshot(
     required_capabilities: Iterable[str] = (),
     reason: str | None = None,
     published_at: datetime | None = None,
+    allow_stale: bool = False,
 ) -> models.PlanningReadSnapshot:
     """Atomically publish an immutable read payload for current accepted truth.
 
@@ -395,6 +396,7 @@ def publish_read_snapshot(
         db,
         consumer,
         required_capabilities=required_capabilities,
+        allow_stale=bool(allow_stale),
     )
     existing = db.execute(
         select(models.PlanningReadSnapshot).where(

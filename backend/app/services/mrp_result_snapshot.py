@@ -544,6 +544,7 @@ def build_mrp_result_snapshot(
             snapshot_key=_snapshot_key(run_id),
             payload=manifest,
             required_capabilities=REQUIRED_CAPABILITIES,
+            allow_stale=bool(allow_stale_truth),
         )
 
         persisted: list[tuple[models.PlanningReadRow, int | None]] = []
