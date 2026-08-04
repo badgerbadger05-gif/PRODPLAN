@@ -440,12 +440,14 @@ def get_latest_read_snapshot(
     consumer: str,
     snapshot_key: str | None = None,
     required_capabilities: Iterable[str] = (),
+    allow_stale: bool = False,
 ) -> models.PlanningReadSnapshot | None:
     """Read the latest snapshot only for the current accepted truth lineage."""
     truth = require_accepted_truth(
         db,
         consumer,
         required_capabilities=required_capabilities,
+        allow_stale=bool(allow_stale),
     )
     query = select(models.PlanningReadSnapshot).where(
             models.PlanningReadSnapshot.consumer == consumer,

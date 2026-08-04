@@ -508,6 +508,7 @@ def build_mrp_result_snapshot(
         consumer=CONSUMER,
         snapshot_key=_snapshot_key(run_id),
         required_capabilities=REQUIRED_CAPABILITIES,
+        allow_stale=bool(allow_stale_truth),
     )
     if existing is not None:
         return existing
