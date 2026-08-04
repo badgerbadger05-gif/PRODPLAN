@@ -11,6 +11,7 @@ from ..models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    MrpFreezeComponent,
     PaintWeldChainLink,
     PlannedOrder,
     PlanningRun,
@@ -535,7 +536,9 @@ def materialize_make_work_items(
         )
         planned_start = min((task.start_date for task in planned_tasks if task.start_date), default=req.period_from)
         planned_finish = max((task.finish_date or task.need_date for task in planned_tasks if task.finish_date or task.need_date), default=req.period_to)
-        spec_id = _default_spec_id_for_item(db, int(req.item_id))
+        spec_id, spec_revision_hash = _frozen_spec_identity_for_requirement(
+            db, req
+        )
 
         shelf = shelf_by_item.get(int(req.item_id))
         launch_source = LAUNCH_SOURCE_MRP
@@ -588,6 +591,9 @@ def materialize_make_work_items(
                 produced_qty=0,
                 remaining_qty=qty,
                 spec_id=spec_id,
+                spec_revision_hash=(
+                    str(spec_revision_hash) if spec_revision_hash else None
+                ),
                 source_mrp_requirement_id=rid,
                 source_mrp_allocation_key=f"mrp_requirement:{rid}:order:{seq}",
                 ledger_generation_id=generation_id,
@@ -659,6 +665,56 @@ def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:
         .first()
     )
     return int(row.spec_id) if row else None
+
+
+def _frozen_spec_identity_for_requirement(
+    db: Session,
+    requirement: MrpRequirement,
+) -> tuple[Optional[int], Optional[str]]:
+    """Resolve the exact revision frozen for an MRP-backed order line.
+
+    A logical 1C specification ref can now point at newer content. Creating an
+    executor from an older frozen MRP would silently use that newer content in
+    1C, so a known hash mismatch fails closed until successor-MRP is published.
+    """
+    spec_id = _default_spec_id_for_item(db, int(requirement.item_id))
+    if spec_id is None:
+        return None, None
+    spec = db.get(Specification, int(spec_id))
+    if spec is None:
+        return spec_id, None
+    run = db.get(PlanningRun, int(requirement.run_id))
+    if run is None or run.active_freeze_version is None:
+        return spec_id, str(spec.content_hash) if spec.content_hash else None
+    spec_ref = str(spec.spec_ref1c or "").strip()
+    if not spec_ref:
+        return spec_id, str(spec.content_hash) if spec.content_hash else None
+    versions = {
+        str(version)
+        for (version,) in db.query(MrpFreezeComponent.spec_version)
+        .filter(
+            MrpFreezeComponent.run_id == int(run.run_id),
+            MrpFreezeComponent.freeze_version
+            == int(run.active_freeze_version),
+            MrpFreezeComponent.parent_item_id == int(requirement.item_id),
+            MrpFreezeComponent.spec_ref == spec_ref,
+            MrpFreezeComponent.spec_version.isnot(None),
+        )
+        .distinct()
+        .all()
+    }
+    if len(versions) > 1:
+        raise MrpMutationLineageError(
+            f"requirement_id={int(requirement.id)}: frozen specification revision is ambiguous"
+        )
+    frozen_hash = next(iter(versions), None)
+    current_hash = str(spec.content_hash) if spec.content_hash else None
+    if frozen_hash and current_hash and frozen_hash != current_hash:
+        raise MrpMutationLineageError(
+            f"requirement_id={int(requirement.id)}: specification changed; "
+            "successor-MRP must be published before creating new orders"
+        )
+    return spec_id, frozen_hash or current_hash
 
 
 def _available_actions_for_journal_row(
@@ -1108,6 +1164,11 @@ def list_journal(
                 "stage_id": stage_id,
                 "stage_name": stage_name,
                 "spec_id": spec_id,
+                "spec_revision_hash": (
+                    str(product.spec_revision_hash)
+                    if product.spec_revision_hash
+                    else None
+                ),
                 "issue_count": int(issue_count),
                 "route_sheet_printed_at": _date_to_iso(state.route_sheet_printed_at) if state else None,
                 "comment": str(state.comment or "") if state else "",

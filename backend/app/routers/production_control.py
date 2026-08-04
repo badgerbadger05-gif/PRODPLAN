@@ -731,6 +731,7 @@ class ProductionOrderJournalRowResponse(BaseModel):
     stage_id: Optional[int] = None
     stage_name: Optional[str] = None
     spec_id: Optional[int] = None
+    spec_revision_hash: Optional[str] = None
     issue_count: int
     route_sheet_printed_at: Optional[str] = None
     comment: str
@@ -1208,7 +1209,7 @@ def post_export_material_issues_to_1c(
 ):
     """
     Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов
-    (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
+    (Posted=false). Идемпотентно через sync_link.
 
     - `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.
     - `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.

@@ -522,7 +522,7 @@ def sync_production_kinds_odata(payload: ODataSyncRequest, db: Session = Depends
 def sync_auto_tick(db: Session = Depends(get_db)):
     """
     Выполнить не более одного «просроченного» job автоматической синхронизации.
-    Вызывается воркером каждые ~2 минуты: один job за тик → нагрузка на 1С
+    Вызывается воркером каждые ~2 минуты: один job за тик, поэтому нагрузка на 1С
     размазана по времени, без пиков и параллельных запусков. Read-only к 1С.
     """
     try:

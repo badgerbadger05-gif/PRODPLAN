@@ -38,6 +38,7 @@ from .nomenclature_sync import sync_nomenclature_from_odata
 from .category_sync import sync_categories_from_odata
 from .units_sync import UNIT_CLASSIFIER_ENTITY, sync_units_from_odata, backfill_units_from_items
 from .specification_sync import sync_specifications_from_odata
+from .specification_rebase_worker import run_one_pending_specification_rebase
 from .default_specification_sync import sync_default_specifications_from_odata
 from .production_stage_sync import sync_production_stages_from_odata
 from .production_kind_sync import sync_production_kinds_from_odata
@@ -132,6 +133,13 @@ def _single(entity: str, service: Callable[[Session, ODataSyncRequest], Any]) ->
     return runner
 
 
+def _run_specification_rebase(db: Session, _config: Dict[str, Any]) -> Any:
+    return run_one_pending_specification_rebase(
+        db,
+        started_by="sync_orchestrator:specification_rebase",
+    )
+
+
 @dataclass(frozen=True)
 class SyncJob:
     id: str
@@ -151,6 +159,14 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("brigades", "Бригады", 86_400, _single("Catalog_Бригады", sync_employees_from_odata)),
     SyncJob("operations", "Операции", 43_200, _single("Catalog_Спецификации_Операции", sync_operations_from_odata)),
     SyncJob("specifications", "Спецификации", 43_200, _single("Catalog_Спецификации", sync_specifications_from_odata)),
+    # Sync always fills the durable queue. The heavy consumer stays disabled
+    # until the first shadow benchmark establishes a safe interval/window.
+    SyncJob(
+        "specificationRebase",
+        "Пересчёт MRP по изменённым спецификациям",
+        3_600,
+        _run_specification_rebase,
+    ),
     SyncJob("defaultSpecifications", "Спецификации по умолчанию", 43_200, _single("InformationRegister_СпецификацииПоУмолчанию", sync_default_specifications_from_odata)),
     SyncJob("productionStages", "Этапы производства", 86_400, _single("Catalog_ЭтапыПроизводства", sync_production_stages_from_odata)),
     SyncJob("warehouses", "Склады", 86_400, _single("AccumulationRegister_ЗапасыНаСкладах", sync_stock_warehouses_from_odata)),
@@ -258,7 +274,9 @@ def _interval_for(state: Dict[str, Any], job: SyncJob) -> int:
 
 def _is_enabled(state: Dict[str, Any], job_id: str) -> bool:
     val = _job_state(state, job_id).get("enabled")
-    return True if val is None else bool(val)
+    if val is None:
+        return job_id != "specificationRebase"
+    return bool(val)
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:

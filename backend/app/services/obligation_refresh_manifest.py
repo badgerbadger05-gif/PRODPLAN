@@ -227,12 +227,14 @@ def _existing_result(
                 "target refresh manifest candidate identity is malformed"
             ) from exc
         candidate = db.get(models.PlanningRun, candidate_id)
+        source_plan = db.get(models.ProductionPlanHeader, plan_id)
         if (
             candidate is None
+            or source_plan is None
             or str(candidate.status) != "BUILDING_SNAPSHOT"
             or int(candidate.ledger_generation_id or -1) != int(target.id)
             or int(candidate.source_plan_id or -1) != plan_id
-            or candidate.prior_run_id is not None
+            or candidate.prior_run_id != source_plan.predecessor_run_id
         ):
             raise ObligationRefreshManifestError(
                 "target refresh manifest candidate lineage conflicts"

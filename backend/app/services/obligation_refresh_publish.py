@@ -147,6 +147,7 @@ def _require_manifest(
     additions: list[models.PlanningRun] = []
     retained: list[models.PlanningRun] = []
     retired: list[models.PlanningRun] = []
+    successor_predecessor_ids: set[int] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             raise ObligationRefreshPublishError("obligation_refresh_manifest entry is malformed")
@@ -221,13 +222,24 @@ def _require_manifest(
             raise ObligationRefreshPublishError("obligation_refresh_manifest has missing or extra candidates")
         declared_candidate_ids.add(candidate_id)
 
-        if entry.get("parent_run_id") is not None or candidate.prior_run_id is not None:
-            raise ObligationRefreshPublishError("add candidate must not have a parent run")
+        if entry.get("parent_run_id") is not None:
+            raise ObligationRefreshPublishError("add manifest must not claim a current parent run")
         if plan_id in parent_by_plan:
             raise ObligationRefreshPublishError("add manifest repeats a current parent plan")
         plan = db.get(models.ProductionPlanHeader, plan_id)
         if plan is None or str(plan.status) != "fixed":
             raise ObligationRefreshPublishError("add manifest plan must be fixed")
+        if candidate.prior_run_id != plan.predecessor_run_id:
+            raise ObligationRefreshPublishError(
+                "add candidate predecessor conflicts with source plan lineage"
+            )
+        if plan.predecessor_run_id is not None:
+            predecessor = parent_by_id.get(int(plan.predecessor_run_id))
+            if predecessor is None:
+                raise ObligationRefreshPublishError(
+                    "successor candidate predecessor is not a current parent"
+                )
+            successor_predecessor_ids.add(int(predecessor.run_id))
         if candidate.period_from != plan.period_from or candidate.period_to != plan.period_to:
             raise ObligationRefreshPublishError("add candidate period conflicts with fixed plan")
         if candidate_status == "BUILDING_SNAPSHOT":
@@ -245,6 +257,11 @@ def _require_manifest(
     covered_parent_ids = {
         int(parent.run_id) for parent in [*retained, *retired]
     }
+    retired_ids = {int(parent.run_id) for parent in retired}
+    if not successor_predecessor_ids.issubset(retired_ids):
+        raise ObligationRefreshPublishError(
+            "successor candidate predecessor must be retired in the same build"
+        )
     if covered_parent_ids != set(parent_by_id):
         raise ObligationRefreshPublishError("obligation_refresh_manifest omits or adds refresh parents")
 
@@ -920,6 +937,8 @@ def publish_obligation_refresh_batch(
         retired_run.status = "CLOSED"
         retired_run.finished_at = accepted_at
         plan.status = "closed"
+        if plan.closed_at is None:
+            plan.closed_at = accepted_at
 
     target.status = "accepted"
     target.accepted_at = accepted_at

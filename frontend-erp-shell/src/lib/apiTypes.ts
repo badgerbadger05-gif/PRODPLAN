@@ -400,7 +400,7 @@ export interface paths {
         /**
          * Sync Auto Tick
          * @description Выполнить не более одного «просроченного» job автоматической синхронизации.
-         *     Вызывается воркером каждые ~2 минуты: один job за тик → нагрузка на 1С
+         *     Вызывается воркером каждые ~2 минуты: один job за тик, поэтому нагрузка на 1С
          *     размазана по времени, без пиков и параллельных запусков. Read-only к 1С.
          */
         post: operations["sync_auto_tick_api_v1_sync_auto_tick_post"];
@@ -1271,13 +1271,53 @@ export interface paths {
         put?: never;
         /**
          * Close Mrp Run
-         * @description Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).
+         * @description Явно закрыть плановый прогон (FIXED_SNAPSHOT -> CLOSED).
          *
          *     Закрытие убирает активные резервы из рабочих очередей (release),
          *     требования и закупочные строки не перезаписывает. Доступно только для
          *     зафиксированных прогонах. Повторный вызов идемпотентен.
          */
         post: operations["close_mrp_run_api_v1_plan_mrp_run__run_id__close_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plan/mrp/run/{run_id}/rebase-specification": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebase Mrp Run For Specification
+         * @description Create a successor MRP only for the predecessor's unproduced roots.
+         */
+        post: operations["rebase_mrp_run_for_specification_api_v1_plan_mrp_run__run_id__rebase_specification_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plan/mrp/specification-rebase/run-pending": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Pending Specification Rebase
+         * @description Run/preview one durable automatic rebase item (benchmark entrypoint).
+         */
+        post: operations["run_pending_specification_rebase_api_v1_plan_mrp_specification_rebase_run_pending_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2230,7 +2270,7 @@ export interface paths {
         /**
          * Post Export Material Issues To 1C
          * @description Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов
-         *     (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
+         *     (Posted=false). Идемпотентно через sync_link.
          *
          *     - `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.
          *     - `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.
@@ -2586,7 +2626,7 @@ export interface paths {
         put?: never;
         /**
          * Chain Preview
-         * @description Предпросмотр цепочки «окраска → сварка» (dry-run, ничего не пишет).
+         * @description Предпросмотр цепочки «окраска - сварка» (dry-run, ничего не пишет).
          */
         post: operations["chain_preview_api_v1_paint_weld_chain_preview_post"];
         delete?: never;
@@ -2627,7 +2667,7 @@ export interface paths {
         put?: never;
         /**
          * Chain Close
-         * @description Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,
+         * @description Закрыть цепочку «окраска-сварка» одним действием: выпуски обеих строк,
          *     СборкаЗапасов обоих заказов и один комбинированный СдельныйНаряд, закрывающий
          *     оба заказа. dry_run=true — предпросмотр.
          *
@@ -4354,6 +4394,14 @@ export interface components {
             /** Counterpart Product Id */
             counterpart_product_id?: number | null;
         };
+        /** PendingSpecificationRebaseRequest */
+        PendingSpecificationRebaseRequest: {
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+        };
         /** PeriodPlanBulkUpsertRequest */
         PeriodPlanBulkUpsertRequest: {
             /**
@@ -4763,6 +4811,8 @@ export interface components {
             stage_name?: string | null;
             /** Spec Id */
             spec_id?: number | null;
+            /** Spec Revision Hash */
+            spec_revision_hash?: string | null;
             /** Issue Count */
             issue_count: number;
             /** Route Sheet Printed At */
@@ -5526,6 +5576,16 @@ export interface components {
             demand_manifest: {
                 [key: string]: unknown;
             }[];
+        };
+        /** SpecificationRebaseRequest */
+        SpecificationRebaseRequest: {
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+            /** Changed Spec Refs */
+            changed_spec_refs?: string[];
         };
         /** SpecificationSearchItemResponse */
         SpecificationSearchItemResponse: {
@@ -8081,6 +8141,74 @@ export interface operations {
         requestBody?: {
             content: {
                 "application/json": components["schemas"]["ReconcileRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rebase_mrp_run_for_specification_api_v1_plan_mrp_run__run_id__rebase_specification_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SpecificationRebaseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    run_pending_specification_rebase_api_v1_plan_mrp_specification_rebase_run_pending_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PendingSpecificationRebaseRequest"];
             };
         };
         responses: {

@@ -40,6 +40,9 @@ class SpecificationSyncStats:
     spec_operations_created: int = 0
     spec_operations_updated: int = 0
     spec_operations_deleted: int = 0
+    revisions_created: int = 0
+    rebase_requests_queued: int = 0
+    changed_spec_refs: List[str] | None = None
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
@@ -105,6 +108,27 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
 
         # Получаем существующие записи для сопоставления
         existing_specs = {spec.spec_ref1c: spec for spec in db.query(Specification).all() if spec.spec_ref1c}
+        # First deployment has no hashes yet. Snapshot the current local BOM
+        # before applying the incoming OData payload, otherwise the first real
+        # old->new transition would be mistaken for an initial baseline.
+        from .specification_revision import record_specification_revisions
+
+        missing_hash_ids = [
+            int(spec.spec_id)
+            for spec in existing_specs.values()
+            if not spec.content_hash
+        ]
+        baseline_stats = record_specification_revisions(
+            db,
+            missing_hash_ids,
+            previous_hash_by_id={spec_id: None for spec_id in missing_hash_ids},
+            source="local_baseline",
+        )
+        previous_hash_by_id = {
+            int(spec.spec_id): (str(spec.content_hash) if spec.content_hash else None)
+            for spec in existing_specs.values()
+        }
+        touched_spec_ids: set[int] = set()
         existing_operations = {op.operation_ref1c: op for op in db.query(Operation).all() if op.operation_ref1c}
         existing_production_kinds = {pk.ref_1c: pk for pk in db.query(ProductionKind).all() if pk.ref_1c}
 
@@ -208,6 +232,7 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 # Проверяем, что спецификация создана или найдена
                 if not current_spec:
                     continue
+                touched_spec_ids.add(int(current_spec.spec_id))
 
                 # Обрабатываем компоненты спецификации.
                 # Естественный ключ строки состава — тройка (spec_id, item_id, закреплённая спека),
@@ -395,6 +420,24 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.spec_operations_created = spec_operations_created
         stats.spec_operations_updated = spec_operations_updated
         stats.spec_operations_deleted = spec_operations_deleted
+
+        # Child reconciliation may use bulk DELETE, therefore flush before
+        # hashing the planning-significant content.  Sync automatically emits a
+        # durable request but never starts one heavy MRP per OData row.
+        db.flush()
+        revision_stats = record_specification_revisions(
+            db,
+            touched_spec_ids,
+            previous_hash_by_id=previous_hash_by_id,
+            source="odata",
+        )
+        stats.revisions_created = int(
+            baseline_stats["revisions_created"]
+        ) + int(revision_stats["revisions_created"])
+        stats.rebase_requests_queued = int(
+            revision_stats["rebase_requests_queued"]
+        )
+        stats.changed_spec_refs = list(revision_stats["changed_spec_refs"])
 
         if req.dry_run:
             db.rollback()

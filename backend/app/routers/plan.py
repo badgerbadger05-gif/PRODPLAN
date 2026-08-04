@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..database import get_db
 from ..services.stage_directory import fetch_stages
@@ -1507,13 +1507,22 @@ class ReconcileRequest(BaseModel):
     dry_run: bool = False
 
 
+class SpecificationRebaseRequest(BaseModel):
+    dry_run: bool = False
+    changed_spec_refs: List[str] = Field(default_factory=list)
+
+
+class PendingSpecificationRebaseRequest(BaseModel):
+    dry_run: bool = False
+
+
 @router.post("/mrp/run/{run_id}/close")
 async def close_mrp_run(
     run_id: int,
     req: ReconcileRequest = ReconcileRequest(),
     db: Session = Depends(get_db),
 ):
-    """Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).
+    """Явно закрыть плановый прогон (FIXED_SNAPSHOT -> CLOSED).
 
     Закрытие убирает активные резервы из рабочих очередей (release),
     требования и закупочные строки не перезаписывает. Доступно только для
@@ -1526,6 +1535,55 @@ async def close_mrp_run(
     except ValueError as e:
         detail = str(e)
         raise HTTPException(status_code=404 if "не найден" in detail else 400, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/mrp/run/{run_id}/rebase-specification")
+async def rebase_mrp_run_for_specification(
+    run_id: int,
+    req: SpecificationRebaseRequest = SpecificationRebaseRequest(),
+    db: Session = Depends(get_db),
+):
+    """Create a successor MRP only for the predecessor's unproduced roots."""
+    from ..services.specification_mrp_rebase import (
+        rebase_fixed_plan_remaining_roots,
+    )
+
+    try:
+        return rebase_fixed_plan_remaining_roots(
+            db,
+            int(run_id),
+            changed_spec_refs=req.changed_spec_refs,
+            started_by=f"api:specification_rebase:{int(run_id)}",
+            dry_run=bool(req.dry_run),
+        )
+    except ValueError as e:
+        detail = str(e)
+        raise HTTPException(
+            status_code=404 if "не найден" in detail else 400,
+            detail=detail,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/mrp/specification-rebase/run-pending")
+async def run_pending_specification_rebase(
+    req: PendingSpecificationRebaseRequest = PendingSpecificationRebaseRequest(),
+    db: Session = Depends(get_db),
+):
+    """Run/preview one durable automatic rebase item (benchmark entrypoint)."""
+    from ..services.specification_rebase_worker import (
+        run_one_pending_specification_rebase,
+    )
+
+    try:
+        return run_one_pending_specification_rebase(
+            db,
+            dry_run=bool(req.dry_run),
+            started_by="api:pending_specification_rebase",
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -199,7 +199,7 @@ def _matches_added_plan(
     """Match only an exact retry of a first-plan candidate."""
     return (
         str(candidate.status) == "BUILDING_SNAPSHOT"
-        and candidate.prior_run_id is None
+        and candidate.prior_run_id == plan.predecessor_run_id
         and candidate.source_plan_id == plan.id
         and candidate.period_from == plan.period_from
         and candidate.period_to == plan.period_to
@@ -261,7 +261,14 @@ def create_added_candidate_run(
 
     candidate = models.PlanningRun(
         status="BUILDING_SNAPSHOT",
-        prior_run_id=None,
+        # A first MRP run for a successor production plan is still an ``add``
+        # to the live set, but it retains immutable historical lineage to the
+        # run whose remaining roots it inherited.
+        prior_run_id=(
+            int(plan.predecessor_run_id)
+            if plan.predecessor_run_id is not None
+            else None
+        ),
         ledger_generation_id=int(target.id),
         source_plan_id=int(plan.id),
         period_from=plan.period_from,

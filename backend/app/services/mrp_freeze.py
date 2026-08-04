@@ -655,10 +655,17 @@ def _write_freeze_component(
         agg[key] = agg.get(key, 0.0) + float(norm)
         spec_ids.add(int(spec_id))
 
-    spec_ref_by_id = {
-        int(sid): (str(ref) if ref else None)
-        for sid, ref in (
-            db.query(Specification.spec_id, Specification.spec_ref1c)
+    spec_by_id = {
+        int(sid): (
+            str(ref) if ref else None,
+            str(content_hash) if content_hash else None,
+        )
+        for sid, ref, content_hash in (
+            db.query(
+                Specification.spec_id,
+                Specification.spec_ref1c,
+                Specification.content_hash,
+            )
             .filter(Specification.spec_id.in_(list(spec_ids)))
             .all()
         )
@@ -667,7 +674,8 @@ def _write_freeze_component(
     for (parent, component, spec_id), norm in sorted(agg.items()):
         ppk = pool_key_for(parent)
         cpk = pool_key_for(component)
-        spec_ref = spec_ref_by_id.get(int(spec_id)) or str(spec_id)
+        spec_ref, spec_version = spec_by_id.get(int(spec_id), (None, None))
+        spec_ref = spec_ref or str(spec_id)
         db.add(
             MrpFreezeComponent(
                 run_id=int(run.run_id),
@@ -681,7 +689,7 @@ def _write_freeze_component(
                 component_organization_ref=cpk.organization_ref,
                 component_planning_stock_pool=cpk.planning_stock_pool,
                 spec_ref=str(spec_ref),
-                spec_version=None,
+                spec_version=spec_version,
                 norm_qty_per_unit=float(norm),
                 unit_coef=1.0,
                 created_at=now,
@@ -944,11 +952,15 @@ def freeze_candidate_snapshots(
         entry = manifest_entries[int(run.run_id)]
         if int(run.source_plan_id or -1) != int(entry["plan_id"]):
             raise LedgerPoolUnavailable("candidate freeze source plan conflicts with sealed manifest")
-        if entry.get("parent_run_id") is not None or run.prior_run_id is not None:
-            raise LedgerPoolUnavailable("candidate freeze add candidate must not have a parent run")
+        if entry.get("parent_run_id") is not None:
+            raise LedgerPoolUnavailable("candidate freeze add entry must not claim a current parent")
         plan = db.get(ProductionPlanHeader, int(run.source_plan_id))
         if plan is None or str(plan.status) != "fixed":
             raise LedgerPoolUnavailable("candidate freeze add plan must be fixed")
+        if run.prior_run_id != plan.predecessor_run_id:
+            raise LedgerPoolUnavailable(
+                "candidate freeze predecessor conflicts with source plan lineage"
+            )
         if run.period_from != plan.period_from or run.period_to != plan.period_to:
             raise LedgerPoolUnavailable("candidate freeze add candidate period conflicts with fixed plan")
         if (

@@ -112,6 +112,7 @@ BEGIN
                   ('planning_truth_state', 'current_generation_id', 'ledger_generation'),
                   ('production_material_issues', 'ledger_generation_id', 'ledger_generation'),
                   ('production_orders', 'source_run_id', 'planning_run'),
+                  ('production_plan_header', 'predecessor_run_id', 'planning_run'),
                   ('production_plan_line', 'locked_by_run_id', 'planning_run'),
                   ('production_products', 'ledger_generation_id', 'ledger_generation'),
                   ('production_products', 'source_mrp_requirement_id', 'mrp_requirement'),
@@ -150,6 +151,13 @@ $detach_rebuildable_fks$;
 UPDATE production_orders
 SET source_run_id = NULL
 WHERE source_run_id IS NOT NULL;
+
+-- The plan-to-plan lineage remains in predecessor_plan_id and the immutable
+-- lineage_context. A rebuild truncates planning_run, so its optional shortcut
+-- must be detached before the fail-closed TRUNCATE.
+UPDATE production_plan_header
+SET predecessor_run_id = NULL
+WHERE predecessor_run_id IS NOT NULL;
 
 UPDATE production_plan_line
 SET locked_by_run_id = NULL
@@ -241,6 +249,11 @@ ALTER TABLE production_orders
     FOREIGN KEY (source_run_id)
     REFERENCES planning_run(run_id)
     ON DELETE SET NULL;
+ALTER TABLE production_plan_header
+    ADD CONSTRAINT fk_production_plan_header_predecessor_run
+    FOREIGN KEY (predecessor_run_id)
+    REFERENCES planning_run(run_id)
+    ON DELETE RESTRICT;
 ALTER TABLE production_plan_line
     ADD CONSTRAINT production_plan_line_locked_by_run_id_fkey
     FOREIGN KEY (locked_by_run_id)

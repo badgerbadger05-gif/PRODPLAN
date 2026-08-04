@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import app.services.odata_client as odata_client_module
-from app.models import Item, SpecComponent
+from app.models import Item, SpecComponent, SpecificationRebaseQueue
 from app.schemas import ODataSyncRequest
 from app.services import specification_sync
 from app.services.specification_sync import _norm_component_spec_ref
@@ -121,3 +121,24 @@ def test_reconcile_keys_by_item_and_child_spec(db_session, monkeypatch):
     rows = db_session.query(SpecComponent).all()
     assert len(rows) == 1
     assert rows[0].component_spec_ref1c == "spec-x"
+
+
+def test_second_sync_change_enqueues_automatic_rebase(db_session, monkeypatch):
+    _add_item(db_session, "nom-a")
+    _patch_client(
+        monkeypatch,
+        [_spec_record([_comp("c1", "nom-a", 1, "", type_="Материал")])],
+    )
+    first = specification_sync.sync_specifications_from_odata(db_session, _req())
+    assert first["rebase_requests_queued"] == 0
+
+    _patch_client(
+        monkeypatch,
+        [_spec_record([_comp("c1", "nom-a", 2, "", type_="Материал")])],
+    )
+    second = specification_sync.sync_specifications_from_odata(db_session, _req())
+
+    assert second["rebase_requests_queued"] == 1
+    queued = db_session.query(SpecificationRebaseQueue).one()
+    assert queued.status == "pending"
+    assert queued.old_content_hash != queued.new_content_hash

@@ -1022,7 +1022,7 @@
           "sync"
         ],
         "summary": "Sync Auto Tick",
-        "description": "Выполнить не более одного «просроченного» job автоматической синхронизации.\nВызывается воркером каждые ~2 минуты: один job за тик → нагрузка на 1С\nразмазана по времени, без пиков и параллельных запусков. Read-only к 1С.",
+        "description": "Выполнить не более одного «просроченного» job автоматической синхронизации.\nВызывается воркером каждые ~2 минуты: один job за тик, поэтому нагрузка на 1С\nразмазана по времени, без пиков и параллельных запусков. Read-only к 1С.",
         "operationId": "sync_auto_tick_api_v1_sync_auto_tick_post",
         "responses": {
           "200": {
@@ -4680,7 +4680,7 @@
           "plan"
         ],
         "summary": "Close Mrp Run",
-        "description": "Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).\n\nЗакрытие убирает активные резервы из рабочих очередей (release),\nтребования и закупочные строки не перезаписывает. Доступно только для\nзафиксированных прогонах. Повторный вызов идемпотентен.",
+        "description": "Явно закрыть плановый прогон (FIXED_SNAPSHOT -> CLOSED).\n\nЗакрытие убирает активные резервы из рабочих очередей (release),\nтребования и закупочные строки не перезаписывает. Доступно только для\nзафиксированных прогонах. Повторный вызов идемпотентен.",
         "operationId": "close_mrp_run_api_v1_plan_mrp_run__run_id__close_post",
         "parameters": [
           {
@@ -4698,6 +4698,102 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/ReconcileRequest",
+                "default": {
+                  "dry_run": false
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plan/mrp/run/{run_id}/rebase-specification": {
+      "post": {
+        "tags": [
+          "plan"
+        ],
+        "summary": "Rebase Mrp Run For Specification",
+        "description": "Create a successor MRP only for the predecessor's unproduced roots.",
+        "operationId": "rebase_mrp_run_for_specification_api_v1_plan_mrp_run__run_id__rebase_specification_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpecificationRebaseRequest",
+                "default": {
+                  "dry_run": false,
+                  "changed_spec_refs": []
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/plan/mrp/specification-rebase/run-pending": {
+      "post": {
+        "tags": [
+          "plan"
+        ],
+        "summary": "Run Pending Specification Rebase",
+        "description": "Run/preview one durable automatic rebase item (benchmark entrypoint).",
+        "operationId": "run_pending_specification_rebase_api_v1_plan_mrp_specification_rebase_run_pending_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PendingSpecificationRebaseRequest",
                 "default": {
                   "dry_run": false
                 }
@@ -8091,7 +8187,7 @@
           "production-control"
         ],
         "summary": "Post Export Material Issues To 1C",
-        "description": "Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов\n(Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.\n\n- `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.\n- `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.",
+        "description": "Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов\n(Posted=false). Идемпотентно через sync_link.\n\n- `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.\n- `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.",
         "operationId": "post_export_material_issues_to_1c_api_v1_production_control_material_issues_export_to_1c_post",
         "requestBody": {
           "content": {
@@ -9323,7 +9419,7 @@
           "paint-weld"
         ],
         "summary": "Chain Preview",
-        "description": "Предпросмотр цепочки «окраска → сварка» (dry-run, ничего не пишет).",
+        "description": "Предпросмотр цепочки «окраска - сварка» (dry-run, ничего не пишет).",
         "operationId": "chain_preview_api_v1_paint_weld_chain_preview_post",
         "requestBody": {
           "content": {
@@ -9411,7 +9507,7 @@
           "paint-weld"
         ],
         "summary": "Chain Close",
-        "description": "Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,\nСборкаЗапасов обоих заказов и один комбинированный СдельныйНаряд, закрывающий\nоба заказа. dry_run=true — предпросмотр.\n\nЗакрытие возобновляемо. Если часть шага прошла (одна СборкаЗапасов в 1С, или\nобе сборки есть, а наряда нет), ответ приходит с HTTP 200 и\n``status='partial'``, ``resume_required=true``, ``chain_state``,\n``posted_sides``/``pending_sides`` и человекочитаемым ``message``: проведённые\nдокументы не откатываются, повторный вызов докатывает недостающие без дублей.\n400 остаётся только для случая, когда в 1С не ушло ничего.",
+        "description": "Закрыть цепочку «окраска-сварка» одним действием: выпуски обеих строк,\nСборкаЗапасов обоих заказов и один комбинированный СдельныйНаряд, закрывающий\nоба заказа. dry_run=true — предпросмотр.\n\nЗакрытие возобновляемо. Если часть шага прошла (одна СборкаЗапасов в 1С, или\nобе сборки есть, а наряда нет), ответ приходит с HTTP 200 и\n``status='partial'``, ``resume_required=true``, ``chain_state``,\n``posted_sides``/``pending_sides`` и человекочитаемым ``message``: проведённые\nдокументы не откатываются, повторный вызов докатывает недостающие без дублей.\n400 остаётся только для случая, когда в 1С не ушло ничего.",
         "operationId": "chain_close_api_v1_paint_weld_chain_close_post",
         "requestBody": {
           "content": {
@@ -15008,6 +15104,17 @@
         ],
         "title": "PaintWeldChainResponse"
       },
+      "PendingSpecificationRebaseRequest": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "PendingSpecificationRebaseRequest"
+      },
       "PeriodPlanBulkUpsertRequest": {
         "properties": {
           "entries": {
@@ -16314,6 +16421,17 @@
               }
             ],
             "title": "Spec Id"
+          },
+          "spec_revision_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Revision Hash"
           },
           "issue_count": {
             "type": "integer",
@@ -18495,6 +18613,24 @@
           "demand_manifest"
         ],
         "title": "ShelfProjectionRow"
+      },
+      "SpecificationRebaseRequest": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "default": false
+          },
+          "changed_spec_refs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Changed Spec Refs"
+          }
+        },
+        "type": "object",
+        "title": "SpecificationRebaseRequest"
       },
       "SpecificationSearchItemResponse": {
         "properties": {

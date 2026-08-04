@@ -38,6 +38,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Потребность пополнения | зафиксированное поле резерва (§5) |
 | Выполнение пополнения | адресное назначение в пределах точно связанного живого резерва, затем единый FIFO (§5, §6, §12.6) |
 | Остаток выпуска плана | исходный выпуск минус принятый выпуск этого плана (§7) |
+| Изменение спецификации живого плана | старый MRP не мутирует; он закрывается с фактом, а successor-MRP создаётся на остаток корней по новой BOM (§3, §7) |
 | Очередь сборки | остатки выпуска всех живых планов, oldest-first (§7) |
 | Календарная раскладка сборки | барабан поверх очереди сборки (§8) |
 | Цель полки | расход барабана внутри защитного окна, ограниченный MRP (§10) |
@@ -68,6 +69,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Custody материалов производства | generation-scoped `production_material_custody_projection.py`; live fold текущих документов и статусов не является источником чтения или fallback |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py`; пул строится ОДИН раз, базис — исторический SLE-баланс, net после заморозки неизменяем; единственная точка расширения пулов — `pool_key_for` |
 | Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
+| Единая спецификация сборки: узлы и комплектовки со складов | контракт `unified-assembly-specification.md` (§26); развёртка — существующие `backend/app/services/mrp_freeze.py`, `planning_service.py`, `bom_specification_resolver.py`, без второго движка |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
 | Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
@@ -108,7 +110,7 @@ PRODPLAN состоит из четырёх последовательно св�
 
 ## Запрещено
 
-- повторно разворачивать BOM зафиксированного плана;
+- повторно разворачивать BOM зафиксированного плана; при specification-rebase создаётся другой successor-план;
 - создавать несколько MRP-снимков одного плана;
 - пересчитывать исходную потребность при refresh или поступлении;
 - считать выполнение по статусам и накопительным полям заказов;

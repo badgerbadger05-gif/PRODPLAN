@@ -587,11 +587,75 @@ class Specification(Base):
     spec_ref1c = Column(String(36), unique=True, index=True)
     # Новое поле для связи с видом производства
     production_kind_id = Column(Integer, ForeignKey('production_kinds.id'), nullable=True)
+    # Hash of the current planning-significant revision. Historical payloads
+    # live in SpecificationRevision; this mutable pointer is only a selector.
+    content_hash = Column(String(64), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
     # Связь с видом производства
     production_kind = relationship("ProductionKind")
+
+
+class SpecificationRevision(Base):
+    """Immutable planning-significant specification payload."""
+
+    __tablename__ = "specification_revision"
+    __table_args__ = (
+        UniqueConstraint(
+            "spec_id", "content_hash", name="uq_specification_revision_content"
+        ),
+        Index("ix_specification_revision_spec_created", "spec_id", "created_at"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    spec_id = Column(
+        Integer,
+        ForeignKey("specifications.spec_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    content_hash = Column(String(64), nullable=False, index=True)
+    payload = Column(CrossPlatformJSON, nullable=False)
+    source = Column(String(32), nullable=False, default="odata", server_default="odata")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class SpecificationRebaseQueue(Base):
+    """Durable automatic work request emitted by specification sync."""
+
+    __tablename__ = "specification_rebase_queue"
+    __table_args__ = (
+        UniqueConstraint("revision_id", name="uq_specification_rebase_queue_revision"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed')",
+            name="ck_specification_rebase_queue_status",
+        ),
+        Index("ix_specification_rebase_queue_status_detected", "status", "detected_at"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    spec_id = Column(
+        Integer,
+        ForeignKey("specifications.spec_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    revision_id = Column(
+        BigInteger,
+        ForeignKey("specification_revision.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    old_content_hash = Column(String(64), nullable=False)
+    new_content_hash = Column(String(64), nullable=False)
+    status = Column(String(16), nullable=False, default="pending", server_default="pending")
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    detected_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(TEXT, nullable=True)
+    result = Column(CrossPlatformJSON, nullable=True)
 
 
 class SpecComponent(Base):
@@ -694,6 +758,9 @@ class ProductionProduct(Base):
     produced_qty = Column(DECIMAL(10, 3), default=0.0, nullable=False)
     remaining_qty = Column(DECIMAL(10, 3), nullable=False)
     spec_id = Column(Integer, ForeignKey('specifications.spec_id'), nullable=True)
+    # Exact immutable revision used when this order line was materialized.
+    # ``spec_id`` remains the logical/current specification selector.
+    spec_revision_hash = Column(String(64), nullable=True, index=True)
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
     # When this line was generated from MRP (rather than 1C-synced), points to
     # the planned_order row it came from. NULL for 1C-synced lines. Partial
@@ -1348,6 +1415,10 @@ class ProductionPlanHeader(Base):
             "status in ('draft', 'fixed', 'closed')",
             name="ck_production_plan_header_status",
         ),
+        UniqueConstraint(
+            "predecessor_run_id",
+            name="uq_production_plan_header_predecessor_run",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -1359,6 +1430,30 @@ class ProductionPlanHeader(Base):
     created_by = Column(String(100), nullable=True)
     fixed_by = Column(String(100), nullable=True)
     fixed_at = Column(TIMESTAMP, nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_reason = Column(String(50), nullable=True)
+    # Immutable successor lineage.  A specification rebase never edits the
+    # predecessor plan: it creates one new fixed plan for the unproduced root
+    # remainder and points that plan at the historical predecessor run.
+    predecessor_plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    predecessor_run_id = Column(
+        BigInteger,
+        ForeignKey(
+            "planning_run.run_id",
+            ondelete="RESTRICT",
+            name="fk_production_plan_header_predecessor_run",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    lineage_reason = Column(String(50), nullable=True)
+    lineage_context = Column(CrossPlatformJSON, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -2520,7 +2615,7 @@ class MrpFreezeComponent(Base):
     component_organization_ref = Column(String(36), nullable=True)
     component_planning_stock_pool = Column(String(64), nullable=True)
     spec_ref = Column(String(36), nullable=False, server_default="")
-    spec_version = Column(String(50), nullable=True)
+    spec_version = Column(String(64), nullable=True)
     norm_qty_per_unit = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     unit_coef = Column(DECIMAL(15, 3), nullable=False, default=1.0, server_default="1")
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
