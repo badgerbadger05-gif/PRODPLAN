@@ -387,7 +387,14 @@ def supplier_future_supply_evidence(
             "source_line_ref": external_line_ref or None,
             "source_local_id": ",".join(local_ids),
             "ordered_qty_at_cutoff": ordered,
-            "realized_qty_at_cutoff": realized_by_line[(order_ref, line_no)],
+            # Net supplier-return movements may exceed receipts inside the
+            # visible prefix.  They do not represent a negative realization:
+            # the future-supply contract is cumulative received quantity and
+            # is deliberately nonnegative.  Keep the raw signed Ledger facts
+            # immutable and normalize only this semantic projection.
+            "realized_qty_at_cutoff": max(
+                realized_by_line[(order_ref, line_no)], Decimal("0")
+            ),
             "eta_date": eta,
             "source_state_key": raw_state,
             # Mirror timestamps are synchronization metadata, not versioned 1C

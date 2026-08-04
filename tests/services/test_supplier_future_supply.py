@@ -486,6 +486,20 @@ def test_buy_allocation_without_successful_link_is_rejected(db_session):
     assert row.realized_qty_at_cutoff == Decimal("1")
 
 
+def test_supplier_net_return_does_not_create_negative_realization(db_session):
+    generation, item, _allocation = _context(db_session)
+    _receipt(db_session, generation, item, qty="-9", suffix="return")
+    db_session.flush()
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.realized_qty_at_cutoff == Decimal("0")
+
+
 def test_buy_allocation_remains_future_supply_in_next_generation(db_session):
     generation1, item, reservation, allocation = _buy_context(db_session)
     db_session.add(models.SyncLink(
