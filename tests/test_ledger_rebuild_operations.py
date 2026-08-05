@@ -9,6 +9,9 @@ from app import models
 
 REPO = Path(__file__).resolve().parents[1]
 CLEAR_SQL = REPO / "tools" / "sql" / "clear_rebuildable_ledger_projections.sql"
+INITIAL_CLEAR_SQL = (
+    REPO / "tools" / "sql" / "clear_initial_legacy_rejected_projections.sql"
+)
 VERIFY_SQL = REPO / "tools" / "sql" / "verify_ledger_rebuild.sql"
 ALEMBIC_SQLITE_UPGRADE = REPO / "tests" / "alembic_sqlite_upgrade.py"
 
@@ -141,6 +144,21 @@ def test_clear_script_is_guarded_and_preserves_non_rebuildable_inputs():
         "shelf_policy",
         "dbr_assembly_rate",
     }.isdisjoint(targets)
+
+
+def test_initial_legacy_clear_delegates_to_canonical_clear_fail_closed():
+    source = INITIAL_CLEAR_SQL.read_text(encoding="utf-8")
+
+    assert "CLEAR_INITIAL_LEGACY_REJECTED_PROJECTIONS" in source
+    assert "legacy-rejected-20260723-06" in source
+    assert "initial legacy clear requires an empty planning_truth_state" in source
+    assert "initial legacy clear refuses % additional Ledger generation(s)" in source
+    assert "other_client_sessions" in source
+    assert "source_watermarks::jsonb" in source
+    assert "pre-lineage-schema" in source
+    assert "\\ir clear_rebuildable_ledger_projections.sql" in source
+    assert "CLEAR_REBUILDABLE_LEDGER_PROJECTIONS" in source
+    assert re.search(r"\bTRUNCATE\b", source, flags=re.IGNORECASE) is None
 
 
 def test_clear_script_detaches_and_restores_every_current_keep_to_clear_fk():

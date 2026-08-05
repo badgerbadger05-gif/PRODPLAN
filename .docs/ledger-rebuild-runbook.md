@@ -149,6 +149,30 @@ another client session remains:
 "${compose[@]}" --profile automation stop sync-worker backend
 ```
 
+### First transition from the pre-lineage database
+
+Use this wrapper only when the migration created the single rejected generation
+`legacy-rejected-20260723-06` and `planning_truth_state` is still empty. It
+temporarily establishes the pointer required by the canonical clear inside the
+same uncommitted transaction, then delegates to that clear. No application can
+observe the temporary state; any failed guard rolls the whole transaction back.
+
+```bash
+"${compose[@]}" exec -T db sh -lc \
+  'psql -X -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -v ON_ERROR_STOP=1 \
+    -v expected_database="$POSTGRES_DB" \
+    -v expected_generation_key=legacy-rejected-20260723-06 \
+    -v confirm=CLEAR_INITIAL_LEGACY_REJECTED_PROJECTIONS' \
+  < "$repo/tools/sql/clear_initial_legacy_rejected_projections.sql"
+```
+
+The wrapper refuses any existing truth pointer, any additional Ledger
+generation, a different generation key/watermark, or another client session.
+It must end with the canonical `CLEAR PASS`. Never use it for later rebuilds.
+
+### Normal canonical clear
+
 Run the destructive clear with the exact values observed immediately before
 maintenance:
 
