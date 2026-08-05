@@ -395,6 +395,7 @@ def carry_forward_retained_reservations(
     parent_generation_id: int,
     target_generation_id: int,
     retained_run_ids: tuple[int, ...],
+    preserve_realization: bool = False,
 ) -> int:
     """Copy immutable retained obligations, but never carry physical realization.
 
@@ -436,10 +437,14 @@ def carry_forward_retained_reservations(
             priority_period_to=source.priority_period_to,
             realization_mode=source.realization_mode,
             reserved_qty=source.reserved_qty,
-            realized_qty=Decimal("0"),
+            realized_qty=(source.realized_qty if preserve_realization else Decimal("0")),
             covered_from_stock_at_freeze_qty=source.covered_from_stock_at_freeze_qty,
             replenishment_required_qty=source.replenishment_required_qty,
-            replenishment_received_qty=Decimal("0"),
+            replenishment_received_qty=(
+                source.replenishment_received_qty
+                if preserve_realization
+                else Decimal("0")
+            ),
             lifecycle_status=source.lifecycle_status,
             opened_at=source.opened_at,
             closed_at=source.closed_at,
@@ -458,7 +463,11 @@ def carry_forward_retained_reservations(
             planning_stock_pool=source.planning_stock_pool,
             event_kind="open",
             reserved_delta=source.reserved_qty,
-            realized_delta=Decimal("0"),
+            realized_delta=(
+                source.replenishment_received_qty
+                if preserve_realization
+                else Decimal("0")
+            ),
             sle_id=None,
             fact_ref="",
             fact_line_ref="",

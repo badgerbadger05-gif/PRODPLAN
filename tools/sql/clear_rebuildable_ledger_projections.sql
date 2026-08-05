@@ -186,6 +186,7 @@ SET current_generation_id = NULL;
 -- No CASCADE: a newly introduced reference to rebuildable state makes this
 -- transaction fail instead of silently deleting an unreviewed table.
 TRUNCATE
+    production_plan_execution_fact,
     stock_ledger_entry,
     stock_ledger_anchor,
     stock_ledger_fact_supersession,
@@ -217,6 +218,7 @@ TRUNCATE
     replenishment_work_item,
     planning_run_bucket_modes,
     mrp_bucket_type_legacy,
+    mrp_run_root,
     planning_run,
     assembly_output_allocation,
     assembly_output_fact_decision,

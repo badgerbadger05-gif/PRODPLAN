@@ -1471,6 +1471,13 @@ class ProductionPlanLine(Base):
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     bucket_date = Column(Date, nullable=False, index=True)
     qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    # Canonical persisted plan execution. ``qty`` is the immutable matrix;
+    # accepted/remaining are advanced only when a new accepted assembly fact
+    # is assigned to this line. Public reads never rebuild these values.
+    accepted_output_qty = Column(
+        DECIMAL(15, 3), nullable=False, default=0.0, server_default="0"
+    )
+    remaining_output_qty = Column(DECIMAL(15, 3), nullable=True)
     locked_by_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
@@ -1478,6 +1485,59 @@ class ProductionPlanLine(Base):
     plan = relationship("ProductionPlanHeader", back_populates="lines")
     item = relationship("Item")
     locked_by_run = relationship("PlanningRun", foreign_keys=[locked_by_run_id])
+
+
+class MrpRunRoot(Base):
+    """Frozen top-level output owned by one MRP run.
+
+    The production-plan line remains unchanged across specification rebases.
+    Each sequential run receives only the root quantity it is responsible for
+    and keeps its own execution denominator and remainder.
+    """
+
+    __tablename__ = "mrp_run_root"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "plan_line_id", name="uq_mrp_run_root_run_plan_line"
+        ),
+        CheckConstraint("planned_qty >= 0", name="ck_mrp_run_root_planned_nonnegative"),
+        CheckConstraint("accepted_qty >= 0", name="ck_mrp_run_root_accepted_nonnegative"),
+        CheckConstraint("remaining_qty >= 0", name="ck_mrp_run_root_remaining_nonnegative"),
+        Index("ix_mrp_run_root_run", "run_id"),
+        Index("ix_mrp_run_root_plan_line", "plan_line_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    planned_qty = Column(DECIMAL(15, 3), nullable=False)
+    accepted_qty = Column(
+        DECIMAL(15, 3), nullable=False, default=0.0, server_default="0"
+    )
+    remaining_qty = Column(DECIMAL(15, 3), nullable=False)
+    created_at = Column(
+        TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        TIMESTAMP,
+        default=func.now(),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    run = relationship("PlanningRun")
+    plan_line = relationship("ProductionPlanLine")
 
 
 class PlanningRun(Base):
@@ -2999,6 +3059,12 @@ class AssemblyOutputAllocation(Base):
         nullable=False,
         index=True,
     )
+    run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     plan_line_id = Column(
         Integer,
         ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
@@ -3018,6 +3084,62 @@ class AssemblyOutputAllocation(Base):
     stock_ledger_entry = relationship("StockLedgerEntry")
     plan = relationship("ProductionPlanHeader")
     plan_line = relationship("ProductionPlanLine")
+    run = relationship("PlanningRun")
+
+
+class ProductionPlanExecutionFact(Base):
+    """One accepted physical output assignment persisted across generations."""
+
+    __tablename__ = "production_plan_execution_fact"
+    __table_args__ = (
+        UniqueConstraint(
+            "stock_ledger_entry_id",
+            "plan_line_id",
+            name="uq_production_plan_execution_fact_sle_line",
+        ),
+        CheckConstraint(
+            "allocated_qty > 0",
+            name="ck_production_plan_execution_fact_qty_positive",
+        ),
+        Index("ix_production_plan_execution_fact_run", "run_id"),
+        Index("ix_production_plan_execution_fact_plan", "plan_id", "plan_line_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    stock_ledger_entry_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    match_rule = Column(String(8), nullable=False)
+    accepted_at = Column(
+        DateTime(timezone=True), nullable=False, default=func.now(), server_default=func.now()
+    )
+
+    stock_ledger_entry = relationship("StockLedgerEntry")
+    plan = relationship("ProductionPlanHeader")
+    plan_line = relationship("ProductionPlanLine")
+    run = relationship("PlanningRun")
 
 
 class StockLedgerFactSupersession(Base):

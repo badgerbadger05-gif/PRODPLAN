@@ -128,26 +128,14 @@ def test_worker_drains_one_stale_run_and_completes_request(db_session, monkeypat
     def fake_rebase(db, run_id, **kwargs):
         old = db.get(models.PlanningRun, int(run_id))
         old.status = "CLOSED"
-        db.get(models.ProductionPlanHeader, int(old.source_plan_id)).status = "closed"
-        successor_plan = models.ProductionPlanHeader(
-            name="Successor",
-            period_from=date(2026, 8, 4),
-            period_to=date(2026, 8, 31),
-            status="fixed",
-            fixed_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
-            predecessor_plan_id=int(old.source_plan_id),
-            predecessor_run_id=int(old.run_id),
-            lineage_reason="specification_rebase",
-        )
-        db.add(successor_plan)
-        db.flush()
+        plan = db.get(models.ProductionPlanHeader, int(old.source_plan_id))
         successor_run = models.PlanningRun(
-            source_plan_id=int(successor_plan.id),
+            source_plan_id=int(plan.id),
             prior_run_id=int(old.run_id),
             status="FIXED_SNAPSHOT",
-            period_from=successor_plan.period_from,
-            period_to=successor_plan.period_to,
-            fixed_at=successor_plan.fixed_at,
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            fixed_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
             active_freeze_version=1,
             pinned=True,
             config_snapshot={},

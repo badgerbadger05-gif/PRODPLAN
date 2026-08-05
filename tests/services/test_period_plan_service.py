@@ -4,6 +4,7 @@ with supplier-order netting.
 
 import datetime
 from datetime import date
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -467,13 +468,16 @@ def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
     assert snapshot.payload == payload
 
 
-def test_period_plan_list_reads_progress_from_current_immutable_snapshot(db_session):
+def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db_session):
     item = _make_purchased_item(db_session, "LIST-PROGRESS")
     plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
     generation_id = int(
         db_session.query(PlanningTruthState.current_generation_id).scalar()
     )
     generation = db_session.get(LedgerGeneration, generation_id)
+    line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    line.accepted_output_qty = 3
+    line.remaining_output_qty = 2
     db_session.add(PlanningReadSnapshot(
         consumer="period_plan_execution",
         snapshot_key=f"plan={plan.id};run=77",
@@ -496,12 +500,63 @@ def test_period_plan_list_reads_progress_from_current_immutable_snapshot(db_sess
     result = list_period_plans(db_session)
 
     row = next(row for row in result["rows"] if row["id"] == plan.id)
-    assert row["execution_pct"] == 62.5
-    assert row["execution_completed_qty"] == 5
-    assert row["execution_base_qty"] == 8
+    assert row["execution_pct"] == 60.0
+    assert row["execution_completed_qty"] == 3
+    assert row["execution_base_qty"] == 5
     assert row["execution_status"] == "accepted"
     assert row["execution_reason"] is None
     assert row["execution_generation_id"] == generation_id
+
+
+def test_replacement_mrp_starts_at_zero_of_saved_remainder_with_empty_journal(db_session):
+    item = _make_purchased_item(db_session, "REPLACEMENT-JOURNAL")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=12.0)
+    line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    line.accepted_output_qty = Decimal("10")
+    line.remaining_output_qty = Decimal("2")
+    generation_id = int(db_session.query(PlanningTruthState.current_generation_id).scalar())
+    parent = PlanningRun(
+        status="CLOSED",
+        source_plan_id=plan.id,
+        ledger_generation_id=generation_id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(parent)
+    db_session.flush()
+    replacement = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        prior_run_id=parent.run_id,
+        ledger_generation_id=generation_id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(replacement)
+    db_session.flush()
+    db_session.add(models.MrpRunRoot(
+        run_id=replacement.run_id,
+        plan_line_id=line.id,
+        planned_qty=Decimal("2"),
+        accepted_qty=Decimal("0"),
+        remaining_qty=Decimal("2"),
+    ))
+    db_session.flush()
+
+    payload = build_period_plan_execution_snapshot(
+        db_session,
+        plan.id,
+        run_id=replacement.run_id,
+        generation_id=generation_id,
+    )
+
+    assert payload["rows"] == []
+    assert payload["summary"]["execution_completed_qty"] == 0
+    assert payload["summary"]["execution_base_qty"] == 2
+    assert payload["summary"]["execution_pct"] == 0
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("10")
+    assert line.remaining_output_qty == Decimal("2")
 
 
 @pytest.mark.parametrize("match_status", ["exact", "unmatched"])

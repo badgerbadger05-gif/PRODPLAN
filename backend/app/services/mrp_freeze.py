@@ -920,7 +920,7 @@ def freeze_candidate_snapshots(
                 retained_entries.append(entry)
             manifest_plan_ids.add(plan_id)
             continue
-        if action != "add":
+        if action not in {"add", "replace"}:
             raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
         if plan_id <= 0:
             raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
@@ -956,12 +956,16 @@ def freeze_candidate_snapshots(
         entry = manifest_entries[int(run.run_id)]
         if int(run.source_plan_id or -1) != int(entry["plan_id"]):
             raise LedgerPoolUnavailable("candidate freeze source plan conflicts with sealed manifest")
-        if entry.get("parent_run_id") is not None:
+        if entry.get("action") == "add" and entry.get("parent_run_id") is not None:
             raise LedgerPoolUnavailable("candidate freeze add entry must not claim a current parent")
+        if entry.get("action") == "replace" and int(
+            entry.get("parent_run_id") or -1
+        ) != int(run.prior_run_id or -1):
+            raise LedgerPoolUnavailable("candidate freeze replacement lineage conflicts")
         plan = db.get(ProductionPlanHeader, int(run.source_plan_id))
         if plan is None or str(plan.status) != "fixed":
             raise LedgerPoolUnavailable("candidate freeze add plan must be fixed")
-        if run.prior_run_id != plan.predecessor_run_id:
+        if entry.get("action") == "add" and run.prior_run_id != plan.predecessor_run_id:
             raise LedgerPoolUnavailable(
                 "candidate freeze predecessor conflicts with source plan lineage"
             )
@@ -973,11 +977,20 @@ def freeze_candidate_snapshots(
             or run.config_snapshot != add_request["config_snapshot"]
         ):
             raise LedgerPoolUnavailable("candidate freeze add candidate config conflicts with manifest")
-        if db.query(ProductionPlanLine.id).filter(
+        locked_lines = db.query(ProductionPlanLine).filter(
             ProductionPlanLine.plan_id == int(plan.id),
             ProductionPlanLine.locked_by_run_id.isnot(None),
-        ).first() is not None:
-            raise LedgerPoolUnavailable("candidate freeze add plan lines must be unlocked")
+        ).all()
+        if run.prior_run_id is None:
+            if locked_lines:
+                raise LedgerPoolUnavailable("candidate freeze add plan lines must be unlocked")
+        elif any(
+            int(line.locked_by_run_id) != int(run.prior_run_id)
+            for line in locked_lines
+        ):
+            raise LedgerPoolUnavailable(
+                "candidate freeze replacement plan lines conflict with predecessor run"
+            )
         # Rebuild is deliberately only for an empty candidate.  Retrying a
         # partial candidate risks preserving stale derived rows.
         existing_requirements = (

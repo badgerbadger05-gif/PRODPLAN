@@ -45,7 +45,7 @@ def test_material_cache_drop_migration_is_linear_head():
 
     config = Config(str(REPO_ROOT / "backend" / "alembic.ini"))
     config.set_main_option("script_location", str(REPO_ROOT / "backend" / "alembic"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["20260804_01"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["20260805_01"]
 
 
 def test_ownership_migrations_round_trip_on_disposable_sqlite(tmp_path):

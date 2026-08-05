@@ -254,7 +254,7 @@ def _set_purchase_journal_rows(db_session, target, *, rows):
     db_session.flush()
 
 
-def _batch(db, count=2, add_count=0):
+def _batch(db, count=2, add_count=0, replace_count=0):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     parent_generation = _generation(db, key="accepted", status="accepted", cutoff=cutoff)
     db.add(models.PlanningTruthState(id=1, current_generation_id=parent_generation.id))
@@ -275,6 +275,33 @@ def _batch(db, count=2, add_count=0):
         db.add(parent)
         db.flush()
         parents.append(parent)
+        if index < replace_count:
+            plan.status = "fixed"
+            plan.fixed_at = cutoff
+            item = models.Item(
+                item_code=f"replacement-root-{index}",
+                item_name=f"replacement root {index}",
+            )
+            db.add(item)
+            db.flush()
+            line = models.ProductionPlanLine(
+                plan_id=plan.id,
+                item_id=item.item_id,
+                bucket_date=date(2026, 7, 1),
+                qty=Decimal("12"),
+                accepted_output_qty=Decimal("10"),
+                remaining_output_qty=Decimal("2"),
+                locked_by_run_id=parent.run_id,
+            )
+            db.add(line)
+            db.flush()
+            db.add(models.MrpRunRoot(
+                run_id=parent.run_id,
+                plan_line_id=line.id,
+                planned_qty=Decimal("12"),
+                accepted_qty=Decimal("10"),
+                remaining_qty=Decimal("2"),
+            ))
     target = _generation(
         db, key="refresh", status="building", cutoff=cutoff,
         watermarks={"generation_kind": "obligation_refresh", "parent_generation_id": parent_generation.id},
@@ -293,6 +320,7 @@ def _batch(db, count=2, add_count=0):
         additions.append(plan)
     manifest = create_obligation_refresh_manifest(
         db, parent_generation.id, target.id, [row.id for row in additions],
+        replace_plan_ids=[parents[index].source_plan_id for index in range(replace_count)],
         started_by="test", horizon_days=90, config_version_id=None,
         config_snapshot={"added": True},
     )
@@ -653,6 +681,36 @@ def test_publish_transfers_refresh_locks_and_acquires_add_locks(db_session):
 
     assert refresh_line.locked_by_run_id == parents[0].run_id
     assert add_line.locked_by_run_id == add_candidate.run_id
+
+
+def test_publish_replaces_same_plan_and_transfers_saved_root_remainder(db_session):
+    cutoff, parent_generation, target, parents, candidates = _batch(
+        db_session,
+        count=1,
+        replace_count=1,
+    )
+    parent = parents[0]
+    candidate = candidates[0]
+    plan_id = int(parent.source_plan_id)
+    line = db_session.query(models.ProductionPlanLine).filter_by(plan_id=plan_id).one()
+
+    assert int(candidate.source_plan_id) == plan_id
+    assert int(candidate.prior_run_id) == int(parent.run_id)
+    root = db_session.query(models.MrpRunRoot).filter_by(run_id=candidate.run_id).one()
+    assert root.planned_qty == Decimal("2")
+    assert root.accepted_qty == Decimal("0")
+    assert root.remaining_qty == Decimal("2")
+
+    result = _publish(db_session, parent_generation, target, cutoff)
+
+    assert result.published is True
+    assert parent.status == "CLOSED"
+    assert candidate.status == "FIXED_SNAPSHOT"
+    assert line.locked_by_run_id == candidate.run_id
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("10")
+    assert line.remaining_output_qty == Decimal("2")
+    assert db_session.query(models.ProductionPlanHeader).count() == 1
 
 
 def test_publish_rejects_prelocked_add_plan(db_session):

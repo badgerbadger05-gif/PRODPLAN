@@ -6,7 +6,16 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from ..models import Specification, SpecComponent, Operation, SpecOperation, Item, ProductionStage, ProductionKind
+from ..models import (
+    Specification,
+    SpecComponent,
+    Operation,
+    SpecOperation,
+    Item,
+    ProductionStage,
+    ProductionKind,
+    ProductionManufactureOperation,
+)
 from ..schemas import ODataSyncRequest
 
 _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
@@ -301,18 +310,19 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 # иначе легальные дубли «один компонент с разными спеками» удалялись бы.
                 if can_reconcile_components:
                     try:
-                        deleted = 0
-                        existing_rows = (
-                            db.query(SpecComponent)
-                            .filter(SpecComponent.spec_id == current_spec.spec_id)
-                            .all()
-                        )
-                        for row in existing_rows:
-                            if (int(row.item_id), row.component_spec_ref1c) not in seen_component_keys:
-                                db.delete(row)
-                                deleted += 1
-                        if deleted:
-                            components_deleted += int(deleted)
+                        with db.begin_nested():
+                            deleted = 0
+                            existing_rows = (
+                                db.query(SpecComponent)
+                                .filter(SpecComponent.spec_id == current_spec.spec_id)
+                                .all()
+                            )
+                            for row in existing_rows:
+                                if (int(row.item_id), row.component_spec_ref1c) not in seen_component_keys:
+                                    db.delete(row)
+                                    deleted += 1
+                            if deleted:
+                                components_deleted += int(deleted)
                     except Exception as e:
                         print(f"Ошибка reconcile компонентов спецификации {ref_key}: {e}")
 
@@ -390,22 +400,29 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 # Reconcile: удалить связи спецификация-операция, которые больше не присутствуют в 1С (только если поле 'Операции' выгружено)
                 if can_reconcile_operations:
                     try:
-                        q_del = db.query(SpecOperation).filter(SpecOperation.spec_id == current_spec.spec_id)
-                        if seen_operation_ids:
-                            deleted = (
-                                q_del.filter(~SpecOperation.operation_id.in_(list(seen_operation_ids)))
-                                .delete(synchronize_session=False)
+                        with db.begin_nested():
+                            referenced_ops = (
+                                db.query(ProductionManufactureOperation.spec_operation_id)
+                                .filter(ProductionManufactureOperation.spec_operation_id.isnot(None))
+                                .subquery()
                             )
-                        else:
+                            q_del = db.query(SpecOperation).filter(
+                                SpecOperation.spec_id == current_spec.spec_id,
+                                ~SpecOperation.spec_operation_id.in_(referenced_ops.select()),
+                            )
+                            if seen_operation_ids:
+                                q_del = q_del.filter(~SpecOperation.operation_id.in_(list(seen_operation_ids)))
                             deleted = q_del.delete(synchronize_session=False)
-                        if deleted:
-                            spec_operations_deleted += int(deleted)
+                            if deleted:
+                                spec_operations_deleted += int(deleted)
                     except Exception as e:
                         print(f"Ошибка reconcile операций спецификации {ref_key}: {e}")
 
             except Exception as e:
                 # Логируем ошибку, но продолжаем обработку
                 print(f"Ошибка обработки спецификации {ref_key}: {e}")
+                if not db.is_active:
+                    raise
                 continue
 
         # Сохраняем изменения

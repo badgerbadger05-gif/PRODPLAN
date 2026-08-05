@@ -31,11 +31,13 @@ class QueueCandidate:
     open_qty: Decimal
     sort_key: str = ""
     eligible_from: datetime | None = None
+    run_id: int = 0
 
 
 @dataclass(frozen=True)
 class OutputAllocation:
     stock_ledger_entry_id: int
+    run_id: int
     plan_id: int
     plan_line_id: int
     qty: Decimal
@@ -88,6 +90,7 @@ def allocate_output_fact(
             return
         allocations.append(OutputAllocation(
             stock_ledger_entry_id=fact.stock_ledger_entry_id,
+            run_id=row.run_id,
             plan_id=row.plan_id,
             plan_line_id=row.plan_line_id,
             qty=qty,

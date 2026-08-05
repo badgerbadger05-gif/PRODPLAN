@@ -16,6 +16,7 @@ from ..models import (
     LedgerGeneration,
     MrpRequirement,
     MrpRequirementBucket,
+    MrpRunRoot,
     Operation,
     PlannedOrder,
     PlannedOrderStage,
@@ -273,6 +274,7 @@ def list_period_plans(
     )
     plan_ids = [int(plan.id) for plan in plans]
     line_stats: Dict[int, Dict[str, float]] = {}
+    persisted_output_by_plan: Dict[int, Dict[str, Any]] = {}
     execution_by_plan: Dict[int, Dict[str, Any]] = {}
     if plan_ids:
         stats_rows = (
@@ -280,6 +282,10 @@ def list_period_plans(
                 ProductionPlanLine.plan_id,
                 func.count(ProductionPlanLine.id).label("line_count"),
                 func.coalesce(func.sum(ProductionPlanLine.qty), 0.0).label("total_qty"),
+                func.count(ProductionPlanLine.remaining_output_qty).label("initialized_count"),
+                func.coalesce(func.sum(ProductionPlanLine.accepted_output_qty), 0.0).label(
+                    "accepted_output_qty"
+                ),
             )
             .filter(ProductionPlanLine.plan_id.in_(plan_ids))
             .group_by(ProductionPlanLine.plan_id)
@@ -289,6 +295,25 @@ def list_period_plans(
             int(row.plan_id): {"line_count": int(row.line_count or 0), "total_qty": _to_float(row.total_qty)}
             for row in stats_rows
         }
+        for row in stats_rows:
+            line_count = int(row.line_count or 0)
+            initialized = line_count > 0 and int(row.initialized_count or 0) == line_count
+            if not initialized:
+                continue
+            planned = _to_float(row.total_qty)
+            accepted = min(max(_to_float(row.accepted_output_qty), 0.0), planned)
+            execution_pct = _rounded_replenishment_pct(planned, accepted)
+            persisted_output_by_plan[int(row.plan_id)] = {
+                "execution_pct": execution_pct,
+                "execution_partial": False,
+                "execution_progress_status": replenishment_execution_status(
+                    planned,
+                    accepted,
+                    partial_truth=False,
+                ),
+                "execution_completed_qty": accepted,
+                "execution_base_qty": planned,
+            }
         truth_generation_id = (
             db.query(PlanningTruthState.current_generation_id)
             .filter(PlanningTruthState.id == 1)
@@ -349,9 +374,10 @@ def list_period_plans(
                     line_count=int(line_stats.get(int(plan.id), {}).get("line_count", 0)),
                     total_qty=float(line_stats.get(int(plan.id), {}).get("total_qty", 0.0)),
                 ),
-                **execution_by_plan.get(
-                    int(plan.id),
-                    {
+                **{
+                    **execution_by_plan.get(
+                        int(plan.id),
+                        {
                         "execution_pct": None,
                         "execution_partial": False,
                         "execution_progress_status": "unavailable",
@@ -369,8 +395,13 @@ def list_period_plans(
                             if truth_generation_id is not None
                             else None
                         ),
-                    },
-                ),
+                        },
+                    ),
+                    # Plan execution is the persisted root-output counter.  A
+                    # replacement MRP starts its own 0/N execution without
+                    # resetting the immutable plan's accumulated X/total.
+                    **persisted_output_by_plan.get(int(plan.id), {}),
+                },
             }
             for plan in plans
         ],
@@ -1294,6 +1325,36 @@ def _freeze_one_run(
         .all()
     )
 
+    run_roots = {
+        int(root.plan_line_id): root
+        for root in db.query(MrpRunRoot)
+        .filter(MrpRunRoot.run_id == int(run.run_id))
+        .all()
+    }
+    if not run_roots:
+        # First fixation: the run receives the immutable plan matrix. A
+        # specification rebase pre-creates roots from the saved plan remainder
+        # and therefore never enters this branch.
+        for line in lines:
+            planned = max(Decimal(str(line.qty or 0)), Decimal("0"))
+            if line.remaining_output_qty is None:
+                line.accepted_output_qty = max(
+                    Decimal(str(line.accepted_output_qty or 0)), Decimal("0")
+                )
+                line.remaining_output_qty = max(
+                    planned - Decimal(str(line.accepted_output_qty or 0)), Decimal("0")
+                )
+            root = MrpRunRoot(
+                run_id=int(run.run_id),
+                plan_line_id=int(line.id),
+                planned_qty=planned,
+                accepted_qty=Decimal("0"),
+                remaining_qty=planned,
+            )
+            db.add(root)
+            run_roots[int(line.id)] = root
+        db.flush()
+
     # Candidate fixation is add-only.  An existing requirement means this run
     # was already derived, and rebuilding it would mutate frozen obligations
     # and could delete purchase proposals without confirmed 1C read-back.
@@ -1309,8 +1370,11 @@ def _freeze_one_run(
     # --- Collect plan-level (level 0) demand and lock plan lines ---
     buckets_by_item: Dict[int, Dict[date, float]] = {}
     for line in lines:
+        root = run_roots.get(int(line.id))
+        if root is None:
+            continue
         item_id = int(line.item_id)
-        line_qty = _to_float(line.qty)
+        line_qty = _to_float(root.planned_qty)
         if line_qty <= 0:
             continue
         buckets_by_item.setdefault(item_id, {})
@@ -2153,6 +2217,37 @@ def _resolve_execution_run(db: Session, plan: ProductionPlanHeader, run_id: Opti
     return run
 
 
+def _attach_run_output_summary(
+    db: Session,
+    payload: Dict[str, Any],
+    run: PlanningRun,
+) -> Dict[str, Any]:
+    """Overlay the persisted root-output counter for exactly one MRP run."""
+    planned, accepted = (
+        db.query(
+            func.coalesce(func.sum(MrpRunRoot.planned_qty), 0),
+            func.coalesce(func.sum(MrpRunRoot.accepted_qty), 0),
+        )
+        .filter(MrpRunRoot.run_id == int(run.run_id))
+        .one()
+    )
+    planned_qty = max(_to_float(planned), 0.0)
+    accepted_qty = min(max(_to_float(accepted), 0.0), planned_qty)
+    result = dict(payload)
+    summary = dict(result.get("summary") or {})
+    summary.update({
+        "root_output_completed_qty": accepted_qty,
+        "root_output_base_qty": planned_qty,
+        "root_output_pct": _rounded_replenishment_pct(planned_qty, accepted_qty),
+        "execution_completed_qty": accepted_qty,
+        "execution_base_qty": planned_qty,
+        "execution_pct": _rounded_replenishment_pct(planned_qty, accepted_qty),
+        "execution_partial": False,
+    })
+    result["summary"] = summary
+    return result
+
+
 def _execution_unavailable_payload(
     db: Session,
     *,
@@ -2387,6 +2482,16 @@ def _finalize_execution_payload(
     summary_payload = dict(result.get("summary") or {})
     if str(result.get("truth_status") or "") == "accepted":
         summary_payload.update(_execution_row_summary(summary_rows))
+        if "root_output_base_qty" in summary_payload:
+            summary_payload.update({
+                "execution_completed_qty": summary_payload["root_output_completed_qty"],
+                "execution_base_qty": summary_payload["root_output_base_qty"],
+                "execution_pct": summary_payload["root_output_pct"],
+                "execution_partial": False,
+            })
+            summary_payload.pop("root_output_completed_qty", None)
+            summary_payload.pop("root_output_base_qty", None)
+            summary_payload.pop("root_output_pct", None)
     else:
         # Unknown execution stays unknown. Filtering may change the row count,
         # but must never turn unavailable quantities into numeric zeroes.
@@ -3192,6 +3297,8 @@ def get_period_plan_execution_journal(
                 sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
         payload = dict(snapshot.payload)
 
+    payload = _attach_run_output_summary(db, payload, run)
+
     return _finalize_execution_payload(
         db,
         payload,
@@ -3279,14 +3386,25 @@ def build_period_plan_execution_snapshot(
     for item_id in list(roots_by_item):
         roots_by_item[item_id] = sorted(set(roots_by_item[item_id]))
 
-    rows, _meta = _build_execution_snapshot_rows(
-        db,
-        run,
-        requirement_ids=run_requirements,
-        items_by_requirement=items_by_req,
-        generation_id=generation_id,
-        root_item_ids_by_item=roots_by_item,
+    run_root_accepted = _to_float(
+        db.query(func.coalesce(func.sum(MrpRunRoot.accepted_qty), 0))
+        .filter(MrpRunRoot.run_id == int(run.run_id))
+        .scalar()
     )
+    if run.prior_run_id is not None and run_root_accepted <= 1e-9:
+        # A replacement MRP has no execution history of its own at birth.  Its
+        # requirements remain visible in the MRP result, while this journal
+        # intentionally stays empty until the first accepted root output.
+        rows = []
+    else:
+        rows, _meta = _build_execution_snapshot_rows(
+            db,
+            run,
+            requirement_ids=run_requirements,
+            items_by_requirement=items_by_req,
+            generation_id=generation_id,
+            root_item_ids_by_item=roots_by_item,
+        )
     rows = _filter_execution_rows(
         db,
         rows,
@@ -3296,7 +3414,7 @@ def build_period_plan_execution_snapshot(
     )
     rows = _attach_execution_information_links(rows)
     summary = _execution_row_summary(rows)
-    payload = {
+    payload = _attach_run_output_summary(db, {
         "plan": _serialize_plan(plan),
         "run_id": int(run.run_id),
         # Candidate snapshots are unreachable until the surrounding transaction
@@ -3309,7 +3427,7 @@ def build_period_plan_execution_snapshot(
         "truth_reason": None,
         "rows": rows,
         "summary": summary,
-    }
+    }, run)
     snapshot_key = _execution_snapshot_key(
         plan_id=plan.id,
         run_id=run.run_id,

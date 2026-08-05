@@ -1,10 +1,4 @@
-"""Create an immutable successor MRP for unproduced top-level roots.
-
-The predecessor plan/run is never edited structurally.  Its execution payload
-is sealed in ``ClosedPlanSnapshot`` and one obligation-generation publication
-retires the predecessor while adding a new fixed plan containing only the root
-remainder observed at the accepted physical cutoff.
-"""
+"""Replace one immutable MRP run on the saved remainder of the same plan."""
 
 from __future__ import annotations
 
@@ -14,7 +8,6 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Any, Iterable
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -39,12 +32,12 @@ def _utc(value: datetime) -> datetime:
 
 def _existing_successor(
     db: Session, predecessor_run_id: int
-) -> models.ProductionPlanHeader | None:
+) -> models.PlanningRun | None:
     return (
-        db.query(models.ProductionPlanHeader)
+        db.query(models.PlanningRun)
         .filter(
-            models.ProductionPlanHeader.predecessor_run_id
-            == int(predecessor_run_id)
+            models.PlanningRun.prior_run_id == int(predecessor_run_id),
+            models.PlanningRun.source_plan_id.isnot(None),
         )
         .one_or_none()
     )
@@ -54,30 +47,9 @@ def _remaining_root_rows(
     db: Session,
     *,
     plan_id: int,
-    generation_id: int,
     successor_period_from,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return coalesced successor rows and an audit of predecessor execution."""
-    accepted_rows = (
-        db.query(
-            models.AssemblyOutputAllocation.plan_line_id,
-            func.coalesce(
-                func.sum(models.AssemblyOutputAllocation.allocated_qty), ZERO
-            ),
-        )
-        .filter(
-            models.AssemblyOutputAllocation.ledger_generation_id
-            == int(generation_id),
-            models.AssemblyOutputAllocation.plan_id == int(plan_id),
-        )
-        .group_by(models.AssemblyOutputAllocation.plan_line_id)
-        .all()
-    )
-    accepted_by_line = {
-        int(plan_line_id): _dec(accepted_qty)
-        for plan_line_id, accepted_qty in accepted_rows
-    }
-
+    """Read saved plan execution; never aggregate physical facts here."""
     combined: dict[tuple[int, Any], Decimal] = defaultdict(lambda: ZERO)
     audit: list[dict[str, Any]] = []
     lines = (
@@ -90,8 +62,10 @@ def _remaining_root_rows(
         raise ValueError("source production plan has no root lines")
     for line in lines:
         planned = max(_dec(line.qty), ZERO)
-        accepted = max(accepted_by_line.get(int(line.id), ZERO), ZERO)
-        remaining = max(planned - accepted, ZERO)
+        if line.remaining_output_qty is None:
+            raise ValueError("plan line has no persisted execution remainder")
+        accepted = max(_dec(line.accepted_output_qty), ZERO)
+        remaining = max(_dec(line.remaining_output_qty), ZERO)
         bucket_date = max(line.bucket_date, successor_period_from)
         audit.append(
             {
@@ -157,22 +131,12 @@ def rebase_fixed_plan_remaining_roots(
 
     prior_successor = _existing_successor(db, int(predecessor.run_id))
     if prior_successor is not None:
-        successor_run = (
-            db.query(models.PlanningRun)
-            .filter(
-                models.PlanningRun.source_plan_id == int(prior_successor.id),
-                models.PlanningRun.status == "FIXED_SNAPSHOT",
-            )
-            .one_or_none()
-        )
         return {
             "status": "already_rebased",
             "predecessor_plan_id": int(predecessor.source_plan_id),
             "predecessor_run_id": int(predecessor.run_id),
-            "successor_plan_id": int(prior_successor.id),
-            "successor_run_id": (
-                int(successor_run.run_id) if successor_run is not None else None
-            ),
+            "successor_plan_id": int(predecessor.source_plan_id),
+            "successor_run_id": int(prior_successor.run_id),
             "dry_run": bool(dry_run),
         }
 
@@ -214,27 +178,14 @@ def rebase_fixed_plan_remaining_roots(
     successor_period_from = max(
         predecessor_plan.period_from, successor_fixed_at.date()
     )
-    successor_period_to = max(
-        predecessor_plan.period_to, successor_period_from
-    )
     successor_rows, root_audit = _remaining_root_rows(
         db,
         plan_id=int(predecessor_plan.id),
-        generation_id=parent_generation_id,
         successor_period_from=successor_period_from,
     )
     spec_refs = tuple(
         sorted({str(value).strip() for value in changed_spec_refs if str(value).strip()})
     )
-    context = {
-        "version": 1,
-        "reason": REBASE_REASON,
-        "predecessor_generation_id": parent_generation_id,
-        "predecessor_cutoff": _utc(generation.cutoff).isoformat(),
-        "changed_spec_refs": list(spec_refs),
-        "root_lines": root_audit,
-    }
-
     from app.services.period_plan_service import (
         _latest_closed_plan_snapshot,
         _read_period_plan_execution_payload_for_run,
@@ -265,40 +216,16 @@ def rebase_fixed_plan_remaining_roots(
     elif dict(closed_snapshot.payload or {}) != execution_payload:
         raise ValueError("closed plan snapshot payload conflicts with current execution")
 
-    successor: models.ProductionPlanHeader | None = None
-    if successor_rows:
-        successor = models.ProductionPlanHeader(
-            name=(f"{predecessor_plan.name} / остаток"[:255]),
-            period_from=successor_period_from,
-            period_to=successor_period_to,
-            status="fixed",
-            comment=f"Successor MRP для run {int(predecessor.run_id)}",
-            created_by=started_by,
-            fixed_by=started_by,
-            fixed_at=successor_fixed_at,
-            predecessor_plan_id=int(predecessor_plan.id),
-            predecessor_run_id=int(predecessor.run_id),
-            lineage_reason=REBASE_REASON,
-            lineage_context=context,
+    old_remaining_by_item: dict[int, Decimal] = defaultdict(lambda: ZERO)
+    old_reservations = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == parent_generation_id,
+        models.ReservationEntry.run_id == int(predecessor.run_id),
+        models.ReservationEntry.lifecycle_status == "active",
+    ).all()
+    for reservation in old_reservations:
+        old_remaining_by_item[int(reservation.item_id)] += max(
+            _dec(reservation.reserved_qty) - _dec(reservation.realized_qty), ZERO
         )
-        db.add(successor)
-        db.flush()
-        for row in successor_rows:
-            db.add(
-                models.ProductionPlanLine(
-                    plan_id=int(successor.id),
-                    item_id=int(row["item_id"]),
-                    bucket_date=row["bucket_date"],
-                    qty=row["qty"],
-                )
-            )
-        db.flush()
-
-    predecessor_plan.closed_reason = REBASE_REASON
-    predecessor_plan.lineage_context = {
-        **dict(predecessor_plan.lineage_context or {}),
-        "closed_by_rebase": context,
-    }
 
     from app.services.obligation_refresh_orchestrator import run_obligation_refresh
 
@@ -312,28 +239,56 @@ def rebase_fixed_plan_remaining_roots(
             db,
             parent_generation_id=parent_generation_id,
             generation_key=generation_key,
-            add_plan_ids=((int(successor.id),) if successor is not None else ()),
-            retire_plan_ids=(int(predecessor_plan.id),),
+            add_plan_ids=(),
+            retire_plan_ids=(
+                () if successor_rows else (int(predecessor_plan.id),)
+            ),
+            replace_plan_ids=(
+                (int(predecessor_plan.id),) if successor_rows else ()
+            ),
             started_by=started_by or f"specification_rebase:{int(predecessor.run_id)}",
             horizon_days=predecessor.horizon_days,
             config_version_id=predecessor.config_version_id,
             config_snapshot=dict(predecessor.config_snapshot or {}),
         )
         successor_run = None
-        if successor is not None:
+        if successor_rows:
             successor_run = (
                 db.query(models.PlanningRun)
                 .filter(
-                    models.PlanningRun.source_plan_id == int(successor.id),
+                    models.PlanningRun.source_plan_id == int(predecessor_plan.id),
+                    models.PlanningRun.prior_run_id == int(predecessor.run_id),
                     models.PlanningRun.status == "FIXED_SNAPSHOT",
                 )
                 .one()
             )
+        new_required_by_item: dict[int, Decimal] = defaultdict(lambda: ZERO)
+        if successor_run is not None:
+            for requirement in db.query(models.MrpRequirement).filter(
+                models.MrpRequirement.run_id == int(successor_run.run_id)
+            ).all():
+                new_required_by_item[int(requirement.item_id)] += _dec(
+                    requirement.total_required_qty
+                )
+        correction = [
+            {
+                "item_id": item_id,
+                "old_remaining": str(old_remaining_by_item.get(item_id, ZERO)),
+                "new_required": str(new_required_by_item.get(item_id, ZERO)),
+                "delta": str(
+                    new_required_by_item.get(item_id, ZERO)
+                    - old_remaining_by_item.get(item_id, ZERO)
+                ),
+            }
+            for item_id in sorted(set(old_remaining_by_item) | set(new_required_by_item))
+        ]
         result = {
-            "status": "rebased" if successor is not None else "closed_complete",
+            "status": "rebased" if successor_run is not None else "closed_complete",
             "predecessor_plan_id": int(predecessor_plan.id),
             "predecessor_run_id": int(predecessor.run_id),
-            "successor_plan_id": int(successor.id) if successor is not None else None,
+            "successor_plan_id": (
+                int(predecessor_plan.id) if successor_run is not None else None
+            ),
             "successor_run_id": (
                 int(successor_run.run_id) if successor_run is not None else None
             ),
@@ -346,6 +301,7 @@ def rebase_fixed_plan_remaining_roots(
                 }
                 for row in successor_rows
             ],
+            "component_correction": correction,
             "dry_run": bool(dry_run),
         }
         if dry_run:

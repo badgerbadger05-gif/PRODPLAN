@@ -8,7 +8,7 @@ work in one outer transaction.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
@@ -286,5 +286,88 @@ def create_added_candidate_run(
         pinned=False,
     )
     db.add(candidate)
+    db.flush()
+    return candidate
+
+
+def create_replacement_candidate_run(
+    db: Session,
+    parent_run_id: int,
+    target_generation_id: int,
+    started_by: str | None,
+    *,
+    horizon_days: int | None,
+    config_version_id: int | None,
+    config_snapshot: dict,
+) -> models.PlanningRun:
+    """Create the next MRP run for the same immutable production plan."""
+    parent = db.get(models.PlanningRun, int(parent_run_id))
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    if (
+        parent is None
+        or str(parent.status) != "FIXED_SNAPSHOT"
+        or parent.source_plan_id is None
+    ):
+        raise PlanningRunCandidateError("replacement parent must be a live fixed MRP")
+    plan = db.get(models.ProductionPlanHeader, int(parent.source_plan_id))
+    if plan is None or str(plan.status) != "fixed":
+        raise PlanningRunCandidateError("replacement source plan must remain fixed")
+    if target is None or str(target.status) != "building" or target.cutoff is None:
+        raise PlanningRunCandidateError("replacement target must be a dated BUILDING generation")
+
+    existing = db.query(models.PlanningRun).filter(
+        models.PlanningRun.ledger_generation_id == int(target.id),
+        models.PlanningRun.source_plan_id == int(plan.id),
+        models.PlanningRun.status == "BUILDING_SNAPSHOT",
+    ).one_or_none()
+    if existing is not None:
+        if int(existing.prior_run_id or -1) != int(parent.run_id):
+            raise PlanningRunCandidateError("replacement candidate lineage conflicts")
+        return existing
+
+    started_at = _as_utc(target.cutoff, "target cutoff") + timedelta(microseconds=1)
+    candidate = models.PlanningRun(
+        status="BUILDING_SNAPSHOT",
+        prior_run_id=int(parent.run_id),
+        ledger_generation_id=int(target.id),
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        horizon_days=horizon_days,
+        config_version_id=config_version_id,
+        config_snapshot=deepcopy(config_snapshot),
+        started_by=started_by,
+        started_at=started_at,
+        finished_at=None,
+        fixed_at=None,
+        warnings={},
+        kpi={},
+        active_freeze_version=None,
+        pinned=False,
+    )
+    db.add(candidate)
+    db.flush()
+
+    lines = db.query(models.ProductionPlanLine).filter(
+        models.ProductionPlanLine.plan_id == int(plan.id)
+    ).order_by(models.ProductionPlanLine.id).all()
+    for line in lines:
+        remaining = (
+            line.remaining_output_qty
+            if line.remaining_output_qty is not None
+            else max(
+                (line.qty or 0) - (line.accepted_output_qty or 0),
+                0,
+            )
+        )
+        if remaining <= 0:
+            continue
+        db.add(models.MrpRunRoot(
+            run_id=int(candidate.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=remaining,
+            accepted_qty=0,
+            remaining_qty=remaining,
+        ))
     db.flush()
     return candidate

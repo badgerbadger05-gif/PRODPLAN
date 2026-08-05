@@ -632,6 +632,13 @@ def test_rerun_rewrites_rows_its_interrupted_worker_never_persisted(db_session):
     first = materialize_assembly_output_allocations(db_session, generation.id)
     db_session.query(models.AssemblyOutputAllocation).delete()
     db_session.query(models.AssemblyOutputFactDecision).delete()
+    db_session.query(models.ProductionPlanExecutionFact).delete()
+    line = db_session.query(models.ProductionPlanLine).one()
+    root = db_session.query(models.MrpRunRoot).one()
+    line.accepted_output_qty = Decimal("0")
+    line.remaining_output_qty = Decimal("5")
+    root.accepted_qty = Decimal("0")
+    root.remaining_qty = Decimal("5")
     db_session.flush()
 
     second = materialize_assembly_output_allocations(db_session, generation.id)
@@ -688,12 +695,13 @@ def test_isolated_by_generation_physical_prefix(db_session):
     assert first["ledger_generation_id"] == int(generation_a.id)
     assert second["ledger_generation_id"] == int(generation_b.id)
     assert first["fact_qty"] == "5"
-    # A later physical batch names the full immutable prefix, not only its delta.
-    assert second["fact_qty"] == "11"
+    # Accepted assignments are persisted once. A later generation processes
+    # only facts not already written to plan execution.
+    assert second["fact_qty"] == "6"
     assert first["batch_id"] != second["batch_id"]
 
 
-def test_live_plan_allocation_is_rebuilt_in_next_generation_without_mutating_history(
+def test_live_plan_allocation_appends_only_new_facts_in_next_generation(
     db_session,
 ):
     cutoff_a = datetime(2026, 7, 10, tzinfo=timezone.utc)
@@ -738,9 +746,8 @@ def test_live_plan_allocation_is_rebuilt_in_next_generation_without_mutating_his
     )
     assert historical.allocated_qty == Decimal("5")
 
-    # A live fixed plan is projected again in the next generation. The new
-    # projection sees the immutable physical prefix; the old allocation stays
-    # generation-scoped history.
+    # The next generation sees only the new fact. The stored plan/run execution
+    # already contains the first five and is advanced to seven exactly once.
     run.ledger_generation_id = int(generation_b.id)
     run.ledger_cutoff = cutoff_b
     _sline(
@@ -763,9 +770,17 @@ def test_live_plan_allocation_is_rebuilt_in_next_generation_without_mutating_his
         .all()
     )
 
-    assert sum((row.allocated_qty for row in current), Decimal("0")) == Decimal("7")
+    assert sum((row.allocated_qty for row in current), Decimal("0")) == Decimal("2")
     assert historical.allocated_qty == Decimal("5")
     assert {row.ledger_generation_id for row in current} == {generation_b.id}
+    db_session.refresh(line)
+    root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=run.run_id, plan_line_id=line.id
+    ).one()
+    assert line.accepted_output_qty == Decimal("7")
+    assert line.remaining_output_qty == Decimal("3")
+    assert root.accepted_qty == Decimal("7")
+    assert root.remaining_qty == Decimal("3")
 
 
 def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):

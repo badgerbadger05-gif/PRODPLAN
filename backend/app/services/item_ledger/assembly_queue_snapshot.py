@@ -120,31 +120,29 @@ def _build_rows_by_scope(
     if generation is None:
         raise ValueError("assembly queue snapshot generation not found")
     run_ids = live_plan_run_ids(db, generation)
-    accepted_allocations = (
-        db.query(
-            models.AssemblyOutputAllocation.plan_line_id.label("plan_line_id"),
+    legacy_accepted_by_line = {
+        int(line_id): _dec(qty)
+        for line_id, qty in db.query(
+            models.AssemblyOutputAllocation.plan_line_id,
             func.coalesce(
                 func.sum(models.AssemblyOutputAllocation.allocated_qty),
                 Decimal("0"),
-            ).label("accepted_plan_output_qty"),
+            ),
         )
         .filter(
-            models.AssemblyOutputAllocation.ledger_generation_id == int(generation_id),
+            models.AssemblyOutputAllocation.ledger_generation_id
+            == int(generation_id)
         )
         .group_by(models.AssemblyOutputAllocation.plan_line_id)
-        .subquery()
-    )
-
+        .all()
+    }
     rows = (
         db.query(
             models.ProductionPlanLine,
             models.PlanningRun,
             models.ProductionPlanHeader,
             models.Item,
-            func.coalesce(
-                accepted_allocations.c.accepted_plan_output_qty,
-                Decimal("0"),
-            ).label("accepted_plan_output_qty"),
+            models.MrpRunRoot,
         )
         .join(
             models.ProductionPlanHeader,
@@ -159,8 +157,11 @@ def _build_rows_by_scope(
         )
         .join(models.Item, models.Item.item_id == models.ProductionPlanLine.item_id)
         .outerjoin(
-            accepted_allocations,
-            accepted_allocations.c.plan_line_id == models.ProductionPlanLine.id,
+            models.MrpRunRoot,
+            and_(
+                models.MrpRunRoot.run_id == models.PlanningRun.run_id,
+                models.MrpRunRoot.plan_line_id == models.ProductionPlanLine.id,
+            ),
         )
         .filter(
             models.ProductionPlanHeader.status == "fixed",
@@ -176,17 +177,35 @@ def _build_rows_by_scope(
     )
 
     lines: list[dict[str, Any]] = []
-    for line, run, plan, item, accepted_plan_output_qty in rows:
-        planned_output_qty = _dec(line.qty)
-        accepted_output_qty = _dec(accepted_plan_output_qty)
-        assembly_remaining_qty = max(planned_output_qty - accepted_output_qty, Decimal("0"))
+    for line, run, plan, item, root in rows:
+        # Legacy rows without run roots remain readable during migration only.
+        # Every newly frozen run owns an explicit MrpRunRoot.
+        planned_output_qty = _dec(root.planned_qty if root is not None else line.qty)
+        accepted_output_qty = _dec(
+            root.accepted_qty
+            if root is not None
+            else legacy_accepted_by_line.get(int(line.id), line.accepted_output_qty)
+        )
+        assembly_remaining_qty = _dec(
+            root.remaining_qty
+            if root is not None
+            else (
+                line.remaining_output_qty
+                if line.remaining_output_qty is not None
+                else max(_dec(line.qty) - accepted_output_qty, Decimal("0"))
+            )
+        )
         if not include_zero and assembly_remaining_qty <= Decimal("0"):
             continue
 
         plan_id = int(plan.id)
         line_id = int(line.id)
         run_id = int(run.run_id)
-        eligible_from = plan.fixed_at or run.fixed_at
+        eligible_from = (
+            run.started_at
+            if run.prior_run_id is not None
+            else (plan.fixed_at or run.fixed_at)
+        )
         period_from, period_to = _frozen_run_period(run, plan)
         priority = _priority_key(period_from, period_to, plan_id, line_id)
         sort_key = _sort_key(period_from, period_to, plan_id, line_id)

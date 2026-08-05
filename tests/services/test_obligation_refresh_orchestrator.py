@@ -79,14 +79,73 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     return accepted, plan, line, item, parent, cutoff
 
 
-def _run(db, parent, key, *, add=(), config=None, pool_mapping=None):
+def _run(db, parent, key, *, add=(), replace=(), config=None, pool_mapping=None):
     return workflow.run_obligation_refresh(
         db, parent_generation_id=parent.id, generation_key=key, add_plan_ids=add,
+        replace_plan_ids=replace,
         started_by="test", horizon_days=30, config_version_id=None,
         config_snapshot=config or {},
         planning_pool_by_warehouse=pool_mapping,
         accepted_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
+
+
+def test_replacement_is_end_to_end_same_plan_saved_remainder_without_history_replay(db_session):
+    accepted, plan, line, _item, parent, _cutoff = _world(
+        db_session,
+        qty=12,
+    )
+    line.accepted_output_qty = Decimal("10")
+    line.remaining_output_qty = Decimal("2")
+    line.locked_by_run_id = parent.run_id
+    db_session.add(models.MrpRunRoot(
+        run_id=parent.run_id,
+        plan_line_id=line.id,
+        planned_qty=Decimal("12"),
+        accepted_qty=Decimal("10"),
+        remaining_qty=Decimal("2"),
+    ))
+    db_session.commit()
+
+    result = _run(
+        db_session,
+        accepted,
+        "orch-replace-saved-remainder",
+        replace=[plan.id],
+    )
+
+    candidate = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=parent.run_id,
+    ).one()
+    root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=candidate.run_id,
+    ).one()
+    replay_batch = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=result.target_generation_id,
+        stage="reservation_replay",
+    ).one()
+    execution_snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=result.target_generation_id,
+        consumer="period_plan_execution",
+        snapshot_key=f"plan={plan.id};run={candidate.run_id}",
+    ).one()
+
+    assert result.published is True
+    assert db_session.query(models.ProductionPlanHeader).count() == 1
+    assert int(candidate.source_plan_id) == int(plan.id)
+    assert parent.status == "CLOSED"
+    assert candidate.status == "FIXED_SNAPSHOT"
+    assert root.planned_qty == Decimal("2")
+    assert root.accepted_qty == Decimal("0")
+    assert root.remaining_qty == Decimal("2")
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("10")
+    assert line.remaining_output_qty == Decimal("2")
+    assert line.locked_by_run_id == candidate.run_id
+    assert replay_batch.metrics["replay_summary"]["status"] == "skipped_same_cutoff_rebase"
+    assert execution_snapshot.payload["rows"] == []
+    assert execution_snapshot.payload["summary"]["execution_completed_qty"] == 0
+    assert execution_snapshot.payload["summary"]["execution_base_qty"] == 2
 
 
 def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(db_session):

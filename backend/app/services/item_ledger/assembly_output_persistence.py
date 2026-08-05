@@ -99,6 +99,18 @@ def _load_visible_facts(
     if generation.cutoff is None:
         raise ValueError("assembly output allocation requires generation cutoff")
 
+    current_generation_allocated_sle = db.query(
+        models.AssemblyOutputAllocation.stock_ledger_entry_id
+    ).filter(
+        models.AssemblyOutputAllocation.ledger_generation_id == int(generation.id)
+    )
+    already_accepted_sle = db.query(
+        models.ProductionPlanExecutionFact.stock_ledger_entry_id
+    ).filter(
+        ~models.ProductionPlanExecutionFact.stock_ledger_entry_id.in_(
+            current_generation_allocated_sle
+        )
+    )
     rows = (
         visible_sle_query(
             db,
@@ -108,6 +120,7 @@ def _load_visible_facts(
         .filter(
             models.StockLedgerEntry.movement_kind == "assembly_in",
             models.StockLedgerEntry.qty > 0,
+            ~models.StockLedgerEntry.id.in_(already_accepted_sle),
         )
         .order_by(
             models.StockLedgerEntry.posting_at.asc(),
@@ -157,6 +170,7 @@ def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandida
 
         candidates.append(
             QueueCandidate(
+                run_id=int(row.planning_run_id),
                 plan_id=int(row.plan_id),
                 plan_line_id=int(row.plan_line_id),
                 item_id=int(row.item_id),
@@ -346,6 +360,7 @@ def _candidate_rows_for_fact(
             continue
         ordered.append(
             QueueCandidate(
+                run_id=int(candidate.run_id),
                 plan_id=int(candidate.plan_id),
                 plan_line_id=int(candidate.plan_line_id),
                 item_id=int(candidate.item_id),
@@ -417,6 +432,7 @@ def _expected_signatures(
             allocation_rows.append(
                 {
                     "stock_ledger_entry_id": int(allocation.stock_ledger_entry_id),
+                    "run_id": int(allocation.run_id),
                     "plan_id": int(allocation.plan_id),
                     "plan_line_id": int(allocation.plan_line_id),
                     "allocated_qty": _qty_text(allocation.qty),
@@ -565,6 +581,7 @@ def _signature_allocations(
         [
             {
                 "stock_ledger_entry_id": int(row.stock_ledger_entry_id),
+                "run_id": int(row.run_id or 0),
                 "plan_id": int(row.plan_id),
                 "plan_line_id": int(row.plan_line_id),
                 "allocated_qty": _qty_text(row.allocated_qty),
@@ -575,6 +592,7 @@ def _signature_allocations(
         ],
         key=lambda row: (
             int(row["stock_ledger_entry_id"]),
+            int(row["run_id"]),
             int(row["plan_id"]),
             int(row["plan_line_id"]),
             int(row["allocation_ordinal"]),
@@ -689,6 +707,7 @@ def _persist_rows(
             models.AssemblyOutputAllocation(
                 ledger_generation_id=int(generation.id),
                 stock_ledger_entry_id=int(alloc["stock_ledger_entry_id"]),
+                run_id=int(alloc["run_id"]),
                 plan_id=int(alloc["plan_id"]),
                 plan_line_id=int(alloc["plan_line_id"]),
                 allocated_qty=_dec(alloc["allocated_qty"]),
@@ -696,6 +715,54 @@ def _persist_rows(
                 allocation_ordinal=int(alloc["allocation_ordinal"]),
             )
         )
+
+        line = db.get(models.ProductionPlanLine, int(alloc["plan_line_id"]))
+        root = (
+            db.query(models.MrpRunRoot)
+            .filter(
+                models.MrpRunRoot.run_id == int(alloc["run_id"]),
+                models.MrpRunRoot.plan_line_id == int(alloc["plan_line_id"]),
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if line is None:
+            raise ValueError("assembly allocation references missing plan line")
+        if root is None:
+            planned = max(_dec(line.qty), Decimal("0"))
+            accepted = max(_dec(line.accepted_output_qty), Decimal("0"))
+            remaining = (
+                _dec(line.remaining_output_qty)
+                if line.remaining_output_qty is not None
+                else max(planned - accepted, Decimal("0"))
+            )
+            root = models.MrpRunRoot(
+                run_id=int(alloc["run_id"]),
+                plan_line_id=int(alloc["plan_line_id"]),
+                planned_qty=remaining,
+                accepted_qty=Decimal("0"),
+                remaining_qty=remaining,
+            )
+            db.add(root)
+            line.accepted_output_qty = accepted
+            line.remaining_output_qty = remaining
+            db.flush()
+        qty = _dec(alloc["allocated_qty"])
+        if qty > _dec(root.remaining_qty) or qty > _dec(line.remaining_output_qty):
+            raise ValueError("assembly allocation exceeds persisted execution remainder")
+        db.add(models.ProductionPlanExecutionFact(
+            stock_ledger_entry_id=int(alloc["stock_ledger_entry_id"]),
+            plan_id=int(alloc["plan_id"]),
+            plan_line_id=int(alloc["plan_line_id"]),
+            run_id=int(alloc["run_id"]),
+            allocated_qty=qty,
+            match_rule=_text(alloc["match_rule"]),
+            accepted_at=generation.cutoff or datetime.now(timezone.utc),
+        ))
+        line.accepted_output_qty = _dec(line.accepted_output_qty) + qty
+        line.remaining_output_qty = max(_dec(line.remaining_output_qty) - qty, Decimal("0"))
+        root.accepted_qty = _dec(root.accepted_qty) + qty
+        root.remaining_qty = max(_dec(root.remaining_qty) - qty, Decimal("0"))
 
     db.flush()
 

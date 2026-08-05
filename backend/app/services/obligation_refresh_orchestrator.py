@@ -191,6 +191,7 @@ def _complete(batch: models.LedgerBuildBatch, metrics: Mapping[str, Any]) -> Non
 def _manifest_request_matches(
     target: models.LedgerGeneration,
     *, add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
+    replace_plan_ids: Iterable[int],
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
@@ -207,6 +208,7 @@ def _manifest_request_matches(
         expected = {
             "plan_ids": sorted(int(v) for v in add_plan_ids),
             "retire_plan_ids": sorted(int(v) for v in retire_plan_ids),
+            "replace_plan_ids": sorted(int(v) for v in replace_plan_ids),
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": dict(config_snapshot),
@@ -254,6 +256,7 @@ def _publish_retained_mrp_snapshots(
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
+    replace_plan_ids: Iterable[int],
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
@@ -261,6 +264,7 @@ def _retry_published(
 ) -> ObligationRefreshOrchestrationResult:
     _manifest_request_matches(
         target, add_plan_ids=add_plan_ids, retire_plan_ids=retire_plan_ids,
+        replace_plan_ids=replace_plan_ids,
         horizon_days=horizon_days,
                               config_version_id=config_version_id, config_snapshot=config_snapshot,
                               planning_pool_by_warehouse=planning_pool_by_warehouse)
@@ -303,6 +307,7 @@ def run_obligation_refresh(
     generation_key: str,
     add_plan_ids: Iterable[int] = (),
     retire_plan_ids: Iterable[int] = (),
+    replace_plan_ids: Iterable[int] = (),
     started_by: str | None = None,
     horizon_days: int | None = None,
     config_version_id: int | None = None,
@@ -327,12 +332,20 @@ def run_obligation_refresh(
     config = dict(config_snapshot or {})
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
     retire_ids = tuple(sorted(int(v) for v in retire_plan_ids))
+    replace_ids = tuple(sorted(int(v) for v in replace_plan_ids))
+    incremental_rebase = bool(replace_ids) and not add_ids and not retire_ids
     if len(add_ids) != len(set(add_ids)) or any(v <= 0 for v in add_ids):
         raise ValueError("add_plan_ids must be unique positive ids")
     if len(retire_ids) != len(set(retire_ids)) or any(v <= 0 for v in retire_ids):
         raise ValueError("retire_plan_ids must be unique positive ids")
-    if set(add_ids).intersection(retire_ids):
-        raise ValueError("a plan cannot be added and retired together")
+    if len(replace_ids) != len(set(replace_ids)) or any(v <= 0 for v in replace_ids):
+        raise ValueError("replace_plan_ids must be unique positive ids")
+    if (
+        set(add_ids).intersection(retire_ids)
+        or set(add_ids).intersection(replace_ids)
+        or set(retire_ids).intersection(replace_ids)
+    ):
+        raise ValueError("add, retire and replace plan sets must be disjoint")
     if len(add_ids) > 1:
         # The freeze anchors the shared stock baseline at the earliest
         # period_from of the batch: mixing periods would net a later plan
@@ -379,6 +392,7 @@ def run_obligation_refresh(
         return _retry_published(
             db, existing, parent_generation_id=original_parent_id,
             add_plan_ids=add_ids, retire_plan_ids=retire_ids,
+            replace_plan_ids=replace_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
             planning_pool_by_warehouse=pool_mapping,
             allow_stale_parent=bool(allow_stale_parent),
@@ -401,7 +415,8 @@ def run_obligation_refresh(
     target_id = int(fork.ledger_generation_id)
     manifest = create_obligation_refresh_manifest(
         db, int(parent_generation_id), target_id, add_ids,
-        retire_plan_ids=retire_ids, started_by=started_by,
+        retire_plan_ids=retire_ids, replace_plan_ids=replace_ids,
+        started_by=started_by,
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
         planning_pool_by_warehouse=pool_mapping,
     )
@@ -420,6 +435,7 @@ def run_obligation_refresh(
         parent_generation_id=int(parent_generation_id),
         target_generation_id=target_id,
         retained_run_ids=retained_run_ids,
+        preserve_realization=incremental_rebase,
     )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
@@ -475,12 +491,36 @@ def run_obligation_refresh(
         "input_checksum": sha256(_canonical({"candidate_run_ids": candidate_ids, "freeze": freeze}).encode()).hexdigest(),
     }
     _complete(reservation_batch, reservation_metrics)
-    replay = replay_candidate_realizations(db, target_id)
-    supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
-        db,
-        ledger_generation_id=target_id,
-        cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
-    )
+    if incremental_rebase:
+        # Same physical cutoff: retained folds are copied as persisted state,
+        # while replacement reservations intentionally start empty. Replaying
+        # the historical prefix would assign old facts to the new MRP and was
+        # the multi-hour source of the previous implementation.
+        replay = {"status": "skipped_same_cutoff_rebase", "facts": 0}
+        supplier_summary = {
+            "provenance_count": 0,
+            "exact_fact_count": 0,
+            "allocation_count": 0,
+            "surplus_qty": "0",
+        }
+        replay_batch = _single_stage(db, target_id, "reservation_replay", key)
+        _complete(replay_batch, {
+            "replay_summary": _json_value(replay),
+            "supplier_receipt_summary": _json_value(supplier_summary),
+        })
+    else:
+        replay = replay_candidate_realizations(db, target_id)
+        supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+            db,
+            ledger_generation_id=target_id,
+            cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
+        )
+        supplier_summary = {
+            "provenance_count": supplier.provenance_count,
+            "exact_fact_count": supplier.exact_fact_count,
+            "allocation_count": supplier.allocation_count,
+            "surplus_qty": supplier.surplus_qty,
+        }
     # Work items are a persisted projection of the reservation fold.  Both
     # make and supplier realizations must therefore be applied first; building
     # this projection earlier freezes stale ``fulfilled_qty``/``remaining_qty``
@@ -529,12 +569,7 @@ def run_obligation_refresh(
         "assembly_output_summary": _json_value(assembly_outputs),
         "drum_schedule_summary": _json_value(drum_schedule),
         "shelf_projection_summary": _json_value(shelf_projection),
-        "supplier_receipt_summary": _json_value({
-            "provenance_count": supplier.provenance_count,
-            "exact_fact_count": supplier.exact_fact_count,
-            "allocation_count": supplier.allocation_count,
-            "surplus_qty": supplier.surplus_qty,
-        }),
+        "supplier_receipt_summary": _json_value(supplier_summary),
         "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
         "production_control_journal_snapshot_id": int(production_journal_snapshot.id),
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
