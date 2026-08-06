@@ -232,6 +232,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     parent = _accepted_parent_fixture(db_session)
     got_filter: list[str] = []
     got_strict = {"value": False}
+    opening_at = datetime(2026, 5, 31, 20, 59, 59, tzinfo=timezone.utc)
 
     class DummyClient:
         base_url = "https://example.local/odata"
@@ -262,7 +263,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
         assert kwargs["target_cutoff"].tzinfo is not None
         assert kwargs["discovery_lookback"] is None
         assert kwargs["audit_all_known_recorders"] is False
-        assert "opening_balance_loader" not in kwargs
+        assert kwargs["opening_balance_loader"](opening_at) == {}
         return Result()
 
     monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
@@ -278,7 +279,13 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     expected_cutoff = now.astimezone(ZoneInfo("Europe/Moscow")).replace(
         tzinfo=None, microsecond=0
     ).isoformat()
-    assert got_filter == [f"Period le datetime'{expected_cutoff}'"]
+    expected_opening = opening_at.astimezone(ZoneInfo("Europe/Moscow")).replace(
+        tzinfo=None, microsecond=0
+    ).isoformat()
+    assert got_filter == [
+        f"Period le datetime'{expected_cutoff}'",
+        f"Period le datetime'{expected_opening}'",
+    ]
     assert got_strict["value"] is True
     state = orch.status()["physical_refresh"]
     assert state["last_status"] == "ok"

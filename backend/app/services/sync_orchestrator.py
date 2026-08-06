@@ -615,16 +615,20 @@ def _run_physical_refresh_job(
             "result": {"accepted": True, "candidate_runs": 0, "recovered": True},
         }
     client = _build_client()
-    filter_query = f"Period le datetime'{_odata_datetime(target_cutoff)}'"
-    balance_rows = get_stock_from_1c_odata(
-        base_url=client.base_url,
-        entity_name=_PHYSICAL_REFRESH_ENTITY,
-        username=client.username,
-        password=client.password,
-        token=client.token,
-        filter_query=filter_query,
-    )
-    balance_snapshot = build_balance_snapshot(db, balance_rows, strict=True)
+
+    def _balance_snapshot_at(cutoff: datetime):
+        filter_query = f"Period le datetime'{_odata_datetime(cutoff)}'"
+        balance_rows = get_stock_from_1c_odata(
+            base_url=client.base_url,
+            entity_name=_PHYSICAL_REFRESH_ENTITY,
+            username=client.username,
+            password=client.password,
+            token=client.token,
+            filter_query=filter_query,
+        )
+        return build_balance_snapshot(db, balance_rows, strict=True)
+
+    balance_snapshot = _balance_snapshot_at(target_cutoff)
 
     result = run_physical_refresh(
         db,
@@ -632,10 +636,15 @@ def _run_physical_refresh_job(
         target_cutoff=target_cutoff,
         client=client,
         balance_snapshot=balance_snapshot,
+        # A late-posted/cancelled movement before the retained T0 changes 1C's
+        # answer at the opening boundary without appearing in the post-T0
+        # recorder manifest.  Reconcile that one persisted prefix directly;
+        # it writes only key deltas and does not replay historical documents.
+        opening_balance_loader=_balance_snapshot_at,
         # The automatic path advances current facts incrementally.  Re-auditing
-        # every historical recorder and rebuilding the opening boundary turned
-        # each hourly refresh into a multi-hour historical replay.  Full audit
-        # remains available to the explicit maintenance workflow.
+        # every historical recorder turned each hourly refresh into a
+        # multi-hour historical replay. Full audit remains available only to
+        # the explicit maintenance workflow.
         # Manifest discovery over retained history is cheap and catches a
         # document posted today with an old Period.  The import service compares
         # this manifest (identity, row count, balance hash) with the accepted
