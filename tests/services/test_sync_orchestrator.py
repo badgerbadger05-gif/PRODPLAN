@@ -369,6 +369,52 @@ def test_missing_balance_item_forces_nomenclature_before_physical_retry(
     assert nomenclature["forced_due_at"] == now.isoformat()
 
 
+def test_convergence_failure_discards_stale_candidate_before_retry(
+    tmp_state, db_session, monkeypatch
+):
+    _accepted_parent_fixture(db_session)
+    monkeypatch.setattr(
+        orch,
+        "load_odata_config",
+        lambda: {"base_url": "http://x/unf_demo/odata"},
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {
+            "pending": 0,
+            "error_retryable": 0,
+            "error_exhausted": 0,
+            "ready": 0,
+        },
+    )
+    discarded: list[int] = []
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            orch.PhysicalRefreshBalanceConvergenceError(51, "moved balance")
+        ),
+    )
+    monkeypatch.setattr(
+        orch,
+        "discard_physical_refresh_candidate",
+        lambda _db, *, ledger_generation_id, reason: discarded.append(
+            ledger_generation_id
+        ),
+    )
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    failed = orch.tick(db=db_session, now=now)
+
+    assert failed["status"] == "error"
+    assert failed["discarded_candidate_id"] == 51
+    assert discarded == [51]
+    state = orch.status()["physical_refresh"]
+    assert state["active_cutoff"] is None
+    assert state["active_generation_key"] is None
+
+
 def test_physical_refresh_drops_identity_of_discarded_candidate(
     tmp_state, db_session, monkeypatch
 ):

@@ -57,7 +57,13 @@ from .item_ledger.reconcile import (
     BalanceSnapshotItemResolutionError,
     build_balance_snapshot,
 )
-from .item_ledger.physical_refresh_orchestrator import run_physical_refresh
+from .item_ledger.physical_refresh_discard import (
+    discard_physical_refresh_candidate,
+)
+from .item_ledger.physical_refresh_orchestrator import (
+    PhysicalRefreshBalanceConvergenceError,
+    run_physical_refresh,
+)
 from .odata_client import get_stock_from_1c_odata
 from .. import models
 
@@ -895,6 +901,24 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             except Exception as exc:  # noqa: BLE001
                 _rollback_if_possible(db)
                 dependency_job_forced_due = None
+                discarded_candidate_id = None
+                if isinstance(exc, PhysicalRefreshBalanceConvergenceError):
+                    # Convergence compares an immutable candidate cutoff with
+                    # a balance snapshot read from 1C.  Once that comparison
+                    # fails, reusing the same candidate on a later tick can
+                    # never prove a current snapshot: 1C keeps moving while
+                    # the candidate remains frozen.  Roll it back through the
+                    # checked discard path and let the next retry fork from the
+                    # accepted parent with a new cutoff.
+                    discard_physical_refresh_candidate(
+                        db,
+                        ledger_generation_id=exc.ledger_generation_id,
+                        reason="automatic rotation after balance convergence failure",
+                    )
+                    db.commit()
+                    discarded_candidate_id = exc.ledger_generation_id
+                    physical_state["active_cutoff"] = None
+                    physical_state["active_generation_key"] = None
                 if isinstance(exc, BalanceSnapshotItemResolutionError):
                     # A new item may appear in stock or production between the
                     # daily nomenclature pulls. Do not leave physical truth
@@ -930,6 +954,8 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                     result["dependency_job_forced_due"] = (
                         dependency_job_forced_due
                     )
+                if discarded_candidate_id is not None:
+                    result["discarded_candidate_id"] = discarded_candidate_id
             _save_state(state, required=True)
             result["duration_ms"] = physical_state["last_duration_ms"]
             return result

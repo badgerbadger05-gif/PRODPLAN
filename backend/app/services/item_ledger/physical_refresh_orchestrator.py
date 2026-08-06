@@ -46,6 +46,14 @@ class PhysicalRefreshOrchestratorError(RuntimeError):
     """A complete fresh truth could not be proved and was not published."""
 
 
+class PhysicalRefreshBalanceConvergenceError(PhysicalRefreshOrchestratorError):
+    """A persisted candidate no longer matches the 1C balance at its cutoff."""
+
+    def __init__(self, ledger_generation_id: int, message: str):
+        self.ledger_generation_id = int(ledger_generation_id)
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class PhysicalRefreshOrchestrationResult:
     parent_generation_id: int
@@ -271,7 +279,8 @@ def run_physical_refresh(
         # false; neither operation moves the public planning-truth pointer.
         db.commit()
         if not convergence.valid:
-            raise PhysicalRefreshOrchestratorError(
+            raise PhysicalRefreshBalanceConvergenceError(
+                int(fork.ledger_generation_id),
                 f"Balance convergence failed: {convergence.mismatched} mismatches"
                 f" ({_mismatch_digest(convergence)})"
             )
