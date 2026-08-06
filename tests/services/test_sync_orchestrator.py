@@ -484,13 +484,14 @@ def test_physical_refresh_drops_identity_of_discarded_candidate(
 
     monkeypatch.setattr(orch, "_run_physical_refresh_job", _fresh)
     monkeypatch.setattr(orch, "_due_jobs", lambda state, current: [])
-    retry_at = datetime.fromisoformat(stale["next_retry_at"])
-    result = orch.tick(db=db_session, now=retry_at + timedelta(seconds=1))
+    before_retry = now + timedelta(seconds=1)
+    assert before_retry < datetime.fromisoformat(stale["next_retry_at"])
+    result = orch.tick(db=db_session, now=before_retry)
 
     assert result["status"] == "ok"
     assert result["job"] == "physicalRefresh"
     assert seen["key"] != stale_key
-    assert seen["cutoff"] == (retry_at + timedelta(seconds=1)).replace(microsecond=0)
+    assert seen["cutoff"] == before_retry.replace(microsecond=0)
     assert orch.status()["physical_refresh"]["active_generation_key"] is None
 
 

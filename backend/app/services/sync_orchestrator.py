@@ -809,6 +809,29 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         )
         block_changed = _record_physical_block(physical_state, physical_block, now)
 
+        # A checked admin/automatic discard can move the persisted retry
+        # candidate out of BUILDING while its failure backoff is still active.
+        # Clear that dead identity before evaluating retry readiness; otherwise
+        # the supported discard path leaves current truth stale until the old
+        # candidate's timeout expires.
+        persisted_active_key = str(
+            physical_state.get("active_generation_key") or ""
+        ).strip()
+        if persisted_active_key:
+            persisted_candidate = (
+                db.query(models.LedgerGeneration)
+                .filter(models.LedgerGeneration.generation_key == persisted_active_key)
+                .one_or_none()
+            )
+            if (
+                persisted_candidate is not None
+                and str(persisted_candidate.status) != "building"
+            ):
+                physical_state["active_cutoff"] = None
+                physical_state["active_generation_key"] = None
+                physical_state["next_retry_at"] = None
+                physical_state["failure_count"] = 0
+
         # The physical slot competes with the reference schedule; both the
         # "queue has work" and the "interval elapsed" reasons must respect the
         # failure backoff, otherwise a permanently failing refresh retries every
@@ -835,27 +858,6 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             started = time.time()
             active_cutoff = _parse_iso(physical_state.get("active_cutoff"))
             active_key = str(physical_state.get("active_generation_key") or "").strip()
-            if active_key:
-                persisted_candidate = (
-                    db.query(models.LedgerGeneration)
-                    .filter(models.LedgerGeneration.generation_key == active_key)
-                    .one_or_none()
-                )
-                if (
-                    persisted_candidate is not None
-                    and str(persisted_candidate.status) != "building"
-                ):
-                    # The candidate this identity belonged to left BUILDING
-                    # outside the orchestrator (admin discard/rollback).
-                    # Reusing its cutoff would rebuild a dead candidate against
-                    # a moved 1C balance forever, and the accumulated backoff
-                    # belongs to those dead attempts — reset both.
-                    active_cutoff = None
-                    active_key = ""
-                    physical_state["active_cutoff"] = None
-                    physical_state["active_generation_key"] = None
-                    physical_state["next_retry_at"] = None
-                    physical_state["failure_count"] = 0
             if active_cutoff is None or not active_key:
                 active_parent = active_parent_for_inventory
                 recoverable = physical_inventory["recoverable"]
