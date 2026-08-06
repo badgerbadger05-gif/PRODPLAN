@@ -9,7 +9,7 @@ from threading import Lock
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, text
+from sqlalchemy import func, text, tuple_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -27,11 +27,17 @@ from .historical_import_orchestration import (
     run_historical_physical_import,
 )
 from .opening_balance_reconcile import (
+    ADJUSTMENT_RECORDER_TYPE,
     OpeningBalanceReconcileResult,
     opening_boundary,
     reconcile_opening_balance,
 )
-from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, physical_sequence_lock_context
+from .physical import (
+    PHYSICAL_SEQUENCE_LOCK_KEY,
+    SEED_RECORDER_TYPE,
+    physical_sequence_lock_context,
+)
+from .physical_visibility import visible_sle_query
 from .ingest import pull_recorder_movements
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
@@ -231,7 +237,32 @@ def _repair_mismatched_recorders(
         )
     opening_at = _utc(opening[1], "opening boundary")
     cutoff = _utc(generation.cutoff, "generation cutoff")
-    identities: set[tuple[str, str]] = set()
+    synthetic_types = {SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE}
+    candidate_identities: set[tuple[str, str]] = set()
+    candidate_rows = visible_sle_query(
+        db,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        cutoff=generation.cutoff,
+    ).filter(
+        tuple_(
+            models.StockLedgerEntry.item_id,
+            models.StockLedgerEntry.organization_ref,
+            models.StockLedgerEntry.warehouse_ref1c,
+        ).in_(mismatch_keys)
+    ).all()
+    for row in candidate_rows:
+        identity = (
+            str(row.recorder_type or ""),
+            str(row.recorder_ref or ""),
+        )
+        if identity[0] not in synthetic_types and identity[0] and identity[1]:
+            candidate_identities.add(identity)
+    if len(candidate_identities) > _TARGETED_REPAIR_MAX_RECORDERS:
+        raise PhysicalRefreshOrchestratorError(
+            "targeted convergence repair exceeded recorder limit"
+        )
+
+    current_identities: set[tuple[str, str]] = set()
 
     for item_id, item_ref in sorted(ref_by_item.items()):
         wanted = {
@@ -275,8 +306,8 @@ def _repair_mismatched_recorders(
                     _normalized_ref(row.get("Recorder")),
                 )
                 if identity[0] and identity[1]:
-                    identities.add(identity)
-            if len(identities) > _TARGETED_REPAIR_MAX_RECORDERS:
+                    current_identities.add(identity)
+            if len(candidate_identities | current_identities) > _TARGETED_REPAIR_MAX_RECORDERS:
                 raise PhysicalRefreshOrchestratorError(
                     "targeted convergence repair exceeded recorder limit"
                 )
@@ -284,6 +315,7 @@ def _repair_mismatched_recorders(
                 break
             offset += len(rows)
 
+    identities = candidate_identities | current_identities
     for recorder_type, recorder_ref in sorted(identities):
         result = pull_recorder_movements(
             db,
@@ -319,6 +351,8 @@ def _repair_mismatched_recorders(
             "version": "1",
             "mismatched_keys": len(mismatch_keys),
             "recorder_count": len(identities),
+            "candidate_recorder_count": len(candidate_identities),
+            "current_recorder_count": len(current_identities),
             "physical_import_batch_id": int(terminal),
         },
     }
