@@ -7,8 +7,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app import models
@@ -31,6 +32,7 @@ from .opening_balance_reconcile import (
     reconcile_opening_balance,
 )
 from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, physical_sequence_lock_context
+from .ingest import pull_recorder_movements
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
     run_physical_recorder_audit,
@@ -150,6 +152,8 @@ def _reconcile_opening_balance(
 
 
 _MISMATCH_SAMPLE = 5
+_TARGETED_REPAIR_PAGE_SIZE = 1000
+_TARGETED_REPAIR_MAX_RECORDERS = 500
 
 
 def _mismatch_digest(convergence: BalanceConvergenceResult) -> str:
@@ -169,6 +173,157 @@ def _mismatch_digest(convergence: BalanceConvergenceResult) -> str:
     if surplus > 0:
         sample = f"{sample}, +{surplus} more"
     return f"worst: {sample}" if sample else "no deltas retained"
+
+
+def _odata_local(value: datetime) -> str:
+    return _utc(value, "OData datetime").astimezone(
+        ZoneInfo("Europe/Moscow")
+    ).replace(tzinfo=None, microsecond=0).isoformat()
+
+
+def _normalized_ref(value: Any) -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("guid'") and raw.endswith("'"):
+        raw = raw[5:-1]
+    return raw.strip("{}").strip()
+
+
+def _normalized_recorder_type(value: Any) -> str:
+    raw = str(value or "").strip()
+    prefix = "StandardODATA."
+    return raw[len(prefix):] if raw.startswith(prefix) else raw
+
+
+def _repair_mismatched_recorders(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    client: Any,
+    convergence: BalanceConvergenceResult,
+) -> int:
+    """Re-pull only recorders touching mismatched balance keys.
+
+    This is the bounded fallback for a known 1C document that was re-posted
+    behind the accepted cutoff without changing its line count.  It queries
+    the flat register by the mismatched item, narrows rows by organisation and
+    warehouse, and never scans or pulls unrelated recorder contents.
+    """
+    mismatch_keys = {
+        (int(delta.item_id), str(delta.organization_ref), str(delta.warehouse_ref1c))
+        for delta in convergence.deltas
+        if not delta.matched
+    }
+    if not mismatch_keys:
+        return 0
+
+    item_rows = db.query(models.Item.item_id, models.Item.item_ref1c).filter(
+        models.Item.item_id.in_({key[0] for key in mismatch_keys})
+    ).all()
+    ref_by_item = {
+        int(item_id): _normalized_ref(item_ref)
+        for item_id, item_ref in item_rows
+        if _normalized_ref(item_ref)
+    }
+    opening = opening_boundary(db)
+    if opening is None:
+        raise PhysicalRefreshOrchestratorError(
+            "targeted convergence repair requires opening boundary"
+        )
+    opening_at = _utc(opening[1], "opening boundary")
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    identities: set[tuple[str, str]] = set()
+
+    for item_id, item_ref in sorted(ref_by_item.items()):
+        wanted = {
+            (org, warehouse)
+            for candidate_item, org, warehouse in mismatch_keys
+            if candidate_item == item_id
+        }
+        offset = 0
+        while True:
+            params = {
+                "$top": _TARGETED_REPAIR_PAGE_SIZE,
+                "$skip": offset,
+                "$filter": (
+                    f"Period gt datetime'{_odata_local(opening_at)}' and "
+                    f"Period le datetime'{_odata_local(cutoff)}' and "
+                    f"Номенклатура_Key eq guid'{item_ref}'"
+                ),
+                "$select": (
+                    "Period,Recorder,Recorder_Type,LineNumber,"
+                    "Организация_Key,СтруктурнаяЕдиница_Key"
+                ),
+                "$orderby": "Period,Recorder_Type,Recorder,LineNumber",
+            }
+            response = client._make_request(
+                "AccumulationRegister_ЗапасыНаСкладах_RecordType", params
+            )
+            rows = response.get("value") if isinstance(response, Mapping) else None
+            if not isinstance(rows, list):
+                raise PhysicalRefreshOrchestratorError(
+                    "targeted convergence repair received malformed register page"
+                )
+            for row in rows:
+                key = (
+                    _normalized_ref(row.get("Организация_Key")),
+                    _normalized_ref(row.get("СтруктурнаяЕдиница_Key")),
+                )
+                if key not in wanted:
+                    continue
+                identity = (
+                    _normalized_recorder_type(row.get("Recorder_Type")),
+                    _normalized_ref(row.get("Recorder")),
+                )
+                if identity[0] and identity[1]:
+                    identities.add(identity)
+            if len(identities) > _TARGETED_REPAIR_MAX_RECORDERS:
+                raise PhysicalRefreshOrchestratorError(
+                    "targeted convergence repair exceeded recorder limit"
+                )
+            if len(rows) < _TARGETED_REPAIR_PAGE_SIZE:
+                break
+            offset += len(rows)
+
+    for recorder_type, recorder_ref in sorted(identities):
+        result = pull_recorder_movements(
+            db,
+            recorder_type,
+            recorder_ref,
+            client=client,
+            source="physical_refresh_targeted_repair",
+            ledger_generation_id=None,
+            max_posting_at=generation.cutoff,
+            strict_historical=True,
+        )
+        if (
+            result.status not in {"done", "empty"}
+            or result.error
+            or result.diagnostics
+            or result.skipped_unknown_item
+            or result.skipped_unknown_record_type
+            or result.skipped_non_warehouse
+        ):
+            raise PhysicalRefreshOrchestratorError(
+                f"targeted recorder repair failed: {recorder_type} {recorder_ref}"
+            )
+
+    terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
+    if terminal is None:
+        raise PhysicalRefreshOrchestratorError(
+            "targeted convergence repair lost physical terminal"
+        )
+    generation.physical_import_batch_id = int(terminal)
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "targeted_convergence_repair": {
+            "version": "1",
+            "mismatched_keys": len(mismatch_keys),
+            "recorder_count": len(identities),
+            "physical_import_batch_id": int(terminal),
+        },
+    }
+    db.commit()
+    return len(identities)
 
 
 def _current_parent(db: Session) -> models.LedgerGeneration:
@@ -277,6 +432,26 @@ def run_physical_refresh(
             ledger_generation_id=int(fork.ledger_generation_id),
             balance_snapshot=balance_snapshot,
         )
+        if not convergence.valid:
+            physical_generation = db.get(
+                models.LedgerGeneration, int(fork.ledger_generation_id)
+            )
+            if physical_generation is None:
+                raise PhysicalRefreshOrchestratorError(
+                    "physical refresh generation disappeared before targeted repair"
+                )
+            repaired = _repair_mismatched_recorders(
+                db,
+                generation=physical_generation,
+                client=client,
+                convergence=convergence,
+            )
+            if repaired:
+                convergence = evaluate_physical_refresh_balance_convergence(
+                    db,
+                    ledger_generation_id=int(fork.ledger_generation_id),
+                    balance_snapshot=balance_snapshot,
+                )
         # Retain the diagnostic and completed import even when convergence is
         # false; neither operation moves the public planning-truth pointer.
         db.commit()
