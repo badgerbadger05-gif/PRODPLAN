@@ -263,6 +263,28 @@ def _collect_recorder_identities(
     return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
 
 
+def _collect_due_recorder_identities(
+    db: Session,
+) -> tuple[tuple[str, str], ...]:
+    """Recorder identities explicitly queued as new or changed by sync links."""
+    identities: set[tuple[str, str]] = set()
+    queued_rows = db.query(models.StockRecorderPull).filter(
+        (models.StockRecorderPull.status == "pending")
+        | (
+            (models.StockRecorderPull.status == "error")
+            & (models.StockRecorderPull.attempts < DEFAULT_MAX_ATTEMPTS)
+        ),
+    ).all()
+    for row in queued_rows:
+        recorder_type = str(row.recorder_type or "")
+        recorder_ref = str(row.recorder_ref or "")
+        if recorder_type in _SYNTHETIC_RECORDER_TYPES:
+            continue
+        if recorder_ref:
+            identities.add((recorder_type, recorder_ref))
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
 def _validate_checkpoint(
     db: Session,
     *,
@@ -379,6 +401,7 @@ def run_physical_recorder_audit(
     discovery_lookback: timedelta | None = None,
     discovery_window_size: timedelta = DISCOVERY_WINDOW_SIZE,
     discovery_page_size: int = DISCOVERY_PAGE_SIZE,
+    audit_all_known_recorders: bool = True,
 ) -> PhysicalRefreshImportResult:
     """Run recorder-audit refresh for one physical-refresh BUILDING generation.
 
@@ -430,7 +453,11 @@ def run_physical_recorder_audit(
 
     # Discovery precedes the known set: a recorder that only 1C knows about must
     # join this audit, otherwise it can never enter the ledger at all.
-    known_recorders = _collect_recorder_identities(db, int(parent_generation_id))
+    known_recorders = (
+        _collect_recorder_identities(db, int(parent_generation_id))
+        if audit_all_known_recorders
+        else _collect_due_recorder_identities(db)
+    )
     discovery_range = _discovery_range(
         db,
         parent_cutoff=parent_cutoff,

@@ -196,6 +196,7 @@ def run_physical_refresh(
     window_size: timedelta = timedelta(days=1),
     max_windows: int | None = None,
     discovery_lookback: timedelta | None = None,
+    audit_all_known_recorders: bool = True,
     opening_balance_loader: Callable[[datetime], Mapping[Any, Any]] | None = None,
     config_version_id: int | None = None,
     config_snapshot: Mapping[str, Any] | None = None,
@@ -247,6 +248,7 @@ def run_physical_refresh(
             parent_generation_id=int(parent.id),
             client=client,
             discovery_lookback=discovery_lookback,
+            audit_all_known_recorders=audit_all_known_recorders,
         )
         # Between the audit and the forward import: the audit requires the
         # generation to still sit on the parent boundary, and the forward import

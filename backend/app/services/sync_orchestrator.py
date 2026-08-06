@@ -626,29 +626,18 @@ def _run_physical_refresh_job(
     )
     balance_snapshot = build_balance_snapshot(db, balance_rows, strict=True)
 
-    def _load_opening_balance(opening_at: datetime) -> Dict[Any, Any]:
-        """1C's Balance as of the anchor, re-asked on every refresh.
-
-        Documents backdated behind the anchor change this answer after the seed
-        was taken; the refresh materializes the difference as an adjustment.
-        """
-        rows = get_stock_from_1c_odata(
-            base_url=client.base_url,
-            entity_name=_PHYSICAL_REFRESH_ENTITY,
-            username=client.username,
-            password=client.password,
-            token=client.token,
-            filter_query=f"Period le datetime'{_odata_datetime(opening_at)}'",
-        )
-        return build_balance_snapshot(db, rows, strict=True)
-
     result = run_physical_refresh(
         db,
         generation_key=generation_key,
         target_cutoff=target_cutoff,
         client=client,
         balance_snapshot=balance_snapshot,
-        opening_balance_loader=_load_opening_balance,
+        # The automatic path advances current facts incrementally.  Re-auditing
+        # every historical recorder and rebuilding the opening boundary turned
+        # each hourly refresh into a multi-hour historical replay.  Full audit
+        # remains available to the explicit maintenance workflow.
+        discovery_lookback=timedelta(0),
+        audit_all_known_recorders=False,
     )
     return {
         "parent_generation_id": result.parent_generation_id,
