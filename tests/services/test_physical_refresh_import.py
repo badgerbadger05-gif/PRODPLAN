@@ -560,6 +560,50 @@ def test_incremental_audit_repulls_known_recorder_when_line_count_changed(
     assert checkpoint.metrics["discovery"]["revised_recorders"] == 1
 
 
+def test_incremental_audit_repulls_known_recorder_that_vanished(
+    db_session, monkeypatch
+):
+    parent, parent_batch = _accepted_parent(db_session, "incremental-vanished")
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="vanished-doc",
+        posting_at=parent.cutoff - timedelta(days=5),
+    )
+    target = _building_target(db_session, parent, "incremental-vanished")
+    db_session.commit()
+
+    pulled: list[str] = []
+
+    def _pull(db, recorder_type, recorder_ref, **kwargs):
+        pulled.append(recorder_ref)
+        return PullResult(
+            status="empty",
+            inserted=0,
+            physical_import_batch_id=int(parent_batch.id),
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=_RegisterClient([]),
+        discovery_lookback=None,
+        audit_all_known_recorders=False,
+    )
+
+    assert pulled == ["vanished-doc"]
+    assert result.recorder_count == 1
+    assert result.vanished_recorders == 1
+    checkpoint = db_session.get(models.LedgerBuildBatch, result.checkpoint_id)
+    assert checkpoint.metrics["discovery"]["vanished_recorders"] == 1
+
+
 def test_physical_refresh_recorder_audit_rejects_pull_error_status(db_session, monkeypatch):
     parent, parent_batch = _accepted_parent(db_session, "error-status")
     _seed_visible_entry(

@@ -12,8 +12,9 @@ inside an already-closed forward window: the forward scan never revisits it and
 the audit, which only re-pulls recorders the ledger already knows, never learns
 it exists.  Such a recorder is invisible forever and the gap accumulates with
 every refresh.  The audit therefore re-discovers the retained horizon
-``(opening_at, parent_cutoff]`` on every run and folds anything new into the set
-it verifies.
+``(opening_at, parent_cutoff]`` on every run and folds new, revised, and now
+absent recorders into the set it verifies.  Re-pulling an absent recorder as
+empty supersedes movements left behind by a cancelled/unposted document.
 """
 
 from __future__ import annotations
@@ -69,6 +70,8 @@ class PhysicalRefreshImportResult:
     from_checkpoint: bool
     discovered_recorders: int = 0
     backdated_recorders: int = 0
+    revised_recorders: int = 0
+    vanished_recorders: int = 0
 
 
 def _utc(value: datetime | str | None, field: str) -> datetime:
@@ -460,6 +463,8 @@ def run_physical_recorder_audit(
             from_checkpoint=True,
             discovered_recorders=int(discovery.get("discovered_recorders") or 0),
             backdated_recorders=int(discovery.get("backdated_recorders") or 0),
+            revised_recorders=int(discovery.get("revised_recorders") or 0),
+            vanished_recorders=int(discovery.get("vanished_recorders") or 0),
         )
 
     if int(generation.physical_import_batch_id) != start_boundary_id:
@@ -511,12 +516,21 @@ def run_physical_recorder_audit(
     }
     discovered = tuple(sorted(discovered_counts))
     known_set = set(all_known_recorders)
-    backdated = tuple(sorted(set(discovered) - known_set))
+    discovered_set = set(discovered)
+    backdated = tuple(sorted(discovered_set - known_set))
     revised = tuple(sorted(
         identity
-        for identity in set(discovered) & known_set
+        for identity in discovered_set & known_set
         if discovered_counts[identity] != visible_line_counts[identity]
     ))
+    # Absence is meaningful only when discovery covered the complete retained
+    # horizon.  A disabled or bounded maintenance scan cannot prove that a
+    # known recorder vanished from 1C.
+    vanished = (
+        tuple(sorted(known_set - discovered_set))
+        if discovery_range is not None and discovery_lookback is None
+        else ()
+    )
     discovery_metrics = {
         "from_exclusive": discovery_range[0].isoformat() if discovery_range else None,
         "to_inclusive": discovery_range[1].isoformat() if discovery_range else None,
@@ -526,15 +540,19 @@ def run_physical_recorder_audit(
         "backdated": list(_result_summary(backdated)),
         "revised_recorders": len(revised),
         "revised": list(_result_summary(revised)),
+        "vanished_recorders": len(vanished),
+        "vanished": list(_result_summary(vanished)),
     }
 
     # Existing historical recorders are re-pulled only by the explicit full
     # audit.  Automatic refresh pulls the queue plus identities that are truly
-    # absent from the accepted parent (late-posted/backdated documents).
+    # absent from the accepted parent (late-posted/backdated documents), whose
+    # line set changed, or which disappeared from the current 1C register.
     target_recorders = _merge_recorder_identities(
         audit_recorders,
         backdated,
         revised,
+        vanished,
     )
     recorder_manifest = list(_result_summary(target_recorders))
     input_checksum = canonical_content_hash(recorder_manifest)
@@ -693,6 +711,8 @@ def run_physical_recorder_audit(
             from_checkpoint=False,
             discovered_recorders=len(discovered),
             backdated_recorders=len(backdated),
+            revised_recorders=len(revised),
+            vanished_recorders=len(vanished),
         )
     except PhysicalRefreshImportError:
         db.rollback()
