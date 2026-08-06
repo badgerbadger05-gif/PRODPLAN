@@ -108,6 +108,10 @@ services:
       SYNC_BASE_URL: http://backend:8000
       SYNC_TICK_INTERVAL_SECONDS: ${PRODPLAN_SHADOW_SYNC_TICK_INTERVAL_SECONDS:-300}
       SYNC_STARTUP_DELAY_SECONDS: ${PRODPLAN_SHADOW_SYNC_STARTUP_DELAY_SECONDS:-180}
+      # A physical refresh can legitimately run for tens of minutes.  Keep
+      # the single worker request attached until the backend returns its
+      # checked result; the cluster lock still prevents overlap.
+      SYNC_TICK_TIMEOUT_SECONDS: ${PRODPLAN_SHADOW_SYNC_TICK_TIMEOUT_SECONDS:-3600}
       PRODPLAN_DEPLOYMENT_CONTOUR: parallel
     depends_on:
       backend:
