@@ -19,6 +19,9 @@ def test_committed_openapi_matches_application_schema(tmp_path: Path) -> None:
         **os.environ,
         "DATABASE_URL": f"sqlite:///{database_path}",
         "PYTHONPATH": str(REPO / "backend"),
+        # The child prints a JSON schema containing Cyrillic text.  Force a
+        # deterministic stdout encoding on Windows as well as on Linux.
+        "PYTHONIOENCODING": "utf-8",
     }
     result = subprocess.run(
         [

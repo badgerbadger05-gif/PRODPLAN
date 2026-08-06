@@ -30,6 +30,16 @@ from app import models
 from .physical import EPS, LedgerKey, _dec
 
 
+class BalanceSnapshotItemResolutionError(ValueError):
+    """A non-zero 1C balance references nomenclature absent from PRODPLAN."""
+
+    def __init__(self, identity: str):
+        self.identity = str(identity)
+        super().__init__(
+            f"Balance row item cannot be resolved locally: {self.identity}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Balance snapshot → ledger keys
 # ---------------------------------------------------------------------------
@@ -86,9 +96,7 @@ def build_balance_snapshot(
         if item_id is None:
             if strict and abs(_dec(row.get("qty") or 0)) > EPS:
                 identity = ref or str(row.get("code") or "").strip() or "<missing>"
-                raise ValueError(
-                    f"Balance row item cannot be resolved locally: {identity}"
-                )
+                raise BalanceSnapshotItemResolutionError(identity)
             continue
         org = str(row.get("organization_ref") or "").strip()
         key = LedgerKey(int(item_id), "", org, wh)

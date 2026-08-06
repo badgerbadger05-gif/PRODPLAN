@@ -53,7 +53,10 @@ from .processing_stock_sync import (
 )
 from .nomenclature_groups_sync import refresh_nomenclature_groups
 from .item_ledger.ingest import is_retryable_error, _build_client
-from .item_ledger.reconcile import build_balance_snapshot
+from .item_ledger.reconcile import (
+    BalanceSnapshotItemResolutionError,
+    build_balance_snapshot,
+)
 from .item_ledger.physical_refresh_orchestrator import run_physical_refresh
 from .odata_client import get_stock_from_1c_odata
 from .. import models
@@ -891,6 +894,25 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 result = {"status": "ok", "job": "physicalRefresh", "summary": summary}
             except Exception as exc:  # noqa: BLE001
                 _rollback_if_possible(db)
+                dependency_job_forced_due = None
+                if isinstance(exc, BalanceSnapshotItemResolutionError):
+                    # A new item may appear in stock or production between the
+                    # daily nomenclature pulls. Do not leave physical truth
+                    # stale until the next 24-hour slot: force the parent
+                    # reference job due, then the normal fairness rule runs it
+                    # before the backed-off physical retry.
+                    nomenclature_state = dict(
+                        _job_state(state, "nomenclature")
+                    )
+                    nomenclature_state["last_run_at"] = None
+                    nomenclature_state["forced_due_at"] = now.isoformat()
+                    nomenclature_state["forced_due_reason"] = (
+                        "physical_refresh_missing_item"
+                    )
+                    state.setdefault("jobs", {})["nomenclature"] = (
+                        nomenclature_state
+                    )
+                    dependency_job_forced_due = "nomenclature"
                 failures = int(physical_state.get("failure_count") or 0) + 1
                 backoff = min(
                     _PHYSICAL_REFRESH_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
@@ -904,6 +926,10 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 physical_state["last_duration_ms"] = int((time.time() - started) * 1000)
                 physical_state["last_cutoff"] = _to_utc(now).isoformat()
                 result = {"status": "error", "job": "physicalRefresh", "error": str(exc)}
+                if dependency_job_forced_due is not None:
+                    result["dependency_job_forced_due"] = (
+                        dependency_job_forced_due
+                    )
             _save_state(state, required=True)
             result["duration_ms"] = physical_state["last_duration_ms"]
             return result
