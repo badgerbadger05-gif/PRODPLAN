@@ -260,7 +260,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     def _mock_run(*args, **kwargs):
         assert kwargs["generation_key"].startswith(f"physical-refresh:{parent.id}:")
         assert kwargs["target_cutoff"].tzinfo is not None
-        assert kwargs["discovery_lookback"] == timedelta(0)
+        assert kwargs["discovery_lookback"] is None
         assert kwargs["audit_all_known_recorders"] is False
         assert "opening_balance_loader" not in kwargs
         return Result()

@@ -445,6 +445,66 @@ def test_incremental_audit_pulls_only_due_recorders(db_session, monkeypatch):
     assert result.discovered_recorders == 0
 
 
+def test_incremental_audit_pulls_due_and_truly_new_backdated_recorders(
+    db_session, monkeypatch
+):
+    parent, parent_batch = _accepted_parent(db_session, "incremental-backdated")
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="Document_Receipt",
+        recorder_ref="old-visible-doc",
+        posting_at=parent.cutoff - timedelta(days=5),
+    )
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_СборкаЗапасов",
+        recorder_ref="changed-doc",
+        status="pending",
+    ))
+    target = _building_target(db_session, parent, "incremental-backdated")
+    db_session.commit()
+
+    client = _RegisterClient([
+        _register_row(
+            "Document_Receipt",
+            "old-visible-doc",
+            period="2026-07-20T10:00:00",
+        ),
+        _register_row(
+            "Document_ПеремещениеЗапасов",
+            "new-backdated-doc",
+            period="2026-07-21T10:00:00",
+        ),
+    ])
+    pulled: list[str] = []
+
+    def _pull(db, recorder_type, recorder_ref, **kwargs):
+        pulled.append(recorder_ref)
+        return PullResult(
+            status="done",
+            inserted=0,
+            physical_import_batch_id=int(parent_batch.id),
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=client,
+        discovery_lookback=None,
+        audit_all_known_recorders=False,
+    )
+
+    assert pulled == ["new-backdated-doc", "changed-doc"]
+    assert result.recorder_count == 2
+    assert result.discovered_recorders == 2
+    assert result.backdated_recorders == 1
+
+
 def test_physical_refresh_recorder_audit_rejects_pull_error_status(db_session, monkeypatch):
     parent, parent_batch = _accepted_parent(db_session, "error-status")
     _seed_visible_entry(

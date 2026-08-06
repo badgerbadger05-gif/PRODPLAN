@@ -453,8 +453,16 @@ def run_physical_recorder_audit(
 
     # Discovery precedes the known set: a recorder that only 1C knows about must
     # join this audit, otherwise it can never enter the ledger at all.
-    known_recorders = (
-        _collect_recorder_identities(db, int(parent_generation_id))
+    # Keep the complete parent identity set even on the incremental path.  The
+    # light-weight historical scan below is specifically meant to find a
+    # recorder that 1C posted today with an old document Period.  Comparing it
+    # only with the due queue made every historical identity look "new" and
+    # turned the incremental refresh back into a full recorder audit.
+    all_known_recorders = _collect_recorder_identities(
+        db, int(parent_generation_id)
+    )
+    audit_recorders = (
+        all_known_recorders
         if audit_all_known_recorders
         else _collect_due_recorder_identities(db)
     )
@@ -478,7 +486,9 @@ def run_physical_recorder_audit(
             raise PhysicalRefreshImportError(
                 f"backdated recorder discovery failed: {exc}"
             ) from exc
-    backdated = tuple(sorted(set(discovered) - set(known_recorders)))
+    backdated = tuple(
+        sorted(set(discovered) - set(all_known_recorders))
+    )
     discovery_metrics = {
         "from_exclusive": discovery_range[0].isoformat() if discovery_range else None,
         "to_inclusive": discovery_range[1].isoformat() if discovery_range else None,
@@ -488,7 +498,13 @@ def run_physical_recorder_audit(
         "backdated": list(_result_summary(backdated)),
     }
 
-    target_recorders = _merge_recorder_identities(known_recorders, discovered)
+    # Existing historical recorders are re-pulled only by the explicit full
+    # audit.  Automatic refresh pulls the queue plus identities that are truly
+    # absent from the accepted parent (late-posted/backdated documents).
+    target_recorders = _merge_recorder_identities(
+        audit_recorders,
+        backdated,
+    )
     recorder_manifest = list(_result_summary(target_recorders))
     input_checksum = canonical_content_hash(recorder_manifest)
 

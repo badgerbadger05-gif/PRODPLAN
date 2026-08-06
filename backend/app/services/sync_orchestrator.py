@@ -636,7 +636,11 @@ def _run_physical_refresh_job(
         # every historical recorder and rebuilding the opening boundary turned
         # each hourly refresh into a multi-hour historical replay.  Full audit
         # remains available to the explicit maintenance workflow.
-        discovery_lookback=timedelta(0),
+        # Identity-only discovery over retained history is cheap and catches a
+        # document posted today with an old Period.  The import service compares
+        # this manifest with the accepted parent and pulls only truly new or
+        # explicitly queued recorders; known history is not re-audited.
+        discovery_lookback=None,
         audit_all_known_recorders=False,
     )
     return {
