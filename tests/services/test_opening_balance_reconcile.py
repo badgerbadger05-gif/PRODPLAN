@@ -132,6 +132,34 @@ def test_backdated_document_behind_the_anchor_becomes_an_adjustment(db_session):
     assert generation.physical_import_batch_id == result.physical_import_batch_id
 
 
+def test_targeted_reconcile_does_not_adjust_unrelated_opening_key(db_session):
+    generation, item = _world(db_session)
+    unrelated = models.Item(
+        item_code="UNRELATED-T0",
+        item_name="Unrelated opening key",
+        item_ref1c="UNRELATED-T0",
+    )
+    db_session.add(unrelated)
+    db_session.flush()
+
+    result = reconcile_opening_balance(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        opening_snapshot={
+            LedgerKey(item.item_id, "", ORG, WH): Decimal("2180"),
+            LedgerKey(unrelated.item_id, "", ORG, WH): Decimal("99"),
+        },
+        only_keys={(item.item_id, ORG, WH)},
+    )
+
+    assert result.adjusted_keys == 1
+    assert result.adjustments[0].item_id == item.item_id
+    assert db_session.query(models.StockLedgerAnchor).filter_by(
+        item_id=unrelated.item_id,
+        anchor_period=OPENING_AT.date(),
+    ).count() == 0
+
+
 def test_second_run_over_the_same_truth_is_a_no_op(db_session):
     """The correction must not repeat once it is in the ledger."""
     generation, item = _world(db_session)

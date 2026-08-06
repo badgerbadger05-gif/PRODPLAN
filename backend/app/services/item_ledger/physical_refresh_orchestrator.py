@@ -134,8 +134,9 @@ def _reconcile_opening_balance(
     *,
     ledger_generation_id: int,
     loader: Callable[[datetime], Mapping[Any, Any]] | None,
+    only_keys: set[tuple[int, str, str]] | None = None,
 ) -> OpeningBalanceReconcileResult | None:
-    """Re-align the T0 prefix with 1C before the forward window import."""
+    """Re-align selected T0 keys with 1C without replaying history."""
     if loader is None:
         return None
     boundary = opening_boundary(db)
@@ -146,6 +147,7 @@ def _reconcile_opening_balance(
         db,
         ledger_generation_id=int(ledger_generation_id),
         opening_snapshot=loader(opening_at),
+        only_keys=only_keys,
     )
     db.commit()
     return result
@@ -405,14 +407,7 @@ def run_physical_refresh(
             discovery_lookback=discovery_lookback,
             audit_all_known_recorders=audit_all_known_recorders,
         )
-        # Between the audit and the forward import: the audit requires the
-        # generation to still sit on the parent boundary, and the forward import
-        # starts from whatever boundary this leaves behind.
-        opening_reconcile = _reconcile_opening_balance(
-            db,
-            ledger_generation_id=int(fork.ledger_generation_id),
-            loader=opening_balance_loader,
-        )
+        opening_reconcile = None
         physical_import = run_historical_physical_import(
             db,
             ledger_generation_id=int(fork.ledger_generation_id),
@@ -447,6 +442,28 @@ def run_physical_refresh(
                 convergence=convergence,
             )
             if repaired:
+                convergence = evaluate_physical_refresh_balance_convergence(
+                    db,
+                    ledger_generation_id=int(fork.ledger_generation_id),
+                    balance_snapshot=balance_snapshot,
+                )
+        if not convergence.valid and opening_balance_loader is not None:
+            remaining_keys = {
+                (
+                    int(delta.item_id),
+                    str(delta.organization_ref),
+                    str(delta.warehouse_ref1c),
+                )
+                for delta in convergence.deltas
+                if not delta.matched
+            }
+            opening_reconcile = _reconcile_opening_balance(
+                db,
+                ledger_generation_id=int(fork.ledger_generation_id),
+                loader=opening_balance_loader,
+                only_keys=remaining_keys,
+            )
+            if opening_reconcile is not None and opening_reconcile.adjusted_keys:
                 convergence = evaluate_physical_refresh_balance_convergence(
                     db,
                     ledger_generation_id=int(fork.ledger_generation_id),
