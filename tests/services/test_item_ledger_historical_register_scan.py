@@ -19,6 +19,13 @@ def _row(period: datetime | str | None, recorder: str, line: int):
         "Recorder": recorder,
         "Recorder_Type": "StandardODATA.Document_СборкаЗапасов",
         "LineNumber": line,
+        "Active": True,
+        "RecordType": "Receipt",
+        "Номенклатура_Key": "item-ref",
+        "Характеристика_Key": "",
+        "Организация_Key": "org-ref",
+        "СтруктурнаяЕдиница_Key": "warehouse-ref",
+        "Количество": 1,
     }
 
 
@@ -85,6 +92,7 @@ def test_scans_more_than_1000_rows_with_period_ties_and_dedupes_recorders():
     assert result.recorders[-1].identity.recorder_ref == "rec-1252"
     assert result.recorders[0].row_count == 2
     assert result.recorders[-1].row_count == 1
+    assert result.recorders[0].balance_content_hash
 
 
 def test_filter_dates_are_converted_to_naive_moscow_time():
@@ -259,3 +267,29 @@ def test_scanner_uses_only_read_request_method():
 
     assert len(result.recorders) == 1
     assert len(client.calls) == 1
+
+
+def test_balance_hash_changes_when_same_count_row_changes_warehouse():
+    start = datetime(2026, 1, 1)
+    period = start + timedelta(hours=1)
+    original = _row(period, "same-recorder", 1)
+    changed = dict(original)
+    changed["СтруктурнаяЕдиница_Key"] = "other-warehouse"
+
+    original_scan = scan_historical_register_range(
+        FakeRangeClient([original]),
+        from_exclusive=start,
+        to_inclusive=start + timedelta(days=1),
+    )
+    changed_scan = scan_historical_register_range(
+        FakeRangeClient([changed]),
+        from_exclusive=start,
+        to_inclusive=start + timedelta(days=1),
+    )
+
+    assert original_scan.recorders[0].row_count == 1
+    assert changed_scan.recorders[0].row_count == 1
+    assert (
+        original_scan.recorders[0].balance_content_hash
+        != changed_scan.recorders[0].balance_content_hash
+    )

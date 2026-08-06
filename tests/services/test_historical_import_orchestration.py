@@ -21,6 +21,13 @@ def _register_row(period: datetime, recorder_ref: str):
         "Recorder": recorder_ref,
         "Recorder_Type": f"StandardODATA.{RECORDER_TYPE}",
         "LineNumber": 1,
+        "Active": True,
+        "RecordType": "Receipt",
+        "Номенклатура_Key": "ITEM-REF",
+        "СтруктурнаяЕдиница_Key": "WH-REF",
+        "Характеристика_Key": "",
+        "Организация_Key": "",
+        "Количество": 1,
     }
 
 

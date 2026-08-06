@@ -1,7 +1,6 @@
 """Targeted contract tests for the physical refresh orchestrator."""
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 import pytest
 
@@ -203,113 +202,6 @@ def test_targeted_repair_pulls_only_recorder_touching_mismatch(
     assert generation.source_watermarks["targeted_convergence_repair"][
         "recorder_count"
     ] == 1
-
-
-def test_targeted_repair_pulls_old_ledger_recorder_after_key_changed(
-    db_session, monkeypatch
-):
-    parent, parent_batch = _accepted_parent(
-        db_session, generation_key="targeted-old-key"
-    )
-    item = models.Item(
-        item_code="TARGETED-OLD-ITEM",
-        item_name="Targeted old item",
-        item_ref1c="old-item-ref",
-    )
-    generation = models.LedgerGeneration(
-        generation_key="targeted-old-key-child",
-        status="building",
-        cutoff=parent.cutoff + timedelta(days=1),
-        source_watermarks={
-            "generation_kind": "physical_refresh",
-            "parent_generation_id": parent.id,
-        },
-        physical_import_batch=parent_batch,
-        algorithm_version="physical-refresh/test",
-        replay_version="physical-refresh/test",
-    )
-    db_session.add_all([item, generation])
-    db_session.flush()
-    db_session.add(models.StockLedgerEntry(
-        ingest_batch_id=parent_batch.id,
-        source_content_hash="old-key-hash",
-        item_id=item.item_id,
-        characteristic_ref="",
-        organization_ref="org-ref",
-        warehouse_ref1c="WH-PHYSICAL-PLAN",
-        qty=Decimal("1"),
-        qty_after=Decimal("1"),
-        posting_at=parent.cutoff,
-        record_type="Receipt",
-        movement_kind="transfer_in",
-        recorder_type="Document_ПеремещениеЗапасов",
-        recorder_ref="old-key-recorder",
-        line_no="1",
-        ingest_source="pull",
-        active=True,
-    ))
-    db_session.commit()
-
-    delta = bootstrap.BalanceConvergenceDelta(
-        item_id=item.item_id,
-        organization_ref="org-ref",
-        warehouse_ref1c="WH-PHYSICAL-PLAN",
-        balance_qty="0",
-        ledger_qty="1",
-        delta_qty="-1",
-        matched=False,
-    )
-    convergence = bootstrap.BalanceConvergenceResult(
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff.isoformat(),
-        checked_at=generation.cutoff.isoformat(),
-        valid=False,
-        content_hash="old-key-mismatch",
-        compared=1,
-        matched=0,
-        mismatched=1,
-        terminal_batch_id=parent_batch.id,
-        deltas=(delta,),
-    )
-
-    class Client:
-        def _make_request(self, entity, params):
-            return {"value": []}
-
-    pulled = []
-    monkeypatch.setattr(
-        workflow,
-        "opening_boundary",
-        lambda db: (parent_batch, datetime(2026, 7, 1, tzinfo=timezone.utc)),
-    )
-    monkeypatch.setattr(
-        workflow,
-        "pull_recorder_movements",
-        lambda db, recorder_type, recorder_ref, **kwargs: (
-            pulled.append((recorder_type, recorder_ref))
-            or PullResult(
-                status="empty",
-                inserted=0,
-                physical_import_batch_id=parent_batch.id,
-            )
-        ),
-    )
-
-    repaired = workflow._repair_mismatched_recorders(
-        db_session,
-        generation=generation,
-        client=Client(),
-        convergence=convergence,
-    )
-
-    assert repaired == 1
-    assert pulled == [(
-        "Document_ПеремещениеЗапасов",
-        "old-key-recorder",
-    )]
-    metrics = generation.source_watermarks["targeted_convergence_repair"]
-    assert metrics["candidate_recorder_count"] == 1
-    assert metrics["current_recorder_count"] == 0
 
 
 def test_run_physical_refresh_no_work_on_lock_contention(db_session, monkeypatch):

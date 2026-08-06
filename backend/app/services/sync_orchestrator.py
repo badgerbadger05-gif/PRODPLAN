@@ -636,10 +636,11 @@ def _run_physical_refresh_job(
         # every historical recorder and rebuilding the opening boundary turned
         # each hourly refresh into a multi-hour historical replay.  Full audit
         # remains available to the explicit maintenance workflow.
-        # Identity-only discovery over retained history is cheap and catches a
+        # Manifest discovery over retained history is cheap and catches a
         # document posted today with an old Period.  The import service compares
-        # this manifest with the accepted parent and pulls only truly new or
-        # explicitly queued recorders; known history is not re-audited.
+        # this manifest (identity, row count, balance hash) with the accepted
+        # parent and pulls only new, changed, or explicitly queued recorders;
+        # known unchanged history is not re-audited.
         discovery_lookback=None,
         audit_all_known_recorders=False,
     )

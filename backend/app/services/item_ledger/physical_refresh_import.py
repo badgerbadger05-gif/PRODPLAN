@@ -28,7 +28,11 @@ from sqlalchemy.orm import Session
 
 from app import models
 
-from .historical_register_scan import scan_historical_register_range
+from .historical_register_scan import (
+    balance_content_hash,
+    balance_movement_payload,
+    scan_historical_register_range,
+)
 from .ingest import DEFAULT_MAX_ATTEMPTS, pull_recorder_movements
 from .opening_balance_reconcile import (
     ADJUSTMENT_RECORDER_TYPE,
@@ -39,10 +43,10 @@ from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 
 
-ALGORITHM_VERSION = "ledger-physical-refresh-import/2"
+ALGORITHM_VERSION = "ledger-physical-refresh-import/3"
 GENERATION_KIND = "physical_refresh"
 CHECKPOINT_KEY_PREFIX = "physical-refresh-recorder-audit"
-CHECKPOINT_VERSION = "2"
+CHECKPOINT_VERSION = "3"
 
 # Discovery re-reads the register only for recorder identities ($select is four
 # columns), so a wide window is cheap next to the per-recorder pulls that follow.
@@ -198,8 +202,8 @@ def _discover_recorder_states(
     to_inclusive: datetime,
     window_size: timedelta,
     page_size: int,
-) -> tuple[tuple[str, str, int], ...]:
-    """Recorder identities and register-row counts over a historical range."""
+) -> tuple[tuple[str, str, int, str], ...]:
+    """Recorder identities and balance-content states over a historical range."""
     scan = scan_historical_register_range(
         client,
         from_exclusive=from_exclusive,
@@ -212,6 +216,7 @@ def _discover_recorder_states(
             discovered.identity.recorder_type,
             discovered.identity.recorder_ref,
             int(discovered.row_count),
+            str(discovered.balance_content_hash),
         )
         for discovered in scan.recorders
     )
@@ -266,21 +271,42 @@ def _collect_recorder_identities(
     return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
 
 
-def _visible_recorder_line_counts(
+def _visible_recorder_states(
     db: Session,
     parent_generation_id: int,
-) -> dict[tuple[str, str], int]:
-    """Visible accepted movement count per real 1C recorder."""
-    counts: dict[tuple[str, str], int] = {}
-    for row in visible_sles_for_generation(db, parent_generation_id):
+) -> dict[tuple[str, str], tuple[int, str]]:
+    """Visible accepted movement count and balance hash per real recorder."""
+    rows = visible_sles_for_generation(db, parent_generation_id)
+    item_refs = {
+        int(item_id): str(item_ref or "")
+        for item_id, item_ref in db.query(
+            models.Item.item_id,
+            models.Item.item_ref1c,
+        ).filter(
+            models.Item.item_id.in_({int(row.item_id) for row in rows})
+        ).all()
+    }
+    payloads: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in rows:
         identity = (
             str(row.recorder_type or ""),
             str(row.recorder_ref or ""),
         )
         if identity[0] in _SYNTHETIC_RECORDER_TYPES or not identity[1]:
             continue
-        counts[identity] = counts.get(identity, 0) + 1
-    return counts
+        payloads.setdefault(identity, []).append(balance_movement_payload(
+            item_ref=item_refs.get(int(row.item_id), ""),
+            characteristic_ref=row.characteristic_ref,
+            organization_ref=row.organization_ref,
+            warehouse_ref=row.warehouse_ref1c,
+            signed_qty=row.qty,
+            record_type=row.record_type,
+            line_no=row.line_no,
+        ))
+    return {
+        identity: (len(values), balance_content_hash(values))
+        for identity, values in payloads.items()
+    }
 
 
 def _collect_due_recorder_identities(
@@ -480,10 +506,10 @@ def run_physical_recorder_audit(
     # recorder that 1C posted today with an old document Period.  Comparing it
     # only with the due queue made every historical identity look "new" and
     # turned the incremental refresh back into a full recorder audit.
-    visible_line_counts = _visible_recorder_line_counts(
+    visible_states = _visible_recorder_states(
         db, int(parent_generation_id)
     )
-    all_known_recorders = tuple(sorted(visible_line_counts))
+    all_known_recorders = tuple(sorted(visible_states))
     due_recorders = _collect_due_recorder_identities(db)
     audit_recorders = (
         _merge_recorder_identities(all_known_recorders, due_recorders)
@@ -495,7 +521,7 @@ def run_physical_recorder_audit(
         parent_cutoff=parent_cutoff,
         lookback=discovery_lookback,
     )
-    discovered_states: tuple[tuple[str, str, int], ...] = ()
+    discovered_states: tuple[tuple[str, str, int, str], ...] = ()
     if discovery_range is not None:
         discovery_from, discovery_to = discovery_range
         try:
@@ -510,18 +536,18 @@ def run_physical_recorder_audit(
             raise PhysicalRefreshImportError(
                 f"backdated recorder discovery failed: {exc}"
             ) from exc
-    discovered_counts = {
-        (recorder_type, recorder_ref): row_count
-        for recorder_type, recorder_ref, row_count in discovered_states
+    discovered_content = {
+        (recorder_type, recorder_ref): (row_count, content_hash)
+        for recorder_type, recorder_ref, row_count, content_hash in discovered_states
     }
-    discovered = tuple(sorted(discovered_counts))
+    discovered = tuple(sorted(discovered_content))
     known_set = set(all_known_recorders)
     discovered_set = set(discovered)
     backdated = tuple(sorted(discovered_set - known_set))
     revised = tuple(sorted(
         identity
         for identity in discovered_set & known_set
-        if discovered_counts[identity] != visible_line_counts[identity]
+        if discovered_content[identity] != visible_states[identity]
     ))
     # Absence is meaningful only when discovery covered the complete retained
     # horizon.  A disabled or bounded maintenance scan cannot prove that a
