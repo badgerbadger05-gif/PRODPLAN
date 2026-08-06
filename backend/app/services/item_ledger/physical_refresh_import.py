@@ -188,19 +188,15 @@ def _discovery_range(
     return floor, parent_cutoff
 
 
-def _discover_recorder_identities(
+def _discover_recorder_states(
     client: Any,
     *,
     from_exclusive: datetime,
     to_inclusive: datetime,
     window_size: timedelta,
     page_size: int,
-) -> tuple[tuple[str, str], ...]:
-    """Recorder identities present in the register over a closed historical range.
-
-    Discovery reads identities only: no recorder contents, no ledger write and
-    no watermark advance.  The caller decides which of them still need a pull.
-    """
+) -> tuple[tuple[str, str, int], ...]:
+    """Recorder identities and register-row counts over a historical range."""
     scan = scan_historical_register_range(
         client,
         from_exclusive=from_exclusive,
@@ -209,7 +205,11 @@ def _discover_recorder_identities(
         page_size=page_size,
     )
     return tuple(
-        (discovered.identity.recorder_type, discovered.identity.recorder_ref)
+        (
+            discovered.identity.recorder_type,
+            discovered.identity.recorder_ref,
+            int(discovered.row_count),
+        )
         for discovered in scan.recorders
     )
 
@@ -261,6 +261,23 @@ def _collect_recorder_identities(
             identities.add((recorder_type, recorder_ref))
 
     return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
+def _visible_recorder_line_counts(
+    db: Session,
+    parent_generation_id: int,
+) -> dict[tuple[str, str], int]:
+    """Visible accepted movement count per real 1C recorder."""
+    counts: dict[tuple[str, str], int] = {}
+    for row in visible_sles_for_generation(db, parent_generation_id):
+        identity = (
+            str(row.recorder_type or ""),
+            str(row.recorder_ref or ""),
+        )
+        if identity[0] in _SYNTHETIC_RECORDER_TYPES or not identity[1]:
+            continue
+        counts[identity] = counts.get(identity, 0) + 1
+    return counts
 
 
 def _collect_due_recorder_identities(
@@ -458,24 +475,26 @@ def run_physical_recorder_audit(
     # recorder that 1C posted today with an old document Period.  Comparing it
     # only with the due queue made every historical identity look "new" and
     # turned the incremental refresh back into a full recorder audit.
-    all_known_recorders = _collect_recorder_identities(
+    visible_line_counts = _visible_recorder_line_counts(
         db, int(parent_generation_id)
     )
+    all_known_recorders = tuple(sorted(visible_line_counts))
+    due_recorders = _collect_due_recorder_identities(db)
     audit_recorders = (
-        all_known_recorders
+        _merge_recorder_identities(all_known_recorders, due_recorders)
         if audit_all_known_recorders
-        else _collect_due_recorder_identities(db)
+        else due_recorders
     )
     discovery_range = _discovery_range(
         db,
         parent_cutoff=parent_cutoff,
         lookback=discovery_lookback,
     )
-    discovered: tuple[tuple[str, str], ...] = ()
+    discovered_states: tuple[tuple[str, str, int], ...] = ()
     if discovery_range is not None:
         discovery_from, discovery_to = discovery_range
         try:
-            discovered = _discover_recorder_identities(
+            discovered_states = _discover_recorder_states(
                 client,
                 from_exclusive=discovery_from,
                 to_inclusive=discovery_to,
@@ -486,9 +505,18 @@ def run_physical_recorder_audit(
             raise PhysicalRefreshImportError(
                 f"backdated recorder discovery failed: {exc}"
             ) from exc
-    backdated = tuple(
-        sorted(set(discovered) - set(all_known_recorders))
-    )
+    discovered_counts = {
+        (recorder_type, recorder_ref): row_count
+        for recorder_type, recorder_ref, row_count in discovered_states
+    }
+    discovered = tuple(sorted(discovered_counts))
+    known_set = set(all_known_recorders)
+    backdated = tuple(sorted(set(discovered) - known_set))
+    revised = tuple(sorted(
+        identity
+        for identity in set(discovered) & known_set
+        if discovered_counts[identity] != visible_line_counts[identity]
+    ))
     discovery_metrics = {
         "from_exclusive": discovery_range[0].isoformat() if discovery_range else None,
         "to_inclusive": discovery_range[1].isoformat() if discovery_range else None,
@@ -496,6 +524,8 @@ def run_physical_recorder_audit(
         "discovered_recorders": len(discovered),
         "backdated_recorders": len(backdated),
         "backdated": list(_result_summary(backdated)),
+        "revised_recorders": len(revised),
+        "revised": list(_result_summary(revised)),
     }
 
     # Existing historical recorders are re-pulled only by the explicit full
@@ -504,6 +534,7 @@ def run_physical_recorder_audit(
     target_recorders = _merge_recorder_identities(
         audit_recorders,
         backdated,
+        revised,
     )
     recorder_manifest = list(_result_summary(target_recorders))
     input_checksum = canonical_content_hash(recorder_manifest)

@@ -35,6 +35,7 @@ class RecorderIdentity:
 class DiscoveredRecorder:
     identity: RecorderIdentity
     first_period: datetime
+    row_count: int
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,7 @@ def _scan_window(
     to_inclusive: datetime,
     page_size: int,
     max_pages: int,
-) -> tuple[WindowCheckpoint, dict[RecorderIdentity, datetime]]:
+) -> tuple[WindowCheckpoint, dict[RecorderIdentity, tuple[datetime, int]]]:
     filter_query = (
         f"Period gt datetime'{_odata_datetime(from_exclusive)}' and "
         f"Period le datetime'{_odata_datetime(to_inclusive)}'"
@@ -138,7 +139,7 @@ def _scan_window(
     pages_read = 0
     rows_read = 0
     seen_page_hashes: set[str] = set()
-    recorder_periods: dict[RecorderIdentity, datetime] = {}
+    recorder_states: dict[RecorderIdentity, tuple[datetime, int]] = {}
     row_hashes: list[str] = []
 
     while True:
@@ -196,9 +197,11 @@ def _scan_window(
                 raise HistoricalRegisterScanError(
                     "register row has incomplete Recorder identity"
                 )
-            previous = recorder_periods.get(identity)
-            if previous is None or period < previous:
-                recorder_periods[identity] = period
+            previous = recorder_states.get(identity)
+            recorder_states[identity] = (
+                period if previous is None else min(previous[0], period),
+                1 if previous is None else previous[1] + 1,
+            )
 
         rows_read += len(rows)
         if len(rows) < page_size:
@@ -212,10 +215,10 @@ def _scan_window(
             to_inclusive=to_inclusive,
             pages_read=pages_read,
             rows_read=rows_read,
-            recorder_count=len(recorder_periods),
+            recorder_count=len(recorder_states),
             content_hash=content_hash,
         ),
-        recorder_periods,
+        recorder_states,
     )
 
 
@@ -251,7 +254,7 @@ def scan_historical_register_range(
 
     cursor = resume
     windows: list[WindowCheckpoint] = []
-    recorder_periods: dict[RecorderIdentity, datetime] = {}
+    recorder_states: dict[RecorderIdentity, tuple[datetime, int]] = {}
     while cursor < to_inclusive:
         window_end = min(cursor + window_size, to_inclusive)
         checkpoint, discovered = _scan_window(
@@ -262,18 +265,20 @@ def scan_historical_register_range(
             max_pages=max_pages_per_window,
         )
         windows.append(checkpoint)
-        for identity, period in discovered.items():
-            previous = recorder_periods.get(identity)
-            if previous is None or period < previous:
-                recorder_periods[identity] = period
+        for identity, (period, row_count) in discovered.items():
+            previous = recorder_states.get(identity)
+            recorder_states[identity] = (
+                period if previous is None else min(previous[0], period),
+                row_count if previous is None else previous[1] + row_count,
+            )
         cursor = window_end
 
     recorders = tuple(
-        DiscoveredRecorder(identity, period)
-        for identity, period in sorted(
-            recorder_periods.items(),
+        DiscoveredRecorder(identity, state[0], state[1])
+        for identity, state in sorted(
+            recorder_states.items(),
             key=lambda pair: (
-                pair[1],
+                pair[1][0],
                 pair[0].recorder_type,
                 pair[0].recorder_ref,
             ),

@@ -83,6 +83,8 @@ def test_scans_more_than_1000_rows_with_period_ties_and_dedupes_recorders():
     assert all(call[1]["$orderby"] == REGISTER_ORDER_BY for call in client.calls)
     assert result.recorders[0].identity.recorder_ref == "rec-0000"
     assert result.recorders[-1].identity.recorder_ref == "rec-1252"
+    assert result.recorders[0].row_count == 2
+    assert result.recorders[-1].row_count == 1
 
 
 def test_filter_dates_are_converted_to_naive_moscow_time():
