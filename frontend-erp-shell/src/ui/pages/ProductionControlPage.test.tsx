@@ -18,6 +18,7 @@ vi.mock('../../services/productionControl', () => ({
   listProductionOperations: vi.fn(),
   getProductionControlSettings: vi.fn(),
   listRootProductOptions: vi.fn(),
+  materializeMakeWorkItems: vi.fn(),
   saveProductionControlSettings: vi.fn(),
   getOrderMaterials: vi.fn(),
   updateOrderStatus: vi.fn(),
@@ -51,6 +52,7 @@ import {
   produceOrderLine,
   closeProductionOrder,
   listRootProductOptions,
+  materializeMakeWorkItems,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 
@@ -230,6 +232,7 @@ beforeEach(() => {
     total: 1,
   })
   vi.mocked(listProductionOperations).mockResolvedValue({ rows: [], total: 0 })
+  vi.mocked(materializeMakeWorkItems).mockResolvedValue({ status: 'ok', created: [], reused: [] })
   vi.mocked(updateOrderStatus).mockResolvedValue({} as never)
   vi.mocked(deleteProductionOrder).mockResolvedValue({} as never)
   vi.mocked(produceOrderLine).mockResolvedValue({ qty: 10 } as never)
@@ -511,6 +514,42 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101], 'erp-shell', undefined))
     // issue_id 1 from postMaterialIssues result flows into the 1C export.
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
+  })
+
+  it('materializes a calculated MRP proposal before launching it in 1C', async () => {
+    const proposal = {
+      ...fakeRows()[0],
+      journal_row_key: 'work-item:701',
+      work_item_id: 701,
+      product_id: null,
+      order_id: null,
+      order_number: 'MRP-R-701',
+      order_prodplan_number: 'MRP-R-701',
+      coverage_label: 'После создания заказа',
+      available_actions: ['materialize'],
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(materializeMakeWorkItems).mockResolvedValue({
+      status: 'ok',
+      created: [{
+        work_item_id: 701, product_id: 901, order_id: 801,
+        order_number: 'MRP-R-701-1', requirement_id: 701, qty: 10,
+      }],
+      reused: [],
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Расчёт MRP · заказ ещё не создан')
+
+    await user.click(screen.getByRole('checkbox', { name: /MRP-R-701/ }))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+
+    await waitFor(() => expect(materializeMakeWorkItems).toHaveBeenCalledWith([701]))
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([901], 'erp-shell', undefined))
+    expect(getOrderMaterials).not.toHaveBeenCalled()
   })
 
   it('runs the canonical produce action for one assembled row', async () => {

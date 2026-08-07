@@ -30,7 +30,7 @@ export function ProductionDetailPane({
   useEffect(() => {
     setBatchValue(activeRow?.optimal_batch != null ? String(activeRow.optimal_batch) : '')
     setBatchError('')
-  }, [activeRow?.product_id, activeRow?.optimal_batch])
+  }, [activeRow?.journal_row_key, activeRow?.optimal_batch])
 
   async function handleBatchSave() {
     if (!activeRow?.item_id) return
@@ -212,9 +212,9 @@ export function ProductionDetailPane({
             </div>
           )}
           <div className="detailActions">
-            <button onClick={onLoadMaterials}>Повторить загрузку</button>
-            <button onClick={onPrint}>Печать листа</button>
-            {activeRow && (
+            <button onClick={onLoadMaterials} disabled={!activeRow?.product_id}>Повторить загрузку</button>
+            <button onClick={onPrint} disabled={!activeRow?.product_id}>Печать листа</button>
+            {activeRow?.product_id && (
               <button
                 onClick={onProduce}
                 title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back"
@@ -222,7 +222,7 @@ export function ProductionDetailPane({
                 Произвести строку
               </button>
             )}
-            {activeRow && (
+            {activeRow?.product_id && (
               <button
                 onClick={onReturnLeftovers}
                 title="Запросить возврат; backend проверит принятый выпуск, исходящую выдачу и фактический остаток"

@@ -35,12 +35,18 @@ from app.services.planning_truth import (
     get_latest_read_snapshot,
     get_truth_state,
 )
-from app.services.production_control_journal import STATUS_FILTER_GROUPS, list_journal
+from app.services.production_control_journal import (
+    STATUS_FILTER_GROUPS,
+    list_journal,
+    list_make_proposals,
+)
 
 
 CONSUMER = "production_control_journal"
 SNAPSHOT_KEY = "journal:v1"
 ROW_KIND = "production_order"
+PROPOSAL_ROW_KIND = "production_proposal"
+ROW_KINDS = (ROW_KIND, PROPOSAL_ROW_KIND)
 REQUIRED = (
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
@@ -201,7 +207,7 @@ def list_root_product_options(
 
 def _root_product_options(
     db: Session,
-    roots_by_product: Mapping[int, set[int]],
+    roots_by_product: Mapping[object, set[int]],
 ) -> list[dict[str, Any]]:
     root_ids = sorted({root_id for values in roots_by_product.values() for root_id in values})
     if not root_ids:
@@ -339,7 +345,18 @@ def _build_rows(
 
     if len(rows) != total:
         raise ValueError("production-control journal builder row count changed during build")
-    product_ids = [int(row["product_id"]) for row in rows]
+    rows.extend(
+        list_make_proposals(
+            db,
+            ledger_generation_id=int(generation.id),
+            accepted_run_ids=run_ids,
+        )
+    )
+    product_ids = [
+        int(row["product_id"])
+        for row in rows
+        if row.get("product_id") is not None
+    ]
     if len(product_ids) != len(set(product_ids)):
         raise ValueError("production-control journal candidate has duplicate products")
 
@@ -349,6 +366,8 @@ def _build_rows(
         ledger_generation_id=int(generation.id),
     )
     for row in rows:
+        if row.get("product_id") is None:
+            continue
         product_id = int(row["product_id"])
         row_snapshot = route_snapshots.get(product_id)
         if not isinstance(row_snapshot, Mapping):
@@ -360,12 +379,12 @@ def _build_rows(
     }
 
 
-def _root_membership_by_product(
+def _root_membership_by_row(
     db: Session,
     *,
     rows: Sequence[Mapping[str, Any]],
     accepted_run_ids: Sequence[int],
-) -> dict[int, set[int]]:
+) -> dict[str, set[int]]:
     run_ids = sorted({int(value) for value in accepted_run_ids})
     if not rows or not run_ids:
         return {}
@@ -391,7 +410,7 @@ def _root_membership_by_product(
         if root_ids
         else {}
     )
-    result: dict[int, set[int]] = {}
+    result: dict[str, set[int]] = {}
     for row in rows:
         source_run_id = row.get("source_run_id")
         if source_run_id is None:
@@ -406,7 +425,7 @@ def _root_membership_by_product(
             if item_id in descendants.get(root_id, {root_id})
         }
         if matched:
-            result[int(row["product_id"])] = matched
+            result[str(row["journal_row_key"])] = matched
     return result
 
 
@@ -416,7 +435,7 @@ def _persisted_candidate_matches(
     snapshot: models.PlanningReadSnapshot,
     payload: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
-    roots_by_product: Mapping[int, set[int]],
+    roots_by_row: Mapping[str, set[int]],
 ) -> bool:
     if (
         snapshot.truth_status != "building"
@@ -430,22 +449,18 @@ def _persisted_candidate_matches(
         .order_by(models.PlanningReadRow.row_key.asc())
         .all()
     )
-    expected = {
-        f"product:{int(row['product_id'])}": dict(row)
-        for row in rows
-    }
+    expected = {str(row["journal_row_key"]): dict(row) for row in rows}
     if len(persisted) != len(expected):
         return False
     for row in persisted:
         if (
-            row.row_kind != ROW_KIND
+            row.row_kind not in ROW_KINDS
             or row.payload != expected.get(str(row.row_key))
             or int(row.item_id or -1) != int(row.payload.get("item_id") or -1)
         ):
             return False
         actual_roots = {int(member.root_item_id) for member in row.root_members}
-        product_id = int(row.payload["product_id"])
-        if actual_roots != set(roots_by_product.get(product_id, set())):
+        if actual_roots != set(roots_by_row.get(str(row.row_key), set())):
             return False
     return True
 
@@ -471,12 +486,12 @@ def build_candidate_snapshot(
     )
     run_ids = tuple(sorted({int(value) for value in accepted_run_ids}))
     rows, journal_meta = _build_rows(db, generation, run_ids)
-    roots_by_product = _root_membership_by_product(
+    roots_by_row = _root_membership_by_row(
         db,
         rows=rows,
         accepted_run_ids=run_ids,
     )
-    root_product_options = _root_product_options(db, roots_by_product)
+    root_product_options = _root_product_options(db, roots_by_row)
     payload = {
         "meta": {
             "ledger_generation_id": int(generation.id),
@@ -504,7 +519,7 @@ def build_candidate_snapshot(
             snapshot=existing,
             payload=payload,
             rows=rows,
-            roots_by_product=roots_by_product,
+            roots_by_row=roots_by_row,
         ):
             raise ValueError("production-control journal candidate conflict")
         return existing
@@ -522,18 +537,22 @@ def build_candidate_snapshot(
     db.add(snapshot)
     db.flush()
     for position, payload_row in enumerate(rows):
-        product_id = int(payload_row["product_id"])
+        row_key = str(payload_row["journal_row_key"])
         row = models.PlanningReadRow(
             snapshot_id=int(snapshot.id),
-            row_key=f"product:{product_id}",
-            row_kind=ROW_KIND,
+            row_key=row_key,
+            row_kind=(
+                ROW_KIND
+                if payload_row.get("product_id") is not None
+                else PROPOSAL_ROW_KIND
+            ),
             item_id=int(payload_row["item_id"]),
             sort_key=f"{position:012d}",
             payload=dict(payload_row),
         )
         db.add(row)
         db.flush()
-        for root_item_id in sorted(roots_by_product.get(product_id, set())):
+        for root_item_id in sorted(roots_by_row.get(row_key, set())):
             db.add(
                 models.PlanningReadRootMember(
                     snapshot_id=int(snapshot.id),
@@ -572,7 +591,7 @@ def validate_candidate_snapshot(
         db.query(models.PlanningReadRow)
         .filter(
             models.PlanningReadRow.snapshot_id == int(candidate.id),
-            models.PlanningReadRow.row_kind == ROW_KIND,
+            models.PlanningReadRow.row_kind.in_(ROW_KINDS),
         )
         .all()
     )
@@ -581,11 +600,40 @@ def validate_candidate_snapshot(
             "production-control journal candidate rows are incomplete"
         )
     product_ids: set[int] = set()
+    work_item_ids: set[int] = set()
     for row in rows:
         payload_row = row.payload if isinstance(row.payload, dict) else None
         try:
-            product_id = int(payload_row["product_id"]) if payload_row else -1
             item_id = int(payload_row["item_id"]) if payload_row else -1
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is malformed"
+            ) from exc
+        if row.row_kind == PROPOSAL_ROW_KIND:
+            try:
+                work_item_id = int(payload_row["work_item_id"]) if payload_row else -1
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ProductionControlJournalPromotionError(
+                    "production-control journal proposal row is malformed"
+                ) from exc
+            if (
+                item_id <= 0
+                or work_item_id <= 0
+                or work_item_id in work_item_ids
+                or payload_row.get("product_id") is not None
+                or payload_row.get("order_id") is not None
+                or payload_row.get("available_actions") != ["materialize"]
+                or row.row_key != f"work-item:{work_item_id}"
+                or payload_row.get("journal_row_key") != row.row_key
+                or int(row.item_id or -1) != item_id
+            ):
+                raise ProductionControlJournalPromotionError(
+                    "production-control journal proposal row is malformed"
+                )
+            work_item_ids.add(work_item_id)
+            continue
+        try:
+            product_id = int(payload_row["product_id"]) if payload_row else -1
         except (KeyError, TypeError, ValueError) as exc:
             raise ProductionControlJournalPromotionError(
                 "production-control journal candidate row is malformed"
@@ -600,6 +648,7 @@ def validate_candidate_snapshot(
             or item_id <= 0
             or product_id in product_ids
             or row.row_key != f"product:{product_id}"
+            or payload_row.get("journal_row_key") != row.row_key
             or int(row.item_id or -1) != item_id
         ):
             raise ProductionControlJournalPromotionError(
@@ -790,7 +839,7 @@ def read_snapshot(
 
     query = db.query(models.PlanningReadRow).filter(
         models.PlanningReadRow.snapshot_id == int(snapshot.id),
-        models.PlanningReadRow.row_kind == ROW_KIND,
+        models.PlanningReadRow.row_kind.in_(ROW_KINDS),
     )
     row_payload = models.PlanningReadRow.payload
     if product_id is not None:

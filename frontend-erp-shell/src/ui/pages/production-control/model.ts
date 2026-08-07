@@ -81,7 +81,7 @@ export function writeProductionControlUrlState(
     next.set(key, value)
   }
   if (state.offset > 0) next.set('offset', String(state.offset))
-  if (state.activeProductId != null) {
+  if (state.activeProductId != null && state.activeProductId > 0) {
     next.set('active_product_id', String(state.activeProductId))
   }
   return next
@@ -124,25 +124,33 @@ export function activeProductionRow(
   rows: readonly OrderRow[],
   activeId: number | null,
 ): OrderRow | null {
-  return rows.find((row) => row.product_id === activeId) ?? rows[0] ?? null
+  return rows.find((row) => productionRowId(row) === activeId) ?? rows[0] ?? null
+}
+
+export function productionRowId(row: OrderRow): number {
+  if (row.product_id != null) return row.product_id
+  if (row.work_item_id != null) return -row.work_item_id
+  return 0
 }
 
 export function selectedProductionRows(
   rows: readonly OrderRow[],
   selectedIds: ReadonlySet<number>,
 ): OrderRow[] {
-  return rows.filter((row) => selectedIds.has(row.product_id))
+  return rows.filter((row) => selectedIds.has(productionRowId(row)))
 }
 
 export function productionRow(rows: readonly OrderRow[], productId: number | null): OrderRow | null {
-  return rows.find((row) => row.product_id === productId) ?? null
+  return rows.find((row) => productionRowId(row) === productId) ?? null
 }
 
 export function deletableProductionRows(
   rows: readonly OrderRow[],
   selectedIds: ReadonlySet<number>,
 ): OrderRow[] {
-  return selectedProductionRows(rows, selectedIds).filter((row) => !row.order_ref1c)
+  return selectedProductionRows(rows, selectedIds).filter(
+    (row) => row.product_id != null && row.order_id != null && !row.order_ref1c,
+  )
 }
 
 export function buildProductionSettingsPayload(

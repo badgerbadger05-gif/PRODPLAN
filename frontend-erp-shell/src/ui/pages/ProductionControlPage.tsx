@@ -20,6 +20,7 @@ import {
   getProductionControlSettings,
   listRootProductOptions,
   listProductionOrders,
+  materializeMakeWorkItems,
   postMaterialIssues,
   produceOrderLine,
   returnLeftoverComponents,
@@ -56,6 +57,7 @@ import {
   nextProductionSort,
   parseProductionControlUrlState,
   productionPagination,
+  productionRowId,
   selectedProductionRows,
   writeProductionControlUrlState,
 } from './production-control/model'
@@ -146,8 +148,8 @@ export function ProductionControlPage() {
       setActiveId((current) => {
         const focusedProductId = Number(focusProductId || 0)
         if (focusedProductId && data.rows?.some((row) => row.product_id === focusedProductId)) return focusedProductId
-        if (current && data.rows?.some((row) => row.product_id === current)) return current
-        return data.rows?.[0]?.product_id ?? null
+        if (current && data.rows?.some((row) => productionRowId(row) === current)) return current
+        return data.rows?.[0] ? productionRowId(data.rows[0]) : null
       })
     } catch (e) {
       if (requestSeq !== listRequestSeq.current) return
@@ -251,6 +253,7 @@ export function ProductionControlPage() {
   }
 
   async function changeStatus(row: OrderRow, status: string) {
+    if (row.product_id == null) return
     const previous = row.status
     setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status } : item))
     try {
@@ -364,14 +367,27 @@ export function ProductionControlPage() {
   }
 
   async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
-    const ids = productIds ?? Array.from(selectedIds)
-    if (!ids.length) return
+    let ids = productIds ?? selectedRows.flatMap((row) => row.product_id == null ? [] : [row.product_id])
+    const workItemIds = productIds == null
+      ? selectedRows.flatMap((row) => row.work_item_id == null ? [] : [row.work_item_id])
+      : []
+    if (!ids.length && !workItemIds.length) return
     if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
-    const printWindow = prepareRouteSheetWindow()
+    let printWindow: Window | null = null
     try {
+      if (workItemIds.length) {
+        const materialized = await materializeMakeWorkItems(workItemIds)
+        ids = Array.from(new Set([
+          ...ids,
+          ...(materialized.created ?? []).map((row) => row.product_id),
+          ...(materialized.reused ?? []).map((row) => row.product_id),
+        ]))
+      }
+      if (!ids.length) throw new Error('Не удалось создать исполнительные заказы из расчёта MRP')
+      printWindow = prepareRouteSheetWindow()
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = issueResult.selection_required ?? []
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
@@ -531,7 +547,9 @@ export function ProductionControlPage() {
   }
 
   async function deleteSelectedLocalOrders() {
-    const selected = rows.filter((row) => selectedIds.has(row.product_id))
+    const selected = rows.filter(
+      (row) => row.product_id != null && selectedIds.has(productionRowId(row)) && !row.order_ref1c,
+    )
     if (!selected.length) return
     const names = selected.map((row) => row.order_prodplan_number || row.order_number).join(', ')
     if (!beginDangerousMutation()) return
@@ -544,7 +562,7 @@ export function ProductionControlPage() {
     setMessage('')
     try {
       for (const row of selected) {
-        await deleteProductionOrder(row.product_id)
+        if (row.product_id != null) await deleteProductionOrder(row.product_id)
       }
       setSelectedIds(new Set())
       setMessage(`Удалено локальных заказов: ${selected.length}`)
@@ -623,11 +641,11 @@ export function ProductionControlPage() {
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}
           onClose={() => void closeActiveOrder(selectedRows[0]?.product_id)}
-          onPrintSelected={() => openRouteSheets(Array.from(selectedIds))}
+          onPrintSelected={() => openRouteSheets(selectedRows.flatMap((row) => row.product_id == null ? [] : [row.product_id]))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
           onRefresh={() => void load(offset)}
-          onSelectAll={() => setSelectedIds(new Set(rows.map((row) => row.product_id)))}
+          onSelectAll={() => setSelectedIds(new Set(rows.map(productionRowId)))}
           onClearSelection={() => setSelectedIds(new Set())}
           rootProductLabel={rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}
           onOpenRootProductFilter={() => setRootDialogOpen(true)}
@@ -665,7 +683,7 @@ export function ProductionControlPage() {
                 }}
                 onSelectIds={setSelectedIds}
                 onActivate={setActiveId}
-                onOpenMaterials={(row) => void loadMaterials(row.product_id)}
+                onOpenMaterials={(row) => { if (row.product_id != null) void loadMaterials(row.product_id) }}
                 onChangeStatus={(row, status) => void changeStatus(row, status)}
                 onToggleSort={toggleSort}
               />
@@ -689,10 +707,10 @@ export function ProductionControlPage() {
               activeRow={activeRow}
               materials={materials}
               coverageLabels={coverageLabels}
-              onLoadMaterials={() => activeRow && void loadMaterials(activeRow.product_id)}
+              onLoadMaterials={() => { if (activeRow?.product_id != null) void loadMaterials(activeRow.product_id) }}
               onProduce={() => void produceActiveLine(activeRow?.product_id)}
               onReturnLeftovers={() => void returnActiveLeftovers(activeRow?.product_id)}
-              onPrint={() => activeRow && openRouteSheets([activeRow.product_id])}
+              onPrint={() => { if (activeRow?.product_id != null) openRouteSheets([activeRow.product_id]) }}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
             />
           )}

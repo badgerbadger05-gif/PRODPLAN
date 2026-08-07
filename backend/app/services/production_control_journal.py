@@ -44,7 +44,6 @@ from .planning_truth import PlanningTruthReadiness, require_accepted_truth
 from .paint_weld_pairs import is_welded_blocked
 from .mrp_mutation_guard import (
     MrpMutationLineageError,
-    require_current_run,
 )
 from .bom_specification_resolver import BomSpecificationResolver
 from .item_ledger.production_output_cache import (
@@ -183,25 +182,18 @@ def _journal_coverage_status(
 
 
 def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
-    """Exact same-generation materializations, independent of legacy state.
+    """Active local materializations for the exact frozen requirement.
 
-    ``remaining_qty``, 1C order state and journal status are projections, not
-    authorization.  Once this requirement was materialized in its generation,
-    a retry must reuse it even when those legacy fields are stale.
+    Physical Ledger generations advance while the frozen MRP requirement stays
+    immutable. Matching the exact requirement prevents duplicate executors
+    without rewriting their creation-generation provenance.
     """
-    current_run = db.query(PlanningRun).filter(PlanningRun.run_id == int(req.run_id)).first()
-    if current_run is None or current_run.ledger_generation_id is None:
-        return []
     return [
         (product, order)
         for product, order in (
         db.query(ProductionProduct, ProductionOrder)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .filter(ProductionProduct.source_mrp_requirement_id == int(req.id))
-        .filter(
-            ProductionProduct.ledger_generation_id
-            == int(current_run.ledger_generation_id)
-        )
         .filter(ProductionOrder.source == "mrp")
         .filter(ProductionOrder.deletion_mark.is_(False))
         .all()
@@ -392,11 +384,21 @@ def materialize_make_work_items(
     run_ids = {int(row.run_id) for row in selected}
     if len(run_ids) != 1:
         raise MrpMutationLineageError("selected work items have mixed or empty runs")
-    run, generation_id = require_current_run(
+    selected_run_id = run_ids.pop()
+    truth = require_accepted_truth(
         db,
-        run_ids.pop(),
-        consumer="production_control.materialize_make_work_items",
+        "production_control.materialize_make_work_items",
     )
+    generation_id = int(truth.generation_id)
+    run = db.get(PlanningRun, selected_run_id)
+    if run is None or str(run.status or "").upper() != "FIXED_SNAPSHOT":
+        raise MrpMutationLineageError(
+            f"planning run {selected_run_id} is not a FIXED_SNAPSHOT"
+        )
+    if run.active_freeze_version is None:
+        raise MrpMutationLineageError(
+            f"planning run {selected_run_id} has no active freeze"
+        )
     if any(
         int(row.ledger_generation_id) != generation_id
         or row.replenishment_method != "make"
@@ -503,13 +505,6 @@ def materialize_make_work_items(
         active_products = _active_mrp_products_for_requirement(db, req)
         if active_products:
             for product, order in active_products:
-                if (
-                    product.ledger_generation_id is None
-                    or int(product.ledger_generation_id) != generation_id
-                ):
-                    raise MrpMutationLineageError(
-                        f"requirement_id={rid}: existing materialization has stale Ledger lineage"
-                    )
                 payload = _reused_product_payload(product, order, requirement_id=rid)
                 payload["work_item_id"] = work_id
                 reused.append(payload)
@@ -1126,6 +1121,8 @@ def list_journal(
         output = accepted_product_output(product)
         result.append(
             {
+                "journal_row_key": f"product:{int(product.product_id)}",
+                "work_item_id": None,
                 "product_id": int(product.product_id),
                 "order_id": int(product.order_id),
                 "order_number": str(product.order.order_number or ""),
@@ -1215,6 +1212,213 @@ def list_journal(
         "latest_run_id": run_id,
         "latest_source_plan_id": int(latest_run.source_plan_id) if latest_run and latest_run.source_plan_id is not None else None,
     }
+
+
+def list_make_proposals(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    accepted_run_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Project unmaterialized MAKE work items into the unified journal.
+
+    These are saved MRP calculations, not executable ``ProductionOrder``
+    documents.  They stay read-only until the operator explicitly materializes
+    them; consequently product/order identifiers are absent and no 1C action is
+    performed while the Ledger candidate is built.
+    """
+    generation_id = int(ledger_generation_id)
+    run_ids = sorted({int(value) for value in accepted_run_ids})
+    if not run_ids:
+        return []
+
+    materialized_requirement_ids = {
+        int(requirement_id)
+        for (requirement_id,) in (
+            db.query(ProductionProduct.source_mrp_requirement_id)
+            .join(
+                ProductionOrder,
+                ProductionOrder.order_id == ProductionProduct.order_id,
+            )
+            .filter(
+                ProductionOrder.source == "mrp",
+                ProductionOrder.deletion_mark.is_(False),
+                ProductionProduct.source_mrp_requirement_id.isnot(None),
+                ProductionOrder.source_run_id.in_(run_ids),
+            )
+            .all()
+        )
+    }
+    query = (
+        db.query(ReplenishmentWorkItem)
+        .filter(
+            ReplenishmentWorkItem.ledger_generation_id == generation_id,
+            ReplenishmentWorkItem.run_id.in_(run_ids),
+            ReplenishmentWorkItem.replenishment_method == "make",
+            ReplenishmentWorkItem.replenishment_remaining_qty > 0,
+        )
+        .order_by(ReplenishmentWorkItem.run_id.asc(), ReplenishmentWorkItem.id.asc())
+    )
+    if materialized_requirement_ids:
+        query = query.filter(
+            ~ReplenishmentWorkItem.requirement_id.in_(materialized_requirement_ids)
+        )
+    work_items = query.all()
+    if not work_items:
+        return []
+
+    item_ids = sorted({int(row.item_id) for row in work_items})
+    requirement_ids = sorted({int(row.requirement_id) for row in work_items})
+    items = {
+        int(item.item_id): item
+        for item in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
+    }
+    requirements = {
+        int(row.id): row
+        for row in db.query(MrpRequirement).filter(MrpRequirement.id.in_(requirement_ids)).all()
+    }
+    run_rows = (
+        db.query(PlanningRun, ProductionPlanHeader)
+        .outerjoin(
+            ProductionPlanHeader,
+            ProductionPlanHeader.id == PlanningRun.source_plan_id,
+        )
+        .filter(PlanningRun.run_id.in_(run_ids))
+        .all()
+    )
+    run_meta = {
+        int(run.run_id): {
+            "source_plan_id": int(run.source_plan_id) if run.source_plan_id is not None else None,
+            "source_plan_name": str(plan.name or "") if plan else "",
+            "source_plan_period_from": _date_to_iso(
+                run.period_from or (plan.period_from if plan else None)
+            ),
+            "source_plan_period_to": _date_to_iso(
+                run.period_to or (plan.period_to if plan else None)
+            ),
+        }
+        for run, plan in run_rows
+    }
+    planned_dates: Dict[int, Tuple[Optional[date], Optional[date]]] = {}
+    for demand_ref, start_date, finish_date in (
+        db.query(
+            PlannedOrder.demand_ref,
+            func.min(PlannedOrder.start_date),
+            func.max(func.coalesce(PlannedOrder.finish_date, PlannedOrder.need_date)),
+        )
+        .filter(PlannedOrder.run_id.in_(run_ids))
+        .filter(PlannedOrder.demand_ref.isnot(None))
+        .group_by(PlannedOrder.demand_ref)
+        .all()
+    ):
+        token = str(demand_ref or "")
+        if not token.startswith("mrp_requirement:"):
+            continue
+        try:
+            requirement_id = int(token.split(":", 1)[1])
+        except (TypeError, ValueError):
+            continue
+        planned_dates[requirement_id] = (start_date, finish_date)
+
+    spec_by_item = _default_spec_ids_by_item(db, item_ids)
+    spec_ids = sorted(set(spec_by_item.values()))
+    workshop_by_spec = _main_workshops_for_specs(db, spec_ids)
+    unit_by_raw = _unit_display_by_raw(
+        db,
+        [items[item_id].unit for item_id in item_ids if item_id in items],
+    )
+    shelf_by_item = _shelf_pull_by_item(
+        db,
+        ledger_generation_id=generation_id,
+        item_ids=item_ids,
+    )
+
+    result: List[Dict[str, Any]] = []
+    for work in work_items:
+        item = items.get(int(work.item_id))
+        requirement = requirements.get(int(work.requirement_id))
+        if item is None or requirement is None:
+            raise ValueError(
+                f"MAKE work item {int(work.id)} has incomplete item/requirement lineage"
+            )
+        planned_start, planned_finish = planned_dates.get(
+            int(requirement.id),
+            (requirement.period_from, requirement.period_to),
+        )
+        shelf = shelf_by_item.get(int(work.item_id))
+        if shelf is not None and shelf.latest_start_date is not None:
+            planned_start = shelf.latest_start_date
+        if shelf is not None and shelf.first_shortage_date is not None:
+            planned_finish = shelf.first_shortage_date
+        spec_id = spec_by_item.get(int(work.item_id))
+        workshop_id, workshop_name, stage_id, stage_name = workshop_by_spec.get(
+            int(spec_id or 0),
+            (None, None, None, None),
+        )
+        required_qty = _to_float(work.replenishment_required_qty)
+        fulfilled_qty = _to_float(work.replenishment_fulfilled_qty)
+        remaining_qty = _to_float(work.replenishment_remaining_qty)
+        result.append(
+            {
+                "journal_row_key": f"work-item:{int(work.id)}",
+                "work_item_id": int(work.id),
+                "product_id": None,
+                "order_id": None,
+                "order_number": f"MRP-R-{int(requirement.id)}",
+                "order_prodplan_number": f"MRP-R-{int(requirement.id)}",
+                "order_date": None,
+                "order_source": "mrp",
+                "source": "mrp",
+                "order_ref1c": None,
+                "order_one_c_number": None,
+                "line_number": None,
+                "item_id": int(item.item_id),
+                "item_code": str(item.item_code or ""),
+                "item_name": str(item.item_name or ""),
+                "item_article": str(item.item_article or ""),
+                "optimal_batch": _to_float(item.optimal_batch) if item.optimal_batch is not None else None,
+                "unit": unit_by_raw.get(str(item.unit or "").strip(), ""),
+                "quantity": required_qty,
+                "produced_qty": fulfilled_qty,
+                "remaining_qty": remaining_qty,
+                "status": "shortage",
+                "coverage_status": "unknown",
+                "coverage_label": "После создания заказа",
+                "issue_status": "not_requested",
+                "material_coverage_status": None,
+                "material_coverage_label": None,
+                "material_coverage_calculated_at": None,
+                "planned_start_date": _date_to_iso(planned_start),
+                "planned_finish_date": _date_to_iso(planned_finish),
+                **_forecast_payload(planned_finish, requirement.period_to),
+                "opened_at": None,
+                "workshop_id": workshop_id,
+                "workshop_name": workshop_name,
+                "stage_id": stage_id,
+                "stage_name": stage_name,
+                "spec_id": int(spec_id) if spec_id is not None else None,
+                "spec_revision_hash": None,
+                "issue_count": 0,
+                "route_sheet_printed_at": None,
+                "comment": "Расчёт MRP; исполнительный заказ ещё не создан",
+                "source_run_id": int(work.run_id),
+                **run_meta.get(int(work.run_id), {}),
+                "source_planned_order_id": None,
+                "source_mrp_requirement_id": int(work.requirement_id),
+                "source_mrp_allocation_key": None,
+                "available_actions": ["materialize"],
+                "mrp_req_net_qty": required_qty,
+                "mrp_req_covered_qty": fulfilled_qty,
+                "mrp_req_remaining_qty": remaining_qty,
+                "launch_source": LAUNCH_SOURCE_SHELF if shelf else LAUNCH_SOURCE_MRP,
+                "shelf_warehouse_ref1c": shelf.warehouse_ref1c if shelf else None,
+                "shelf_pull_qty": shelf.pull_qty if shelf else None,
+                "shelf_materialized_qty": shelf.materialized_qty if shelf else None,
+                "shelf_latest_start_date": _date_to_iso(shelf.latest_start_date) if shelf else None,
+                "paint_weld_chain": None,
+            }
+        )
+    return result
 
 
 # Terminal states that close a line: a remainder left un-produced here is never

@@ -4732,13 +4732,17 @@ export interface components {
         };
         /**
          * ProductionOrderJournalRowResponse
-         * @description One real production line in the unified production-control journal.
+         * @description One executor order or saved MRP proposal in the unified journal.
          */
         ProductionOrderJournalRowResponse: {
+            /** Journal Row Key */
+            journal_row_key?: string | null;
+            /** Work Item Id */
+            work_item_id?: number | null;
             /** Product Id */
-            product_id: number;
+            product_id?: number | null;
             /** Order Id */
-            order_id: number;
+            order_id?: number | null;
             /** Order Number */
             order_number: string;
             /** Order Prodplan Number */

@@ -3,6 +3,7 @@ import { dateRu, qty } from '../../../lib/format'
 import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from '../../tableDoctype'
 import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
 import { ForecastShift } from '../period-plan/ForecastShift'
+import { productionRowId } from './model'
 
 type Props = {
   rows: OrderRow[]
@@ -19,6 +20,7 @@ type Props = {
 const manualProductionStatusOptions = productionStatusOptions.filter(([value]) => value !== 'completed')
 
 function orderSubline(row: OrderRow) {
+  if (row.product_id == null) return 'Расчёт MRP · заказ ещё не создан'
   if (row.order_ref1c) return row.order_one_c_number || (row.order_source === '1c' ? row.order_number : 'Открыт в 1С')
   return `${dateRu(row.order_date)} · стр. ${row.line_number || '—'}`
 }
@@ -56,25 +58,28 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
         </tr>
       </thead>
       <tbody>
-        {rows.map((row) => (
+        {rows.map((row) => {
+          const rowId = productionRowId(row)
+          const isProposal = row.product_id == null
+          return (
           <tr
-            key={row.product_id}
-            className={row.product_id === activeRow?.product_id ? 'activeRow' : ''}
+            key={row.journal_row_key || rowId}
+            className={rowId === (activeRow ? productionRowId(activeRow) : null) ? 'activeRow' : ''}
             tabIndex={0}
-            aria-selected={row.product_id === activeRow?.product_id}
-            onClick={() => onActivate(row.product_id)}
-            onDoubleClick={() => onOpenMaterials(row)}
+            aria-selected={rowId === (activeRow ? productionRowId(activeRow) : null)}
+            onClick={() => onActivate(rowId)}
+            onDoubleClick={() => { if (!isProposal) onOpenMaterials(row) }}
             onKeyDown={(event) => {
               if (event.target !== event.currentTarget) return
               if (event.key === 'Enter') {
                 event.preventDefault()
-                onActivate(row.product_id)
-                onOpenMaterials(row)
+                onActivate(rowId)
+                if (!isProposal) onOpenMaterials(row)
               } else if (event.key === ' ') {
                 event.preventDefault()
                 const next = new Set(selectedIds)
-                if (next.has(row.product_id)) next.delete(row.product_id)
-                else next.add(row.product_id)
+                if (next.has(rowId)) next.delete(rowId)
+                else next.add(rowId)
                 onSelectIds(next)
               }
             }}
@@ -83,11 +88,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <input
                 type="checkbox"
                 aria-label={`Выбрать заказ ${orderMainLine(row)}`}
-                checked={selectedIds.has(row.product_id)}
+                checked={selectedIds.has(rowId)}
                 onChange={(e) => {
                   const next = new Set(selectedIds)
-                  if (e.target.checked) next.add(row.product_id)
-                  else next.delete(row.product_id)
+                  if (e.target.checked) next.add(rowId)
+                  else next.delete(rowId)
                   onSelectIds(next)
                 }}
                 onClick={(e) => e.stopPropagation()}
@@ -135,7 +140,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <span className="muted">{row.stage_name || ''}</span>
             </td>
             <td>
-              <select aria-label={`Статус заказа ${orderMainLine(row)}`} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
+              <select aria-label={`Статус заказа ${orderMainLine(row)}`} disabled={isProposal} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
                 {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </td>
@@ -146,7 +151,8 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               {!!row.issue_count && <span className="muted issueCount">док. {row.issue_count}</span>}
             </td>
           </tr>
-        ))}
+          )
+        })}
       </tbody>
     </table>
   )

@@ -133,20 +133,30 @@ def require_materialized_orders(
     run_ids = {int(order.source_run_id) for order in orders if order.source_run_id is not None}
     if len(run_ids) != 1 or any(order.source_run_id is None for order in orders):
         raise MrpMutationLineageError("selected orders have null or mixed planning runs")
-    run, generation_id = require_current_run(db, run_ids.pop(), consumer=consumer)
+    truth = require_accepted_truth(
+        db,
+        consumer,
+        required_capabilities=REQUIRED_MUTATION_CAPABILITIES,
+    )
+    generation_id = int(truth.generation_id)
+    run = db.get(models.PlanningRun, run_ids.pop())
+    if run is None or str(run.status or "").upper() != "FIXED_SNAPSHOT":
+        raise MrpMutationLineageError("selected orders do not belong to a fixed MRP run")
+    if run.active_freeze_version is None:
+        raise MrpMutationLineageError(f"planning run {run.run_id} has no active freeze")
     for order in orders:
         products = list(order.products)
         if not products:
             raise MrpMutationLineageError(f"production order {order.order_id} has no products")
         for product in products:
-            if (
-                product.ledger_generation_id is None
-                or int(product.ledger_generation_id) != generation_id
-            ):
-                raise MrpMutationLineageError(
-                    f"production product {product.product_id} is null, mixed or stale Ledger lineage"
-                )
             if product.source_planned_order_id is not None:
+                if (
+                    product.ledger_generation_id is None
+                    or int(product.ledger_generation_id) != generation_id
+                ):
+                    raise MrpMutationLineageError(
+                        f"production product {product.product_id} is null, mixed or stale Ledger lineage"
+                    )
                 proposal = db.get(models.PlannedOrder, int(product.source_planned_order_id))
                 if proposal is None:
                     raise MrpMutationLineageError("source planned order is missing")
@@ -160,6 +170,35 @@ def require_materialized_orders(
                 if requirement is None:
                     raise MrpMutationLineageError("source MRP requirement is missing")
                 require_selected_requirements([requirement], run=run)
+                if (
+                    product.ledger_generation_id is None
+                    or int(product.ledger_generation_id) != generation_id
+                ):
+                    current_work = (
+                        db.query(models.ReplenishmentWorkItem)
+                        .join(
+                            models.ReservationEntry,
+                            models.ReservationEntry.id
+                            == models.ReplenishmentWorkItem.reservation_id,
+                        )
+                        .filter(
+                            models.ReplenishmentWorkItem.ledger_generation_id
+                            == generation_id,
+                            models.ReplenishmentWorkItem.run_id == int(run.run_id),
+                            models.ReplenishmentWorkItem.requirement_id
+                            == int(requirement.id),
+                            models.ReplenishmentWorkItem.replenishment_method == "make",
+                            models.ReservationEntry.ledger_generation_id
+                            == generation_id,
+                            models.ReservationEntry.lifecycle_status == "active",
+                            models.ReservationEntry.realization_mode == "make",
+                        )
+                        .one_or_none()
+                    )
+                    if current_work is None:
+                        raise MrpMutationLineageError(
+                            f"production product {product.product_id} is null, mixed or stale Ledger lineage"
+                        )
             else:
                 raise MrpMutationLineageError(
                     f"production product {product.product_id} has no current MRP source"

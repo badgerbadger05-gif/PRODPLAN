@@ -689,12 +689,14 @@ class PaintWeldChainResponse(BaseModel):
 
 
 class ProductionOrderJournalRowResponse(BaseModel):
-    """One real production line in the unified production-control journal."""
+    """One executor order or saved MRP proposal in the unified journal."""
 
     model_config = ConfigDict(extra="forbid")
 
-    product_id: int
-    order_id: int
+    journal_row_key: Optional[str] = None
+    work_item_id: Optional[int] = None
+    product_id: Optional[int] = None
+    order_id: Optional[int] = None
     order_number: str
     order_prodplan_number: Optional[str] = None
     order_date: Optional[str] = None

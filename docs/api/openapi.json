@@ -16113,12 +16113,48 @@
       },
       "ProductionOrderJournalRowResponse": {
         "properties": {
+          "journal_row_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Journal Row Key"
+          },
+          "work_item_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Id"
+          },
           "product_id": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Product Id"
           },
           "order_id": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Order Id"
           },
           "order_number": {
@@ -16644,8 +16680,6 @@
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "product_id",
-          "order_id",
           "order_number",
           "order_source",
           "source",
@@ -16665,7 +16699,7 @@
           "comment"
         ],
         "title": "ProductionOrderJournalRowResponse",
-        "description": "One real production line in the unified production-control journal."
+        "description": "One executor order or saved MRP proposal in the unified journal."
       },
       "ProductionResource": {
         "properties": {

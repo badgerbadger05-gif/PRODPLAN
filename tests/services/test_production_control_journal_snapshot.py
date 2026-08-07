@@ -136,6 +136,91 @@ def _journal_line(db):
     return item, order, product
 
 
+def _make_proposal(db, generation):
+    item = models.Item(
+        item_code="SNAP-MAKE-PROPOSAL",
+        item_name="Snapshot MAKE proposal",
+        item_article="SNAP-MAKE",
+        unit="шт",
+        replenishment_method="Производство",
+        status="active",
+    )
+    plan = models.ProductionPlanHeader(
+        name="Snapshot proposal plan",
+        period_from=generation.cutoff.date(),
+        period_to=generation.cutoff.date(),
+        status="fixed",
+    )
+    db.add_all([item, plan])
+    db.flush()
+    plan_line = models.ProductionPlanLine(
+        plan_id=plan.id,
+        item_id=item.item_id,
+        bucket_date=generation.cutoff.date(),
+        qty=12,
+    )
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+    )
+    db.add_all([plan_line, run])
+    db.flush()
+    requirement = models.MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=12,
+        net_required_qty=12,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=run.run_id,
+        freeze_version=1,
+        requirement_id=requirement.id,
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="make",
+        reserved_qty=12,
+        covered_from_stock_at_freeze_qty=0,
+        replenishment_required_qty=12,
+        replenishment_received_qty=2,
+        realized_qty=2,
+        lifecycle_status="active",
+    )
+    db.add(reservation)
+    db.flush()
+    work = models.ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        plan_id=plan.id,
+        run_id=run.run_id,
+        requirement_id=requirement.id,
+        item_id=item.item_id,
+        replenishment_method="make",
+        replenishment_required_qty=12,
+        replenishment_fulfilled_qty=2,
+        replenishment_remaining_qty=10,
+    )
+    db.add(work)
+    db.flush()
+    return run, work
+
+
 def _accept(db, generation, snapshot):
     accepted_at = datetime(2026, 7, 29, 13, tzinfo=timezone.utc)
     generation.status = "accepted"
@@ -240,6 +325,31 @@ def test_candidate_snapshot_row_contains_route_sheet_snapshot(db_session):
     assert int(route_payload["sheet"]["product_id"]) == product.product_id
     assert int(route_payload["sheet"]["remaining_qty"]) == 7
     assert "_route_sheet_snapshot" in row.payload
+
+
+def test_candidate_snapshot_contains_unmaterialized_make_proposal(db_session):
+    generation = _building_generation(db_session, "production-journal-make-proposal")
+    run, work = _make_proposal(db_session, generation)
+
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    row = db_session.query(models.PlanningReadRow).filter_by(
+        snapshot_id=snapshot.id,
+        row_key=f"work-item:{work.id}",
+    ).one()
+
+    assert row.row_kind == "production_proposal"
+    assert row.payload["journal_row_key"] == f"work-item:{work.id}"
+    assert row.payload["work_item_id"] == work.id
+    assert row.payload["product_id"] is None
+    assert row.payload["order_id"] is None
+    assert row.payload["remaining_qty"] == 10
+    assert row.payload["available_actions"] == ["materialize"]
+    assert "_route_sheet_snapshot" not in row.payload
+    assert db_session.query(models.ProductionOrder).count() == 0
 
 
 def test_route_sheet_snapshot_builder_uses_candidate_generation_for_stock_bins(

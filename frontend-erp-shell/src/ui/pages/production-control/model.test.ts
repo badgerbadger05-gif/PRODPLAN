@@ -12,6 +12,7 @@ import {
   parseProductionControlUrlState,
   productionPagination,
   productionRow,
+  productionRowId,
   selectedProductionRows,
   writeProductionControlUrlState,
 } from './model'
@@ -21,9 +22,13 @@ const filters: ProductionFilters = {
   sort_by: 'planned_start_date', sort_dir: 'asc',
 }
 const rows = [
-  { product_id: 1, item_id: 11, order_number: 'LOCAL', status: 'ready', coverage_status: 'ready' },
-  { product_id: 2, item_id: 12, order_number: 'ERP', order_ref1c: 'REF', status: 'ready' },
+  { product_id: 1, order_id: 1, item_id: 11, order_number: 'LOCAL', status: 'ready', coverage_status: 'ready' },
+  { product_id: 2, order_id: 2, item_id: 12, order_number: 'ERP', order_ref1c: 'REF', status: 'ready' },
 ] as OrderRow[]
+const proposal = {
+  journal_row_key: 'work-item:7', work_item_id: 7, product_id: null, order_id: null,
+  item_id: 13, order_number: 'MRP-R-7', status: 'shortage', coverage_status: 'unknown',
+} as OrderRow
 
 describe('production control model', () => {
   it('builds list params from paging, focus, and non-empty filters', () => {
@@ -89,6 +94,10 @@ describe('production control model', () => {
     expect(productionRow(rows, 2)?.order_number).toBe('ERP')
     expect(selectedProductionRows(rows, new Set([1, 2]))).toHaveLength(2)
     expect(deletableProductionRows(rows, new Set([1, 2])).map((row) => row.product_id)).toEqual([1])
+    expect(productionRowId(proposal)).toBe(-7)
+    expect(activeProductionRow([...rows, proposal], -7)).toBe(proposal)
+    expect(selectedProductionRows([...rows, proposal], new Set([-7]))).toEqual([proposal])
+    expect(deletableProductionRows([...rows, proposal], new Set([-7]))).toEqual([])
   })
 
   it('normalizes settings rows into the API payload', () => {

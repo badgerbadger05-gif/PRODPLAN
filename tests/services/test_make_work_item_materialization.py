@@ -155,3 +155,73 @@ def test_materialize_make_work_items_can_rematerialize_after_full_cancel(db_sess
     assert Decimal(work.replenishment_remaining_qty) == Decimal("8")
     assert Decimal(requirement.net_required_qty) == Decimal("10")
     assert Decimal(reservation.replenishment_required_qty) == Decimal("10")
+
+
+def test_materialize_reuses_exact_requirement_after_physical_generation_advances(db_session):
+    work, requirement, _reservation = _scope(db_session)
+    first = materialize_make_work_items(db_session, [work.id])
+    first_product_ids = [row["product_id"] for row in first["created"]]
+
+    cutoff = datetime(2026, 7, 27, 8, tzinfo=timezone.utc)
+    physical = models.PhysicalImportBatch(
+        batch_key="make-work-item-physical-next", status="completed", cutoff=cutoff
+    )
+    generation = models.LedgerGeneration(
+        generation_key="make-work-item-generation-next",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        physical_import_batch=physical,
+        algorithm_version="test",
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+    )
+    db_session.add_all([physical, generation])
+    db_session.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=work.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=work.run_id,
+        freeze_version=1,
+        requirement_id=requirement.id,
+        priority_period_from=requirement.period_from,
+        priority_period_to=requirement.period_to,
+        realization_mode="make",
+        reserved_qty=10,
+        covered_from_stock_at_freeze_qty=0,
+        replenishment_required_qty=10,
+        replenishment_received_qty=2,
+        realized_qty=2,
+        lifecycle_status="active",
+    )
+    db_session.add(reservation)
+    db_session.flush()
+    next_work = models.ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        plan_id=work.plan_id,
+        run_id=work.run_id,
+        requirement_id=requirement.id,
+        item_id=work.item_id,
+        replenishment_method="make",
+        replenishment_required_qty=10,
+        replenishment_fulfilled_qty=2,
+        replenishment_remaining_qty=8,
+    )
+    db_session.add(next_work)
+    truth = db_session.get(models.PlanningTruthState, 1)
+    truth.current_generation_id = generation.id
+    db_session.commit()
+
+    second = materialize_make_work_items(db_session, [next_work.id])
+
+    assert second["created"] == []
+    assert [row["product_id"] for row in second["reused"]] == first_product_ids
+    assert {row["work_item_id"] for row in second["reused"]} == {next_work.id}
