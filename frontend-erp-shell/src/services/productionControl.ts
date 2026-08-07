@@ -50,9 +50,18 @@ export type MaterializeMakeWorkItemsResponse = {
   reused: MaterializedMakeProduct[]
 }
 
-export function materializeMakeWorkItems(workItemIds: number[]) {
-  const body: ApiSchemas['OrdersFromWorkItemsPayload'] = {
-    work_item_ids: workItemIds,
+export type MakeLaunchRequest = {
+  work_item_id: number
+  launch_qty: number
+  expected_materialized_qty: number
+}
+
+export function materializeMakeWorkItems(workItems: number[] | MakeLaunchRequest[]) {
+  const legacyIds = workItems.filter((row): row is number => typeof row === 'number')
+  const requests = workItems.filter((row): row is MakeLaunchRequest => typeof row !== 'number')
+  const body = {
+    work_item_ids: legacyIds,
+    work_items: requests,
     initiated_by: 'erp-shell',
   }
   return api<MaterializeMakeWorkItemsResponse>('/v1/production-control/orders/from-work-items', {
@@ -87,6 +96,11 @@ export function saveProductionControlSettings(payload: ControlSettingsUpdate) {
 
 export function getOrderMaterials(productId: number) {
   return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
+}
+
+export function getWorkItemMaterials(workItemId: number, quantity: number) {
+  const params = new URLSearchParams({ qty: String(quantity) })
+  return api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
 }
 
 export function updateOrderStatus(productId: number, status: string) {

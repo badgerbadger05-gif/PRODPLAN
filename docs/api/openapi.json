@@ -7561,6 +7561,65 @@
         }
       }
     },
+    "/api/v1/production-control/work-items/{work_item_id}/materials": {
+      "get": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Get Work Item Materials",
+        "description": "Preview BOM coverage for a saved MRP row without creating an order.",
+        "operationId": "get_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_get",
+        "parameters": [
+          {
+            "name": "work_item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Work Item Id"
+            }
+          },
+          {
+            "name": "qty",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Qty"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductionMaterialsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/production-control/orders/{product_id}/produce": {
       "post": {
         "tags": [
@@ -14627,6 +14686,31 @@
         "type": "object",
         "title": "LineStatePayload"
       },
+      "MakeWorkItemLaunchPayload": {
+        "properties": {
+          "work_item_id": {
+            "type": "integer",
+            "title": "Work Item Id"
+          },
+          "launch_qty": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Launch Qty"
+          },
+          "expected_materialized_qty": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Expected Materialized Qty",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "work_item_id",
+          "launch_qty"
+        ],
+        "title": "MakeWorkItemLaunchPayload"
+      },
       "ManualPairPayload": {
         "properties": {
           "painted_item_id": {
@@ -15045,6 +15129,13 @@
             "type": "array",
             "title": "Work Item Ids"
           },
+          "work_items": {
+            "items": {
+              "$ref": "#/components/schemas/MakeWorkItemLaunchPayload"
+            },
+            "type": "array",
+            "title": "Work Items"
+          },
           "initiated_by": {
             "anyOf": [
               {
@@ -15058,9 +15149,6 @@
           }
         },
         "type": "object",
-        "required": [
-          "work_item_ids"
-        ],
         "title": "OrdersFromWorkItemsPayload"
       },
       "PaintWeldChainResponse": {
@@ -15878,8 +15966,26 @@
             "title": "Cutoff"
           },
           "product_id": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Product Id"
+          },
+          "work_item_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Work Item Id"
           },
           "order_number": {
             "type": "string",
@@ -15935,7 +16041,6 @@
           "ledger_generation_id",
           "truth_status",
           "cutoff",
-          "product_id",
           "order_number",
           "item_name",
           "item_article",
@@ -16665,6 +16770,28 @@
               }
             ],
             "title": "Shelf Latest Start Date"
+          },
+          "materialized_order_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialized Order Qty"
+          },
+          "launchable_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Launchable Qty"
           },
           "paint_weld_chain": {
             "anyOf": [

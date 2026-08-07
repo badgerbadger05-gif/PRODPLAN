@@ -17,6 +17,7 @@ import {
   fetchRouteSheetsPrintHtml,
   closeProductionOrder,
   getOrderMaterials,
+  getWorkItemMaterials,
   getProductionControlSettings,
   listRootProductOptions,
   listProductionOrders,
@@ -76,6 +77,7 @@ export function ProductionControlPage() {
     initialUrlState.current.activeProductId,
   )
   const [materials, setMaterials] = useState<MaterialsResponse | null>(null)
+  const [launchQtyByWorkItem, setLaunchQtyByWorkItem] = useState<Record<number, number>>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [total, setTotal] = useState(0)
@@ -242,6 +244,14 @@ export function ProductionControlPage() {
     [requestMaterials],
   )
 
+  const loadWorkItemMaterials = useCallback(
+    (workItemId: number, quantity: number) => requestMaterials(
+      -workItemId,
+      () => getWorkItemMaterials(workItemId, quantity),
+    ),
+    [requestMaterials],
+  )
+
   function beginDangerousMutation() {
     if (dangerousMutationLocked.current) return false
     dangerousMutationLocked.current = true
@@ -379,7 +389,14 @@ export function ProductionControlPage() {
     let printWindow: Window | null = null
     try {
       if (workItemIds.length) {
-        const materialized = await materializeMakeWorkItems(workItemIds)
+        const materialized = await materializeMakeWorkItems(workItemIds.map((workItemId) => {
+          const row = selectedRows.find((item) => item.work_item_id === workItemId)
+          return {
+            work_item_id: workItemId,
+            launch_qty: launchQtyByWorkItem[workItemId] ?? row?.launchable_qty ?? row?.quantity ?? 0,
+            expected_materialized_qty: row?.materialized_order_qty ?? 0,
+          }
+        }))
         ids = Array.from(new Set([
           ...ids,
           ...(materialized.created ?? []).map((row) => row.product_id),
@@ -595,12 +612,22 @@ export function ProductionControlPage() {
 
   useEffect(() => {
     setMaterials(null)
-  }, [activeRow?.product_id])
+  }, [activeRow?.journal_row_key])
 
   useEffect(() => {
     const productId = activeRow?.product_id
-    if (productId) void loadMaterials(productId)
-  }, [activeRow?.product_id, loadMaterials])
+    const workItemId = activeRow?.work_item_id
+    if (productId) {
+      void loadMaterials(productId)
+    } else if (workItemId) {
+      const launchQty = launchQtyByWorkItem[workItemId]
+        ?? activeRow.launchable_qty
+        ?? activeRow.quantity
+      const timer = window.setTimeout(() => void loadWorkItemMaterials(workItemId, launchQty), 250)
+      return () => window.clearTimeout(timer)
+    }
+    return undefined
+  }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials])
 
   const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
 
@@ -707,7 +734,22 @@ export function ProductionControlPage() {
               activeRow={activeRow}
               materials={materials}
               coverageLabels={coverageLabels}
-              onLoadMaterials={() => { if (activeRow?.product_id != null) void loadMaterials(activeRow.product_id) }}
+              onLoadMaterials={() => {
+                if (activeRow?.product_id != null) void loadMaterials(activeRow.product_id)
+                else if (activeRow?.work_item_id != null) {
+                  void loadWorkItemMaterials(
+                    activeRow.work_item_id,
+                    launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty ?? activeRow.quantity,
+                  )
+                }
+              }}
+              launchQuantity={activeRow?.work_item_id != null
+                ? launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty ?? activeRow.quantity
+                : null}
+              onLaunchQuantityChange={(value) => {
+                if (activeRow?.work_item_id == null) return
+                setLaunchQtyByWorkItem((current) => ({ ...current, [activeRow.work_item_id as number]: value }))
+              }}
               onProduce={() => void produceActiveLine(activeRow?.product_id)}
               onReturnLeftovers={() => void returnActiveLeftovers(activeRow?.product_id)}
               onPrint={() => { if (activeRow?.product_id != null) openRouteSheets([activeRow.product_id]) }}

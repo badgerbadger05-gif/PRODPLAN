@@ -157,6 +157,48 @@ def test_materialize_make_work_items_can_rematerialize_after_full_cancel(db_sess
     assert Decimal(reservation.replenishment_required_qty) == Decimal("10")
 
 
+def test_materialize_make_work_item_uses_operator_launch_qty_and_retries_safely(db_session):
+    work, requirement, reservation = _scope(db_session)
+    request = {
+        work.id: {
+            "launch_qty": 3,
+            "expected_materialized_qty": 0,
+        }
+    }
+
+    first = materialize_make_work_items(
+        db_session, [work.id], launch_requests=request
+    )
+    retry = materialize_make_work_items(
+        db_session, [work.id], launch_requests=request
+    )
+
+    assert [row["qty"] for row in first["created"]] == [3.0]
+    assert retry["created"] == []
+    assert [row["qty"] for row in retry["reused"]] == [3.0]
+    db_session.refresh(work)
+    db_session.refresh(requirement)
+    db_session.refresh(reservation)
+    assert Decimal(work.replenishment_remaining_qty) == Decimal("8")
+    assert Decimal(requirement.net_required_qty) == Decimal("10")
+    assert Decimal(reservation.replenishment_required_qty) == Decimal("10")
+
+
+def test_materialize_make_work_item_rejects_qty_above_unlaunched_remainder(db_session):
+    work, _requirement, _reservation = _scope(db_session)
+
+    result = materialize_make_work_items(
+        db_session,
+        [work.id],
+        launch_requests={
+            work.id: {"launch_qty": 9, "expected_materialized_qty": 0}
+        },
+    )
+
+    assert result["created"] == []
+    assert "доступно к запуску 8" in result["errors"][0]
+
+
 def test_materialize_reuses_exact_requirement_after_physical_generation_advances(db_session):
     work, requirement, _reservation = _scope(db_session)
     first = materialize_make_work_items(db_session, [work.id])

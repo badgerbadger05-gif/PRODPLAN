@@ -2,7 +2,10 @@ import type { components } from '../lib/apiTypes'
 
 type ApiSchemas = components['schemas']
 
-export type OrderRow = ApiSchemas['ProductionOrderJournalRowResponse']
+export type OrderRow = ApiSchemas['ProductionOrderJournalRowResponse'] & {
+  materialized_order_qty?: number | null
+  launchable_qty?: number | null
+}
 export type OrdersResponse = ApiSchemas['ProductionOrderJournalResponse']
 export type TruthMeta = OrdersResponse['truth_meta']
 

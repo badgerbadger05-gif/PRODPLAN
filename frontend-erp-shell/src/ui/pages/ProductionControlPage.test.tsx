@@ -21,6 +21,7 @@ vi.mock('../../services/productionControl', () => ({
   materializeMakeWorkItems: vi.fn(),
   saveProductionControlSettings: vi.fn(),
   getOrderMaterials: vi.fn(),
+  getWorkItemMaterials: vi.fn(),
   updateOrderStatus: vi.fn(),
   postMaterialIssues: vi.fn(),
   fetchRouteSheetsPrintHtml: vi.fn(),
@@ -43,6 +44,7 @@ import {
   listProductionEmployees,
   listProductionOperations,
   getOrderMaterials,
+  getWorkItemMaterials,
   updateOrderStatus,
   postMaterialIssues,
   exportMaterialIssuesTo1C,
@@ -222,6 +224,7 @@ beforeEach(() => {
     truth_meta: fakeTruthMeta,
   })
   vi.mocked(getOrderMaterials).mockResolvedValue(fakeMaterials())
+  vi.mocked(getWorkItemMaterials).mockResolvedValue({ ...fakeMaterials(), product_id: null, work_item_id: 701 })
   vi.mocked(listResources).mockResolvedValue(fakeResources)
   vi.mocked(listRootProductOptions).mockResolvedValue({
     rows: fakeRootOptions,
@@ -527,6 +530,8 @@ describe('ProductionControlPage — characterization', () => {
       order_prodplan_number: 'MRP-R-701',
       coverage_label: 'После создания заказа',
       available_actions: ['materialize'],
+      materialized_order_qty: 0,
+      launchable_qty: 10,
     } as OrderRow
     vi.mocked(listProductionOrders).mockResolvedValue({
       rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
@@ -544,10 +549,20 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
     await screen.findByText('Расчёт MRP · заказ ещё не создан')
 
+    const launchInput = screen.getByRole('spinbutton', { name: 'Количество запуска' })
+    await user.clear(launchInput)
+    await user.type(launchInput, '6')
+    await user.tab()
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6))
+
     await user.click(screen.getByRole('checkbox', { name: /MRP-R-701/ }))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
 
-    await waitFor(() => expect(materializeMakeWorkItems).toHaveBeenCalledWith([701]))
+    await waitFor(() => expect(materializeMakeWorkItems).toHaveBeenCalledWith([{
+      work_item_id: 701,
+      launch_qty: 6,
+      expected_materialized_qty: 0,
+    }]))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([901], 'erp-shell', undefined))
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })

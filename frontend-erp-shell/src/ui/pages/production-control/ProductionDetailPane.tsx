@@ -11,6 +11,8 @@ type Props = {
   onProduce: () => void
   onReturnLeftovers: () => void
   onOptimalBatchSave: (itemId: number, value: number | null) => Promise<void>
+  launchQuantity: number | null
+  onLaunchQuantityChange: (value: number) => void
 }
 
 export function ProductionDetailPane({
@@ -22,15 +24,33 @@ export function ProductionDetailPane({
   onProduce,
   onReturnLeftovers,
   onOptimalBatchSave,
+  launchQuantity,
+  onLaunchQuantityChange,
 }: Props) {
   const [batchValue, setBatchValue] = useState('')
   const [batchSaving, setBatchSaving] = useState(false)
   const [batchError, setBatchError] = useState('')
+  const [launchValue, setLaunchValue] = useState('')
 
   useEffect(() => {
     setBatchValue(activeRow?.optimal_batch != null ? String(activeRow.optimal_batch) : '')
     setBatchError('')
   }, [activeRow?.journal_row_key, activeRow?.optimal_batch])
+
+  useEffect(() => {
+    setLaunchValue(launchQuantity == null ? '' : String(launchQuantity))
+  }, [activeRow?.journal_row_key, launchQuantity])
+
+  function commitLaunchQuantity() {
+    if (activeRow?.work_item_id == null) return
+    const value = Number(launchValue)
+    const max = activeRow.launchable_qty ?? activeRow.quantity
+    if (!Number.isFinite(value) || value <= 0 || value > max) {
+      setLaunchValue(String(launchQuantity ?? max))
+      return
+    }
+    onLaunchQuantityChange(value)
+  }
 
   async function handleBatchSave() {
     if (!activeRow?.item_id) return
@@ -150,7 +170,24 @@ export function ProductionDetailPane({
             <span>Источник</span><strong>{sourceDisplayLabel}</strong>
             <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>
-            <strong>{qty(activeRow.quantity)} {activeRow.unit}</strong>
+            {activeRow.work_item_id != null ? (
+              <span className="batchEditCell">
+                <input
+                  type="number"
+                  aria-label="Количество запуска"
+                  min={0.001}
+                  max={activeRow.launchable_qty ?? activeRow.quantity}
+                  step={1}
+                  value={launchValue}
+                  onChange={(event) => setLaunchValue(event.target.value)}
+                  onBlur={commitLaunchQuantity}
+                  onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
+                />
+                {activeRow.unit && <span className="batchUnit">{activeRow.unit}</span>}
+              </span>
+            ) : (
+              <strong>{qty(activeRow.quantity)} {activeRow.unit}</strong>
+            )}
             <span>Статус</span><strong>{productionStatusLabel(activeRow.status)}</strong>
             <span>Обеспечение</span>
             <strong>
@@ -212,7 +249,7 @@ export function ProductionDetailPane({
             </div>
           )}
           <div className="detailActions">
-            <button onClick={onLoadMaterials} disabled={!activeRow?.product_id}>Повторить загрузку</button>
+            <button onClick={onLoadMaterials}>Повторить загрузку</button>
             <button onClick={onPrint} disabled={!activeRow?.product_id}>Печать листа</button>
             {activeRow?.product_id && (
               <button

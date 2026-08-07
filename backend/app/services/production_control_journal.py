@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
@@ -363,6 +363,7 @@ def materialize_make_work_items(
     work_item_ids: Sequence[int],
     *,
     initiated_by: Optional[str] = None,
+    launch_requests: Optional[Mapping[int, Mapping[str, float]]] = None,
 ) -> Dict[str, Any]:
     """
     Materialize canonical make work items into internal production orders.
@@ -503,7 +504,12 @@ def materialize_make_work_items(
             )
             continue
         active_products = _active_mrp_products_for_requirement(db, req)
-        if active_products:
+        request = (launch_requests or {}).get(work_id)
+        active_open_qty = sum(
+            _to_float(accepted_product_output(product).remaining_qty)
+            for product, _order in active_products
+        )
+        if request is None and active_products:
             for product, order in active_products:
                 payload = _reused_product_payload(product, order, requirement_id=rid)
                 payload["work_item_id"] = work_id
@@ -514,7 +520,27 @@ def materialize_make_work_items(
                 "reason": "already materialized for this Ledger generation",
             })
             continue
-        remaining = net_qty
+        remaining = max(0.0, net_qty - active_open_qty)
+        if request is not None:
+            requested_qty = _to_float(request.get("launch_qty"))
+            expected_materialized_qty = _to_float(request.get("expected_materialized_qty"))
+            target_qty = expected_materialized_qty + requested_qty
+            if requested_qty <= 1e-9:
+                errors.append(f"work_item_id={work_id}: количество запуска должно быть больше нуля")
+                continue
+            if abs(active_open_qty - target_qty) <= 1e-6:
+                for product, order in active_products:
+                    payload = _reused_product_payload(product, order, requirement_id=rid)
+                    payload["work_item_id"] = work_id
+                    reused.append(payload)
+                continue
+            if abs(active_open_qty - expected_materialized_qty) > 1e-6:
+                errors.append(f"work_item_id={work_id}: состав живых заказов изменился; обновите журнал")
+                continue
+            if requested_qty - remaining > 1e-6:
+                errors.append(f"work_item_id={work_id}: доступно к запуску {remaining:g}, запрошено {requested_qty:g}")
+                continue
+            remaining = requested_qty
 
         existing_count = (
             db.query(ProductionProduct)
@@ -1232,23 +1258,6 @@ def list_make_proposals(
     if not run_ids:
         return []
 
-    materialized_requirement_ids = {
-        int(requirement_id)
-        for (requirement_id,) in (
-            db.query(ProductionProduct.source_mrp_requirement_id)
-            .join(
-                ProductionOrder,
-                ProductionOrder.order_id == ProductionProduct.order_id,
-            )
-            .filter(
-                ProductionOrder.source == "mrp",
-                ProductionOrder.deletion_mark.is_(False),
-                ProductionProduct.source_mrp_requirement_id.isnot(None),
-                ProductionOrder.source_run_id.in_(run_ids),
-            )
-            .all()
-        )
-    }
     query = (
         db.query(ReplenishmentWorkItem)
         .filter(
@@ -1259,10 +1268,6 @@ def list_make_proposals(
         )
         .order_by(ReplenishmentWorkItem.run_id.asc(), ReplenishmentWorkItem.id.asc())
     )
-    if materialized_requirement_ids:
-        query = query.filter(
-            ~ReplenishmentWorkItem.requirement_id.in_(materialized_requirement_ids)
-        )
     work_items = query.all()
     if not work_items:
         return []
@@ -1277,6 +1282,25 @@ def list_make_proposals(
         int(row.id): row
         for row in db.query(MrpRequirement).filter(MrpRequirement.id.in_(requirement_ids)).all()
     }
+    active_open_by_requirement: Dict[int, float] = {}
+    for requirement_id, quantity, produced_qty in (
+        db.query(
+            ProductionProduct.source_mrp_requirement_id,
+            ProductionProduct.quantity,
+            ProductionProduct.produced_qty,
+        )
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(
+            ProductionOrder.source == "mrp",
+            ProductionOrder.deletion_mark.is_(False),
+            ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
+        )
+        .all()
+    ):
+        rid = int(requirement_id)
+        active_open_by_requirement[rid] = active_open_by_requirement.get(rid, 0.0) + max(
+            0.0, _to_float(quantity) - _to_float(produced_qty)
+        )
     run_rows = (
         db.query(PlanningRun, ProductionPlanHeader)
         .outerjoin(
@@ -1332,6 +1356,9 @@ def list_make_proposals(
         ledger_generation_id=generation_id,
         item_ids=item_ids,
     )
+    shelf_allowance = {
+        item_id: float(pull.materialized_qty) for item_id, pull in shelf_by_item.items()
+    }
 
     result: List[Dict[str, Any]] = []
     for work in work_items:
@@ -1358,6 +1385,14 @@ def list_make_proposals(
         required_qty = _to_float(work.replenishment_required_qty)
         fulfilled_qty = _to_float(work.replenishment_fulfilled_qty)
         remaining_qty = _to_float(work.replenishment_remaining_qty)
+        materialized_qty = active_open_by_requirement.get(int(work.requirement_id), 0.0)
+        launchable_qty = max(0.0, remaining_qty - materialized_qty)
+        if shelf is not None:
+            allowance = shelf_allowance.get(int(work.item_id), 0.0)
+            launchable_qty = min(launchable_qty, allowance)
+            shelf_allowance[int(work.item_id)] = max(0.0, allowance - launchable_qty)
+        if launchable_qty <= 1e-9:
+            continue
         result.append(
             {
                 "journal_row_key": f"work-item:{int(work.id)}",
@@ -1378,7 +1413,7 @@ def list_make_proposals(
                 "item_article": str(item.item_article or ""),
                 "optimal_batch": _to_float(item.optimal_batch) if item.optimal_batch is not None else None,
                 "unit": unit_by_raw.get(str(item.unit or "").strip(), ""),
-                "quantity": required_qty,
+                "quantity": launchable_qty,
                 "produced_qty": fulfilled_qty,
                 "remaining_qty": remaining_qty,
                 "status": "shortage",
@@ -1410,6 +1445,8 @@ def list_make_proposals(
                 "mrp_req_net_qty": required_qty,
                 "mrp_req_covered_qty": fulfilled_qty,
                 "mrp_req_remaining_qty": remaining_qty,
+                "materialized_order_qty": materialized_qty,
+                "launchable_qty": launchable_qty,
                 "launch_source": LAUNCH_SOURCE_SHELF if shelf else LAUNCH_SOURCE_MRP,
                 "shelf_warehouse_ref1c": shelf.warehouse_ref1c if shelf else None,
                 "shelf_pull_qty": shelf.pull_qty if shelf else None,

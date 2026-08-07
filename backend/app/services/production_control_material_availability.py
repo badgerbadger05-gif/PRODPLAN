@@ -241,6 +241,7 @@ def preview_materials(
     product_id: int,
     *,
     ledger_generation_id: int | None = None,
+    _product_override: ProductionProduct | None = None,
 ) -> Dict[str, Any]:
     """
     Return the BOM components required for a production line plus per-component
@@ -272,7 +273,7 @@ def preview_materials(
         ledger_generation_id = int(truth.generation_id)
     else:
         ledger_generation_id = int(ledger_generation_id)
-    product = (
+    product = _product_override or (
         db.query(ProductionProduct)
         .options(
             joinedload(ProductionProduct.order),
@@ -397,6 +398,36 @@ def preview_materials(
         "coverage_status": order_coverage,
         "coverage_label": _ui_coverage_label(order_coverage),
     }
+    return payload
+
+
+def preview_make_work_item_materials(
+    db: Session,
+    *,
+    work_item_id: int,
+    item_id: int,
+    quantity: float,
+    spec_id: int | None,
+    ledger_generation_id: int,
+    order_number: str,
+) -> Dict[str, Any]:
+    """Preview one saved MAKE obligation without creating an executor order."""
+    item = db.get(Item, int(item_id))
+    if item is None:
+        raise ValueError("Номенклатура расчётной строки не найдена")
+    preview_product = ProductionProduct(
+        product_id=-int(work_item_id), order_id=-int(work_item_id), item_id=int(item_id),
+        quantity=float(quantity), produced_qty=0, remaining_qty=float(quantity),
+        spec_id=int(spec_id) if spec_id is not None else None,
+    )
+    preview_product.item = item
+    preview_product.order = ProductionOrder(order_number=str(order_number or ""))
+    payload = preview_materials(
+        db, -int(work_item_id), ledger_generation_id=int(ledger_generation_id),
+        _product_override=preview_product,
+    )
+    payload["work_item_id"] = int(work_item_id)
+    payload["product_id"] = None
     return payload
 
 

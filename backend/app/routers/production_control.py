@@ -4,7 +4,7 @@ from typing import Annotated, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -43,6 +43,7 @@ from ..services.production_control_journal_snapshot import (
 from ..services.production_control_material_availability import (
     MaterialCoverageSnapshotUnavailable,
     get_materials_snapshot,
+    preview_make_work_item_materials,
 )
 from ..services.production_control_printing import (
     mark_route_sheets_printed_by_snapshot_members,
@@ -113,7 +114,8 @@ class ProductionMaterialsResponse(BaseModel):
     ledger_generation_id: int
     truth_status: str
     cutoff: str
-    product_id: int
+    product_id: Optional[int] = None
+    work_item_id: Optional[int] = None
     order_number: str
     item_name: str
     item_article: str
@@ -614,8 +616,15 @@ class MaterialIssueCreatePayload(BaseModel):
     source_warehouse_ref1c: Optional[str] = None
 
 
+class MakeWorkItemLaunchPayload(BaseModel):
+    work_item_id: int
+    launch_qty: float = Field(gt=0)
+    expected_materialized_qty: float = Field(default=0, ge=0)
+
+
 class OrdersFromWorkItemsPayload(BaseModel):
-    work_item_ids: List[int]
+    work_item_ids: List[int] = Field(default_factory=list)
+    work_items: List[MakeWorkItemLaunchPayload] = Field(default_factory=list)
     initiated_by: Optional[str] = None
 
 
@@ -755,6 +764,8 @@ class ProductionOrderJournalRowResponse(BaseModel):
     shelf_pull_qty: Optional[float] = None
     shelf_materialized_qty: Optional[float] = None
     shelf_latest_start_date: Optional[str] = None
+    materialized_order_qty: Optional[float] = None
+    launchable_qty: Optional[float] = None
     paint_weld_chain: Optional[PaintWeldChainResponse] = None
 
 
@@ -886,6 +897,43 @@ def get_order_line_materials(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/work-items/{work_item_id}/materials", response_model=ProductionMaterialsResponse)
+def get_work_item_materials(
+    work_item_id: int,
+    qty: Optional[float] = None,
+    db: Session = Depends(get_db),
+):
+    """Preview BOM coverage for a saved MRP row without creating an order."""
+    try:
+        truth = planning_truth.require_accepted_truth(
+            db, "production_control.work_item_materials"
+        )
+        work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
+        if work is None or int(work.ledger_generation_id) != int(truth.generation_id):
+            raise HTTPException(status_code=404, detail="Актуальная расчётная строка не найдена")
+        launch_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
+        if launch_qty <= 0 or launch_qty > float(work.replenishment_remaining_qty) + 1e-6:
+            raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
+        payload = preview_make_work_item_materials(
+            db,
+            work_item_id=int(work.id),
+            item_id=int(work.item_id),
+            quantity=launch_qty,
+            spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
+            ledger_generation_id=int(truth.generation_id),
+            order_number=f"MRP-R-{int(work.requirement_id)}",
+        )
+        payload["truth_status"] = "accepted"
+        payload["cutoff"] = truth.cutoff.isoformat()
+        return payload
+    except HTTPException:
+        raise
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _export_failure_detail(
@@ -1102,13 +1150,24 @@ def post_orders_from_work_items(
 
     Frozen requirement, reservation and work-item quantities are not changed.
     """
-    if not payload.work_item_ids:
+    selected_ids = [int(x) for x in payload.work_item_ids]
+    launch_requests = {}
+    for row in payload.work_items:
+        work_id = int(row.work_item_id)
+        selected_ids.append(work_id)
+        launch_requests[work_id] = {
+            "launch_qty": float(row.launch_qty),
+            "expected_materialized_qty": float(row.expected_materialized_qty),
+        }
+    selected_ids = list(dict.fromkeys(selected_ids))
+    if not selected_ids:
         raise HTTPException(status_code=400, detail="Не выбраны рабочие строки")
     try:
         return materialize_make_work_items(
             db,
-            [int(x) for x in payload.work_item_ids],
+            selected_ids,
             initiated_by=payload.initiated_by,
+            launch_requests=launch_requests or None,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

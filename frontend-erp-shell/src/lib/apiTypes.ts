@@ -2052,6 +2052,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/work-items/{work_item_id}/materials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Work Item Materials
+         * @description Preview BOM coverage for a saved MRP row without creating an order.
+         */
+        get: operations["get_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/orders/{product_id}/produce": {
         parameters: {
             query?: never;
@@ -4239,6 +4259,18 @@ export interface components {
             /** Comment */
             comment?: string | null;
         };
+        /** MakeWorkItemLaunchPayload */
+        MakeWorkItemLaunchPayload: {
+            /** Work Item Id */
+            work_item_id: number;
+            /** Launch Qty */
+            launch_qty: number;
+            /**
+             * Expected Materialized Qty
+             * @default 0
+             */
+            expected_materialized_qty: number;
+        };
         /** ManualPairPayload */
         ManualPairPayload: {
             /** Painted Item Id */
@@ -4379,7 +4411,9 @@ export interface components {
         /** OrdersFromWorkItemsPayload */
         OrdersFromWorkItemsPayload: {
             /** Work Item Ids */
-            work_item_ids: number[];
+            work_item_ids?: number[];
+            /** Work Items */
+            work_items?: components["schemas"]["MakeWorkItemLaunchPayload"][];
             /** Initiated By */
             initiated_by?: string | null;
         };
@@ -4662,7 +4696,9 @@ export interface components {
             /** Cutoff */
             cutoff: string;
             /** Product Id */
-            product_id: number;
+            product_id?: number | null;
+            /** Work Item Id */
+            work_item_id?: number | null;
             /** Order Number */
             order_number: string;
             /** Item Name */
@@ -4863,6 +4899,10 @@ export interface components {
             shelf_materialized_qty?: number | null;
             /** Shelf Latest Start Date */
             shelf_latest_start_date?: string | null;
+            /** Materialized Order Qty */
+            materialized_order_qty?: number | null;
+            /** Launchable Qty */
+            launchable_qty?: number | null;
             paint_weld_chain?: components["schemas"]["PaintWeldChainResponse"] | null;
         };
         /** ProductionResource */
@@ -9575,6 +9615,39 @@ export interface operations {
             header?: never;
             path: {
                 product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProductionMaterialsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_get: {
+        parameters: {
+            query?: {
+                qty?: number | null;
+            };
+            header?: never;
+            path: {
+                work_item_id: number;
             };
             cookie?: never;
         };
