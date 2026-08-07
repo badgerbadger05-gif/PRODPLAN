@@ -342,6 +342,30 @@ def test_characteristic_specific_direct_order_fails_closed_until_pool_support(db
     assert row.reason == "characteristic_not_supported_by_mrp_pool"
 
 
+def test_zero_guid_characteristic_is_canonical_empty_and_counts_in_mrp(db_session):
+    generation, item, _allocation = _context(db_session)
+    db_session.query(models.PurchaseExportLineAllocation).delete()
+    db_session.query(models.SyncLink).delete()
+    _mirrored_order_line(
+        db_session,
+        item,
+        state="Заказан (товар в пути)",
+        characteristic="00000000-0000-0000-0000-000000000000",
+    )
+
+    row = supplier_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={"warehouse-1": "main"},
+    )[0]
+
+    assert row.evidence_status == "exact"
+    assert row.reason is None
+    assert row.characteristic_ref == ""
+    assert row.source_state_key == "Заказан (товар в пути)"
+    assert row.ordered_qty_at_cutoff == Decimal("10")
+
+
 def test_export_and_mirror_merge_into_one_line_without_double_quantity(db_session):
     generation, item, allocation = _context(db_session)
     allocation.planning_stock_pool = "main"

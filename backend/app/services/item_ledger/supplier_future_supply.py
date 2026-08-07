@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.one_c_export_common import clean_ref1c
 from app.services.supplier_order_status import SupplyPhase, phase_for_state
 
 from .future_supply_capture import FutureSupplyEvidence, future_supply_evidence_hash
@@ -302,7 +303,7 @@ def supplier_future_supply_evidence(
             else "exported" if link else ""
         )[:64]
         characteristic_ref = (
-            _text(mirror_line.characteristic_ref1c)
+            clean_ref1c(mirror_line.characteristic_ref1c)
             if mirror_line is not None
             else ""
         )

@@ -21,6 +21,9 @@ type Props = {
 
 export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, sort, onSelectPurchaseRowKeys, onActivate, onToggleSort }: Props) {
   const formatCoveragePercent = (value: number | null | undefined) => (value == null ? 'н/д' : `${qty(value)}%`)
+  const formatCoverageQuantity = (value: number | null | undefined, unit: string | null) => (
+    value == null ? 'н/д' : `${qty(value)}${unit ? ` ${unit}` : ''}`
+  )
 
   return (
     <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(purchaseOrderColumns) }}>
@@ -94,7 +97,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                 / {qty(row.remaining_qty)}
                 {row.unit ? ` ${row.unit}` : ''}
                 {row.row_generator === 'mrp_reservation'
-                  ? ` · оформлено ${formatCoveragePercent(row.open_order_covered_pct)} · к заказу ${formatCoveragePercent(row.to_order_pct)}`
+                  ? ` · в живых заказах ${formatCoverageQuantity(row.open_order_covered_qty, row.unit)} (${formatCoveragePercent(row.open_order_covered_pct)}) · к заказу ${formatCoverageQuantity(row.to_order_qty, row.unit)} (${formatCoveragePercent(row.to_order_pct)})`
                   : ''}
               </span>
             </td>
