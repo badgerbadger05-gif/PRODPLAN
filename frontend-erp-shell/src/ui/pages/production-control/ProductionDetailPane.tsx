@@ -74,10 +74,12 @@ export function ProductionDetailPane({
   const rowSource = activeRow?.order_source || activeRow?.source
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty
-  const activeCoverageStatus = activeRow?.coverage_status
+  const activeCoverageStatus = materials?.coverage_status
+    || activeRow?.coverage_status
     || activeRow?.status
     || 'unknown'
-  const activeCoverageLabel = activeRow?.coverage_label
+  const activeCoverageLabel = materials?.coverage_label
+    || activeRow?.coverage_label
     || coverageLabels[String(activeCoverageStatus)]
     || activeCoverageStatus
   const planSourceLabel = activeRow?.source_plan_name
@@ -179,7 +181,15 @@ export function ProductionDetailPane({
                   max={activeRow.launchable_qty ?? activeRow.quantity}
                   step={1}
                   value={launchValue}
-                  onChange={(event) => setLaunchValue(event.target.value)}
+                  onChange={(event) => {
+                    const next = event.target.value
+                    setLaunchValue(next)
+                    const value = Number(next)
+                    const max = activeRow.launchable_qty ?? activeRow.quantity
+                    if (next !== '' && Number.isFinite(value) && value > 0 && value <= max) {
+                      onLaunchQuantityChange(value)
+                    }
+                  }}
                   onBlur={commitLaunchQuantity}
                   onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
                 />
