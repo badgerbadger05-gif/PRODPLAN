@@ -173,6 +173,40 @@ export function produceOrderLine(productId: number, payload: ProduceLinePayload)
   })
 }
 
+export type OpenPaintWeldChainsResult = {
+  status: string
+  product_ids: number[]
+  entries: Array<Record<string, unknown>>
+  errors: Array<Record<string, unknown>>
+}
+
+export function openPaintWeldChains(productIds: number[]) {
+  return api<OpenPaintWeldChainsResult>('/v1/production-control/orders/open-paint-weld-chains', {
+    method: 'POST',
+    body: JSON.stringify({ product_ids: productIds, initiated_by: 'erp-shell' }),
+  })
+}
+
+export type ClosePaintWeldChainResult = {
+  status: string
+  message?: string | null
+  resume_required?: boolean
+  painted?: Record<string, unknown>
+  welded?: Record<string, unknown>
+}
+
+export function closePaintWeldChain(productId: number) {
+  return api<ClosePaintWeldChainResult>('/v1/paint-weld/chain/close', {
+    method: 'POST',
+    body: JSON.stringify({
+      product_id: productId,
+      dry_run: false,
+      executor: 'erp-shell',
+      initiated_by: 'erp-shell',
+    }),
+  })
+}
+
 export function returnLeftoverComponents(productId: number, initiatedBy?: string | null) {
   const query = initiatedBy ? `?initiated_by=${encodeURIComponent(initiatedBy)}` : ''
   return api<ReturnLeftoversResult>(`/v1/production-control/orders/${productId}/return-leftovers${query}`, {

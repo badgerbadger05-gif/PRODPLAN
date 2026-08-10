@@ -45,6 +45,7 @@ from ..services.production_control_material_availability import (
     get_materials_snapshot,
     preview_make_work_item_materials,
 )
+from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
     mark_route_sheets_printed_by_snapshot_members,
     render_route_sheets_from_snapshots,
@@ -628,6 +629,11 @@ class OrdersFromWorkItemsPayload(BaseModel):
     initiated_by: Optional[str] = None
 
 
+class OpenPaintWeldChainsPayload(BaseModel):
+    product_ids: List[int]
+    initiated_by: Optional[str] = None
+
+
 class ExportProductionOrdersPayload(BaseModel):
     order_ids: List[int]
     dry_run: bool = True
@@ -695,6 +701,15 @@ class PaintWeldChainResponse(BaseModel):
     link_id: int
     counterpart_order_id: Optional[int] = None
     counterpart_product_id: Optional[int] = None
+    counterpart_order_number: Optional[str] = None
+    counterpart_order_prodplan_number: Optional[str] = None
+    counterpart_item_name: Optional[str] = None
+    counterpart_item_article: Optional[str] = None
+    counterpart_item_code: Optional[str] = None
+    counterpart_quantity: Optional[float] = None
+    counterpart_remaining_qty: Optional[float] = None
+    counterpart_unit: Optional[str] = None
+    counterpart_workshop_name: Optional[str] = None
 
 
 class ProductionOrderJournalRowResponse(BaseModel):
@@ -1171,6 +1186,28 @@ def post_orders_from_work_items(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/open-paint-weld-chains", response_model=dict)
+def post_open_paint_weld_chains(
+    payload: OpenPaintWeldChainsPayload,
+    db: Session = Depends(get_db),
+):
+    """Открыть сварочную сторону для выбранных окрасочных строк и вернуть
+    полный набор product_id, который должен пройти выдачу материалов и печать.
+    """
+    if not payload.product_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны строки заказов")
+    result = open_paint_chains_for_products(
+        db,
+        product_ids=payload.product_ids,
+        initiated_by=payload.initiated_by,
+    )
+    if result.get("status") == "partial_error":
+        errors = result.get("errors") or []
+        detail = "; ".join(str(row.get("error") or "ошибка цепочки") for row in errors)
+        raise HTTPException(status_code=400, detail=detail or "Не удалось открыть цепочку окраска-сварка")
+    return result
 
 
 @router.post("/orders/export-to-1c", response_model=dict)

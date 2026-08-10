@@ -828,6 +828,16 @@ def list_journal(
         )
     )
 
+    # A linked weld order is the execution side of one aggregated journal
+    # entry owned by the painted order. Direct focus remains available for
+    # diagnostics and deep links.
+    if product_id is None and order_id is None:
+        query = query.filter(
+            ~ProductionOrder.order_id.in_(
+                db.query(PaintWeldChainLink.welded_order_id)
+            )
+        )
+
     if product_id is not None:
         query = query.filter(ProductionProduct.product_id == int(product_id))
     if order_id is not None:
@@ -1050,10 +1060,15 @@ def list_journal(
                 {int(link.painted_order_id) for link in chain_links}
                 | {int(link.welded_order_id) for link in chain_links}
             )
-            product_by_order: Dict[int, int] = {}
-            for pid, oid in (
-                db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+            product_by_order: Dict[int, ProductionProduct] = {}
+            for counterpart_product in (
+                db.query(ProductionProduct)
                 .filter(ProductionProduct.order_id.in_(counterpart_order_ids))
+                .options(
+                    joinedload(ProductionProduct.order),
+                    joinedload(ProductionProduct.item),
+                    joinedload(ProductionProduct.control_state).joinedload(ProductionOrderLineState.workshop),
+                )
                 .order_by(
                     ProductionProduct.order_id.asc(),
                     ProductionProduct.line_number.asc(),
@@ -1061,7 +1076,32 @@ def list_journal(
                 )
                 .all()
             ):
-                product_by_order.setdefault(int(oid), int(pid))
+                product_by_order.setdefault(int(counterpart_product.order_id), counterpart_product)
+            counterpart_units = _unit_display_by_raw(
+                db,
+                [product.item.unit for product in product_by_order.values() if product.item],
+            )
+
+            def _counterpart_payload(order_id: int) -> Dict[str, Any]:
+                product = product_by_order.get(order_id)
+                if product is None:
+                    return {}
+                output = accepted_product_output(product)
+                state = getattr(product, "control_state", None)
+                return {
+                    "counterpart_product_id": int(product.product_id),
+                    "counterpart_order_number": str(product.order.order_number or ""),
+                    "counterpart_order_prodplan_number": _prodplan_order_display_number(product, product.order),
+                    "counterpart_item_name": str(product.item.item_name or ""),
+                    "counterpart_item_article": str(product.item.item_article or ""),
+                    "counterpart_item_code": str(product.item.item_code or ""),
+                    "counterpart_quantity": _to_float(output.planned_qty),
+                    "counterpart_remaining_qty": _to_float(output.remaining_qty),
+                    "counterpart_unit": counterpart_units.get(str(product.item.unit or "").strip(), ""),
+                    "counterpart_workshop_name": (
+                        state.workshop.resource_name if state and state.workshop else None
+                    ),
+                }
             for link in chain_links:
                 painted_oid = int(link.painted_order_id)
                 welded_oid = int(link.welded_order_id)
@@ -1069,13 +1109,13 @@ def list_journal(
                     "role": "painted",
                     "link_id": int(link.id),
                     "counterpart_order_id": welded_oid,
-                    "counterpart_product_id": product_by_order.get(welded_oid),
+                    **_counterpart_payload(welded_oid),
                 }
                 chain_by_order_id[welded_oid] = {
                     "role": "welded",
                     "link_id": int(link.id),
                     "counterpart_order_id": painted_oid,
-                    "counterpart_product_id": product_by_order.get(painted_oid),
+                    **_counterpart_payload(painted_oid),
                 }
 
     result: List[Dict[str, Any]] = []

@@ -2212,6 +2212,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/orders/open-paint-weld-chains": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Open Paint Weld Chains
+         * @description Открыть сварочную сторону для выбранных окрасочных строк и вернуть
+         *     полный набор product_id, который должен пройти выдачу материалов и печать.
+         */
+        post: operations["post_open_paint_weld_chains_api_v1_production_control_orders_open_paint_weld_chains_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/orders/export-to-1c": {
         parameters: {
             query?: never;
@@ -4469,6 +4490,13 @@ export interface components {
             /** Odata Entity */
             odata_entity: string;
         };
+        /** OpenPaintWeldChainsPayload */
+        OpenPaintWeldChainsPayload: {
+            /** Product Ids */
+            product_ids: number[];
+            /** Initiated By */
+            initiated_by?: string | null;
+        };
         /** OrdersFromWorkItemsPayload */
         OrdersFromWorkItemsPayload: {
             /** Work Item Ids */
@@ -4488,6 +4516,24 @@ export interface components {
             counterpart_order_id?: number | null;
             /** Counterpart Product Id */
             counterpart_product_id?: number | null;
+            /** Counterpart Order Number */
+            counterpart_order_number?: string | null;
+            /** Counterpart Order Prodplan Number */
+            counterpart_order_prodplan_number?: string | null;
+            /** Counterpart Item Name */
+            counterpart_item_name?: string | null;
+            /** Counterpart Item Article */
+            counterpart_item_article?: string | null;
+            /** Counterpart Item Code */
+            counterpart_item_code?: string | null;
+            /** Counterpart Quantity */
+            counterpart_quantity?: number | null;
+            /** Counterpart Remaining Qty */
+            counterpart_remaining_qty?: number | null;
+            /** Counterpart Unit */
+            counterpart_unit?: string | null;
+            /** Counterpart Workshop Name */
+            counterpart_workshop_name?: string | null;
         };
         /** PendingSpecificationRebaseRequest */
         PendingSpecificationRebaseRequest: {
@@ -9956,6 +10002,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["OrdersFromWorkItemsPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_open_paint_weld_chains_api_v1_production_control_orders_open_paint_weld_chains_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OpenPaintWeldChainsPayload"];
             };
         };
         responses: {

@@ -13,6 +13,7 @@ import {
   productionPagination,
   productionRow,
   productionRowId,
+  productionRowProductIds,
   selectedProductionRows,
   writeProductionControlUrlState,
 } from './model'
@@ -98,6 +99,17 @@ describe('production control model', () => {
     expect(activeProductionRow([...rows, proposal], -7)).toBe(proposal)
     expect(selectedProductionRows([...rows, proposal], new Set([-7]))).toEqual([proposal])
     expect(deletableProductionRows([...rows, proposal], new Set([-7]))).toEqual([])
+  })
+
+  it('uses backend-provided chain membership for combined actions', () => {
+    const painted = {
+      ...rows[0],
+      product_id: 11,
+      order_number: 'PAINT',
+      paint_weld_chain: { role: 'painted', link_id: 7, counterpart_product_id: 12 },
+    } as OrderRow
+
+    expect(productionRowProductIds(painted)).toEqual([11, 12])
   })
 
   it('normalizes settings rows into the API payload', () => {

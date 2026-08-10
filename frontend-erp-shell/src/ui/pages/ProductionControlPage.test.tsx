@@ -19,6 +19,8 @@ vi.mock('../../services/productionControl', () => ({
   getProductionControlSettings: vi.fn(),
   listRootProductOptions: vi.fn(),
   materializeMakeWorkItems: vi.fn(),
+  openPaintWeldChains: vi.fn(),
+  closePaintWeldChain: vi.fn(),
   saveProductionControlSettings: vi.fn(),
   getOrderMaterials: vi.fn(),
   getWorkItemMaterials: vi.fn(),
@@ -61,6 +63,8 @@ import {
   closeProductionOrder,
   listRootProductOptions,
   materializeMakeWorkItems,
+  openPaintWeldChains,
+  closePaintWeldChain,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 import {
@@ -301,6 +305,10 @@ beforeEach(() => {
   })
   vi.mocked(listProductionOperations).mockResolvedValue({ rows: [], total: 0 })
   vi.mocked(materializeMakeWorkItems).mockResolvedValue({ status: 'ok', created: [], reused: [] })
+  vi.mocked(openPaintWeldChains).mockImplementation(async (productIds) => ({
+    status: 'ok', product_ids: productIds, entries: [], errors: [],
+  }))
+  vi.mocked(closePaintWeldChain).mockResolvedValue({ status: 'ok' })
   vi.mocked(updateOrderStatus).mockResolvedValue({} as never)
   vi.mocked(deleteProductionOrder).mockResolvedValue({} as never)
   vi.mocked(produceOrderLine).mockResolvedValue({ qty: 10 } as never)
@@ -664,6 +672,64 @@ describe('ProductionControlPage — characterization', () => {
       101,
       { executor: 'erp-shell' },
     ))
+  })
+
+  it('shows a paint-weld pair as one row and launches both sides together', async () => {
+    const [painted] = fakeRows()
+    const paint = {
+      ...painted,
+      item_name: 'Кронштейн после окраски',
+      paint_weld_chain: {
+        role: 'painted', link_id: 71, counterpart_product_id: 102,
+        counterpart_order_number: 'WELD-1', counterpart_order_prodplan_number: 'WELD-1',
+        counterpart_item_name: 'Кронштейн после сварки',
+        counterpart_quantity: 10, counterpart_remaining_qty: 10, counterpart_unit: 'шт',
+      },
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [paint], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(openPaintWeldChains).mockResolvedValue({
+      status: 'ok', product_ids: [101, 102], entries: [], errors: [],
+    })
+    const user = userEvent.setup()
+    renderPage()
+
+    await screen.findByText('Сварка: WELD-1')
+    expect(within(ordersTable(document.body)).getAllByRole('row')).toHaveLength(2)
+    await user.click(within(rowFor('Кронштейн после окраски')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+
+    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101, 102]))
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101, 102], 'erp-shell', undefined))
+  })
+
+  it('closes a paint-weld pair through the combined chain action', async () => {
+    const [painted] = fakeRows()
+    const paint = {
+      ...painted,
+      item_name: 'Кронштейн после окраски',
+      paint_weld_chain: {
+        role: 'painted', link_id: 72, counterpart_product_id: 102,
+        counterpart_order_number: 'WELD-2', counterpart_order_prodplan_number: 'WELD-2',
+        counterpart_item_name: 'Кронштейн после сварки',
+        counterpart_quantity: 10, counterpart_remaining_qty: 10, counterpart_unit: 'шт',
+      },
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [paint], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Сварка: Кронштейн после сварки')
+
+    await user.click(within(rowFor('Кронштейн после окраски')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Произвести' }))
+
+    await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101))
+    expect(produceOrderLine).not.toHaveBeenCalled()
   })
 
   it('runs sanctioned close-to-1C action for selected row', async () => {

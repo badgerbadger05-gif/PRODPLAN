@@ -7966,6 +7966,50 @@
         }
       }
     },
+    "/api/v1/production-control/orders/open-paint-weld-chains": {
+      "post": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Post Open Paint Weld Chains",
+        "description": "Открыть сварочную сторону для выбранных окрасочных строк и вернуть\nполный набор product_id, который должен пройти выдачу материалов и печать.",
+        "operationId": "post_open_paint_weld_chains_api_v1_production_control_orders_open_paint_weld_chains_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenPaintWeldChainsPayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Post Open Paint Weld Chains Api V1 Production Control Orders Open Paint Weld Chains Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/production-control/orders/export-to-1c": {
       "post": {
         "tags": [
@@ -15279,6 +15323,33 @@
         ],
         "title": "ODataSyncStats"
       },
+      "OpenPaintWeldChainsPayload": {
+        "properties": {
+          "product_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Product Ids"
+          },
+          "initiated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Initiated By"
+          }
+        },
+        "type": "object",
+        "required": [
+          "product_ids"
+        ],
+        "title": "OpenPaintWeldChainsPayload"
+      },
       "OrdersFromWorkItemsPayload": {
         "properties": {
           "work_item_ids": {
@@ -15341,6 +15412,105 @@
               }
             ],
             "title": "Counterpart Product Id"
+          },
+          "counterpart_order_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Order Number"
+          },
+          "counterpart_order_prodplan_number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Order Prodplan Number"
+          },
+          "counterpart_item_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Item Name"
+          },
+          "counterpart_item_article": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Item Article"
+          },
+          "counterpart_item_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Item Code"
+          },
+          "counterpart_quantity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Quantity"
+          },
+          "counterpart_remaining_qty": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Remaining Qty"
+          },
+          "counterpart_unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Unit"
+          },
+          "counterpart_workshop_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counterpart Workshop Name"
           }
         },
         "additionalProperties": false,

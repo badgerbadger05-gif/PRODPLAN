@@ -227,6 +227,24 @@ export function ProductionDetailPane({
               {batchError && <span className="batchHint error">{batchError}</span>}
             </span>
           </div>
+          {activeRow.paint_weld_chain?.counterpart_product_id && (
+            <div className="mrpCoverageBlock">
+              <div className="mrpCoverageTitle">Агрегированная цепочка «сварка → окраска»</div>
+              <div className="detailGrid">
+                <span>Окраска</span><strong>{activeOrderNumber()} · {activeRow.item_name}</strong>
+                <span>Сварка</span>
+                <strong>
+                  {activeRow.paint_weld_chain.counterpart_order_prodplan_number
+                    || activeRow.paint_weld_chain.counterpart_order_number} · {activeRow.paint_weld_chain.counterpart_item_name}
+                </strong>
+                <span>Остаток сварки</span>
+                <strong>
+                  {qty(activeRow.paint_weld_chain.counterpart_remaining_qty)} {activeRow.paint_weld_chain.counterpart_unit}
+                </strong>
+                <span>Действие</span><strong>Совместный выпуск и один сдельный наряд</strong>
+              </div>
+            </div>
+          )}
           <ItemLedgerSummaryBlock itemId={activeRow.item_id} unit={activeRow.unit} />
           {hasShelfLaunchData && (
             <div className="shelfLaunchBlock">
@@ -269,7 +287,7 @@ export function ProductionDetailPane({
                 onClick={onProduce}
                 title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back"
               >
-                Произвести строку
+                {activeRow.paint_weld_chain ? 'Произвести цепочку' : 'Произвести строку'}
               </button>
             )}
             {activeRow?.product_id && (

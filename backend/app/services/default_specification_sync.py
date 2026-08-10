@@ -210,6 +210,20 @@ def sync_default_specifications_from_odata(db: Session, req: ODataSyncRequest) -
             db.rollback()
         else:
             db.commit()
+            # Производный справочник цепочек должен следовать за default BOM
+            # автоматически; ручной rebuild после каждой синхронизации не нужен.
+            from .paint_weld_pairs import rebuild_auto_pairs
+
+            result = asdict(stats)
+            try:
+                result["paint_weld_pairs"] = rebuild_auto_pairs(db)
+            except Exception as pair_error:
+                db.rollback()
+                result["paint_weld_pairs"] = {
+                    "status": "error",
+                    "error": str(pair_error),
+                }
+            return result
 
     except Exception as e:
         db.rollback()

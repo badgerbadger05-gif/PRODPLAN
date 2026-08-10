@@ -781,6 +781,39 @@ def read_route_sheet_snapshot_rows(
 
     missing_ids = sorted(set(ids) - set(route_snapshot_by_product_id))
     if missing_ids:
+        # Aggregated paint-weld journal rows persist one route-sheet payload on
+        # the painted anchor. Resolve a requested welded product from that
+        # same immutable snapshot instead of requiring a duplicate row.
+        missing_set = set(missing_ids)
+        anchor_rows = (
+            db.query(models.PlanningReadRow)
+            .filter(
+                models.PlanningReadRow.snapshot_id == int(snapshot.id),
+                models.PlanningReadRow.row_kind == ROW_KIND,
+            )
+            .all()
+        )
+        for row in anchor_rows:
+            row_payload = row.payload if isinstance(row.payload, dict) else None
+            if not isinstance(row_payload, dict) or "_route_sheet_snapshot" not in row_payload:
+                continue
+            try:
+                anchor_product_id = int(row_payload["product_id"])
+                route_snapshot = _route_sheet_payload_value(
+                    row_payload,
+                    product_id=anchor_product_id,
+                )
+                chain = route_snapshot.get("sheet", {}).get("chain") or {}
+                weld_product_id = int(chain.get("weld_product_id"))
+            except (KeyError, TypeError, ValueError, ProductionControlJournalPromotionError):
+                continue
+            if weld_product_id in missing_set:
+                route_snapshot_by_product_id[weld_product_id] = route_snapshot
+                missing_set.remove(weld_product_id)
+                if not missing_set:
+                    break
+        missing_ids = sorted(missing_set)
+    if missing_ids:
         raise _route_sheet_unavailable(
             db,
             "accepted production-control route-sheets snapshot does not contain "

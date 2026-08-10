@@ -63,6 +63,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
         {rows.map((row) => {
           const rowId = productionRowId(row)
           const isProposal = row.product_id == null
+          const chain = row.paint_weld_chain
           return (
           <tr
             key={row.journal_row_key || rowId}
@@ -103,6 +104,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               <strong title={orderMainLine(row)}>{orderMainLine(row)}</strong>
               <span title={orderSubline(row)}>{orderSubline(row)}</span>
+              {chain?.counterpart_product_id && (
+                <span className="muted">
+                  Сварка: {chain.counterpart_order_prodplan_number || chain.counterpart_order_number || '—'}
+                </span>
+              )}
             </td>
             <td
               className={`itemCell ${row.route_sheet_printed_at ? 'printedRouteSheetCell' : ''}`}
@@ -125,10 +131,20 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
                 {row.item_article || row.item_code || ''}
                 {row.source === 'mrp' && <span className="planningBadge mrp">MRP</span>}
               </span>
+              {chain?.counterpart_product_id && (
+                <span className="muted" title={chain.counterpart_item_name || ''}>
+                  Сварка: {chain.counterpart_item_name || '—'}
+                </span>
+              )}
             </td>
             <td className="numCell">
               <strong>{qty(row.remaining_qty)}</strong>
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
+              {chain?.counterpart_product_id && (
+                <span className="muted">
+                  св. {qty(chain.counterpart_remaining_qty)} / {qty(chain.counterpart_quantity)}
+                </span>
+              )}
             </td>
             <td className="dateCell">
               <span>
@@ -140,6 +156,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             <td>
               <strong>{row.workshop_name || 'Не назначен'}</strong>
               <span className="muted">{row.stage_name || ''}</span>
+              {chain?.counterpart_product_id && (
+                <span className="muted">
+                  Сварка: {chain.counterpart_workshop_name || '—'}
+                </span>
+              )}
             </td>
             <td>
               {isProposal ? (

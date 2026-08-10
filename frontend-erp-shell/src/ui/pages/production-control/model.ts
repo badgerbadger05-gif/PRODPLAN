@@ -133,6 +133,13 @@ export function productionRowId(row: OrderRow): number {
   return 0
 }
 
+export function productionRowProductIds(row: OrderRow): number[] {
+  return Array.from(new Set([
+    row.product_id,
+    row.paint_weld_chain?.counterpart_product_id,
+  ].filter((value): value is number => value != null && value > 0)))
+}
+
 export function selectedProductionRows(
   rows: readonly OrderRow[],
   selectedIds: ReadonlySet<number>,

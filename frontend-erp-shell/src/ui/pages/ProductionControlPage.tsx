@@ -22,6 +22,8 @@ import {
   listRootProductOptions,
   listProductionOrders,
   materializeMakeWorkItems,
+  openPaintWeldChains,
+  closePaintWeldChain,
   postMaterialIssues,
   produceOrderLine,
   returnLeftoverComponents,
@@ -59,6 +61,7 @@ import {
   parseProductionControlUrlState,
   productionPagination,
   productionRowId,
+  productionRowProductIds,
   selectedProductionRows,
   writeProductionControlUrlState,
 } from './production-control/model'
@@ -338,7 +341,7 @@ export function ProductionControlPage() {
   }
 
   async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
-    const ids = productIds ?? Array.from(selectedIds)
+    const ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
     if (!ids.length) return
     if (!beginDangerousMutation()) return
     setLoading(true)
@@ -384,7 +387,7 @@ export function ProductionControlPage() {
   }
 
   async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
-    let ids = productIds ?? selectedRows.flatMap((row) => row.product_id == null ? [] : [row.product_id])
+    let ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
     const workItemIds = productIds == null
       ? selectedRows.flatMap((row) => row.work_item_id == null ? [] : [row.work_item_id])
       : []
@@ -411,6 +414,8 @@ export function ProductionControlPage() {
         ]))
       }
       if (!ids.length) throw new Error('Не удалось создать исполнительные заказы из расчёта MRP')
+      const chains = await openPaintWeldChains(ids)
+      ids = Array.from(new Set(chains.product_ids ?? ids))
       printWindow = prepareRouteSheetWindow()
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = issueResult.selection_required ?? []
@@ -501,6 +506,19 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
+      const row = rows.find((item) => item.product_id === productId)
+      if (row?.paint_weld_chain) {
+        const result = await closePaintWeldChain(productId)
+        setMessage(
+          result.message
+            || (result.resume_required
+              ? 'Цепочка сварка–окраска закрыта частично. Повторите действие для завершения.'
+              : 'Сварка и окраска закрыты совместно; создан один комбинированный сдельный наряд.'),
+        )
+        await loadMaterials(productId)
+        await load(offsetRef.current)
+        return
+      }
       const result = await produceOrderLine(productId, {
         executor: 'erp-shell',
       })
@@ -675,7 +693,7 @@ export function ProductionControlPage() {
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}
           onClose={() => void closeActiveOrder(selectedRows[0]?.product_id)}
-          onPrintSelected={() => openRouteSheets(selectedRows.flatMap((row) => row.product_id == null ? [] : [row.product_id]))}
+          onPrintSelected={() => openRouteSheets(selectedRows.flatMap(productionRowProductIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
           onRefresh={() => void load(offset)}
@@ -759,7 +777,7 @@ export function ProductionControlPage() {
               }}
               onProduce={() => void produceActiveLine(activeRow?.product_id)}
               onReturnLeftovers={() => void returnActiveLeftovers(activeRow?.product_id)}
-              onPrint={() => { if (activeRow?.product_id != null) openRouteSheets([activeRow.product_id]) }}
+              onPrint={() => { if (activeRow) openRouteSheets(productionRowProductIds(activeRow)) }}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
             />
           )}

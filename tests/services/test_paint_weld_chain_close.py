@@ -567,15 +567,21 @@ def test_journal_rows_carry_chain_info(db_session):
 
     from app.services.production_control_journal import list_journal
 
-    rows = list_journal(db_session)["rows"]
+    journal = list_journal(db_session)
+    rows = journal["rows"]
     by_pid = {row["product_id"]: row for row in rows}
-    weld_row = by_pid[int(ctx["weld"]["product"].product_id)]
     paint_row = by_pid[int(ctx["paint"]["product"].product_id)]
+    weld_product_id = int(ctx["weld"]["product"].product_id)
+    assert weld_product_id not in by_pid
+    assert journal["total"] == len(rows)
+    weld_row = list_journal(db_session, product_id=weld_product_id)["rows"][0]
 
     assert weld_row["paint_weld_chain"]["role"] == "welded"
     assert weld_row["paint_weld_chain"]["counterpart_product_id"] == paint_row["product_id"]
     assert paint_row["paint_weld_chain"]["role"] == "painted"
     assert paint_row["paint_weld_chain"]["counterpart_product_id"] == weld_row["product_id"]
+    assert paint_row["paint_weld_chain"]["counterpart_item_name"] == ctx["weld"]["item"].item_name
+    assert paint_row["paint_weld_chain"]["counterpart_quantity"] == 6.0
     # строка вне цепочки — None
     assert all(
         row["paint_weld_chain"] is None
