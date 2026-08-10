@@ -310,6 +310,9 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 # иначе легальные дубли «один компонент с разными спеками» удалялись бы.
                 if can_reconcile_components:
                     try:
+                        # SAVEPOINT: ошибка удаления не должна абортировать всю
+                        # транзакцию синка (иначе остальные спецификации падают
+                        # каскадом PendingRollbackError).
                         with db.begin_nested():
                             deleted = 0
                             existing_rows = (
@@ -397,7 +400,11 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         print(f"Ошибка обработки операции спецификации {ref_key}: {e}")
                         continue
 
-                # Reconcile: удалить связи спецификация-операция, которые больше не присутствуют в 1С (только если поле 'Операции' выгружено)
+                # Reconcile: удалить связи спецификация-операция, которые больше не присутствуют в 1С (только если поле 'Операции' выгружено).
+                # Строки, на которые ссылаются операции изготовлений
+                # (production_manufacture_operations.spec_operation_id), не удаляем:
+                # изготовление обязано сохранять свою производственную основу,
+                # а попытка удаления валит FK и абортирует транзакцию.
                 if can_reconcile_operations:
                     try:
                         with db.begin_nested():
@@ -422,6 +429,10 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 # Логируем ошибку, но продолжаем обработку
                 print(f"Ошибка обработки спецификации {ref_key}: {e}")
                 if not db.is_active:
+                    # После ошибки flush сессия непригодна: все накопленные
+                    # изменения уже потеряны, каждая следующая спецификация
+                    # упадёт каскадом PendingRollbackError. Поднимаем исходную
+                    # ошибку, чтобы job завершился с настоящей причиной.
                     raise
                 continue
 
