@@ -331,6 +331,35 @@ def _collect_due_recorder_identities(
     return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
 
 
+def _collect_pull_state_drift_identities(
+    db: Session,
+    visible_states: Mapping[tuple[str, str], tuple[int, str]],
+) -> tuple[tuple[str, str], ...]:
+    """Recorders whose latest observed pull differs from accepted Ledger.
+
+    A rejected physical-refresh candidate restores the accepted SLE prefix but
+    intentionally keeps ``stock_recorder_pull`` as the latest observation of
+    1C.  Without this comparison a bounded discovery window can miss an older
+    recorder that the rejected candidate had already found, leaving the
+    accepted Ledger permanently behind its known line count.
+    """
+    identities: set[tuple[str, str]] = set()
+    rows = db.query(models.StockRecorderPull).filter(
+        models.StockRecorderPull.status.in_(["done", "empty"]),
+    ).all()
+    for row in rows:
+        identity = (
+            str(row.recorder_type or ""),
+            str(row.recorder_ref or ""),
+        )
+        if identity[0] in _SYNTHETIC_RECORDER_TYPES or not identity[1]:
+            continue
+        visible_count = int(visible_states.get(identity, (0, ""))[0])
+        if visible_count != int(row.line_count or 0):
+            identities.add(identity)
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
 def _validate_checkpoint(
     db: Session,
     *,
@@ -511,10 +540,15 @@ def run_physical_recorder_audit(
     )
     all_known_recorders = tuple(sorted(visible_states))
     due_recorders = _collect_due_recorder_identities(db)
+    pull_state_drift = _collect_pull_state_drift_identities(db, visible_states)
     audit_recorders = (
-        _merge_recorder_identities(all_known_recorders, due_recorders)
+        _merge_recorder_identities(
+            all_known_recorders,
+            due_recorders,
+            pull_state_drift,
+        )
         if audit_all_known_recorders
-        else due_recorders
+        else _merge_recorder_identities(due_recorders, pull_state_drift)
     )
     discovery_range = _discovery_range(
         db,
@@ -568,6 +602,8 @@ def run_physical_recorder_audit(
         "revised": list(_result_summary(revised)),
         "vanished_recorders": len(vanished),
         "vanished": list(_result_summary(vanished)),
+        "pull_state_drift_recorders": len(pull_state_drift),
+        "pull_state_drift": list(_result_summary(pull_state_drift)),
     }
 
     # Existing historical recorders are re-pulled only by the explicit full

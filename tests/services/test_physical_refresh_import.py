@@ -512,6 +512,56 @@ def test_incremental_audit_pulls_due_and_truly_new_backdated_recorders(
     assert result.backdated_recorders == 1
 
 
+def test_incremental_audit_repulls_recorder_left_ahead_by_rejected_candidate(
+    db_session, monkeypatch
+):
+    parent, parent_batch = _accepted_parent(db_session, "pull-state-drift")
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="Document_СборкаЗапасов",
+        recorder_ref="older-revised-doc",
+        posting_at=parent.cutoff - timedelta(days=30),
+    )
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_СборкаЗапасов",
+        recorder_ref="older-revised-doc",
+        status="done",
+        line_count=6,
+        source="physical_refresh_recorder_audit",
+    ))
+    target = _building_target(db_session, parent, "pull-state-drift")
+    db_session.commit()
+
+    pulled: list[str] = []
+
+    def _pull(db, recorder_type, recorder_ref, **kwargs):
+        pulled.append(recorder_ref)
+        return PullResult(
+            status="done",
+            inserted=0,
+            physical_import_batch_id=int(parent_batch.id),
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=_RegisterClient(),
+        discovery_lookback=timedelta(days=7),
+        audit_all_known_recorders=False,
+    )
+
+    assert pulled == ["older-revised-doc"]
+    assert result.recorder_count == 1
+    checkpoint = db_session.get(models.LedgerBuildBatch, result.checkpoint_id)
+    assert checkpoint.metrics["discovery"]["pull_state_drift_recorders"] == 1
+
+
 def test_incremental_audit_repulls_known_recorder_when_line_count_changed(
     db_session, monkeypatch
 ):
