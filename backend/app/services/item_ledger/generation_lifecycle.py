@@ -12,7 +12,7 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -33,10 +33,12 @@ from .future_supply_capture import (
     FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
     FUTURE_SUPPLY_CAPTURE_STAGE,
     FutureSupplyCaptureError,
+    carry_forward_future_supply_evidence,
     replace_future_supply_capture,
     carry_forward_future_supply,
     verify_future_supply_capture,
 )
+from .supplier_future_supply import supplier_future_supply_evidence
 from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
@@ -1117,6 +1119,91 @@ def _carry_forward_parent_future_supply(
     ))
 
 
+def _capture_physical_future_supply(
+    db: Session,
+    generation: models.LedgerGeneration,
+    *,
+    planning_pool_by_warehouse: Mapping[str, str],
+) -> dict[str, Any]:
+    """Refresh supplier orders at the physical cutoff and retain WIP.
+
+    Supplier orders are synchronized mutable source documents.  Copying their
+    old qualification forever makes newly ordered goods invisible and also
+    preserves qualification bugs already fixed in code.  A physical
+    generation is the canonical point at which those fields become immutable,
+    so recapture only supplier evidence here; no BOM or MRP obligation is
+    recalculated.
+    """
+    parent_id = _parent_generation_id(generation)
+    if parent_id is None:
+        return _zero_future_supply_capture(db, generation)
+    parent = db.get(models.LedgerGeneration, int(parent_id))
+    if parent is None or str(parent.status) != "accepted":
+        raise GenerationValidationError(
+            "physical future supply requires an accepted parent generation"
+        )
+
+    batch_key = f"future-supply-capture:g{int(generation.id)}"
+    batch = db.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
+        models.LedgerBuildBatch.stage == FUTURE_SUPPLY_CAPTURE_STAGE,
+        models.LedgerBuildBatch.batch_key == batch_key,
+    ).one_or_none()
+    if batch is None:
+        batch = models.LedgerBuildBatch(
+            ledger_generation_id=int(generation.id),
+            stage=FUTURE_SUPPLY_CAPTURE_STAGE,
+            batch_key=batch_key,
+            status="building",
+            algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+            metrics={},
+        )
+        db.add(batch)
+        db.flush()
+    if str(batch.algorithm_version) != FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION:
+        raise GenerationValidationError(
+            "physical future supply requires the canonical capture algorithm"
+        )
+    if str(batch.status) == "completed":
+        try:
+            return dict(verify_future_supply_capture(
+                db,
+                int(generation.id),
+                capture_batch_id=int(batch.id),
+            ))
+        except FutureSupplyCaptureError as exc:
+            raise GenerationValidationError(
+                f"physical future supply proof is malformed: {exc}"
+            ) from exc
+
+    wip = carry_forward_future_supply_evidence(
+        db,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(generation.id),
+        supply_kinds=("wip_order",),
+    )
+    supplier = supplier_future_supply_evidence(
+        db,
+        int(generation.id),
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    )
+    try:
+        metrics = replace_future_supply_capture(
+            db,
+            int(generation.id),
+            int(batch.id),
+            (*wip, *supplier),
+        )
+    except FutureSupplyCaptureError as exc:
+        raise GenerationValidationError(
+            f"physical future supply capture failed: {exc}"
+        ) from exc
+    batch.status = "completed"
+    batch.completed_at = datetime.now(timezone.utc)
+    db.flush()
+    return dict(metrics, created=True)
+
+
 def _zero_future_supply_capture(db: Session, generation: models.LedgerGeneration) -> dict[str, Any]:
     """Create a canonical zero-row future-supply proof for no-parent generations."""
     batch_key = f"future-supply-capture:g{int(generation.id)}"
@@ -1251,6 +1338,7 @@ def accept_generation_build(
     odata_client: Any | None = None,
     explicit_empty_physical: bool = False,
     expected_parent_id: int | None = None,
+    planning_pool_by_warehouse: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build all local projections and publish only after every gate succeeds.
 
@@ -1261,7 +1349,15 @@ def accept_generation_build(
     with db.begin_nested():
         generation = _building_generation(db, generation_id)
         physical = materialize_generation_stock_bins(db, int(generation.id))
-        future_supply = _carry_forward_parent_future_supply(db, generation)
+        future_supply = (
+            _capture_physical_future_supply(
+                db,
+                generation,
+                planning_pool_by_warehouse=planning_pool_by_warehouse,
+            )
+            if planning_pool_by_warehouse is not None
+            else _carry_forward_parent_future_supply(db, generation)
+        )
         if future_supply is None:
             future_supply = _zero_future_supply_capture(db, generation)
         obligations = materialize_historical_obligations(db, int(generation.id))

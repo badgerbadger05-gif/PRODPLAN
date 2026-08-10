@@ -339,6 +339,72 @@ def test_accept_carries_the_parent_capture_and_claims_the_capability(db_session)
     assert generation.capabilities["future_supply"] is True
 
 
+def test_accept_recaptures_current_supplier_orders_on_physical_refresh(db_session):
+    generation, _requirement = _synthetic(db_session, "fs-current-supplier")
+    item = db_session.query(models.Item).filter_by(
+        item_code="ITEM-fs-current-supplier"
+    ).one()
+    parent = _accepted_parent_with_future_supply(
+        db_session,
+        "current-supplier-parent",
+        item,
+        qty="4",
+        supply_kind="supplier_order",
+    )
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "parent_generation_id": int(parent.id),
+    }
+    db_session.add(models.PlanningTruthState(
+        id=1,
+        current_generation_id=int(parent.id),
+    ))
+    order = models.SupplierOrder(
+        order_number="SUP-CURRENT",
+        order_date=datetime(2026, 7, 1),
+        order_ref1c="supplier-current",
+        order_state_name="Заказан (товар в пути)",
+        is_posted=True,
+        deletion_mark=False,
+        created_at=datetime(2026, 7, 1),
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(models.SupplierOrderItem(
+        order_id=int(order.order_id),
+        item_id_ref=int(item.item_id),
+        line_number=1,
+        characteristic_ref1c="00000000-0000-0000-0000-000000000000",
+        destination_warehouse_ref1c="WH",
+        quantity=Decimal("9"),
+        received_qty=Decimal("0"),
+        remaining_qty=Decimal("9"),
+        delivery_date=datetime(2026, 8, 1),
+        created_at=datetime(2026, 7, 1),
+    ))
+    db_session.flush()
+
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+        planning_pool_by_warehouse={"WH": "default"},
+    )
+
+    supplier = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=int(generation.id),
+        supply_kind="supplier_order",
+        source_ref="supplier-current",
+        source_line_ref="1",
+    ).one()
+    assert result["future_supply"]["created"] is True
+    assert supplier.evidence_status == "exact"
+    assert supplier.reason is None
+    assert supplier.characteristic_ref == ""
+    assert supplier.ordered_qty_at_cutoff == Decimal("9")
+    assert supplier.open_qty_at_cutoff == Decimal("9")
+
+
 def test_a_generation_with_nothing_to_inherit_still_creates_zero_future_supply_proof(db_session):
     generation, _requirement = _synthetic(db_session, "fs-genesis")
 

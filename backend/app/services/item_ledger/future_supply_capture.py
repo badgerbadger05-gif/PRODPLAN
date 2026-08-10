@@ -466,6 +466,55 @@ def _carry_forward_rows(
     return carried
 
 
+def carry_forward_future_supply_evidence(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target_generation_id: int,
+    supply_kinds: Iterable[str] | None = None,
+) -> tuple[FutureSupplyEvidence, ...]:
+    """Return re-cutoffted parent rows as canonical capture evidence.
+
+    Physical refreshes recapture mutable supplier-order mirrors at their new
+    cutoff, but WIP remains carried until its own source adapter can safely
+    re-read a BUILDING physical generation.  Returning evidence rather than
+    persisting here lets the caller replace both kinds atomically in the one
+    mandatory future-supply capture batch.
+    """
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    if parent is None or str(parent.status) != "accepted":
+        raise FutureSupplyCaptureError(
+            "future supply evidence carry-forward requires an accepted source generation"
+        )
+    if target is None or str(target.status) != "building":
+        raise FutureSupplyCaptureError(
+            "future supply evidence carry-forward requires a BUILDING target generation"
+        )
+    requested = {
+        _norm(value)
+        for value in (supply_kinds if supply_kinds is not None else _KINDS)
+    }
+    if not requested or not requested.issubset(_KINDS):
+        raise FutureSupplyCaptureError("future supply evidence carry-forward has invalid kinds")
+
+    evidence: list[FutureSupplyEvidence] = []
+    for row in _carry_forward_rows(db, parent=parent, target=target):
+        if str(row["supply_kind"]) not in requested:
+            continue
+        values = {
+            field: row[field]
+            for field in FutureSupplyEvidence.__dataclass_fields__
+            if field != "source_content_hash"
+        }
+        unsigned = FutureSupplyEvidence(**values)
+        evidence.append(FutureSupplyEvidence(
+            **values,
+            source_content_hash=future_supply_evidence_hash(unsigned),
+        ))
+    return tuple(evidence)
+
+
 def _generation_rows(db: Session, generation_id: int) -> list[models.LedgerFutureSupply]:
     return db.query(models.LedgerFutureSupply).filter(
         models.LedgerFutureSupply.ledger_generation_id == int(generation_id)

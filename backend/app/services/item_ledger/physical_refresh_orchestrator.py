@@ -509,6 +509,7 @@ def run_physical_refresh(
             replay_from=replay_from,
             odata_client=client,
             expected_parent_id=int(parent.id),
+            planning_pool_by_warehouse=pool_mapping,
         )
         fixed_run_ids = tuple(
             int(run_id)
