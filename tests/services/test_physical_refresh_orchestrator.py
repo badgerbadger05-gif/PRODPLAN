@@ -204,6 +204,96 @@ def test_targeted_repair_pulls_only_recorder_touching_mismatch(
     ] == 1
 
 
+def test_targeted_repair_repulls_known_recorder_missing_from_current_register(
+    db_session, monkeypatch
+):
+    parent, parent_batch = _accepted_parent(
+        db_session, generation_key="targeted-vanished"
+    )
+    item = models.Item(
+        item_code="VANISHED-ITEM",
+        item_name="Vanished item",
+        item_ref1c="vanished-item-ref",
+    )
+    generation = models.LedgerGeneration(
+        generation_key="targeted-vanished-child",
+        status="building",
+        cutoff=parent.cutoff + timedelta(days=1),
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": parent.id,
+        },
+        physical_import_batch=parent_batch,
+        algorithm_version="physical-refresh/test",
+        replay_version="physical-refresh/test",
+    )
+    db_session.add_all([item, generation])
+    db_session.flush()
+    db_session.add(models.StockLedgerEntry(
+        source_content_hash="vanished-recorder-row",
+        item_id=item.item_id,
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        organization_ref="org-ref",
+        qty=13,
+        posting_at=parent.cutoff,
+        movement_kind="receipt",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="vanished-recorder",
+        ingest_batch_id=parent_batch.id,
+    ))
+    db_session.commit()
+    delta = bootstrap.BalanceConvergenceDelta(
+        item_id=item.item_id,
+        organization_ref="org-ref",
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        balance_qty="0",
+        ledger_qty="13",
+        delta_qty="-13",
+        matched=False,
+    )
+    convergence = bootstrap.BalanceConvergenceResult(
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff.isoformat(),
+        checked_at=generation.cutoff.isoformat(),
+        valid=False,
+        content_hash="vanished",
+        compared=1,
+        matched=0,
+        mismatched=1,
+        terminal_batch_id=parent_batch.id,
+        deltas=(delta,),
+    )
+
+    class Client:
+        def _make_request(self, _entity, _params):
+            return {"value": []}
+
+    pulled = []
+    monkeypatch.setattr(
+        workflow,
+        "opening_boundary",
+        lambda db: (parent_batch, datetime(2026, 7, 1, tzinfo=timezone.utc)),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "pull_recorder_movements",
+        lambda db, recorder_type, recorder_ref, **kwargs: (
+            pulled.append((recorder_type, recorder_ref))
+            or PullResult(status="empty", inserted=0, physical_import_batch_id=parent_batch.id)
+        ),
+    )
+
+    repaired = workflow._repair_mismatched_recorders(
+        db_session,
+        generation=generation,
+        client=Client(),
+        convergence=convergence,
+    )
+
+    assert repaired == 1
+    assert pulled == [("Document_ПеремещениеЗапасов", "vanished-recorder")]
+
+
 def test_run_physical_refresh_no_work_on_lock_contention(db_session, monkeypatch):
     parent, _ = _accepted_parent(db_session)
     blocked = []

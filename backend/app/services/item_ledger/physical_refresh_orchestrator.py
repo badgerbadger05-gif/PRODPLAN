@@ -27,11 +27,13 @@ from .historical_import_orchestration import (
     run_historical_physical_import,
 )
 from .opening_balance_reconcile import (
+    ADJUSTMENT_RECORDER_TYPE,
     OpeningBalanceReconcileResult,
     opening_boundary,
     reconcile_opening_balance,
 )
-from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, physical_sequence_lock_context
+from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, SEED_RECORDER_TYPE, physical_sequence_lock_context
+from .physical_visibility import visible_sle_query
 from .ingest import pull_recorder_movements
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
@@ -234,6 +236,35 @@ def _repair_mismatched_recorders(
     opening_at = _utc(opening[1], "opening boundary")
     cutoff = _utc(generation.cutoff, "generation cutoff")
     identities: set[tuple[str, str]] = set()
+
+    # A cancelled/unposted recorder disappears from 1C's current register, so
+    # the register-side lookup below cannot discover it.  Seed the repair set
+    # with recorder identities already contributing to each mismatched Ledger
+    # cell; re-pulling a vanished recorder produces the tombstone that removes
+    # its obsolete movements.
+    known_rows = visible_sle_query(
+        db,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        cutoff=generation.cutoff,
+    ).filter(
+        models.StockLedgerEntry.item_id.in_({key[0] for key in mismatch_keys}),
+    ).all()
+    synthetic_types = {SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE}
+    for row in known_rows:
+        key = (
+            int(row.item_id),
+            _normalized_ref(row.organization_ref),
+            _normalized_ref(row.warehouse_ref1c),
+        )
+        recorder_type = _normalized_recorder_type(row.recorder_type)
+        recorder_ref = _normalized_ref(row.recorder_ref)
+        if (
+            key in mismatch_keys
+            and recorder_type not in synthetic_types
+            and recorder_type
+            and recorder_ref
+        ):
+            identities.add((recorder_type, recorder_ref))
 
     for item_id, item_ref in sorted(ref_by_item.items()):
         wanted = {
