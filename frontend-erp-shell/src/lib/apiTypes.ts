@@ -4042,6 +4042,8 @@ export interface components {
             supply_kind: string;
             /** Source Ref */
             source_ref: string;
+            /** Source Number */
+            source_number: string;
             /** Source Line Ref */
             source_line_ref: string;
             /** Ordered Qty */

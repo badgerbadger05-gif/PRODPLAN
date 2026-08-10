@@ -9,6 +9,11 @@ import {
   listPurchaseJournal,
   syncSupplierOrdersFrom1C,
 } from '../../services/purchaseControl'
+import {
+  getItemLedgerFutureSupply,
+  getItemLedgerPosition,
+  getItemLedgerReservations,
+} from '../../services/itemLedger'
 import { PurchaseControlPage } from './PurchaseControlPage'
 
 vi.mock('../../services/purchaseControl', () => ({
@@ -17,6 +22,12 @@ vi.mock('../../services/purchaseControl', () => ({
   getPurchaseOrderCard: vi.fn(),
   listPurchaseJournal: vi.fn(),
   syncSupplierOrdersFrom1C: vi.fn(),
+}))
+
+vi.mock('../../services/itemLedger', () => ({
+  getItemLedgerFutureSupply: vi.fn(),
+  getItemLedgerPosition: vi.fn(),
+  getItemLedgerReservations: vi.fn(),
 }))
 
 const purchaseRow: PurchaseRow = {
@@ -192,6 +203,50 @@ describe('PurchaseControlPage Doctype migration', () => {
         read_only: true,
       },
     })
+    const truthMeta = {
+      ledger_generation: 23,
+      cutoff: '2026-07-23T12:00:00+00:00',
+      truth_status: 'accepted' as const,
+      truth_reason: null,
+    }
+    vi.mocked(getItemLedgerPosition).mockResolvedValue({
+      item_id: 9,
+      item_code: 'BEARING-01',
+      item_name: 'Подшипник ведущего вала',
+      pool_key: '9::default',
+      on_hand: 4,
+      on_hand_by_warehouse: [{ warehouse_ref1c: 'WH-1', warehouse_name: 'Основной склад', qty: 4, qty_negative: false }],
+      incoming_supplier: 12,
+      incoming_wip: 0,
+      incoming: 12,
+      reserved_soft: 8,
+      available: -4,
+      projected: 8,
+      uncovered: 0,
+      flags: { on_hand_negative: false, has_uncovered: false, reconcile_pending: false },
+      truth_meta: truthMeta,
+    })
+    vi.mocked(getItemLedgerReservations).mockResolvedValue({
+      rows: [],
+      truth_meta: truthMeta,
+    })
+    vi.mocked(getItemLedgerFutureSupply).mockResolvedValue({
+      rows: [{
+        id: 42,
+        supply_kind: 'supplier_order',
+        source_ref: 'b0d16efe-6553-11f1-9270-9ee51454587f',
+        source_number: 'ЗП-000042',
+        source_line_ref: '1',
+        ordered_qty: 12,
+        received_qty: 0,
+        open_qty: 12,
+        eta_date: '2026-07-25',
+        destination_warehouse_ref1c: 'WH-1',
+        source_state_key: 'ordered',
+        evidence_status: 'exact',
+      }],
+      truth_meta: truthMeta,
+    })
     vi.mocked(syncSupplierOrdersFrom1C).mockResolvedValue({ orders_created: 0, orders_updated: 1 })
     vi.mocked(materializePurchaseControlRows).mockResolvedValue({
       snapshot_id: 51,
@@ -209,6 +264,9 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(screen.getByRole('button', { name: 'Нет товара: 1' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Промснаб' })).toBeInTheDocument()
     expect(screen.getByText(/в живых заказах 0 шт \(0%\) · к заказу 12 шт \(100%\)/)).toBeInTheDocument()
+    expect(await screen.findByText('Ledger по номенклатуре')).toBeInTheDocument()
+    expect(screen.getByText('Основной склад')).toBeInTheDocument()
+    expect(screen.getByText(/Заказ поставщику ЗП-000042/)).toBeInTheDocument()
 
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('order_id')).toBe('8')
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('search')).toBe('вал')

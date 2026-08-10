@@ -302,6 +302,11 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
             source_content_hash="b" * 64,
         ),
     ])
+    db_session.add(models.SupplierOrder(
+        order_number="ЗП-000042",
+        order_date=dt.datetime(2026, 7, 20),
+        order_ref1c="SUP-42",
+    ))
     db_session.commit()
 
     response = client.get(f"/api/v1/item-ledger/{seeded['a']}/future-supply")
@@ -313,6 +318,7 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
         "id": payload["rows"][0]["id"],
         "supply_kind": "supplier_order",
         "source_ref": "SUP-42",
+        "source_number": "ЗП-000042",
         "source_line_ref": "1",
         "ordered_qty": 12.0,
         "received_qty": 5.0,

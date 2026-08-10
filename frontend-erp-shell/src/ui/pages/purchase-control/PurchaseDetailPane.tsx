@@ -9,6 +9,7 @@ import {
 } from '../../../domain/purchaseControl'
 import { dateRu, qty } from '../../../lib/format'
 import { getPurchaseOrderCard } from '../../../services/purchaseControl'
+import { ItemLedgerSummaryBlock } from '../../item-ledger/ItemLedgerSummaryBlock'
 
 type Props = {
   activeRow: PurchaseRow | null
@@ -116,6 +117,8 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
             )}
         </strong>
       </div>
+
+      <ItemLedgerSummaryBlock itemId={activeRow.item_id} unit={activeRow.unit} />
 
       {orderId && (
         <>

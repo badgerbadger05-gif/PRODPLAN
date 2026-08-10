@@ -275,7 +275,8 @@ beforeEach(() => {
     rows: [{
       id: 601,
       supply_kind: 'supplier_order',
-      source_ref: 'SUP-42',
+      source_ref: 'b0d16efe-6553-11f1-9270-9ee51454587f',
+      source_number: 'ЗП-000042',
       source_line_ref: '1',
       ordered_qty: 7,
       received_qty: 0,
@@ -333,10 +334,10 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByText('Ledger по номенклатуре')).toBeInTheDocument()
     expect(await screen.findByText('Основной склад')).toBeInTheDocument()
     expect(screen.getByText(/План августа · треб. #9001/)).toBeInTheDocument()
-    expect(screen.getByText(/Заказ поставщику SUP-42/)).toBeInTheDocument()
-    expect(getItemLedgerPosition).toHaveBeenCalledWith(201)
-    expect(getItemLedgerReservations).toHaveBeenCalledWith(201, { status: 'active' })
-    expect(getItemLedgerFutureSupply).toHaveBeenCalledWith(201)
+    expect(screen.getByText(/Заказ поставщику ЗП-000042/)).toBeInTheDocument()
+    expect(getItemLedgerPosition).toHaveBeenCalledWith(201, expect.anything())
+    expect(getItemLedgerReservations).toHaveBeenCalledWith(201, { status: 'active' }, expect.anything())
+    expect(getItemLedgerFutureSupply).toHaveBeenCalledWith(201, expect.anything())
   })
 
   it('renders the page shell: heading, command bar, and table columns', async () => {

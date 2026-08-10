@@ -13924,6 +13924,10 @@
             "type": "string",
             "title": "Source Ref"
           },
+          "source_number": {
+            "type": "string",
+            "title": "Source Number"
+          },
           "source_line_ref": {
             "type": "string",
             "title": "Source Line Ref"
@@ -13969,6 +13973,7 @@
           "id",
           "supply_kind",
           "source_ref",
+          "source_number",
           "source_line_ref",
           "ordered_qty",
           "received_qty",

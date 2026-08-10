@@ -164,6 +164,7 @@ class ItemLedgerFutureSupplyRow(BaseModel):
     id: int
     supply_kind: str
     source_ref: str
+    source_number: str
     source_line_ref: str
     ordered_qty: float
     received_qty: float
@@ -385,12 +386,41 @@ def get_future_supply(
         )
         .all()
     )
+    supplier_refs = {
+        str(row.source_ref)
+        for row in rows
+        if row.supply_kind == "supplier_order" and row.source_ref
+    }
+    production_refs = {
+        str(row.source_ref)
+        for row in rows
+        if row.supply_kind == "wip_order" and row.source_ref
+    }
+    source_numbers = {
+        ("supplier_order", str(ref)): str(number or "")
+        for ref, number in db.query(
+            models.SupplierOrder.order_ref1c,
+            models.SupplierOrder.order_number,
+        ).filter(models.SupplierOrder.order_ref1c.in_(supplier_refs)).all()
+    } if supplier_refs else {}
+    if production_refs:
+        source_numbers.update({
+            ("wip_order", str(ref)): str(number or "")
+            for ref, number in db.query(
+                models.ProductionOrder.order_ref1c,
+                models.ProductionOrder.order_number,
+            ).filter(models.ProductionOrder.order_ref1c.in_(production_refs)).all()
+        })
     return {
         "rows": [
             {
                 "id": int(row.id),
                 "supply_kind": str(row.supply_kind or ""),
                 "source_ref": str(row.source_ref or ""),
+                "source_number": source_numbers.get(
+                    (str(row.supply_kind or ""), str(row.source_ref or "")),
+                    "",
+                ),
                 "source_line_ref": str(row.source_line_ref or ""),
                 "ordered_qty": _f(row.ordered_qty_at_cutoff),
                 "received_qty": _f(row.realized_qty_at_cutoff),
