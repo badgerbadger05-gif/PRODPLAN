@@ -11,8 +11,17 @@ type Props = {
 }
 
 const realizationLabel: Record<string, string> = {
-  consume: 'Списание (consume)',
-  make: 'Выпуск (make)',
+  consume: 'Расход',
+  make: 'Производство',
+  rework: 'Доработка',
+}
+
+const statusLabel: Record<string, string> = {
+  active: 'Активен',
+  closed: 'Закрыт',
+  released: 'Снят',
+  carried: 'Перенесён',
+  cancelled: 'Отменён',
 }
 
 const statusTone: Record<string, string> = {
@@ -36,9 +45,9 @@ export function ItemLedgerReservationsTable({ rows, selectedReservationId, onSel
     <table className="journalTable" aria-label="Резервы номенклатуры">
       <thead>
         <tr>
-          <th>ID резерва</th>
+          <th>Резерв</th>
           <th>План</th>
-          <th>Заявка</th>
+          <th>Потребность</th>
           <th>Период</th>
           <th>Тип</th>
           <th className="numCell">Резерв</th>
@@ -98,7 +107,7 @@ export function ItemLedgerReservationsTable({ rows, selectedReservationId, onSel
               <td className="numCell">{qty(row.replenishment_required_qty)}</td>
               <td className="numCell">{qty(row.replenishment_received_qty)}</td>
               <td className="numCell"><strong>{qty(row.replenishment_remaining_qty)}</strong></td>
-              <td><StatusBadge tone={statusTone[row.lifecycle_status] || ''}>{row.lifecycle_status}</StatusBadge></td>
+              <td><StatusBadge tone={statusTone[row.lifecycle_status] || ''}>{statusLabel[row.lifecycle_status] || row.lifecycle_status}</StatusBadge></td>
             </tr>
           )
         })}

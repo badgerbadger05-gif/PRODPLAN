@@ -28,6 +28,7 @@ function renderFlag(flag: string, active: boolean) {
 }
 
 export function ItemLedgerPositionSummary({ position }: Props) {
+  const poolLabel = position.pool_key.endsWith('::default') ? 'Основной' : 'Специальный'
   return (
     <section aria-label={`Сводка позиции номенклатуры ${position.item_code}`}>
       <h3>Сводка позиции</h3>
@@ -36,7 +37,7 @@ export function ItemLedgerPositionSummary({ position }: Props) {
         <span>{position.item_name}</span>
       </p>
       <p>
-        <strong>Пул:</strong> <code>{position.pool_key}</code>
+        <strong>Контур:</strong> <span title={position.pool_key}>{poolLabel}</span>
       </p>
       <div className="muted" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         {renderFlag('on_hand_negative', position.flags.on_hand_negative)}
@@ -50,19 +51,19 @@ export function ItemLedgerPositionSummary({ position }: Props) {
             <td className="numCell">{numberCell(position.on_hand)}</td>
           </tr>
           <tr>
-            <th>Входящий поставщик</th>
+            <th>Заказы поставщика</th>
             <td className="numCell">{numberCell(position.incoming_supplier)}</td>
           </tr>
           <tr>
-            <th>Входящий WIP</th>
+            <th>Заказы в производство</th>
             <td className="numCell">{numberCell(position.incoming_wip)}</td>
           </tr>
           <tr>
-            <th>Всего входящий</th>
+            <th>Всего в заказах</th>
             <td className="numCell">{numberCell(position.incoming)}</td>
           </tr>
           <tr>
-            <th>Резервный мягкий остаток</th>
+            <th>Активные резервы</th>
             <td className="numCell">{numberCell(position.reserved_soft)}</td>
           </tr>
           <tr>
@@ -70,11 +71,11 @@ export function ItemLedgerPositionSummary({ position }: Props) {
             <td className="numCell">{numberCell(position.available)}</td>
           </tr>
           <tr>
-            <th>Проецируемый остаток</th>
+            <th>Проекция</th>
             <td className="numCell">{numberCell(position.projected)}</td>
           </tr>
           <tr>
-            <th>Непокрытый дефицит</th>
+            <th>Не покрыто</th>
             <td className="numCell">{numberCell(position.uncovered)}</td>
           </tr>
         </tbody>
@@ -90,7 +91,7 @@ export function ItemLedgerPositionSummary({ position }: Props) {
         <tbody>
           {position.on_hand_by_warehouse.map((warehouse) => (
             <tr key={warehouse.warehouse_ref1c}>
-              <td><code>{warehouse.warehouse_name}</code> <span>{warehouse.warehouse_ref1c}</span></td>
+              <td title={warehouse.warehouse_ref1c}>{warehouse.warehouse_name || 'Склад 1С'}</td>
               <td className="numCell">{qty(warehouse.qty)}</td>
             </tr>
           ))}

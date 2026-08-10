@@ -4056,8 +4056,12 @@ export interface components {
             eta_date: string | null;
             /** Destination Warehouse Ref1C */
             destination_warehouse_ref1c: string;
+            /** Destination Warehouse Name */
+            destination_warehouse_name: string;
             /** Source State Key */
             source_state_key: string;
+            /** Source State Name */
+            source_state_name: string;
             /** Evidence Status */
             evidence_status: string;
         };
@@ -4083,6 +4087,10 @@ export interface components {
             recorder_type: string;
             /** Recorder Ref */
             recorder_ref: string;
+            /** Recorder Number */
+            recorder_number: string;
+            /** Basis Order Number */
+            basis_order_number: string;
             /** Line No */
             line_no: string;
             /** Ingest Source */

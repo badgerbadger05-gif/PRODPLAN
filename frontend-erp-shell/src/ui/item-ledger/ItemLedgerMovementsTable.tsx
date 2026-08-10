@@ -21,6 +21,26 @@ const recordTypeTone: Record<string, string> = {
   Expense: 'shortage',
 }
 
+const recordTypeLabel: Record<string, string> = {
+  Receipt: 'Приход',
+  Expense: 'Расход',
+}
+
+const ingestSourceLabel: Record<string, string> = {
+  document_pull: 'Документы 1С',
+  balance_reconcile: 'Сверка остатков',
+  seed: 'Начальный остаток',
+  adjustment: 'Корректировка',
+}
+
+function recorderTypeLabel(value: string) {
+  const labels: Record<string, string> = {
+    Document_СборкаЗапасов: 'Сборка запасов',
+    Document_ПеремещениеЗапасов: 'Перемещение запасов',
+  }
+  return labels[value] || value.replace(/^Document_/, '').replaceAll('_', ' ') || 'Документ 1С'
+}
+
 function signedQty(value: number) {
   return <strong>{value > 0 ? '+' : ''}{qty(value)}</strong>
 }
@@ -38,8 +58,6 @@ export function ItemLedgerMovementsTable({ rows }: Props) {
           <th>Документ</th>
           <th>Строка</th>
           <th>Источник</th>
-          <th>Характеристика</th>
-          <th>Организация</th>
         </tr>
       </thead>
       <tbody>
@@ -47,28 +65,25 @@ export function ItemLedgerMovementsTable({ rows }: Props) {
           <tr key={row.id}>
             <td>{dateTimeRu(row.posting_at) || '—'}</td>
             <td>
-              <strong>{row.warehouse_name}</strong>
-              <span>{row.warehouse_ref1c}</span>
+              <strong title={row.warehouse_ref1c}>{row.warehouse_name || 'Склад 1С'}</strong>
             </td>
             <td className="numCell">{signedQty(row.qty)}</td>
             <td className="numCell">{qty(row.qty_after)}</td>
             <td>
               <strong>{movementKindLabel[row.movement_kind] || row.movement_kind}</strong>
-              <span>{recordTypeTone[row.record_type] ? <span className={`pill ${recordTypeTone[row.record_type]}`}>{row.record_type}</span> : row.record_type}</span>
+              <span>{recordTypeTone[row.record_type] ? <span className={`pill ${recordTypeTone[row.record_type]}`}>{recordTypeLabel[row.record_type]}</span> : row.record_type}</span>
             </td>
-            <td>
-              <code>{row.recorder_type}</code>
-              <span>{row.recorder_ref}</span>
+            <td title={`${row.recorder_type} ${row.recorder_ref}`}>
+              <strong>{recorderTypeLabel(row.recorder_type)}</strong>
+              <span>{row.recorder_number || (row.basis_order_number ? `Заказ ${row.basis_order_number}` : 'Документ 1С')}</span>
             </td>
             <td>{row.line_no || '—'}</td>
-            <td>{row.ingest_source}</td>
-            <td>{row.characteristic_ref || '—'}</td>
-            <td>{row.organization_ref || '—'}</td>
+            <td>{ingestSourceLabel[row.ingest_source] || row.ingest_source || '—'}</td>
           </tr>
         ))}
         {!rows.length && (
           <tr>
-            <td colSpan={10}>
+            <td colSpan={8}>
               <div className="emptyDetail">Движений нет</div>
             </td>
           </tr>

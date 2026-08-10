@@ -325,7 +325,9 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
         "open_qty": 7.0,
         "eta_date": "2026-08-15",
         "destination_warehouse_ref1c": "W1",
+        "destination_warehouse_name": "Цех 1",
         "source_state_key": "ordered",
+        "source_state_name": "",
         "evidence_status": "exact",
     }]
 
@@ -333,7 +335,19 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
 # ---------------------------------------------------------------------------
 #  movements
 # ---------------------------------------------------------------------------
-def test_movements_sorted_and_scoped(client, seeded):
+def test_movements_sorted_and_scoped(client, db_session, seeded):
+    db_session.add(models.ProductionOrder(
+        order_number="PP001305968",
+        order_date=dt.datetime(2026, 7, 20),
+        order_ref1c="ORDER-42",
+    ))
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_Test",
+        recorder_ref="rec-2",
+        order_ref="ORDER-42",
+        status="done",
+    ))
+    db_session.commit()
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements").json()
     ItemLedgerMovementsResponse.model_validate(d)
     assert d["truth_meta"]["truth_status"] == "accepted"
@@ -347,6 +361,9 @@ def test_movements_sorted_and_scoped(client, seeded):
     assert first["qty_after"] == pytest.approx(300.0)
     assert first["warehouse_name"] == "Цех 1"
     assert first["ingest_source"] == "document_pull"
+    assert first["recorder_number"] == ""
+    assert first["basis_order_number"] == ""
+    assert next(row for row in d["rows"] if row["recorder_ref"] == "rec-2")["basis_order_number"] == "PP001305968"
 
 
 def test_movements_pagination(client, seeded):

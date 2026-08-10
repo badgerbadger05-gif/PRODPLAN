@@ -13959,9 +13959,17 @@
             "type": "string",
             "title": "Destination Warehouse Ref1C"
           },
+          "destination_warehouse_name": {
+            "type": "string",
+            "title": "Destination Warehouse Name"
+          },
           "source_state_key": {
             "type": "string",
             "title": "Source State Key"
+          },
+          "source_state_name": {
+            "type": "string",
+            "title": "Source State Name"
           },
           "evidence_status": {
             "type": "string",
@@ -13980,7 +13988,9 @@
           "open_qty",
           "eta_date",
           "destination_warehouse_ref1c",
+          "destination_warehouse_name",
           "source_state_key",
+          "source_state_name",
           "evidence_status"
         ],
         "title": "ItemLedgerFutureSupplyRow"
@@ -14034,6 +14044,14 @@
             "type": "string",
             "title": "Recorder Ref"
           },
+          "recorder_number": {
+            "type": "string",
+            "title": "Recorder Number"
+          },
+          "basis_order_number": {
+            "type": "string",
+            "title": "Basis Order Number"
+          },
           "line_no": {
             "type": "string",
             "title": "Line No"
@@ -14063,6 +14081,8 @@
           "record_type",
           "recorder_type",
           "recorder_ref",
+          "recorder_number",
+          "basis_order_number",
           "line_no",
           "ingest_source",
           "characteristic_ref",

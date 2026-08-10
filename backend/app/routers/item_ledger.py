@@ -116,6 +116,8 @@ class ItemLedgerMovement(BaseModel):
     record_type: str
     recorder_type: str
     recorder_ref: str
+    recorder_number: str
+    basis_order_number: str
     line_no: str
     ingest_source: str
     characteristic_ref: str
@@ -171,7 +173,9 @@ class ItemLedgerFutureSupplyRow(BaseModel):
     open_qty: float
     eta_date: Optional[str]
     destination_warehouse_ref1c: str
+    destination_warehouse_name: str
     source_state_key: str
+    source_state_name: str
     evidence_status: str
 
 
@@ -396,38 +400,49 @@ def get_future_supply(
         for row in rows
         if row.supply_kind == "wip_order" and row.source_ref
     }
-    source_numbers = {
-        ("supplier_order", str(ref)): str(number or "")
-        for ref, number in db.query(
+    source_rows = {
+        ("supplier_order", str(ref)): (str(number or ""), str(state_name or ""))
+        for ref, number, state_name in db.query(
             models.SupplierOrder.order_ref1c,
             models.SupplierOrder.order_number,
+            models.SupplierOrder.order_state_name,
         ).filter(models.SupplierOrder.order_ref1c.in_(supplier_refs)).all()
     } if supplier_refs else {}
     if production_refs:
-        source_numbers.update({
-            ("wip_order", str(ref)): str(number or "")
-            for ref, number in db.query(
+        source_rows.update({
+            ("wip_order", str(ref)): (str(number or ""), str(state_name or ""))
+            for ref, number, state_name in db.query(
                 models.ProductionOrder.order_ref1c,
                 models.ProductionOrder.order_number,
+                models.ProductionOrder.order_state_name,
             ).filter(models.ProductionOrder.order_ref1c.in_(production_refs)).all()
         })
+    warehouse_names, *_ = _contour(db)
     return {
         "rows": [
             {
                 "id": int(row.id),
                 "supply_kind": str(row.supply_kind or ""),
                 "source_ref": str(row.source_ref or ""),
-                "source_number": source_numbers.get(
+                "source_number": source_rows.get(
                     (str(row.supply_kind or ""), str(row.source_ref or "")),
-                    "",
-                ),
+                    ("", ""),
+                )[0],
                 "source_line_ref": str(row.source_line_ref or ""),
                 "ordered_qty": _f(row.ordered_qty_at_cutoff),
                 "received_qty": _f(row.realized_qty_at_cutoff),
                 "open_qty": _f(row.open_qty_at_cutoff),
                 "eta_date": _iso(row.eta_date),
                 "destination_warehouse_ref1c": str(row.destination_warehouse_ref1c or ""),
+                "destination_warehouse_name": warehouse_names.get(
+                    str(row.destination_warehouse_ref1c or ""),
+                    "",
+                ),
                 "source_state_key": str(row.source_state_key or ""),
+                "source_state_name": source_rows.get(
+                    (str(row.supply_kind or ""), str(row.source_ref or "")),
+                    ("", ""),
+                )[1],
                 "evidence_status": str(row.evidence_status or ""),
             }
             for row in rows
@@ -489,6 +504,50 @@ def get_movements(
         .limit(limit)
         .all()
     )
+    recorder_refs = {str(row.recorder_ref or "") for row in rows if row.recorder_ref}
+    recorder_numbers = {
+        str(ref): str(number or "")
+        for ref, number in db.query(
+            models.ProductionMaterialIssue.exported_ref1c,
+            models.ProductionMaterialIssue.document_number,
+        ).filter(models.ProductionMaterialIssue.exported_ref1c.in_(recorder_refs)).all()
+    } if recorder_refs else {}
+    basis_order_numbers = {
+        str(ref): str(number or "")
+        for ref, number in db.query(
+            models.ProductionManufacture.exported_ref1c,
+            models.ProductionOrder.order_number,
+        ).join(
+            models.ProductionOrder,
+            models.ProductionOrder.order_id == models.ProductionManufacture.order_id,
+        ).filter(models.ProductionManufacture.exported_ref1c.in_(recorder_refs)).all()
+    } if recorder_refs else {}
+    if recorder_refs:
+        basis_order_numbers.update({
+            str(ref): str(number or "")
+            for ref, number in db.query(
+                models.StockRecorderPull.recorder_ref,
+                models.ProductionOrder.order_number,
+            ).join(
+                models.ProductionOrder,
+                models.ProductionOrder.order_ref1c == models.StockRecorderPull.order_ref,
+            ).filter(models.StockRecorderPull.recorder_ref.in_(recorder_refs)).all()
+        })
+    row_ids = [int(row.id) for row in rows]
+    if row_ids:
+        supplier_bases = db.query(
+            models.StockLedgerSupplierReceiptProvenance.receipt_doc_ref,
+            models.SupplierOrder.order_number,
+        ).join(
+            models.SupplierOrder,
+            models.SupplierOrder.order_ref1c
+            == models.StockLedgerSupplierReceiptProvenance.supplier_order_ref,
+        ).filter(
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id == generation_id,
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(row_ids),
+            models.StockLedgerSupplierReceiptProvenance.match_status == "exact",
+        ).all()
+        basis_order_numbers.update({str(ref): str(number or "") for ref, number in supplier_bases})
     out = [
         {
             "id": int(r.id),
@@ -501,6 +560,8 @@ def get_movements(
             "record_type": r.record_type or "",
             "recorder_type": r.recorder_type or "",
             "recorder_ref": r.recorder_ref or "",
+            "recorder_number": recorder_numbers.get(str(r.recorder_ref or ""), ""),
+            "basis_order_number": basis_order_numbers.get(str(r.recorder_ref or ""), ""),
             "line_no": r.line_no or "",
             "ingest_source": r.ingest_source or "",
             "characteristic_ref": r.characteristic_ref or "",

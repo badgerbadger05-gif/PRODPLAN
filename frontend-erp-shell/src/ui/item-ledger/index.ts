@@ -1,4 +1,5 @@
 export { ItemLedgerMovementsTable } from './ItemLedgerMovementsTable'
+export { ItemLedgerFutureSupplyTable } from './ItemLedgerFutureSupplyTable'
 export { ItemLedgerPositionSummary } from './ItemLedgerPositionSummary'
 export { ItemLedgerReservationEventsTimeline } from './ItemLedgerReservationEventsTimeline'
 export { ItemLedgerReservationsTable } from './ItemLedgerReservationsTable'
