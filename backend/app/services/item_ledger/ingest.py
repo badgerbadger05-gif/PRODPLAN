@@ -105,6 +105,10 @@ class HistoricalPullValidationError(ValueError):
     """A recorder cannot join a strict, cutoff-bounded historical prefix."""
 
 
+class HistoricalPullBeyondCutoffError(HistoricalPullValidationError):
+    """A recorder's current 1C state belongs to a later physical prefix."""
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -383,7 +387,7 @@ def pull_recorder_movements(
             assert cutoff_period is not None
             beyond_cutoff = parsed_period > cutoff_period
             if beyond_cutoff:
-                raise HistoricalPullValidationError(
+                raise HistoricalPullBeyondCutoffError(
                     f"recorder movement {parsed_period.isoformat()} exceeds "
                     f"historical cutoff {max_posting_at.isoformat()} in "
                     f"{recorder_type} {recorder_ref}"

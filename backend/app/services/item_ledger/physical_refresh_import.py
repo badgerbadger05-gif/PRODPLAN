@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -33,7 +33,11 @@ from .historical_register_scan import (
     balance_movement_payload,
     scan_historical_register_range,
 )
-from .ingest import DEFAULT_MAX_ATTEMPTS, pull_recorder_movements
+from .ingest import (
+    DEFAULT_MAX_ATTEMPTS,
+    HistoricalPullBeyondCutoffError,
+    pull_recorder_movements,
+)
 from .opening_balance_reconcile import (
     ADJUSTMENT_RECORDER_TYPE,
     opening_boundary,
@@ -622,6 +626,8 @@ def run_physical_recorder_audit(
     run_rows: list[dict[str, Any]] = []
     changed_recorders = 0
     expected_terminal_id = start_boundary_id
+    pull_state_drift_set = set(pull_state_drift)
+    deferred_pull_state_drift: list[tuple[str, str]] = []
 
     try:
         for recorder_type, recorder_ref in target_recorders:
@@ -635,9 +641,29 @@ def run_physical_recorder_audit(
                 max_posting_at=generation.cutoff,
                 strict_historical=True,
             )
-            result = pull_recorder_movements(
-                db, recorder_type, recorder_ref, **pull_kwargs
-            )
+            try:
+                result = pull_recorder_movements(
+                    db, recorder_type, recorder_ref, **pull_kwargs
+                )
+            except HistoricalPullBeyondCutoffError:
+                identity = (recorder_type, recorder_ref)
+                if identity not in pull_state_drift_set:
+                    raise
+                # The pull journal describes the latest 1C state, which may
+                # have been observed after this candidate's immutable cutoff.
+                # Leave the accepted prefix unchanged and keep the count drift
+                # so the next candidate retries the recorder at a later cutoff.
+                deferred_pull_state_drift.append(identity)
+                run_rows.append({
+                    "recorder_type": recorder_type,
+                    "recorder_ref": recorder_ref,
+                    "status": "deferred_beyond_cutoff",
+                    "inserted": 0,
+                    "line_count": 0,
+                    "deleted": 0,
+                    "touched_keys": 0,
+                })
+                continue
             if result.status not in {"done", "empty"}:
                 raise PhysicalRefreshImportError(
                     f"recorder {recorder_type} {recorder_ref} failed with status {result.status}"
@@ -731,6 +757,9 @@ def run_physical_recorder_audit(
                 "input_checksum": input_checksum,
                 "recorder_count": len(target_recorders),
                 "discovery": discovery_metrics,
+                "deferred_pull_state_drift": list(
+                    _result_summary(tuple(deferred_pull_state_drift))
+                ),
             },
         }
 
@@ -754,6 +783,9 @@ def run_physical_recorder_audit(
                 "recorders": recorder_manifest,
                 "audit_rows": run_rows,
                 "discovery": discovery_metrics,
+                "deferred_pull_state_drift": list(
+                    _result_summary(tuple(deferred_pull_state_drift))
+                ),
             },
             completed_at=datetime.now(timezone.utc),
         )

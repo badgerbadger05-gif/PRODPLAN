@@ -9,6 +9,7 @@ from app import models
 from app.services.item_ledger.ingest import (
     DEFAULT_MAX_ATTEMPTS,
     EMPTY_GUID,
+    HistoricalPullBeyondCutoffError,
     PullResult,
 )
 from app.services.item_ledger.physical_visibility import visible_sles_for_generation
@@ -560,6 +561,51 @@ def test_incremental_audit_repulls_recorder_left_ahead_by_rejected_candidate(
     assert result.recorder_count == 1
     checkpoint = db_session.get(models.LedgerBuildBatch, result.checkpoint_id)
     assert checkpoint.metrics["discovery"]["pull_state_drift_recorders"] == 1
+
+
+def test_incremental_audit_defers_pull_state_drift_newer_than_cutoff(
+    db_session, monkeypatch
+):
+    parent, parent_batch = _accepted_parent(db_session, "future-pull-state")
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="future-revised-doc",
+        posting_at=parent.cutoff - timedelta(days=30),
+    )
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="future-revised-doc",
+        status="done",
+        line_count=2,
+        source="physical_refresh_recorder_audit",
+    ))
+    target = _building_target(db_session, parent, "future-pull-state")
+    db_session.commit()
+
+    def _pull(*args, **kwargs):
+        raise HistoricalPullBeyondCutoffError("movement exceeds cutoff")
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=_RegisterClient(),
+        discovery_lookback=timedelta(days=7),
+        audit_all_known_recorders=False,
+    )
+
+    assert result.recorder_count == 1
+    checkpoint = db_session.get(models.LedgerBuildBatch, result.checkpoint_id)
+    assert checkpoint.metrics["deferred_pull_state_drift"] == [{
+        "recorder_type": "Document_ПеремещениеЗапасов",
+        "recorder_ref": "future-revised-doc",
+    }]
 
 
 def test_incremental_audit_repulls_known_recorder_when_line_count_changed(
