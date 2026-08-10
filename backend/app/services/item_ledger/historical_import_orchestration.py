@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app import models
 
 from .historical_register_scan import scan_historical_register_range
-from .ingest import pull_recorder_movements
+from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
 from .physical import canonical_content_hash, guard_physical_batch_writer
 
 
@@ -279,6 +279,7 @@ def run_historical_physical_import(
             db.flush()
 
             pull_metrics: list[dict[str, Any]] = []
+            deferred_recorders: list[dict[str, str]] = []
             for discovered in scan.recorders:
                 identity = discovered.identity
                 pull_kwargs = dict(
@@ -291,10 +292,22 @@ def run_historical_physical_import(
                     max_posting_at=to_inclusive,
                     strict_historical=True,
                 )
-                result = pull_recorder_movements(
-                    db, identity.recorder_type, identity.recorder_ref,
-                    **pull_kwargs,
-                )
+                try:
+                    result = pull_recorder_movements(
+                        db, identity.recorder_type, identity.recorder_ref,
+                        **pull_kwargs,
+                    )
+                except HistoricalPullBeyondCutoffError:
+                    # The flat register page was read just before 1C reposted
+                    # the document beyond this immutable cutoff.  Its current
+                    # RecordSet can no longer represent the older prefix, so
+                    # defer it to the next window instead of failing the whole
+                    # refresh or partially importing one document revision.
+                    deferred_recorders.append({
+                        "recorder_type": identity.recorder_type,
+                        "recorder_ref": identity.recorder_ref,
+                    })
+                    continue
                 quarantined = (
                     result.status not in {"done", "empty"}
                     or bool(result.error)
@@ -333,6 +346,8 @@ def run_historical_physical_import(
                 "pages_read": int(checkpoint.pages_read),
                 "recorder_count": int(checkpoint.recorder_count),
                 "recorders_pulled": len(pull_metrics),
+                "recorders_deferred_beyond_cutoff": len(deferred_recorders),
+                "deferred_recorders": deferred_recorders,
                 "movements_inserted": sum(row["inserted"] for row in pull_metrics),
                 "scan_checksum": checkpoint.content_hash,
                 "pull_checksum": canonical_content_hash(pull_metrics),

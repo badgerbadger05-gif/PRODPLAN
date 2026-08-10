@@ -269,7 +269,7 @@ def test_external_physical_batch_between_windows_blocks_resume(db_session):
     ).count() == 1
 
 
-def test_recorder_movement_after_fixed_cutoff_never_advances_checkpoint(db_session):
+def test_recorder_reposted_after_fixed_cutoff_is_deferred_to_next_prefix(db_session):
     start = datetime(2026, 3, 1)
     cutoff = start + timedelta(days=1)
     generation, baseline = _generation(db_session, cutoff=cutoff)
@@ -279,18 +279,24 @@ def test_recorder_movement_after_fixed_cutoff_never_advances_checkpoint(db_sessi
         {"REC-LATE": [_movement(cutoff + timedelta(seconds=1))]},
     )
 
-    with pytest.raises(HistoricalImportError, match="exceeds historical cutoff"):
-        run_historical_physical_import(
-            db_session,
-            ledger_generation_id=generation.id,
-            client=client,
-            from_exclusive=start,
-            to_inclusive=cutoff,
-        )
+    result = run_historical_physical_import(
+        db_session,
+        ledger_generation_id=generation.id,
+        client=client,
+        from_exclusive=start,
+        to_inclusive=cutoff,
+    )
 
     db_session.refresh(generation)
-    assert generation.physical_import_batch_id == baseline.id
-    assert db_session.query(models.LedgerBuildBatch).count() == 0
+    assert result.complete is True
+    assert generation.physical_import_batch_id != baseline.id
+    checkpoint = db_session.query(models.LedgerBuildBatch).one()
+    assert checkpoint.metrics["recorders_pulled"] == 0
+    assert checkpoint.metrics["recorders_deferred_beyond_cutoff"] == 1
+    assert checkpoint.metrics["deferred_recorders"] == [{
+        "recorder_type": RECORDER_TYPE,
+        "recorder_ref": "REC-LATE",
+    }]
     assert db_session.query(models.StockLedgerEntry).count() == 0
 
 
