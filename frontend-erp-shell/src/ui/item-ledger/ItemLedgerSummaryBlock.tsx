@@ -21,6 +21,10 @@ function supplyLabel(source: string) {
 }
 
 export function ItemLedgerSummaryBlock({ itemId, unit }: Props) {
+  const displayUnit = unit && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(unit)
+    ? unit
+    : ''
+  const amount = (value: number) => `${qty(value)} ${displayUnit}`.trim()
   const [position, setPosition] = useState<ItemLedgerPosition | null>(null)
   const [reservations, setReservations] = useState<ItemLedgerReservationsResponse | null>(null)
   const [futureSupply, setFutureSupply] = useState<ItemLedgerFutureSupplyResponse | null>(null)
@@ -64,15 +68,15 @@ export function ItemLedgerSummaryBlock({ itemId, unit }: Props) {
       {!loading && !error && position && (
         <>
           <div className="mrpCoverageGrid itemLedgerGrid">
-            <span>Остаток</span><strong>{qty(position.on_hand)} {unit}</strong>
-            <span>Резервы</span><strong>{qty(position.reserved_soft)} {unit}</strong>
-            <span>Заказы поставщика</span><strong>{qty(position.incoming_supplier)} {unit}</strong>
-            <span>Заказы в производство</span><strong>{qty(position.incoming_wip)} {unit}</strong>
-            <span>Доступно</span><strong>{qty(position.available)} {unit}</strong>
-            <span>Проекция</span><strong>{qty(position.projected)} {unit}</strong>
+            <span>Остаток</span><strong>{amount(position.on_hand)}</strong>
+            <span>Резервы</span><strong>{amount(position.reserved_soft)}</strong>
+            <span>Заказы поставщика</span><strong>{amount(position.incoming_supplier)}</strong>
+            <span>Заказы в производство</span><strong>{amount(position.incoming_wip)}</strong>
+            <span>Доступно</span><strong>{amount(position.available)}</strong>
+            <span>Проекция</span><strong>{amount(position.projected)}</strong>
             <span>Не покрыто</span>
             <strong className={position.uncovered > 0 ? 'mrpRemainingWarn' : 'mrpRemainingOk'}>
-              {qty(position.uncovered)} {unit}
+              {amount(position.uncovered)}
             </strong>
           </div>
           {!!position.on_hand_by_warehouse.length && (
@@ -81,7 +85,7 @@ export function ItemLedgerSummaryBlock({ itemId, unit }: Props) {
               {position.on_hand_by_warehouse.map((row) => (
                 <div className="itemLedgerRecord" key={row.warehouse_ref1c}>
                   <span>{row.warehouse_name || row.warehouse_ref1c}</span>
-                  <b>{qty(row.qty)} {unit}</b>
+                  <b>{amount(row.qty)}</b>
                 </div>
               ))}
             </div>
@@ -91,7 +95,7 @@ export function ItemLedgerSummaryBlock({ itemId, unit }: Props) {
             {(reservations?.rows ?? []).slice(0, 8).map((row) => (
               <div className="itemLedgerRecord" key={row.reservation_id}>
                 <span>{row.plan_name || `MRP #${row.run_id ?? '—'}`} · треб. #{row.requirement_id}</span>
-                <b>{qty(row.replenishment_remaining_qty)} / {qty(row.reserved_qty)} {unit}</b>
+                <b>{amount(row.replenishment_remaining_qty)} / {amount(row.reserved_qty)}</b>
               </div>
             ))}
             {!reservations?.rows.length && <div className="emptyDetail">Живых резервов нет</div>}
@@ -106,7 +110,7 @@ export function ItemLedgerSummaryBlock({ itemId, unit }: Props) {
                 <span>
                   {supplyLabel(row.supply_kind)} {row.source_number || row.source_ref || `#${row.id}`} · {dateRu(row.eta_date) || 'без даты'}
                 </span>
-                <b>{qty(row.open_qty)} / {qty(row.ordered_qty)} {unit}</b>
+                <b>{amount(row.open_qty)} / {amount(row.ordered_qty)}</b>
               </div>
             ))}
             {!futureSupply?.rows.length && <div className="emptyDetail">Живых заказов нет</div>}
