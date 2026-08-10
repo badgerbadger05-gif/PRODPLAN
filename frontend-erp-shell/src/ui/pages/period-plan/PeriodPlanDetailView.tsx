@@ -180,7 +180,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     } = {},
   ) => {
     const nextRunId = options.run_id ?? activeRunId
-    if (!nextRunId) return
     const hasRootItemFilter = Object.prototype.hasOwnProperty.call(options, 'root_item_id')
     const bomLevel = options.bom_level ?? journalBomLevel
     const status = options.status ?? journalCoverage
@@ -190,7 +189,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     try {
       const data = await getExecutionJournal(planId, {
         flow: (options.flow ?? journalFlow) || undefined,
-        run_id: nextRunId,
+        run_id: nextRunId ?? undefined,
         root_item_id: hasRootItemFilter ? options.root_item_id : journalRootItemId,
         bom_level: bomLevel ? Number(bomLevel) : undefined,
         status: status === 'execution_unavailable' ? status : status || undefined,
@@ -230,8 +229,8 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   useEffect(() => {
     if (tab === 'matrix' && !matrix) void loadMatrix()
-    if (tab === 'journal' && activeRunId) {
-      void loadJournal({ run_id: activeRunId })
+    if (tab === 'journal') {
+      void loadJournal({ run_id: activeRunId ?? undefined })
     }
   }, [activeRunId, loadJournal, loadMatrix, matrix, tab])
 

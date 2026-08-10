@@ -562,6 +562,23 @@ describe('PeriodPlanPage — detail view', () => {
     expect(await screen.findByText('Тип')).toBeInTheDocument()
   })
 
+  it('loads the accepted execution snapshot when the plan has no linked MRP runs', async () => {
+    const user = userEvent.setup()
+    vi.mocked(periodPlanSvc.listPeriodPlanRuns).mockResolvedValue({ rows: [], total: 0 })
+    renderAt('/period-plan/123')
+    await screen.findByText('Насос ГА-1')
+
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+
+    await waitFor(() => expect(periodPlanSvc.getExecutionJournal).toHaveBeenCalled())
+    expect(periodPlanSvc.getExecutionJournal).toHaveBeenCalledWith(
+      123,
+      expect.objectContaining({ run_id: undefined }),
+    )
+    expect(await screen.findByText('Тип')).toBeInTheDocument()
+    expect(screen.queryByText(/MRP-снимок не создан/)).not.toBeInTheDocument()
+  })
+
   it('shows ledger links in expanded journal rows while preserving work-item links', async () => {
     const user = userEvent.setup()
     vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponseWithLedgerLinks)
