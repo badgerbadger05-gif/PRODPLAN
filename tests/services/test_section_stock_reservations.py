@@ -31,7 +31,6 @@ from app.models import (
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues
 from app.services.production_material_custody_projection import (
-    MaterialCustodySnapshotUnavailable,
     initialize_material_custody_baseline,
 )
 from app.services.planning_truth import publish_generation
@@ -381,16 +380,21 @@ def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_sess
     assert state.issue_status == "posted"
     assert state.status == "assembled"
 
-    # The accepted projection is now stale. A second order cannot claim from a
-    # live reconstruction; it must wait for the next physical refresh.
+    # The second order sees the first order's live workshop claim immediately.
+    # Only two units remain free, so the remainder requires source selection;
+    # no physical refresh is needed to reach that decision.
     product_b = _make_order_line(db, parent, order_qty=8.0, suffix="B2")
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(
-            db, [product_b.product_id], warehouse_ref1c=WORKSHOP_WH
-        )
+    second = create_material_issues(
+        db, [product_b.product_id], warehouse_ref1c=WORKSHOP_WH
+    )
+    assert len(second["created"]) == 2
+    assert len(second["already_on_destination"]) == 1
+    covered = second["already_on_destination"][0]["components"][0]
+    assert covered["covered_qty"] == pytest.approx(2.0)
+    assert covered["remaining_qty"] == pytest.approx(6.0)
 
 
-def test_create_issues_rejects_retry_after_custody_watermark_changes(db_session):
+def test_create_issues_reuses_retry_after_live_custody_changes(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -398,8 +402,9 @@ def test_create_issues_rejects_retry_after_custody_watermark_changes(db_session)
 
     first = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
     assert len(first["created"]) == 2
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    second = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert second["created"] == []
+    assert len(second["reused"]) == 2
 
     issues = (
         db.query(ProductionMaterialIssue)
@@ -415,7 +420,7 @@ def test_create_issues_rejects_retry_after_custody_watermark_changes(db_session)
     )
 
 
-def test_quantity_increase_waits_for_refreshed_custody_projection(db_session):
+def test_quantity_increase_extends_live_custody_without_refresh(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -426,17 +431,18 @@ def test_quantity_increase_waits_for_refreshed_custody_projection(db_session):
     product.remaining_qty = 10.0
     db.commit()
 
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    second = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
     issue = (
         db.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
         .one()
     )
-    assert issue.lines[0].required_qty == pytest.approx(8.0)
+    assert issue.lines[0].required_qty == pytest.approx(10.0)
 
 
-def test_quantity_decrease_waits_for_refreshed_custody_projection(db_session):
+def test_quantity_decrease_releases_live_custody_without_refresh(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -447,14 +453,15 @@ def test_quantity_decrease_waits_for_refreshed_custody_projection(db_session):
     product.remaining_qty = 5.0
     db.commit()
 
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    second = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
     issue = (
         db.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
         .one()
     )
-    assert issue.lines[0].required_qty == pytest.approx(8.0)
+    assert issue.lines[0].required_qty == pytest.approx(5.0)
 
 
 # ---------------------------------------------------------------------------

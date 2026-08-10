@@ -24,6 +24,7 @@ from app.models import (
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
     _same_1c_timestamp,
+    load_current_accepted_material_custody,
     load_material_custody_projection,
 )
 from app.services.planning_truth import publish_generation
@@ -192,6 +193,122 @@ def _event(
             document_line_no="1",
         )
     )
+
+
+def test_current_accepted_custody_folds_local_events_after_cutoff(db_session):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key="custody-live-tail", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="LIVE")
+    issue = ProductionMaterialIssue(
+        document_number="MT-LIVE",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-DST",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    manifest = _manifest(db_session, generation_id=generation.id, source_event_high_watermark_id=0)
+    manifest.is_baseline = True
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="transit",
+        warehouse="WH-SRC",
+        qty=5,
+        key="custody:live:created",
+        effective_at=cutoff + timedelta(minutes=1),
+    )
+    db_session.commit()
+
+    generation_id, state = load_current_accepted_material_custody(
+        db_session,
+        consumer="test.live_tail",
+    )
+
+    assert generation_id == generation.id
+    assert state.for_product(product.product_id).in_transit[component.item_id] == 5
+    assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 5
+
+
+def test_current_accepted_custody_ignores_unaccepted_physical_tail(db_session):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key="custody-live-physical", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="PHY")
+    issue = ProductionMaterialIssue(
+        document_number="MT-PHY",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-DST",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    manifest = _manifest(db_session, generation_id=generation.id, source_event_high_watermark_id=0)
+    manifest.is_baseline = True
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="transit",
+        warehouse="WH-SRC",
+        qty=5,
+        key="custody:physical:created",
+        effective_at=cutoff + timedelta(minutes=1),
+    )
+    db_session.flush()
+    sle = StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="f" * 64,
+        item_id=component.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-SRC",
+        qty=-5,
+        qty_after=0,
+        posting_at=cutoff + timedelta(minutes=2),
+        record_type="Expense",
+        movement_kind="transfer_out",
+        recorder_type="Document_Transfer",
+        recorder_ref="transfer-live",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(sle)
+    db_session.flush()
+    _event(
+        db_session,
+        source_kind="transfer_posted",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="transit",
+        warehouse="WH-SRC",
+        qty=-5,
+        key="custody:physical:posted",
+        effective_at=cutoff + timedelta(minutes=2),
+        source_sle_id=sle.id,
+    )
+    db_session.commit()
+
+    _generation_id, state = load_current_accepted_material_custody(
+        db_session,
+        consumer="test.live_physical_tail",
+    )
+
+    assert state.for_product(product.product_id).in_transit[component.item_id] == 5
+    assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 5
 
 
 def test_projection_folds_from_baseline(db_session):
