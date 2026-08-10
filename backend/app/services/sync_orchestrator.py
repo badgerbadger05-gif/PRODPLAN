@@ -203,6 +203,7 @@ _PHYSICAL_REFRESH_RETRY_BASE_SECONDS = 300
 _PHYSICAL_REFRESH_RETRY_MAX_SECONDS = 3600
 _PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
 _PHYSICAL_REFRESH_ENTITY = "AccumulationRegister_ЗапасыНаСкладах/Balance"
+_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK = timedelta(days=7)
 # Signed bigint, stable across processes and deployments.
 _SYNC_ORCHESTRATOR_LOCK_KEY = 0x73796E632D6F7263  # 'sync-orc'
 
@@ -645,12 +646,12 @@ def _run_physical_refresh_job(
         # every historical recorder turned each hourly refresh into a
         # multi-hour historical replay. Full audit remains available only to
         # the explicit maintenance workflow.
-        # Manifest discovery over retained history is cheap and catches a
-        # document posted today with an old Period.  The import service compares
-        # this manifest (identity, row count, balance hash) with the accepted
-        # parent and pulls only new, changed, or explicitly queued recorders;
-        # known unchanged history is not re-audited.
-        discovery_lookback=None,
+        # Keep automatic discovery bounded.  A full retained-history scan can
+        # classify thousands of old recorders as revised and turn this hourly
+        # maintenance path into the multi-hour historical replay it replaced.
+        # Explicitly queued recorders are still processed regardless of age;
+        # the bounded scan catches ordinary late/backdated operational changes.
+        discovery_lookback=_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK,
         audit_all_known_recorders=False,
     )
     return {
