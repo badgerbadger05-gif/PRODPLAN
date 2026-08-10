@@ -13,7 +13,10 @@ from app.services.item_ledger.physical import (
     guard_physical_batch_writer,
     physical_sequence_lock_context,
 )
-from app.services.item_ledger.ingest import PullResult
+from app.services.item_ledger.ingest import (
+    HistoricalPullBeyondCutoffError,
+    PullResult,
+)
 
 
 def test_physical_lifecycle_lock_uses_dedicated_connection_across_commits():
@@ -292,6 +295,91 @@ def test_targeted_repair_repulls_known_recorder_missing_from_current_register(
 
     assert repaired == 1
     assert pulled == [("Document_ПеремещениеЗапасов", "vanished-recorder")]
+
+
+def test_targeted_repair_defers_current_revision_beyond_candidate_cutoff(
+    db_session, monkeypatch
+):
+    parent, parent_batch = _accepted_parent(
+        db_session, generation_key="targeted-future"
+    )
+    item = models.Item(
+        item_code="FUTURE-ITEM",
+        item_name="Future revision item",
+        item_ref1c="future-item-ref",
+    )
+    generation = models.LedgerGeneration(
+        generation_key="targeted-future-child",
+        status="building",
+        cutoff=parent.cutoff + timedelta(days=1),
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": parent.id,
+        },
+        physical_import_batch=parent_batch,
+        algorithm_version="physical-refresh/test",
+        replay_version="physical-refresh/test",
+    )
+    db_session.add_all([item, generation])
+    db_session.commit()
+    delta = bootstrap.BalanceConvergenceDelta(
+        item_id=item.item_id,
+        organization_ref="org-ref",
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        balance_qty="0",
+        ledger_qty="1",
+        delta_qty="-1",
+        matched=False,
+    )
+    convergence = bootstrap.BalanceConvergenceResult(
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff.isoformat(),
+        checked_at=generation.cutoff.isoformat(),
+        valid=False,
+        content_hash="future",
+        compared=1,
+        matched=0,
+        mismatched=1,
+        terminal_batch_id=parent_batch.id,
+        deltas=(delta,),
+    )
+
+    class Client:
+        def _make_request(self, _entity, _params):
+            return {"value": [{
+                "Recorder": "future-recorder",
+                "Recorder_Type": "StandardODATA.Document_ПеремещениеЗапасов",
+                "Организация_Key": "org-ref",
+                "СтруктурнаяЕдиница_Key": "WH-PHYSICAL-PLAN",
+            }]}
+
+    monkeypatch.setattr(
+        workflow,
+        "opening_boundary",
+        lambda db: (parent_batch, datetime(2026, 7, 1, tzinfo=timezone.utc)),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "pull_recorder_movements",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            HistoricalPullBeyondCutoffError("movement exceeds cutoff")
+        ),
+    )
+
+    repaired = workflow._repair_mismatched_recorders(
+        db_session,
+        generation=generation,
+        client=Client(),
+        convergence=convergence,
+    )
+
+    assert repaired == 0
+    repair = generation.source_watermarks["targeted_convergence_repair"]
+    assert repair["recorder_count"] == 0
+    assert repair["deferred_beyond_cutoff"] == [{
+        "recorder_type": "Document_ПеремещениеЗапасов",
+        "recorder_ref": "future-recorder",
+    }]
 
 
 def test_run_physical_refresh_no_work_on_lock_contention(db_session, monkeypatch):

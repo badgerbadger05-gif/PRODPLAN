@@ -34,7 +34,7 @@ from .opening_balance_reconcile import (
 )
 from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, SEED_RECORDER_TYPE, physical_sequence_lock_context
 from .physical_visibility import visible_sle_query
-from .ingest import pull_recorder_movements
+from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
     run_physical_recorder_audit,
@@ -317,17 +317,26 @@ def _repair_mismatched_recorders(
                 break
             offset += len(rows)
 
+    deferred: list[tuple[str, str]] = []
+    repaired = 0
     for recorder_type, recorder_ref in sorted(identities):
-        result = pull_recorder_movements(
-            db,
-            recorder_type,
-            recorder_ref,
-            client=client,
-            source="physical_refresh_targeted_repair",
-            ledger_generation_id=None,
-            max_posting_at=generation.cutoff,
-            strict_historical=True,
-        )
+        try:
+            result = pull_recorder_movements(
+                db,
+                recorder_type,
+                recorder_ref,
+                client=client,
+                source="physical_refresh_targeted_repair",
+                ledger_generation_id=None,
+                max_posting_at=generation.cutoff,
+                strict_historical=True,
+            )
+        except HistoricalPullBeyondCutoffError:
+            # The accepted prefix must keep the recorder revision that existed
+            # at its cutoff.  A newer current RecordSet belongs to the next
+            # refresh and cannot safely repair this immutable candidate.
+            deferred.append((recorder_type, recorder_ref))
+            continue
         if (
             result.status not in {"done", "empty"}
             or result.error
@@ -339,6 +348,7 @@ def _repair_mismatched_recorders(
             raise PhysicalRefreshOrchestratorError(
                 f"targeted recorder repair failed: {recorder_type} {recorder_ref}"
             )
+        repaired += 1
 
     terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
     if terminal is None:
@@ -351,12 +361,16 @@ def _repair_mismatched_recorders(
         "targeted_convergence_repair": {
             "version": "1",
             "mismatched_keys": len(mismatch_keys),
-            "recorder_count": len(identities),
+            "recorder_count": repaired,
+            "deferred_beyond_cutoff": [
+                {"recorder_type": recorder_type, "recorder_ref": recorder_ref}
+                for recorder_type, recorder_ref in deferred
+            ],
             "physical_import_batch_id": int(terminal),
         },
     }
     db.commit()
-    return len(identities)
+    return repaired
 
 
 def _current_parent(db: Session) -> models.LedgerGeneration:
