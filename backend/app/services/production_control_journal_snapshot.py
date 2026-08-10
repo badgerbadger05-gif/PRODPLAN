@@ -345,13 +345,28 @@ def _build_rows(
 
     if len(rows) != total:
         raise ValueError("production-control journal builder row count changed during build")
-    rows.extend(
-        list_make_proposals(
-            db,
-            ledger_generation_id=int(generation.id),
-            accepted_run_ids=run_ids,
-        )
+    proposal_rows = list_make_proposals(
+        db,
+        ledger_generation_id=int(generation.id),
+        accepted_run_ids=run_ids,
     )
+    from app.services.production_control_material_availability import (
+        preview_make_work_items_coverage,
+    )
+    proposal_coverage = preview_make_work_items_coverage(
+        db,
+        proposal_rows,
+        ledger_generation_id=int(generation.id),
+    )
+    for row in proposal_rows:
+        coverage = proposal_coverage.get(int(row["work_item_id"]))
+        if coverage is not None:
+            row["coverage_status"] = coverage["coverage_status"]
+            row["coverage_label"] = coverage["coverage_label"]
+            row["material_coverage_status"] = coverage["coverage_status"]
+            row["material_coverage_label"] = coverage["coverage_label"]
+            row["material_coverage_calculated_at"] = generation.cutoff.isoformat()
+    rows.extend(proposal_rows)
     product_ids = [
         int(row["product_id"])
         for row in rows

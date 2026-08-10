@@ -259,13 +259,31 @@ export type MaterialIssueDetail = TransferIssueRow & {
 }
 
 export const productionStatusOptions = [
-  ['shortage', 'Дефицит'],
+  ['not_created', 'Не создан'],
+  ['created', 'Создан'],
   ['to_move', 'К перемещению'],
   ['ready', 'В работу'],
   ['in_progress', 'В работе'],
   ['done', 'Готов'],
   ['completed', 'Завершён'],
 ] as const
+
+export const productionStatusLabels: Record<string, string> = {
+  not_created: 'Не создан',
+  created: 'Создан',
+  shortage: 'Создан',
+  partial: 'Создан',
+  ready: 'В работу',
+  to_move: 'К перемещению',
+  assembled: 'В работу',
+  in_progress: 'В работе',
+  done: 'Готов',
+  produced_partial: 'Готов',
+  produced: 'Готов',
+  production_error: 'Ошибка выпуска',
+  completed: 'Завершён',
+  cancelled: 'Отменён',
+}
 
 export const coverageLabels: Record<string, string> = {
   unknown: 'Неизвестно',
@@ -294,11 +312,11 @@ export type ProductionFilters = {
 }
 
 export function productionStatusLabel(value: string) {
-  return coverageLabels[value] ?? value
+  return productionStatusLabels[value] ?? value
 }
 
 export function productionStatusSelectValue(value: string) {
-  if (value === 'partial') return 'shortage'
+  if (value === 'shortage' || value === 'partial') return 'created'
   if (value === 'assembled') return 'ready'
   if (value === 'produced' || value === 'produced_partial') return 'done'
   return productionStatusOptions.some(([status]) => status === value) ? value : ''

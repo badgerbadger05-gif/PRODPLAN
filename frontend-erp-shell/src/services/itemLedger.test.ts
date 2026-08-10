@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   getItemLedgerMovements,
+  getItemLedgerFutureSupply,
   getItemLedgerPosition,
   getItemLedgerReservations,
   getItemLedgerReservationEvents,
@@ -85,6 +86,17 @@ describe('item-ledger boundary service', () => {
         headers: expect.objectContaining({ 'Content-Type': 'application/json' }),
       }),
     )
+    expectGetOnlyFetchCall(fetchMock)
+  })
+
+  it('loads live future-supply orders with exact path', async () => {
+    const payload = { rows: [] }
+    const fetchMock = mockFetchJson(payload)
+
+    await expect(getItemLedgerFutureSupply(15)).resolves.toEqual(payload)
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit | undefined]
+    expect(url).toBe('/api/v1/item-ledger/15/future-supply')
     expectGetOnlyFetchCall(fetchMock)
   })
 

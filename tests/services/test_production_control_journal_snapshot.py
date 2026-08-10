@@ -145,13 +145,31 @@ def _make_proposal(db, generation):
         replenishment_method="Производство",
         status="active",
     )
+    component = models.Item(
+        item_code="SNAP-MAKE-COMPONENT",
+        item_name="Snapshot MAKE component",
+        item_article="SNAP-COMP",
+        unit="шт",
+        replenishment_method="Закупка",
+        status="active",
+    )
+    spec = models.Specification(
+        spec_code="SNAP-MAKE-SPEC",
+        spec_name="Snapshot MAKE specification",
+        spec_ref1c="snap-make-spec",
+    )
     plan = models.ProductionPlanHeader(
         name="Snapshot proposal plan",
         period_from=generation.cutoff.date(),
         period_to=generation.cutoff.date(),
         status="fixed",
     )
-    db.add_all([item, plan])
+    db.add_all([item, component, spec, plan])
+    db.flush()
+    db.add_all([
+        models.DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id),
+        models.SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1),
+    ])
     db.flush()
     plan_line = models.ProductionPlanLine(
         plan_id=plan.id,
@@ -347,6 +365,10 @@ def test_candidate_snapshot_contains_unmaterialized_make_proposal(db_session):
     assert row.payload["product_id"] is None
     assert row.payload["order_id"] is None
     assert row.payload["remaining_qty"] == 10
+    assert row.payload["status"] == "not_created"
+    assert row.payload["coverage_status"] == "shortage"
+    assert row.payload["coverage_label"] == "Дефицит"
+    assert row.payload["material_coverage_status"] == "shortage"
     assert row.payload["available_actions"] == ["materialize"]
     assert "_route_sheet_snapshot" not in row.payload
     assert db_session.query(models.ProductionOrder).count() == 0

@@ -160,6 +160,27 @@ class ItemLedgerReservationsResponse(BaseModel):
     truth_meta: TruthMeta
 
 
+class ItemLedgerFutureSupplyRow(BaseModel):
+    id: int
+    supply_kind: str
+    source_ref: str
+    source_line_ref: str
+    ordered_qty: float
+    received_qty: float
+    open_qty: float
+    eta_date: Optional[str]
+    destination_warehouse_ref1c: str
+    source_state_key: str
+    evidence_status: str
+
+
+class ItemLedgerFutureSupplyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: List[ItemLedgerFutureSupplyRow]
+    truth_meta: TruthMeta
+
+
 class ItemLedgerReservationEventRow(BaseModel):
     id: int
     event_at: Optional[str]
@@ -330,6 +351,58 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
             "has_uncovered": uncovered > EPS,
             "reconcile_pending": reconcile_pending,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+#  — future supply (open production/supplier orders)
+# ---------------------------------------------------------------------------
+@router.get("/{item_id}/future-supply", response_model=ItemLedgerFutureSupplyResponse)
+def get_future_supply(
+    item_id: int,
+    db: Session = Depends(get_db),
+) -> ItemLedgerFutureSupplyResponse:
+    """Open exact order evidence captured in the accepted Ledger generation."""
+    _get_item_or_404(db, item_id)
+    truth = _accepted_generation(
+        db,
+        consumer="item_ledger.future_supply",
+        capabilities=(CAPABILITY_FUTURE_SUPPLY,),
+    )
+    rows = (
+        db.query(models.LedgerFutureSupply)
+        .filter(
+            models.LedgerFutureSupply.item_id == int(item_id),
+            models.LedgerFutureSupply.ledger_generation_id == int(truth.generation_id),
+            models.LedgerFutureSupply.evidence_status == "exact",
+            models.LedgerFutureSupply.open_qty_at_cutoff > EPS,
+        )
+        .order_by(
+            models.LedgerFutureSupply.eta_date.asc().nulls_last(),
+            models.LedgerFutureSupply.supply_kind.asc(),
+            models.LedgerFutureSupply.source_ref.asc().nulls_last(),
+            models.LedgerFutureSupply.id.asc(),
+        )
+        .all()
+    )
+    return {
+        "rows": [
+            {
+                "id": int(row.id),
+                "supply_kind": str(row.supply_kind or ""),
+                "source_ref": str(row.source_ref or ""),
+                "source_line_ref": str(row.source_line_ref or ""),
+                "ordered_qty": _f(row.ordered_qty_at_cutoff),
+                "received_qty": _f(row.realized_qty_at_cutoff),
+                "open_qty": _f(row.open_qty_at_cutoff),
+                "eta_date": _iso(row.eta_date),
+                "destination_warehouse_ref1c": str(row.destination_warehouse_ref1c or ""),
+                "source_state_key": str(row.source_state_key or ""),
+                "evidence_status": str(row.evidence_status or ""),
+            }
+            for row in rows
+        ],
+        "truth_meta": _truth_meta(truth),
     }
 
 

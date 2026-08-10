@@ -1,10 +1,20 @@
 import { useEffect, useState } from 'react'
 import { productionStatusLabel, type MaterialsResponse, type OrderRow } from '../../../domain/productionControl'
+import type {
+  ItemLedgerFutureSupplyResponse,
+  ItemLedgerPosition,
+  ItemLedgerReservationsResponse,
+} from '../../../domain/itemLedger'
 import { dateRu, qty } from '../../../lib/format'
 
 type Props = {
   activeRow: OrderRow | null
   materials: MaterialsResponse | null
+  ledgerPosition: ItemLedgerPosition | null
+  ledgerReservations: ItemLedgerReservationsResponse | null
+  ledgerFutureSupply: ItemLedgerFutureSupplyResponse | null
+  ledgerLoading: boolean
+  ledgerError: string
   coverageLabels: Record<string, string>
   onLoadMaterials: () => void
   onPrint: () => void
@@ -18,6 +28,11 @@ type Props = {
 export function ProductionDetailPane({
   activeRow,
   materials,
+  ledgerPosition,
+  ledgerReservations,
+  ledgerFutureSupply,
+  ledgerLoading,
+  ledgerError,
   coverageLabels,
   onLoadMaterials,
   onPrint,
@@ -79,9 +94,10 @@ export function ProductionDetailPane({
     || activeRow?.status
     || 'unknown'
   const activeCoverageLabel = materials?.coverage_label
-    || activeRow?.coverage_label
+    || (activeRow?.coverage_status === 'unknown' ? coverageLabels.unknown : activeRow?.coverage_label)
     || coverageLabels[String(activeCoverageStatus)]
     || activeCoverageStatus
+  const activeStatusLabel = activeRow?.product_id == null ? 'Не создан' : productionStatusLabel(activeRow.status)
   const planSourceLabel = activeRow?.source_plan_name
     || (activeRow?.source_plan_id ? `План #${activeRow.source_plan_id}` : '')
   const sourceDisplayLabel = planSourceLabel || activeRow?.launch_source || rowSource || '1C'
@@ -103,6 +119,10 @@ export function ProductionDetailPane({
     if (source === 'planned_purchase') return 'MRP закупка'
     if (source === 'planned_production') return 'MRP производство'
     return 'Заказ'
+  }
+
+  function ledgerSupplyLabel(source: string) {
+    return source === 'supplier_order' ? 'Заказ поставщику' : 'Заказ на производство'
   }
 
   function expectedLine(m: NonNullable<MaterialsResponse['components']>[number]) {
@@ -198,7 +218,7 @@ export function ProductionDetailPane({
             ) : (
               <strong>{qty(activeRow.quantity)} {activeRow.unit}</strong>
             )}
-            <span>Статус</span><strong>{productionStatusLabel(activeRow.status)}</strong>
+            <span>Статус</span><strong>{activeStatusLabel}</strong>
             <span>Обеспечение</span>
             <strong>
               <span className={`pill ${activeCoverageStatus}`}>
@@ -224,6 +244,65 @@ export function ProductionDetailPane({
               {batchSaving && <span className="batchHint">...</span>}
               {batchError && <span className="batchHint error">{batchError}</span>}
             </span>
+          </div>
+          <div className="itemLedgerBlock">
+            <div className="itemLedgerTitle">
+              <span>Ledger по номенклатуре</span>
+              {ledgerPosition && <span>поколение #{ledgerPosition.truth_meta.ledger_generation}</span>}
+            </div>
+            {ledgerLoading && <div className="emptyDetail">Загрузка Ledger…</div>}
+            {ledgerError && <div className="errorLine" role="alert">{ledgerError}</div>}
+            {!ledgerLoading && !ledgerError && ledgerPosition && (
+              <>
+                <div className="mrpCoverageGrid itemLedgerGrid">
+                  <span>Остаток</span><strong>{qty(ledgerPosition.on_hand)} {activeRow.unit}</strong>
+                  <span>Резервы</span><strong>{qty(ledgerPosition.reserved_soft)} {activeRow.unit}</strong>
+                  <span>Заказы поставщика</span><strong>{qty(ledgerPosition.incoming_supplier)} {activeRow.unit}</strong>
+                  <span>Заказы в производство</span><strong>{qty(ledgerPosition.incoming_wip)} {activeRow.unit}</strong>
+                  <span>Доступно</span><strong>{qty(ledgerPosition.available)} {activeRow.unit}</strong>
+                  <span>Проекция</span><strong>{qty(ledgerPosition.projected)} {activeRow.unit}</strong>
+                  <span>Не покрыто</span><strong className={ledgerPosition.uncovered > 0 ? 'mrpRemainingWarn' : 'mrpRemainingOk'}>{qty(ledgerPosition.uncovered)} {activeRow.unit}</strong>
+                </div>
+                {!!ledgerPosition.on_hand_by_warehouse.length && (
+                  <div className="itemLedgerRecords">
+                    <strong>Остатки по складам</strong>
+                    {ledgerPosition.on_hand_by_warehouse.map((row) => (
+                      <div className="itemLedgerRecord" key={row.warehouse_ref1c}>
+                        <span>{row.warehouse_name || row.warehouse_ref1c}</span>
+                        <b>{qty(row.qty)} {activeRow.unit}</b>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="itemLedgerRecords">
+                  <strong>Активные резервы</strong>
+                  {(ledgerReservations?.rows ?? []).slice(0, 8).map((row) => (
+                    <div className="itemLedgerRecord" key={row.reservation_id}>
+                      <span>{row.plan_name || `MRP #${row.run_id ?? '—'}`} · треб. #{row.requirement_id}</span>
+                      <b>{qty(row.replenishment_remaining_qty)} / {qty(row.reserved_qty)} {activeRow.unit}</b>
+                    </div>
+                  ))}
+                  {!ledgerReservations?.rows.length && <div className="emptyDetail">Живых резервов нет</div>}
+                  {(ledgerReservations?.rows.length ?? 0) > 8 && (
+                    <div className="itemLedgerMore">Ещё {(ledgerReservations?.rows.length ?? 0) - 8}</div>
+                  )}
+                </div>
+                <div className="itemLedgerRecords">
+                  <strong>Живые заказы</strong>
+                  {(ledgerFutureSupply?.rows ?? []).slice(0, 8).map((row) => (
+                    <div className="itemLedgerRecord" key={row.id}>
+                      <span>{ledgerSupplyLabel(row.supply_kind)} {row.source_ref || `#${row.id}`} · {dateRu(row.eta_date) || 'без даты'}</span>
+                      <b>{qty(row.open_qty)} / {qty(row.ordered_qty)} {activeRow.unit}</b>
+                    </div>
+                  ))}
+                  {!ledgerFutureSupply?.rows.length && <div className="emptyDetail">Живых заказов нет</div>}
+                  {(ledgerFutureSupply?.rows.length ?? 0) > 8 && (
+                    <div className="itemLedgerMore">Ещё {(ledgerFutureSupply?.rows.length ?? 0) - 8}</div>
+                  )}
+                </div>
+                <a className="itemLedgerLink" href={`#/ledger/items/${activeRow.item_id}`}>Открыть полную карточку Ledger</a>
+              </>
+            )}
           </div>
           {hasShelfLaunchData && (
             <div className="shelfLaunchBlock">

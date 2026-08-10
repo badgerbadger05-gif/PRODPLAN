@@ -2733,6 +2733,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/item-ledger/{item_id}/future-supply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Future Supply
+         * @description Open exact order evidence captured in the accepted Ledger generation.
+         */
+        get: operations["get_future_supply_api_v1_item_ledger__item_id__future_supply_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/item-ledger/{item_id}/movements": {
         parameters: {
             query?: never;
@@ -4007,6 +4027,37 @@ export interface components {
              * @default active
              */
             status: string;
+        };
+        /** ItemLedgerFutureSupplyResponse */
+        ItemLedgerFutureSupplyResponse: {
+            /** Rows */
+            rows: components["schemas"]["ItemLedgerFutureSupplyRow"][];
+            truth_meta: components["schemas"]["TruthMeta"];
+        };
+        /** ItemLedgerFutureSupplyRow */
+        ItemLedgerFutureSupplyRow: {
+            /** Id */
+            id: number;
+            /** Supply Kind */
+            supply_kind: string;
+            /** Source Ref */
+            source_ref: string;
+            /** Source Line Ref */
+            source_line_ref: string;
+            /** Ordered Qty */
+            ordered_qty: number;
+            /** Received Qty */
+            received_qty: number;
+            /** Open Qty */
+            open_qty: number;
+            /** Eta Date */
+            eta_date: string | null;
+            /** Destination Warehouse Ref1C */
+            destination_warehouse_ref1c: string;
+            /** Source State Key */
+            source_state_key: string;
+            /** Evidence Status */
+            evidence_status: string;
         };
         /** ItemLedgerMovement */
         ItemLedgerMovement: {
@@ -10966,6 +11017,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ItemLedgerPositionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_future_supply_api_v1_item_ledger__item_id__future_supply_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                item_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemLedgerFutureSupplyResponse"];
                 };
             };
             /** @description Validation Error */

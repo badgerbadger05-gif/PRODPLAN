@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
@@ -429,6 +429,82 @@ def preview_make_work_item_materials(
     payload["work_item_id"] = int(work_item_id)
     payload["product_id"] = None
     return payload
+
+
+def preview_make_work_items_coverage(
+    db: Session,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    ledger_generation_id: int,
+) -> Dict[int, Dict[str, str]]:
+    """Calculate proposal material coverage in bulk for one Ledger generation.
+
+    The production journal may contain thousands of unmaterialized MAKE rows.
+    Calling :func:`preview_make_work_item_materials` once per row would reload
+    the same Ledger positions and custody projection thousands of times.  This
+    helper keeps the exact same coverage formula, but loads every specification,
+    component position and custody hold once for the whole candidate.
+    """
+    proposals = [
+        row for row in rows
+        if row.get("work_item_id") is not None and row.get("spec_id") is not None
+    ]
+    if not proposals:
+        return {}
+
+    spec_ids = sorted({int(row["spec_id"]) for row in proposals})
+    component_rows = (
+        db.query(
+            SpecComponent.spec_id,
+            SpecComponent.item_id,
+            SpecComponent.quantity,
+        )
+        .filter(SpecComponent.spec_id.in_(spec_ids))
+        .order_by(SpecComponent.spec_id.asc(), SpecComponent.component_id.asc())
+        .all()
+    )
+    components_by_spec: Dict[int, List[Tuple[int, float]]] = {}
+    component_ids: set[int] = set()
+    for spec_id, item_id, quantity in component_rows:
+        component_id = int(item_id)
+        components_by_spec.setdefault(int(spec_id), []).append(
+            (component_id, _to_float_strict(quantity, field="spec_component.quantity"))
+        )
+        component_ids.add(component_id)
+
+    from .item_ledger import item_ledger_position
+    from .production_material_custody_projection import load_material_custody_projection
+
+    positions = item_ledger_position(
+        db,
+        sorted(component_ids),
+        ledger_generation_id=int(ledger_generation_id),
+        allow_building_read=True,
+    )
+    custody = load_material_custody_projection(
+        db,
+        ledger_generation_id=int(ledger_generation_id),
+    )
+    reserved_by_item = custody.total_by_item()
+
+    result: Dict[int, Dict[str, str]] = {}
+    for row in proposals:
+        labels: List[str] = []
+        quantity = _to_float_strict(row.get("quantity"), field="proposal.quantity")
+        for component_id, qty_per_unit in components_by_spec.get(int(row["spec_id"]), []):
+            required = qty_per_unit * quantity
+            on_hand = _to_float_strict(
+                positions.get(component_id, {}).get("on_hand", 0.0),
+                field="item_ledger_position.on_hand",
+            )
+            available = on_hand - _to_float(reserved_by_item.get(component_id))
+            labels.append(_component_coverage_label(required, available))
+        coverage = _aggregate_coverage(labels)
+        result[int(row["work_item_id"])] = {
+            "coverage_status": coverage,
+            "coverage_label": _ui_coverage_label(coverage),
+        }
+    return result
 
 
 def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:

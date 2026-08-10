@@ -39,6 +39,12 @@ vi.mock('../../services/resources', () => ({
   listResources: vi.fn(),
 }))
 
+vi.mock('../../services/itemLedger', () => ({
+  getItemLedgerPosition: vi.fn(),
+  getItemLedgerReservations: vi.fn(),
+  getItemLedgerFutureSupply: vi.fn(),
+}))
+
 import {
   listProductionOrders,
   listProductionEmployees,
@@ -57,6 +63,11 @@ import {
   materializeMakeWorkItems,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
+import {
+  getItemLedgerFutureSupply,
+  getItemLedgerPosition,
+  getItemLedgerReservations,
+} from '../../services/itemLedger'
 
 // --- Fake data shaped to the domain types ---------------------------------
 // row 101: local order (no 1C ref), coverage 'assembled' + issue 'posted'
@@ -225,6 +236,57 @@ beforeEach(() => {
   })
   vi.mocked(getOrderMaterials).mockResolvedValue(fakeMaterials())
   vi.mocked(getWorkItemMaterials).mockResolvedValue({ ...fakeMaterials(), product_id: null, work_item_id: 701 })
+  vi.mocked(getItemLedgerPosition).mockResolvedValue({
+    item_id: 201,
+    item_code: 'ART-1',
+    item_name: 'Кронштейн',
+    pool_key: '201::default',
+    on_hand: 12,
+    on_hand_by_warehouse: [{ warehouse_ref1c: 'WH-1', warehouse_name: 'Основной склад', qty: 12, qty_negative: false }],
+    incoming_supplier: 7,
+    incoming_wip: 3,
+    incoming: 10,
+    reserved_soft: 9,
+    available: 3,
+    projected: 13,
+    uncovered: 0,
+    flags: { on_hand_negative: false, has_uncovered: false, reconcile_pending: false },
+    truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
+  })
+  vi.mocked(getItemLedgerReservations).mockResolvedValue({
+    rows: [{
+      reservation_id: 501,
+      run_id: 77,
+      plan_id: 1,
+      plan_name: 'План августа',
+      requirement_id: 9001,
+      realization_mode: 'make',
+      priority: { period_from: '2026-08-01', period_to: '2026-08-31' },
+      reserved_qty: 9,
+      covered_from_stock_at_freeze_qty: 0,
+      replenishment_required_qty: 9,
+      replenishment_received_qty: 2,
+      replenishment_remaining_qty: 7,
+      lifecycle_status: 'active',
+    }],
+    truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
+  })
+  vi.mocked(getItemLedgerFutureSupply).mockResolvedValue({
+    rows: [{
+      id: 601,
+      supply_kind: 'supplier_order',
+      source_ref: 'SUP-42',
+      source_line_ref: '1',
+      ordered_qty: 7,
+      received_qty: 0,
+      open_qty: 7,
+      eta_date: '2026-08-15',
+      destination_warehouse_ref1c: 'WH-1',
+      source_state_key: 'ordered',
+      evidence_status: 'exact',
+    }],
+    truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
+  })
   vi.mocked(listResources).mockResolvedValue(fakeResources)
   vi.mocked(listRootProductOptions).mockResolvedValue({
     rows: fakeRootOptions,
@@ -265,6 +327,18 @@ beforeEach(() => {
 })
 
 describe('ProductionControlPage — characterization', () => {
+  it('shows accepted Ledger balances, active reservations and live orders for the selected item', async () => {
+    renderPage()
+
+    expect(await screen.findByText('Ledger по номенклатуре')).toBeInTheDocument()
+    expect(await screen.findByText('Основной склад')).toBeInTheDocument()
+    expect(screen.getByText(/План августа · треб. #9001/)).toBeInTheDocument()
+    expect(screen.getByText(/Заказ поставщику SUP-42/)).toBeInTheDocument()
+    expect(getItemLedgerPosition).toHaveBeenCalledWith(201)
+    expect(getItemLedgerReservations).toHaveBeenCalledWith(201, { status: 'active' })
+    expect(getItemLedgerFutureSupply).toHaveBeenCalledWith(201)
+  })
+
   it('renders the page shell: heading, command bar, and table columns', async () => {
     const { container } = renderPage()
     await screen.findByText('Вал')
@@ -528,7 +602,9 @@ describe('ProductionControlPage — characterization', () => {
       order_id: null,
       order_number: 'MRP-R-701',
       order_prodplan_number: 'MRP-R-701',
-      coverage_label: 'После создания заказа',
+      status: 'not_created',
+      coverage_status: 'shortage',
+      coverage_label: 'Дефицит',
       available_actions: ['materialize'],
       materialized_order_qty: 0,
       launchable_qty: 10,
@@ -548,6 +624,8 @@ describe('ProductionControlPage — characterization', () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Расчёт MRP · заказ ещё не создан')
+    expect(within(rowFor('Кронштейн')).getByText('Не создан')).toBeInTheDocument()
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 10))
 
     const launchInput = screen.getByRole('spinbutton', { name: 'Количество запуска' })
     await user.clear(launchInput)

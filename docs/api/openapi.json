@@ -9647,6 +9647,49 @@
         }
       }
     },
+    "/api/v1/item-ledger/{item_id}/future-supply": {
+      "get": {
+        "tags": [
+          "item-ledger"
+        ],
+        "summary": "Get Future Supply",
+        "description": "Open exact order evidence captured in the accepted Ledger generation.",
+        "operationId": "get_future_supply_api_v1_item_ledger__item_id__future_supply_get",
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Item Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemLedgerFutureSupplyResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/item-ledger/{item_id}/movements": {
       "get": {
         "tags": [
@@ -13845,6 +13888,97 @@
           "item_name"
         ],
         "title": "ItemCreate"
+      },
+      "ItemLedgerFutureSupplyResponse": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ItemLedgerFutureSupplyRow"
+            },
+            "type": "array",
+            "title": "Rows"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rows",
+          "truth_meta"
+        ],
+        "title": "ItemLedgerFutureSupplyResponse"
+      },
+      "ItemLedgerFutureSupplyRow": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "supply_kind": {
+            "type": "string",
+            "title": "Supply Kind"
+          },
+          "source_ref": {
+            "type": "string",
+            "title": "Source Ref"
+          },
+          "source_line_ref": {
+            "type": "string",
+            "title": "Source Line Ref"
+          },
+          "ordered_qty": {
+            "type": "number",
+            "title": "Ordered Qty"
+          },
+          "received_qty": {
+            "type": "number",
+            "title": "Received Qty"
+          },
+          "open_qty": {
+            "type": "number",
+            "title": "Open Qty"
+          },
+          "eta_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta Date"
+          },
+          "destination_warehouse_ref1c": {
+            "type": "string",
+            "title": "Destination Warehouse Ref1C"
+          },
+          "source_state_key": {
+            "type": "string",
+            "title": "Source State Key"
+          },
+          "evidence_status": {
+            "type": "string",
+            "title": "Evidence Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "supply_kind",
+          "source_ref",
+          "source_line_ref",
+          "ordered_qty",
+          "received_qty",
+          "open_qty",
+          "eta_date",
+          "destination_warehouse_ref1c",
+          "source_state_key",
+          "evidence_status"
+        ],
+        "title": "ItemLedgerFutureSupplyRow"
       },
       "ItemLedgerMovement": {
         "properties": {

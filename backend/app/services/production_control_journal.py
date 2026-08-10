@@ -57,6 +57,7 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 # Legacy technical states are kept for compatibility and mapped to the compact
 # workshop-facing labels below.
 LINE_STATUSES = {
+    "created",
     "shortage",
     "partial",
     "ready",
@@ -75,6 +76,7 @@ LINE_STATUSES = {
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 COVERAGE_LABELS = {
+    "unknown": "Недоступно",
     "shortage": "Дефицит",
     "partial": "Частично",
     "ready": "Обеспечен",
@@ -89,6 +91,7 @@ COVERAGE_LABELS = {
     "cancelled": "Отменен",
 }
 STATUS_FILTER_GROUPS = {
+    "created": ("created", "shortage", "partial"),
     "shortage": ("shortage",),
     "partial": ("partial",),
     "ready": ("ready",),
@@ -164,6 +167,11 @@ def _shelf_pull_by_item(
 
 
 def _journal_work_status(line_status: str) -> str:
+    # Legacy ``shortage`` / ``partial`` values were material-coverage bands
+    # persisted in the workflow state.  They do not describe order lifecycle.
+    # A materialized executor with either value is simply created/not started.
+    if line_status in {"shortage", "partial"}:
+        return "created"
     # "assembled" describes material coverage in the journal, not the workshop
     # action state. Keep the row actionable as "В работу".
     if line_status == "assembled":
@@ -178,7 +186,7 @@ def _journal_coverage_status(
 ) -> str:
     if material_coverage_status in ACTIVE_COVERAGE_STATUSES:
         return material_coverage_status
-    return line_status
+    return "unknown"
 
 
 def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
@@ -1129,10 +1137,7 @@ def list_journal(
         material_coverage_status = str((material_snapshot or {}).get("coverage_status") or "")
         material_coverage_label = str((material_snapshot or {}).get("coverage_label") or "")
         row_coverage_status = _journal_coverage_status(line_status, issue_status, material_coverage_status)
-        if issue_status in {"", "not_requested"} and row_coverage_status in ACTIVE_COVERAGE_STATUSES:
-            work_status = _journal_work_status(row_coverage_status)
-        else:
-            work_status = _journal_work_status(line_status)
+        work_status = _journal_work_status(line_status)
         has_1c_link = _production_order_has_1c_link(db, product.order)
         available_actions = _available_actions_for_journal_row(
             order=product.order,
@@ -1416,9 +1421,9 @@ def list_make_proposals(
                 "quantity": launchable_qty,
                 "produced_qty": fulfilled_qty,
                 "remaining_qty": remaining_qty,
-                "status": "shortage",
+                "status": "not_created",
                 "coverage_status": "unknown",
-                "coverage_label": "После создания заказа",
+                "coverage_label": "Недоступно",
                 "issue_status": "not_requested",
                 "material_coverage_status": None,
                 "material_coverage_label": None,

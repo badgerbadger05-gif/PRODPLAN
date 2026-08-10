@@ -11,6 +11,16 @@ import {
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
+import type {
+  ItemLedgerFutureSupplyResponse,
+  ItemLedgerPosition,
+  ItemLedgerReservationsResponse,
+} from '../../domain/itemLedger'
+import {
+  getItemLedgerFutureSupply,
+  getItemLedgerPosition,
+  getItemLedgerReservations,
+} from '../../services/itemLedger'
 import {
   deleteProductionOrder,
   exportMaterialIssuesTo1C,
@@ -66,6 +76,7 @@ import {
 export function ProductionControlPage() {
   const listRequestSeq = useRef(0)
   const materialsRequestSeq = useRef(0)
+  const ledgerRequestSeq = useRef(0)
   const dangerousMutationLocked = useRef(false)
   const [searchParams, setSearchParams] = useSearchParams()
   const focusProductId = searchParams.get('product_id')
@@ -77,6 +88,11 @@ export function ProductionControlPage() {
     initialUrlState.current.activeProductId,
   )
   const [materials, setMaterials] = useState<MaterialsResponse | null>(null)
+  const [ledgerPosition, setLedgerPosition] = useState<ItemLedgerPosition | null>(null)
+  const [ledgerReservations, setLedgerReservations] = useState<ItemLedgerReservationsResponse | null>(null)
+  const [ledgerFutureSupply, setLedgerFutureSupply] = useState<ItemLedgerFutureSupplyResponse | null>(null)
+  const [ledgerLoading, setLedgerLoading] = useState(false)
+  const [ledgerError, setLedgerError] = useState('')
   const [launchQtyByWorkItem, setLaunchQtyByWorkItem] = useState<Record<number, number>>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -233,6 +249,13 @@ export function ProductionControlPage() {
       const data = await request(productId)
       if (requestSeq !== materialsRequestSeq.current) return
       setMaterials(data)
+      setRows((list) => list.map((row) => productionRowId(row) === productId ? {
+        ...row,
+        coverage_status: data.coverage_status || row.coverage_status,
+        coverage_label: data.coverage_label || row.coverage_label,
+        material_coverage_status: data.coverage_status || row.material_coverage_status,
+        material_coverage_label: data.coverage_label || row.material_coverage_label,
+      } : row))
     } catch (e) {
       if (requestSeq !== materialsRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
@@ -251,6 +274,31 @@ export function ProductionControlPage() {
     ),
     [requestMaterials],
   )
+
+  const loadItemLedger = useCallback(async (itemId: number) => {
+    const requestSeq = ++ledgerRequestSeq.current
+    setLedgerLoading(true)
+    setLedgerError('')
+    setLedgerPosition(null)
+    setLedgerReservations(null)
+    setLedgerFutureSupply(null)
+    try {
+      const [position, reservations, futureSupply] = await Promise.all([
+        getItemLedgerPosition(itemId),
+        getItemLedgerReservations(itemId, { status: 'active' }),
+        getItemLedgerFutureSupply(itemId),
+      ])
+      if (requestSeq !== ledgerRequestSeq.current) return
+      setLedgerPosition(position)
+      setLedgerReservations(reservations)
+      setLedgerFutureSupply(futureSupply)
+    } catch (e) {
+      if (requestSeq !== ledgerRequestSeq.current) return
+      setLedgerError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (requestSeq === ledgerRequestSeq.current) setLedgerLoading(false)
+    }
+  }, [])
 
   function beginDangerousMutation() {
     if (dangerousMutationLocked.current) return false
@@ -629,6 +677,10 @@ export function ProductionControlPage() {
     return undefined
   }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials])
 
+  useEffect(() => {
+    if (activeRow?.item_id != null) void loadItemLedger(activeRow.item_id)
+  }, [activeRow?.item_id, loadItemLedger])
+
   const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
 
   return (
@@ -733,6 +785,11 @@ export function ProductionControlPage() {
             <ProductionDetailPane
               activeRow={activeRow}
               materials={materials}
+              ledgerPosition={ledgerPosition}
+              ledgerReservations={ledgerReservations}
+              ledgerFutureSupply={ledgerFutureSupply}
+              ledgerLoading={ledgerLoading}
+              ledgerError={ledgerError}
               coverageLabels={coverageLabels}
               onLoadMaterials={() => {
                 if (activeRow?.product_id != null) void loadMaterials(activeRow.product_id)

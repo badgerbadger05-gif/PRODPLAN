@@ -600,9 +600,8 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal["total"] == 1
     assert journal["rows"][0]["order_number"] == "1839"
     assert journal["rows"][0]["item_article"] == "ART-P"
-    # Default per plan-aligned status set: 'shortage' until coverage is
-    # evaluated (was 'new' under the legacy workshop-progress set).
-    assert journal["rows"][0]["status"] == "shortage"
+    assert journal["rows"][0]["status"] == "created"
+    assert journal["rows"][0]["coverage_status"] == "unknown"
     # 1C-synced order: source defaults to '1c', order_ref1c populated.
     # Frontend uses these to hide the "Export to 1C" button on 1C rows.
     assert journal["rows"][0]["order_source"] == "1c"
@@ -1003,8 +1002,8 @@ def test_journal_splits_work_status_from_material_coverage(db_session):
     row = list_journal(db_session)["rows"][0]
 
     assert row["status"] == "ready"
-    assert row["coverage_status"] == "assembled"
-    assert row["coverage_label"] == "Собрано"
+    assert row["coverage_status"] == "unknown"
+    assert row["coverage_label"] == "Недоступно"
 
 
 def test_posted_assembled_line_uses_frozen_ready_coverage_when_available(db_session):
@@ -1080,9 +1079,12 @@ def test_journal_filters_by_workshop_and_coverage_before_paging(db_session):
     journal = list_journal(
         db_session,
         workshop_id=workshop_a.resource_id,
-        coverage_status="assembled",
+        coverage_status="ready",
         limit=1,
         offset=0,
+        _material_coverage_by_product={
+            rows[1].product_id: {"coverage_status": "ready", "coverage_label": "Обеспечен"},
+        },
     )
 
     assert journal["total"] == 1
@@ -1232,8 +1234,22 @@ def test_journal_without_coverage_filter_does_not_reuse_last_row_status(db_sessi
         db_session.add(ProductionOrderLineState(product_id=product.product_id, status=status))
     db_session.commit()
 
-    all_rows = list_journal(db_session)["rows"]
-    partial_rows = list_journal(db_session, coverage_status="partial")["rows"]
+    material_coverage = {
+        product.product_id: {
+            "coverage_status": status,
+            "coverage_label": "Обеспечен" if status == "ready" else "Частично обеспечен",
+        }
+        for product, status in zip(
+            db_session.query(ProductionProduct).filter(ProductionProduct.item_id == item.item_id).order_by(ProductionProduct.product_id).all(),
+            ["ready", "partial"],
+        )
+    }
+    all_rows = list_journal(db_session, _material_coverage_by_product=material_coverage)["rows"]
+    partial_rows = list_journal(
+        db_session,
+        coverage_status="partial",
+        _material_coverage_by_product=material_coverage,
+    )["rows"]
 
     assert {row["order_number"] for row in all_rows} == {"COV-1", "COV-2"}
     assert [row["order_number"] for row in partial_rows] == ["COV-2"]
@@ -2319,7 +2335,7 @@ def test_journal_uses_candidate_material_coverage_for_coverage_band_rows(db_sess
 
     assert row["coverage_status"] == "ready"
     assert row["coverage_label"] == "Обеспечен"
-    assert row["status"] == "ready"
+    assert row["status"] == "created"
 
 
 def test_preview_materials_reads_ledger_future_supply_for_target_generation(db_session):

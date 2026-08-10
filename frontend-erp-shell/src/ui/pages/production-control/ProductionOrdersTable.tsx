@@ -17,7 +17,9 @@ type Props = {
   onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
-const manualProductionStatusOptions = productionStatusOptions.filter(([value]) => value !== 'completed')
+const manualProductionStatusOptions = productionStatusOptions.filter(
+  ([value]) => value !== 'completed' && value !== 'not_created',
+)
 
 function orderSubline(row: OrderRow) {
   if (row.product_id == null) return 'Расчёт MRP · заказ ещё не создан'
@@ -140,13 +142,19 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <span className="muted">{row.stage_name || ''}</span>
             </td>
             <td>
-              <select aria-label={`Статус заказа ${orderMainLine(row)}`} disabled={isProposal} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
-                {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-              </select>
+              {isProposal ? (
+                <span className="muted">Не создан</span>
+              ) : (
+                <select aria-label={`Статус заказа ${orderMainLine(row)}`} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
+                  {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              )}
             </td>
             <td>
               <span className={`pill ${row.coverage_status || row.status || 'unknown'}`}>
-                {row.coverage_label || coverageLabels[String(row.coverage_status || row.status || '')] || row.coverage_status || row.status || '—'}
+                {row.coverage_status === 'unknown'
+                  ? coverageLabels.unknown
+                  : row.coverage_label || coverageLabels[String(row.coverage_status || '')] || row.coverage_status || '—'}
               </span>
               {!!row.issue_count && <span className="muted issueCount">док. {row.issue_count}</span>}
             </td>

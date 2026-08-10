@@ -2268,3 +2268,67 @@ input:focus, select:focus {
   background: rgba(199,167,96,.18);
   color: #fff;
 }
+
+.itemLedgerBlock {
+  margin-top: 8px;
+  border: 1px solid #9bb3a2;
+  background: #f3f8f4;
+}
+
+.itemLedgerTitle {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-bottom: 1px solid #9bb3a2;
+  background: #d8e8dc;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.itemLedgerTitle span:last-child {
+  color: #4c6653;
+  font-weight: 500;
+}
+
+.itemLedgerGrid {
+  grid-template-columns: 130px 1fr;
+}
+
+.itemLedgerRecords {
+  border-top: 1px solid #c7d8cb;
+  background: #fff;
+}
+
+.itemLedgerRecords > strong {
+  display: block;
+  padding: 5px 8px;
+  background: #e8f0ea;
+  font-size: 12px;
+}
+
+.itemLedgerRecord {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 5px 8px;
+  border-top: 1px solid #e3ebe5;
+  font-size: 11px;
+}
+
+.itemLedgerRecord span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.itemLedgerRecord b {
+  white-space: nowrap;
+}
+
+.itemLedgerMore,
+.itemLedgerLink {
+  display: block;
+  padding: 5px 8px;
+  border-top: 1px solid #e3ebe5;
+  font-size: 11px;
+}

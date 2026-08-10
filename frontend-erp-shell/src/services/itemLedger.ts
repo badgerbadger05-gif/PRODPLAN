@@ -2,6 +2,7 @@ import { api } from '../lib/api'
 import type { paths } from '../lib/apiTypes'
 import type {
   ItemLedgerMovementsResponse,
+  ItemLedgerFutureSupplyResponse,
   ItemLedgerPosition,
   ItemLedgerReservationsResponse,
   ItemLedgerReservationEventsResponse,
@@ -27,6 +28,14 @@ function toQuery(params: Record<string, string | number | undefined | null>) {
 
 export function getItemLedgerPosition(itemId: number, signal?: AbortSignal) {
   return api<ItemLedgerPosition>(`${ITEM_LEDGER_BASE}/${encodeURIComponent(itemId)}/position`, undefined, signal)
+}
+
+export function getItemLedgerFutureSupply(itemId: number, signal?: AbortSignal) {
+  return api<ItemLedgerFutureSupplyResponse>(
+    `${ITEM_LEDGER_BASE}/${encodeURIComponent(itemId)}/future-supply`,
+    undefined,
+    signal,
+  )
 }
 
 export function getItemLedgerMovements(itemId: number, filters: ItemLedgerMovementsFilters = {}, signal?: AbortSignal) {
