@@ -729,6 +729,7 @@ export function ProductionControlPage() {
                 rows={rows}
                 activeRow={activeRow}
                 selectedIds={selectedIds}
+                launchQtyByWorkItem={launchQtyByWorkItem}
                 sort={{
                   sortBy: filters.sort_by === 'planned_start_date' ? filters.sort_by : null,
                   sortDir: filters.sort_dir,

@@ -299,7 +299,12 @@ export function ProductionDetailPane({
               </button>
             )}
           </div>
-          <h3>Комплектующие</h3>
+          <h3>
+            Комплектующие
+            {activeRow.work_item_id != null && materials?.qty != null
+              ? ` на ${qty(materials.qty)} ${activeRow.unit || ''}`
+              : ''}
+          </h3>
           <div className="materialsList">
             {(materials?.components ?? []).map((m) => (
               <div className={`materialRow ${m.availability_status || m.coverage_status || 'unknown'}`} key={m.component_item_id}>

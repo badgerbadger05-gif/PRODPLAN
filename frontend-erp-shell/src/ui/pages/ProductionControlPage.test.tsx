@@ -624,6 +624,16 @@ describe('ProductionControlPage — characterization', () => {
       rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
       truth_meta: fakeTruthMeta,
     })
+    vi.mocked(getWorkItemMaterials).mockImplementation(async (_workItemId, quantity) => ({
+      ...fakeMaterials(),
+      product_id: null,
+      work_item_id: 701,
+      qty: quantity,
+      components: fakeMaterials().components.map((component) => ({
+        ...component,
+        required_qty: component.qty_per_unit * quantity,
+      })),
+    }))
     vi.mocked(materializeMakeWorkItems).mockResolvedValue({
       status: 'ok',
       created: [{
@@ -643,6 +653,9 @@ describe('ProductionControlPage — characterization', () => {
     await user.type(launchInput, '6')
     await user.tab()
     await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6))
+    await waitFor(() => expect(within(rowFor('Кронштейн')).getByText('6')).toBeInTheDocument())
+    expect(await screen.findByRole('heading', { name: 'Комплектующие на 6 шт' })).toBeInTheDocument()
+    expect(screen.getByText('нужно 24')).toBeInTheDocument()
 
     await user.click(screen.getByRole('checkbox', { name: /MRP-R-701/ }))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))

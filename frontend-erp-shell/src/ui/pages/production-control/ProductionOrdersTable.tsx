@@ -9,6 +9,7 @@ type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
   selectedIds: Set<number>
+  launchQtyByWorkItem: Readonly<Record<number, number>>
   sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
   onSelectIds: (ids: Set<number>) => void
   onActivate: (id: number) => void
@@ -31,7 +32,7 @@ function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
 }
 
-export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
+export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyByWorkItem, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
       <colgroup>
@@ -63,6 +64,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
         {rows.map((row) => {
           const rowId = productionRowId(row)
           const isProposal = row.product_id == null
+          const launchQuantity = row.work_item_id != null
+            ? launchQtyByWorkItem[row.work_item_id] ?? row.launchable_qty ?? row.remaining_qty
+            : row.remaining_qty
           const chain = row.paint_weld_chain
           return (
           <tr
@@ -138,8 +142,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               )}
             </td>
             <td className="numCell">
-              <strong>{qty(row.remaining_qty)}</strong>
+              <strong>{qty(launchQuantity)}</strong>
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
+              {isProposal && launchQuantity !== row.remaining_qty && (
+                <span className="muted">запуск / остаток {qty(row.remaining_qty)}</span>
+              )}
               {chain?.counterpart_product_id && (
                 <span className="muted">
                   св. {qty(chain.counterpart_remaining_qty)} / {qty(chain.counterpart_quantity)}
