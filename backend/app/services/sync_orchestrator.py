@@ -204,6 +204,7 @@ _PHYSICAL_REFRESH_RETRY_MAX_SECONDS = 3600
 _PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
 _PHYSICAL_REFRESH_ENTITY = "AccumulationRegister_ЗапасыНаСкладах/Balance"
 _PHYSICAL_REFRESH_DISCOVERY_LOOKBACK = timedelta(days=7)
+_PHYSICAL_REFRESH_SETTLE_LAG = timedelta(minutes=5)
 # Signed bigint, stable across processes and deployments.
 _SYNC_ORCHESTRATOR_LOCK_KEY = 0x73796E632D6F7263  # 'sync-orc'
 
@@ -878,7 +879,13 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                     )
                     active_key = str(candidate.generation_key)
                 else:
-                    active_cutoff = _to_utc(now).replace(microsecond=0)
+                    # 1C publishes register rows and Balance independently.
+                    # Reading the moving edge makes the two sources disagree
+                    # while documents are being posted.  Refresh a short,
+                    # already-settled prefix instead of the current second.
+                    active_cutoff = (
+                        _to_utc(now) - _PHYSICAL_REFRESH_SETTLE_LAG
+                    ).replace(microsecond=0)
                     active_key = (
                         f"physical-refresh:{active_parent.id}:"
                         f"{active_cutoff.isoformat()}"

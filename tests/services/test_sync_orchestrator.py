@@ -264,7 +264,9 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
         assert kwargs["discovery_lookback"] == timedelta(days=7)
         assert kwargs["audit_all_known_recorders"] is False
         assert kwargs["opening_balance_loader"](opening_at) == {}
-        return Result()
+        result = Result()
+        result.cutoff = kwargs["target_cutoff"]
+        return result
 
     monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
     monkeypatch.setattr(orch, "pull_queue_health", lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0})
@@ -276,7 +278,8 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
     result = orch.tick(db=db_session, now=now)
     assert result["job"] == "physicalRefresh"
-    expected_cutoff = now.astimezone(ZoneInfo("Europe/Moscow")).replace(
+    settled_cutoff = now - timedelta(minutes=5)
+    expected_cutoff = settled_cutoff.astimezone(ZoneInfo("Europe/Moscow")).replace(
         tzinfo=None, microsecond=0
     ).isoformat()
     expected_opening = opening_at.astimezone(ZoneInfo("Europe/Moscow")).replace(
@@ -289,7 +292,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     assert got_strict["value"] is True
     state = orch.status()["physical_refresh"]
     assert state["last_status"] == "ok"
-    assert state["last_cutoff"] == now.isoformat()
+    assert state["last_cutoff"] == settled_cutoff.isoformat()
     assert state["last_result"]["published"] is True
 
 
@@ -312,7 +315,8 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
     status = orch.status()["physical_refresh"]
     assert status["failure_count"] == 1
     assert status["next_retry_at"] is not None
-    assert status["active_cutoff"] == now.isoformat()
+    settled_cutoff = now - timedelta(minutes=5)
+    assert status["active_cutoff"] == settled_cutoff.isoformat()
     active_key = status["active_generation_key"]
     assert active_key
     next_retry = datetime.fromisoformat(status["next_retry_at"])
@@ -324,7 +328,7 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
 
     monkeypatch.setattr(orch, "_build_client", lambda: type("Client", (), {"base_url": "https://example.local/odata", "username": None, "password": None, "token": None}))
     def _resume(db, cutoff, key):
-        assert cutoff == now
+        assert cutoff == settled_cutoff
         assert key == active_key
         return {"parent_generation_id": 1, "physical_generation_id": 1, "published_generation_id": 1, "target_cutoff": cutoff.isoformat(), "published": True, "result": {"ok": True}}
 
@@ -498,7 +502,9 @@ def test_physical_refresh_drops_identity_of_discarded_candidate(
     assert result["status"] == "ok"
     assert result["job"] == "physicalRefresh"
     assert seen["key"] != stale_key
-    assert seen["cutoff"] == before_retry.replace(microsecond=0)
+    assert seen["cutoff"] == (
+        before_retry - timedelta(minutes=5)
+    ).replace(microsecond=0)
     assert orch.status()["physical_refresh"]["active_generation_key"] is None
 
 
