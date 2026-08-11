@@ -264,10 +264,12 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect((await screen.findAllByText('Подшипник ведущего вала')).length).toBeGreaterThan(0)
     expect(screen.getAllByText('Под заказ (MRP)').length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: 'Нет товара: 1' })).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: 'Промснаб' })).toBeInTheDocument()
+    // Справочник поставщиков грузится отдельным запросом от журнала — ждём его.
+    expect(await screen.findByRole('option', { name: 'Промснаб' })).toBeInTheDocument()
     expect(screen.getByText(/в живых заказах 0 шт \(0%\) · к заказу 12 шт \(100%\)/)).toBeInTheDocument()
-    expect(await screen.findByText('Ledger по номенклатуре')).toBeInTheDocument()
-    expect(screen.getByText('Основной склад')).toBeInTheDocument()
+    // Заголовок Ledger-блока рендерится ещё до ответа сервисов, ждать надо сами данные.
+    expect(await screen.findByText('Основной склад')).toBeInTheDocument()
+    expect(screen.getByText('Ledger по номенклатуре')).toBeInTheDocument()
     expect(screen.getByText(/Заказ поставщику ЗП-000042/)).toBeInTheDocument()
 
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('order_id')).toBe('8')
@@ -313,6 +315,8 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(vi.mocked(listPurchaseJournal).mock.calls[1]?.[0].get('sort_by')).toBe('delivery_date')
     expect(vi.mocked(listPurchaseJournal).mock.calls[1]?.[0].get('sort_dir')).toBe('asc')
 
+    // Опция появляется только после ответа справочника фильтров.
+    await screen.findByRole('option', { name: 'Промснаб' })
     fireEvent.change(screen.getByLabelText('Поставщик'), { target: { value: '7' } })
     await waitFor(() => expect(listPurchaseJournal).toHaveBeenCalledTimes(3))
     expect(vi.mocked(listPurchaseJournal).mock.calls[2]?.[0].get('supplier_id')).toBe('7')
