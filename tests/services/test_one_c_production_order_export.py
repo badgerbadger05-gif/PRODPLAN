@@ -540,6 +540,99 @@ def test_mismatched_retry_payload_fails_closed_before_network(db_session, monkey
     assert order.order_ref1c == "existing-order-ref"
 
 
+def test_successful_order_link_survives_later_accepted_generation():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=10,
+        number="PP000000010",
+        source_run_id=2,
+        ledger_generation_id=160,
+        freeze_version=1,
+        document_date=datetime(2026, 8, 10),
+    )
+    link = SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=10,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP000000010",
+        target_ref_key="existing-order-ref",
+        payload_hash="payload-from-generation-137",
+        status="success",
+        ledger_generation_id=137,
+    )
+
+    verified = exporter._validate_existing_retry_link(
+        entry=entry,
+        link=link,
+        expected_payload_hash="payload-materialized-in-generation-160",
+        order_ref1c="existing-order-ref",
+    )
+
+    assert verified == "existing-order-ref"
+
+
+def test_successful_order_link_survives_canonical_rebuild_lineage_clear():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=10,
+        number="PP000000010",
+        source_run_id=2,
+        ledger_generation_id=160,
+        freeze_version=1,
+        document_date=datetime(2026, 8, 10),
+    )
+    link = SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=10,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP000000010",
+        target_ref_key="existing-order-ref",
+        payload_hash="historical-payload",
+        status="success",
+        ledger_generation_id=None,
+    )
+
+    assert exporter._validate_existing_retry_link(
+        entry=entry,
+        link=link,
+        expected_payload_hash="current-payload",
+        order_ref1c="existing-order-ref",
+    ) == "existing-order-ref"
+
+
+def test_failed_order_link_from_another_generation_still_fails_closed():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=10,
+        number="PP000000010",
+        source_run_id=2,
+        ledger_generation_id=160,
+        freeze_version=1,
+        document_date=datetime(2026, 8, 10),
+    )
+    link = SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=10,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP000000010",
+        target_ref_key=None,
+        payload_hash="old-attempt",
+        status="error",
+        ledger_generation_id=137,
+    )
+
+    with pytest.raises(exporter.MrpMutationLineageError, match="another Ledger generation"):
+        exporter._validate_existing_retry_link(
+            entry=entry,
+            link=link,
+            expected_payload_hash="current-attempt",
+            order_ref1c="",
+        )
+
+
 def test_missing_durable_order_date_fails_before_payload_hash():
     entry = exporter.ProductionOrderExportEntry(
         order_id=1,

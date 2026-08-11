@@ -986,11 +986,29 @@ def _validate_existing_retry_link(
     # A link without a target ref is merely a prior failed attempt.  It cannot
     # be accepted as an existing document, but its payload/generation still
     # must agree before we can create or recover anything.
+    if entry.ledger_generation_id is None:
+        raise MrpMutationLineageError("production export has no accepted Ledger generation")
+    durable_success = (
+        str(link.status or "") == "success" and link_ref and order_ref1c == link_ref
+    )
     if link.ledger_generation_id is None:
+        # Canonical rebuilds preserve successful external identity while
+        # clearing rebuildable Ledger lineage.  The agreeing source Ref_Key is
+        # sufficient for the creation command to remain an idempotent no-op.
+        if durable_success:
+            return link_ref
         raise MrpMutationLineageError("production SyncLink has no accepted Ledger generation")
-    if entry.ledger_generation_id is None or int(link.ledger_generation_id) != int(entry.ledger_generation_id):
+    same_generation = int(link.ledger_generation_id) == int(entry.ledger_generation_id)
+    if not same_generation and not durable_success:
         raise MrpMutationLineageError("production SyncLink belongs to another Ledger generation")
-    if not link.payload_hash or str(link.payload_hash) != expected_payload_hash:
+    # A successfully created 1C order is a durable executor document.  A later
+    # accepted physical Ledger generation may materialize the same live MRP
+    # obligation with a different current payload, but that must not create or
+    # patch a second 1C order.  Inside the same immutable generation, however,
+    # a payload mismatch still means local lineage corruption and fails closed.
+    if same_generation and (
+        not link.payload_hash or str(link.payload_hash) != expected_payload_hash
+    ):
         raise MrpMutationLineageError("production SyncLink payload does not match canonical export payload")
     if order_ref1c and order_ref1c != link_ref:
         raise MrpMutationLineageError("production_orders.order_ref1c disagrees with verified SyncLink")

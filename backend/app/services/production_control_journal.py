@@ -933,7 +933,6 @@ def list_journal(
         if product.order and product.order.source_run_id is not None
     })
     order_one_c_number_by_id: Dict[int, str] = {}
-    truth_ledger_generation_id = int(truth.generation_id)
     if order_ids:
         for row in (
             db.query(SyncLink.source_id, SyncLink.target_number)
@@ -942,7 +941,6 @@ def list_journal(
                 SyncLink.source_doctype == "production_order",
                 SyncLink.source_id.in_(order_ids),
                 SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
-                SyncLink.ledger_generation_id == truth_ledger_generation_id,
                 SyncLink.status == "success",
                 SyncLink.target_number.isnot(None),
             )
