@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -851,3 +851,141 @@ def test_list_root_product_options_reads_only_frozen_snapshot_labels(db_session)
     assert [item["item_id"] for item in options] == [root_a.item_id, root_b.item_id]
     assert options[0]["item_name"] == "Root A"
     assert options[1]["item_name"] == "Root B"
+
+
+def _launch_after_cutoff(db, generation, work, *, created_at, quantity=10):
+    """Открыть исполнительный заказ уже ПОСЛЕ cutoff принятого поколения."""
+    order = models.ProductionOrder(
+        order_number="SNAP-LAUNCH-1",
+        order_date=datetime(2026, 7, 30),
+        source="mrp",
+        source_run_id=int(work.run_id),
+        order_ref1c="snap-launch-ref",
+        deletion_mark=False,
+        created_at=created_at,
+    )
+    db.add(order)
+    db.flush()
+    product = models.ProductionProduct(
+        order_id=order.order_id,
+        item_id=int(work.item_id),
+        line_number=1,
+        quantity=quantity,
+        produced_qty=0,
+        remaining_qty=quantity,
+        source_mrp_requirement_id=int(work.requirement_id),
+        ledger_generation_id=int(generation.id),
+    )
+    db.add(product)
+    db.flush()
+    db.commit()
+    return order, product
+
+
+def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_session):
+    """Запуск после cutoff виден сразу: «Не создан» по существующему документу
+    1С — это потеря заказа для оператора, а не корректная заморозка плана."""
+    generation = _building_generation(db_session, "production-journal-live-launch")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+
+    before = read_snapshot(db_session, limit=100)
+    proposal = next(
+        row for row in before["rows"] if row["journal_row_key"] == f"work-item:{work.id}"
+    )
+    assert proposal["status"] == "not_created"
+    assert proposal["product_id"] is None
+
+    order, product = _launch_after_cutoff(
+        db_session,
+        generation,
+        work,
+        created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
+    )
+
+    after = read_snapshot(db_session, limit=100)
+    row = next(
+        item for item in after["rows"] if item["journal_row_key"] == f"work-item:{work.id}"
+    )
+    assert row["status"] == "created"
+    assert row["product_id"] == product.product_id
+    assert row["order_id"] == order.order_id
+    assert row["order_number"] == "SNAP-LAUNCH-1"
+    assert row["order_ref1c"] == "snap-launch-ref"
+    assert row["available_actions"] == ["close_1c"]
+    # Плановые величины остаются снимочными: наложение касается только
+    # исполнительной части строки.
+    assert row["remaining_qty"] == 10
+    assert row["coverage_status"] == "shortage"
+
+
+def test_route_sheet_prints_for_order_opened_after_cutoff(db_session):
+    """Маршрутный лист — документ по физическому заказу, а не плановая
+    гипотеза: он обязан печататься сразу после запуска."""
+    generation = _building_generation(db_session, "production-journal-live-route")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+
+    _, product = _launch_after_cutoff(
+        db_session,
+        generation,
+        work,
+        created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
+    )
+
+    rows = read_route_sheet_snapshot_rows(db_session, [product.product_id])
+    assert len(rows) == 1
+    assert int(rows[0]["anchor_product_id"]) == product.product_id
+
+
+def test_route_sheet_still_fails_closed_for_unknown_product(db_session):
+    """Наложение не превращается в дыру: изделия, которого нет ни в снимке, ни
+    среди созданных после cutoff, по-прежнему нет."""
+    generation = _building_generation(db_session, "production-journal-live-unknown")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+
+    with pytest.raises(RouteSheetSnapshotUnavailable) as caught:
+        read_route_sheet_snapshot_rows(db_session, [987654])
+    assert "987654" in caught.value.as_dict()["reason"]
+
+
+def test_order_deleted_in_1c_does_not_resurrect_journal_row(db_session):
+    """Снятый пометкой удаления заказ не должен подменять строку-предложение."""
+    generation = _building_generation(db_session, "production-journal-live-deleted")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+
+    order, _product = _launch_after_cutoff(
+        db_session,
+        generation,
+        work,
+        created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
+    )
+    order.deletion_mark = True
+    db_session.commit()
+
+    rows = read_snapshot(db_session, limit=100)["rows"]
+    row = next(item for item in rows if item["journal_row_key"] == f"work-item:{work.id}")
+    assert row["status"] == "not_created"
+    assert row["product_id"] is None
