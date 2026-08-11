@@ -2,10 +2,15 @@ from datetime import datetime
 from decimal import Decimal
 
 from app import models
+from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+    FUTURE_SUPPLY_CAPTURE_STAGE,
+)
 from app.services.item_ledger.wip_future_supply import (
     capture_wip_future_supply,
     collect_wip_future_supply_evidence,
 )
+from app.services.production_control_common import DONE_STATE_KEY
 
 
 def _scope(db, suffix="one"):
@@ -63,6 +68,139 @@ def _sle(db, generation, item, *, recorder, qty="3", kind="assembly_in", char=""
     db.flush()
     return row
 
+
+
+def _capture_target(db, source):
+    """A BUILDING sibling of the accepted generation plus its capture batch."""
+    target = models.LedgerGeneration(
+        generation_key=f"wip-target-{source.generation_key}", status="building",
+        cutoff=source.cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch_id=source.physical_import_batch_id,
+        algorithm_version="test",
+    )
+    db.add(target)
+    db.flush()
+    batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage=FUTURE_SUPPLY_CAPTURE_STAGE,
+        status="building", batch_key=f"wip-future-supply-{target.id}",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+    )
+    db.add(batch)
+    db.flush()
+    return target, batch
+
+
+def test_order_completed_in_1c_is_not_open_future_supply(db_session):
+    """ЗСНФ-001878: «Завершен» in 1C with 0 of 16 received is not an arrival.
+
+    Closing is one-sided in 1C and read back here.  The unreceived remainder of
+    a closed order will never be produced against it, so it must not keep
+    inflating the projection.
+    """
+    generation, _physical, _build, item, warehouse = _scope(db_session, "done")
+    order, _product_row = _product(
+        db_session, item, warehouse, order_ref="ORDER-DONE", qty="16",
+    )
+    order.order_state_key = DONE_STATE_KEY
+    db_session.flush()
+
+    row = collect_wip_future_supply_evidence(
+        db_session, generation.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "production order is completed in 1C"
+    # The obligation itself stays auditable; only the open remainder dies.
+    assert row.ordered_qty_at_cutoff == Decimal("16")
+    assert row.realized_qty_at_cutoff == Decimal("0")
+    assert row.source_state_key == DONE_STATE_KEY
+
+    target, batch = _capture_target(db_session, generation)
+    metrics = capture_wip_future_supply(
+        db_session, generation.id, target.id, batch.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )
+
+    assert metrics["open_qty"] == Decimal("0")
+    stored = db_session.query(models.LedgerFutureSupply).filter(
+        models.LedgerFutureSupply.ledger_generation_id == target.id
+    ).one()
+    assert Decimal(str(stored.open_qty_at_cutoff)) == Decimal("0")
+    assert stored.evidence_status == "rejected"
+
+
+def test_done_state_key_is_matched_case_insensitively(db_session):
+    generation, _physical, _build, item, warehouse = _scope(db_session, "doneupper")
+    order, _product_row = _product(
+        db_session, item, warehouse, order_ref="ORDER-DONE-UPPER", qty="7",
+    )
+    order.order_state_key = DONE_STATE_KEY.upper()
+    db_session.flush()
+
+    row = collect_wip_future_supply_evidence(
+        db_session, generation.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "production order is completed in 1C"
+
+
+def test_deleted_order_is_not_open_future_supply(db_session):
+    generation, _physical, _build, item, warehouse = _scope(db_session, "deleted")
+    order, _product_row = _product(
+        db_session, item, warehouse, order_ref="ORDER-DELETED", qty="9",
+    )
+    order.deletion_mark = True
+    db_session.flush()
+
+    row = collect_wip_future_supply_evidence(
+        db_session, generation.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )[0]
+
+    assert row.evidence_status == "rejected"
+    assert row.reason == "production order is marked for deletion in 1C"
+    assert row.ordered_qty_at_cutoff == Decimal("9")
+
+    target, batch = _capture_target(db_session, generation)
+    metrics = capture_wip_future_supply(
+        db_session, generation.id, target.id, batch.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )
+
+    assert metrics["open_qty"] == Decimal("0")
+
+
+def test_working_order_still_reports_its_open_remainder(db_session):
+    """The normal path must survive the closed-order rejection."""
+    generation, _physical, _build, item, warehouse = _scope(db_session, "working")
+    order, _product_row = _product(
+        db_session, item, warehouse, order_ref="ORDER-WORKING", qty="16",
+    )
+    assert order.order_state_key == "open"
+    assert bool(order.deletion_mark) is False
+
+    row = collect_wip_future_supply_evidence(
+        db_session, generation.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )[0]
+
+    assert row.evidence_status == "exact"
+    assert row.reason is None
+
+    target, batch = _capture_target(db_session, generation)
+    metrics = capture_wip_future_supply(
+        db_session, generation.id, target.id, batch.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )
+
+    assert metrics["open_qty"] == Decimal("16")
+    stored = db_session.query(models.LedgerFutureSupply).filter(
+        models.LedgerFutureSupply.ledger_generation_id == target.id
+    ).one()
+    assert Decimal(str(stored.open_qty_at_cutoff)) == Decimal("16")
 
 
 def test_order_ref_route_requires_one_item_characteristic_candidate(db_session):

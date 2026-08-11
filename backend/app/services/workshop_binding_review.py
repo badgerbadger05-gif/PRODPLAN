@@ -30,7 +30,10 @@ from ..models import (
     ProductionProduct,
     ProductionResource,
 )
-from .production_control_common import to_float as _to_float
+from .production_control_common import (
+    DONE_STATE_KEY as _DONE_STATE_KEY,
+    to_float as _to_float,
+)
 from .production_output_truth import accepted_product_output
 from .workshop_resolution import (
     PROBLEM_REASON_CODES,
@@ -47,7 +50,6 @@ from .workshop_resolution import (
 # Mirrors production_control_journal._TERMINAL_LINE_STATUSES without importing
 # the heavy journal module.
 _TERMINAL_LINE_STATUSES = ("completed", "cancelled")
-_DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _diagnosis_payload(diagnosis: WorkshopDiagnosis) -> Dict[str, Any]:

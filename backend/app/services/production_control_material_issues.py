@@ -22,7 +22,11 @@ from ..models import (
     SyncLink,
     WorkshopWarehouseBinding,
 )
-from .production_control_common import date_to_iso as _date_to_iso, to_float as _to_float
+from .production_control_common import (
+    DONE_STATE_KEY,
+    date_to_iso as _date_to_iso,
+    to_float as _to_float,
+)
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
 from .production_control_material_availability import _components_for_product
 from .one_c_export_common import (
@@ -53,7 +57,6 @@ from .workshop_resolution import (
 )
 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
-DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 HIDDEN_ORDER_LINE_STATUSES = {"produced", "done", "completed", "cancelled"}
 
 

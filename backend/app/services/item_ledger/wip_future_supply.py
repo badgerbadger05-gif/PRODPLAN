@@ -16,6 +16,7 @@ from typing import Mapping
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.production_control_common import DONE_STATE_KEY, norm_guid
 
 from .future_supply_capture import (
     FutureSupplyEvidence,
@@ -41,6 +42,25 @@ def _as_date(value: object) -> date | None:
     if isinstance(value, date):
         return value
     return None
+
+
+def _order_is_deleted(order: models.ProductionOrder) -> bool:
+    return bool(getattr(order, "deletion_mark", False))
+
+
+def _order_is_done(order: models.ProductionOrder) -> bool:
+    return norm_guid(getattr(order, "order_state_key", None)) == DONE_STATE_KEY
+
+
+def _order_is_closed_in_1c(order: models.ProductionOrder) -> bool:
+    """True when 1C no longer expects anything from this production order."""
+    return _order_is_deleted(order) or _order_is_done(order)
+
+
+def _closed_order_reason(order: models.ProductionOrder) -> str:
+    if _order_is_deleted(order):
+        return "production order is marked for deletion in 1C"
+    return "production order is completed in 1C"
 
 
 def _evidence(**values: object) -> FutureSupplyEvidence:
@@ -95,10 +115,11 @@ def collect_wip_future_supply_evidence(
 ) -> list[FutureSupplyEvidence]:
     """Project ProductionProduct obligations and accepted make facts.
 
-    Every production line is retained.  A missing contour destination, missing
-    external line identity, or ambiguous receipt route becomes non-supply
-    evidence with ``open=0`` when persisted; it is never converted into an
-    invented zero fact.
+    Every production line is retained.  An order closed or deleted in 1C, a
+    missing contour destination, missing external line identity, or an ambiguous
+    receipt route becomes non-supply evidence with ``open=0`` when persisted; it
+    is never converted into an invented zero fact and never silently dropped, so
+    the rejection reason stays auditable in the generation.
     """
     generation = _accepted_generation(db, ledger_generation_id)
     pools_by_destination = _pool_mapping(planning_pool_by_warehouse)
@@ -189,12 +210,20 @@ def collect_wip_future_supply_evidence(
         planning_pool = pools_by_destination.get(destination, "")
         reason: str | None = None
         status = "exact"
-        if not order_ref or not line_ref:
+        if _order_is_closed_in_1c(order):
+            # An order closed one-sidedly in 1C is read back, never written back
+            # (CANON, «Жизненный цикл заказа»).  Its unreceived remainder will
+            # never be produced against this order, so it must stop being an
+            # expected arrival; a later receipt would come in as a fact of its
+            # own.  Rejecting the evidence zeroes ``open_qty_at_cutoff`` in the
+            # shared capture core without inventing a second engine.
+            status, reason = "rejected", _closed_order_reason(order)
+        elif not order_ref or not line_ref:
             status, reason = "rejected", "missing exact production order or line identity"
         elif not destination:
             status, reason = "rejected", "missing destination warehouse mapping"
         elif not planning_pool:
-            # Production lines are read without any state/date filter, so a
+            # Production lines are read without any date filter, so a
             # finished-goods or retired destination is normal input: reject the
             # line, never the whole capture.
             status, reason = "rejected", "planning_pool_not_mapped"

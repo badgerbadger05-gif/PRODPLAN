@@ -78,8 +78,6 @@ def _rounded_replenishment_pct(required_qty: Any, received_qty: Any) -> float | 
     return None if value is None else round(float(value), 1)
 
 
-# Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
-_DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 _CLOSE_REFRESH_KEY_PREFIX = "close-fixed-run"
 _FIX_REFRESH_KEY_PREFIX = "fix-period-plan"
 
