@@ -229,3 +229,83 @@ def test_rebase_closes_fully_produced_plan_without_empty_successor(
         models.ProductionPlanHeader.predecessor_run_id == int(run.run_id)
     ).count() == 0
     assert db_session.get(models.ProductionPlanHeader, int(plan.id)).status == "closed"
+
+
+def test_rebase_tolerates_closed_snapshot_from_earlier_generation(
+    db_session, monkeypatch
+):
+    """A stale ClosedPlanSnapshot from an older generation must not block a
+    re-rebase.
+
+    The existing-snapshot integrity check must re-derive the execution payload
+    at the snapshot's OWN generation, mirroring ``close_fixed_plan``.  Comparing
+    against a payload re-read at the current (advanced) accepted truth bakes the
+    ever-changing ledger_generation/cutoff metadata into the equality, so once
+    truth moves past the close it can never match and every re-rebase of the
+    same run fails with a phantom "payload conflicts" error — which deadlocks
+    the automatic rebase queue on the earliest affected run.
+    """
+    generation, plan, run, _ = _world(db_session, accepted_qty=Decimal("8"))
+
+    # An older accepted generation at which the run was previously closed.
+    older_physical = models.PhysicalImportBatch(
+        batch_key="spec-rebase-older-physical",
+        status="completed",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        completed_at=CUTOFF,
+    )
+    older_generation = models.LedgerGeneration(
+        generation_key="spec-rebase-older",
+        status="accepted",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=older_physical,
+        algorithm_version="test",
+        accepted_at=CUTOFF,
+    )
+    db_session.add_all([older_physical, older_generation])
+    db_session.flush()
+
+    # Immutable close captured at the OLDER generation, with a payload that (like
+    # the real one) embeds that generation's identity.
+    db_session.add(
+        models.ClosedPlanSnapshot(
+            plan_id=int(plan.id),
+            run_id=int(run.run_id),
+            ledger_generation_id=int(older_generation.id),
+            cutoff=older_generation.cutoff,
+            payload={"gen": int(older_generation.id)},
+            closed_at=CUTOFF,
+        )
+    )
+    db_session.commit()
+
+    _stub_publication(monkeypatch, db_session)
+
+    # A generation-sensitive payload: the real function embeds
+    # ledger_generation/cutoff, so its result differs per generation.  Override
+    # the constant stub installed by ``_stub_publication`` so the guard is
+    # genuinely exercised (buggy code reads at the current truth generation and
+    # would mismatch; the fix reads at the snapshot's generation and matches).
+    from app.services import period_plan_service
+
+    monkeypatch.setattr(
+        period_plan_service,
+        "_read_period_plan_execution_payload_for_run",
+        lambda *args, **kwargs: {"gen": int(kwargs["generation_id"])},
+    )
+
+    result = rebase_fixed_plan_remaining_roots(
+        db_session,
+        int(run.run_id),
+        changed_spec_refs=("spec-a",),
+        started_by="test",
+    )
+
+    assert result["status"] == "rebased"
+    # The stale close record is preserved, not duplicated or overwritten.
+    assert db_session.query(models.ClosedPlanSnapshot).filter_by(
+        plan_id=int(plan.id), run_id=int(run.run_id)
+    ).count() == 1
