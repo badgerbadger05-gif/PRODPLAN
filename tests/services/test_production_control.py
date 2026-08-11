@@ -682,7 +682,7 @@ def test_journal_visibility_and_completion_ignore_corrupted_remaining_cache(db_s
 
 
 
-def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
+def test_journal_exposes_historical_executor_number_after_ledger_advances(db_session):
     item = Item(
         item_code="P-ORDER-NUMBERS",
         item_name="Order number item",
@@ -723,7 +723,7 @@ def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
             target_entity="Document_ЗаказНаПроизводство",
             target_ref_key="order-ref-1c",
             target_number="PP001204945",
-            ledger_generation_id=int(db_session.info["production_journal_generation_id"]),
+            ledger_generation_id=None,
             status="success",
         )
     )
