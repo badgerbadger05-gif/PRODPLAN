@@ -61,7 +61,6 @@ from app.services.production_material_custody_events import (
     append_material_issue_custody_event,
 )
 from app.services.production_material_custody_projection import (
-    MaterialCustodySnapshotUnavailable,
     initialize_material_custody_baseline,
 )
 from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
@@ -1445,7 +1444,7 @@ def test_partial_unique_source_planned_order_blocks_duplicates(db_session):
     db_session.commit()
 
 
-def test_create_material_issues_retry_requires_refreshed_custody(db_session):
+def test_create_material_issues_retry_reuses_live_custody_without_refresh(db_session):
     """
     Re-clicking "prepare issue" must not create a duplicate draft document for
     the same production line. The second call should reuse the existing one
@@ -1500,8 +1499,9 @@ def test_create_material_issues_retry_requires_refreshed_custody(db_session):
     assert len(first["created"]) == 1
     assert first.get("reused", []) == []
 
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    second = create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    assert second["created"] == []
+    assert [row["issue_id"] for row in second["reused"]] == [first["created"][0]["issue_id"]]
 
     # And only one row physically exists.
     from app.models import ProductionMaterialIssue
@@ -1513,7 +1513,7 @@ def test_create_material_issues_retry_requires_refreshed_custody(db_session):
     )
 
 
-def test_exported_transfer_quantity_change_requires_custody_refresh(db_session):
+def test_exported_transfer_quantity_change_uses_live_custody(db_session):
     parent = Item(
         item_code="P-REEXP",
         item_name="Parent reexport",
@@ -1567,8 +1567,8 @@ def test_exported_transfer_quantity_change_requires_custody_refresh(db_session):
     product.remaining_qty = 3
     db_session.commit()
 
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    second = create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    assert second["created"] == []
     assert (
         db_session.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
@@ -1576,10 +1576,10 @@ def test_exported_transfer_quantity_change_requires_custody_refresh(db_session):
         == 1
     )
     line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
-    assert float(line.required_qty) == 5.0
+    assert float(line.required_qty) == 3.0
 
 
-def test_posted_transfer_retry_requires_custody_refresh(db_session):
+def test_posted_transfer_retry_reuses_live_custody(db_session):
     parent = Item(
         item_code="P-POSTED-REUSE",
         item_name="Parent posted reuse",
@@ -1634,8 +1634,9 @@ def test_posted_transfer_retry_requires_custody_refresh(db_session):
     line.line_status = "issued"
     db_session.commit()
 
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    second = create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    assert second["created"] == []
+    assert [row["issue_id"] for row in second["reused"]] == [issue_id]
     assert (
         db_session.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
@@ -1644,7 +1645,7 @@ def test_posted_transfer_retry_requires_custody_refresh(db_session):
     )
 
 
-def test_existing_issue_source_change_requires_custody_refresh(db_session):
+def test_existing_issue_source_change_reuses_original_live_issue(db_session):
     parent = Item(item_code="P-SRC-REUSE", item_name="Parent source reuse", unit="шт", status="active")
     comp = Item(item_code="C-SRC-REUSE", item_name="Component source reuse", unit="шт", status="active")
     db_session.add_all([parent, comp])
@@ -1663,10 +1664,11 @@ def test_existing_issue_source_change_requires_custody_refresh(db_session):
     db_session.commit()
 
     first = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-b")
+    second = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-b")
 
     assert len(first["created"]) == 1
+    assert second["created"] == []
+    assert [row["issue_id"] for row in second["reused"]] == [first["created"][0]["issue_id"]]
     assert (
         db_session.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id == product.product_id)
@@ -2714,8 +2716,8 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
     from app.models import ProductionMaterialIssue
     issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
     assert issue.warehouse_ref1c == "aaaa1111-aaaa-1111-aaaa-111111111111"
-    # A second command cannot use live custody after the first command changed
-    # the append-only watermark; it waits for physical refresh.
+    # The next command folds the first command's local custody tail immediately;
+    # it does not wait for a new physical generation.
     product2 = ProductionProduct(
         order_id=order.order_id,
         item_id=parent.item_id,
@@ -2736,13 +2738,13 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
     )
     db_session.commit()
 
-    with pytest.raises(MaterialCustodySnapshotUnavailable, match="physical refresh"):
-        create_material_issues(
-            db_session,
-            [product2.product_id],
-            initiated_by="op",
-            warehouse_ref1c="bbbb2222-bbbb-2222-bbbb-222222222222",
-        )
+    second = create_material_issues(
+        db_session,
+        [product2.product_id],
+        initiated_by="op",
+        warehouse_ref1c="bbbb2222-bbbb-2222-bbbb-222222222222",
+    )
+    assert len(second["created"]) == 1
 
 
 def test_create_material_issues_splits_components_by_source_warehouse(db_session):

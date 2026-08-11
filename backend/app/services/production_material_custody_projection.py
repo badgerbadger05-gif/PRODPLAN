@@ -1051,7 +1051,18 @@ def load_current_accepted_material_custody(
     *,
     consumer: str,
 ) -> tuple[int, MaterialCustodyState]:
-    """Load accepted custody only when it still matches the event stream."""
+    """Load accepted custody with the live PRODPLAN-owned event tail.
+
+    The accepted generation is an immutable physical snapshot.  Creating a
+    material issue, however, appends an operational custody event immediately
+    after that snapshot's cutoff.  Requiring a new physical generation for
+    every such append makes two consecutive launches impossible: the first
+    launch makes the accepted projection stale before the second one starts.
+
+    Keep the accepted projection as the base and fold only local, non-physical
+    events appended after its cutoff.  SLE-backed events remain invisible until
+    a later physical generation accepts their source movements.
+    """
     from .planning_truth import require_accepted_truth
 
     truth = require_accepted_truth(db, consumer)
@@ -1067,16 +1078,102 @@ def load_current_accepted_material_custody(
         db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0)).scalar()
         or 0
     )
-    if current_event_watermark != int(manifest.source_event_high_watermark_id):
+    manifest_watermark = int(manifest.source_event_high_watermark_id)
+    if current_event_watermark < manifest_watermark:
         raise MaterialCustodySnapshotUnavailable(
             expected_generation_id=generation_id,
             stored_generation_id=generation_id,
-            reason=(
-                "accepted custody snapshot is stale after operational custody changes; "
-                "physical refresh is required"
-            ),
+            reason="accepted custody snapshot watermark is ahead of the event stream",
         )
-    return generation_id, load_material_custody_projection(
+    state = load_material_custody_projection(
         db,
         ledger_generation_id=generation_id,
     )
+    if current_event_watermark == manifest_watermark:
+        return generation_id, state
+
+    generation = db.get(models.LedgerGeneration, generation_id)
+    if generation is None or generation.cutoff is None:
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason="accepted custody Ledger generation has no cutoff",
+        )
+
+    tail = (
+        db.query(models.ProductionMaterialCustodyEvent)
+        .filter(models.ProductionMaterialCustodyEvent.id > manifest_watermark)
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+        .all()
+    )
+    for event in tail:
+        if event.effective_at <= generation.cutoff:
+            if event.source_sle_id is not None and _is_reimport_duplicate_physical_event(
+                db,
+                event,
+                original_high_watermark_id=manifest_watermark,
+            ):
+                continue
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=int(event.component_item_id),
+                manifest_generation_id=generation_id,
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="late custody event falls inside the accepted physical cutoff",
+            )
+        # A physical event is accepted only together with the physical Ledger
+        # generation that proves its source SLE.  Until then the preceding
+        # local transit/workshop reservation remains the safe current state.
+        if event.source_sle_id is not None:
+            continue
+        if str(event.source_kind) not in {"issue_created", "terminal_release"}:
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=int(event.component_item_id),
+                manifest_generation_id=generation_id,
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="unsupported live custody event without a physical source",
+            )
+
+        product = _ensure_material_custody_product_state(state, int(event.product_id))
+        component_id = int(event.component_item_id)
+        warehouse = str(event.warehouse_ref1c or "")
+        location = str(event.location_kind or "")
+        delta = _to_float(event.delta_qty)
+        if location == _LOCATION_TRANSIT:
+            bucket = product.in_transit
+        elif location == _LOCATION_WORKSHOP:
+            bucket = product.at_workshop
+        else:
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=component_id,
+                manifest_generation_id=generation_id,
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="unsupported live custody event location",
+            )
+
+        next_product_qty = bucket.get(component_id, 0.0) + delta
+        next_warehouse_qty = state.by_warehouse_item.get((warehouse, component_id), 0.0) + delta
+        if next_product_qty < -_EPSILON or next_warehouse_qty < -_EPSILON:
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=component_id,
+                manifest_generation_id=generation_id,
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason=f"live custody event produced negative {location} reservation",
+            )
+        if next_product_qty <= _EPSILON:
+            bucket.pop(component_id, None)
+        else:
+            bucket[component_id] = next_product_qty
+        if next_warehouse_qty <= _EPSILON:
+            state.by_warehouse_item.pop((warehouse, component_id), None)
+        else:
+            state.by_warehouse_item[(warehouse, component_id)] = next_warehouse_qty
+
+    return generation_id, state
