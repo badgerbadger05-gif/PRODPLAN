@@ -13,7 +13,8 @@
 - Прочитай `.docs/CANON.md` целиком (~150 строк) и контракт своей области:
   `item_ledger.md`, `planning-truth-contract.md`, `one_c_export_from_prodplan.md`
   (матрица направлений записи 1С), `reservation-replenishment-core.md`,
-  `assembly-queue-and-drum.md`, `shelves-buffers-and-mechshop-pull.md`.
+  `assembly-queue-and-drum.md`, `shelves-buffers-and-mechshop-pull.md`,
+  `unified-assembly-specification.md` (единая спецификация сборки, §26).
 - Новая логика сначала ищется в реестре канонических модулей CANON.md.
   Второй движок / второе хранилище / вторая формула той же сущности — запрещены.
 - Факт выпуска — это поступление на склад. Оно гасит потребность и не значит больше ничего.
