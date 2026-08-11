@@ -9522,7 +9522,7 @@
           "paint-weld"
         ],
         "summary": "Chain Preview",
-        "description": "Предпросмотр цепочки «окраска - сварка» (dry-run, ничего не пишет).",
+        "description": "Предпросмотр цепочки «сварка → окраска» (dry-run, ничего не пишет).",
         "operationId": "chain_preview_api_v1_paint_weld_chain_preview_post",
         "requestBody": {
           "content": {
@@ -9566,7 +9566,7 @@
           "paint-weld"
         ],
         "summary": "Chain Open",
-        "description": "Открыть цепочку. dry_run=true (по умолчанию) — предпросмотр; dry_run=false —\nреальное создание в 1С (окраска, затем сварка на основании).",
+        "description": "Открыть цепочку. dry_run=true (по умолчанию) — предпросмотр; dry_run=false —\nреальное создание в 1С (сварка, затем окраска на основании сварочного заказа).",
         "operationId": "chain_open_api_v1_paint_weld_chain_open_post",
         "requestBody": {
           "content": {
@@ -15521,6 +15521,60 @@
         ],
         "title": "PaintWeldChainResponse"
       },
+      "PaintWeldPairResponse": {
+        "properties": {
+          "pair_id": {
+            "type": "integer",
+            "title": "Pair Id"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "painted",
+              "welded"
+            ],
+            "title": "Role"
+          },
+          "counterpart_item_id": {
+            "type": "integer",
+            "title": "Counterpart Item Id"
+          },
+          "counterpart_item_code": {
+            "type": "string",
+            "title": "Counterpart Item Code"
+          },
+          "counterpart_item_name": {
+            "type": "string",
+            "title": "Counterpart Item Name"
+          },
+          "counterpart_item_article": {
+            "type": "string",
+            "title": "Counterpart Item Article"
+          },
+          "selection_disabled_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Disabled Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "pair_id",
+          "role",
+          "counterpart_item_id",
+          "counterpart_item_code",
+          "counterpart_item_name",
+          "counterpart_item_article"
+        ],
+        "title": "PaintWeldPairResponse"
+      },
       "PendingSpecificationRebaseRequest": {
         "properties": {
           "dry_run": {
@@ -16362,6 +16416,48 @@
           "coverage_label": {
             "type": "string",
             "title": "Coverage Label"
+          },
+          "coverage_basis": {
+            "type": "string",
+            "enum": [
+              "direct_bom",
+              "welded_bom"
+            ],
+            "title": "Coverage Basis",
+            "default": "direct_bom"
+          },
+          "coverage_basis_item_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Basis Item Id"
+          },
+          "coverage_basis_item_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Basis Item Name"
+          },
+          "coverage_basis_item_article": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage Basis Item Article"
           }
         },
         "additionalProperties": false,
@@ -17051,6 +17147,17 @@
             "title": "Available Actions",
             "default": []
           },
+          "selection_disabled_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Disabled Reason"
+          },
           "launch_source": {
             "type": "string",
             "title": "Launch Source",
@@ -17126,6 +17233,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/PaintWeldChainResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "paint_weld_pair": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PaintWeldPairResponse"
               },
               {
                 "type": "null"

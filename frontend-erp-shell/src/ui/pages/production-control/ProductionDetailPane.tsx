@@ -285,7 +285,9 @@ export function ProductionDetailPane({
             {activeRow?.product_id && (
               <button
                 onClick={onProduce}
-                title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back"
+                disabled={Boolean(activeRow.selection_disabled_reason)}
+                title={activeRow.selection_disabled_reason
+                  || 'Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back'}
               >
                 {activeRow.paint_weld_chain ? 'Произвести цепочку' : 'Произвести строку'}
               </button>
@@ -300,7 +302,9 @@ export function ProductionDetailPane({
             )}
           </div>
           <h3>
-            Комплектующие
+            {materials?.coverage_basis_item_name
+              ? `Показаны компоненты сварной детали: ${materials.coverage_basis_item_name}`
+              : 'Комплектующие'}
             {activeRow.work_item_id != null && materials?.qty != null
               ? ` на ${qty(materials.qty)} ${activeRow.unit || ''}`
               : ''}

@@ -1,9 +1,9 @@
-"""Цепочка открытия «окраска → сварка» (этап 2).
+"""Цепочка открытия «сварка → окраска» (этап 2).
 
 Проверяем:
 - вердикт stock_covers → сварка не создаётся (окраска — штатно);
 - частичное покрытие → qty сварки уменьшено на эффективный остаток сварной;
-- need_weld → пара заказов в правильном порядке (окраска раньше сварки), с
+- need_weld → пара заказов в правильном порядке (сварка раньше окраски), с
   датами (финиш сварки = старт окраски, старт = финиш − buffer_days участка) и
   «основанием» в комментарии сварочного 1С-документа + локальной связью;
 - идемпотентность повтора (нет дублей заказа/связи, нет повторного POST);
@@ -34,9 +34,15 @@ from app.models import (
     ResourceProductionKind,
     SpecComponent,
     Specification,
+    MrpFreezeComponent,
     SyncLink,
+    ProductionMaterialIssueLine,
+    WorkshopWarehouseBinding,
+    StockBin,
 )
+from app.services import production_material_custody_projection as custody_projection
 from app.services import one_c_production_order_export as exporter
+from app.services import production_control_material_issues as material_issues
 from app.services.paint_weld_chain import open_paint_chain, open_paint_chains_for_products
 from app.services.planning_truth import publish_generation
 
@@ -90,10 +96,29 @@ def _setup_pair(
     kind = ProductionKind(ref_1c="kind-weld", name="Сварка")
     db.add(kind)
     db.flush()
-    weld_spec = Specification(spec_name="Сварка кронштейна", spec_ref1c="spec-weld", production_kind_id=kind.id)
+    weld_spec = Specification(
+        spec_name="Сварка кронштейна",
+        spec_ref1c="spec-weld",
+        production_kind_id=kind.id,
+        content_hash="spec-weld-frozen-v1",
+    )
     db.add(weld_spec)
     db.flush()
     db.add(DefaultSpecification(item_id=welded.item_id, spec_id=weld_spec.spec_id))
+    weld_component = _item(
+        db,
+        code="WLD-COMP",
+        name="Компонент сварной детали",
+        ref1c="ref-weld-component",
+    )
+    db.add(
+        SpecComponent(
+            spec_id=weld_spec.spec_id,
+            item_id=weld_component.item_id,
+            quantity=1,
+            component_type="Сборка",
+        )
+    )
     weld_resource = ProductionResource(resource_name="Участок сварочный", buffer_days=WELD_BUFFER_DAYS)
     db.add(weld_resource)
     db.flush()
@@ -138,6 +163,17 @@ def _setup_pair(
     )
     db.add(run)
     db.flush()
+    db.add(
+        MrpFreezeComponent(
+            run_id=run.run_id,
+            freeze_version=1,
+            parent_item_id=welded.item_id,
+            component_item_id=weld_component.item_id,
+            spec_ref=str(weld_spec.spec_ref1c or ""),
+            spec_version=str(weld_spec.content_hash or ""),
+            norm_qty_per_unit=1,
+        )
+    )
     painted_proposal = PlannedOrder(
         run_id=run.run_id,
         item_id=painted.item_id,
@@ -252,6 +288,17 @@ class _FailingClient(_FakeClient):
         raise RuntimeError("1С: не заполнена организация")
 
 
+class _FailSecondClient(_FakeClient):
+    """Сварка создана, но 1С отклонила следующий окрасочный заказ."""
+
+    def post(self, entity, payload, **_kwargs):
+        self._n += 1
+        self.posts.append((entity, payload))
+        if self._n == 2:
+            raise RuntimeError("1С: ошибка окраски")
+        return {"Ref_Key": "ref-weld-success"}
+
+
 def _stub_demo(monkeypatch):
     monkeypatch.setattr(
         exporter,
@@ -318,8 +365,11 @@ def test_preview_need_weld_builds_pair_with_dates_and_basis(db_session, monkeypa
     # финиш сварки = старт окраски; старт = финиш − buffer_days
     assert welded_out["planned_finish_date"] == "2026-08-10"
     assert welded_out["planned_start_date"] == (date(2026, 8, 10) - __import__("datetime").timedelta(days=WELD_BUFFER_DAYS)).isoformat()
-    # «основание» отражено и в предпросмотре сварочного payload
-    assert "основание: окрасочный заказ" in welded_out["payload"]["Комментарий"]
+    # Сварка — первый этап без основания; окраска ссылается на сварку.
+    assert "ДокументОснование" not in welded_out["payload"]
+    assert "основание: сварочный заказ" in res["painted"]["payload"]["Комментарий"]
+    assert res["painted"]["basis_pending_1c_ref"] is True
+    assert "ДокументОснование" not in res["painted"]["payload"]
     assert welded_out["payload"]["Продукция"][0]["Номенклатура_Key"] == "ref-welded"
     # dry-run ничего не пишет
     assert db.query(ProductionOrder).count() == 1
@@ -362,16 +412,16 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
     )
 
     assert res["verdict"] == "need_weld"
-    # окраска выгружена первой, сварка — второй
+    # сварка выгружена первой, окраска — второй
     assert len(fake.posts) == 2
-    assert res["painted"]["order_ref1c"] == "ref-1c-1"
-    assert res["welded"]["order_ref1c"] == "ref-1c-2"
+    assert res["welded"]["order_ref1c"] == "ref-1c-1"
+    assert res["painted"]["order_ref1c"] == "ref-1c-2"
 
     # заказы существуют локально
     paint_order = db.query(ProductionOrder).filter(ProductionOrder.order_id == res["painted"]["order_id"]).one()
     weld_order = db.query(ProductionOrder).filter(ProductionOrder.order_id == res["welded"]["order_id"]).one()
-    assert paint_order.order_ref1c == "ref-1c-1"
-    assert weld_order.order_ref1c == "ref-1c-2"
+    assert weld_order.order_ref1c == "ref-1c-1"
+    assert paint_order.order_ref1c == "ref-1c-2"
     weld_product = (
         db.query(ProductionProduct)
         .filter(ProductionProduct.order_id == weld_order.order_id)
@@ -391,17 +441,17 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
     assert link.welded_order_id == weld_order.order_id
 
     # «основание» проброшено штатными полями 1С + продублировано в комментарии
-    weld_payload = fake.posts[1][1]
-    assert weld_payload["ЗаказНаПроизводствоОснование_Key"] == paint_order.order_ref1c
-    assert weld_payload["ДокументОснование"] == paint_order.order_ref1c
-    assert weld_payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
-    assert "основание: окрасочный заказ" in weld_payload["Комментарий"]
-    assert paint_order.order_ref1c in weld_payload["Комментарий"]
+    paint_payload = fake.posts[1][1]
+    assert paint_payload["ЗаказНаПроизводствоОснование_Key"] == weld_order.order_ref1c
+    assert paint_payload["ДокументОснование"] == weld_order.order_ref1c
+    assert paint_payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
+    assert "основание: сварочный заказ" in paint_payload["Комментарий"]
+    assert weld_order.order_ref1c in paint_payload["Комментарий"]
 
-    # у окрасочного (первичного) заказа полей основания нет
-    paint_payload = fake.posts[0][1]
-    assert "ЗаказНаПроизводствоОснование_Key" not in paint_payload
-    assert "ДокументОснование" not in paint_payload
+    # у сварочного (первичного) заказа полей основания нет
+    weld_payload = fake.posts[0][1]
+    assert "ЗаказНаПроизводствоОснование_Key" not in weld_payload
+    assert "ДокументОснование" not in weld_payload
 
     # sync_link на оба заказа
     assert (
@@ -417,25 +467,21 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
         initiated_by="test",
     )
     assert expanded["status"] == "ok"
-    assert expanded["entries"][0]["status"] == "existing"
+    assert expanded["entries"][0]["status"] == "ok"
     assert expanded["product_ids"] == sorted(
         [painted_product.product_id, weld_product.product_id]
     )
 
 
-def test_weld_order_is_not_exported_when_paint_order_has_no_ref(db_session, monkeypatch):
-    """Контракт: «если основание неизвестно — дочерний документ выгружать нельзя».
-
-    1С не вернула Ref_Key окрасочного заказа → order_ref1c пуст → сварочный
-    заказ НЕ уходит в 1С (иначе он создался бы без ЗаказНаПроизводствоОснование).
-    """
+def test_paint_order_is_not_exported_when_weld_order_has_no_ref(db_session, monkeypatch):
+    """Без подтверждённой сварки окрасочный документ не отправляется."""
     db = db_session
     _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
     _stub_demo(monkeypatch)
     fake = _RefusingClient()
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    with pytest.raises(ValueError, match="без подтверждённого основания"):
+    with pytest.raises(ValueError, match="без подтверждённого сварочного основания"):
         open_paint_chain(
             db,
             painted_product_id=painted_product.product_id,
@@ -443,16 +489,15 @@ def test_weld_order_is_not_exported_when_paint_order_has_no_ref(db_session, monk
             dry_run=False,
         )
 
-    # ровно одна попытка POST — окрасочная; дочернего документа в 1С нет
+    # Ровно одна попытка POST — сварочная; окраски в 1С нет.
     assert len(fake.posts) == 1
-    assert db.query(ProductionOrder).count() == 1
-    assert db.query(PaintWeldChainLink).count() == 0
-    paint_order = db.query(ProductionOrder).one()
-    assert not (paint_order.order_ref1c or "")
+    assert db.query(ProductionOrder).count() == 2
+    assert db.query(PaintWeldChainLink).count() == 1
+    assert all(not (order.order_ref1c or "") for order in db.query(ProductionOrder).all())
 
 
-def test_weld_order_is_not_exported_when_paint_export_errors(db_session, monkeypatch):
-    """Ошибка 1С по родителю попадает в текст ошибки цепочки как причина."""
+def test_paint_order_is_not_exported_when_weld_export_errors(db_session, monkeypatch):
+    """Ошибка первого сварочного этапа не допускает POST окраски."""
     db = db_session
     _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
     _stub_demo(monkeypatch)
@@ -471,8 +516,61 @@ def test_weld_order_is_not_exported_when_paint_export_errors(db_session, monkeyp
     assert "не заполнена организация" in message
     assert "не выгружен" in message
     assert len(fake.posts) == 1
+    assert db.query(ProductionOrder).count() == 2
+    assert db.query(PaintWeldChainLink).count() == 1
+
+
+def test_open_fails_closed_when_frozen_weld_bom_is_missing(db_session, monkeypatch):
+    db = db_session
+    _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
+    db.query(MrpFreezeComponent).delete(synchronize_session=False)
+    db.commit()
+    _stub_demo(monkeypatch)
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    with pytest.raises(ValueError, match="frozen BOM rows are missing"):
+        open_paint_chain(
+            db,
+            painted_product_id=painted_product.product_id,
+            planned_start="2026-08-10",
+            dry_run=False,
+        )
+
+    assert fake.posts == []
     assert db.query(ProductionOrder).count() == 1
     assert db.query(PaintWeldChainLink).count() == 0
+
+
+def test_paint_failure_keeps_weld_success_and_retry_posts_only_paint(db_session, monkeypatch):
+    db = db_session
+    _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
+    _stub_demo(monkeypatch)
+    first_client = _FailSecondClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: first_client)
+
+    first = open_paint_chain(
+        db,
+        painted_product_id=painted_product.product_id,
+        planned_start="2026-08-10",
+        dry_run=False,
+    )
+    assert first["status"] == "partial_error"
+    assert first["welded"]["order_ref1c"] == "ref-weld-success"
+    assert first["painted"]["order_ref1c"] is None
+    assert len(first_client.posts) == 2
+
+    retry_client = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: retry_client)
+    second = open_paint_chain(
+        db,
+        painted_product_id=painted_product.product_id,
+        planned_start="2026-08-10",
+        dry_run=False,
+    )
+    assert second["status"] == "ok"
+    assert len(retry_client.posts) == 1
+    assert retry_client.posts[0][1]["ЗаказНаПроизводствоОснование_Key"] == "ref-weld-success"
 
 
 def test_open_is_idempotent_on_repeat(db_session, monkeypatch):
@@ -601,3 +699,156 @@ def test_existing_weld_allocations_reduce_shared_obligation(
     assert result["guard"]["allocated_qty"] == 5
     assert result["guard"]["outstanding_qty"] == 3
     assert result["welded"]["qty"] == 3
+
+
+def test_welded_material_issues_use_frozen_bom_after_default_spec_change(
+    db_session, monkeypatch
+):
+    db = db_session
+    painted, welded, painted_product = _setup_pair(db, weld_outstanding=10)
+
+    run = db.query(PlanningRun).one()
+    run_id = int(run.run_id)
+    freeze_version = run.active_freeze_version
+    assert freeze_version is not None
+
+    old_weld_default = db.query(DefaultSpecification).filter(
+        DefaultSpecification.item_id == int(welded.item_id)
+    ).one()
+    old_weld_spec = db.get(Specification, int(old_weld_default.spec_id))
+    assert old_weld_spec is not None
+    old_weld_spec.content_hash = "spec_hash_frozen_v1"
+    db.query(MrpFreezeComponent).filter(
+        MrpFreezeComponent.parent_item_id == int(welded.item_id)
+    ).delete(synchronize_session=False)
+    db.query(SpecComponent).filter(
+        SpecComponent.spec_id == int(old_weld_spec.spec_id)
+    ).delete(synchronize_session=False)
+
+    old_component = _item(
+        db,
+        code="CMP-A",
+        name="Комплект для старой сварки",
+        ref1c="ref-comp-a",
+    )
+    new_component = _item(
+        db,
+        code="CMP-B",
+        name="Комплект для новой сварки",
+        ref1c="ref-comp-b",
+    )
+
+    db.add(
+        SpecComponent(
+            spec_id=int(old_weld_spec.spec_id),
+            item_id=int(old_component.item_id),
+            quantity=1,
+            component_type="Сборка",
+        )
+    )
+    db.add(
+        MrpFreezeComponent(
+            run_id=run_id,
+            freeze_version=int(freeze_version),
+            parent_item_id=int(welded.item_id),
+            component_item_id=int(old_component.item_id),
+            spec_ref=str(old_weld_spec.spec_ref1c or ""),
+            spec_version=str(old_weld_spec.content_hash or ""),
+            norm_qty_per_unit=1,
+        )
+    )
+
+    new_weld_spec = Specification(
+        spec_name="Сварка кронштейна v2",
+        spec_ref1c="spec-weld-updated",
+        content_hash="spec_hash_live_v2",
+    )
+    db.add(new_weld_spec)
+    db.flush()
+    db.add(
+        SpecComponent(
+            spec_id=int(new_weld_spec.spec_id),
+            item_id=int(new_component.item_id),
+            quantity=1,
+            component_type="Сборка",
+        )
+    )
+    old_weld_default.spec_id = int(new_weld_spec.spec_id)
+
+    weld_resource = db.query(ProductionResource).filter(
+        ProductionResource.resource_name == "Участок сварочный"
+    ).one()
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=int(weld_resource.resource_id),
+            warehouse_ref1c="warehouse-weld",
+            production_warehouse_ref1c="warehouse-out",
+        )
+    )
+    for comp in [old_component, new_component]:
+        db.add(
+            StockBin(
+                ledger_generation_id=int(run.ledger_generation_id),
+                item_id=int(comp.item_id),
+                warehouse_ref1c="warehouse-source",
+                on_hand=10,
+                characteristic_ref="",
+                organization_ref="",
+            )
+        )
+    db.flush()
+
+    _stub_demo(monkeypatch)
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+    monkeypatch.setattr(
+        custody_projection,
+        "load_current_accepted_material_custody",
+        lambda _db, consumer=None: (
+            int(run.ledger_generation_id),
+            custody_projection.MaterialCustodyState(),
+        ),
+    )
+    monkeypatch.setattr(
+        material_issues,
+        "load_current_accepted_material_custody",
+        lambda _db, consumer=None: (
+            int(run.ledger_generation_id),
+            custody_projection.MaterialCustodyState(),
+        ),
+    )
+
+    result = open_paint_chain(
+        db,
+        painted_product_id=painted_product.product_id,
+        planned_start="2026-08-10",
+        dry_run=False,
+    )
+
+    assert result["verdict"] == "need_weld"
+    weld_order_id = int(result["welded"]["order_id"])
+    welded_product = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.order_id == weld_order_id)
+        .one()
+    )
+    assert welded_product.spec_id == int(old_weld_spec.spec_id)
+    assert str(welded_product.spec_revision_hash or "") == str(old_weld_spec.content_hash)
+
+    issues = material_issues.create_material_issues(
+        db,
+        product_ids=[int(welded_product.product_id)],
+        initiated_by="pytest",
+    )
+    assert issues["status"] == "ok"
+    assert not issues["selection_required"]
+    assert issues["errors"] == []
+
+    issue_line = (
+        db.query(ProductionMaterialIssueLine)
+        .filter(ProductionMaterialIssueLine.issue_id == int(issues["created"][0]["issue_id"]))
+        .first()
+    )
+    assert issue_line is not None
+    assert int(issue_line.component_item_id) == int(old_component.item_id)
+    assert int(issue_line.source_spec_id or 0) == int(old_weld_spec.spec_id)

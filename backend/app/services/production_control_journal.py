@@ -13,6 +13,7 @@ from ..models import (
     MrpRequirement,
     MrpFreezeComponent,
     PaintWeldChainLink,
+    PaintWeldPair,
     PlannedOrder,
     PlanningRun,
     ProductionPlanHeader,
@@ -758,6 +759,66 @@ def _available_actions_for_journal_row(
     return []
 
 
+def _paint_weld_pair_metadata_by_item(
+    db: Session,
+    item_ids: Sequence[int],
+) -> Dict[int, Dict[str, Any]]:
+    ids = sorted({int(value) for value in item_ids if value is not None})
+    if not ids:
+        return {}
+    pairs = (
+        db.query(PaintWeldPair)
+        .filter(PaintWeldPair.is_active.is_(True))
+        .filter(
+            (PaintWeldPair.painted_item_id.in_(ids))
+            | (PaintWeldPair.welded_item_id.in_(ids))
+        )
+        .order_by(PaintWeldPair.id.asc())
+        .all()
+    )
+    counterpart_ids = sorted(
+        {int(pair.painted_item_id) for pair in pairs}
+        | {int(pair.welded_item_id) for pair in pairs}
+    )
+    items = {
+        int(item.item_id): item
+        for item in db.query(Item).filter(Item.item_id.in_(counterpart_ids)).all()
+    }
+    blocked_welded = is_welded_blocked(db, ids)
+    result: Dict[int, Dict[str, Any]] = {}
+    for pair in pairs:
+        painted_id = int(pair.painted_item_id)
+        welded_id = int(pair.welded_item_id)
+        painted = items.get(painted_id)
+        welded = items.get(welded_id)
+        if painted_id in ids:
+            result[painted_id] = {
+                "pair_id": int(pair.id),
+                "role": "painted",
+                "counterpart_item_id": welded_id,
+                "counterpart_item_code": str(welded.item_code or "") if welded else "",
+                "counterpart_item_name": str(welded.item_name or "") if welded else "",
+                "counterpart_item_article": str(welded.item_article or "") if welded else "",
+                "selection_disabled_reason": None,
+            }
+        if welded_id in ids and welded_id not in result:
+            result[welded_id] = {
+                "pair_id": int(pair.id),
+                "role": "welded",
+                "counterpart_item_id": painted_id,
+                "counterpart_item_code": str(painted.item_code or "") if painted else "",
+                "counterpart_item_name": str(painted.item_name or "") if painted else "",
+                "counterpart_item_article": str(painted.item_article or "") if painted else "",
+                "selection_disabled_reason": (
+                    "Сварная деталь входит в цепочку сварка → окраска; "
+                    "запуск выполняется из окрашенной строки"
+                    if welded_id in blocked_welded
+                    else None
+                ),
+            }
+    return result
+
+
 def list_journal(
     db: Session,
     *,
@@ -827,16 +888,6 @@ def list_journal(
             ProductionOrder.source_run_id.in_(accepted_run_ids or [-1]),
         )
     )
-
-    # A linked weld order is the execution side of one aggregated journal
-    # entry owned by the painted order. Direct focus remains available for
-    # diagnostics and deep links.
-    if product_id is None and order_id is None:
-        query = query.filter(
-            ~ProductionOrder.order_id.in_(
-                db.query(PaintWeldChainLink.welded_order_id)
-            )
-        )
 
     if product_id is not None:
         query = query.filter(ProductionProduct.product_id == int(product_id))
@@ -1021,6 +1072,7 @@ def list_journal(
                 ),
             }
     item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
+    pair_by_item = _paint_weld_pair_metadata_by_item(db, item_ids)
     product_ids = sorted({int(product.product_id) for product in rows if product.product_id is not None})
     default_spec_by_item = _default_spec_ids_by_item(db, item_ids)
     spec_ids = sorted({
@@ -1182,6 +1234,14 @@ def list_journal(
             status=work_status,
             has_1c_link=has_1c_link,
         )
+        pair_metadata = pair_by_item.get(int(product.item_id))
+        selection_disabled_reason = (
+            str(pair_metadata.get("selection_disabled_reason") or "")
+            if pair_metadata
+            else ""
+        ) or None
+        if selection_disabled_reason:
+            available_actions = []
         coverage_label = (
             material_coverage_label
             if row_coverage_status == material_coverage_status and material_coverage_label
@@ -1244,6 +1304,7 @@ def list_journal(
                 "source_mrp_requirement_id": source_mrp_requirement_id,
                 "source_mrp_allocation_key": str(product.source_mrp_allocation_key or "") if product.source_mrp_allocation_key else None,
                 "available_actions": available_actions,
+                "selection_disabled_reason": selection_disabled_reason,
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
                 "mrp_req_covered_qty": req_meta.get("covered_qty"),
                 "mrp_req_remaining_qty": req_meta.get("remaining_qty"),
@@ -1255,6 +1316,7 @@ def list_journal(
                 "shelf_materialized_qty": shelf.materialized_qty if shelf else None,
                 "shelf_latest_start_date": _date_to_iso(shelf.latest_start_date) if shelf else None,
                 "paint_weld_chain": chain_by_order_id.get(int(product.order_id)),
+                "paint_weld_pair": pair_metadata,
             }
         )
 
@@ -1316,6 +1378,7 @@ def list_make_proposals(
         return []
 
     item_ids = sorted({int(row.item_id) for row in work_items})
+    pair_by_item = _paint_weld_pair_metadata_by_item(db, item_ids)
     requirement_ids = sorted({int(row.requirement_id) for row in work_items})
     items = {
         int(item.item_id): item
@@ -1436,6 +1499,12 @@ def list_make_proposals(
             shelf_allowance[int(work.item_id)] = max(0.0, allowance - launchable_qty)
         if launchable_qty <= 1e-9:
             continue
+        pair_metadata = pair_by_item.get(int(work.item_id))
+        selection_disabled_reason = (
+            str(pair_metadata.get("selection_disabled_reason") or "")
+            if pair_metadata
+            else ""
+        ) or None
         result.append(
             {
                 "journal_row_key": f"work-item:{int(work.id)}",
@@ -1484,7 +1553,8 @@ def list_make_proposals(
                 "source_planned_order_id": None,
                 "source_mrp_requirement_id": int(work.requirement_id),
                 "source_mrp_allocation_key": None,
-                "available_actions": ["materialize"],
+                "available_actions": [] if selection_disabled_reason else ["materialize"],
+                "selection_disabled_reason": selection_disabled_reason,
                 "mrp_req_net_qty": required_qty,
                 "mrp_req_covered_qty": fulfilled_qty,
                 "mrp_req_remaining_qty": remaining_qty,
@@ -1496,6 +1566,7 @@ def list_make_proposals(
                 "shelf_materialized_qty": shelf.materialized_qty if shelf else None,
                 "shelf_latest_start_date": _date_to_iso(shelf.latest_start_date) if shelf else None,
                 "paint_weld_chain": None,
+                "paint_weld_pair": pair_metadata,
             }
         )
     return result

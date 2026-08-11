@@ -126,6 +126,10 @@ class ProductionMaterialsResponse(BaseModel):
     coverage: str
     coverage_status: str
     coverage_label: str
+    coverage_basis: Literal["direct_bom", "welded_bom"] = "direct_bom"
+    coverage_basis_item_id: Optional[int] = None
+    coverage_basis_item_name: Optional[str] = None
+    coverage_basis_item_article: Optional[str] = None
 
 
 class DrumSlotRow(BaseModel):
@@ -712,6 +716,18 @@ class PaintWeldChainResponse(BaseModel):
     counterpart_workshop_name: Optional[str] = None
 
 
+class PaintWeldPairResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pair_id: int
+    role: Literal["painted", "welded"]
+    counterpart_item_id: int
+    counterpart_item_code: str
+    counterpart_item_name: str
+    counterpart_item_article: str
+    selection_disabled_reason: Optional[str] = None
+
+
 class ProductionOrderJournalRowResponse(BaseModel):
     """One executor order or saved MRP proposal in the unified journal."""
 
@@ -773,6 +789,7 @@ class ProductionOrderJournalRowResponse(BaseModel):
     mrp_req_covered_qty: Optional[float] = None
     mrp_req_remaining_qty: Optional[float] = None
     available_actions: list[str] = []
+    selection_disabled_reason: Optional[str] = None
     # DBR shelf pull: what drives this launch, how much and onto which shelf.
     launch_source: str = "mrp_remaining"
     shelf_warehouse_ref1c: Optional[str] = None
@@ -782,6 +799,7 @@ class ProductionOrderJournalRowResponse(BaseModel):
     materialized_order_qty: Optional[float] = None
     launchable_qty: Optional[float] = None
     paint_weld_chain: Optional[PaintWeldChainResponse] = None
+    paint_weld_pair: Optional[PaintWeldPairResponse] = None
 
 
 class ProductionOrderJournalResponse(BaseModel):
@@ -939,6 +957,7 @@ def get_work_item_materials(
             spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
             ledger_generation_id=int(truth.generation_id),
             order_number=f"MRP-R-{int(work.requirement_id)}",
+            run_id=int(work.run_id),
         )
         payload["truth_status"] = "accepted"
         payload["cutoff"] = truth.cutoff.isoformat()

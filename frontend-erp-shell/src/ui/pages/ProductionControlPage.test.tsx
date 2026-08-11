@@ -148,6 +148,7 @@ function fakeMaterials(): MaterialsResponse {
     coverage: 'assembled',
     coverage_status: 'assembled',
     coverage_label: 'Собрано',
+    coverage_basis: 'direct_bom',
     components: [
       {
         component_item_id: 301,
@@ -692,11 +693,9 @@ describe('ProductionControlPage — characterization', () => {
     const paint = {
       ...painted,
       item_name: 'Кронштейн после окраски',
-      paint_weld_chain: {
-        role: 'painted', link_id: 71, counterpart_product_id: 102,
-        counterpart_order_number: 'WELD-1', counterpart_order_prodplan_number: 'WELD-1',
-        counterpart_item_name: 'Кронштейн после сварки',
-        counterpart_quantity: 10, counterpart_remaining_qty: 10, counterpart_unit: 'шт',
+      paint_weld_pair: {
+        pair_id: 7, role: 'painted', counterpart_item_id: 202,
+        counterpart_item_name: 'Кронштейн после сварки', counterpart_item_article: 'WELD-1', counterpart_item_code: '',
       },
     } as OrderRow
     vi.mocked(listProductionOrders).mockResolvedValue({
@@ -709,13 +708,66 @@ describe('ProductionControlPage — characterization', () => {
     const user = userEvent.setup()
     renderPage()
 
-    await screen.findByText('Сварка: WELD-1')
+    await screen.findByText(/^Сварная деталь: Кронштейн после сварки/)
     expect(within(ordersTable(document.body)).getAllByRole('row')).toHaveLength(2)
     await user.click(within(rowFor('Кронштейн после окраски')).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
 
-    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101, 102]))
+    expect(window.confirm).toHaveBeenCalledWith(
+      'Будет открыта цепочка сварка → окраска. Сначала будет запущена сварная деталь: Кронштейн после сварки. Продолжить?',
+    )
+    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101]))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101, 102], 'erp-shell', undefined))
+  })
+
+  it('shows a welded row as a disabled chain member and identifies the welded materials basis', async () => {
+    const [painted] = fakeRows()
+    const paint = {
+      ...painted,
+      item_name: 'Кронштейн после окраски',
+      paint_weld_pair: {
+        pair_id: 8, role: 'painted' as const, counterpart_item_id: 202,
+        counterpart_item_name: 'Кронштейн после сварки', counterpart_item_article: 'WELD-1', counterpart_item_code: '',
+      },
+    }
+    const welded = {
+      ...painted,
+      product_id: 102,
+      order_id: 102,
+      item_id: 202,
+      item_name: 'Кронштейн после сварки',
+      order_number: 'WELD-1',
+      order_prodplan_number: 'WELD-1',
+      selection_disabled_reason: 'Запускается вместе с окрашенной деталью',
+      paint_weld_pair: {
+        pair_id: 8, role: 'welded' as const, counterpart_item_id: 101,
+        counterpart_item_name: 'Кронштейн после окраски', counterpart_item_article: '', counterpart_item_code: '',
+      },
+    }
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [paint, welded], total: 2, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(getOrderMaterials).mockResolvedValue({
+      ...fakeMaterials(), coverage_basis_item_name: 'Кронштейн после сварки',
+    })
+    const user = userEvent.setup()
+    renderPage()
+
+    await waitFor(() => expect(within(ordersTable(document.body)).getByText('Кронштейн после сварки')).toBeInTheDocument())
+    const tableRow = rowFor('Кронштейн после сварки')
+    expect(tableRow).toHaveClass('weldedPaintWeldRow')
+    expect(within(tableRow).getByRole('checkbox')).toBeDisabled()
+    expect(within(ordersTable(document.body)).getByText('Цепочка сварка → окраска: запуск из окрашенной строки')).toBeInTheDocument()
+    expect(within(ordersTable(document.body)).getByText(/^Цепочка сварка → окраска: сварная строка/)).toBeInTheDocument()
+    expect(await screen.findByText('Показаны компоненты сварной детали: Кронштейн после сварки')).toBeInTheDocument()
+
+    await user.click(tableRow)
+    expect(screen.getByRole('button', { name: 'Произвести строку' })).toBeDisabled()
+
+    tableRow.focus()
+    await user.keyboard(' ')
+    expect(within(tableRow).getByRole('checkbox')).not.toBeChecked()
   })
 
   it('closes a paint-weld pair through the combined chain action', async () => {
@@ -736,7 +788,7 @@ describe('ProductionControlPage — characterization', () => {
     })
     const user = userEvent.setup()
     renderPage()
-    await screen.findByText('Сварка: Кронштейн после сварки')
+    await screen.findByText('Сварная деталь: Кронштейн после сварки')
 
     await user.click(within(rowFor('Кронштейн после окраски')).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: 'Произвести' }))

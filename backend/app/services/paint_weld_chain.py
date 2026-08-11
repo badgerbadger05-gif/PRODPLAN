@@ -1,4 +1,4 @@
-"""Цепочка открытия «окраска → сварка» из штатного журнала (этап 2).
+"""Цепочка открытия «сварка → окраска» из штатного журнала.
 
 См. .docs/paint_weld_chain_logic.md.
 
@@ -8,24 +8,23 @@
   вердикт по сварной детали:
   * ``stock_covers`` / ``order_open`` / ``no_pair`` — сварочный заказ НЕ создаётся,
     окрасочный заказ создаётся/выгружается штатно;
-  * ``need_weld`` — создаётся ПАРА заказов: сначала окрасочный (штатный путь
-    журнала: production_orders/production_products + экспорт через
-    ``one_c_production_order_export``), затем сварочный НА ОСНОВАНИИ окрасочного.
+  * ``need_weld`` — создаётся ПАРА заказов: сначала сварочный, затем
+    окрасочный НА ОСНОВАНИИ сварочного.
 
 - сварочный заказ:
   * qty ограничено незакрытым `make`-обязательством Ledger за вычетом уже
     материализованных из него сварочных строк;
   * финиш сварки = старт окраски, старт сварки = финиш − buffer_days сварочного
     участка;
-  * связь «на основании»: сварочный 1С-документ выгружается со штатными полями
-    основания (``ЗаказНаПроизводствоОснование_Key`` + ``ДокументОснование``/
-    ``_Type`` через ``basis_order_refs`` экспортёра). Локальная связь
+  * связь «на основании»: окрасочный 1С-документ выгружается со штатными полями
+    основания сварочного заказа (``ЗаказНаПроизводствоОснование_Key`` +
+    ``ДокументОснование``/``_Type`` через ``basis_order_refs`` экспортёра). Локальная связь
     ``paint_weld_chain_links`` остаётся источником истины на стороне PRODPLAN
     (якорь идемпотентности), комментарий дублирует основание для людей.
 
 - ``dry_run=True`` — полный предпросмотр (оба payload'а + вердикт гарда) без
   записи; ``dry_run=False`` — реальное создание в правильном порядке
-  (окраска → сварка), идемпотентно при повторе (якорь — ``painted_order_id`` в
+  (сварка → окраска), идемпотентно при повторе (якорь — ``painted_order_id`` в
   ``paint_weld_chain_links`` и sync_link экспортёра).
 """
 
@@ -47,8 +46,10 @@ from ..models import (
     ProductionOrderLineState,
     ProductionManufacture,
     ProductionProduct,
+    MrpFreezeComponent,
     ProductionResource,
     ReservationEntry,
+    Specification,
 )
 from .mrp_mutation_guard import (
     MrpMutationLineageError,
@@ -98,6 +99,70 @@ def _weld_buffer_days(db: Session, welded_item_id: int) -> int:
         .first()
     )
     return int(resource.buffer_days or 0) if resource else 0
+
+
+def _resolve_frozen_weld_spec(
+    db: Session,
+    *,
+    run: PlanningRun,
+    welded_item_id: int,
+) -> tuple[Optional[int], Optional[str]]:
+    """Return exactly one frozen BOM spec for this weld item or fail-closed."""
+    freeze_version = run.active_freeze_version
+    if freeze_version is None:
+        raise ValueError(
+            "cannot safely pin welded specification: active MRP freeze is missing"
+        )
+
+    frozen_specs = {
+        (str(spec_ref or "").strip(), str(spec_version or "").strip())
+        for spec_ref, spec_version in (
+            db.query(MrpFreezeComponent.spec_ref, MrpFreezeComponent.spec_version)
+            .filter(
+                MrpFreezeComponent.run_id == int(run.run_id),
+                MrpFreezeComponent.freeze_version == int(freeze_version),
+                MrpFreezeComponent.parent_item_id == int(welded_item_id),
+            )
+            .all()
+        )
+    }
+    if not frozen_specs:
+        raise ValueError(
+            "cannot safely pin welded specification: frozen BOM rows are missing"
+        )
+    if len(frozen_specs) != 1:
+        raise ValueError(
+            "cannot safely pin welded specification: frozen BOM has multiple "
+            "specification roots for this item"
+        )
+    spec_ref, spec_version = next(iter(frozen_specs))
+    if not spec_ref or not spec_version:
+        raise ValueError(
+            "cannot safely pin welded specification: frozen BOM lacks immutable "
+            "spec reference/version"
+        )
+
+    spec = (
+        db.query(Specification)
+        .filter(Specification.spec_ref1c == spec_ref)
+        .first()
+    )
+    if spec is None:
+        raise ValueError(
+            "cannot safely pin welded specification: frozen BOM spec not found in"
+            " specifications"
+        )
+    if not str(spec.content_hash or ""):
+        raise ValueError(
+            "cannot safely pin welded specification: frozen BOM spec has no current "
+            "content hash"
+        )
+    if str(spec.content_hash or "") != str(spec_version):
+        raise ValueError(
+            "cannot safely pin welded specification: frozen BOM spec hash changed; "
+            "external writes blocked until a fresh freeze"
+        )
+    return int(spec.spec_id), str(spec_version)
 
 
 @dataclass(frozen=True)
@@ -323,6 +388,11 @@ def _ensure_weld_order(
 
     if weld_qty <= 1e-9 or weld_qty > obligation.available_qty + 1e-9:
         raise ValueError("weld quantity exceeds the outstanding Ledger obligation")
+    frozen_spec_id, frozen_spec_hash = _resolve_frozen_weld_spec(
+        db, run=ctx.run, welded_item_id=welded_item_id
+    )
+    welded_spec_id = int(frozen_spec_id)
+
     # Exporting the painted parent may commit its own 1C sync state.  Re-lock
     # and re-read the shared requirement immediately before allocating the
     # welded slice so another painted order cannot spend the same quantity in
@@ -354,7 +424,8 @@ def _ensure_weld_order(
         quantity=weld_qty,
         produced_qty=0,
         remaining_qty=weld_qty,
-        spec_id=_default_spec_id(db, welded_item_id),
+        spec_id=welded_spec_id,
+        spec_revision_hash=frozen_spec_hash,
         source_mrp_requirement_id=int(obligation.requirement.id),
         source_mrp_allocation_key=(
             f"paint_weld:{int(painted_order.order_id)}:"
@@ -385,12 +456,12 @@ def _ensure_weld_order(
     return order, False
 
 
-def _basis_comment(paint_order: ProductionOrder) -> str:
-    ref = str(paint_order.order_ref1c or "").strip()
-    number = production_order_number(paint_order)
+def _basis_comment(weld_order: ProductionOrder) -> str:
+    ref = str(weld_order.order_ref1c or "").strip()
+    number = production_order_number(weld_order)
     if ref:
-        return f"основание: окрасочный заказ {number} (1С ref {ref})"
-    return f"основание: окрасочный заказ {number}"
+        return f"основание: сварочный заказ {number} (1С ref {ref})"
+    return f"основание: сварочный заказ {number}"
 
 
 def _order_payload(export_summary: Dict[str, Any], order_id: int) -> Optional[Dict[str, Any]]:
@@ -416,7 +487,7 @@ def _order_export_entry(
 def _parent_export_failure(
     export_summary: Dict[str, Any], *, order_id: int
 ) -> Optional[str]:
-    """Причина, по которой окрасочный заказ нельзя считать выгруженным в 1С.
+    """Причина, по которой конкретный заказ нельзя считать выгруженным в 1С.
 
     Контракт .docs/one_c_export_from_prodplan.md: «Если основание неизвестно или
     родительский документ ещё не создан в 1С, дочерний документ выгружать
@@ -456,7 +527,7 @@ def open_paint_chain(
     dry_run: bool = True,
     initiated_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Открыть окрасочный заказ + (при need_weld) сварочный на основании.
+    """Открыть сварочный заказ и затем окрасочный на его основании.
 
     Возвращает вердикт гарда, сводку по обоим заказам и — в dry_run — payload'ы,
     которые ушли бы в 1С.
@@ -542,6 +613,15 @@ def open_paint_chain(
         )
         weld_needed = verdict == "need_weld" or existing_link is not None
         result["weld_needed"] = weld_needed
+        if (
+            weld_needed
+            and existing_link is None
+            and str(paint_order.order_ref1c or "").strip()
+        ):
+            raise ValueError(
+                "окрасочный заказ уже выгружен в 1С без сварочного основания; "
+                "автоматически переворачивать исторический документ запрещено"
+            )
 
         welded_item_id = int(pair.welded_item_id) if pair is not None else None
         weld_qty = 0.0
@@ -566,98 +646,10 @@ def open_paint_chain(
                 weld_qty = min(ctx.qty, obligation.available_qty)
             weld_start, weld_finish = _weld_dates(db, welded_item_id, ctx.start)
 
-        if dry_run:
-            paint_export = export_production_orders_to_1c(
-                db, [int(paint_order.order_id)], dry_run=True
-            )
-            result["painted"] = {
-                "order_id": int(paint_order.order_id),
-                "order_number": str(paint_order.order_number or ""),
-                "item_id": ctx.item_id,
-                "qty": round(ctx.qty, 3),
-                "planned_start_date": ctx.start.isoformat() if ctx.start else None,
-                "planned_finish_date": ctx.finish.isoformat() if ctx.finish else None,
-                "reused": paint_reused,
-                "payload": _order_payload(paint_export, int(paint_order.order_id)),
-            }
-            if weld_needed and welded_item_id is not None:
-                pair = _active_pair(db, ctx.item_id)
-                weld_order, weld_reused = _ensure_weld_order(
-                    db,
-                    ctx=ctx,
-                    obligation=obligation,
-                    pair=pair,
-                    painted_order=paint_order,
-                    welded_item_id=welded_item_id,
-                    weld_qty=weld_qty,
-                    weld_start=weld_start,
-                    weld_finish=weld_finish,
-                    basis_comment=_basis_comment(paint_order),
-                )
-                weld_export = export_production_orders_to_1c(
-                    db,
-                    [int(weld_order.order_id)],
-                    dry_run=True,
-                    comment_suffixes={int(weld_order.order_id): _basis_comment(paint_order)},
-                    # В предпросмотре ref окрасочного есть только если он уже
-                    # выгружен в 1С; при реальном открытии поле появится всегда.
-                    basis_order_refs={
-                        int(weld_order.order_id): str(paint_order.order_ref1c or "")
-                    },
-                )
-                result["welded"] = {
-                    "order_id": int(weld_order.order_id),
-                    "order_number": str(weld_order.order_number or ""),
-                    "item_id": welded_item_id,
-                    "qty": weld_qty,
-                    "planned_start_date": weld_start.isoformat() if weld_start else None,
-                    "planned_finish_date": weld_finish.isoformat() if weld_finish else None,
-                    "basis": _basis_comment(paint_order),
-                    "reused": weld_reused,
-                    "payload": _order_payload(weld_export, int(weld_order.order_id)),
-                }
-            # Предпросмотр ничего не пишет.
-            db.rollback()
-            return result
-
-        # ----- реальная запись: окраска, затем сварка -----
-        paint_export = export_production_orders_to_1c(
-            db,
-            [int(paint_order.order_id)],
-            dry_run=False,
-        )
-        db.flush()
-        db.refresh(paint_order)
-        # Основание дочернего документа обязано быть подтверждённым, а не
-        # предполагаемым: без этой проверки сварочный заказ уходил в 1С без
-        # ЗаказНаПроизводствоОснование_Key, как только окрасочный не создался.
-        paint_failure = _parent_export_failure(
-            paint_export, order_id=int(paint_order.order_id)
-        )
-        paint_ref = str(paint_order.order_ref1c or "").strip()
-        if paint_failure is None and not paint_ref:
-            paint_failure = "order_ref1c окрасочного заказа остался пустым"
-        if paint_failure is not None:
-            raise ValueError(
-                f"Окрасочный заказ {production_order_number(paint_order)} не выгружен "
-                f"в 1С: {paint_failure}. Сварочный заказ не выгружается без "
-                "подтверждённого основания."
-            )
-        result["painted"] = {
-            "order_id": int(paint_order.order_id),
-            "order_number": str(paint_order.order_number or ""),
-            "order_ref1c": str(paint_order.order_ref1c or "") or None,
-            "item_id": ctx.item_id,
-            "qty": round(ctx.qty, 3),
-            "planned_start_date": ctx.start.isoformat() if ctx.start else None,
-            "planned_finish_date": ctx.finish.isoformat() if ctx.finish else None,
-            "reused": paint_reused,
-            "export": paint_export,
-        }
-
+        weld_order: ProductionOrder | None = None
+        weld_reused = False
         if weld_needed and welded_item_id is not None:
             pair = _active_pair(db, ctx.item_id)
-            basis = _basis_comment(paint_order)
             weld_order, weld_reused = _ensure_weld_order(
                 db,
                 ctx=ctx,
@@ -668,14 +660,72 @@ def open_paint_chain(
                 weld_qty=weld_qty,
                 weld_start=weld_start,
                 weld_finish=weld_finish,
-                basis_comment=basis,
+                basis_comment="первый этап цепочки сварка → окраска",
             )
-            weld_export = export_production_orders_to_1c(
+            if (
+                existing_link is not None
+                and str(paint_order.order_ref1c or "").strip()
+                and not str(weld_order.order_ref1c or "").strip()
+            ):
+                raise ValueError(
+                    "обнаружена историческая цепочка окраска → сварка: "
+                    "окрасочный заказ уже есть в 1С, а сварочный не подтверждён; "
+                    "автоматическое изменение направления запрещено"
+                )
+
+        if dry_run:
+            weld_export = None
+            if weld_order is not None:
+                weld_export = export_production_orders_to_1c(
+                    db, [int(weld_order.order_id)], dry_run=True,
+                )
+                result["welded"] = {
+                    "order_id": int(weld_order.order_id),
+                    "order_number": str(weld_order.order_number or ""),
+                    "item_id": welded_item_id,
+                    "qty": weld_qty,
+                    "planned_start_date": weld_start.isoformat() if weld_start else None,
+                    "planned_finish_date": weld_finish.isoformat() if weld_finish else None,
+                    "reused": weld_reused,
+                    "payload": _order_payload(weld_export, int(weld_order.order_id)),
+                }
+            paint_basis = _basis_comment(weld_order) if weld_order is not None else None
+            paint_export = export_production_orders_to_1c(
                 db,
-                [int(weld_order.order_id)],
-                dry_run=False,
-                comment_suffixes={int(weld_order.order_id): basis},
-                basis_order_refs={int(weld_order.order_id): paint_ref},
+                [int(paint_order.order_id)],
+                dry_run=True,
+                comment_suffixes=(
+                    {int(paint_order.order_id): paint_basis} if paint_basis else None
+                ),
+                basis_order_refs=(
+                    {int(paint_order.order_id): str(weld_order.order_ref1c or "")}
+                    if weld_order is not None
+                    else None
+                ),
+            )
+            result["painted"] = {
+                "order_id": int(paint_order.order_id),
+                "order_number": str(paint_order.order_number or ""),
+                "item_id": ctx.item_id,
+                "qty": round(ctx.qty, 3),
+                "planned_start_date": ctx.start.isoformat() if ctx.start else None,
+                "planned_finish_date": ctx.finish.isoformat() if ctx.finish else None,
+                "basis": paint_basis,
+                "basis_pending_1c_ref": bool(
+                    weld_order is not None
+                    and not str(weld_order.order_ref1c or "").strip()
+                ),
+                "reused": paint_reused,
+                "payload": _order_payload(paint_export, int(paint_order.order_id)),
+            }
+            db.rollback()
+            return result
+
+        # ----- реальная запись: сварка, затем окраска -----
+        weld_ref = ""
+        if weld_order is not None:
+            weld_export = export_production_orders_to_1c(
+                db, [int(weld_order.order_id)], dry_run=False,
             )
             db.refresh(weld_order)
             weld_failure = _parent_export_failure(
@@ -683,6 +733,7 @@ def open_paint_chain(
             )
             if weld_failure is None and not str(weld_order.order_ref1c or "").strip():
                 weld_failure = "order_ref1c сварочного заказа остался пустым"
+            weld_ref = str(weld_order.order_ref1c or "").strip()
             result["welded"] = {
                 "order_id": int(weld_order.order_id),
                 "order_number": str(weld_order.order_number or ""),
@@ -691,20 +742,55 @@ def open_paint_chain(
                 "qty": weld_qty,
                 "planned_start_date": weld_start.isoformat() if weld_start else None,
                 "planned_finish_date": weld_finish.isoformat() if weld_finish else None,
-                "basis": basis,
                 "reused": weld_reused,
                 "export": weld_export,
                 "error": weld_failure,
             }
             if weld_failure is not None:
-                # Окрасочный заказ уже живёт в 1С (экспортёр коммитит построчно),
-                # поэтому откатывать нечего — но и «ok» это не есть.
-                result["status"] = "partial_error"
-                result["error"] = (
-                    f"Окрасочный заказ выгружен, сварочный "
-                    f"{production_order_number(weld_order)} — нет: {weld_failure}. "
-                    "Повторите открытие цепочки."
+                raise ValueError(
+                    f"Сварочный заказ {production_order_number(weld_order)} не выгружен "
+                    f"в 1С: {weld_failure}. Окрасочный заказ не выгружается без "
+                    "подтверждённого сварочного основания."
                 )
+
+        paint_basis = _basis_comment(weld_order) if weld_order is not None else None
+        paint_export = export_production_orders_to_1c(
+            db,
+            [int(paint_order.order_id)],
+            dry_run=False,
+            comment_suffixes=(
+                {int(paint_order.order_id): paint_basis} if paint_basis else None
+            ),
+            basis_order_refs=(
+                {int(paint_order.order_id): weld_ref} if weld_ref else None
+            ),
+        )
+        db.refresh(paint_order)
+        paint_failure = _parent_export_failure(
+            paint_export, order_id=int(paint_order.order_id)
+        )
+        if paint_failure is None and not str(paint_order.order_ref1c or "").strip():
+            paint_failure = "order_ref1c окрасочного заказа остался пустым"
+        result["painted"] = {
+            "order_id": int(paint_order.order_id),
+            "order_number": str(paint_order.order_number or ""),
+            "order_ref1c": str(paint_order.order_ref1c or "") or None,
+            "item_id": ctx.item_id,
+            "qty": round(ctx.qty, 3),
+            "planned_start_date": ctx.start.isoformat() if ctx.start else None,
+            "planned_finish_date": ctx.finish.isoformat() if ctx.finish else None,
+            "basis": paint_basis,
+            "reused": paint_reused,
+            "export": paint_export,
+            "error": paint_failure,
+        }
+        if paint_failure is not None:
+            result["status"] = "partial_error"
+            result["error"] = (
+                f"Сварочный заказ выгружен, окрасочный "
+                f"{production_order_number(paint_order)} — нет: {paint_failure}. "
+                "Повторите открытие цепочки."
+            )
 
         db.commit()
         return result
@@ -727,6 +813,7 @@ def open_paint_chains_for_products(
     requested = list(dict.fromkeys(int(value) for value in product_ids if int(value) > 0))
     expanded: set[int] = set(requested)
     entries: List[Dict[str, Any]] = []
+    processed_links: set[int] = set()
 
     def _expand_link(link: PaintWeldChainLink) -> None:
         linked_products = (
@@ -756,7 +843,34 @@ def open_paint_chains_for_products(
         )
         if link is not None:
             _expand_link(link)
-            entries.append({"product_id": product_id, "status": "existing", "link_id": int(link.id)})
+            if int(link.id) in processed_links:
+                entries.append({"product_id": product_id, "status": "existing", "link_id": int(link.id)})
+                continue
+            processed_links.add(int(link.id))
+            painted_product = (
+                db.query(ProductionProduct)
+                .filter(ProductionProduct.order_id == int(link.painted_order_id))
+                .order_by(ProductionProduct.line_number.asc(), ProductionProduct.product_id.asc())
+                .first()
+            )
+            if painted_product is None:
+                entries.append({"product_id": product_id, "status": "error", "error": "цепочка не содержит окрасочную строку"})
+                continue
+            try:
+                resumed = open_paint_chain(
+                    db,
+                    painted_product_id=int(painted_product.product_id),
+                    dry_run=False,
+                    initiated_by=initiated_by,
+                )
+                entries.append({
+                    "product_id": product_id,
+                    "status": str(resumed.get("status") or "existing"),
+                    "link_id": int(link.id),
+                })
+            except Exception as exc:
+                db.rollback()
+                entries.append({"product_id": product_id, "status": "error", "error": str(exc)})
             continue
 
         pair = (
@@ -993,7 +1107,9 @@ def close_paint_chain(
 
     created_manufacture_ids: List[int] = []
 
-    def _ensure_manufacture(plan: Dict[str, Any], operation_executors: Any) -> int:
+    def _ensure_manufacture(
+        plan: Dict[str, Any], operation_executors: Any, allow_paint_weld_chain: bool = False
+    ) -> int:
         if plan["qty_to_produce"] > 0:
             produced = produce_line(
                 db,
@@ -1002,6 +1118,7 @@ def close_paint_chain(
                 executor=executor,
                 operation_executors=operation_executors,
                 comment=comment,
+                allow_paint_weld_chain=allow_paint_weld_chain,
             )
             plan["produce"] = produced
             manufacture_id = int(produced["manufacture_id"])
@@ -1018,8 +1135,15 @@ def close_paint_chain(
         return int(plan["existing_manufacture_id"])
 
     # Сварка первой: её выпуск — вход окраски.
-    weld_manufacture_id = _ensure_manufacture(weld_plan, weld_operation_executors)
-    paint_manufacture_id = _ensure_manufacture(paint_plan, paint_operation_executors)
+    weld_manufacture_id = _ensure_manufacture(
+        weld_plan,
+        weld_operation_executors,
+        allow_paint_weld_chain=True,
+    )
+    paint_manufacture_id = _ensure_manufacture(
+        paint_plan,
+        paint_operation_executors,
+    )
     weld_plan["manufacture_id"] = weld_manufacture_id
     paint_plan["manufacture_id"] = paint_manufacture_id
 
