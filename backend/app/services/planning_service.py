@@ -282,9 +282,6 @@ DEFAULT_PLANNING_CONFIG: Dict[str, Any] = {
 SERVER_MAX_LIMIT = 1000
 DEFAULT_PAGE_LIMIT = 50
 
-# 1C state key for completed production orders.
-DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-
 
 def _production_supply_qty_expr():
     """Quantity still expected from an open production line.

@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import ProductionOrder, ProductionProduct, Item
+from .production_control_common import DONE_STATE_KEY
 from .production_output_truth import accepted_product_output
 
 
@@ -61,7 +62,6 @@ def export_production_orders_xlsx(db: Session) -> Dict[str, Any]:
 
     # Дополнительный фильтр "не завершён": в 1С/интеграции иногда появляются записи,
     # которые прошли по удалённости, но находятся в состоянии "Завершен".
-    DONE_STATE_KEY = _norm_guid("ad28565a-991b-11eb-e39a-fa163e61326a")
     orders = [
         o for o in orders
         if _norm_guid(getattr(o, "order_state_key", None)) != DONE_STATE_KEY

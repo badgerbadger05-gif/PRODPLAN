@@ -35,6 +35,7 @@ from ..models import (
 )
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 from .bom_specification_resolver import BomSpecificationResolver
+from .production_control_common import DONE_STATE_KEY
 from .production_output_truth import accepted_product_remaining_expr
 
 # Красящий вид производства: имя production_kind содержит любой из маркеров.
@@ -416,7 +417,7 @@ def _open_weld_orders(db: Session, welded_item_id: int) -> List[Dict[str, Any]]:
         .filter(ProductionOrder.deletion_mark.is_(False))
         .filter(
             func.lower(func.coalesce(ProductionOrder.order_state_key, ""))
-            != "ad28565a-991b-11eb-e39a-fa163e61326a"
+            != DONE_STATE_KEY
         )
         .filter(remaining_expr > 0)
         .all()

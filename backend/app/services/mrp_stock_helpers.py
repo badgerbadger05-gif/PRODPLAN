@@ -27,10 +27,8 @@ from ..models import (
     StockWarehouse,
 )
 from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+from .production_control_common import DONE_STATE_KEY as _DONE_STATE_KEY
 from .production_output_truth import accepted_product_remaining_expr
-
-
-_DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 @dataclass(frozen=True)

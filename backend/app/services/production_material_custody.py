@@ -24,11 +24,8 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from ..models import ProductionProduct
+from .production_control_common import DONE_STATE_KEY
 from .production_output_truth import accepted_product_output
-
-# 1C state for completed production orders. Duplicated locally to keep this
-# low-level reservation module independent from journal/planning services.
-DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 # Issue statuses where the kit has not physically moved yet.
 TRANSIT_STATUSES = ("draft", "requested", "issued", "exported")

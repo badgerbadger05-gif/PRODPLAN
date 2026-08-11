@@ -34,6 +34,7 @@ from ..models import (
     Unit,
 )
 from .production_control_common import (
+    DONE_STATE_KEY,
     date_to_iso as _date_to_iso,
     looks_like_guid as _looks_like_guid,
     parse_date as _parse_date,
@@ -53,7 +54,6 @@ from .item_ledger.production_output_cache import (
 from .production_material_custody_events import append_material_issue_custody_event
 
 
-DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 # Plan: line statuses shown in the production journal.
 # Legacy technical states are kept for compatibility and mapped to the compact
 # workshop-facing labels below.

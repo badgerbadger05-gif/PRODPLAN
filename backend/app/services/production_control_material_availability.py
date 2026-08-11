@@ -765,7 +765,8 @@ def _active_product_ids(db: Session, *, limit: int = 0) -> List[int]:
     from sqlalchemy import or_
 
     from ..models import ProductionOrder
-    from .production_control_journal import DONE_STATE_KEY, _TERMINAL_LINE_STATUSES
+    from .production_control_common import DONE_STATE_KEY
+    from .production_control_journal import _TERMINAL_LINE_STATUSES
 
     remaining_expr = accepted_product_remaining_expr(
         ProductionProduct.quantity,
