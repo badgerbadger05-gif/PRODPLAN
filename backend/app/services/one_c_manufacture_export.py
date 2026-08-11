@@ -62,9 +62,11 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import manufacture_number
 from .one_c_production_order_export import export_production_orders_to_1c
+from .bom_specification_resolver import BomSpecificationResolver
 
 
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
+ORDER_BASIS_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 
 
@@ -159,6 +161,7 @@ def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id
         .order_by(SpecComponent.component_id.asc())
         .all()
     )
+    spec_resolver = BomSpecificationResolver(db)
     for idx, (component, item) in enumerate(components, start=1):
         item_ref = _clean_ref1c(item.item_ref1c)
         if not item_ref:
@@ -170,8 +173,9 @@ def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id
             "КлючСвязи": idx,
         }
         _add_unit_payload(row, item.unit)
-        if spec_ref:
-            row["Спецификация_Key"] = spec_ref
+        pinned_child_ref = spec_resolver.child_spec_ref1c(component)
+        if pinned_child_ref or spec_ref:
+            row["Спецификация_Key"] = pinned_child_ref or spec_ref
         rows.append(row)
     return rows
 
@@ -638,14 +642,16 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     if material_structural_unit:
         payload["СтруктурнаяЕдиницаЗапасов_Key"] = material_structural_unit
     # 1C UNF links assembly to production order through this dedicated field.
-    # The generic composite ДокументОснование on Document_СборкаЗапасов does
-    # not accept Document_ЗаказНаПроизводство in the current OData metadata.
+    # Still send the generic basis fields too, as canonical contract requires
+    # Document_СборкаЗапасов to carry an explicit parent link.
     if not entry.order_ref1c:
         raise ValueError(
             f"manufacture_id={entry.manufacture_id}: нет order_ref1c — "
             "СборкаЗапасов не может быть создана без основания-заказа"
         )
     payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
+    payload["ДокументОснование"] = entry.order_ref1c
+    payload["ДокументОснование_Type"] = ORDER_BASIS_TYPE
     return payload
 
 

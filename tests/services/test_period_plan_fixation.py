@@ -11,14 +11,18 @@ from datetime import date
 import pytest
 
 from app.models import (
+    AssemblyRate,
     Item,
     LedgerGeneration,
     MrpRequirement,
+    ProductionMaterialCustodyProjectionManifest,
     PhysicalImportBatch,
     PlanningRun,
     PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionResource,
+    StockWarehouse,
 )
 from app.services import period_plan_service
 from app.services.period_plan_service import (
@@ -36,7 +40,7 @@ def _accepted_planning_truth(db_session):
         batch_key="fixation-ledger",
         status="completed",
         cutoff=cutoff,
-        source_watermarks={},
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
         completed_at=cutoff,
     )
     generation = LedgerGeneration(
@@ -54,9 +58,36 @@ def _accepted_planning_truth(db_session):
         physical_import_batch=batch,
         algorithm_version="test",
     )
-    db_session.add(generation)
+    db_session.add_all([
+        generation,
+        StockWarehouse(
+            warehouse_ref1c="WH-FIXATION-PLAN",
+            warehouse_name="Fixation planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+    ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=generation.cutoff,
+            built_at=generation.cutoff,
+        )
+    )
+    resource = ProductionResource(
+        resource_name="Fixation assembly",
+        planning_range=30,
+        capacity=100,
+    )
+    db_session.add(resource)
+    db_session.flush()
+    db_session.info["fixation_assembly_resource_id"] = int(resource.resource_id)
     db_session.commit()
     db_session.info["fixation_generation_id"] = int(generation.id)
     return generation
@@ -68,12 +99,17 @@ def _purchased_item(db, code: str) -> Item:
         item_name=f"Деталь {code}",
         item_article=code,
         unit="шт",
-        stock_qty=0.0,
-        replenishment_method="Покупка",
+                replenishment_method="Покупка",
         replenishment_time=3,
         status="active",
     )
     db.add(item)
+    db.flush()
+    db.add(AssemblyRate(
+        resource_id=int(db.info["fixation_assembly_resource_id"]),
+        item_id=int(item.item_id),
+        qty_per_capacity=1,
+    ))
     db.flush()
     return item
 
@@ -220,6 +256,7 @@ def test_snapshot_helper_resolves_the_generation_key_without_a_caller(db_session
     item = _purchased_item(db_session, "FIX-KEYLESS")
     plan = _draft_plan(db_session, item, qty=6.0)
     plan.status = "fixed"
+    plan.fixed_at = datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
     db_session.commit()
 
     result = create_mrp_snapshot_for_plan(db_session, plan.id, started_by="test")

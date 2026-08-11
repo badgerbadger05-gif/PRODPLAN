@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import date, datetime, timezone
+import math
 from decimal import Decimal
 
 import pytest
@@ -10,13 +11,18 @@ from app.routers.purchase_control import get_filters, get_order
 from app.services.planning_truth import publish_generation
 from app.services.purchase_control_journal import (
     get_order_card,
+    _materialization_action,
+    _reconcile_buy_row_for_horizon,
     list_filters,
     list_journal,
 )
 from app.routers.purchase_control import get_orders
 from app.services.purchase_control_snapshot import (
     PurchaseJournalSnapshotUnavailable,
+    PurchaseJournalPromotionError,
     build_candidate_snapshot,
+    open_supplier_coverage_by_reservation,
+    promote_candidate_snapshot,
 )
 
 
@@ -26,6 +32,21 @@ CAPABILITIES = {
     "planning_snapshots": True,
     "purchase_control_journal": True,
 }
+
+
+def test_materialization_action_is_server_owned_and_fail_closed():
+    assert _materialization_action({
+        "row_generator": "mrp_reservation",
+        "line_status": "to_order",
+        "to_order_qty": 2,
+    }) == (True, None)
+    allowed, reason = _materialization_action({
+        "row_generator": "mrp_reservation",
+        "line_status": "to_order",
+        "to_order_qty": None,
+    })
+    assert allowed is False
+    assert reason == "Количество к заказу отсутствует"
 
 
 def _context(db):
@@ -273,6 +294,113 @@ def test_candidate_is_idempotent_and_groups_multiple_lines(db_session):
     assert all(row["row_generator"] == "mrp_reservation" for row in first.payload["rows"])
 
 
+@pytest.mark.parametrize(
+    "bad_qty",
+    [None, "", True, math.nan, math.inf, -math.inf],
+)
+def test_candidate_promotion_rejects_nonfinite_or_blank_numeric(db_session, bad_qty):
+    generation, _order, _legacy, _supplies = _context(db_session)
+    item = db_session.query(models.Item).filter_by(item_code="MAT-B").one()
+    _add_buy_plan_run(
+        db_session,
+        generation=generation,
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        item=item,
+        required_qty=Decimal("7"),
+        realized_qty=Decimal("2"),
+        covered_incoming=Decimal("1"),
+        uncovered=Decimal("4"),
+    )
+    snapshot = build_candidate_snapshot(db_session, generation.id)
+    row = next(
+        row
+        for row in snapshot.payload["rows"]
+        if row["row_generator"] == "mrp_reservation"
+    )
+    row["remaining_qty"] = bad_qty
+
+    with pytest.raises(PurchaseJournalPromotionError):
+        promote_candidate_snapshot(
+            db_session,
+            generation=generation,
+            accepted_at=datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+        )
+
+
+def test_direct_supplier_supply_covers_frozen_reservations_fifo(db_session):
+    generation, _order, _legacy, supplies = _context(db_session)
+    item = db_session.query(models.Item).filter_by(item_code="MAT-B").one()
+    senior_run = _add_buy_plan_run(
+        db_session,
+        generation=generation,
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        item=item,
+        required_qty=Decimal("7"),
+        realized_qty=Decimal("0"),
+        covered_incoming=Decimal("0"),
+        uncovered=Decimal("7"),
+    )
+    junior_run = _add_buy_plan_run(
+        db_session,
+        generation=generation,
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        item=item,
+        required_qty=Decimal("7"),
+        realized_qty=Decimal("0"),
+        covered_incoming=Decimal("0"),
+        uncovered=Decimal("7"),
+    )
+    # This exact generation-scoped line has no MrpFreezeAllocation: it models a
+    # supplier order created directly in 1C after both plans were frozen.
+    supplies[0].open_qty_at_cutoff = Decimal("10")
+    supplies[0].ordered_qty_at_cutoff = Decimal("10")
+    supplies[0].realized_qty_at_cutoff = Decimal("0")
+    entries = (
+        db_session.query(
+            models.ReplenishmentWorkItem,
+            models.ReservationEntry,
+            models.Item,
+        )
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReplenishmentWorkItem.reservation_id,
+        )
+        .join(models.Item, models.Item.item_id == models.ReservationEntry.item_id)
+        .filter(
+            models.ReplenishmentWorkItem.run_id.in_(
+                (senior_run.run_id, junior_run.run_id)
+            )
+        )
+        .all()
+    )
+
+    covered, slices = open_supplier_coverage_by_reservation(
+        db_session,
+        generation.id,
+        entries,
+    )
+
+    reservations = {
+        int(reservation.run_id): reservation
+        for _work_item, reservation, _item in entries
+    }
+    senior = reservations[senior_run.run_id]
+    junior = reservations[junior_run.run_id]
+    assert covered == {senior.id: 7.0, junior.id: 3.0}
+    assert slices[senior.id][0]["source_ref"] == supplies[0].source_ref
+    assert slices[senior.id][0]["covered_qty"] == 7.0
+    assert slices[junior.id][0]["covered_qty"] == 3.0
+    assert sum(
+        row["covered_qty"]
+        for reservation_slices in slices.values()
+        for row in reservation_slices
+    ) == 10.0
+
+
 def test_candidate_conflict_is_rejected(db_session):
     generation, _order, _legacy, supplies = _context(db_session)
     build_candidate_snapshot(db_session, generation.id)
@@ -367,7 +495,7 @@ def test_router_returns_structured_503_when_snapshot_is_missing(db_session):
     assert response.value.detail["code"] == "purchase_control_snapshot_unavailable"
 
 
-def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
+def test_candidate_subtracts_frozen_open_supplier_order_coverage(db_session):
     cutoff = datetime(2026, 7, 24, 12, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key="purchase-snapshot-buy-physical",
@@ -404,6 +532,7 @@ def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
         period_from=plan.period_from,
         period_to=plan.period_to,
         ledger_generation_id=generation.id,
+        active_freeze_version=0,
     )
     db_session.add(run)
     db_session.flush()
@@ -456,6 +585,147 @@ def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
     db_session.add(work_item)
     db_session.flush()
 
+    junior_plan = models.ProductionPlanHeader(
+        name="purchase-buy-plan-junior",
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        status="fixed",
+    )
+    db_session.add(junior_plan)
+    db_session.flush()
+    junior_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        source_plan_id=junior_plan.id,
+        period_from=junior_plan.period_from,
+        period_to=junior_plan.period_to,
+        ledger_generation_id=generation.id,
+        active_freeze_version=0,
+    )
+    db_session.add(junior_run)
+    db_session.flush()
+    junior_requirement = models.MrpRequirement(
+        run_id=junior_run.run_id,
+        item_id=item.item_id,
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        period_from=junior_plan.period_from,
+        period_to=junior_plan.period_to,
+        bom_level=1,
+    )
+    db_session.add(junior_requirement)
+    db_session.flush()
+    junior_reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="main",
+        run_id=junior_run.run_id,
+        freeze_version=0,
+        requirement_id=junior_requirement.id,
+        priority_period_from=junior_plan.period_from,
+        priority_period_to=junior_plan.period_to,
+        realization_mode="buy",
+        reserved_qty=Decimal("5"),
+        realized_qty=Decimal("0"),
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("5"),
+        replenishment_received_qty=Decimal("0"),
+        lifecycle_status="active",
+    )
+    db_session.add(junior_reservation)
+    db_session.flush()
+    db_session.add(
+        models.ReplenishmentWorkItem(
+            ledger_generation_id=generation.id,
+            reservation_id=junior_reservation.id,
+            plan_id=junior_plan.id,
+            run_id=junior_run.run_id,
+            requirement_id=junior_requirement.id,
+            item_id=int(item.item_id),
+            replenishment_method="buy",
+            replenishment_required_qty=Decimal("5"),
+            replenishment_fulfilled_qty=Decimal("0"),
+            replenishment_remaining_qty=Decimal("5"),
+        )
+    )
+    db_session.flush()
+
+    capture = models.LedgerBuildBatch(
+        ledger_generation_id=generation.id,
+        stage="snapshot_build",
+        batch_key="purchase-snapshot-open-order",
+        status="completed",
+        algorithm_version="test",
+        metrics={},
+    )
+    db_session.add(capture)
+    db_session.flush()
+    db_session.add_all(
+        [
+            models.LedgerFutureSupply(
+                ledger_generation_id=generation.id,
+                supply_kind="supplier_order",
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref="",
+                planning_stock_pool="main",
+                destination_warehouse_ref1c="WH-1",
+                source_ref="ORDER-OPEN",
+                source_line_ref="1",
+                source_local_id="test",
+                ordered_qty_at_cutoff=Decimal("6"),
+                realized_qty_at_cutoff=Decimal("2"),
+                open_qty_at_cutoff=Decimal("4"),
+                eta_date=date(2026, 8, 15),
+                source_state_key="exported",
+                source_updated_at=cutoff,
+                capture_cutoff=cutoff,
+                source_content_hash="open-order-test",
+                capture_batch_id=capture.id,
+                evidence_status="exact",
+            ),
+            models.MrpFreezeAllocation(
+                run_id=run.run_id,
+                freeze_version=0,
+                requirement_id=requirement.id,
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref="",
+                planning_stock_pool="main",
+                source_type="supplier_order",
+                source_ref="ORDER-OPEN",
+                source_line_ref="1",
+                alloc_qty=Decimal("6"),
+                fact_at_freeze=Decimal("6"),
+                realized_qty=Decimal("0"),
+                evaporated_qty=Decimal("0"),
+            ),
+            models.MrpFreezeAllocation(
+                run_id=junior_run.run_id,
+                freeze_version=0,
+                requirement_id=junior_requirement.id,
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref="",
+                planning_stock_pool="main",
+                source_type="supplier_order",
+                source_ref="ORDER-OPEN",
+                source_line_ref="1",
+                alloc_qty=Decimal("5"),
+                fact_at_freeze=Decimal("6"),
+                realized_qty=Decimal("0"),
+                evaporated_qty=Decimal("0"),
+            ),
+        ]
+    )
+    db_session.flush()
+
+    # A later refreeze pointer is mutable operational state. Coverage for this
+    # generation must remain pinned to each ReservationEntry.freeze_version.
+    run.active_freeze_version = 9
+    junior_run.active_freeze_version = 9
     db_session.flush()
 
     snapshot = build_candidate_snapshot(db_session, generation.id)
@@ -465,19 +735,35 @@ def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
     row = rows[0]
     assert row["item_code"] == "RAW-MAT"
     assert row["line_status"] == "to_order"
-    # An order is an execution document, not physical fulfillment. Only the
-    # accepted receipt reduces the replenishment remainder.
-    assert row["to_order_qty"] == 7.0
-    assert row["required_qty"] == 10.0
+    assert row["realized_qty"] == 3.0
+    assert row["open_order_covered_qty"] == 4.0
+    assert row["to_order_qty"] == 8.0
+    assert row["required_qty"] == 15.0
     assert row["received_qty"] == 3.0
+    assert row["required_qty"] == (
+        row["realized_qty"]
+        + row["open_order_covered_qty"]
+        + row["to_order_qty"]
+    )
     slices = row.get("slices")
     assert isinstance(slices, list) and slices
     for bucket in slices:
         assert bucket["work_item_id"] is not None
+    assert slices[0]["reservation_id"] == reservation.id
+    assert slices[0]["coverage_slices"] == [
+        {
+            "source_type": "supplier_order",
+            "source_ref": "ORDER-OPEN",
+            "source_line_ref": "1",
+            "covered_qty": 4.0,
+        }
+    ]
+    assert slices[1]["reservation_id"] == junior_reservation.id
+    assert slices[1]["coverage_slices"] == []
 
 
 def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_session):
-    generation, _order, _legacy_lines, _supplies = _context(db_session)
+    generation, _order, _legacy_lines, supplies = _context(db_session)
 
     run = models.ProductionPlanHeader(
         name="purchase-buy-plan",
@@ -491,6 +777,10 @@ def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_sess
     item = db_session.query(models.Item).filter(models.Item.item_code == "MAT-A").first()
     if item is None:
         item = db_session.query(models.Item).filter(models.Item.item_name == "Материал А").first()
+    for supply in supplies:
+        if int(supply.item_id) == int(item.item_id):
+            supply.evidence_status = "rejected"
+            supply.reason = "test keeps the demand uncovered"
 
     planning_run = models.PlanningRun(
         status="FIXED_SNAPSHOT",
@@ -622,3 +912,166 @@ def test_router_horizon_selector_filters_buy_rows_by_plan_slice(db_session):
     ]
     assert row["to_order_pct"] == 70.0
     assert row["open_order_covered_pct"] == 0.0
+
+
+def test_reconcile_buy_row_for_horizon_with_zero_required_returns_none_percentages():
+    row = {
+        "row_generator": "mrp_reservation",
+        "slices": [
+            {
+                "required_qty": 0,
+                "realized_qty": 0,
+                "open_order_covered_qty": 0,
+                "to_order_qty": 5,
+                "run_id": 1,
+                "plan_period_from": "2026-01-01",
+                "plan_period_to": "2026-01-31",
+                "period_label": "Январь 2026",
+                "need_date": "2026-01-01",
+                "need_period_to": "2026-01-31",
+                "reservation_id": 10,
+                "requirement_id": 20,
+            }
+        ],
+    }
+
+    projected = _reconcile_buy_row_for_horizon(row, "2026-01-31")
+
+    assert projected is not None
+    assert projected["to_order_pct"] is None
+    assert projected["open_order_covered_pct"] is None
+
+
+def test_reconcile_buy_row_for_horizon_over_coverage_is_capped():
+    row = {
+        "row_generator": "mrp_reservation",
+        "slices": [
+            {
+                "required_qty": 10,
+                "realized_qty": 0,
+                "open_order_covered_qty": 20,
+                "to_order_qty": 50,
+                "run_id": 1,
+                "plan_period_from": "2026-01-01",
+                "plan_period_to": "2026-01-31",
+                "period_label": "Январь 2026",
+                "need_date": "2026-01-01",
+                "need_period_to": "2026-01-31",
+                "reservation_id": 10,
+                "requirement_id": 20,
+            }
+        ],
+    }
+
+    projected = _reconcile_buy_row_for_horizon(row, "2026-01-31")
+
+    assert projected is not None
+    assert projected["to_order_pct"] == 100.0
+    assert projected["open_order_covered_pct"] == 100.0
+
+
+def test_build_candidate_snapshot_freezes_materialization_input_refs(db_session):
+    cutoff = datetime(2026, 8, 1, 10, tzinfo=timezone.utc)
+    physical = models.PhysicalImportBatch(
+        batch_key="purchase-materialization-input-freeze",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+    )
+    generation = models.LedgerGeneration(
+        generation_key="purchase-materialization-input-freeze-generation",
+        status="building",
+        cutoff=cutoff,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=physical,
+        algorithm_version="test",
+    )
+    item = models.Item(
+        item_code="RAW-MAT-FREEZE",
+        item_name="Материал freeze",
+        item_ref1c="ITEM-FREEZE-REF",
+        supplier_ref1c="SUP-ITEM-FREEZE",
+        unit="шт",
+    )
+    supplier = models.Supplier(
+        supplier_ref1c="SUP-ITEM-FREEZE",
+        supplier_name="Поставщик freeze",
+    )
+    plan = models.ProductionPlanHeader(
+        name="purchase-freeze-plan",
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        status="fixed",
+    )
+    db_session.add_all([generation, item, supplier, plan])
+    db_session.flush()
+    planning_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(planning_run)
+    db_session.flush()
+    requirement = models.MrpRequirement(
+        run_id=planning_run.run_id,
+        item_id=item.item_id,
+        total_required_qty=Decimal("10"),
+        net_required_qty=Decimal("10"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=1,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="main",
+        run_id=planning_run.run_id,
+        freeze_version=0,
+        requirement_id=requirement.id,
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="buy",
+        reserved_qty=Decimal("10"),
+        realized_qty=Decimal("2"),
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("10"),
+        replenishment_received_qty=Decimal("2"),
+        lifecycle_status="active",
+    )
+    db_session.add(reservation)
+    db_session.flush()
+    db_session.add(
+        models.ReplenishmentWorkItem(
+            ledger_generation_id=generation.id,
+            reservation_id=reservation.id,
+            plan_id=plan.id,
+            run_id=planning_run.run_id,
+            requirement_id=requirement.id,
+            item_id=item.item_id,
+            replenishment_method="buy",
+            replenishment_required_qty=Decimal("10"),
+            replenishment_fulfilled_qty=Decimal("2"),
+            replenishment_remaining_qty=Decimal("8"),
+        )
+    )
+    db_session.flush()
+
+    snapshot = build_candidate_snapshot(db_session, generation.id)
+    rows = [row for row in snapshot.payload["rows"] if row.get("row_generator") == "mrp_reservation"]
+    assert len(rows) == 1
+
+    row = rows[0]
+    materialization_input = row.get("materialization_input")
+    assert isinstance(materialization_input, dict)
+    assert materialization_input["supplier_ref1c"] == item.supplier_ref1c.lower()
+    assert materialization_input["item_ref1c"] == item.item_ref1c
+    assert materialization_input["unit_ref1c"] == item.unit
+    assert "destination_warehouse_ref1c" in materialization_input

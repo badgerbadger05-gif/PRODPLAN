@@ -21,6 +21,7 @@ const orders = [
     planned_finish_date: '2026-07-23',
     forecast_date: '2026-07-24',
     forecast_shift_days: 1,
+    forecast_status: 'delayed',
     forecast_reason: 'Ожидание комплектующих',
     status: 'ready',
     coverage_status: 'assembled',
@@ -52,6 +53,7 @@ const orders = [
     planned_finish_date: '2026-07-25',
     forecast_date: '2026-08-02',
     forecast_shift_days: 8,
+    forecast_status: 'critical',
     forecast_reason: 'Дефицит подшипников',
     status: 'shortage',
     coverage_status: 'shortage',
@@ -76,6 +78,8 @@ const materials = {
     missing_qty: 0,
     unit: 'шт',
     availability_status: 'assembled',
+    coverage_status: 'assembled',
+    coverage_label: 'Собрано',
   }],
 }
 
@@ -93,7 +97,19 @@ test('production control visual contract', async ({ page }) => {
     const { pathname } = new URL(route.request().url())
     if (pathname === '/api/v1/production-control/orders') {
       await route.fulfill({
-        json: { rows: orders, total: orders.length, limit: 100, offset: 0, latest_run_id: 77 },
+        json: {
+          rows: orders,
+          total: orders.length,
+          limit: 100,
+          offset: 0,
+          latest_run_id: 77,
+          truth_meta: {
+            ledger_generation: 77,
+            cutoff: '2026-07-31T00:00:00Z',
+            truth_status: 'accepted',
+            truth_reason: null,
+          },
+        },
       })
       return
     }

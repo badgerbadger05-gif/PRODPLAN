@@ -28,7 +28,9 @@ CAPABILITY_ASSEMBLY_QUEUE = "assembly_queue"
 CAPABILITY_DRUM_SCHEDULE = "drum_schedule"
 CAPABILITY_SHELF_PROJECTION = "shelf_projection"
 CAPABILITY_PURCHASE_CONTROL_JOURNAL = "purchase_control_journal"
+CAPABILITY_PRODUCTION_CONTROL_JOURNAL = "production_control_journal"
 CAPABILITY_FUTURE_SUPPLY = "future_supply"
+CAPABILITY_RESERVATION_CONSUMPTION_ALLOCATION = "reservation_consumption_allocation"
 TRUTH_MAX_AGE_SECONDS_ENV = "PLANNING_TRUTH_MAX_AGE_SECONDS"
 
 
@@ -229,10 +231,15 @@ def require_accepted_truth(
     db: Session,
     consumer: str,
     required_capabilities: Iterable[str] = (),
+    *,
+    allow_stale: bool = False,
 ) -> PlanningTruthReadiness:
     """Fail closed for a named report, planner, DBR or mutation consumer."""
     readiness = get_truth_state(db)
-    if not readiness.ready:
+    stale_but_explicitly_allowed = (
+        bool(allow_stale) and str(readiness.truth_status) == "stale"
+    )
+    if not readiness.ready and not stale_but_explicitly_allowed:
         raise PlanningTruthUnavailable(readiness, consumer=consumer)
     missing = sorted({
         str(capability)
@@ -377,6 +384,7 @@ def publish_read_snapshot(
     required_capabilities: Iterable[str] = (),
     reason: str | None = None,
     published_at: datetime | None = None,
+    allow_stale: bool = False,
 ) -> models.PlanningReadSnapshot:
     """Atomically publish an immutable read payload for current accepted truth.
 
@@ -388,6 +396,7 @@ def publish_read_snapshot(
         db,
         consumer,
         required_capabilities=required_capabilities,
+        allow_stale=bool(allow_stale),
     )
     existing = db.execute(
         select(models.PlanningReadSnapshot).where(
@@ -433,12 +442,14 @@ def get_latest_read_snapshot(
     consumer: str,
     snapshot_key: str | None = None,
     required_capabilities: Iterable[str] = (),
+    allow_stale: bool = False,
 ) -> models.PlanningReadSnapshot | None:
     """Read the latest snapshot only for the current accepted truth lineage."""
     truth = require_accepted_truth(
         db,
         consumer,
         required_capabilities=required_capabilities,
+        allow_stale=bool(allow_stale),
     )
     query = select(models.PlanningReadSnapshot).where(
             models.PlanningReadSnapshot.consumer == consumer,

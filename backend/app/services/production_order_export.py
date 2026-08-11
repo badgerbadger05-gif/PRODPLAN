@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import ProductionOrder, ProductionProduct, Item
+from .production_output_truth import accepted_product_output
 
 
 def _norm_guid(val) -> str:
@@ -155,14 +156,12 @@ def export_production_orders_xlsx(db: Session) -> Dict[str, Any]:
             if product.characteristic_ref1c:
                 characteristic = f"ID: {product.characteristic_ref1c[:8]}..."
 
-            # Количество с учётом новых полей
-            ordered_qty = float(product.quantity) if product.quantity else 0.0
-            produced_qty = float(product.produced_qty) if hasattr(product, 'produced_qty') and product.produced_qty is not None else 0.0
-            # Вычисляем remaining_qty явно, если поле не загружено или None
-            if hasattr(product, 'remaining_qty') and product.remaining_qty is not None:
-                remaining_qty = float(product.remaining_qty)
-            else:
-                remaining_qty = ordered_qty - produced_qty
+            # Physical output is the accepted-Ledger cache; remaining_qty is
+            # only a compatibility column and must never drive the export.
+            output = accepted_product_output(product)
+            ordered_qty = float(output.planned_qty)
+            produced_qty = float(output.produced_qty)
+            remaining_qty = float(output.remaining_qty)
 
             row_data = [
                 item_name,

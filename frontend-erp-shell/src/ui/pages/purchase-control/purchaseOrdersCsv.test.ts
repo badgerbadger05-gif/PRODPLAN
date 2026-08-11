@@ -15,6 +15,8 @@ const row: PurchaseRow = {
   order_state_name: null,
   source: 'mrp',
   row_generator: 'mrp_reservation',
+  can_materialize: true,
+  materialize_disabled_reason: null,
   required_qty: 100,
   realized_qty: 0,
   open_order_covered_qty: 0,

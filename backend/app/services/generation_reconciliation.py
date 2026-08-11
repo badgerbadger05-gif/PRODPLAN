@@ -60,8 +60,9 @@ def build_generation_targets(
 ) -> dict[tuple[int, str], ReconciliationTarget]:
     """Validate one accepted generation and return proposal sizing targets.
 
-    ``make`` and ``buy`` are sized from the frozen replenishment obligation.
-    The realization side is the independently folded append-only event stream.
+    ``make``, ``buy`` and executor-less ``rework`` are sized from the frozen
+    replenishment obligation. The realization side is the independently folded
+    append-only event stream; consumers still must not materialize ``rework``.
     """
     generation = db.get(models.LedgerGeneration, int(ledger_generation_id))
     if generation is None or str(generation.status or "") != "accepted":
@@ -102,7 +103,7 @@ def build_generation_targets(
     grouped: dict[tuple[int, str], dict[str, Decimal]] = {}
     for entry in entries:
         mode = str(entry.realization_mode or "")
-        if mode not in {"make", "buy"}:
+        if mode not in {"make", "buy", "rework"}:
             raise GenerationReconciliationMismatch(
                 f"reservation {entry.id} has unsupported realization_mode={mode!r}"
             )

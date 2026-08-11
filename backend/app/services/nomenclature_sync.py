@@ -170,7 +170,11 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             existing_item.item_code != code or
                             existing_item.item_name != name or
                             existing_item.item_article != article or
-                            existing_item.replenishment_method != replenishment_method or
+                            (
+                                bool(replenishment_method)
+                                and existing_item.replenishment_method
+                                != replenishment_method
+                            ) or
                             (replenishment_time is not None and existing_item.replenishment_time != replenishment_time) or
                             existing_item.supplier_ref1c != supplier_ref1c or
                             existing_item.unit != unit_key
@@ -180,8 +184,10 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             existing_item.item_code = code
                             existing_item.item_name = name
                             existing_item.item_article = article
-                            existing_item.replenishment_method = replenishment_method
-                            existing_item.replenishment_time = replenishment_time
+                            if replenishment_method:
+                                existing_item.replenishment_method = replenishment_method
+                            if replenishment_time is not None:
+                                existing_item.replenishment_time = replenishment_time
                             existing_item.supplier_ref1c = supplier_ref1c
                             existing_item.unit = unit_key
                             updated_count += 1
@@ -197,8 +203,10 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             existing_item_by_code.item_name = name
                             existing_item_by_code.item_article = article
                             existing_item_by_code.item_ref1c = ref_key
-                            existing_item_by_code.replenishment_method = replenishment_method
-                            existing_item_by_code.replenishment_time = replenishment_time
+                            if replenishment_method:
+                                existing_item_by_code.replenishment_method = replenishment_method
+                            if replenishment_time is not None:
+                                existing_item_by_code.replenishment_time = replenishment_time
                             existing_item_by_code.supplier_ref1c = supplier_ref1c
                             existing_item_by_code.unit = unit_key
                             existing_item_by_code.status = 'active'
@@ -215,8 +223,10 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_item_sql.item_name = name
                                 existing_item_sql.item_article = article
                                 existing_item_sql.item_ref1c = ref_key
-                                existing_item_sql.replenishment_method = replenishment_method
-                                existing_item_sql.replenishment_time = replenishment_time
+                                if replenishment_method:
+                                    existing_item_sql.replenishment_method = replenishment_method
+                                if replenishment_time is not None:
+                                    existing_item_sql.replenishment_time = replenishment_time
                                 existing_item_sql.supplier_ref1c = supplier_ref1c
                                 existing_item_sql.unit = unit_key
                                 existing_item_sql.status = 'active'
@@ -235,7 +245,6 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                     replenishment_method=replenishment_method,
                                     replenishment_time=replenishment_time,
                                     unit=unit_key,
-                                    stock_qty=0.0,
                                     status='active'
                                 )
                                 db.add(new_item)
@@ -273,7 +282,9 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
 
                         resolved_category = existing_category
 
-                    if target_item is not None:
+                    # An omitted category in a partial/expanded OData row is
+                    # unknown, not an instruction to clear the local relation.
+                    if target_item is not None and category_key:
                         target_item.category = resolved_category
 
                 except Exception as e:
@@ -338,7 +349,6 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             replenishment_method=replenishment_method or None,
                             replenishment_time=replenishment_time,
                             unit=unit_key or None,
-                            stock_qty=0.0,
                             status='active'
                         )
                         db.add(new_item)

@@ -10,6 +10,7 @@ from sqlalchemy import and_, asc, func
 from sqlalchemy.orm import Session
 
 from app import models
+from .live_plan_scope import live_plan_run_ids
 
 
 CONSUMER = "assembly_queue"
@@ -49,32 +50,99 @@ def _sort_key(period_from: Any, period_to: Any, plan_id: int, plan_line_id: int)
     )
 
 
+def _datetime_key(value: datetime) -> str:
+    normalized = value
+    if normalized.tzinfo is not None:
+        normalized = normalized.astimezone(timezone.utc).replace(tzinfo=None)
+    return normalized.isoformat(timespec="microseconds") + "Z"
+
+
+def _snapshot_row_from_assembly_queue_line(
+    row: models.AssemblyQueueLine,
+) -> dict[str, Any]:
+    return {
+        "plan_id": int(row.plan_id),
+        "plan_line_id": int(row.plan_line_id),
+        "run_id": int(row.planning_run_id),
+        "item_id": int(row.item_id),
+        "item_code": str(row.item.item_code or ""),
+        "item_name": str(row.item.item_name or ""),
+        "bucket_date": _date_key(row.bucket_date),
+        "period_from": _date_key(row.period_from),
+        "period_to": _date_key(row.period_to),
+        "planned_output_qty": float(_dec(row.planned_output_qty)),
+        "accepted_plan_output_qty": float(_dec(row.accepted_plan_output_qty)),
+        "assembly_remaining_qty": float(_dec(row.assembly_remaining_qty)),
+        "eligible_from": _datetime_key(row.eligible_from) if row.eligible_from is not None else None,
+        "priority_key": [
+            _date_key(row.period_from),
+            _date_key(row.period_to),
+            int(row.plan_id),
+            int(row.plan_line_id),
+        ],
+        "sort_key": str(row.sort_key),
+    }
+
+
+def _to_date(value: Any) -> date:
+    if isinstance(value, date):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    return date.fromisoformat(str(value))
+
+
+def _frozen_run_period(run: Any, plan: Any) -> tuple[date, date]:
+    """Use the fixed PlanningRun period and reject divergent source headers."""
+    if run.period_from is None or run.period_to is None:
+        raise ValueError("assembly queue PlanningRun misses frozen period")
+    period_from = _to_date(run.period_from)
+    period_to = _to_date(run.period_to)
+    if period_from != _to_date(plan.period_from) or period_to != _to_date(plan.period_to):
+        raise ValueError(
+            f"assembly queue period mismatch for run_id={int(run.run_id)} "
+            f"and plan_id={int(plan.id)}"
+        )
+    return period_from, period_to
+
+
 def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
-    accepted_allocations = (
-        db.query(
-            models.AssemblyOutputAllocation.plan_line_id.label("plan_line_id"),
+    return _build_rows_by_scope(db, generation_id, include_zero=False)
+
+
+def _build_rows_by_scope(
+    db: Session,
+    generation_id: int,
+    *,
+    include_zero: bool,
+) -> list[dict[str, Any]]:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError("assembly queue snapshot generation not found")
+    run_ids = live_plan_run_ids(db, generation)
+    legacy_accepted_by_line = {
+        int(line_id): _dec(qty)
+        for line_id, qty in db.query(
+            models.AssemblyOutputAllocation.plan_line_id,
             func.coalesce(
                 func.sum(models.AssemblyOutputAllocation.allocated_qty),
                 Decimal("0"),
-            ).label("accepted_plan_output_qty"),
+            ),
         )
         .filter(
-            models.AssemblyOutputAllocation.ledger_generation_id == int(generation_id),
+            models.AssemblyOutputAllocation.ledger_generation_id
+            == int(generation_id)
         )
         .group_by(models.AssemblyOutputAllocation.plan_line_id)
-        .subquery()
-    )
-
+        .all()
+    }
     rows = (
         db.query(
             models.ProductionPlanLine,
             models.PlanningRun,
             models.ProductionPlanHeader,
             models.Item,
-            func.coalesce(
-                accepted_allocations.c.accepted_plan_output_qty,
-                Decimal("0"),
-            ).label("accepted_plan_output_qty"),
+            models.MrpRunRoot,
         )
         .join(
             models.ProductionPlanHeader,
@@ -84,14 +152,16 @@ def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
             models.PlanningRun,
             and_(
                 models.PlanningRun.source_plan_id == models.ProductionPlanHeader.id,
-                models.PlanningRun.status == "FIXED_SNAPSHOT",
-                models.PlanningRun.ledger_generation_id == int(generation_id),
+                models.PlanningRun.run_id.in_(run_ids),
             ),
         )
         .join(models.Item, models.Item.item_id == models.ProductionPlanLine.item_id)
         .outerjoin(
-            accepted_allocations,
-            accepted_allocations.c.plan_line_id == models.ProductionPlanLine.id,
+            models.MrpRunRoot,
+            and_(
+                models.MrpRunRoot.run_id == models.PlanningRun.run_id,
+                models.MrpRunRoot.plan_line_id == models.ProductionPlanLine.id,
+            ),
         )
         .filter(
             models.ProductionPlanHeader.status == "fixed",
@@ -107,18 +177,38 @@ def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
     )
 
     lines: list[dict[str, Any]] = []
-    for line, run, plan, item, accepted_plan_output_qty in rows:
-        planned_output_qty = _dec(line.qty)
-        accepted_output_qty = _dec(accepted_plan_output_qty)
-        assembly_remaining_qty = max(planned_output_qty - accepted_output_qty, Decimal("0"))
-        if assembly_remaining_qty <= Decimal("0"):
+    for line, run, plan, item, root in rows:
+        # Legacy rows without run roots remain readable during migration only.
+        # Every newly frozen run owns an explicit MrpRunRoot.
+        planned_output_qty = _dec(root.planned_qty if root is not None else line.qty)
+        accepted_output_qty = _dec(
+            root.accepted_qty
+            if root is not None
+            else legacy_accepted_by_line.get(int(line.id), line.accepted_output_qty)
+        )
+        assembly_remaining_qty = _dec(
+            root.remaining_qty
+            if root is not None
+            else (
+                line.remaining_output_qty
+                if line.remaining_output_qty is not None
+                else max(_dec(line.qty) - accepted_output_qty, Decimal("0"))
+            )
+        )
+        if not include_zero and assembly_remaining_qty <= Decimal("0"):
             continue
 
         plan_id = int(plan.id)
         line_id = int(line.id)
         run_id = int(run.run_id)
-        priority = _priority_key(run.period_from, run.period_to, plan_id, line_id)
-        sort_key = _sort_key(run.period_from, run.period_to, plan_id, line_id)
+        eligible_from = (
+            run.started_at
+            if run.prior_run_id is not None
+            else (plan.fixed_at or run.fixed_at)
+        )
+        period_from, period_to = _frozen_run_period(run, plan)
+        priority = _priority_key(period_from, period_to, plan_id, line_id)
+        sort_key = _sort_key(period_from, period_to, plan_id, line_id)
         payload: dict[str, Any] = {
             "plan_id": plan_id,
             "plan_line_id": line_id,
@@ -127,11 +217,12 @@ def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
             "item_code": str(item.item_code or ""),
             "item_name": str(item.item_name or ""),
             "bucket_date": _date_key(line.bucket_date),
-            "period_from": _date_key(run.period_from),
-            "period_to": _date_key(run.period_to),
+            "period_from": _date_key(period_from),
+            "period_to": _date_key(period_to),
             "planned_output_qty": float(planned_output_qty),
             "accepted_plan_output_qty": float(accepted_output_qty),
             "assembly_remaining_qty": float(assembly_remaining_qty),
+            "eligible_from": eligible_from,
             "priority_key": priority,
         }
         lines.append(
@@ -145,6 +236,85 @@ def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
         )
 
     return lines
+
+
+def materialize_assembly_queue_lines(
+    db: Session,
+    generation_id: int,
+) -> list[models.AssemblyQueueLine]:
+    """Build or validate saved assembly-queue rows for a generation."""
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError("assembly queue requires a BUILDING generation")
+    if str(generation.status or "") != "building":
+        raise ValueError("assembly queue requires a BUILDING generation")
+
+    rows = (
+        db.query(models.AssemblyQueueLine)
+        .filter(
+            models.AssemblyQueueLine.ledger_generation_id == int(generation.id),
+        )
+        .order_by(models.AssemblyQueueLine.sort_key.asc(), models.AssemblyQueueLine.id.asc())
+        .all()
+    )
+    if rows:
+        missing = [int(row.plan_line_id) for row in rows if row.eligible_from is None]
+        if missing:
+            raise ValueError(
+                "persisted assembly queue lacks frozen eligible_from for plan lines "
+                + ",".join(str(value) for value in missing)
+            )
+        return [row for row in rows if str(row.line_status or "") == "open"]
+
+    payload_rows: list[models.AssemblyQueueLine] = []
+    for row in _build_rows(db, int(generation.id)):
+        payload = row["payload"]
+        bucket_date = _to_date(payload["bucket_date"])
+        period_from = _to_date(payload["period_from"])
+        period_to = _to_date(payload["period_to"])
+        eligible_from = payload.get("eligible_from")
+        if eligible_from is None:
+            raise ValueError(
+                f"assembly queue line {int(payload['plan_line_id'])} lacks fixed_at"
+            )
+        payload_rows.append(models.AssemblyQueueLine(
+            ledger_generation_id=int(generation.id),
+            planning_run_id=int(payload["run_id"]),
+            plan_id=int(payload["plan_id"]),
+            plan_line_id=int(payload["plan_line_id"]),
+            item_id=int(row["item_id"]),
+            bucket_date=bucket_date,
+            period_from=period_from,
+            period_to=period_to,
+            planned_output_qty=_dec(payload["planned_output_qty"]),
+            accepted_plan_output_qty=_dec(payload["accepted_plan_output_qty"]),
+            assembly_remaining_qty=_dec(payload["assembly_remaining_qty"]),
+            original_priority=payload["priority_key"],
+            eligible_from=eligible_from,
+            sort_key=str(row["sort_key"]),
+            line_status="open",
+        ))
+    db.add_all(payload_rows)
+    db.flush()
+    return payload_rows
+
+
+def _snapshot_rows_from_queue(
+    queue_rows: list[models.AssemblyQueueLine],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in queue_rows:
+        linespec = _snapshot_row_from_assembly_queue_line(row)
+        rows.append(
+            {
+                "row_key": f"plan-line:{int(row.plan_line_id)}",
+                "row_kind": ROW_KIND,
+                "item_id": int(row.item_id),
+                "sort_key": _date_key(row.sort_key),
+                "payload": linespec,
+            }
+        )
+    return rows
 
 
 def _payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -219,7 +389,8 @@ def build_assembly_queue_snapshot(db: Session, generation_id: int) -> models.Pla
     if str(generation.status or "") != "building":
         raise ValueError("assembly queue snapshot requires a BUILDING generation")
 
-    rows = _build_rows(db, int(generation.id))
+    queue_rows = materialize_assembly_queue_lines(db, int(generation.id))
+    rows = _snapshot_rows_from_queue(queue_rows)
     payload = _payload(rows)
     row_specs = _snapshot_row_specs(rows)
 

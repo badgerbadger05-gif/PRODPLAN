@@ -21,6 +21,7 @@ from sqlalchemy.pool import StaticPool
 from app import models
 from app.database import Base, get_db
 from app.routers.item_ledger import (
+    ItemLedgerFutureSupplyResponse,
     ItemLedgerMovementsResponse,
     ItemLedgerPositionResponse,
     ItemLedgerReservationEventsResponse,
@@ -94,7 +95,7 @@ def client(db_session):
 # ---------------------------------------------------------------------------
 def _item(db, code, method="Производство"):
     it = models.Item(item_code=code, item_name=f"Item {code}", item_ref1c=f"ref-{code}",
-                     replenishment_method=method, stock_qty=0)
+                     replenishment_method=method)
     db.add(it)
     db.flush()
     return it
@@ -104,6 +105,7 @@ def test_openapi_exposes_strict_response_models(client):
     schema = client.app.openapi()
     expected = {
         "/api/v1/item-ledger/{item_id}/position": "ItemLedgerPositionResponse",
+        "/api/v1/item-ledger/{item_id}/future-supply": "ItemLedgerFutureSupplyResponse",
         "/api/v1/item-ledger/{item_id}/movements": "ItemLedgerMovementsResponse",
         "/api/v1/item-ledger/{item_id}/reservations": "ItemLedgerReservationsResponse",
         "/api/v1/item-ledger/{item_id}/reservations/{reservation_id}/events": "ItemLedgerReservationEventsResponse",
@@ -248,10 +250,104 @@ def test_position_unknown_item_404(client, seeded):
     assert client.get("/api/v1/item-ledger/999999/position").status_code == 404
 
 
+def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
+    generation_id = db_session.get(models.PlanningTruthState, 1).current_generation_id
+    batch = models.LedgerBuildBatch(
+        ledger_generation_id=generation_id,
+        stage="future_supply_capture",
+        batch_key="router:future-supply",
+        status="completed",
+        algorithm_version="tests/1",
+        metrics={},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    common = {
+        "ledger_generation_id": generation_id,
+        "item_id": seeded["a"],
+        "characteristic_ref": "",
+        "organization_ref": "",
+        "planning_stock_pool": "default",
+        "destination_warehouse_ref1c": "W1",
+        "source_local_id": None,
+        "source_requirement_id": None,
+        "eta_date": dt.date(2026, 8, 15),
+        "source_state_key": "ordered",
+        "source_updated_at": None,
+        "capture_cutoff": dt.datetime(2026, 7, 23, 23, 59),
+        "capture_batch_id": batch.id,
+        "reason": None,
+    }
+    db_session.add_all([
+        models.LedgerFutureSupply(
+            **common,
+            supply_kind="supplier_order",
+            source_ref="SUP-42",
+            source_line_ref="1",
+            ordered_qty_at_cutoff=Decimal("12"),
+            realized_qty_at_cutoff=Decimal("5"),
+            open_qty_at_cutoff=Decimal("7"),
+            evidence_status="exact",
+            source_content_hash="a" * 64,
+        ),
+        models.LedgerFutureSupply(
+            **common,
+            supply_kind="wip_order",
+            source_ref="WIP-CLOSED",
+            source_line_ref="1",
+            ordered_qty_at_cutoff=Decimal("3"),
+            realized_qty_at_cutoff=Decimal("3"),
+            open_qty_at_cutoff=Decimal("0"),
+            evidence_status="exact",
+            source_content_hash="b" * 64,
+        ),
+    ])
+    db_session.add(models.SupplierOrder(
+        order_number="ЗП-000042",
+        order_date=dt.datetime(2026, 7, 20),
+        order_ref1c="SUP-42",
+    ))
+    db_session.commit()
+
+    response = client.get(f"/api/v1/item-ledger/{seeded['a']}/future-supply")
+    assert response.status_code == 200
+    payload = response.json()
+    ItemLedgerFutureSupplyResponse.model_validate(payload)
+    assert payload["truth_meta"]["ledger_generation"] == generation_id
+    assert payload["rows"] == [{
+        "id": payload["rows"][0]["id"],
+        "supply_kind": "supplier_order",
+        "source_ref": "SUP-42",
+        "source_number": "ЗП-000042",
+        "source_line_ref": "1",
+        "ordered_qty": 12.0,
+        "received_qty": 5.0,
+        "open_qty": 7.0,
+        "eta_date": "2026-08-15",
+        "destination_warehouse_ref1c": "W1",
+        "destination_warehouse_name": "Цех 1",
+        "source_state_key": "ordered",
+        "source_state_name": "",
+        "evidence_status": "exact",
+    }]
+
+
 # ---------------------------------------------------------------------------
 #  movements
 # ---------------------------------------------------------------------------
-def test_movements_sorted_and_scoped(client, seeded):
+def test_movements_sorted_and_scoped(client, db_session, seeded):
+    db_session.add(models.ProductionOrder(
+        order_number="PP001305968",
+        order_date=dt.datetime(2026, 7, 20),
+        order_ref1c="ORDER-42",
+    ))
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_Test",
+        recorder_ref="rec-2",
+        order_ref="ORDER-42",
+        status="done",
+    ))
+    db_session.commit()
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements").json()
     ItemLedgerMovementsResponse.model_validate(d)
     assert d["truth_meta"]["truth_status"] == "accepted"
@@ -265,6 +361,9 @@ def test_movements_sorted_and_scoped(client, seeded):
     assert first["qty_after"] == pytest.approx(300.0)
     assert first["warehouse_name"] == "Цех 1"
     assert first["ingest_source"] == "document_pull"
+    assert first["recorder_number"] == ""
+    assert first["basis_order_number"] == ""
+    assert next(row for row in d["rows"] if row["recorder_ref"] == "rec-2")["basis_order_number"] == "PP001305968"
 
 
 def test_movements_pagination(client, seeded):

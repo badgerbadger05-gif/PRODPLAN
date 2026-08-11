@@ -25,13 +25,19 @@ from app import models
 from ..mrp_freeze import PoolKey, pool_key_for
 from ..replenishment import (
     REPLENISHMENT_FLOW_PURCHASE,
+    REPLENISHMENT_FLOW_PRODUCTION,
+    REPLENISHMENT_FLOW_REWORK,
+    REPLENISHMENT_FLOW_UNAVAILABLE,
     classify_replenishment_flow,
 )
 from .reservation import (
     BUY,
     MAKE,
+    REWORK,
     append_realization_event,
+    fold_reservation_entry,
     fold_reservation_events,
+    freeze_reservation_amounts,
     replenishment_remaining,
 )
 
@@ -55,6 +61,7 @@ def _resolve_generation_id(
     ledger_generation_id: Optional[int] = None,
     *,
     for_write: bool = True,
+    allow_building_read: bool = False,
 ) -> int:
     generation = (
         db.get(models.LedgerGeneration, int(ledger_generation_id))
@@ -73,66 +80,67 @@ def _resolve_generation_id(
             f"reservation Ledger generation {generation.id} is {generation.status}; "
             "writes require building"
         )
-    if (
-        not for_write
-        and str(generation.status) == "accepted"
-        and (generation.cutoff is None or generation.accepted_at is None)
-    ):
-        raise ValueError(
-            f"reservation Ledger generation {generation.id} is malformed: "
-            "accepted reads require cutoff and accepted_at"
-        )
+    if not for_write:
+        status = str(generation.status)
+        if status != "accepted" and not (
+            allow_building_read and status == "building"
+        ):
+            raise ValueError(
+                f"reservation Ledger generation {generation.id} is {status}; "
+                "reads require accepted truth"
+            )
+        if status == "accepted" and (
+            generation.cutoff is None or generation.accepted_at is None
+        ):
+            raise ValueError(
+                f"reservation Ledger generation {generation.id} is malformed: "
+                "accepted reads require cutoff and accepted_at"
+            )
     return int(generation.id)
 
 
 def _ledger_on_hand_by_generation(
     db: Session,
     ledger_generation_id: int,
+    *,
+    item_ids: Optional[Set[int]] = None,
 ) -> Dict[int, float]:
-    ignored_refs = {
-        str(ref)
-        for (ref,) in db.query(models.IgnoredWarehouse.warehouse_ref1c).all()
-        if ref
-    }
-    warehouse_rows = db.query(
-        models.StockWarehouse.warehouse_ref1c,
-        models.StockWarehouse.is_selected,
-        models.StockWarehouse.is_finished_goods,
-    ).all()
-    selected_refs = {
-        str(ref)
-        for ref, selected, finished in warehouse_rows
-        if ref and bool(selected) and not bool(finished)
-    }
-    finished_refs = {
-        str(ref)
-        for ref, _selected, finished in warehouse_rows
-        if ref and bool(finished)
-    }
-    query = db.query(
-        models.StockBin.item_id,
-        func.sum(models.StockBin.on_hand),
-    ).filter(models.StockBin.ledger_generation_id == ledger_generation_id)
-    if selected_refs:
-        query = query.filter(models.StockBin.warehouse_ref1c.in_(selected_refs))
-    if ignored_refs:
-        query = query.filter(~models.StockBin.warehouse_ref1c.in_(ignored_refs))
-    if finished_refs:
-        query = query.filter(~models.StockBin.warehouse_ref1c.in_(finished_refs))
-    return {
-        int(item_id): float(quantity or 0)
-        for item_id, quantity in query.group_by(models.StockBin.item_id).all()
-    }
+    from ..mrp_stock_helpers import planning_stock_by_item
+
+    return planning_stock_by_item(
+        db,
+        int(ledger_generation_id),
+        item_ids=item_ids,
+        # Item Ledger position is cross-organization unless its pool key
+        # explicitly narrows organization. MRP callers use the default-org
+        # policy through the same owner.
+        organization_ref=None,
+    )
 
 
-def _is_produced(item: Optional[models.Item]) -> bool:
+def _resolve_reservation_mode(item: Optional[models.Item]) -> str:
     method = getattr(item, "replenishment_method", None) if item is not None else None
-    return classify_replenishment_flow(method) != REPLENISHMENT_FLOW_PURCHASE
+    flow = classify_replenishment_flow(method)
+    if flow == REPLENISHMENT_FLOW_PURCHASE:
+        return BUY
+    if flow == REPLENISHMENT_FLOW_PRODUCTION:
+        return MAKE
+    if flow == REPLENISHMENT_FLOW_REWORK:
+        return REWORK
+    if flow == REPLENISHMENT_FLOW_UNAVAILABLE:
+        raise ValueError(
+            "Unsupported replenishment flow in reservation materialization "
+            f"(item={int(item.item_id) if item is not None else None}, method={method!r})"
+        )
+    raise ValueError(
+        f"Unsupported replenishment flow '{flow}' in reservation materialization "
+        f"(item={int(item.item_id) if item is not None else None}, method={method!r})"
+    )
 
 
 def mode_targets(req: models.MrpRequirement, item: Optional[models.Item]) -> List[Tuple[str, Decimal]]:
     """Assign each requirement to one canonical mode: make or buy."""
-    flow = MAKE if _is_produced(item) else BUY
+    flow = _resolve_reservation_mode(item)
     return [(flow, _dec(req.total_required_qty))]
 
 
@@ -165,7 +173,19 @@ def _get_or_create_entry(
     freeze_version = int(
         req.freeze_version
         if req.freeze_version is not None
-        else (run.active_freeze_version if run and run.active_freeze_version is not None else 0)
+        else (run.active_freeze_version if run and run.active_freeze_version is not None else 1)
+    )
+    frozen_stock_allocation = (
+        db.query(func.coalesce(func.sum(models.MrpFreezeAllocation.alloc_qty), 0))
+        .filter(models.MrpFreezeAllocation.requirement_id == int(req.id))
+        .filter(models.MrpFreezeAllocation.run_id == int(req.run_id))
+        .filter(models.MrpFreezeAllocation.freeze_version == freeze_version)
+        .filter(models.MrpFreezeAllocation.source_type == "stock")
+        .scalar()
+    )
+    frozen = freeze_reservation_amounts(
+        req.total_required_qty,
+        _dec(frozen_stock_allocation),
     )
     entry = models.ReservationEntry(
         ledger_generation_id=ledger_generation_id,
@@ -180,11 +200,8 @@ def _get_or_create_entry(
         priority_period_to=pt,
         realization_mode=mode,
         reserved_qty=Decimal("0"),
-        covered_from_stock_at_freeze_qty=max(
-            _dec(req.total_required_qty) - _dec(req.net_required_qty),
-            Decimal("0"),
-        ),
-        replenishment_required_qty=max(_dec(req.net_required_qty), Decimal("0")),
+        covered_from_stock_at_freeze_qty=frozen.covered_from_stock_at_freeze_qty,
+        replenishment_required_qty=frozen.replenishment_required_qty,
         replenishment_received_qty=Decimal("0"),
         realized_qty=Decimal("0"),
         lifecycle_status="active",
@@ -230,22 +247,8 @@ def _fold_entry(
     db: Session,
     entry: models.ReservationEntry,
 ) -> Tuple[Decimal, Decimal, Decimal]:
-    """Fold events into one reserve cache row."""
-    events = (
-        db.query(models.ReservationEvent)
-        .filter(models.ReservationEvent.reservation_id == int(entry.id))
-        .filter(models.ReservationEvent.ledger_generation_id == int(entry.ledger_generation_id))
-        .order_by(models.ReservationEvent.id.asc())
-        .all()
-    )
-    fold = fold_reservation_events(events)
-    entry.reserved_qty = fold.reserved_qty
-    entry.realized_qty = fold.realized_qty
-    entry.replenishment_received_qty = min(
-        fold.realized_qty,
-        _dec(entry.replenishment_required_qty),
-    )
-    db.flush()
+    """Fold through the canonical reservation-entry projector."""
+    fold = fold_reservation_entry(db, int(entry.id))
     remaining = replenishment_remaining(
         entry.replenishment_required_qty,
         entry.replenishment_received_qty,
@@ -362,7 +365,10 @@ _FUTURE_SUPPLY_KIND_FIELD = {
 
 
 def _ledger_incoming_by_generation(
-    db: Session, generation_id: int
+    db: Session,
+    generation_id: int,
+    *,
+    item_ids: Optional[Set[int]] = None,
 ) -> Dict[int, Dict[str, float]]:
     """Open future supply of one generation, split by kind.
 
@@ -371,7 +377,9 @@ def _ledger_incoming_by_generation(
     a generation without a capture reports nothing rather than a fabricated
     zero, and its consumers fail closed on the ``future_supply`` capability.
     """
-    rows = (
+    if item_ids is not None and not item_ids:
+        return {}
+    query = (
         db.query(
             models.LedgerFutureSupply.item_id,
             models.LedgerFutureSupply.supply_kind,
@@ -381,12 +389,15 @@ def _ledger_incoming_by_generation(
             models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
             models.LedgerFutureSupply.evidence_status == "exact",
         )
-        .group_by(
-            models.LedgerFutureSupply.item_id,
-            models.LedgerFutureSupply.supply_kind,
-        )
-        .all()
     )
+    if item_ids is not None:
+        query = query.filter(
+            models.LedgerFutureSupply.item_id.in_(sorted(item_ids))
+        )
+    rows = query.group_by(
+        models.LedgerFutureSupply.item_id,
+        models.LedgerFutureSupply.supply_kind,
+    ).all()
     incoming: Dict[int, Dict[str, float]] = {}
     for item_id, supply_kind, open_qty in rows:
         field = _FUTURE_SUPPLY_KIND_FIELD.get(str(supply_kind or ""))
@@ -404,16 +415,32 @@ def item_ledger_position(
     item_ids: Optional[Sequence[int]] = None,
     *,
     ledger_generation_id: Optional[int] = None,
+    allow_building_read: bool = False,
 ) -> Dict[int, Dict[str, float]]:
     """Render pool projection `{item_id: {on_hand, incoming, reserved_soft, ...}}`."""
-    generation_id = _resolve_generation_id(db, ledger_generation_id, for_write=False)
+    generation_id = _resolve_generation_id(
+        db,
+        ledger_generation_id,
+        for_write=False,
+        allow_building_read=allow_building_read,
+    )
     want: Optional[Set[int]] = (
         {int(i) for i in item_ids if i is not None} if item_ids is not None else None
     )
-    on_hand_all = _ledger_on_hand_by_generation(db, generation_id)
-    incoming_all = _ledger_incoming_by_generation(db, generation_id)
+    if want is not None and not want:
+        return {}
+    on_hand_all = _ledger_on_hand_by_generation(
+        db,
+        generation_id,
+        item_ids=want,
+    )
+    incoming_all = _ledger_incoming_by_generation(
+        db,
+        generation_id,
+        item_ids=want,
+    )
     reserved_soft: Dict[int, float] = {}
-    res_rows = (
+    reservation_query = (
         db.query(
             models.ReservationEntry.item_id,
             models.ReservationEntry.reserved_qty,
@@ -422,8 +449,12 @@ def item_ledger_position(
             models.ReservationEntry.lifecycle_status == "active",
             models.ReservationEntry.ledger_generation_id == generation_id,
         )
-        .all()
     )
+    if want is not None:
+        reservation_query = reservation_query.filter(
+            models.ReservationEntry.item_id.in_(sorted(want))
+        )
+    res_rows = reservation_query.all()
     for item_id, reserved in res_rows:
         frozen = max(float(reserved or 0.0), 0.0)
         if frozen > 0.0:

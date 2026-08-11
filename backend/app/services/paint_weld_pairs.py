@@ -34,6 +34,8 @@ from ..models import (
     Specification,
 )
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
+from .bom_specification_resolver import BomSpecificationResolver
+from .production_output_truth import accepted_product_remaining_expr
 
 # Красящий вид производства: имя production_kind содержит любой из маркеров.
 # «окрас» — подстрока «покраска», поэтому ловит и «Узел (покраска)».
@@ -69,29 +71,25 @@ def _paint_kind_ids(db: Session) -> Set[int]:
 
 def _painted_specs(db: Session) -> Dict[int, int]:
     """
-    {painted_item_id: spec_id} — позиции, чья DEFAULT-спека (минимальный
-    default_specifications.id для позиции) имеет красящий production_kind.
+    {painted_item_id: spec_id} — позиции, чья однозначно разрешённая
+    default-спека имеет красящий production_kind.
     """
     paint_kind_ids = _paint_kind_ids(db)
     if not paint_kind_ids:
         return {}
-    rows = (
-        db.query(
-            DefaultSpecification.item_id,
-            DefaultSpecification.spec_id,
-            Specification.production_kind_id,
-        )
-        .join(Specification, Specification.spec_id == DefaultSpecification.spec_id)
-        .order_by(DefaultSpecification.item_id.asc(), DefaultSpecification.id.asc())
-        .all()
-    )
+    item_ids = [
+        int(item_id)
+        for (item_id,) in db.query(DefaultSpecification.item_id).distinct().all()
+    ]
+    resolver = BomSpecificationResolver(db)
+    spec_by_id = {
+        int(spec.spec_id): spec for spec in db.query(Specification).all()
+    }
     result: Dict[int, int] = {}
-    seen: Set[int] = set()
-    for item_id, spec_id, kind_id in rows:
-        iid = int(item_id)
-        if iid in seen:
-            continue  # только default-спека (первая по id)
-        seen.add(iid)
+    for iid in item_ids:
+        spec_id = resolver.default_spec_id(iid)
+        spec = spec_by_id.get(int(spec_id)) if spec_id is not None else None
+        kind_id = getattr(spec, "production_kind_id", None)
         if kind_id is not None and int(kind_id) in paint_kind_ids:
             result[iid] = int(spec_id)
     return result
@@ -385,32 +383,42 @@ def deactivate_pair(db: Session, pair_id: int) -> Dict[str, Any]:
 def _effective_welded_stock(db: Session, welded_item_id: int) -> float:
     """Accepted Ledger stock minus operational reservations."""
     from .item_ledger import item_ledger_position
-    from .planning_truth import require_accepted
-    from .production_material_custody import committed_material_by_item
+    from .production_material_custody_projection import load_current_accepted_material_custody
 
-    truth = require_accepted(db)
+    generation_id, custody = load_current_accepted_material_custody(
+        db,
+        consumer="paint_weld_effective_stock",
+    )
     stock = _to_float(
         item_ledger_position(
             db,
             [welded_item_id],
-            ledger_generation_id=truth.generation_id,
+            ledger_generation_id=generation_id,
         )[welded_item_id]["on_hand"]
     )
-    reserved = _to_float(committed_material_by_item(db, [welded_item_id]).get(welded_item_id, 0.0))
+    reserved = _to_float(custody.total_by_item().get(welded_item_id, 0.0))
     return max(stock - reserved, 0.0)
 
 
 def _open_weld_orders(db: Session, welded_item_id: int) -> List[Dict[str, Any]]:
-    """Открытые сварочные заказы: строки production_products с remaining_qty>0."""
+    """Открытые сварочные заказы по quantity минус принятому выпуску."""
+    remaining_expr = accepted_product_remaining_expr(
+        ProductionProduct.quantity,
+        ProductionProduct.produced_qty,
+    )
     rows = (
         db.query(
             ProductionOrder.order_number,
-            ProductionProduct.remaining_qty,
+            remaining_expr.label("remaining_qty"),
         )
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .filter(ProductionProduct.item_id == int(welded_item_id))
         .filter(ProductionOrder.deletion_mark.is_(False))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+        .filter(
+            func.lower(func.coalesce(ProductionOrder.order_state_key, ""))
+            != "ad28565a-991b-11eb-e39a-fa163e61326a"
+        )
+        .filter(remaining_expr > 0)
         .all()
     )
     orders: List[Dict[str, Any]] = []

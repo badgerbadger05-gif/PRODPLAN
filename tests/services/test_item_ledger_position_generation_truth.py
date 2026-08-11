@@ -2,8 +2,33 @@
 
 from datetime import date, datetime
 
+import pytest
+from sqlalchemy import event
+
 from app import models
 from app.services.item_ledger.reservation_ledger import item_ledger_position
+
+
+def test_position_fails_closed_for_unaccepted_generation(
+    db_session,
+    building_ledger_generation,
+):
+    with pytest.raises(ValueError, match="reads require accepted truth"):
+        item_ledger_position(
+            db_session,
+            [],
+            ledger_generation_id=building_ledger_generation.id,
+        )
+
+    building_ledger_generation.status = "rejected"
+    db_session.flush()
+    with pytest.raises(ValueError, match="reads require accepted truth"):
+        item_ledger_position(
+            db_session,
+            [],
+            ledger_generation_id=building_ledger_generation.id,
+            allow_building_read=True,
+        )
 
 
 def _item_requirement(db, code: str):
@@ -104,6 +129,7 @@ def test_live_legacy_supply_mirrors_do_not_change_ledger_position(
         db,
         [item.item_id],
         ledger_generation_id=generation.id,
+        allow_building_read=True,
     )[item.item_id]
 
     assert position["incoming_supplier"] == 0
@@ -148,9 +174,11 @@ def test_position_incoming_is_isolated_by_ledger_generation(
 
     first_position = item_ledger_position(
         db, [item.item_id], ledger_generation_id=first.id,
+        allow_building_read=True,
     )[item.item_id]
     second_position = item_ledger_position(
         db, [item.item_id], ledger_generation_id=second.id,
+        allow_building_read=True,
     )[item.item_id]
 
     assert first_position["incoming_supplier"] == 0
@@ -172,7 +200,7 @@ def _future_supply(
     """One captured future-supply row scoped to a generation."""
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(generation.id),
-        stage="snapshot_build",
+        stage="future_supply_capture",
         batch_key=f"capture-{generation.id}-{source_ref}",
         status="completed",
         algorithm_version="tests/1",
@@ -239,12 +267,134 @@ def test_position_incoming_reads_the_generation_future_supply_capture(
 
     position = item_ledger_position(
         db, [item.item_id], ledger_generation_id=generation.id,
+        allow_building_read=True,
     )[item.item_id]
 
     assert position["incoming_supplier"] == 6
     assert position["incoming_wip"] == 4
     assert position["incoming"] == 10
     assert position["projected"] == 10
+
+
+def test_requested_items_are_filtered_at_every_sql_source(
+    db_session,
+    building_ledger_generation,
+):
+    db = db_session
+    generation = building_ledger_generation
+    wanted, wanted_run, wanted_requirement = _item_requirement(
+        db,
+        "POSITION-SQL-WANTED",
+    )
+    irrelevant, irrelevant_run, irrelevant_requirement = _item_requirement(
+        db,
+        "POSITION-SQL-IRRELEVANT",
+    )
+    db.add_all([
+        models.StockBin(
+            ledger_generation_id=generation.id,
+            item_id=wanted.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH",
+            on_hand=3,
+        ),
+        models.StockBin(
+            ledger_generation_id=generation.id,
+            item_id=irrelevant.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH",
+            on_hand=999,
+        ),
+    ])
+    _future_supply(
+        db,
+        generation=generation,
+        item=wanted,
+        supply_kind="supplier_order",
+        open_qty=4,
+        source_ref="wanted",
+    )
+    _future_supply(
+        db,
+        generation=generation,
+        item=irrelevant,
+        supply_kind="supplier_order",
+        open_qty=999,
+        source_ref="irrelevant",
+    )
+    _reservation(
+        db,
+        generation_id=generation.id,
+        item=wanted,
+        run=wanted_run,
+        requirement=wanted_requirement,
+    )
+    _reservation(
+        db,
+        generation_id=generation.id,
+        item=irrelevant,
+        run=irrelevant_run,
+        requirement=irrelevant_requirement,
+    )
+    db.flush()
+
+    statements: list[str] = []
+
+    def capture(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(str(statement).lower())
+
+    event.listen(db.bind, "before_cursor_execute", capture)
+    try:
+        result = item_ledger_position(
+            db,
+            [wanted.item_id],
+            ledger_generation_id=generation.id,
+            allow_building_read=True,
+        )
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture)
+
+    assert set(result) == {wanted.item_id}
+    assert result[wanted.item_id]["on_hand"] == 3
+    assert result[wanted.item_id]["incoming_supplier"] == 4
+    assert result[wanted.item_id]["reserved_soft"] == 10
+    for table in ("stock_bin", "ledger_future_supply", "reservation_entry"):
+        source_queries = [
+            statement for statement in statements
+            if f"from {table}" in statement
+        ]
+        assert source_queries, f"no query captured for {table}"
+        assert all("item_id in" in statement for statement in source_queries)
+
+
+def test_empty_requested_item_set_does_not_scan_position_sources(
+    db_session,
+    building_ledger_generation,
+):
+    statements: list[str] = []
+
+    def capture(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(str(statement).lower())
+
+    event.listen(db_session.bind, "before_cursor_execute", capture)
+    try:
+        result = item_ledger_position(
+            db_session,
+            [],
+            ledger_generation_id=building_ledger_generation.id,
+            allow_building_read=True,
+        )
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", capture)
+
+    assert result == {}
+    assert not any(
+        f"from {table}" in statement
+        for statement in statements
+        for table in ("stock_bin", "ledger_future_supply", "reservation_entry")
+    )
 
 
 def test_position_incoming_stays_scoped_to_its_own_generation(
@@ -275,9 +425,11 @@ def test_position_incoming_stays_scoped_to_its_own_generation(
 
     first_position = item_ledger_position(
         db, [item.item_id], ledger_generation_id=first.id,
+        allow_building_read=True,
     )[item.item_id]
     second_position = item_ledger_position(
         db, [item.item_id], ledger_generation_id=second.id,
+        allow_building_read=True,
     )[item.item_id]
 
     assert first_position["incoming_supplier"] == 5

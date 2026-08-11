@@ -1,6 +1,6 @@
 // Error thrown for any non-2xx response. Carries the HTTP status and the parsed
-// `detail` payload so callers can render structured 409 bodies (e.g. the DBR
-// launch conflict with its `deficit_lines`) instead of a stringified blob.
+// `detail` payload so callers can render structured error bodies instead of
+// raw non-JSON text.
 export class ApiError extends Error {
   status: number
   detail: unknown

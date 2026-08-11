@@ -5,6 +5,7 @@ import { ApiError } from '../../lib/api'
 import { qty } from '../../lib/format'
 import type {
   ItemLedgerMovementsResponse,
+  ItemLedgerFutureSupplyResponse,
   ItemLedgerPosition,
   ItemLedgerReservationsResponse,
   ItemLedgerReservationEventsResponse,
@@ -83,6 +84,8 @@ const movements: ItemLedgerMovementsResponse = {
       record_type: 'Expense',
       recorder_type: 'Document_СборкаЗапасов',
       recorder_ref: 'doc-1',
+      recorder_number: '',
+      basis_order_number: 'PP001305968',
       line_no: '2',
       ingest_source: 'document_pull',
       characteristic_ref: 'ХАР',
@@ -99,12 +102,34 @@ const movements: ItemLedgerMovementsResponse = {
       record_type: 'Receipt',
       recorder_type: 'Document_Поступление',
       recorder_ref: 'doc-2',
+      recorder_number: 'ПТ-000001',
+      basis_order_number: '',
       line_no: '',
       ingest_source: 'seed',
       characteristic_ref: 'ХАР',
       organization_ref: 'org-1',
     },
   ],
+}
+
+const futureSupply: ItemLedgerFutureSupplyResponse = {
+  truth_meta: truthMeta,
+  rows: [{
+    id: 21,
+    supply_kind: 'wip_order',
+    source_ref: 'order-guid',
+    source_number: 'PP001305968',
+    source_line_ref: '1',
+    ordered_qty: 20,
+    received_qty: 0,
+    open_qty: 20,
+    eta_date: '2026-08-11',
+    destination_warehouse_ref1c: 'MAIN',
+    destination_warehouse_name: 'Основной склад',
+    source_state_key: 'state-guid',
+    source_state_name: 'Запущен',
+    evidence_status: 'exact',
+  }],
 }
 
 const reservations: ItemLedgerReservationsResponse = {
@@ -167,6 +192,7 @@ function createProvider(overrides: Partial<ItemLedgerDataProvider> = {}): ItemLe
     loadPosition: vi.fn().mockResolvedValue(position),
     loadMovements: vi.fn().mockResolvedValue(movements),
     loadReservations: vi.fn().mockResolvedValue(reservations),
+    loadFutureSupply: vi.fn().mockResolvedValue(futureSupply),
     loadReservationEvents: vi.fn().mockResolvedValue(reservationEvents),
     ...overrides,
   }
@@ -223,6 +249,16 @@ describe('LedgerWorkspacePage', () => {
     expect(screen.getByText(/doc-1/)).toBeInTheDocument()
   })
 
+  it('shows live orders with business identifiers instead of technical refs', async () => {
+    render(<LedgerWorkspacePage itemId="9401" provider={createProvider()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Живые заказы' }))
+
+    expect(await screen.findByText('PP001305968')).toBeInTheDocument()
+    expect(screen.getAllByText('Основной склад').length).toBeGreaterThan(0)
+    expect(screen.queryByText('order-guid')).not.toBeInTheDocument()
+  })
+
   it('renders 404 contract error state', async () => {
     const provider = createProvider({
       loadPosition: vi.fn().mockRejectedValue(new ApiError('not found', 404, null)),
@@ -240,6 +276,7 @@ describe('LedgerWorkspacePage', () => {
       loadPosition: vi.fn().mockResolvedValue(position),
       loadMovements: vi.fn().mockResolvedValue(movements),
       loadReservations: vi.fn().mockResolvedValue(reservations),
+      loadFutureSupply: vi.fn().mockResolvedValue(futureSupply),
       loadReservationEvents: vi.fn((_, reservationId) => {
         if (reservationId === 101) return firstEvents.promise
         return secondEvents.promise

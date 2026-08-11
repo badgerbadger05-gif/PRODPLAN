@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any
-from pydantic import BaseModel
+from typing import Literal
+from pydantic import BaseModel, ConfigDict
 
 from ..database import get_db
 from ..services.nomenclature_search import search_nomenclature_service
@@ -9,20 +9,32 @@ from ..services.nomenclature_search import search_nomenclature_service
 router = APIRouter(prefix="/v1/nomenclature", tags=["nomenclature"])
 
 
-class SearchResponse(BaseModel):
-    items: List[Dict[str, Any]]
+class NomenclatureSearchItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    item_code: str
+    item_name: str
+    item_article: str | None
+    similarity: float
+
+
+class NomenclatureSearchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[NomenclatureSearchItemResponse]
     total: int
     query: str
     # Оставлено ради совместимости формы ответа с фронтом; всегда 'text'.
-    search_type: str
+    search_type: Literal["text"]
 
 
-@router.get("/search")
+@router.get("/search", response_model=NomenclatureSearchResponse)
 async def search_nomenclature(
     q: str = Query(..., description="Поисковый запрос"),
     limit: int = Query(20, description="Максимальное количество результатов", ge=1, le=100),
     db: Session = Depends(get_db)
-):
+) -> NomenclatureSearchResponse:
     """
     Текстовый поиск номенклатуры по наименованию, коду и артикулу.
 
@@ -35,7 +47,7 @@ async def search_nomenclature(
     try:
         results = search_nomenclature_service(db=db, query=q, limit=limit)
 
-        return SearchResponse(
+        return NomenclatureSearchResponse(
             items=results,
             total=len(results),
             query=q,

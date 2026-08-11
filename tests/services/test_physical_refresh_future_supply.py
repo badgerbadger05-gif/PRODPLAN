@@ -6,14 +6,16 @@ future supply and never cloned it, while the purchase-journal candidate reads
 journal reporting zero ordered and zero in transit.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from app import models
 from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
     FutureSupplyCaptureError,
+    _carry_forward_rows,
     carry_forward_future_supply,
 )
 from app.services.item_ledger.generation_lifecycle import accept_generation_build
@@ -24,7 +26,14 @@ from tests.services.test_generation_lifecycle import _synthetic
 CUTOFF = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
 
 
-def _accepted_parent_with_future_supply(db, key: str, item, *, qty="4"):
+def _accepted_parent_with_future_supply(
+    db, key: str, item, *,
+    qty="4",
+    realized_qty: str = "0",
+    open_qty: str | None = None,
+    source_requirement_id: int | None = None,
+    supply_kind: str = "wip_order",
+):
     physical = models.PhysicalImportBatch(
         batch_key=f"fs-physical-{key}",
         status="completed",
@@ -47,7 +56,7 @@ def _accepted_parent_with_future_supply(db, key: str, item, *, qty="4"):
     db.flush()
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(parent.id),
-        stage="snapshot_build",
+        stage="future_supply_capture",
         batch_key=f"fs-capture-{key}",
         status="completed",
         algorithm_version="test",
@@ -59,15 +68,16 @@ def _accepted_parent_with_future_supply(db, key: str, item, *, qty="4"):
     supply = models.LedgerFutureSupply(
         ledger_generation_id=int(parent.id),
         capture_batch_id=int(batch.id),
-        supply_kind="wip_order",
+        supply_kind=supply_kind,
         item_id=item.item_id,
         planning_stock_pool="default",
         destination_warehouse_ref1c="WH",
         source_ref=f"order-{key}",
         source_line_ref="1",
+        source_requirement_id=source_requirement_id,
         ordered_qty_at_cutoff=Decimal(qty),
-        realized_qty_at_cutoff=Decimal("0"),
-        open_qty_at_cutoff=Decimal(qty),
+        realized_qty_at_cutoff=Decimal(realized_qty),
+        open_qty_at_cutoff=Decimal(open_qty if open_qty is not None else qty),
         eta_date=date(2026, 8, 1),
         source_state_key="ready",
         capture_cutoff=CUTOFF,
@@ -105,9 +115,58 @@ def _item(db, code: str):
     return item
 
 
-def test_carry_forward_copies_the_parent_capture_verbatim(db_session):
+def _supplier_realization_between_cutoffs(
+    db_session,
+    parent_generation: models.LedgerGeneration,
+    item,
+    *,
+    order_ref: str,
+    qty: str = "2",
+):
+    posted_at = CUTOFF.replace(hour=18).replace(tzinfo=None)
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(parent_generation.physical_import_batch_id),
+        source_content_hash=("r" * 64),
+        item_id=item.item_id,
+        qty=Decimal(qty),
+        posting_at=posted_at,
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Document_ПоступлениеТоваров",
+        recorder_ref=f"receipt-{order_ref}",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(sle)
+    db_session.flush()
+    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=int(parent_generation.id),
+        stock_ledger_entry_id=sle.id,
+        receipt_doc_type=sle.recorder_type,
+        receipt_doc_ref=sle.recorder_ref,
+        receipt_doc_line_no=sle.line_no,
+        supplier_order_ref=order_ref,
+        supplier_order_line_no="1",
+        operation_kind="supplier_receipt",
+        evidence_hash=("p" * 64),
+        evidence_payload={},
+        match_rule="exact",
+        match_status="exact",
+        ambiguity_count=0,
+    ))
+    db_session.flush()
+
+
+def test_carry_forward_stamps_capture_cutoff_to_target_and_recomputes_open_qty(db_session):
     item = _item(db_session, "FS-CARRY")
-    parent = _accepted_parent_with_future_supply(db_session, "carry", item)
+    parent = _accepted_parent_with_future_supply(
+        db_session,
+        "carry",
+        item,
+        qty="10",
+        realized_qty="3",
+        open_qty="99",
+    )
     child = _building_child(db_session, "carry", parent)
 
     summary = carry_forward_future_supply(
@@ -124,14 +183,88 @@ def test_carry_forward_copies_the_parent_capture_verbatim(db_session):
     assert len(rows) == 1
     carried = rows[0]
     assert carried.source_ref == "order-carry"
-    assert carried.open_qty_at_cutoff == Decimal("4")
-    # The evidence was observed at the parent's cutoff and nothing re-read it,
-    # so the capture instant travels with the row rather than being restamped.
-    assert carried.capture_cutoff.replace(tzinfo=None) == CUTOFF.replace(tzinfo=None)
+    assert carried.open_qty_at_cutoff == Decimal("7")
+    # The captured fact is re-cutoffted to the target generation and kept
+    # in a canonical projected form.
+    assert carried.capture_cutoff == child.cutoff.replace(tzinfo=None)
     assert carried.capture_batch_id is not None
     batch = db_session.get(models.LedgerBuildBatch, int(carried.capture_batch_id))
     assert int(batch.ledger_generation_id) == int(child.id)
     assert batch.status == "completed"
+
+
+def test_carry_forward_keeps_timezone_on_timestamp_written_to_postgres(db_session):
+    item = _item(db_session, "FS-CARRY-TZ")
+    parent = _accepted_parent_with_future_supply(db_session, "carry-tz", item)
+    child = _building_child(db_session, "carry-tz", parent)
+    child.cutoff = datetime(2026, 7, 21, 15, tzinfo=timezone(timedelta(hours=3)))
+    db_session.flush()
+
+    rows = _carry_forward_rows(db_session, parent=parent, target=child)
+
+    assert rows[0]["capture_cutoff"].tzinfo is not None
+    assert rows[0]["capture_cutoff"].astimezone(timezone.utc) == datetime(
+        2026, 7, 21, 12, tzinfo=timezone.utc
+    )
+
+
+def test_carry_forward_reduces_open_qty_when_realization_occurs_between_cutoffs(db_session):
+    item = _item(db_session, "FS-BETWEEN")
+    parent = _accepted_parent_with_future_supply(
+        db_session,
+        "carry-between",
+        item,
+        qty="10",
+        realized_qty="3",
+        open_qty="7",
+        supply_kind="supplier_order",
+    )
+    child = _building_child(db_session, "carry-between", parent)
+    _supplier_realization_between_cutoffs(
+        db_session,
+        parent_generation=parent,
+        item=item,
+        order_ref="order-carry-between",
+        qty="2",
+    )
+
+    summary = carry_forward_future_supply(
+        db_session,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(child.id),
+    )
+
+    rows = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=int(child.id)
+    ).all()
+    assert summary["created"] is True
+    assert summary["rows"] == 1
+    assert len(rows) == 1
+    carried = rows[0]
+    assert carried.source_ref == "order-carry-between"
+    assert carried.open_qty_at_cutoff == Decimal("5")
+
+
+def test_carry_forward_copies_source_requirement_id(db_session):
+    item = _item(db_session, "FS-SR-ID")
+    parent = _accepted_parent_with_future_supply(
+        db_session,
+        "carry-sr-id",
+        item,
+        source_requirement_id=123,
+    )
+    child = _building_child(db_session, "carry-sr-id", parent)
+
+    carry_forward_future_supply(
+        db_session,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(child.id),
+    )
+
+    carried = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=int(child.id)
+    ).one()
+    assert carried.source_requirement_id == 123
 
 
 def test_carry_forward_is_idempotent(db_session):
@@ -206,15 +339,88 @@ def test_accept_carries_the_parent_capture_and_claims_the_capability(db_session)
     assert generation.capabilities["future_supply"] is True
 
 
-def test_a_generation_with_nothing_to_inherit_does_not_claim_future_supply(db_session):
-    """Fail closed: no capture means unavailable, never a fabricated zero."""
+def test_accept_recaptures_current_supplier_orders_on_physical_refresh(db_session):
+    generation, _requirement = _synthetic(db_session, "fs-current-supplier")
+    item = db_session.query(models.Item).filter_by(
+        item_code="ITEM-fs-current-supplier"
+    ).one()
+    parent = _accepted_parent_with_future_supply(
+        db_session,
+        "current-supplier-parent",
+        item,
+        qty="4",
+        supply_kind="supplier_order",
+    )
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "parent_generation_id": int(parent.id),
+    }
+    db_session.add(models.PlanningTruthState(
+        id=1,
+        current_generation_id=int(parent.id),
+    ))
+    order = models.SupplierOrder(
+        order_number="SUP-CURRENT",
+        order_date=datetime(2026, 7, 1),
+        order_ref1c="supplier-current",
+        order_state_name="Заказан (товар в пути)",
+        is_posted=True,
+        deletion_mark=False,
+        created_at=datetime(2026, 7, 1),
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(models.SupplierOrderItem(
+        order_id=int(order.order_id),
+        item_id_ref=int(item.item_id),
+        line_number=1,
+        characteristic_ref1c="00000000-0000-0000-0000-000000000000",
+        destination_warehouse_ref1c="WH",
+        quantity=Decimal("9"),
+        received_qty=Decimal("0"),
+        remaining_qty=Decimal("9"),
+        delivery_date=datetime(2026, 8, 1),
+        created_at=datetime(2026, 7, 1),
+    ))
+    db_session.flush()
+
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+        planning_pool_by_warehouse={"WH": "default"},
+    )
+
+    supplier = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=int(generation.id),
+        supply_kind="supplier_order",
+        source_ref="supplier-current",
+        source_line_ref="1",
+    ).one()
+    assert result["future_supply"]["created"] is True
+    assert supplier.evidence_status == "exact"
+    assert supplier.reason is None
+    assert supplier.characteristic_ref == ""
+    assert supplier.ordered_qty_at_cutoff == Decimal("9")
+    assert supplier.open_qty_at_cutoff == Decimal("9")
+
+
+def test_a_generation_with_nothing_to_inherit_still_creates_zero_future_supply_proof(db_session):
     generation, _requirement = _synthetic(db_session, "fs-genesis")
 
     result = accept_generation_build(
         db_session, generation.id, replay_from=datetime(2026, 7, 1)
     )
 
-    assert result["capabilities"]["future_supply"] is False
-    assert result["future_supply"] is None
+    assert result["capabilities"]["future_supply"] is True
+    assert result["future_supply"]["rows"] == 0
+    assert result["future_supply"]["open_qty"] == Decimal("0")
     db_session.refresh(generation)
-    assert generation.capabilities["future_supply"] is False
+    assert generation.capabilities["future_supply"] is True
+    batch = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=int(generation.id),
+        stage="future_supply_capture",
+    ).one()
+    assert batch.status == "completed"
+    assert batch.algorithm_version == FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION
+    assert batch.metrics["rows"] == 0

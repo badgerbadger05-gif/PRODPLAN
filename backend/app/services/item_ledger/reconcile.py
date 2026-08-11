@@ -9,10 +9,9 @@ rows are summed per key and a row whose item cannot be resolved locally is
 dropped (``strict=True`` raises instead, for the physical-refresh callers that
 must not silently lose stock).
 
-Widening the Balance Dimensions with Характеристика was rejected: the same
-query feeds the stock-sum compatibility projection (``Item.stock_qty``), so
-per-characteristic rows would change its granularity without verified live-1С
-evidence. Consumers therefore compare on the char='' aggregate.
+Widening the Balance Dimensions with Характеристика was rejected without
+verified live-1С evidence. Consumers therefore compare on the char=''
+aggregate.
 
 The physical truth is owned by the ``physical_refresh_*`` lifecycle
 (:mod:`physical_refresh_orchestrator`, :mod:`opening_balance_reconcile`); this
@@ -29,6 +28,16 @@ from sqlalchemy.orm import Session
 
 from app import models
 from .physical import EPS, LedgerKey, _dec
+
+
+class BalanceSnapshotItemResolutionError(ValueError):
+    """A non-zero 1C balance references nomenclature absent from PRODPLAN."""
+
+    def __init__(self, identity: str):
+        self.identity = str(identity)
+        super().__init__(
+            f"Balance row item cannot be resolved locally: {self.identity}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +96,7 @@ def build_balance_snapshot(
         if item_id is None:
             if strict and abs(_dec(row.get("qty") or 0)) > EPS:
                 identity = ref or str(row.get("code") or "").strip() or "<missing>"
-                raise ValueError(
-                    f"Balance row item cannot be resolved locally: {identity}"
-                )
+                raise BalanceSnapshotItemResolutionError(identity)
             continue
         org = str(row.get("organization_ref") or "").strip()
         key = LedgerKey(int(item_id), "", org, wh)

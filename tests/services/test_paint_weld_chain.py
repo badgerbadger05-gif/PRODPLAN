@@ -37,7 +37,7 @@ from app.models import (
     SyncLink,
 )
 from app.services import one_c_production_order_export as exporter
-from app.services.paint_weld_chain import open_paint_chain
+from app.services.paint_weld_chain import open_paint_chain, open_paint_chains_for_products
 from app.services.planning_truth import publish_generation
 
 WELD_BUFFER_DAYS = 14
@@ -54,8 +54,7 @@ def _item(db, *, code: str, name: str, ref1c: str, stock: float = 0.0) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit=f"unit-{code}",
-        stock_qty=stock,
-        replenishment_method="Производство",
+                replenishment_method="Производство",
         status="active",
     )
     db.add(it)
@@ -410,6 +409,17 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
         .filter(SyncLink.source_doctype == "production_order", SyncLink.status == "success")
         .count()
         == 2
+    )
+
+    expanded = open_paint_chains_for_products(
+        db,
+        product_ids=[painted_product.product_id],
+        initiated_by="test",
+    )
+    assert expanded["status"] == "ok"
+    assert expanded["entries"][0]["status"] == "existing"
+    assert expanded["product_ids"] == sorted(
+        [painted_product.product_id, weld_product.product_id]
     )
 
 

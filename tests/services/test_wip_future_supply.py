@@ -103,10 +103,22 @@ def test_missing_destination_is_rejected_not_a_zero_fact(db_session):
     assert row.realized_qty_at_cutoff == Decimal("0")
 
 
-def test_no_explicit_pool_mapping_is_rejected_even_for_selected_warehouse(db_session):
+def test_destination_outside_contour_is_rejected_without_failing_the_capture(db_session):
     generation, _physical, _build, item, warehouse = _scope(db_session, "pool")
-    _product(db_session, item, warehouse)
+    _product(db_session, item, warehouse, order_ref="ORDER-IN", line=1)
+    _order, outside = _product(db_session, item, warehouse, order_ref="ORDER-OUT", line=2)
+    outside.destination_warehouse_ref1c = "WH-finished-goods"
+    db_session.flush()
 
-    row = collect_wip_future_supply_evidence(db_session, generation.id)[0]
-    assert row.evidence_status == "rejected"
-    assert row.reason == "planning_pool_not_mapped"
+    rows = collect_wip_future_supply_evidence(
+        db_session,
+        generation.id,
+        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+    )
+
+    by_ref = {row.source_ref: row for row in rows}
+    assert by_ref["ORDER-IN"].evidence_status == "exact"
+    assert by_ref["ORDER-IN"].planning_stock_pool == "assembly-pool"
+    assert by_ref["ORDER-OUT"].evidence_status == "rejected"
+    assert by_ref["ORDER-OUT"].reason == "planning_pool_not_mapped"
+    assert by_ref["ORDER-OUT"].ordered_qty_at_cutoff == Decimal("10")

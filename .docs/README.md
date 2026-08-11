@@ -7,7 +7,7 @@
 
 1. [`CANON.md`](CANON.md) — владельцы величин и запреты.
 2. [`reservation-replenishment-core.md`](reservation-replenishment-core.md) —
-   количество, резервы, потребности и FIFO.
+   количество, резервы, потребности и адресно-FIFO выполнение.
 3. [`assembly-queue-and-drum.md`](assembly-queue-and-drum.md) — единая очередь
    сборки и календарная раскладка.
 4. [`planning-truth-contract.md`](planning-truth-contract.md) — граница

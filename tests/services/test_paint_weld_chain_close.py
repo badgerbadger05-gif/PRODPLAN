@@ -1,9 +1,9 @@
-"""Этап 4 связки «окраска↔сварка»: комбинированный сдельный + закрытие обоих заказов.
+"""Этап 4 связки «окраска↔сварка»: комбинированный сдельный на оба выпуска.
 
 Один Document_СдельныйНаряд на цепочку: операции сварки и окраски в одном
 документе, у каждой строки свой ЗаказНаПроизводство_Key/участок/номенклатура,
-основание — окрасочная СборкаЗапасов. Успешный экспорт закрывает оба заказа
-(«Успешно», Завершен) и пишет sync_link на оба выпуска — повтор no-op.
+основание — окрасочная СборкаЗапасов. Состояние самих заказов экспорт не пишет
+(его ставит оператор в 1С), sync_link пишется на оба выпуска — повтор no-op.
 """
 from __future__ import annotations
 
@@ -249,7 +249,7 @@ def test_combined_dry_run_payload_merges_two_blocks(db_session):
     assert payload["ДатаЗакрытия"] == payload["Date"]
 
 
-def test_combined_live_closes_both_orders_and_links_both_manufactures(db_session, monkeypatch):
+def test_combined_live_links_both_manufactures_without_touching_orders(db_session, monkeypatch):
     ctx = _setup_chain(db_session)
     fake = _FakeClient(ref_key="pw-chain-ref")
     _stub_live(monkeypatch, fake)
@@ -265,20 +265,16 @@ def test_combined_live_closes_both_orders_and_links_both_manufactures(db_session
     assert result["created"] == 1
     assert len(fake.posts) == 1  # ОДИН документ на оба заказа
 
-    # оба заказа закрыты в 1С
-    patched_paths = [path for path, _ in fake.patches]
-    assert "Document_ЗаказНаПроизводство(guid'order-ref-WELD')" in patched_paths
-    assert "Document_ЗаказНаПроизводство(guid'order-ref-PAINT')" in patched_paths
-    for path, body in fake.patches:
-        if "ЗаказНаПроизводство" in path:
-            assert body["СостояниеЗаказа_Key"] == exporter.DONE_STATE_KEY
-            assert body["ВариантЗавершения"] == exporter.ORDER_COMPLETION_SUCCESS
-
-    # и локально
+    # состояние заказов не пишется ни в 1С, ни локально: закрывает оператор в 1С
+    assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
+    assert all(
+        "СостояниеЗаказа_Key" not in body and "ВариантЗавершения" not in body
+        for _path, body in fake.patches
+    )
     db_session.refresh(ctx["weld"]["order"])
     db_session.refresh(ctx["paint"]["order"])
-    assert ctx["weld"]["order"].order_state_name == "Завершен"
-    assert ctx["paint"]["order"].order_state_name == "Завершен"
+    assert ctx["weld"]["order"].order_state_name is None
+    assert ctx["paint"]["order"].order_state_name is None
 
     # sync_link на оба выпуска с одним target_ref_key
     links = (
@@ -368,6 +364,24 @@ def test_close_chain_dry_run_previews_both_sides(db_session):
     assert len(result["piecework_preview"]["payloads"]) == 1
 
 
+def test_close_chain_ignores_corrupted_remaining_cache(db_session):
+    ctx = _setup_chain(db_session)
+    # Physical accepted output is complete. A non-factual writer corrupting the
+    # compatibility remainder must not create another production command.
+    ctx["weld"]["product"].remaining_qty = ctx["weld"]["product"].quantity
+    ctx["paint"]["product"].remaining_qty = ctx["paint"]["product"].quantity
+    db_session.commit()
+
+    result = close_paint_chain(
+        db_session, product_id=ctx["paint"]["product"].product_id, dry_run=True
+    )
+
+    assert result["weld"]["remaining_qty"] == 0.0
+    assert result["paint"]["remaining_qty"] == 0.0
+    assert result["weld"]["qty_to_produce"] == 0.0
+    assert result["paint"]["qty_to_produce"] == 0.0
+
+
 def test_close_chain_resolves_from_either_side(db_session):
     ctx = _setup_chain(db_session)
 
@@ -382,7 +396,7 @@ def test_close_chain_resolves_from_either_side(db_session):
     assert from_weld["paint"]["product_id"] == from_paint["paint"]["product_id"]
 
 
-def test_close_chain_live_exports_combined_and_closes_orders(db_session, monkeypatch):
+def test_close_chain_live_exports_combined_without_closing_orders(db_session, monkeypatch):
     ctx = _setup_chain(db_session)
     fake = _FakeClient(ref_key="pw-close-ref")
     _stub_live(monkeypatch, fake)
@@ -408,10 +422,12 @@ def test_close_chain_live_exports_combined_and_closes_orders(db_session, monkeyp
     assert result["piecework_export"]["status"] == "ok"
     assert len(fake.posts) == 1
 
+    # заказы остаются открытыми: их закрывает оператор в 1С
+    assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
     db_session.refresh(ctx["weld"]["order"])
     db_session.refresh(ctx["paint"]["order"])
-    assert ctx["weld"]["order"].order_state_name == "Завершен"
-    assert ctx["paint"]["order"].order_state_name == "Завершен"
+    assert ctx["weld"]["order"].order_state_name is None
+    assert ctx["paint"]["order"].order_state_name is None
 
 
 def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, monkeypatch):
@@ -473,10 +489,11 @@ def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, mo
     assert len(fake.posts) == 1
     assert db_session.query(ProductionManufacture).count() == 2
 
+    # докат создаёт наряд, но состояние заказов по-прежнему не пишет
     db_session.refresh(ctx["weld"]["order"])
     db_session.refresh(ctx["paint"]["order"])
-    assert ctx["weld"]["order"].order_state_name == "Завершен"
-    assert ctx["paint"]["order"].order_state_name == "Завершен"
+    assert ctx["weld"]["order"].order_state_name is None
+    assert ctx["paint"]["order"].order_state_name is None
 
     links = (
         db_session.query(SyncLink)
@@ -506,13 +523,11 @@ def test_close_chain_dry_run_reports_partially_posted_state(db_session):
     assert result["pending_sides"] == ["paint"]
 
 
-def test_close_chain_does_not_force_order_completion_on_partial_output(
-    db_session, monkeypatch
-):
-    """Цепочечный путь не форсит закрытие заказа: работает общая семантика —
-    заказ закрывается только при полном покрытии скомандованным объёмом."""
+def test_close_chain_never_writes_order_completion(db_session, monkeypatch):
+    """Цепочечный путь не пишет состояние заказа ни при каком выпуске."""
     ctx = _setup_chain(db_session)
-    # сварка скомандована частично: 4 из 6
+    # Сварка покрыта лишь частично, окраска — полностью. Ни та, ни другая
+    # сторона не даёт PRODPLAN права закрыть заказ в 1С.
     ctx["weld"]["m"].qty = 4
     ctx["weld"]["product"].produced_qty = 0
     db_session.commit()
@@ -528,11 +543,11 @@ def test_close_chain_does_not_force_order_completion_on_partial_output(
     )
 
     assert result["status"] == "ok"
-    patched_paths = [path for path, _ in fake.patches]
-    assert "Document_ЗаказНаПроизводство(guid'order-ref-PAINT')" in patched_paths
-    assert "Document_ЗаказНаПроизводство(guid'order-ref-WELD')" not in patched_paths
+    assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
     db_session.refresh(ctx["weld"]["order"])
+    db_session.refresh(ctx["paint"]["order"])
     assert ctx["weld"]["order"].order_state_name is None
+    assert ctx["paint"]["order"].order_state_name is None
 
 
 def test_journal_rows_carry_chain_info(db_session):
@@ -552,15 +567,21 @@ def test_journal_rows_carry_chain_info(db_session):
 
     from app.services.production_control_journal import list_journal
 
-    rows = list_journal(db_session)["rows"]
+    journal = list_journal(db_session)
+    rows = journal["rows"]
     by_pid = {row["product_id"]: row for row in rows}
-    weld_row = by_pid[int(ctx["weld"]["product"].product_id)]
     paint_row = by_pid[int(ctx["paint"]["product"].product_id)]
+    weld_product_id = int(ctx["weld"]["product"].product_id)
+    assert weld_product_id not in by_pid
+    assert journal["total"] == len(rows)
+    weld_row = list_journal(db_session, product_id=weld_product_id)["rows"][0]
 
     assert weld_row["paint_weld_chain"]["role"] == "welded"
     assert weld_row["paint_weld_chain"]["counterpart_product_id"] == paint_row["product_id"]
     assert paint_row["paint_weld_chain"]["role"] == "painted"
     assert paint_row["paint_weld_chain"]["counterpart_product_id"] == weld_row["product_id"]
+    assert paint_row["paint_weld_chain"]["counterpart_item_name"] == ctx["weld"]["item"].item_name
+    assert paint_row["paint_weld_chain"]["counterpart_quantity"] == 6.0
     # строка вне цепочки — None
     assert all(
         row["paint_weld_chain"] is None

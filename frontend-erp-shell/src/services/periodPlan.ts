@@ -53,14 +53,6 @@ export function updatePeriodPlanHeader(
   })
 }
 
-export function archivePeriodPlan(planId: number) {
-  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/archive`, { method: 'POST' })
-}
-
-export function unarchivePeriodPlan(planId: number) {
-  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/unarchive`, { method: 'POST' })
-}
-
 export function listPeriodPlanRuns(planId: number, limit = 50) {
   return api<PeriodPlanRunsResponse>(`/v1/plan/period-plans/${planId}/runs?limit=${limit}`)
 }
@@ -75,23 +67,6 @@ export function fixPeriodPlan(planId: number, fixedBy = 'erp-shell') {
   })
 }
 
-export function createMrpSnapshot(planId: number) {
-  // The backend publishes an entire Ledger generation atomically.  Keep one
-  // idempotency key in this request body so transport-level retries cannot
-  // create a second generation for the same click.
-  const generationKey = `period-plan-${planId}-${crypto.randomUUID()}`
-  return api<{ status: string; run_id: number; plan_id: number; requirement_count: number; purchase_count: number; rework_count: number }>(
-    `/v1/plan/period-plans/${planId}/mrp-snapshot`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        started_by: 'erp-shell',
-        generation_key: generationKey,
-      }),
-    },
-  )
-}
-
 export function getPeriodPlanMatrix(planId: number) {
   return api<PeriodPlanMatrix>(`/v1/plan/period-plans/${planId}/matrix`)
 }
@@ -103,12 +78,29 @@ export function bulkUpsertPeriodPlanLines(planId: number, entries: Array<{ item_
   })
 }
 
-export function getExecutionJournal(planId: number, params: { run_id?: number; root_item_id?: number | null; bom_level?: number; flow?: string } = {}) {
+export function getExecutionJournal(planId: number, params: {
+  run_id?: number
+  root_item_id?: number | null
+  bom_level?: number
+  flow?: string
+  status?: string
+  include_net_zero?: boolean
+  sort_by?: string
+  sort_dir?: 'asc' | 'desc'
+  limit?: number
+  offset?: number
+} = {}) {
   const search = new URLSearchParams()
   if (params.run_id) search.set('run_id', String(params.run_id))
   if (params.root_item_id) search.set('root_item_id', String(params.root_item_id))
   if (typeof params.bom_level === 'number') search.set('bom_level', String(params.bom_level))
   if (params.flow) search.set('flow', params.flow)
+  if (params.status) search.set('status', params.status)
+  if (typeof params.include_net_zero === 'boolean') search.set('include_net_zero', String(params.include_net_zero))
+  if (params.sort_by) search.set('sort_by', params.sort_by)
+  if (params.sort_dir) search.set('sort_dir', params.sort_dir)
+  if (typeof params.limit === 'number') search.set('limit', String(params.limit))
+  if (typeof params.offset === 'number') search.set('offset', String(params.offset))
   return api<ExecutionJournalResponse>(`/v1/plan/period-plans/${planId}/execution-journal?${search.toString()}`)
 }
 
@@ -129,33 +121,5 @@ export function deleteItemFromPeriodPlan(planId: number, itemId: number) {
   return api<{ status: string; plan_id: number; item_id: number; deleted: number }>(
     `/v1/plan/period-plans/${planId}/items/${itemId}`,
     { method: 'DELETE' },
-  )
-}
-
-export type ReconcileResult = {
-  status: string
-  run_id: number
-  production_added: { item_id: number; item_code?: string; qty: number }[]
-  purchase_added: { item_id: number; item_code?: string; qty: number }[]
-  rescheduled?: { floating: number; fixed: number; warnings: unknown[] }
-}
-
-// Пересчёт остаточной потребности по снимку: добор недопокрытия (заказы в
-// журнал, строки закупок) + перепланировка ещё не открытых в 1С заказов от
-// сегодня. В 1С ничего не пишется — только по кнопке пользователя.
-export function reconcileRun(runId: number) {
-  return api<ReconcileResult>(`/v1/plan/results/${runId}/reconcile`, {
-    method: 'POST',
-    body: JSON.stringify({ dry_run: false }),
-  })
-}
-
-export function createProductionOrdersFromRequirements(requirementIds: number[], initiatedBy = 'erp-shell') {
-  return api<{ status: string; created: unknown[]; reused: unknown[]; skipped: unknown[]; errors: string[] }>(
-    '/v1/production-control/orders/from-mrp-requirements',
-    {
-      method: 'POST',
-      body: JSON.stringify({ requirement_ids: requirementIds, initiated_by: initiatedBy }),
-    },
   )
 }

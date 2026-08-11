@@ -16,12 +16,15 @@ from app.models import (
     ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionOrderLineState,
+    ProductionPlanHeader,
     ProductionProduct,
     PhysicalImportBatch,
     LedgerGeneration,
     PlanningRun,
     PlanningTruthState,
     MrpRequirement,
+    ReplenishmentWorkItem,
+    ReservationEntry,
     SpecComponent,
     Specification,
     SyncLink,
@@ -54,8 +57,7 @@ def _mk_item(db, *, code: str, ref1c: str) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit=f"unit-ref-{code}",
-        stock_qty=100,
-        status="active",
+                status="active",
     )
     db.add(it)
     db.flush()
@@ -212,6 +214,16 @@ class _FakeClient:
     def get_all(self, entity_name, **_kwargs):
         if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
             return list(self.balance_rows)
+        query = str(_kwargs.get("filter_query") or "")
+        if "Ref_Key eq guid'" in query and self.posts:
+            payload = self.posts[-1][1]
+            return [{
+                "Ref_Key": self.ref_key,
+                "Number": payload.get("Number"),
+                "Комментарий": payload.get("Комментарий"),
+                "Posted": False,
+                "DeletionMark": False,
+            }]
         return []
 
 
@@ -253,7 +265,8 @@ def test_dry_run_returns_payload_with_both_structural_units(db_session, monkeypa
     [pl] = result["payloads"]
     payload = pl["payload"]
     assert payload["Posted"] is False
-    assert payload["Number"] == material_issue_number(db, issue)
+    assert payload["Number"].startswith("MT")
+    assert len(payload["Number"]) == 11
     assert payload["СтруктурнаяЕдиница_Key"] == "src-warehouse-guid"
     assert payload["СтруктурнаяЕдиницаПолучатель_Key"] == "dst-warehouse-guid"
     assert payload["ДокументОснование"] == f"order-ref-{parent.item_id}"
@@ -265,6 +278,7 @@ def test_dry_run_returns_payload_with_both_structural_units(db_session, monkeypa
     assert stock_line["КлючСвязи"] == 1
     assert float(stock_line["Количество"]) == 5.0
     assert "PRODPLAN source=material_issue/" in payload["Комментарий"]
+    assert "prodplan-origin=" in payload["Комментарий"]
 
     # No sync_link writes during dry-run.
     assert db.query(SyncLink).filter_by(source_doctype="material_issue").count() == 0
@@ -398,6 +412,95 @@ def test_chain_auto_exports_parent_order_in_dry_run(db_session):
     assert result["issues_eligible"] == 0
 
 
+def test_old_generation_issue_remains_exportable_when_same_mrp_work_is_current(
+    db_session,
+):
+    db = db_session
+    parent = _mk_item(db, code="TR-OLD-GEN", ref1c="parent-old-gen")
+    comp = _mk_item(db, code="TR-OLD-GEN-C", ref1c="comp-old-gen")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-old-gen")
+    issue.order.source = "mrp"
+    _attach_current_mrp_lineage(db, issue.product)
+    old_generation_id = int(issue.ledger_generation_id)
+    requirement = db.get(MrpRequirement, int(issue.product.source_mrp_requirement_id))
+    run = db.get(PlanningRun, int(issue.order.source_run_id))
+    plan = ProductionPlanHeader(
+        name="Transfer old generation plan",
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 5, 31),
+        status="fixed",
+    )
+    db.add(plan)
+    db.flush()
+    run.source_plan_id = plan.id
+
+    cutoff = datetime(2026, 5, 21, tzinfo=timezone.utc)
+    batch = PhysicalImportBatch(
+        batch_key="transfer-export-next-truth",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    generation = LedgerGeneration(
+        generation_key="transfer-export-next-truth",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=batch,
+        algorithm_version="tests",
+    )
+    db.add_all((batch, generation))
+    db.flush()
+    reservation = ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=parent.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=run.run_id,
+        freeze_version=1,
+        requirement_id=requirement.id,
+        priority_period_from=requirement.period_from,
+        priority_period_to=requirement.period_to,
+        realization_mode="make",
+        reserved_qty=5,
+        covered_from_stock_at_freeze_qty=0,
+        replenishment_required_qty=5,
+        replenishment_received_qty=0,
+        realized_qty=0,
+        lifecycle_status="active",
+    )
+    db.add(reservation)
+    db.flush()
+    db.add(ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        plan_id=plan.id,
+        run_id=run.run_id,
+        requirement_id=requirement.id,
+        item_id=parent.item_id,
+        replenishment_method="make",
+        replenishment_required_qty=5,
+        replenishment_fulfilled_qty=0,
+        replenishment_remaining_qty=5,
+    ))
+    db.get(PlanningTruthState, 1).current_generation_id = generation.id
+    db.commit()
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+
+    assert result["issues_eligible"] == 1
+    assert int(issue.ledger_generation_id) == old_generation_id
+    assert result["payloads"][0]["payload"]["Number"].startswith("MT")
+
+
 def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     """In apply mode the chain actually exports the parent order first,
     stamps order_ref1c, then exports the transfer with the correct
@@ -518,7 +621,9 @@ def test_successful_export_stamps_sync_link_and_issue_status(db_session, monkeyp
     )
     assert link.status == "success"
     assert link.target_ref_key == "c8dbfcc4-trf-ref"
-    assert link.target_number == material_issue_number(db, issue)
+    assert link.target_number == issue.document_number
+    assert link.target_number.startswith("MT")
+    assert len(link.target_number) == 11
 
     # ProductionOrderLineState.issue_status moves to 'exported'.
     state = (
@@ -548,6 +653,204 @@ def test_second_export_patches_existing_transfer(db_session, monkeypatch):
     assert len(fake.posts) == 1
     assert len(fake.patches) == 1
     assert fake.patches[0][0] == "Document_ПеремещениеЗапасов(guid'reuse-ref-key')"
+
+
+def test_foreign_number_collision_allocates_another_number_without_adoption(
+    db_session, monkeypatch
+):
+    db = db_session
+    parent = _mk_item(db, code="TRP-COLLISION", ref1c="parent-collision-ref")
+    comp = _mk_item(db, code="TRC-COLLISION", ref1c="comp-collision-ref")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-collision")
+
+    preview = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+    first_number = preview["payloads"][0]["payload"]["Number"]
+
+    class _CollisionClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
+                return []
+            query = str(kwargs.get("filter_query") or "")
+            if "substringof(" in query:
+                return []
+            if first_number in query:
+                return [{
+                    "Ref_Key": "foreign-transfer-ref",
+                    "Number": first_number,
+                    "Комментарий": "another system document",
+                    "Posted": True,
+                    "DeletionMark": False,
+                }]
+            return []
+
+    fake = _CollisionClient(ref_key="new-transfer-ref")
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
+    assert result["status"] == "ok"
+    assert result["issues_created"] == 1
+    assert issue.document_number != first_number
+    assert fake.patches == []
+    assert len(fake.posts) == 1
+    assert fake.posts[0][1]["Number"] == issue.document_number
+
+
+def test_missing_local_link_recovers_transfer_by_origin_without_post(
+    db_session, monkeypatch
+):
+    db = db_session
+    parent = _mk_item(db, code="TRP-RECOVER", ref1c="parent-recover-ref")
+    comp = _mk_item(db, code="TRC-RECOVER", ref1c="comp-recover-ref")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-recover")
+
+    preview = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+    payload = preview["payloads"][0]["payload"]
+    marker = next(
+        part.strip()
+        for part in str(payload["Комментарий"]).split(";")
+        if part.strip().startswith("prodplan-origin=")
+    )
+
+    class _RecoveryClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
+                return []
+            query = str(kwargs.get("filter_query") or "")
+            if marker in query:
+                return [{
+                    "Ref_Key": "recovered-transfer-ref",
+                    "Number": payload["Number"],
+                    "Комментарий": str(payload["Комментарий"]),
+                    "Posted": False,
+                    "DeletionMark": False,
+                }]
+            return []
+
+        def post(self, *_args, **_kwargs):
+            pytest.fail("origin recovery must not POST another transfer")
+
+    fake = _RecoveryClient()
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
+    assert result["issues_created"] == 0
+    assert result["issues_recovered"] == 1
+    db.refresh(issue)
+    assert issue.status == "exported"
+    assert issue.exported_ref1c == "recovered-transfer-ref"
+    link = db.query(SyncLink).filter_by(
+        source_doctype="material_issue",
+        source_id=issue.issue_id,
+        target_entity=exporter.STOCK_TRANSFER_ENTITY,
+    ).one()
+    assert link.status == "success"
+    assert link.target_ref_key == "recovered-transfer-ref"
+
+
+def test_deleted_origin_match_is_not_recovered_and_gets_another_number(
+    db_session, monkeypatch
+):
+    db = db_session
+    parent = _mk_item(db, code="TRP-DELETED", ref1c="parent-deleted-ref")
+    comp = _mk_item(db, code="TRC-DELETED", ref1c="comp-deleted-ref")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-deleted")
+    preview = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+    first_payload = preview["payloads"][0]["payload"]
+    first_number = first_payload["Number"]
+
+    class _DeletedOriginClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
+                return []
+            query = str(kwargs.get("filter_query") or "")
+            if "substringof(" in query or first_number in query:
+                return [{
+                    "Ref_Key": "deleted-transfer-ref",
+                    "Number": first_number,
+                    "Комментарий": first_payload["Комментарий"],
+                    "Posted": False,
+                    "DeletionMark": True,
+                }]
+            return []
+
+    fake = _DeletedOriginClient(ref_key="new-live-transfer-ref")
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
+    assert result["issues_recovered"] == 0
+    assert result["issues_created"] == 1
+    assert issue.document_number != first_number
+    assert len(fake.posts) == 1
+
+
+def test_foreign_existing_ref_is_blocked_before_patch(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="TRP-FOREIGN-REF", ref1c="parent-foreign-ref")
+    comp = _mk_item(db, code="TRC-FOREIGN-REF", ref1c="comp-foreign-ref")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-foreign-ref")
+    issue.exported_ref1c = "foreign-ref"
+    db.commit()
+
+    class _ForeignRefClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            if "Ref_Key eq guid'foreign-ref'" in str(kwargs.get("filter_query") or ""):
+                return [{
+                    "Ref_Key": "foreign-ref",
+                    "Number": "MTFOREIGN01",
+                    "Комментарий": "created by another system",
+                    "Posted": False,
+                    "DeletionMark": False,
+                }]
+            return super().get_all(entity_name, **kwargs)
+
+    fake = _ForeignRefClient()
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    with pytest.raises(RuntimeError, match="не подтверждена"):
+        exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
+    assert fake.posts == []
+    assert fake.patches == []
+
+
+def test_same_contents_at_different_times_have_distinct_origins():
+    common = dict(
+        issue_id=1,
+        document_number="",
+        product_id=5,
+        order_id=10,
+        order_ref1c="order-ref",
+        source_warehouse_ref1c="source-ref",
+        destination_warehouse_ref1c="destination-ref",
+        product_item_ref1c="product-ref",
+        product_line_number=1,
+        lines=[exporter.StockTransferExportLine(
+            line_number=1,
+            component_item_id=20,
+            item_ref1c="component-ref",
+            item_name="Component",
+            item_article="COMP",
+            unit_ref1c=None,
+            qty=5,
+        )],
+    )
+    first = exporter.StockTransferExportEntry(
+        **common,
+        document_date=datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc),
+    )
+    second = exporter.StockTransferExportEntry(
+        **{**common, "issue_id": 2},
+        document_date=datetime(2026, 8, 10, 10, 1, tzinfo=timezone.utc),
+    )
+
+    assert exporter._entry_origin_token(first) != exporter._entry_origin_token(second)
 
 
 def test_posted_transfer_is_not_patched_on_second_export(db_session, monkeypatch):
@@ -590,8 +893,24 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     ))
     db.commit()
 
+    preview = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+    owned_comment = preview["payloads"][0]["payload"]["Комментарий"]
+
+    class _OwnedRefClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            query = str(kwargs.get("filter_query") or "")
+            if "Ref_Key eq guid'existing-transfer-ref'" in query:
+                return [{
+                    "Ref_Key": "existing-transfer-ref",
+                    "Number": issue.document_number,
+                    "Комментарий": owned_comment,
+                    "Posted": False,
+                    "DeletionMark": False,
+                }]
+            return super().get_all(entity_name, **kwargs)
+
     _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
-    fake = _FakeClient(ref_key="new-ref-should-not-be-used")
+    fake = _OwnedRefClient(ref_key="new-ref-should-not-be-used")
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
@@ -614,8 +933,7 @@ def test_skipped_invalid_inputs(db_session, monkeypatch):
         item_article="NOREF",
         item_ref1c=None,
         unit="шт",
-        stock_qty=10,
-        status="active",
+                status="active",
     )
     db.add(comp_no_ref)
     db.flush()

@@ -5,7 +5,6 @@ import type {
   MaterialIssueCreateResponse,
   MaterialIssueCreatePayload,
   MaterialsResponse,
-  OrdersResponse,
   ProductionOperationsResponse,
   ProduceLinePayload,
   ProduceLineResult,
@@ -27,18 +26,48 @@ export type ControlSettingsUpdate = {
   ignored_warehouses: Array<{ warehouse_ref1c: string }>
 }
 
-export type OrderQuantityUpdateResult = {
-  quantity: number
-  remaining_qty: number
-  mrp_req_net_qty?: number | null
-  mrp_req_covered_qty?: number | null
-  mrp_req_remaining_qty?: number | null
-}
+export type RootProductOption = ApiSchemas['ProductionControlRootProductOption']
+export type RootProductOptionsResponse = ApiSchemas['ProductionControlRootProductOptionsResponse']
 
 // Loosely-typed side of the paint↔weld chain preview/close response. The
 // endpoint returns a heterogeneous document the page reads field-by-field.
 export function listProductionOrders(params: URLSearchParams) {
-  return api<OrdersResponse>(`/v1/production-control/orders?${params.toString()}`)
+  return api<ApiSchemas['ProductionOrderJournalResponse']>(`/v1/production-control/orders?${params.toString()}`)
+}
+
+export type MaterializedMakeProduct = {
+  work_item_id: number
+  product_id: number
+  order_id: number
+  order_number: string
+  requirement_id: number
+  qty: number
+}
+
+export type MaterializeMakeWorkItemsResponse = {
+  status: string
+  created: MaterializedMakeProduct[]
+  reused: MaterializedMakeProduct[]
+}
+
+export type MakeLaunchRequest = {
+  work_item_id: number
+  launch_qty: number
+  expected_materialized_qty: number
+}
+
+export function materializeMakeWorkItems(workItems: number[] | MakeLaunchRequest[]) {
+  const legacyIds = workItems.filter((row): row is number => typeof row === 'number')
+  const requests = workItems.filter((row): row is MakeLaunchRequest => typeof row !== 'number')
+  const body = {
+    work_item_ids: legacyIds,
+    work_items: requests,
+    initiated_by: 'erp-shell',
+  }
+  return api<MaterializeMakeWorkItemsResponse>('/v1/production-control/orders/from-work-items', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
 }
 
 export function listProductionEmployees() {
@@ -53,6 +82,10 @@ export function getProductionControlSettings() {
   return api<ControlSettings>('/v1/production-control/settings')
 }
 
+export function listRootProductOptions() {
+  return api<RootProductOptionsResponse>('/v1/production-control/orders/root-products')
+}
+
 export function saveProductionControlSettings(payload: ControlSettingsUpdate) {
   const request: ApiSchemas['SettingsPayload'] = payload
   return api<ControlSettings>('/v1/production-control/settings', {
@@ -65,10 +98,9 @@ export function getOrderMaterials(productId: number) {
   return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
 }
 
-export function refreshOrderMaterials(productId: number) {
-  return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials/refresh`, {
-    method: 'POST',
-  })
+export function getWorkItemMaterials(workItemId: number, quantity: number) {
+  const params = new URLSearchParams({ qty: String(quantity) })
+  return api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
 }
 
 export function updateOrderStatus(productId: number, status: string) {
@@ -134,18 +166,44 @@ export function syncPostedTransfers() {
   })
 }
 
-export function updateOrderQuantity(productId: number, quantity: number) {
-  const payload: ApiSchemas['UpdateQuantityPayload'] = { quantity }
-  return api<OrderQuantityUpdateResult>(`/v1/production-control/orders/${productId}/quantity`, {
-    method: 'PATCH',
-    body: JSON.stringify(payload),
-  })
-}
-
 export function produceOrderLine(productId: number, payload: ProduceLinePayload) {
   return api<ProduceLineResult>(`/v1/production-control/orders/${productId}/produce`, {
     method: 'POST',
     body: JSON.stringify(payload),
+  })
+}
+
+export type OpenPaintWeldChainsResult = {
+  status: string
+  product_ids: number[]
+  entries: Array<Record<string, unknown>>
+  errors: Array<Record<string, unknown>>
+}
+
+export function openPaintWeldChains(productIds: number[]) {
+  return api<OpenPaintWeldChainsResult>('/v1/production-control/orders/open-paint-weld-chains', {
+    method: 'POST',
+    body: JSON.stringify({ product_ids: productIds, initiated_by: 'erp-shell' }),
+  })
+}
+
+export type ClosePaintWeldChainResult = {
+  status: string
+  message?: string | null
+  resume_required?: boolean
+  painted?: Record<string, unknown>
+  welded?: Record<string, unknown>
+}
+
+export function closePaintWeldChain(productId: number) {
+  return api<ClosePaintWeldChainResult>('/v1/paint-weld/chain/close', {
+    method: 'POST',
+    body: JSON.stringify({
+      product_id: productId,
+      dry_run: false,
+      executor: 'erp-shell',
+      initiated_by: 'erp-shell',
+    }),
   })
 }
 
@@ -160,9 +218,9 @@ export function getItem(itemId: number) {
   return api<Record<string, unknown>>(`/v1/items/${itemId}`)
 }
 
-export function updateItem(itemId: number, payload: Record<string, unknown>) {
+export function updateItem(itemId: number, payload: ApiSchemas['ItemPatch']) {
   return api(`/v1/items/${itemId}`, {
-    method: 'PUT',
+    method: 'PATCH',
     body: JSON.stringify(payload),
   })
 }
@@ -176,4 +234,20 @@ export function createMaterialIssues(payload: MaterialIssueCreatePayload) {
 
 export function deleteProductionOrder(productId: number) {
   return api(`/v1/production-control/orders/${productId}`, { method: 'DELETE' })
+}
+
+export type CloseProductionOrderResult = {
+  status: string
+  dry_run: boolean
+  orders_requested: number
+  orders_eligible: number
+  orders_closed: number
+  orders_error: number
+}
+
+export function closeProductionOrder(productId: number, payload: { dry_run?: boolean } = {}) {
+  return api<CloseProductionOrderResult>(`/v1/production-control/orders/${productId}/close`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
 }

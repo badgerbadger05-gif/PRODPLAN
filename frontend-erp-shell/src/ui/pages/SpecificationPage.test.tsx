@@ -32,11 +32,15 @@ const pump: BomItem = {
   item_code: 'PUMP-01',
   item_name: 'Насос ГА-1',
   item_article: 'НАС-01',
+  item_ref1c: null,
   unit: 'шт',
+  unit_ref1c: null,
   replenishment_method: 'Производство',
-  stock_qty: 2,
   spec_id: 10,
+  spec_code: null,
   spec_name: 'СП-10',
+  spec_ref1c: null,
+  default_spec_count: 1,
   has_children: true,
 }
 
@@ -189,7 +193,7 @@ describe('SpecificationPage characterization', () => {
     const user = userEvent.setup()
     vi.mocked(searchSpecificationItems).mockResolvedValue({
       items: [pump, reducer],
-      meta: { count: 2 },
+      meta: { q: 'нас', count: 2, limit: 50 },
     })
     renderPage()
 
@@ -207,8 +211,8 @@ describe('SpecificationPage characterization', () => {
   it('keeps the picker modal and returns focus to its search trigger', async () => {
     const user = userEvent.setup()
     vi.mocked(searchSpecificationItems)
-      .mockResolvedValueOnce({ items: [pump], meta: { count: 1 } })
-      .mockResolvedValueOnce({ items: [pump, reducer], meta: { count: 2 } })
+      .mockResolvedValueOnce({ items: [pump], meta: { q: 'НАС-01', count: 1, limit: 50 } })
+      .mockResolvedValueOnce({ items: [pump, reducer], meta: { q: 'нас', count: 2, limit: 50 } })
     renderPage()
 
     await searchFor(user, 'НАС-01')
@@ -235,7 +239,7 @@ describe('SpecificationPage characterization', () => {
 
   it('auto-loads a single result through all four BOM endpoints in parallel', async () => {
     const user = userEvent.setup()
-    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { q: '', count: 1, limit: 50 } })
     renderPage()
 
     await searchFor(user, 'НАС-01')
@@ -250,7 +254,7 @@ describe('SpecificationPage characterization', () => {
 
   it('supports roving keyboard selection across the specification tree', async () => {
     const user = userEvent.setup()
-    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { q: '', count: 1, limit: 50 } })
     renderPage()
 
     await searchFor(user, 'НАС-01')
@@ -285,7 +289,7 @@ describe('SpecificationPage characterization', () => {
 
   it('exposes and operates specification tabs with the ARIA tabs pattern', async () => {
     const user = userEvent.setup()
-    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { q: '', count: 1, limit: 50 } })
     renderPage()
 
     await searchFor(user, 'НАС-01')
@@ -332,7 +336,7 @@ describe('SpecificationPage characterization', () => {
 
   it('preserves tab, tree and replenishment-method filters and exports XLSX', async () => {
     const user = userEvent.setup()
-    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { q: '', count: 1, limit: 50 } })
     renderPage()
     await searchFor(user, 'НАС-01')
     await screen.findByText('Загружено: НАС-01 · Насос ГА-1')
@@ -366,7 +370,7 @@ describe('SpecificationPage characterization', () => {
 
   it('shows a BOM load failure and succeeds on retry', async () => {
     const user = userEvent.setup()
-    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { q: '', count: 1, limit: 50 } })
     vi.mocked(getSpecificationFull)
       .mockRejectedValueOnce(new Error('BOM временно недоступен'))
       .mockResolvedValueOnce({ nodes, meta: {} })
@@ -384,7 +388,7 @@ describe('SpecificationPage characterization', () => {
     const user = userEvent.setup()
     vi.mocked(searchSpecificationItems).mockResolvedValue({
       items: [pump, reducer],
-      meta: { count: 2 },
+      meta: { q: '', count: 2, limit: 50 },
     })
 
     type FullResult = Awaited<ReturnType<typeof getSpecificationFull>>

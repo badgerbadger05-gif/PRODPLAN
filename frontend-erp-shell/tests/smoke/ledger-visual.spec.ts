@@ -39,7 +39,7 @@ test('item ledger read-only workspace', async ({ page }) => {
   await expect(page.getByText('Труба профильная', { exact: true })).toBeVisible()
   await expect(page.getByText('00000063', { exact: true })).toBeVisible()
   await expect(page.getByRole('table', { name: 'Движения номенклатуры' })).toBeVisible()
-  await expect(page.getByText('Document_СборкаЗапасов')).toBeVisible()
+  await expect(page.getByText('Сборка запасов', { exact: true })).toBeVisible()
   await expect(page.locator('.app')).toHaveScreenshot('ledger-workspace.png', {
     animations: 'disabled', caret: 'hide', scale: 'css',
   })

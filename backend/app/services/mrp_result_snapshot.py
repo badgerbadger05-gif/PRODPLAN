@@ -13,7 +13,7 @@ from hashlib import sha256
 import json
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import func
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -344,7 +344,7 @@ def _require_sealed_candidate_manifest(
                 "candidate snapshot obligation_refresh_manifest candidate identity is malformed"
             ) from exc
         if (
-            action not in {"refresh", "add"}
+            action not in {"add", "replace"}
             or candidate_id <= 0
             or plan_id <= 0
             or candidate_id in declared_ids
@@ -359,36 +359,25 @@ def _require_sealed_candidate_manifest(
             or int(candidate.source_plan_id or -1) != plan_id
         ):
             raise ValueError("candidate snapshot manifest candidate lineage conflicts")
-        if action == "refresh":
-            try:
-                parent_id = int(entry["parent_run_id"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError("candidate snapshot refresh entry lacks parent run") from exc
-            parent = db.get(models.PlanningRun, parent_id)
-            expected_parent_generation = marks.get("parent_generation_id")
-            if (
-                int(candidate.prior_run_id or -1) != parent_id
-                or parent is None
-                or str(parent.status or "") != "FIXED_SNAPSHOT"
-                or int(parent.source_plan_id or -1) != plan_id
-            ):
-                raise ValueError("candidate snapshot refresh candidate parent conflicts")
-            if (
-                int(_resolve_parent_generation_id(db, parent) or -1)
-                != int(expected_parent_generation or -1)
-            ):
-                raise ValueError("candidate snapshot refresh candidate parent conflicts")
-        else:
-            plan = db.get(models.ProductionPlanHeader, plan_id)
-            if (
-                entry.get("parent_run_id") is not None
-                or candidate.prior_run_id is not None
-                or plan is None
-                or str(plan.status or "") != "fixed"
-                or candidate.period_from != plan.period_from
-                or candidate.period_to != plan.period_to
-            ):
-                raise ValueError("candidate snapshot add candidate parent conflicts")
+        if action == "add" and entry.get("parent_run_id") is not None:
+            raise ValueError("candidate snapshot add entry must not claim a parent run")
+        plan = db.get(models.ProductionPlanHeader, plan_id)
+        if (
+            plan is None
+            or str(plan.status or "") != "fixed"
+            or (
+                action == "add"
+                and candidate.prior_run_id != plan.predecessor_run_id
+            )
+            or (
+                action == "replace"
+                and int(candidate.prior_run_id or -1)
+                != int(entry.get("parent_run_id") or -1)
+            )
+            or candidate.period_from != plan.period_from
+            or candidate.period_to != plan.period_to
+        ):
+            raise ValueError("candidate snapshot add candidate parent conflicts")
         declared_ids.add(candidate_id)
         declared_plan_ids.add(plan_id)
         requested_found = requested_found or candidate_id == int(run.run_id)
@@ -494,7 +483,12 @@ def build_mrp_result_candidate_snapshot(
     return snapshot
 
 
-def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSnapshot:
+def build_mrp_result_snapshot(
+    db: Session,
+    run_id: int,
+    *,
+    allow_stale_truth: bool = False,
+) -> models.PlanningReadSnapshot:
     """Build and publish one immutable result snapshot for a fixed run.
 
     The run must already be bound to the currently accepted Ledger generation.
@@ -502,7 +496,10 @@ def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSn
     fields are consulted here.
     """
     truth = require_accepted_truth(
-        db, CONSUMER, required_capabilities=REQUIRED_CAPABILITIES
+        db,
+        CONSUMER,
+        required_capabilities=REQUIRED_CAPABILITIES,
+        allow_stale=bool(allow_stale_truth),
     )
     run = db.get(models.PlanningRun, int(run_id))
     if run is None:
@@ -520,6 +517,7 @@ def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSn
         consumer=CONSUMER,
         snapshot_key=_snapshot_key(run_id),
         required_capabilities=REQUIRED_CAPABILITIES,
+        allow_stale=bool(allow_stale_truth),
     )
     if existing is not None:
         return existing
@@ -555,6 +553,7 @@ def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSn
             snapshot_key=_snapshot_key(run_id),
             payload=manifest,
             required_capabilities=REQUIRED_CAPABILITIES,
+            allow_stale=bool(allow_stale_truth),
         )
 
         persisted: list[tuple[models.PlanningReadRow, int | None]] = []
@@ -666,6 +665,9 @@ def read_mrp_result_rows(
     area_id: int | None = None,
     date_from: str | date | None = None,
     date_to: str | date | None = None,
+    supplier_ref1c: str | None = None,
+    category_id: int | None = None,
+    category_ref1c: str | None = None,
     limit: int = 100,
     offset: int = 0,
     sort_dir: str = "asc",
@@ -708,6 +710,48 @@ def read_mrp_result_rows(
             models.PlanningReadRow.payload["area_id"].as_integer()
             == int(area_id)
         )
+    if supplier_ref1c is not None:
+        if supplier_ref1c == "__missing_supplier_name":
+            supplier_name = func.trim(
+                func.coalesce(models.PlanningReadRow.payload["supplier_name"].as_string(), "")
+            )
+            query = query.filter(
+                supplier_name == ""
+            )
+        else:
+            query = query.filter(
+                func.coalesce(
+                    models.PlanningReadRow.payload["supplier_ref1c"].as_string(),
+                    "",
+                )
+                == str(supplier_ref1c)
+            )
+    if category_id is not None:
+        query = query.filter(
+            models.PlanningReadRow.payload["category_id"].as_integer() == int(category_id)
+        )
+    elif category_ref1c is not None:
+        if category_ref1c == "__missing_category":
+            category_ref = func.trim(
+                func.coalesce(
+                    models.PlanningReadRow.payload["category_ref1c"].as_string(),
+                    "",
+                )
+            )
+            query = query.filter(
+                and_(
+                    models.PlanningReadRow.payload["category_id"].as_integer().is_(None),
+                    category_ref == "",
+                )
+            )
+        else:
+            query = query.filter(
+                func.coalesce(
+                    models.PlanningReadRow.payload["category_ref1c"].as_string(),
+                    "",
+                )
+                == str(category_ref1c)
+            )
     if date_from:
         value = date_from.isoformat() if isinstance(date_from, date) else str(date_from)
         query = query.filter(models.PlanningReadRow.sort_key >= f"{value}|")

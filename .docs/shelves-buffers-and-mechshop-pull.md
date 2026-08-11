@@ -29,12 +29,17 @@ DBR не увеличивает и не уменьшает эти величин
 ```text
 item_id
 warehouse_id
-replenishment_time
+replenishment_time_days
 review_cycle
 safety_days
 batch_multiple
 active
 ```
+
+`ShelfPolicy.replenishment_time_days` — локальная длительность производства
+для защитного окна полки. Это не MRP-поле `Item.replenishment_time`: его
+единственный источник — `СрокПополнения` номенклатуры 1С, включая валидный
+ноль. Ни одно из этих полей не подменяет другое.
 
 Состав полок является устойчивым справочником. Расчёт может предложить новую
 полку, но не создаёт и не удаляет её автоматически при смене плана.
@@ -63,7 +68,7 @@ BOM-развёртки и нового количества не возника�
 
 ```text
 protection_days =
-    replenishment_time + review_cycle + safety_days
+    ShelfPolicy.replenishment_time_days + review_cycle + safety_days
 ```
 
 Целевое количество на полке равно видимому расходу барабана внутри этого
@@ -127,7 +132,10 @@ unlaunched_mrp_qty =
     )
 
 pull_qty =
-    min(shelf_gap_qty, unlaunched_mrp_qty)
+    min(
+        max(shelf_gap_qty - eligible_transfer_qty, 0),
+        unlaunched_mrp_qty,
+    )
 
 materialized_qty =
     min(round_up(pull_qty, batch_multiple), unlaunched_mrp_qty)
@@ -137,9 +145,18 @@ materialized_qty =
 `materialized_qty` может кратковременно превысить цель полки, но не может
 создать выпуск сверх общей незакрытой MRP-потребности.
 
-Если нужное количество уже физически есть вне полки, сначала предлагается
-перемещение. Если оно уже производится с подходящим сроком и назначением,
-новый заказ не создаётся.
+Физический остаток вне полки сам по себе вытягивание не уменьшает. Учитывается
+только свободное количество после удержаний старших резервов, уже адресно
+назначенное сохранённому перемещению этого требования:
+
+```text
+eligible_transfer_qty =
+    min(saved_addressed_transfer_qty, free_other_warehouse_qty)
+```
+
+Неназначенный или удержанный остаток другого склада производство не блокирует.
+Если количество уже производится с подходящим сроком и назначением, новый
+заказ не создаётся.
 
 ## Приоритет
 
@@ -156,7 +173,7 @@ materialized_qty =
 
 ```text
 latest_start_date =
-    first_shortage_date - replenishment_time
+    first_shortage_date - ShelfPolicy.replenishment_time_days
 ```
 
 Чем меньше запас времени до `latest_start_date`, тем выше строка мехцеха.
@@ -177,7 +194,7 @@ latest_start_date =
 Только физический выпуск:
 
 - увеличивает количество на полке;
-- FIFO покрывает потребность пополнения;
+- адресно-FIFO алгоритм покрывает потребность пополнения;
 - уменьшает `replenishment_remaining_qty`.
 
 После сдвига барабана меняются target, срок и приоритет, но не исходное
@@ -193,3 +210,4 @@ latest_start_date =
 6. Остаток другого склада приводит к перемещению, а не к дублю производства.
 7. Сдвиг барабана меняет только время и приоритет.
 8. Физическое выполнение остаётся Ledger-only.
+9. Локальный срок полки не заменяет срок пополнения MRP из 1С.

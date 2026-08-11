@@ -78,8 +78,7 @@ def accepted_generation(db_session):
 
 def _fixed_plan(db, *, code="REPAIR"):
     item = Item(
-        item_code=code, item_name="Деталь", unit="шт", stock_qty=0.0,
-        replenishment_method="Покупка", replenishment_time=2, status="active",
+        item_code=code, item_name="Деталь", unit="шт", replenishment_method="Покупка", replenishment_time=2, status="active",
     )
     db.add(item)
     db.flush()

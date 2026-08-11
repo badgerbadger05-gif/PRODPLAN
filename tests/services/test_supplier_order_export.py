@@ -16,8 +16,7 @@ def test_supplier_order_export_includes_only_orders_used_by_mrp(db_session):
         item_name="Supplier Export Item",
         item_article="SUP-EXP",
         replenishment_method="Покупка",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     supplier = Supplier(supplier_ref1c="supplier-ref", supplier_name="Supplier")
     db.add_all([item, supplier])

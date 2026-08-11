@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -249,6 +250,37 @@ def test_accepted_generation_is_immutable(db_session):
         materialize_historical_obligations(db_session, generation.id)
 
     assert db_session.query(models.ReservationEntry).count() == 0
+
+
+@pytest.mark.parametrize("method", ["", "unknown-method"])
+def test_historical_obligations_rejects_unsupported_replenishment_method(
+    db_session,
+    method,
+):
+    generation = _generation(db_session)
+    run = _run(db_session, _plan(db_session))
+    _requirement_with_method(db_session, run, replenishment_method=method)
+
+    with pytest.raises(ValueError, match="Unsupported replenishment flow"):
+        materialize_historical_obligations(db_session, generation.id)
+
+    assert db_session.query(models.ReservationEntry).count() == 0
+
+
+def test_historical_obligations_preserve_known_rework_without_executor(db_session):
+    generation = _generation(db_session)
+    run = _run(db_session, _plan(db_session))
+    req = _requirement_with_method(
+        db_session, run, replenishment_method="Переработка"
+    )
+
+    result = materialize_historical_obligations(db_session, generation.id)
+
+    entry = _entry_by_mode(db_session, req, "rework")
+    assert result["reservation_entries"] == 1
+    assert entry is not None
+    assert entry.reserved_qty == Decimal("10")
+    assert entry.replenishment_required_qty == Decimal("10")
 
 
 def test_rerun_is_idempotent_with_completed_manifest(db_session):

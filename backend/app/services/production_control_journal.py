@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    MrpFreezeComponent,
     PaintWeldChainLink,
     PlannedOrder,
     PlanningRun,
@@ -38,13 +39,17 @@ from .production_control_common import (
     to_float as _to_float,
 )
 from .production_control_domain import ensure_state as _ensure_state
+from .forecast import forecast_payload as _forecast_payload
 from .planning_truth import PlanningTruthReadiness, require_accepted_truth
-from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .paint_weld_pairs import is_welded_blocked
 from .mrp_mutation_guard import (
     MrpMutationLineageError,
-    require_current_run,
 )
+from .bom_specification_resolver import BomSpecificationResolver
+from .item_ledger.production_output_cache import (
+    accepted_product_output,
+)
+from .production_material_custody_events import append_material_issue_custody_event
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -52,6 +57,7 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 # Legacy technical states are kept for compatibility and mapped to the compact
 # workshop-facing labels below.
 LINE_STATUSES = {
+    "created",
     "shortage",
     "partial",
     "ready",
@@ -70,6 +76,7 @@ LINE_STATUSES = {
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 COVERAGE_LABELS = {
+    "unknown": "Недоступно",
     "shortage": "Дефицит",
     "partial": "Частично",
     "ready": "Обеспечен",
@@ -84,6 +91,7 @@ COVERAGE_LABELS = {
     "cancelled": "Отменен",
 }
 STATUS_FILTER_GROUPS = {
+    "created": ("created", "shortage", "partial"),
     "shortage": ("shortage",),
     "partial": ("partial",),
     "ready": ("ready",),
@@ -159,6 +167,11 @@ def _shelf_pull_by_item(
 
 
 def _journal_work_status(line_status: str) -> str:
+    # Legacy ``shortage`` / ``partial`` values were material-coverage bands
+    # persisted in the workflow state.  They do not describe order lifecycle.
+    # A materialized executor with either value is simply created/not started.
+    if line_status in {"shortage", "partial"}:
+        return "created"
     # "assembled" describes material coverage in the journal, not the workshop
     # action state. Keep the row actionable as "В работу".
     if line_status == "assembled":
@@ -171,38 +184,26 @@ def _journal_coverage_status(
     issue_status: str,
     material_coverage_status: Optional[str] = None,
 ) -> str:
-    if issue_status == "posted" and material_coverage_status in {"shortage", "partial"}:
-        return material_coverage_status
-    if issue_status == "posted":
-        return "assembled"
-    if issue_status in {"requested", "issued", "exported"}:
-        return "to_move"
     if material_coverage_status in ACTIVE_COVERAGE_STATUSES:
         return material_coverage_status
-    return line_status
+    return "unknown"
 
 
 def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
-    """Exact same-generation materializations, independent of legacy state.
+    """Active local materializations for the exact frozen requirement.
 
-    ``remaining_qty``, 1C order state and journal status are projections, not
-    authorization.  Once this requirement was materialized in its generation,
-    a retry must reuse it even when those legacy fields are stale.
+    Physical Ledger generations advance while the frozen MRP requirement stays
+    immutable. Matching the exact requirement prevents duplicate executors
+    without rewriting their creation-generation provenance.
     """
-    current_run = db.query(PlanningRun).filter(PlanningRun.run_id == int(req.run_id)).first()
-    if current_run is None or current_run.ledger_generation_id is None:
-        return []
     return [
         (product, order)
         for product, order in (
         db.query(ProductionProduct, ProductionOrder)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .filter(ProductionProduct.source_mrp_requirement_id == int(req.id))
-        .filter(
-            ProductionProduct.ledger_generation_id
-            == int(current_run.ledger_generation_id)
-        )
         .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.deletion_mark.is_(False))
         .all()
         )
     ]
@@ -215,6 +216,7 @@ def _reused_product_payload(
     requirement_id: int,
 ) -> Dict[str, Any]:
     item = getattr(product, "item", None)
+    output = accepted_product_output(product)
     return {
         "requirement_id": int(requirement_id),
         "product_id": int(product.product_id),
@@ -222,7 +224,7 @@ def _reused_product_payload(
         "order_number": str(order.order_number or "") if order else None,
         "item_id": int(product.item_id),
         "item_name": str(item.item_name or "") if item else "",
-        "qty": _to_float(product.remaining_qty) or _to_float(product.quantity),
+        "qty": _to_float(output.remaining_qty),
     }
 
 
@@ -259,222 +261,10 @@ def _prodplan_order_display_number(product: ProductionProduct, order: Production
     return str(order.order_number or "")
 
 
-def _mrp_duplicate_scope_key(req: MrpRequirement, run: Optional[PlanningRun]) -> Tuple[Any, ...]:
-    source_plan_id = int(run.source_plan_id) if run and run.source_plan_id is not None else None
-    if source_plan_id is not None:
-        return ("plan", source_plan_id, int(req.item_id))
-    return ("period", int(req.item_id), req.period_from, req.period_to)
-
-
-def _production_order_1c_linked_order_ids(db: Session, order_ids: Sequence[int]) -> set[int]:
-    ids = sorted({int(order_id) for order_id in order_ids if order_id is not None})
-    if not ids:
-        return set()
-    return {
-        int(row.source_id)
-        for row in (
-            db.query(SyncLink.source_id)
-            .filter(
-                SyncLink.source_system == "PRODPLAN",
-                SyncLink.source_doctype == "production_order",
-                SyncLink.source_id.in_(ids),
-                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
-                SyncLink.status == "success",
-                SyncLink.target_ref_key.isnot(None),
-            )
-            .all()
-        )
-    }
-
-
-def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[str, Any]:
-    """
-    Cancel local MRP duplicates left by earlier non-idempotent recalculations.
-
-    Hard rule: production orders already opened in 1C are immutable. They are
-    counted as coverage and never cancelled; only local PRODPLAN MRP rows
-    without a 1C ref/success sync-link can be cancelled.
-    """
-    rows = (
-        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, MrpRequirement, PlanningRun)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .join(MrpRequirement, MrpRequirement.id == ProductionProduct.source_mrp_requirement_id)
-        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
-        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
-        .filter(ProductionOrder.source == "mrp")
-        .filter(ProductionOrder.deletion_mark == False)
-        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
-        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
-        .all()
-    )
-    linked_order_ids = _production_order_1c_linked_order_ids(db, [int(order.order_id) for _p, order, _s, _r, _run in rows])
-
-    groups: Dict[Tuple[Any, ...], List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]]] = {}
-    for row in rows:
-        _product, _order, _state, req, run = row
-        groups.setdefault(_mrp_duplicate_scope_key(req, run), []).append(row)
-
-    repaired: List[Dict[str, Any]] = []
-    untouched: List[Dict[str, Any]] = []
-    cancelled_count = 0
-    reduced_count = 0
-    released_qty_total = 0.0
-    reduced_qty_total = 0.0
-
-    for key, group_rows in groups.items():
-        latest_req = max(group_rows, key=lambda row: (row[4].started_at or row[3].created_at, int(row[4].run_id), int(row[3].id)))[3]
-        required_qty = _to_float(latest_req.net_required_qty)
-
-        def keep_priority(row: Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]) -> Tuple[int, int, int, Any, int]:
-            product, order, state, req, _run = row
-            is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
-            status = str(state.status if state else "shortage")
-            is_work_started = status not in ACTIVE_COVERAGE_STATUSES
-            is_latest = int(req.id) == int(latest_req.id)
-            return (
-                1 if is_1c else 0,
-                1 if is_work_started else 0,
-                1 if is_latest else 0,
-                order.order_date,
-                -int(product.product_id),
-            )
-
-        kept: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
-        cancelled: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
-        reduced: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun, float, float]] = []
-        kept_qty = 0.0
-        protected_qty = 0.0
-        editable_target_qty = required_qty
-        for row in sorted(group_rows, key=keep_priority, reverse=True):
-            product, order, state, _req, _run = row
-            qty = _to_float(product.remaining_qty)
-            is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
-            if is_1c:
-                kept.append(row)
-                kept_qty += qty
-                protected_qty += qty
-                editable_target_qty = max(0.0, required_qty - protected_qty)
-                continue
-
-            editable_kept_qty = max(0.0, kept_qty - protected_qty)
-            remaining_editable_target = max(0.0, editable_target_qty - editable_kept_qty)
-            if remaining_editable_target <= 1e-9:
-                cancelled.append(row)
-                continue
-            if qty <= remaining_editable_target + 1e-9:
-                kept.append(row)
-                kept_qty += qty
-            else:
-                new_qty = remaining_editable_target
-                kept.append(row)
-                kept_qty += new_qty
-                reduced.append((product, order, state, _req, _run, qty, new_qty))
-
-        if not cancelled and not reduced:
-            if protected_qty > required_qty + 1e-9:
-                untouched.append({
-                    "scope": list(key),
-                    "item_id": int(latest_req.item_id),
-                    "required_qty": required_qty,
-                    "protected_qty": protected_qty,
-                    "reason": "1C-заказы покрывают больше потребности; локальных дублей для отмены нет",
-                })
-            continue
-
-        cancelled_payload: List[Dict[str, Any]] = []
-        for product, order, state, req, _run in cancelled:
-            qty = _to_float(product.remaining_qty)
-            cancelled_payload.append({
-                "product_id": int(product.product_id),
-                "order_id": int(order.order_id),
-                "order_number": str(order.order_number or ""),
-                "requirement_id": int(req.id),
-                "qty": qty,
-            })
-            if not dry_run:
-                actual_state = state or _ensure_state(db, product)
-                if actual_state.status not in _TERMINAL_LINE_STATUSES:
-                    actual_state.status = "cancelled"
-                    product.remaining_qty = 0.0
-            cancelled_count += 1
-            released_qty_total += qty
-
-        reduced_payload: List[Dict[str, Any]] = []
-        for product, order, _state, req, _run, old_qty, new_qty in reduced:
-            delta = max(0.0, old_qty - new_qty)
-            reduced_payload.append({
-                "product_id": int(product.product_id),
-                "order_id": int(order.order_id),
-                "order_number": str(order.order_number or ""),
-                "requirement_id": int(req.id),
-                "old_qty": old_qty,
-                "new_qty": new_qty,
-                "delta_qty": delta,
-            })
-            if not dry_run and delta > 1e-9:
-                product.remaining_qty = new_qty
-                produced_qty = _to_float(product.produced_qty)
-                product.quantity = max(produced_qty + new_qty, produced_qty)
-            if delta > 1e-9:
-                reduced_count += 1
-                reduced_qty_total += delta
-
-        repaired.append({
-            "scope": list(key),
-            "item_id": int(latest_req.item_id),
-            "latest_requirement_id": int(latest_req.id),
-            "required_qty": required_qty,
-            "kept_qty": kept_qty,
-            "protected_1c_qty": protected_qty,
-            "cancelled_qty": sum(row["qty"] for row in cancelled_payload),
-            "cancelled": cancelled_payload,
-            "reduced_qty": sum(row["delta_qty"] for row in reduced_payload),
-            "reduced": reduced_payload,
-        })
-
-    if not dry_run:
-        db.commit()
-
-    return {
-        "status": "ok",
-        "dry_run": bool(dry_run),
-        "groups_repaired": len(repaired),
-        "cancelled_count": cancelled_count,
-        "reduced_count": reduced_count,
-        "released_qty": released_qty_total,
-        "reduced_qty": reduced_qty_total,
-        "repaired": repaired,
-        "untouched": untouched,
-    }
-
-
 def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
-    result = {int(root_item_id)}
-    spec_by_item: Dict[int, int] = {
-        int(row.item_id): int(row.spec_id)
-        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id == int(root_item_id))
-        .all()
-    }
-
-    def visit(item_id: int, seen_specs: set[int]) -> None:
-        spec_id = spec_by_item.get(int(item_id))
-        if not spec_id or spec_id in seen_specs:
-            return
-        next_seen = set(seen_specs)
-        next_seen.add(int(spec_id))
-        for row in db.query(SpecComponent.item_id).filter(SpecComponent.spec_id == int(spec_id)).all():
-            child_id = int(row.item_id)
-            result.add(child_id)
-            if child_id not in spec_by_item:
-                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
-                if ds:
-                    spec_by_item[child_id] = int(ds.spec_id)
-            visit(child_id, next_seen)
-
-    visit(int(root_item_id), set())
-    return result
+    return BomSpecificationResolver(db).descendant_ids_by_root(
+        [int(root_item_id)]
+    )[int(root_item_id)]
 
 
 def _accepted_plan_snapshot_run_ids_for_root(
@@ -512,21 +302,6 @@ def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[i
         .all()
     )
     return [int(row[0]) for row in rows]
-
-
-def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
-    if not forecast_date or not due_date:
-        return {
-            "forecast_date": _date_to_iso(forecast_date),
-            "forecast_shift_days": None,
-            "forecast_reason": None,
-        }
-    shift = (forecast_date - due_date).days
-    return {
-        "forecast_date": forecast_date.isoformat(),
-        "forecast_shift_days": shift,
-        "forecast_reason": "смещение по мощностям" if shift > 0 else ("раньше плановой даты" if shift < 0 else "в срок"),
-    }
 
 
 def _default_spec_ids_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, int]:
@@ -596,6 +371,7 @@ def materialize_make_work_items(
     work_item_ids: Sequence[int],
     *,
     initiated_by: Optional[str] = None,
+    launch_requests: Optional[Mapping[int, Mapping[str, float]]] = None,
 ) -> Dict[str, Any]:
     """
     Materialize canonical make work items into internal production orders.
@@ -617,11 +393,21 @@ def materialize_make_work_items(
     run_ids = {int(row.run_id) for row in selected}
     if len(run_ids) != 1:
         raise MrpMutationLineageError("selected work items have mixed or empty runs")
-    run, generation_id = require_current_run(
+    selected_run_id = run_ids.pop()
+    truth = require_accepted_truth(
         db,
-        run_ids.pop(),
-        consumer="production_control.materialize_make_work_items",
+        "production_control.materialize_make_work_items",
     )
+    generation_id = int(truth.generation_id)
+    run = db.get(PlanningRun, selected_run_id)
+    if run is None or str(run.status or "").upper() != "FIXED_SNAPSHOT":
+        raise MrpMutationLineageError(
+            f"planning run {selected_run_id} is not a FIXED_SNAPSHOT"
+        )
+    if run.active_freeze_version is None:
+        raise MrpMutationLineageError(
+            f"planning run {selected_run_id} has no active freeze"
+        )
     if any(
         int(row.ledger_generation_id) != generation_id
         or row.replenishment_method != "make"
@@ -726,15 +512,13 @@ def materialize_make_work_items(
             )
             continue
         active_products = _active_mrp_products_for_requirement(db, req)
-        if active_products:
+        request = (launch_requests or {}).get(work_id)
+        active_open_qty = sum(
+            _to_float(accepted_product_output(product).remaining_qty)
+            for product, _order in active_products
+        )
+        if request is None and active_products:
             for product, order in active_products:
-                if (
-                    product.ledger_generation_id is None
-                    or int(product.ledger_generation_id) != generation_id
-                ):
-                    raise MrpMutationLineageError(
-                        f"requirement_id={rid}: existing materialization has stale Ledger lineage"
-                    )
                 payload = _reused_product_payload(product, order, requirement_id=rid)
                 payload["work_item_id"] = work_id
                 reused.append(payload)
@@ -744,7 +528,27 @@ def materialize_make_work_items(
                 "reason": "already materialized for this Ledger generation",
             })
             continue
-        remaining = net_qty
+        remaining = max(0.0, net_qty - active_open_qty)
+        if request is not None:
+            requested_qty = _to_float(request.get("launch_qty"))
+            expected_materialized_qty = _to_float(request.get("expected_materialized_qty"))
+            target_qty = expected_materialized_qty + requested_qty
+            if requested_qty <= 1e-9:
+                errors.append(f"work_item_id={work_id}: количество запуска должно быть больше нуля")
+                continue
+            if abs(active_open_qty - target_qty) <= 1e-6:
+                for product, order in active_products:
+                    payload = _reused_product_payload(product, order, requirement_id=rid)
+                    payload["work_item_id"] = work_id
+                    reused.append(payload)
+                continue
+            if abs(active_open_qty - expected_materialized_qty) > 1e-6:
+                errors.append(f"work_item_id={work_id}: состав живых заказов изменился; обновите журнал")
+                continue
+            if requested_qty - remaining > 1e-6:
+                errors.append(f"work_item_id={work_id}: доступно к запуску {remaining:g}, запрошено {requested_qty:g}")
+                continue
+            remaining = requested_qty
 
         existing_count = (
             db.query(ProductionProduct)
@@ -761,7 +565,9 @@ def materialize_make_work_items(
         )
         planned_start = min((task.start_date for task in planned_tasks if task.start_date), default=req.period_from)
         planned_finish = max((task.finish_date or task.need_date for task in planned_tasks if task.finish_date or task.need_date), default=req.period_to)
-        spec_id = _default_spec_id_for_item(db, int(req.item_id))
+        spec_id, spec_revision_hash = _frozen_spec_identity_for_requirement(
+            db, req
+        )
 
         shelf = shelf_by_item.get(int(req.item_id))
         launch_source = LAUNCH_SOURCE_MRP
@@ -814,6 +620,9 @@ def materialize_make_work_items(
                 produced_qty=0,
                 remaining_qty=qty,
                 spec_id=spec_id,
+                spec_revision_hash=(
+                    str(spec_revision_hash) if spec_revision_hash else None
+                ),
                 source_mrp_requirement_id=rid,
                 source_mrp_allocation_key=f"mrp_requirement:{rid}:order:{seq}",
                 ledger_generation_id=generation_id,
@@ -887,33 +696,74 @@ def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:
     return int(row.spec_id) if row else None
 
 
-def _planned_dates_by_item(
+def _frozen_spec_identity_for_requirement(
     db: Session,
-    run_ids: Sequence[int],
-    item_ids: Optional[Sequence[int]] = None,
-) -> Dict[int, Tuple[Optional[date], Optional[date]]]:
-    ids_for_runs = sorted({int(value) for value in run_ids if value is not None})
-    if not ids_for_runs:
-        return {}
-    q = (
-        db.query(
-            PlannedOrder.item_id,
-            func.min(PlannedOrder.start_date).label("start_date"),
-            func.max(PlannedOrder.finish_date).label("finish_date"),
+    requirement: MrpRequirement,
+) -> tuple[Optional[int], Optional[str]]:
+    """Resolve the exact revision frozen for an MRP-backed order line.
+
+    A logical 1C specification ref can now point at newer content. Creating an
+    executor from an older frozen MRP would silently use that newer content in
+    1C, so a known hash mismatch fails closed until successor-MRP is published.
+    """
+    spec_id = _default_spec_id_for_item(db, int(requirement.item_id))
+    if spec_id is None:
+        return None, None
+    spec = db.get(Specification, int(spec_id))
+    if spec is None:
+        return spec_id, None
+    run = db.get(PlanningRun, int(requirement.run_id))
+    if run is None or run.active_freeze_version is None:
+        return spec_id, str(spec.content_hash) if spec.content_hash else None
+    spec_ref = str(spec.spec_ref1c or "").strip()
+    if not spec_ref:
+        return spec_id, str(spec.content_hash) if spec.content_hash else None
+    versions = {
+        str(version)
+        for (version,) in db.query(MrpFreezeComponent.spec_version)
+        .filter(
+            MrpFreezeComponent.run_id == int(run.run_id),
+            MrpFreezeComponent.freeze_version
+            == int(run.active_freeze_version),
+            MrpFreezeComponent.parent_item_id == int(requirement.item_id),
+            MrpFreezeComponent.spec_ref == spec_ref,
+            MrpFreezeComponent.spec_version.isnot(None),
         )
-        .filter(PlannedOrder.run_id.in_(ids_for_runs))
-    )
-    ids = sorted({int(item_id) for item_id in (item_ids or []) if item_id is not None})
-    if ids:
-        q = q.filter(PlannedOrder.item_id.in_(ids))
-    rows = q.group_by(PlannedOrder.item_id).all()
-    return {int(r.item_id): (r.start_date, r.finish_date) for r in rows}
+        .distinct()
+        .all()
+    }
+    if len(versions) > 1:
+        raise MrpMutationLineageError(
+            f"requirement_id={int(requirement.id)}: frozen specification revision is ambiguous"
+        )
+    frozen_hash = next(iter(versions), None)
+    current_hash = str(spec.content_hash) if spec.content_hash else None
+    if frozen_hash and current_hash and frozen_hash != current_hash:
+        raise MrpMutationLineageError(
+            f"requirement_id={int(requirement.id)}: specification changed; "
+            "successor-MRP must be published before creating new orders"
+        )
+    return spec_id, frozen_hash or current_hash
+
+
+def _available_actions_for_journal_row(
+    *,
+    order: ProductionOrder,
+    status: str,
+    has_1c_link: bool,
+) -> list[str]:
+    if has_1c_link and str(order.source or "1c").lower() == "mrp":
+        if status not in {"completed", "produced_partial", "produced", "cancelled", "done"}:
+            return ["close_1c"]
+    return []
 
 
 def list_journal(
     db: Session,
     *,
     truth: PlanningTruthReadiness | None = None,
+    _accepted_run_ids_override: Optional[Sequence[int]] = None,
+    _material_coverage_by_product: Optional[Dict[int, Dict[str, Any]]] = None,
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
@@ -930,9 +780,13 @@ def list_journal(
     offset: int = 0,
 ) -> Dict[str, Any]:
     truth = truth or require_accepted_truth(db, "production_control_journal")
-    accepted_run_ids = _accepted_fixed_run_ids(
-        db,
-        ledger_generation_id=int(truth.generation_id),
+    accepted_run_ids = (
+        sorted({int(value) for value in _accepted_run_ids_override})
+        if _accepted_run_ids_override is not None
+        else _accepted_fixed_run_ids(
+            db,
+            ledger_generation_id=int(truth.generation_id),
+        )
     )
     # A scalar is retained only for an unambiguous scope.  Never choose the
     # numerically latest run as that can belong to a foreign generation.
@@ -946,7 +800,10 @@ def list_journal(
         .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
+        .filter(
+            func.coalesce(ProductionProduct.quantity, 0)
+            > func.coalesce(ProductionProduct.produced_qty, 0)
+        )
         .filter(
             func.coalesce(ProductionOrderLineState.status, "shortage").notin_(
                 tuple(_TERMINAL_LINE_STATUSES)
@@ -970,6 +827,16 @@ def list_journal(
             ProductionOrder.source_run_id.in_(accepted_run_ids or [-1]),
         )
     )
+
+    # A linked weld order is the execution side of one aggregated journal
+    # entry owned by the painted order. Direct focus remains available for
+    # diagnostics and deep links.
+    if product_id is None and order_id is None:
+        query = query.filter(
+            ~ProductionOrder.order_id.in_(
+                db.query(PaintWeldChainLink.welded_order_id)
+            )
+        )
 
     if product_id is not None:
         query = query.filter(ProductionProduct.product_id == int(product_id))
@@ -1019,21 +886,23 @@ def list_journal(
         max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
         effective_offset = min(requested_offset, max_offset)
         if sort_field in {"planned_start_date", "planned_finish_date"}:
-            planned_dates_sq = (
+            planning_dates_sq = (
                 db.query(
-                    PlannedOrder.item_id.label("item_id"),
-                    func.min(PlannedOrder.start_date).label("start_date"),
-                    func.max(PlannedOrder.finish_date).label("finish_date"),
+                    PlanningRun.run_id.label("run_id"),
+                    func.coalesce(PlanningRun.period_from, ProductionPlanHeader.period_from).label("start_date"),
+                    func.coalesce(PlanningRun.period_to, ProductionPlanHeader.period_to).label("finish_date"),
                 )
-                .filter(PlannedOrder.run_id == run_id)
-                .group_by(PlannedOrder.item_id)
+                .outerjoin(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+                .filter(PlanningRun.run_id.in_(accepted_run_ids))
                 .subquery()
             )
-            query = query.outerjoin(planned_dates_sq, planned_dates_sq.c.item_id == ProductionProduct.item_id)
+            query = query.outerjoin(
+                planning_dates_sq, planning_dates_sq.c.run_id == ProductionOrder.source_run_id
+            )
             date_expr = (
-                func.coalesce(ProductionOrderLineState.planned_finish_date, planned_dates_sq.c.finish_date)
+                func.coalesce(ProductionOrderLineState.planned_finish_date, planning_dates_sq.c.finish_date)
                 if sort_field == "planned_finish_date"
-                else func.coalesce(ProductionOrderLineState.planned_start_date, planned_dates_sq.c.start_date)
+                else func.coalesce(ProductionOrderLineState.planned_start_date, planning_dates_sq.c.start_date)
             )
             if (sort_dir or "").strip().lower() == "desc":
                 query = query.order_by(date_expr.is_(None), date_expr.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
@@ -1049,10 +918,9 @@ def list_journal(
         effective_offset = max(0, int(offset or 0))
 
     page_item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
-    plan_dates = _planned_dates_by_item(db, accepted_run_ids, page_item_ids)
     # The shelf projection of the accepted generation owns the launch date of a
-    # shelf-managed item; the legacy CapacityScheduler dates stay as fallback
-    # only for items without a shelf.
+    # shelf-managed item; otherwise only explicit state or frozen-plan period
+    # dates are used.
     shelf_by_item = _shelf_pull_by_item(
         db,
         ledger_generation_id=int(truth.generation_id) if truth.generation_id is not None else None,
@@ -1069,15 +937,18 @@ def list_journal(
         for row in (
             db.query(SyncLink.source_id, SyncLink.target_number)
             .filter(
+                SyncLink.source_system == "PRODPLAN",
                 SyncLink.source_doctype == "production_order",
                 SyncLink.source_id.in_(order_ids),
                 SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+                SyncLink.status == "success",
                 SyncLink.target_number.isnot(None),
             )
             .all()
         ):
             order_one_c_number_by_id[int(row.source_id)] = str(row.target_number or "")
     source_plan_by_run_id: Dict[int, Dict[str, Any]] = {}
+    source_plan_dates_by_run_id: Dict[int, Tuple[Optional[date], Optional[date]]] = {}
     if run_ids:
         run_rows = (
             db.query(PlanningRun, ProductionPlanHeader)
@@ -1094,6 +965,7 @@ def list_journal(
                 "source_plan_period_from": _date_to_iso(period_from),
                 "source_plan_period_to": _date_to_iso(period_to),
             }
+            source_plan_dates_by_run_id[int(run.run_id)] = (period_from, period_to)
     planned_order_ids = sorted({
         int(product.source_planned_order_id)
         for product in rows
@@ -1186,10 +1058,15 @@ def list_journal(
                 {int(link.painted_order_id) for link in chain_links}
                 | {int(link.welded_order_id) for link in chain_links}
             )
-            product_by_order: Dict[int, int] = {}
-            for pid, oid in (
-                db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+            product_by_order: Dict[int, ProductionProduct] = {}
+            for counterpart_product in (
+                db.query(ProductionProduct)
                 .filter(ProductionProduct.order_id.in_(counterpart_order_ids))
+                .options(
+                    joinedload(ProductionProduct.order),
+                    joinedload(ProductionProduct.item),
+                    joinedload(ProductionProduct.control_state).joinedload(ProductionOrderLineState.workshop),
+                )
                 .order_by(
                     ProductionProduct.order_id.asc(),
                     ProductionProduct.line_number.asc(),
@@ -1197,7 +1074,32 @@ def list_journal(
                 )
                 .all()
             ):
-                product_by_order.setdefault(int(oid), int(pid))
+                product_by_order.setdefault(int(counterpart_product.order_id), counterpart_product)
+            counterpart_units = _unit_display_by_raw(
+                db,
+                [product.item.unit for product in product_by_order.values() if product.item],
+            )
+
+            def _counterpart_payload(order_id: int) -> Dict[str, Any]:
+                product = product_by_order.get(order_id)
+                if product is None:
+                    return {}
+                output = accepted_product_output(product)
+                state = getattr(product, "control_state", None)
+                return {
+                    "counterpart_product_id": int(product.product_id),
+                    "counterpart_order_number": str(product.order.order_number or ""),
+                    "counterpart_order_prodplan_number": _prodplan_order_display_number(product, product.order),
+                    "counterpart_item_name": str(product.item.item_name or ""),
+                    "counterpart_item_article": str(product.item.item_article or ""),
+                    "counterpart_item_code": str(product.item.item_code or ""),
+                    "counterpart_quantity": _to_float(output.planned_qty),
+                    "counterpart_remaining_qty": _to_float(output.remaining_qty),
+                    "counterpart_unit": counterpart_units.get(str(product.item.unit or "").strip(), ""),
+                    "counterpart_workshop_name": (
+                        state.workshop.resource_name if state and state.workshop else None
+                    ),
+                }
             for link in chain_links:
                 painted_oid = int(link.painted_order_id)
                 welded_oid = int(link.welded_order_id)
@@ -1205,13 +1107,13 @@ def list_journal(
                     "role": "painted",
                     "link_id": int(link.id),
                     "counterpart_order_id": welded_oid,
-                    "counterpart_product_id": product_by_order.get(welded_oid),
+                    **_counterpart_payload(welded_oid),
                 }
                 chain_by_order_id[welded_oid] = {
                     "role": "welded",
                     "link_id": int(link.id),
                     "counterpart_order_id": painted_oid,
-                    "counterpart_product_id": product_by_order.get(painted_oid),
+                    **_counterpart_payload(painted_oid),
                 }
 
     result: List[Dict[str, Any]] = []
@@ -1233,7 +1135,14 @@ def list_journal(
         if workshop_id and resolved_workshop_id != int(workshop_id):
             continue
 
-        planned_start, planned_finish = plan_dates.get(int(product.item_id), (None, None))
+        planned_start = None
+        planned_finish = None
+        source_plan_dates = source_plan_dates_by_run_id.get(
+            int(product.order.source_run_id) if product.order and product.order.source_run_id is not None else 0,
+            (None, None),
+        )
+        if source_plan_dates:
+            planned_start, planned_finish = source_plan_dates
         shelf = shelf_by_item.get(int(product.item_id))
         if shelf is not None and shelf.latest_start_date is not None:
             planned_start = shelf.latest_start_date
@@ -1262,20 +1171,27 @@ def list_journal(
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
-        material_coverage_status = str(getattr(state, "material_coverage_status", "") or "")
-        material_coverage_label = str(getattr(state, "material_coverage_label", "") or "")
+        material_snapshot = (_material_coverage_by_product or {}).get(int(product.product_id))
+        material_coverage_status = str((material_snapshot or {}).get("coverage_status") or "")
+        material_coverage_label = str((material_snapshot or {}).get("coverage_label") or "")
         row_coverage_status = _journal_coverage_status(line_status, issue_status, material_coverage_status)
-        if issue_status in {"", "not_requested"} and row_coverage_status in ACTIVE_COVERAGE_STATUSES:
-            work_status = _journal_work_status(row_coverage_status)
-        else:
-            work_status = _journal_work_status(line_status)
+        work_status = _journal_work_status(line_status)
+        has_1c_link = _production_order_has_1c_link(db, product.order)
+        available_actions = _available_actions_for_journal_row(
+            order=product.order,
+            status=work_status,
+            has_1c_link=has_1c_link,
+        )
         coverage_label = (
             material_coverage_label
             if row_coverage_status == material_coverage_status and material_coverage_label
             else COVERAGE_LABELS.get(row_coverage_status, row_coverage_status)
         )
+        output = accepted_product_output(product)
         result.append(
             {
+                "journal_row_key": f"product:{int(product.product_id)}",
+                "work_item_id": None,
                 "product_id": int(product.product_id),
                 "order_id": int(product.order_id),
                 "order_number": str(product.order.order_number or ""),
@@ -1294,16 +1210,17 @@ def list_journal(
                 "item_article": str(product.item.item_article or ""),
                 "optimal_batch": _to_float(product.item.optimal_batch) if product.item.optimal_batch is not None else None,
                 "unit": unit_by_raw.get(str(product.item.unit or "").strip(), ""),
-                "quantity": _to_float(product.quantity),
-                "produced_qty": _to_float(product.produced_qty),
-                "remaining_qty": _to_float(product.remaining_qty),
+                "quantity": _to_float(output.planned_qty),
+                "produced_qty": _to_float(output.produced_qty),
+                "remaining_qty": _to_float(output.remaining_qty),
                 "status": work_status,
                 "coverage_status": row_coverage_status,
                 "coverage_label": coverage_label,
                 "issue_status": issue_status,
                 "material_coverage_status": material_coverage_status or None,
                 "material_coverage_label": material_coverage_label or None,
-                "material_coverage_calculated_at": _date_to_iso(getattr(state, "material_coverage_calculated_at", None)) if state else None,
+                "material_coverage_calculated_at": _date_to_iso(truth.cutoff),
+                "material_coverage_snapshot": material_snapshot,
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
                 **forecast,
@@ -1313,6 +1230,11 @@ def list_journal(
                 "stage_id": stage_id,
                 "stage_name": stage_name,
                 "spec_id": spec_id,
+                "spec_revision_hash": (
+                    str(product.spec_revision_hash)
+                    if product.spec_revision_hash
+                    else None
+                ),
                 "issue_count": int(issue_count),
                 "route_sheet_printed_at": _date_to_iso(state.route_sheet_printed_at) if state else None,
                 "comment": str(state.comment or "") if state else "",
@@ -1321,6 +1243,7 @@ def list_journal(
                 "source_planned_order_id": source_planned_order_id,
                 "source_mrp_requirement_id": source_mrp_requirement_id,
                 "source_mrp_allocation_key": str(product.source_mrp_allocation_key or "") if product.source_mrp_allocation_key else None,
+                "available_actions": available_actions,
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
                 "mrp_req_covered_qty": req_meta.get("covered_qty"),
                 "mrp_req_remaining_qty": req_meta.get("remaining_qty"),
@@ -1360,6 +1283,224 @@ def list_journal(
     }
 
 
+def list_make_proposals(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    accepted_run_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Project unmaterialized MAKE work items into the unified journal.
+
+    These are saved MRP calculations, not executable ``ProductionOrder``
+    documents.  They stay read-only until the operator explicitly materializes
+    them; consequently product/order identifiers are absent and no 1C action is
+    performed while the Ledger candidate is built.
+    """
+    generation_id = int(ledger_generation_id)
+    run_ids = sorted({int(value) for value in accepted_run_ids})
+    if not run_ids:
+        return []
+
+    query = (
+        db.query(ReplenishmentWorkItem)
+        .filter(
+            ReplenishmentWorkItem.ledger_generation_id == generation_id,
+            ReplenishmentWorkItem.run_id.in_(run_ids),
+            ReplenishmentWorkItem.replenishment_method == "make",
+            ReplenishmentWorkItem.replenishment_remaining_qty > 0,
+        )
+        .order_by(ReplenishmentWorkItem.run_id.asc(), ReplenishmentWorkItem.id.asc())
+    )
+    work_items = query.all()
+    if not work_items:
+        return []
+
+    item_ids = sorted({int(row.item_id) for row in work_items})
+    requirement_ids = sorted({int(row.requirement_id) for row in work_items})
+    items = {
+        int(item.item_id): item
+        for item in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
+    }
+    requirements = {
+        int(row.id): row
+        for row in db.query(MrpRequirement).filter(MrpRequirement.id.in_(requirement_ids)).all()
+    }
+    active_open_by_requirement: Dict[int, float] = {}
+    for requirement_id, quantity, produced_qty in (
+        db.query(
+            ProductionProduct.source_mrp_requirement_id,
+            ProductionProduct.quantity,
+            ProductionProduct.produced_qty,
+        )
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(
+            ProductionOrder.source == "mrp",
+            ProductionOrder.deletion_mark.is_(False),
+            ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
+        )
+        .all()
+    ):
+        rid = int(requirement_id)
+        active_open_by_requirement[rid] = active_open_by_requirement.get(rid, 0.0) + max(
+            0.0, _to_float(quantity) - _to_float(produced_qty)
+        )
+    run_rows = (
+        db.query(PlanningRun, ProductionPlanHeader)
+        .outerjoin(
+            ProductionPlanHeader,
+            ProductionPlanHeader.id == PlanningRun.source_plan_id,
+        )
+        .filter(PlanningRun.run_id.in_(run_ids))
+        .all()
+    )
+    run_meta = {
+        int(run.run_id): {
+            "source_plan_id": int(run.source_plan_id) if run.source_plan_id is not None else None,
+            "source_plan_name": str(plan.name or "") if plan else "",
+            "source_plan_period_from": _date_to_iso(
+                run.period_from or (plan.period_from if plan else None)
+            ),
+            "source_plan_period_to": _date_to_iso(
+                run.period_to or (plan.period_to if plan else None)
+            ),
+        }
+        for run, plan in run_rows
+    }
+    planned_dates: Dict[int, Tuple[Optional[date], Optional[date]]] = {}
+    for demand_ref, start_date, finish_date in (
+        db.query(
+            PlannedOrder.demand_ref,
+            func.min(PlannedOrder.start_date),
+            func.max(func.coalesce(PlannedOrder.finish_date, PlannedOrder.need_date)),
+        )
+        .filter(PlannedOrder.run_id.in_(run_ids))
+        .filter(PlannedOrder.demand_ref.isnot(None))
+        .group_by(PlannedOrder.demand_ref)
+        .all()
+    ):
+        token = str(demand_ref or "")
+        if not token.startswith("mrp_requirement:"):
+            continue
+        try:
+            requirement_id = int(token.split(":", 1)[1])
+        except (TypeError, ValueError):
+            continue
+        planned_dates[requirement_id] = (start_date, finish_date)
+
+    spec_by_item = _default_spec_ids_by_item(db, item_ids)
+    spec_ids = sorted(set(spec_by_item.values()))
+    workshop_by_spec = _main_workshops_for_specs(db, spec_ids)
+    unit_by_raw = _unit_display_by_raw(
+        db,
+        [items[item_id].unit for item_id in item_ids if item_id in items],
+    )
+    shelf_by_item = _shelf_pull_by_item(
+        db,
+        ledger_generation_id=generation_id,
+        item_ids=item_ids,
+    )
+    shelf_allowance = {
+        item_id: float(pull.materialized_qty) for item_id, pull in shelf_by_item.items()
+    }
+
+    result: List[Dict[str, Any]] = []
+    for work in work_items:
+        item = items.get(int(work.item_id))
+        requirement = requirements.get(int(work.requirement_id))
+        if item is None or requirement is None:
+            raise ValueError(
+                f"MAKE work item {int(work.id)} has incomplete item/requirement lineage"
+            )
+        planned_start, planned_finish = planned_dates.get(
+            int(requirement.id),
+            (requirement.period_from, requirement.period_to),
+        )
+        shelf = shelf_by_item.get(int(work.item_id))
+        if shelf is not None and shelf.latest_start_date is not None:
+            planned_start = shelf.latest_start_date
+        if shelf is not None and shelf.first_shortage_date is not None:
+            planned_finish = shelf.first_shortage_date
+        spec_id = spec_by_item.get(int(work.item_id))
+        workshop_id, workshop_name, stage_id, stage_name = workshop_by_spec.get(
+            int(spec_id or 0),
+            (None, None, None, None),
+        )
+        required_qty = _to_float(work.replenishment_required_qty)
+        fulfilled_qty = _to_float(work.replenishment_fulfilled_qty)
+        remaining_qty = _to_float(work.replenishment_remaining_qty)
+        materialized_qty = active_open_by_requirement.get(int(work.requirement_id), 0.0)
+        launchable_qty = max(0.0, remaining_qty - materialized_qty)
+        if shelf is not None:
+            allowance = shelf_allowance.get(int(work.item_id), 0.0)
+            launchable_qty = min(launchable_qty, allowance)
+            shelf_allowance[int(work.item_id)] = max(0.0, allowance - launchable_qty)
+        if launchable_qty <= 1e-9:
+            continue
+        result.append(
+            {
+                "journal_row_key": f"work-item:{int(work.id)}",
+                "work_item_id": int(work.id),
+                "product_id": None,
+                "order_id": None,
+                "order_number": f"MRP-R-{int(requirement.id)}",
+                "order_prodplan_number": f"MRP-R-{int(requirement.id)}",
+                "order_date": None,
+                "order_source": "mrp",
+                "source": "mrp",
+                "order_ref1c": None,
+                "order_one_c_number": None,
+                "line_number": None,
+                "item_id": int(item.item_id),
+                "item_code": str(item.item_code or ""),
+                "item_name": str(item.item_name or ""),
+                "item_article": str(item.item_article or ""),
+                "optimal_batch": _to_float(item.optimal_batch) if item.optimal_batch is not None else None,
+                "unit": unit_by_raw.get(str(item.unit or "").strip(), ""),
+                "quantity": launchable_qty,
+                "produced_qty": fulfilled_qty,
+                "remaining_qty": remaining_qty,
+                "status": "not_created",
+                "coverage_status": "unknown",
+                "coverage_label": "Недоступно",
+                "issue_status": "not_requested",
+                "material_coverage_status": None,
+                "material_coverage_label": None,
+                "material_coverage_calculated_at": None,
+                "planned_start_date": _date_to_iso(planned_start),
+                "planned_finish_date": _date_to_iso(planned_finish),
+                **_forecast_payload(planned_finish, requirement.period_to),
+                "opened_at": None,
+                "workshop_id": workshop_id,
+                "workshop_name": workshop_name,
+                "stage_id": stage_id,
+                "stage_name": stage_name,
+                "spec_id": int(spec_id) if spec_id is not None else None,
+                "spec_revision_hash": None,
+                "issue_count": 0,
+                "route_sheet_printed_at": None,
+                "comment": "Расчёт MRP; исполнительный заказ ещё не создан",
+                "source_run_id": int(work.run_id),
+                **run_meta.get(int(work.run_id), {}),
+                "source_planned_order_id": None,
+                "source_mrp_requirement_id": int(work.requirement_id),
+                "source_mrp_allocation_key": None,
+                "available_actions": ["materialize"],
+                "mrp_req_net_qty": required_qty,
+                "mrp_req_covered_qty": fulfilled_qty,
+                "mrp_req_remaining_qty": remaining_qty,
+                "materialized_order_qty": materialized_qty,
+                "launchable_qty": launchable_qty,
+                "launch_source": LAUNCH_SOURCE_SHELF if shelf else LAUNCH_SOURCE_MRP,
+                "shelf_warehouse_ref1c": shelf.warehouse_ref1c if shelf else None,
+                "shelf_pull_qty": shelf.pull_qty if shelf else None,
+                "shelf_materialized_qty": shelf.materialized_qty if shelf else None,
+                "shelf_latest_start_date": _date_to_iso(shelf.latest_start_date) if shelf else None,
+                "paint_weld_chain": None,
+            }
+        )
+    return result
+
+
 # Terminal states that close a line: a remainder left un-produced here is never
 # going to be made on this line, so its coverage must be released back to the
 # requirement.
@@ -1377,9 +1518,10 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         status = str(payload.get("status")).strip()
         if status not in LINE_STATUSES:
             raise ValueError(f"Недопустимый статус: {status}")
+        output = accepted_product_output(product)
         if status == "completed" and (
-            _to_float(product.remaining_qty) > 1e-9
-            or _to_float(product.produced_qty) <= 1e-9
+            _to_float(output.remaining_qty) > 1e-9
+            or _to_float(output.produced_qty) <= 1e-9
         ):
             raise ValueError("Нельзя вручную завершить строку с невыпущенным остатком. Используйте выпуск.")
         state.status = status
@@ -1391,9 +1533,7 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         # from the requirement's coverage so the reconciliation job (and the
         # journal) can see the demand is no longer fully ordered.
         if status in _TERMINAL_LINE_STATUSES and prev_status not in _TERMINAL_LINE_STATUSES:
-            released = _to_float(product.remaining_qty)
-            if released > 1e-9:
-                product.remaining_qty = 0.0
+            released = _to_float(output.remaining_qty)
     if "issue_status" in payload and payload.get("issue_status"):
         issue_status = str(payload.get("issue_status")).strip()
         if issue_status not in ISSUE_STATUSES:
@@ -1424,6 +1564,7 @@ def _production_order_has_1c_link(db: Session, order: ProductionOrder) -> bool:
             SyncLink.source_doctype == "production_order",
             SyncLink.source_id == int(order.order_id),
             SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+            SyncLink.status == "success",
         )
         .first()
         is not None
@@ -1479,6 +1620,32 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
 
     deleted_issues = 0
     for issue in issues:
+        for line in issue.lines or []:
+            status = str(issue.status or "")
+            if status == "posted":
+                held_qty = _to_float(line.required_qty)
+                warehouse = str(issue.warehouse_ref1c or "")
+                location_kind = "workshop"
+            else:
+                held_qty = max(
+                    0.0,
+                    _to_float(line.required_qty) - _to_float(line.issued_qty),
+                )
+                warehouse = str(issue.source_warehouse_ref1c or issue.warehouse_ref1c or "")
+                location_kind = "transit"
+
+            if held_qty > 1e-9 and warehouse:
+                append_material_issue_custody_event(
+                    db,
+                    issue=issue,
+                    line=line,
+                    delta_qty=-held_qty,
+                    source_kind="terminal_release",
+                    location_kind=location_kind,
+                    warehouse_ref1c=warehouse,
+                    source_ref1c=str(issue.source_warehouse_ref1c or ""),
+                )
+
         db.delete(issue)
         deleted_issues += 1
 
@@ -1486,10 +1653,11 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
     for row in products:
         state = row.control_state or _ensure_state(db, row)
         if state.status != "cancelled":
-            qty_to_release = _to_float(row.remaining_qty)
+            qty_to_release = _to_float(
+                accepted_product_output(row).remaining_qty
+            )
             if qty_to_release > 1e-9:
                 released_qty += qty_to_release
-                row.remaining_qty = 0.0
             state.status = "cancelled"
         state.issue_status = "not_requested"
 
@@ -1502,41 +1670,3 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
         "deleted_issues": deleted_issues,
         "released_qty": released_qty,
     }
-
-
-def update_product_quantity(db: Session, product_id: int, quantity: float) -> Dict[str, Any]:
-    """
-    Adjust the planned quantity on a ProductionProduct line.
-
-    Rules:
-    - quantity must be > 0.
-    - quantity cannot be set below already produced_qty (can't un-produce).
-    - remaining_qty is recalculated as max(0, quantity - produced_qty).
-    """
-    product = db.query(ProductionProduct).filter(ProductionProduct.product_id == int(product_id)).one_or_none()
-    if product is None:
-        raise ValueError(f"product_id={product_id}: строка заказа не найдена")
-
-    qty = float(quantity)
-    if qty <= 0:
-        raise ValueError("quantity должен быть положительным")
-
-    produced = _to_float(product.produced_qty)
-    if qty < produced - 1e-9:
-        raise ValueError(
-            f"quantity={qty} меньше уже выпущенного ({produced}). "
-            "Нельзя уменьшить заказ ниже факта."
-        )
-
-    product.quantity = qty
-    product.remaining_qty = max(0.0, qty - produced)
-    material_issues_refresh = refresh_existing_material_issues_for_product(db, product)
-    db.commit()
-    payload: Dict[str, Any] = {
-        "status": "ok",
-        "product_id": int(product_id),
-        "quantity": float(qty),
-        "remaining_qty": float(product.remaining_qty),
-        "material_issues_refresh": material_issues_refresh,
-    }
-    return payload

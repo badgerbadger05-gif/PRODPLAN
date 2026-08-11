@@ -1,8 +1,20 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
+from hashlib import sha256
+import json
 
 import pytest
 
 from app import models
+from app.services.item_ledger.reservation_consumption_persistence import (
+    ALGORITHM_VERSION as RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+)
+from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+    FutureSupplyEvidence,
+    future_supply_evidence_hash,
+    replace_future_supply_capture,
+)
 from app.services.obligation_refresh_publish import (
     ObligationRefreshPublishError,
     publish_obligation_refresh_batch,
@@ -30,11 +42,17 @@ def _generation(db, *, key, status, cutoff, watermarks=None):
     return row
 
 
+def _execution_allocation_checksum(rows: list[dict[str, object]]) -> str:
+    raw = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _capabilities():
     return {
         "physical_ledger": True,
         "reservation_replay": True,
         "execution_allocations": True,
+        "reservation_consumption_allocation": True,
         "supplier_receipt_coverage": True,
         "planning_snapshots": True,
         "replenishment_work_item": True,
@@ -43,23 +61,77 @@ def _capabilities():
         "drum_schedule": True,
         "shelf_projection": True,
         "purchase_control_journal": True,
+        "production_control_journal": True,
         "future_supply": True,
     }
 
 
+def _seed_future_supply_capture(db, target, cutoff):
+    item = models.Item(item_code=f"publish-fs-{target.id}", item_name="publish future supply")
+    db.add(item)
+    db.flush()
+    batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id,
+        stage="future_supply_capture",
+        batch_key=f"{target.id}:future_supply_capture",
+        status="building",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+        metrics={},
+    )
+    db.add(batch)
+    db.flush()
+    base = dict(
+        supply_kind="supplier_order",
+        item_id=item.item_id,
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="WH-1",
+        source_ref="publish-seed-1",
+        source_line_ref="1",
+        source_local_id="seed-local",
+        ordered_qty_at_cutoff=Decimal("10"),
+        realized_qty_at_cutoff=Decimal("1"),
+        eta_date=date(2026, 8, 1),
+        source_state_key="ready",
+        source_updated_at=datetime(2026, 7, 20),
+        capture_cutoff=cutoff,
+        evidence_status="exact",
+    )
+    unsigned = FutureSupplyEvidence(
+        **base,
+    )
+    evidence = FutureSupplyEvidence(
+        **{**base, "source_content_hash": future_supply_evidence_hash(unsigned)},
+    )
+    replace_future_supply_capture(
+        db,
+        int(target.id),
+        int(batch.id),
+        [evidence],
+    )
+    batch.status = "completed"
+    batch.completed_at = cutoff
+    db.flush()
+    return int(batch.id)
+
+
 def _seal_build(db, target, candidates, cutoff):
     target.capabilities = _capabilities()
+    future_supply_capture_batch_id = _seed_future_supply_capture(db, target, cutoff)
     for stage in (
         "physical_import",
         "reservation_materialize",
         "replenishment_work_item",
+        "execution_allocation",
         "reservation_replay",
         "assembly_output_allocation",
         "drum_schedule",
         "shelf_projection",
+        "future_supply_capture",
         "snapshot_build",
     ):
         metrics = {}
+        if stage == "future_supply_capture":
+            continue
         if stage == "snapshot_build":
             metrics = {
                 "candidate_run_ids": [row.run_id for row in candidates],
@@ -67,11 +139,25 @@ def _seal_build(db, target, candidates, cutoff):
                     str(row.run_id): row._test_read_snapshot_id for row in candidates
                 },
                 "future_supply_captured": True,
+                "future_supply_capture_batch_id": future_supply_capture_batch_id,
                 "purchase_control_journal_snapshot_id": target._test_purchase_journal_snapshot_id,
+                "production_control_journal_snapshot_id": target._test_production_journal_snapshot_id,
             }
+        elif stage == "execution_allocation":
+            metrics = {
+                "facts": "0",
+                "allocations": "0",
+                "fact_qty": "0",
+                "allocated_qty": "0",
+                "surplus_qty": "0",
+                "allocation_checksum": _execution_allocation_checksum([]),
+            }
+        algorithm_version = "tests/1"
+        if stage == "execution_allocation":
+            algorithm_version = RESERVATION_CONSUMPTION_ALGORITHM_VERSION
         db.add(models.LedgerBuildBatch(
             ledger_generation_id=target.id, stage=stage, batch_key=f"{target.id}:{stage}",
-            status="completed", algorithm_version="tests/1", metrics=metrics,
+            status="completed", algorithm_version=algorithm_version, metrics=metrics,
             completed_at=cutoff,
         ))
     db.flush()
@@ -121,6 +207,40 @@ def _candidate_read_snapshots(db, target, candidates, cutoff):
     db.add(purchase_journal)
     db.flush()
     target._test_purchase_journal_snapshot_id = purchase_journal.id
+    production_journal = models.PlanningReadSnapshot(
+        consumer="production_control_journal",
+        snapshot_key="journal:v1",
+        ledger_generation_id=target.id,
+        cutoff=cutoff,
+        truth_status="building",
+        reason="unpublished production-control journal",
+        payload={
+            "meta": {
+                "ledger_generation_id": target.id,
+                "cutoff": cutoff.isoformat(),
+                "truth_status": "building",
+                "read_only": True,
+                "row_count": 0,
+                "accepted_run_ids": [row.run_id for row in candidates],
+                "latest_run_id": None,
+                "latest_source_plan_id": None,
+            },
+        },
+        published_at=cutoff,
+    )
+    db.add(production_journal)
+    db.flush()
+    target._test_production_journal_snapshot_id = production_journal.id
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=target.id,
+        cutoff=cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=cutoff,
+        built_at=cutoff,
+    ))
+    db.flush()
 
 
 def _set_purchase_journal_rows(db_session, target, *, rows):
@@ -134,7 +254,7 @@ def _set_purchase_journal_rows(db_session, target, *, rows):
     db_session.flush()
 
 
-def _batch(db, count=2, add_count=0):
+def _batch(db, count=2, add_count=0, replace_count=0):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     parent_generation = _generation(db, key="accepted", status="accepted", cutoff=cutoff)
     db.add(models.PlanningTruthState(id=1, current_generation_id=parent_generation.id))
@@ -155,6 +275,33 @@ def _batch(db, count=2, add_count=0):
         db.add(parent)
         db.flush()
         parents.append(parent)
+        if index < replace_count:
+            plan.status = "fixed"
+            plan.fixed_at = cutoff
+            item = models.Item(
+                item_code=f"replacement-root-{index}",
+                item_name=f"replacement root {index}",
+            )
+            db.add(item)
+            db.flush()
+            line = models.ProductionPlanLine(
+                plan_id=plan.id,
+                item_id=item.item_id,
+                bucket_date=date(2026, 7, 1),
+                qty=Decimal("12"),
+                accepted_output_qty=Decimal("10"),
+                remaining_output_qty=Decimal("2"),
+                locked_by_run_id=parent.run_id,
+            )
+            db.add(line)
+            db.flush()
+            db.add(models.MrpRunRoot(
+                run_id=parent.run_id,
+                plan_line_id=line.id,
+                planned_qty=Decimal("12"),
+                accepted_qty=Decimal("10"),
+                remaining_qty=Decimal("2"),
+            ))
     target = _generation(
         db, key="refresh", status="building", cutoff=cutoff,
         watermarks={"generation_kind": "obligation_refresh", "parent_generation_id": parent_generation.id},
@@ -166,13 +313,14 @@ def _batch(db, count=2, add_count=0):
     for index in range(add_count):
         plan = models.ProductionPlanHeader(
             name=f"added {index}", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
-            status="fixed",
+            status="fixed", fixed_at=cutoff,
         )
         db.add(plan)
         db.flush()
         additions.append(plan)
     manifest = create_obligation_refresh_manifest(
         db, parent_generation.id, target.id, [row.id for row in additions],
+        replace_plan_ids=[parents[index].source_plan_id for index in range(replace_count)],
         started_by="test", horizon_days=90, config_version_id=None,
         config_snapshot={"added": True},
     )
@@ -228,6 +376,23 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert snapshots == []
 
 
+def test_added_run_preserves_source_plan_historical_fixation_time(db_session):
+    cutoff, parent, target, _parents, candidates = _batch(
+        db_session, count=0, add_count=1
+    )
+    historical_fixed_at = cutoff.replace(day=cutoff.day - 5)
+    source_plan = db_session.get(
+        models.ProductionPlanHeader, int(candidates[0].source_plan_id)
+    )
+    source_plan.fixed_at = historical_fixed_at
+    db_session.commit()
+
+    _publish(db_session, parent, target, cutoff)
+
+    assert candidates[0].fixed_at.replace(tzinfo=timezone.utc) == historical_fixed_at
+    assert candidates[0].finished_at.replace(tzinfo=timezone.utc) == cutoff
+
+
 def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
     cutoff, parent, target, _parents, _candidates = _batch(db_session)
     first = _publish(db_session, parent, target, cutoff)
@@ -250,8 +415,7 @@ def test_legacy_parent_without_direct_generation_id_fails_closed_on_retry(db_ses
     legacy_parent.ledger_generation_id = None
     item = models.Item(
         item_code="legacy-lineage-item", item_name="legacy lineage item",
-        unit="шт", replenishment_method="Покупка", replenishment_time=7, stock_qty=0,
-        status="active",
+        unit="шт", replenishment_method="Покупка", replenishment_time=7, status="active",
     )
     db_session.add(item)
     db_session.flush()
@@ -338,6 +502,37 @@ def test_publish_requires_sealed_complete_build(db_session, mutation, error):
         )
 
 
+def test_publish_requires_execution_allocation_checkpoint(db_session):
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    row = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id, stage="execution_allocation"
+    ).one()
+    row.status = "building"
+    row.completed_at = None
+    db_session.flush()
+
+    with pytest.raises(
+        ObligationRefreshPublishError,
+        match="target build stage execution_allocation is incomplete or partial",
+    ):
+        _publish(db_session, parent, target, cutoff)
+
+
+def test_publish_requires_reservation_consumption_allocation_capability(db_session):
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    target.capabilities = {
+        **_capabilities(),
+        "reservation_consumption_allocation": False,
+    }
+    db_session.flush()
+
+    with pytest.raises(
+        ObligationRefreshPublishError,
+        match="target capabilities are incomplete",
+    ):
+        _publish(db_session, parent, target, cutoff, capabilities=dict(target.capabilities))
+
+
 def test_exact_retry_allows_legitimate_export_after_publication(db_session):
     cutoff, parent, target, _parents, candidates = _batch(db_session, add_count=1)
     _publish(db_session, parent, target, cutoff)
@@ -384,7 +579,32 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, truth_status="accepted"
-        ).count() == 2
+    ).count() == 3
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong_count"])
+def test_publish_requires_complete_production_control_journal_snapshot(
+    db_session,
+    mutation,
+):
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    snapshot = db_session.get(
+        models.PlanningReadSnapshot,
+        target._test_production_journal_snapshot_id,
+    )
+    if mutation == "missing":
+        db_session.delete(snapshot)
+    else:
+        payload = dict(snapshot.payload)
+        payload["meta"] = {**payload["meta"], "row_count": 1}
+        snapshot.payload = payload
+    db_session.flush()
+
+    with pytest.raises(
+        ObligationRefreshPublishError,
+        match="production.control journal",
+    ):
+        _publish(db_session, parent, target, cutoff)
 
 
 @pytest.mark.parametrize("mutation, error", [
@@ -461,6 +681,36 @@ def test_publish_transfers_refresh_locks_and_acquires_add_locks(db_session):
 
     assert refresh_line.locked_by_run_id == parents[0].run_id
     assert add_line.locked_by_run_id == add_candidate.run_id
+
+
+def test_publish_replaces_same_plan_and_transfers_saved_root_remainder(db_session):
+    cutoff, parent_generation, target, parents, candidates = _batch(
+        db_session,
+        count=1,
+        replace_count=1,
+    )
+    parent = parents[0]
+    candidate = candidates[0]
+    plan_id = int(parent.source_plan_id)
+    line = db_session.query(models.ProductionPlanLine).filter_by(plan_id=plan_id).one()
+
+    assert int(candidate.source_plan_id) == plan_id
+    assert int(candidate.prior_run_id) == int(parent.run_id)
+    root = db_session.query(models.MrpRunRoot).filter_by(run_id=candidate.run_id).one()
+    assert root.planned_qty == Decimal("2")
+    assert root.accepted_qty == Decimal("0")
+    assert root.remaining_qty == Decimal("2")
+
+    result = _publish(db_session, parent_generation, target, cutoff)
+
+    assert result.published is True
+    assert parent.status == "CLOSED"
+    assert candidate.status == "FIXED_SNAPSHOT"
+    assert line.locked_by_run_id == candidate.run_id
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("10")
+    assert line.remaining_output_qty == Decimal("2")
+    assert db_session.query(models.ProductionPlanHeader).count() == 1
 
 
 def test_publish_rejects_prelocked_add_plan(db_session):

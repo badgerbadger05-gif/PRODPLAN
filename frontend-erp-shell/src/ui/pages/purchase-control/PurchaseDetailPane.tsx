@@ -9,6 +9,7 @@ import {
 } from '../../../domain/purchaseControl'
 import { dateRu, qty } from '../../../lib/format'
 import { getPurchaseOrderCard } from '../../../services/purchaseControl'
+import { ItemLedgerSummaryBlock } from '../../item-ledger/ItemLedgerSummaryBlock'
 
 type Props = {
   activeRow: PurchaseRow | null
@@ -16,6 +17,8 @@ type Props = {
 }
 
 export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
+  const formatCoveragePercent = (value: number | null | undefined) => (value == null ? 'н/д' : `${qty(value)}%`)
+
   const [card, setCard] = useState<PurchaseOrderCard | null>(null)
   const [cardError, setCardError] = useState('')
   const [cardLoading, setCardLoading] = useState(false)
@@ -47,11 +50,11 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
 
   const content = (
     <>
-      <h2>{activeRow.line_status === 'to_order' ? 'MRP-потребность' : 'Карточка строки'}</h2>
+      <h2>{activeRow.row_generator === 'mrp_reservation' ? 'MRP-потребность' : 'Карточка строки'}</h2>
       <div className="detailTitle">{activeRow.item_name}</div>
       <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
       <div className="detailGrid">
-        {activeRow.line_status === 'to_order' ? (
+        {activeRow.row_generator === 'mrp_reservation' ? (
           <>
             <span>Генератор</span><strong>{activeRow.row_generator === 'mrp_reservation' ? 'Под заказ (MRP)' : activeRow.row_generator || '—'}</strong>
             <span>Планы</span><strong>{activeRow.run_ids?.length ?? (activeRow.run_id ? 1 : 0)}</strong>
@@ -64,9 +67,9 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
             <span>Поступило сейчас</span>
             <strong>{activeRow.realized_qty == null ? '—' : qty(activeRow.realized_qty)}</strong>
             <span>Покрыто заказами</span>
-            <strong>{activeRow.open_order_covered_qty == null ? '—' : `${qty(activeRow.open_order_covered_qty)} (${qty(activeRow.open_order_covered_pct ?? 0)}%)`}</strong>
+            <strong>{activeRow.open_order_covered_qty == null ? '—' : `${qty(activeRow.open_order_covered_qty)} (${formatCoveragePercent(activeRow.open_order_covered_pct)})`}</strong>
             <span>К заказу</span>
-            <strong>{activeRow.to_order_qty == null ? '—' : `${qty(activeRow.to_order_qty)} (${qty(activeRow.to_order_pct ?? 0)}%)`}</strong>
+            <strong>{activeRow.to_order_qty == null ? '—' : `${qty(activeRow.to_order_qty)} (${formatCoveragePercent(activeRow.to_order_pct)})`}</strong>
           </>
         ) : (
           <>
@@ -89,7 +92,7 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
           </>
         )}
         <span>Поставщик</span><strong>{activeRow.supplier_name || 'Не указан'}</strong>
-        {activeRow.line_status !== 'to_order' && (
+        {activeRow.row_generator !== 'mrp_reservation' && (
           <>
             <span>Заказано</span><strong>{qty(activeRow.quantity)} {activeRow.unit || ''}</strong>
             <span>Поступило</span>
@@ -114,6 +117,8 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
             )}
         </strong>
       </div>
+
+      <ItemLedgerSummaryBlock itemId={activeRow.item_id} unit={activeRow.unit} />
 
       {orderId && (
         <>

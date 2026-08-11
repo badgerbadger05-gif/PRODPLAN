@@ -20,6 +20,11 @@ type Props = {
 }
 
 export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, sort, onSelectPurchaseRowKeys, onActivate, onToggleSort }: Props) {
+  const formatCoveragePercent = (value: number | null | undefined) => (value == null ? 'н/д' : `${qty(value)}%`)
+  const formatCoverageQuantity = (value: number | null | undefined, unit: string | null) => (
+    value == null ? 'н/д' : `${qty(value)}${unit ? ` ${unit}` : ''}`
+  )
+
   return (
     <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(purchaseOrderColumns) }}>
       <colgroup>
@@ -43,11 +48,12 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
       <tbody>
         {rows.map((row) => {
           const runCount = row.run_ids?.length ?? (row.run_id ? 1 : 0)
-          const generatorLabel = row.row_generator === 'mrp_reservation' ? 'Под заказ (MRP)' : row.row_generator
+          const isMrpReservation = row.row_generator === 'mrp_reservation'
+          const generatorLabel = isMrpReservation ? 'Под заказ (MRP)' : row.row_generator
           return (
           <tr key={row.row_key} className={row.row_key === activeRow?.row_key ? 'activeRow' : ''} onClick={() => onActivate(row.row_key)}>
             <td className="checkCol">
-              {row.line_status === 'to_order' && row.row_generator === 'mrp_reservation' && (row.to_order_qty ?? row.remaining_qty) > 0 && (
+              {row.can_materialize && (
                 <input
                   type="checkbox"
                   aria-label={`Выбрать строку ${row.row_key}`}
@@ -63,9 +69,9 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
               )}
             </td>
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
-              {row.line_status === 'to_order' ? (
+              {isMrpReservation ? (
                 <>
-                  <strong title={generatorLabel || ''}>{generatorLabel || 'К заказу'}</strong>
+                  <strong title={generatorLabel || ''}>{generatorLabel}</strong>
                   <span>{runCount ? `планов: ${runCount}` : 'общая потребность'} · {row.period_label || dateRu(row.need_date) || 'весь горизонт'}</span>
                 </>
               ) : (
@@ -91,7 +97,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                 / {qty(row.remaining_qty)}
                 {row.unit ? ` ${row.unit}` : ''}
                 {row.row_generator === 'mrp_reservation'
-                  ? ` · оформлено ${qty(row.open_order_covered_pct ?? 0)}% · к заказу ${qty(row.to_order_pct ?? 0)}%`
+                  ? ` · в живых заказах ${formatCoverageQuantity(row.open_order_covered_qty, row.unit)} (${formatCoveragePercent(row.open_order_covered_pct)}) · к заказу ${formatCoverageQuantity(row.to_order_qty, row.unit)} (${formatCoveragePercent(row.to_order_pct)})`
                   : ''}
               </span>
             </td>
@@ -101,7 +107,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                 : row.received_qty > 0 ? qty(row.received_qty) : <span className="muted">—</span>}
             </td>
             <td className="dateCell">
-              {row.line_status === 'to_order' ? (
+              {isMrpReservation ? (
                 <span title="Дата потребности по MRP">потр. {dateRu(row.need_date) || '—'}</span>
               ) : (
                 <span>{dateRu(row.delivery_date) || '—'}</span>
@@ -119,7 +125,11 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                   {row.order_state_name}
                 </span>
               ) : (
-                <span className="muted">{row.line_status === 'to_order' ? 'Не заказан' : '—'}</span>
+                <span className="muted">
+                  {isMrpReservation
+                    ? row.line_status === 'expected' ? 'Покрыто открытыми заказами' : 'Не заказан'
+                    : '—'}
+                </span>
               )}
             </td>
             <td>

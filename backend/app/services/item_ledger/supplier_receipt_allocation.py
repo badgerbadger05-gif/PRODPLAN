@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -40,6 +41,12 @@ _OPERATION_NAMES = {
         "корректировка приобретения",
         "корректировка поступления",
         "корректировка по согласованию сторон",
+        # УНФ ЗСМ: перечисление ВидыОперацийКорректировкаПоступления
+        # называет ту же операцию «СогласованноеИзменение» (наблюдено на
+        # Document_КорректировкаПоступления ЗСНФ-000001 с основанием
+        # ПриходнаяНакладная и ключом 8d96f940-…).
+        "согласованное изменение",
+        "согласованноеизменение",
     }),
     SUPPLIER_RETURN_OPERATION: frozenset({
         "возврат поставщику",
@@ -124,6 +131,14 @@ def _normalized_type(value: object) -> str:
             result = result[len(prefix):]
             break
     return result
+
+
+def _order_line_key(item_id: int, order_ref: object, line_no: object) -> tuple[int, str, str] | None:
+    normalized_order = _text(order_ref)
+    normalized_line = _text(line_no)
+    if not normalized_order or normalized_line in ("", "0"):
+        return None
+    return int(item_id), normalized_order, normalized_line
 
 
 def _operation_prefix(row: SupplierDocumentEvidence) -> str:
@@ -238,6 +253,52 @@ def _buy_reservations_for_item(
     return tuple(sorted(rows, key=_buy_reservation_order))
 
 
+def _exact_allocation_caps_by_order_line(
+    db: Session,
+    ledger_generation_id: int,
+) -> dict[tuple[int, str, str], dict[int, Decimal]]:
+    rows = (
+        db.query(
+            models.ReservationEntry.item_id,
+            models.PurchaseExportObligationAllocation.supplier_order_ref,
+            models.PurchaseExportObligationAllocation.supplier_order_line_no,
+            models.PurchaseExportObligationAllocation.reservation_id,
+            func.sum(models.PurchaseExportObligationAllocation.allocated_qty),
+        )
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.PurchaseExportObligationAllocation.reservation_id,
+        )
+        .filter(
+            models.PurchaseExportObligationAllocation.ledger_generation_id == int(ledger_generation_id),
+            models.ReservationEntry.ledger_generation_id == int(ledger_generation_id),
+            models.ReservationEntry.planning_stock_pool == "default",
+            models.ReservationEntry.realization_mode == "buy",
+            models.ReservationEntry.lifecycle_status == "active",
+        )
+        .group_by(
+            models.ReservationEntry.item_id,
+            models.PurchaseExportObligationAllocation.supplier_order_ref,
+            models.PurchaseExportObligationAllocation.supplier_order_line_no,
+            models.PurchaseExportObligationAllocation.reservation_id,
+        )
+        .all()
+    )
+
+    caps: dict[tuple[int, str, str], dict[int, Decimal]] = {}
+    for item_id, supplier_order_ref, supplier_order_line_no, reservation_id, total in rows:
+        key = _order_line_key(
+            int(item_id),
+            supplier_order_ref,
+            supplier_order_line_no,
+        )
+        if key is None:
+            continue
+        caps.setdefault(key, {})[int(reservation_id)] = _decimal(total)
+    return caps
+
+
 def _validate_operations(rows: tuple[SupplierDocumentEvidence, ...]) -> None:
     transfers: dict[tuple[str, str, int, str], list[SupplierDocumentEvidence]] = {}
     for row in rows:
@@ -273,13 +334,15 @@ def _validate_operations(rows: tuple[SupplierDocumentEvidence, ...]) -> None:
 def allocate_supplier_receipts(
     facts: Iterable[ReceiptFact],
     reservations_by_item: dict[int, Iterable[models.ReservationEntry]],
+    *,
+    exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
 
-    Positive supplier receipts fill BUY reservations FIFO by item. Corrections and
-    returns unwind the latest prior realization for the same order lineage (or
-    the named original document for explicit corrections), never allowing
-    realized_qty to go negative.
+    Positive supplier receipts fill exact supplier-order-line matches first inside
+    their export allocation cap, then FIFO by item. Returns unwind the same
+    supplier-order-line first (newest-first), then global FIFO, then named
+    original documents for explicit corrections.
     """
     ordered = sorted(facts, key=lambda row: (row.posting_at, row.sle_id))
     reservations = {
@@ -291,13 +354,16 @@ def allocate_supplier_receipts(
         )
         for item_id, values in reservations_by_item.items()
     }
+    exact_caps = {
+        key: dict(value) for key, value in (exact_allocation_caps or {}).items()
+    }
     remaining: dict[int, Decimal] = {
         _entry_key(entry): _entry_outstanding(entry)
         for values in reservations.values()
         for entry in values
     }
     positive_by_receipt: dict[str, list[CoverageAllocation]] = {}
-    active_by_order: dict[tuple[int, str, str], list[CoverageAllocation]] = {}
+    active_by_order_line: dict[tuple[int, str, str], list[CoverageAllocation]] = {}
     active_by_item: dict[int, list[CoverageAllocation]] = {}
     active_qty: dict[int, Decimal] = {}
     result: list[CoverageAllocation] = []
@@ -307,39 +373,97 @@ def allocate_supplier_receipts(
         if qty > 0:
             item_id = int(fact.item_id)
             left = qty
-            for reservation in reservations.get(item_id, ()):
+            exact_key = _order_line_key(
+                item_id,
+                fact.supplier_order_ref,
+                fact.supplier_order_line_no,
+            )
+            exact_caps_for_key: dict[int, Decimal] = {}
+            if exact_key is not None:
+                exact_caps_for_key = exact_caps.get(exact_key, {})
+            item_reservations = reservations.get(item_id, ())
+
+            for reservation in item_reservations:
+                if left <= 0:
+                    break
                 key = _entry_key(reservation)
                 outstanding = remaining.get(key, Decimal("0"))
+                if not exact_caps_for_key:
+                    continue
+                exact_key_value = exact_caps_for_key.get(int(key), Decimal("0"))
+                if exact_key_value <= 0:
+                    continue
+                exact_take = min(left, outstanding, exact_key_value)
+                if exact_take <= 0:
+                    continue
+                exact_caps_for_key[int(key)] = exact_key_value - exact_take
+                remaining[key] = outstanding - exact_take
+                left -= exact_take
+                allocation = CoverageAllocation(
+                    fact=fact,
+                    reservation=reservation,
+                    qty=exact_take,
+                )
+                result.append(allocation)
+                positive_by_receipt.setdefault(fact.receipt_ref, []).append(allocation)
+                if exact_key is not None:
+                    active_by_order_line.setdefault(exact_key, []).append(allocation)
+                active_by_item.setdefault(item_id, []).append(allocation)
+                active_qty[id(allocation)] = exact_take
+
+            for reservation in item_reservations:
+                if left <= 0:
+                    break
+                key = _entry_key(reservation)
+                outstanding = remaining.get(key, Decimal("0"))
+                if outstanding <= 0:
+                    continue
                 take = min(left, outstanding)
                 if take <= 0:
                     continue
                 allocation = CoverageAllocation(fact=fact, reservation=reservation, qty=take)
                 result.append(allocation)
                 positive_by_receipt.setdefault(fact.receipt_ref, []).append(allocation)
-                active_by_order.setdefault(
-                    (item_id, fact.supplier_order_ref, fact.supplier_order_line_no),
-                    [],
-                ).append(allocation)
+                if exact_key is not None:
+                    active_by_order_line.setdefault(exact_key, []).append(allocation)
                 active_by_item.setdefault(item_id, []).append(allocation)
                 active_qty[id(allocation)] = take
                 remaining[key] = outstanding - take
                 left -= take
-                if left == 0:
-                    break
+            if exact_key is not None and exact_key in exact_caps:
+                exact_caps[exact_key] = exact_caps_for_key
             surplus += left
             continue
 
         left = -qty
         if left <= 0:
             continue
+        exact_key = _order_line_key(
+            int(fact.item_id),
+            fact.supplier_order_ref,
+            fact.supplier_order_line_no,
+        )
+        seen_ids: set[int] = set()
         source = (
             positive_by_receipt.get(_text(fact.correction_receipt_ref), [])
             if fact.correction_receipt_ref
-            else active_by_item.get(int(fact.item_id), [])
+            else []
         )
         unwind_by_reservation: dict[int, Decimal] = {}
         unwind_samples: dict[int, models.ReservationEntry] = {}
-        for original in reversed(source):
+        if fact.correction_receipt_ref:
+            ordered_source = reversed(source)
+        elif exact_key is not None:
+            ordered_source = (
+                list(reversed(active_by_order_line.get(exact_key, [])))
+                + list(reversed(active_by_item.get(int(fact.item_id), [])))
+            )
+        else:
+            ordered_source = reversed(active_by_item.get(int(fact.item_id), []))
+        for original in ordered_source:
+            if id(original) in seen_ids:
+                continue
+            seen_ids.add(id(original))
             available = active_qty.get(id(original), Decimal("0"))
             take = min(left, available)
             if take <= 0:
@@ -566,6 +690,10 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     # still rolls the savepoint back atomically, while the allocator can never
     # run ahead of its auditable provenance.
     db.flush()
+    exact_caps = _exact_allocation_caps_by_order_line(
+        db,
+        ledger_generation_id=ledger_generation_id,
+    )
     reservations_by_item = {
         item_id: _buy_reservations_for_item(
             db,
@@ -574,7 +702,11 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         )
         for item_id in {int(fact.item_id) for fact in facts}
     }
-    allocations, surplus = allocate_supplier_receipts(facts, reservations_by_item)
+    allocations, surplus = allocate_supplier_receipts(
+        facts,
+        reservations_by_item,
+        exact_allocation_caps=exact_caps,
+    )
     realized_keys: set[tuple[int, int]] = set()
     folded_reservations: set[int] = set()
     for allocation in allocations:

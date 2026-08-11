@@ -45,6 +45,12 @@ export type MrpSummary = {
     hours_planned_total?: number
     hours_available_total?: number
   }
+  snapshot_total_qty?: {
+    production?: number
+    purchase?: number
+    rework?: number
+    capacity?: number
+  }
   warnings?: Array<Record<string, unknown>>
 }
 
@@ -66,6 +72,7 @@ export type MrpProductionRow = {
   forecast_date?: string | null
   forecast_shift_days?: number | null
   forecast_reason?: string | null
+  forecast_status?: 'early' | 'on_time' | 'delayed' | 'critical' | 'unavailable'
   main_area_id?: number | null
   main_area_name?: string | null
   main_stage_id?: number | null
@@ -85,6 +92,9 @@ export type MrpPurchaseRow = {
   qty: number
   requested_qty?: number | null
   supplier_covered_qty?: number | null
+  supplier_coverage_pct?: number | null
+  supplier_coverage_status?: 'full' | 'partial' | 'none' | 'not_required'
+  supplier_coverage_label?: string | null
   need_date?: string | null
   order_date?: string | null
   lead_time_days?: number | null
@@ -129,6 +139,7 @@ export type MrpCapacityRow = {
   hours_planned: number
   hours_available: number
   overload_hours: number
+  capacity_status: 'overloaded' | 'within_capacity'
 }
 
 export type MrpPagedResponse<T> = {
@@ -157,7 +168,7 @@ export function planningStatusLabel(status: string) {
 export type PeriodPlan = {
   id: number
   name: string
-  status: 'draft' | 'fixed' | 'archived'
+  status: 'draft' | 'fixed' | 'closed'
   period_from: string
   period_to: string
   comment?: string | null
@@ -172,6 +183,7 @@ export type PeriodPlan = {
   execution_base_qty?: number | null
   execution_pct?: number | null
   execution_partial?: boolean
+  execution_progress_status?: 'unavailable' | 'not_started' | 'in_progress' | 'complete' | 'lower_bound'
   execution_status?: string | null
   execution_reason?: string | null
   execution_by_flow?: Record<string, {
@@ -180,7 +192,7 @@ export type PeriodPlan = {
     execution_pct: number | null
     confirmed_pct?: number | null
     total_base_qty?: number
-    available?: boolean
+    available: boolean
   }> | null
 }
 
@@ -218,6 +230,7 @@ export type PeriodPlanMatrixRow = {
     forecast_date?: string | null
     forecast_shift_days?: number | null
     forecast_reason?: string | null
+    forecast_status?: 'early' | 'on_time' | 'delayed' | 'critical' | 'unavailable'
   }>
 }
 
@@ -225,89 +238,36 @@ export type PeriodPlanMatrix = {
   plan: PeriodPlan
   buckets: string[]
   rows: PeriodPlanMatrixRow[]
+  bucket_totals: Record<string, number>
+  grand_total: number
+  total_qty: number
   total: number
 }
 
-export type ExecutionWorkItem = {
-  type: 'production_order' | 'planned_order' | 'planned_purchase' | 'planned_rework'
-  product_id?: number
-  order_id?: number
-  order_number?: string
-  order_ref1c?: string | null
-  order_source?: string | null
-  one_c_opened?: boolean
-  opened_at?: string | null
-  order_state?: string
-  purchase_id?: number
-  rework_id?: number
-  qty: number
-  completed_qty?: number
-  remaining_qty?: number
-  need_date?: string | null
-  order_date?: string | null
-  lead_time_days?: number
-  forecast_date?: string | null
-  forecast_shift_days?: number | null
-  forecast_reason?: string | null
-}
-
-export type ExecutionJournalLedgerLinkEvent = {
-  event_id: number
-  sle_id?: number | null
-  fact_ref?: string | null
-  fact_line_ref?: string | null
-  match_rule?: string | null
-  reservation_id?: number | null
-}
-
-export type ExecutionJournalLedgerLinks = {
-  item_id: number
-  reservation_ids: number[]
-  events: ExecutionJournalLedgerLinkEvent[]
-}
-
-export type ExecutionJournalRow = {
-  req_id: number
-  item_id: number
-  item_code: string
-  item_article?: string | null
-  item_name: string
-  flow: 'production' | 'purchase' | 'rework'
-  bom_level: number
-  gross_qty: number
-  stock_qty?: number
-  net_qty: number
-  ordered_qty: number
-  completed_qty: number | null
-  covered_qty: number
-  remaining_qty: number
-  unassigned_qty?: number
-  progress_base_qty?: number
-  coverage_pct: number | null
-  execution_available?: boolean
-  execution_unavailable_reason?: string | null
-  execution_source?: 'reservation_realization' | 'supplier_receipt_coverage' | string
-  need_date?: string | null
+export type ExecutionWorkItem = components['schemas']['ExecutionJournalWorkItem']
+export type ExecutionJournalLedgerLinkEvent = components['schemas']['ExecutionJournalLedgerEvent']
+export type ExecutionJournalLedgerLinks = components['schemas']['ExecutionJournalLedgerLinks']
+type ApiExecutionJournalRow = components['schemas']['ExecutionJournalRow']
+export type ExecutionJournalRow = Omit<ApiExecutionJournalRow,
+  'status' | 'root_item_ids' | 'information_links' | 'reservation_ids' | 'execution_events' | 'execution_allocations'
+> & {
   status?: JournalRowStatus
-  forecast_date?: string | null
-  forecast_shift_days?: number | null
-  forecast_reason?: string | null
-  work_items: ExecutionWorkItem[]
-  ledger_links?: ExecutionJournalLedgerLinks | null
+  root_item_ids?: ApiExecutionJournalRow['root_item_ids']
+  information_links?: ApiExecutionJournalRow['information_links']
+  reservation_ids?: ApiExecutionJournalRow['reservation_ids']
+  execution_events?: ApiExecutionJournalRow['execution_events']
+  execution_allocations?: ApiExecutionJournalRow['execution_allocations']
 }
 
-export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none'
+export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none' | 'execution_unavailable'
 
 export function journalRowStatus(row: Pick<ExecutionJournalRow, 'status' | 'net_qty' | 'remaining_qty' | 'completed_qty' | 'ordered_qty'>): JournalRowStatus {
   if (row.status) return row.status
-  if (row.net_qty <= 0) return 'net_zero'
-  if (row.remaining_qty <= 0) return 'covered'
-  if ((row.completed_qty ?? 0) > 0) return 'partial'
-  if (row.ordered_qty > 0) return 'ordered'
-  return 'none'
+  return 'execution_unavailable'
 }
 
 export function journalRowStatusLabel(status: JournalRowStatus) {
+  if (status === 'execution_unavailable') return 'Исполнение недоступно'
   if (status === 'covered') return 'Закрыто'
   if (status === 'partial') return 'Частично'
   if (status === 'ordered') return 'Оформлено'
@@ -316,6 +276,7 @@ export function journalRowStatusLabel(status: JournalRowStatus) {
 }
 
 export function journalRowStatusClass(status: JournalRowStatus) {
+  if (status === 'execution_unavailable') return 'unavailable'
   if (status === 'covered') return 'ready'
   if (status === 'partial') return 'partial'
   if (status === 'ordered') return 'to_move'
@@ -323,53 +284,26 @@ export function journalRowStatusClass(status: JournalRowStatus) {
   return 'completed'
 }
 
-export type ExecutionJournalSummary = {
-  total_items: number
+type ApiExecutionJournalSummary = components['schemas']['ExecutionJournalSummary']
+export type ExecutionJournalSummary = Omit<ApiExecutionJournalSummary,
+  'truth_status' | 'fully_covered' | 'partially_covered' | 'not_covered' | 'net_zero'
+> & {
+  truth_status?: ApiExecutionJournalSummary['truth_status']
   fully_covered: number
   partially_covered: number
   not_covered: number
   net_zero: number
-  execution_completed_qty?: number | null
-  execution_base_qty?: number | null
-  execution_pct?: number | null
-  execution_confirmed_pct?: number | null
-  execution_partial?: boolean
-  execution_by_flow?: Record<string, {
-    completed_qty: number
-    base_qty: number
-    execution_pct: number | null
-    confirmed_pct?: number | null
-    covered_pct?: number | null
-    to_order_pct?: number | null
-    purchase_covered_qty?: number
-    purchase_to_order_qty?: number
-    total_base_qty?: number
-    available?: boolean
-  }> | null
 }
+export type ExecutionJournalResponseFacets = NonNullable<components['schemas']['ExecutionJournalResponse']['facets']>
 
 export type PlanningTruthStatus = 'accepted' | 'unavailable' | 'stale' | 'uninitialized' | 'rejected'
 
-export type ExecutionJournalTruthMeta = {
-  accepted_at?: string | null
-  accepted_by?: string | null
-  truth_source?: string | null
-  unavailable_sections?: string[] | null
-  unavailable_reason?: string | null
-  [key: string]: unknown
-}
-
-export type ExecutionJournalResponse = {
+export type ExecutionJournalTruthMeta = components['schemas']['ExecutionJournalTruthMeta']
+type ApiExecutionJournalResponse = components['schemas']['ExecutionJournalResponse']
+export type ExecutionJournalResponse = Omit<ApiExecutionJournalResponse, 'plan' | 'rows' | 'summary'> & {
   plan: PeriodPlan
-  run_id: number
   rows: ExecutionJournalRow[]
   summary: ExecutionJournalSummary
-  truth_status?: PlanningTruthStatus | string
-  ledger_generation?: string | number | null
-  cutoff?: string | null
-  truth_meta?: ExecutionJournalTruthMeta | null
-  truth_reason?: string | null
-  reason?: string | null
 }
 
 export function isPlanningTruthAccepted(value: Pick<ExecutionJournalResponse, 'truth_status'> | null | undefined) {
@@ -379,13 +313,14 @@ export function isPlanningTruthAccepted(value: Pick<ExecutionJournalResponse, 't
 export function periodPlanStatusLabel(status: string) {
   if (status === 'draft') return 'Черновик'
   if (status === 'fixed') return 'Зафиксирован'
-  if (status === 'archived') return 'Архив'
+  if (status === 'closed') return 'Закрыт'
   return status
 }
 
 export function periodPlanStatusClass(status: string) {
   if (status === 'draft') return 'running'
   if (status === 'fixed') return 'success'
+  if (status === 'closed') return 'success'
   return ''
 }
 
@@ -403,8 +338,4 @@ export function flowClass(flow: string) {
   return ''
 }
 
-export function coverageClass(pct: number) {
-  if (pct >= 95) return 'ready'
-  if (pct >= 50) return 'partial'
-  return 'shortage'
-}
+import type { components } from '../lib/apiTypes'

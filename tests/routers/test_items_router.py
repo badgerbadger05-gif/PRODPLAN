@@ -1,10 +1,4 @@
-"""Contract tests for /api/v1/items partial updates.
-
-PUT applies the whole `ItemUpdate`, so an omitted `stock_qty` falls back to its
-0.0 default. PATCH exists so a browser can edit one planning attribute without
-resending — and therefore without being able to clobber — the physical stock the
-1C sync and the Item Ledger own.
-"""
+"""Contract tests for master-data-only /api/v1/items updates."""
 from __future__ import annotations
 
 import pytest
@@ -56,8 +50,7 @@ def item(db_session):
         item_name="Кронштейн",
         item_article="ART-1",
         unit="шт",
-        stock_qty=17.5,
-        optimal_batch=None,
+                optimal_batch=None,
         status="active",
     )
     db_session.add(row)
@@ -75,8 +68,7 @@ def test_patch_writes_only_the_sent_field(client, db_session, item):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["optimal_batch"] == 24
-    # Everything else, physical stock first of all, is untouched.
-    assert body["stock_qty"] == 17.5
+    assert "stock_qty" not in body
     assert body["item_code"] == "000001"
     assert body["item_name"] == "Кронштейн"
     assert body["item_article"] == "ART-1"
@@ -86,7 +78,7 @@ def test_patch_writes_only_the_sent_field(client, db_session, item):
     db_session.expire_all()
     stored = db_session.get(models.Item, item.item_id)
     assert float(stored.optimal_batch) == 24
-    assert float(stored.stock_qty) == 17.5
+    assert not hasattr(stored, "stock_qty")
 
 
 def test_patch_rejects_stock_qty(client, db_session, item):
@@ -100,7 +92,7 @@ def test_patch_rejects_stock_qty(client, db_session, item):
     stored = db_session.get(models.Item, item.item_id)
     # The whole patch is refused, not partially applied.
     assert stored.optimal_batch is None
-    assert float(stored.stock_qty) == 17.5
+    assert not hasattr(stored, "stock_qty")
 
 
 def test_patch_rejects_unknown_field(client, item):
@@ -122,7 +114,7 @@ def test_patch_clears_a_nullable_field_when_explicitly_sent(client, db_session, 
 
     assert response.status_code == 200, response.text
     assert response.json()["optimal_batch"] is None
-    assert response.json()["stock_qty"] == 17.5
+    assert "stock_qty" not in response.json()
 
 
 def test_patch_missing_item_is_404(client):
@@ -131,12 +123,11 @@ def test_patch_missing_item_is_404(client):
     assert response.status_code == 404
 
 
-def test_put_still_replaces_the_whole_record(client, db_session, item):
-    """Guards the reason PATCH exists: PUT defaults `stock_qty` to 0.0."""
+def test_put_exposes_master_data_only(client, db_session, item):
     response = client.put(
         f"/api/v1/items/{item.item_id}",
         json={"item_code": "000001", "item_name": "Кронштейн", "optimal_batch": 24},
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["stock_qty"] == 0.0
+    assert "stock_qty" not in response.json()

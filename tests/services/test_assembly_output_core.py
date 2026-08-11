@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.services.item_ledger.assembly_output_core import (
@@ -11,17 +12,19 @@ def _line(line_id: int, qty: str, *, item_id: int = 1):
     return QueueCandidate(10 + line_id, line_id, item_id, Decimal(qty))
 
 
-def test_exact_then_spills_fifo_without_overallocation():
+def _line_with_plan(plan_id: int, line_id: int, qty: str, *, item_id: int = 1):
+    return QueueCandidate(plan_id, line_id, item_id, Decimal(qty))
+
+
+def test_exact_never_spills_into_another_plan():
     result = allocate_output_fact(
         OutputFact(100, 1, Decimal("9"), (2,), "exact_plan_line"),
         [_line(1, "3"), _line(2, "4"), _line(3, "5")],
     )
     assert [(row.plan_line_id, row.qty, row.match_rule) for row in result.allocations] == [
         (2, Decimal("4"), "exact"),
-        (1, Decimal("3"), "fifo"),
-        (3, Decimal("2"), "fifo"),
     ]
-    assert result.surplus_qty == 0
+    assert result.surplus_qty == Decimal("5")
 
 
 def test_missing_exact_uses_caller_fifo_and_keeps_surplus():
@@ -46,8 +49,24 @@ def test_ambiguous_exact_never_allocates():
     assert result.surplus_qty == Decimal("5")
 
 
+def test_multiple_exact_rows_of_same_plan_allocate_fifo_and_not_spill():
+    result = allocate_output_fact(
+        OutputFact(107, 1, Decimal("9"), (1, 2), "exact_plan_line"),
+        [
+            _line_with_plan(11, 1, "4"),
+            _line_with_plan(11, 2, "5"),
+            _line_with_plan(11, 3, "7"),
+        ],
+    )
+    assert [(row.plan_line_id, row.qty) for row in result.allocations] == [
+        (1, Decimal("4")),
+        (2, Decimal("5")),
+    ]
+    assert result.surplus_qty == Decimal("0")
+
+
 def test_other_items_and_exhausted_lines_are_ignored_deterministically():
-    fact = OutputFact(103, 1, Decimal("4"))
+    fact = OutputFact(108, 1, Decimal("4"))
     rows = [_line(1, "0"), _line(2, "7", item_id=2), _line(3, "4")]
     first = allocate_output_fact(fact, rows)
     second = allocate_output_fact(fact, rows)
@@ -55,3 +74,65 @@ def test_other_items_and_exhausted_lines_are_ignored_deterministically():
     assert [(row.plan_line_id, row.qty) for row in first.allocations] == [
         (3, Decimal("4")),
     ]
+
+
+def test_fifo_skips_plan_fixed_after_the_fact():
+    fact = OutputFact(
+        104,
+        1,
+        Decimal("5"),
+        posting_at=datetime(2026, 7, 5, tzinfo=timezone.utc),
+    )
+    rows = [
+        QueueCandidate(
+            11,
+            1,
+            1,
+            Decimal("5"),
+            eligible_from=datetime(2026, 7, 6, tzinfo=timezone.utc),
+        ),
+        QueueCandidate(
+            12,
+            2,
+            1,
+            Decimal("5"),
+            eligible_from=datetime(2026, 7, 4, tzinfo=timezone.utc),
+        ),
+    ]
+
+    result = allocate_output_fact(fact, rows)
+
+    assert [(row.plan_line_id, row.qty) for row in result.allocations] == [
+        (2, Decimal("5")),
+    ]
+
+
+def test_ambiguous_or_invalid_provenance_never_falls_back_to_fifo():
+    rows = [_line(1, "5"), _line(2, "5")]
+    ambiguous = allocate_output_fact(
+        OutputFact(
+            105,
+            1,
+            Decimal("5"),
+            link_kind="exact_plan_line",
+            provenance_status="ambiguous",
+            provenance_reason="two products",
+        ),
+        rows,
+    )
+    invalid = allocate_output_fact(
+        OutputFact(
+            106,
+            1,
+            Decimal("5"),
+            link_kind="exact_plan_line",
+            provenance_status="invalid",
+            provenance_reason="stale lineage",
+        ),
+        rows,
+    )
+
+    assert ambiguous.allocations == ()
+    assert ambiguous.surplus_qty == Decimal("5")
+    assert invalid.allocations == ()
+    assert invalid.surplus_qty == Decimal("5")

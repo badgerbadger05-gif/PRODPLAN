@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.models import Item
+from app.models import Item, ItemCategory
 from app.schemas import ODataSyncRequest
 from app.services.nomenclature_sync import sync_nomenclature_from_odata
 
@@ -93,3 +93,42 @@ def test_nomenclature_sync_propagates_commit_failure(db_session, monkeypatch):
 
     assert "Ошибка синхронизации номенклатуры" in str(excinfo.value)
     assert "duplicate key value" in str(excinfo.value)
+
+
+def test_partial_odata_row_preserves_local_planning_attributes(
+    db_session, monkeypatch
+):
+    category = ItemCategory(
+        category_name="Крепёж",
+        category_ref1c="category-existing",
+    )
+    item = Item(
+        item_code="IT-PRESERVE",
+        item_name="Before",
+        item_ref1c="item-preserve-ref",
+        category=category,
+        replenishment_method="Покупка",
+        replenishment_time=14,
+    )
+    db_session.add_all([category, item])
+    db_session.commit()
+
+    _FakeODataClient.count = 1
+    _FakeODataClient.pages = [[{
+        "Ref_Key": "item-preserve-ref",
+        "Code": "IT-PRESERVE",
+        "Description": "After",
+        "IsFolder": False,
+        "СпособПополнения": "",
+        "СрокПополнения": None,
+        "КатегорияНоменклатуры_Key": "",
+    }]]
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", _FakeODataClient)
+
+    sync_nomenclature_from_odata(db_session, _request())
+
+    db_session.refresh(item)
+    assert item.item_name == "After"
+    assert item.replenishment_method == "Покупка"
+    assert item.replenishment_time == 14
+    assert item.category_id == category.category_id

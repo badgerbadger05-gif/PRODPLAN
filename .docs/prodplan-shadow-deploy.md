@@ -54,12 +54,11 @@ PRODPLAN_FRONTEND_BUILD_CONTEXT=/home/barsukov/prodplan-shadow-ui/frontend-erp-s
 PRODPLAN_FRONTEND_EXPECTED_COMMIT=<ПОЛНЫЙ_40_СИМВОЛЬНЫЙ_COMMIT>
 ```
 
-На рабочей станции актуальный UI находился в
-`/home/ivan/PRODPLAN/react-ledger-ui/frontend-erp-shell`, а backend — в
-`/home/ivan/PRODPLAN/repo`. Нельзя молча собрать старый `frontend-erp-shell`
-из backend-checkout. Скрипт проверяет наличие `Dockerfile` и `package.json` в
-указанном контексте, проверяет точное совпадение commit и отказывается собирать
-frontend с незакоммиченными изменениями.
+UI и backend могут находиться в разных checkout. Нельзя молча собирать
+`frontend-erp-shell` из backend-checkout: явно задайте абсолютный build context
+конкретного окружения в `.env.shadow`. Скрипт проверяет наличие `Dockerfile` и
+`package.json`, точное совпадение commit и отказывается собирать frontend с
+незакоммиченными изменениями.
 
 ## 2. Секреты и каталоги
 
@@ -98,8 +97,8 @@ cd /home/barsukov/prodplan-shadow
 scripts/shadow-stack.sh start
 ```
 
-Фоновые `sync-worker` и `reconcile-worker` не запускаются. Они находятся в
-отдельном compose-профиле `automation`.
+Фоновый `sync-worker` не запускается. Он находится в отдельном compose-профиле
+`automation`.
 
 Проверка:
 
@@ -165,8 +164,7 @@ scripts/shadow-stack.sh start-workers
 ```
 
 `sync-worker` ждёт 180 секунд и выполняет не более одного due-job каждые 300
-секунд. `reconcile-worker` ждёт 900 секунд и работает раз в 6 часов. Расписания
-разнесены со стабильным контуром.
+секунд. Его расписание отделено от стабильного контура.
 
 Для ежедневного согласованного backup:
 

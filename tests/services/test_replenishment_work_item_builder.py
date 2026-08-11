@@ -176,6 +176,24 @@ def test_builder_skips_stock_covered_and_inactive_reservations(
     assert metrics["replenishment_work_items"] == 0
 
 
+def test_builder_keeps_known_rework_out_of_work_journals(
+    db_session, building_ledger_generation
+):
+    generation = building_ledger_generation
+    reservation = _one_reservation_world(db_session, generation, suffix="-rework")
+    reservation.realization_mode = "rework"
+    batch = _batch(db_session, generation, key="rework-without-executor")
+    db_session.flush()
+
+    metrics = materialize_replenishment_work_items(
+        db_session, generation.id, batch.id
+    )
+
+    assert db_session.query(models.ReplenishmentWorkItem).count() == 0
+    assert metrics["replenishment_work_item_methods"] == {"make": 0, "buy": 0}
+    assert metrics["executorless_rework_reservations"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Resume: the pass is re-entered when its own batch is already COMPLETED
 # ---------------------------------------------------------------------------

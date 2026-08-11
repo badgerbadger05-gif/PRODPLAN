@@ -27,6 +27,8 @@ from .specification_sync import sync_specifications_from_odata
 from .one_c_document_numbers import material_issue_number
 from .one_c_manufacture_export import commanded_qty_by_product
 from .one_c_piecework_export import PIECEWORK_ENTITY
+from .production_output_truth import accepted_product_output
+from .production_material_custody_events import append_material_issue_custody_event
 
 
 # ---------------------------------------------------------------------------
@@ -82,17 +84,14 @@ def _refresh_product_spec_from_1c(db: Session, product: ProductionProduct) -> bo
 def _ensure_workshop_reservation_covers(
     db: Session,
     product: ProductionProduct,
-    qty: float,
+    qty: Optional[float] = None,
 ) -> None:
     """
-    Block a production event that would write off more components than this
-    line holds on the workshop. 1C has no reservations, so this is the only
-    place that turns "СборкаЗапасов не проведётся при закрытии" into an
-    early, explainable error: the missing part must first arrive via a
-    transfer or be claimed in place.
+    Block a production event that would consume more material than is
+    currently held at the target workshop for this line.
     """
     from .production_control_domain import default_spec_id as _spec_for
-    from .production_control_reservations import load_reservation_state
+    from .production_material_custody_projection import load_current_accepted_material_custody
 
     _refresh_product_spec_from_1c(db, product)
     spec_id = _spec_for(db, product)
@@ -106,7 +105,10 @@ def _ensure_workshop_reservation_covers(
     if not spec_rows:
         return
     per_unit = {int(row.item_id): _to_float(row.quantity) for row in spec_rows}
-    state = load_reservation_state(db, item_ids=list(per_unit.keys()))
+    _, state = load_current_accepted_material_custody(
+        db,
+        consumer="production_output_material_guard",
+    )
     reservation = state.for_product(int(product.product_id))
 
     shortfall_by_item: Dict[int, tuple] = {}
@@ -123,13 +125,13 @@ def _ensure_workshop_reservation_covers(
             for item in db.query(Item).filter(Item.item_id.in_(shortfall_by_item.keys())).all()
         }
         shortfalls = [
-            f"{names.get(cid, cid)}: нужно {needed:g}, на участке {held:g}"
+            f"{names.get(cid, cid)}: нужно {needed:g}, удержано на участке {held:g}"
             for cid, (needed, held) in sorted(shortfall_by_item.items())
         ]
         raise ValueError(
-            "Недостаточно компонентов, зарезервированных на участке под эту строку: "
+            "Недостаточно компонентов, удержанных на участке для этой строки: "
             + "; ".join(shortfalls[:10])
-            + ". Сначала проведите перемещение недостающего или скомплектуйте строку с участка."
+            + ". Сначала проведите перемещение недостающего или зафиксируйте удержание на участке."
         )
 
 
@@ -189,7 +191,7 @@ def produce_line(
     db: Session,
     product_id: int,
     *,
-    qty: float,
+    qty: Optional[float] = None,
     executor: Optional[str] = None,
     operation_executors: Optional[List[Dict[str, Any]]] = None,
     comment: Optional[str] = None,
@@ -205,8 +207,8 @@ def produce_line(
     Document_СдельныйНаряд. Only the read-back posting register imported into
     Item Ledger may change factual execution through canonical FIFO.
     """
-    qty_f = float(qty or 0)
-    if qty_f <= 0:
+    requested_qty = float(qty) if qty is not None else None
+    if requested_qty is not None and requested_qty <= 0:
         raise ValueError("qty должен быть положительным")
 
     product = (
@@ -221,6 +223,7 @@ def produce_line(
     commanded_before = commanded_qty_by_product(db, [int(product.product_id)]).get(
         int(product.product_id), 0.0
     )
+    accepted_output = accepted_product_output(product)
 
     # Resume before anything else: an unfinished выпуск already owns a 1C
     # Document_СборкаЗапасов, so a second press must finish that chain instead
@@ -239,20 +242,36 @@ def produce_line(
             "product_id": int(product.product_id),
             "order_id": int(product.order_id),
             "qty": float(_to_float(manufacture.qty)),
-            "requested_qty": float(qty_f),
-            "produced_qty_total": float(product.produced_qty or 0),
-            "remaining_qty": float(product.remaining_qty or 0),
+            "requested_qty": (
+                float(requested_qty)
+                if requested_qty is not None
+                else float(_to_float(manufacture.qty))
+            ),
+            "produced_qty_total": float(accepted_output.produced_qty),
+            "remaining_qty": float(accepted_output.remaining_qty),
             "commanded_qty_total": float(commanded_before),
-            "command_remaining_qty": float(max(order_quantity - commanded_before, 0.0)),
+            "command_remaining_qty": float(
+                min(
+                    max(order_quantity - commanded_before, 0.0),
+                    accepted_output.remaining_qty,
+                )
+            ),
             "fact_pending": True,
             "line_status": state.status,
         }
 
-    command_remaining = max(0.0, order_quantity - commanded_before)
+    # A legacy/imported 1C fact may have no corresponding local command row,
+    # while a pending local command may not yet be a physical fact. The safe
+    # executable quantity is bounded by both independent ceilings.
+    command_remaining = min(
+        max(0.0, order_quantity - commanded_before),
+        float(accepted_output.remaining_qty),
+    )
     if command_remaining <= 1e-9:
         raise ValueError(
             "По этой строке уже создана исполнительная команда на весь объём"
         )
+    qty_f = command_remaining if requested_qty is None else requested_qty
     if qty_f - command_remaining > 1e-6:
         raise ValueError(
             "qty превышает остаток, ещё не переданный в исполнительные документы"
@@ -336,8 +355,8 @@ def produce_line(
         "product_id": int(product.product_id),
         "order_id": int(product.order_id),
         "qty": float(qty_f),
-        "produced_qty_total": float(product.produced_qty or 0),
-        "remaining_qty": float(product.remaining_qty or 0),
+        "produced_qty_total": float(accepted_output.produced_qty),
+        "remaining_qty": float(accepted_output.remaining_qty),
         "commanded_qty_total": float(commanded_before + qty_f),
         "command_remaining_qty": float(max(command_remaining - qty_f, 0.0)),
         "fact_pending": True,
@@ -371,6 +390,7 @@ def rollback_local_manufacture(db: Session, manufacture_id: int) -> Dict[str, An
         raise ValueError(f"product_id={manufacture.product_id}: строка заказа не найдена")
 
     state = _ensure_state(db, product)
+    accepted_output = accepted_product_output(product)
 
     db.delete(manufacture)
     db.commit()
@@ -379,8 +399,8 @@ def rollback_local_manufacture(db: Session, manufacture_id: int) -> Dict[str, An
         "status": "rolled_back",
         "manufacture_id": int(manufacture_id),
         "product_id": int(product.product_id),
-        "produced_qty_total": float(product.produced_qty),
-        "remaining_qty": float(product.remaining_qty),
+        "produced_qty_total": float(accepted_output.produced_qty),
+        "remaining_qty": float(accepted_output.remaining_qty),
         "line_status": state.status,
     }
 
@@ -541,7 +561,12 @@ def return_leftover_components(
     # the free workshop pool. Only the remainder needs a physical return.
     released_in_place: List[Dict[str, Any]] = []
     for issue in sorted(outgoing, key=lambda i: i.issue_id, reverse=True):
-        if str(issue.direction or "") != "in_place":
+        is_zero_distance_issue = (
+            str(issue.direction or "") == "issue"
+            and str(issue.source_warehouse_ref1c or "").strip()
+            == str(issue.warehouse_ref1c or "").strip()
+        )
+        if str(issue.direction or "") != "in_place" and not is_zero_distance_issue:
             continue
         for line in sorted(issue.lines or [], key=lambda l: l.line_id, reverse=True):
             cid = int(line.component_item_id)
@@ -555,6 +580,18 @@ def return_leftover_components(
             line.issued_qty = held - take
             line.required_qty = max(0.0, _to_float(line.required_qty) - take)
             entry["leftover_qty"] = float(entry["leftover_qty"] - take)
+            warehouse = str(issue.warehouse_ref1c or "").strip()
+            if warehouse:
+                append_material_issue_custody_event(
+                    db,
+                    issue=issue,
+                    line=line,
+                    delta_qty=-take,
+                    source_kind="terminal_release",
+                    location_kind="workshop",
+                    warehouse_ref1c=warehouse,
+                    source_ref1c=str(issue.source_warehouse_ref1c or ""),
+                )
             released_in_place.append(
                 {"component_item_id": cid, "released_qty": float(take)}
             )

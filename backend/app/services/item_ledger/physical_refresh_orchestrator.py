@@ -7,15 +7,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app import models
-
-from ..mrp_result_snapshot import build_mrp_result_snapshot
-from ..purchase_control_snapshot import (
-    promote_candidate_snapshot as promote_purchase_journal_candidate,
+from ..planning_pool_resolver import (
+    effective_planning_pool_by_warehouse,
+    validate_future_supply_destinations,
 )
 from .generation_lifecycle import accept_generation_build
 from .historical_bootstrap_phase0 import (
@@ -27,11 +27,14 @@ from .historical_import_orchestration import (
     run_historical_physical_import,
 )
 from .opening_balance_reconcile import (
+    ADJUSTMENT_RECORDER_TYPE,
     OpeningBalanceReconcileResult,
     opening_boundary,
     reconcile_opening_balance,
 )
-from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, physical_sequence_lock_context
+from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, SEED_RECORDER_TYPE, physical_sequence_lock_context
+from .physical_visibility import visible_sle_query
+from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
     run_physical_recorder_audit,
@@ -45,6 +48,14 @@ _sqlite_lock = Lock()
 
 class PhysicalRefreshOrchestratorError(RuntimeError):
     """A complete fresh truth could not be proved and was not published."""
+
+
+class PhysicalRefreshBalanceConvergenceError(PhysicalRefreshOrchestratorError):
+    """A persisted candidate no longer matches the 1C balance at its cutoff."""
+
+    def __init__(self, ledger_generation_id: int, message: str):
+        self.ledger_generation_id = int(ledger_generation_id)
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -125,8 +136,9 @@ def _reconcile_opening_balance(
     *,
     ledger_generation_id: int,
     loader: Callable[[datetime], Mapping[Any, Any]] | None,
+    only_keys: set[tuple[int, str, str]] | None = None,
 ) -> OpeningBalanceReconcileResult | None:
-    """Re-align the T0 prefix with 1C before the forward window import."""
+    """Re-align selected T0 keys with 1C without replaying history."""
     if loader is None:
         return None
     boundary = opening_boundary(db)
@@ -137,64 +149,15 @@ def _reconcile_opening_balance(
         db,
         ledger_generation_id=int(ledger_generation_id),
         opening_snapshot=loader(opening_at),
+        only_keys=only_keys,
     )
     db.commit()
     return result
 
 
-def _publish_refresh_read_snapshots(
-    db: Session,
-    *,
-    generation: models.LedgerGeneration,
-    fixed_run_ids: tuple[int, ...],
-) -> None:
-    """Finish the read surface of a just-accepted physical refresh.
-
-    Publishes only what this generation owns: its own purchase-journal
-    candidate, and MRP result snapshots for runs already bound to it.  Runs
-    frozen against older truth stay unpublished here on purpose — rebinding
-    them belongs to the obligation refresh, and quietly rebuilding them against
-    fresh facts would contradict the frozen obligations they encode.
-
-    Fails closed when the generation advertises a capability whose snapshot did
-    not materialize: a silently missing snapshot reads to the operator as an
-    outage of the whole screen, which is exactly how this gap survived.
-    """
-    capabilities = dict(generation.capabilities or {})
-    accepted_at = generation.accepted_at or datetime.now(timezone.utc)
-
-    promoted = promote_purchase_journal_candidate(
-        db, generation=generation, accepted_at=accepted_at
-    )
-    if promoted is None and capabilities.get("purchase_control_journal"):
-        raise PhysicalRefreshOrchestratorError(
-            f"generation {generation.id} claims the purchase_control_journal "
-            "capability but has no journal candidate to publish"
-        )
-
-    for run_id in fixed_run_ids:
-        run = db.get(models.PlanningRun, int(run_id))
-        if run is None:
-            continue
-        # A physical refresh does not rebind frozen runs — that is the
-        # obligation refresh's job — so most fixed runs still belong to older
-        # truth and have no snapshot to publish here. Only the ones this
-        # generation actually owns are ours to rebuild.
-        if (
-            int(run.ledger_generation_id or 0) != int(generation.id)
-            or run.ledger_cutoff != generation.cutoff
-        ):
-            continue
-        try:
-            build_mrp_result_snapshot(db, int(run_id))
-        except ValueError as exc:
-            raise PhysicalRefreshOrchestratorError(
-                f"MRP result snapshot for run {run_id} could not be published: {exc}"
-            ) from exc
-    db.flush()
-
-
 _MISMATCH_SAMPLE = 5
+_TARGETED_REPAIR_PAGE_SIZE = 1000
+_TARGETED_REPAIR_MAX_RECORDERS = 500
 
 
 def _mismatch_digest(convergence: BalanceConvergenceResult) -> str:
@@ -214,6 +177,200 @@ def _mismatch_digest(convergence: BalanceConvergenceResult) -> str:
     if surplus > 0:
         sample = f"{sample}, +{surplus} more"
     return f"worst: {sample}" if sample else "no deltas retained"
+
+
+def _odata_local(value: datetime) -> str:
+    return _utc(value, "OData datetime").astimezone(
+        ZoneInfo("Europe/Moscow")
+    ).replace(tzinfo=None, microsecond=0).isoformat()
+
+
+def _normalized_ref(value: Any) -> str:
+    raw = str(value or "").strip()
+    if raw.startswith("guid'") and raw.endswith("'"):
+        raw = raw[5:-1]
+    return raw.strip("{}").strip()
+
+
+def _normalized_recorder_type(value: Any) -> str:
+    raw = str(value or "").strip()
+    prefix = "StandardODATA."
+    return raw[len(prefix):] if raw.startswith(prefix) else raw
+
+
+def _repair_mismatched_recorders(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    client: Any,
+    convergence: BalanceConvergenceResult,
+) -> int:
+    """Re-pull only recorders touching mismatched balance keys.
+
+    This is the bounded fallback for a known 1C document that was re-posted
+    behind the accepted cutoff without changing its line count.  It queries
+    the flat register by the mismatched item, narrows rows by organisation and
+    warehouse, and never scans or pulls unrelated recorder contents.
+    """
+    mismatch_keys = {
+        (int(delta.item_id), str(delta.organization_ref), str(delta.warehouse_ref1c))
+        for delta in convergence.deltas
+        if not delta.matched
+    }
+    if not mismatch_keys:
+        return 0
+
+    item_rows = db.query(models.Item.item_id, models.Item.item_ref1c).filter(
+        models.Item.item_id.in_({key[0] for key in mismatch_keys})
+    ).all()
+    ref_by_item = {
+        int(item_id): _normalized_ref(item_ref)
+        for item_id, item_ref in item_rows
+        if _normalized_ref(item_ref)
+    }
+    opening = opening_boundary(db)
+    if opening is None:
+        raise PhysicalRefreshOrchestratorError(
+            "targeted convergence repair requires opening boundary"
+        )
+    opening_at = _utc(opening[1], "opening boundary")
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    identities: set[tuple[str, str]] = set()
+
+    # A cancelled/unposted recorder disappears from 1C's current register, so
+    # the register-side lookup below cannot discover it.  Seed the repair set
+    # with recorder identities already contributing to each mismatched Ledger
+    # cell; re-pulling a vanished recorder produces the tombstone that removes
+    # its obsolete movements.
+    known_rows = visible_sle_query(
+        db,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        cutoff=generation.cutoff,
+    ).filter(
+        models.StockLedgerEntry.item_id.in_({key[0] for key in mismatch_keys}),
+    ).all()
+    synthetic_types = {SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE}
+    for row in known_rows:
+        key = (
+            int(row.item_id),
+            _normalized_ref(row.organization_ref),
+            _normalized_ref(row.warehouse_ref1c),
+        )
+        recorder_type = _normalized_recorder_type(row.recorder_type)
+        recorder_ref = _normalized_ref(row.recorder_ref)
+        if (
+            key in mismatch_keys
+            and recorder_type not in synthetic_types
+            and recorder_type
+            and recorder_ref
+        ):
+            identities.add((recorder_type, recorder_ref))
+
+    for item_id, item_ref in sorted(ref_by_item.items()):
+        wanted = {
+            (org, warehouse)
+            for candidate_item, org, warehouse in mismatch_keys
+            if candidate_item == item_id
+        }
+        offset = 0
+        while True:
+            params = {
+                "$top": _TARGETED_REPAIR_PAGE_SIZE,
+                "$skip": offset,
+                "$filter": (
+                    f"Period gt datetime'{_odata_local(opening_at)}' and "
+                    f"Period le datetime'{_odata_local(cutoff)}' and "
+                    f"Номенклатура_Key eq guid'{item_ref}'"
+                ),
+                "$select": (
+                    "Period,Recorder,Recorder_Type,LineNumber,"
+                    "Организация_Key,СтруктурнаяЕдиница_Key"
+                ),
+                "$orderby": "Period,Recorder_Type,Recorder,LineNumber",
+            }
+            response = client._make_request(
+                "AccumulationRegister_ЗапасыНаСкладах_RecordType", params
+            )
+            rows = response.get("value") if isinstance(response, Mapping) else None
+            if not isinstance(rows, list):
+                raise PhysicalRefreshOrchestratorError(
+                    "targeted convergence repair received malformed register page"
+                )
+            for row in rows:
+                key = (
+                    _normalized_ref(row.get("Организация_Key")),
+                    _normalized_ref(row.get("СтруктурнаяЕдиница_Key")),
+                )
+                if key not in wanted:
+                    continue
+                identity = (
+                    _normalized_recorder_type(row.get("Recorder_Type")),
+                    _normalized_ref(row.get("Recorder")),
+                )
+                if identity[0] and identity[1]:
+                    identities.add(identity)
+            if len(identities) > _TARGETED_REPAIR_MAX_RECORDERS:
+                raise PhysicalRefreshOrchestratorError(
+                    "targeted convergence repair exceeded recorder limit"
+                )
+            if len(rows) < _TARGETED_REPAIR_PAGE_SIZE:
+                break
+            offset += len(rows)
+
+    deferred: list[tuple[str, str]] = []
+    repaired = 0
+    for recorder_type, recorder_ref in sorted(identities):
+        try:
+            result = pull_recorder_movements(
+                db,
+                recorder_type,
+                recorder_ref,
+                client=client,
+                source="physical_refresh_targeted_repair",
+                ledger_generation_id=None,
+                max_posting_at=generation.cutoff,
+                strict_historical=True,
+            )
+        except HistoricalPullBeyondCutoffError:
+            # The accepted prefix must keep the recorder revision that existed
+            # at its cutoff.  A newer current RecordSet belongs to the next
+            # refresh and cannot safely repair this immutable candidate.
+            deferred.append((recorder_type, recorder_ref))
+            continue
+        if (
+            result.status not in {"done", "empty"}
+            or result.error
+            or result.diagnostics
+            or result.skipped_unknown_item
+            or result.skipped_unknown_record_type
+            or result.skipped_non_warehouse
+        ):
+            raise PhysicalRefreshOrchestratorError(
+                f"targeted recorder repair failed: {recorder_type} {recorder_ref}"
+            )
+        repaired += 1
+
+    terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
+    if terminal is None:
+        raise PhysicalRefreshOrchestratorError(
+            "targeted convergence repair lost physical terminal"
+        )
+    generation.physical_import_batch_id = int(terminal)
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "targeted_convergence_repair": {
+            "version": "1",
+            "mismatched_keys": len(mismatch_keys),
+            "recorder_count": repaired,
+            "deferred_beyond_cutoff": [
+                {"recorder_type": recorder_type, "recorder_ref": recorder_ref}
+                for recorder_type, recorder_ref in deferred
+            ],
+            "physical_import_batch_id": int(terminal),
+        },
+    }
+    db.commit()
+    return repaired
 
 
 def _current_parent(db: Session) -> models.LedgerGeneration:
@@ -241,6 +398,7 @@ def run_physical_refresh(
     window_size: timedelta = timedelta(days=1),
     max_windows: int | None = None,
     discovery_lookback: timedelta | None = None,
+    audit_all_known_recorders: bool = True,
     opening_balance_loader: Callable[[datetime], Mapping[Any, Any]] | None = None,
     config_version_id: int | None = None,
     config_snapshot: Mapping[str, Any] | None = None,
@@ -269,6 +427,15 @@ def run_physical_refresh(
         lock_context = physical_sequence_lock_context()
         lock_context.__enter__()
         parent = _current_parent(db)
+        pool_mapping = effective_planning_pool_by_warehouse(
+            db,
+            planning_pool_by_warehouse,
+        )
+        validate_future_supply_destinations(
+            db,
+            ledger_generation_id=int(parent.id),
+            mapping=pool_mapping,
+        )
         from_cutoff = _utc(parent.cutoff, "parent cutoff")
         fork = fork_physical_refresh_generation(
             db,
@@ -283,15 +450,9 @@ def run_physical_refresh(
             parent_generation_id=int(parent.id),
             client=client,
             discovery_lookback=discovery_lookback,
+            audit_all_known_recorders=audit_all_known_recorders,
         )
-        # Between the audit and the forward import: the audit requires the
-        # generation to still sit on the parent boundary, and the forward import
-        # starts from whatever boundary this leaves behind.
-        opening_reconcile = _reconcile_opening_balance(
-            db,
-            ledger_generation_id=int(fork.ledger_generation_id),
-            loader=opening_balance_loader,
-        )
+        opening_reconcile = None
         physical_import = run_historical_physical_import(
             db,
             ledger_generation_id=int(fork.ledger_generation_id),
@@ -311,11 +472,54 @@ def run_physical_refresh(
             ledger_generation_id=int(fork.ledger_generation_id),
             balance_snapshot=balance_snapshot,
         )
+        if not convergence.valid:
+            physical_generation = db.get(
+                models.LedgerGeneration, int(fork.ledger_generation_id)
+            )
+            if physical_generation is None:
+                raise PhysicalRefreshOrchestratorError(
+                    "physical refresh generation disappeared before targeted repair"
+                )
+            repaired = _repair_mismatched_recorders(
+                db,
+                generation=physical_generation,
+                client=client,
+                convergence=convergence,
+            )
+            if repaired:
+                convergence = evaluate_physical_refresh_balance_convergence(
+                    db,
+                    ledger_generation_id=int(fork.ledger_generation_id),
+                    balance_snapshot=balance_snapshot,
+                )
+        if not convergence.valid and opening_balance_loader is not None:
+            remaining_keys = {
+                (
+                    int(delta.item_id),
+                    str(delta.organization_ref),
+                    str(delta.warehouse_ref1c),
+                )
+                for delta in convergence.deltas
+                if not delta.matched
+            }
+            opening_reconcile = _reconcile_opening_balance(
+                db,
+                ledger_generation_id=int(fork.ledger_generation_id),
+                loader=opening_balance_loader,
+                only_keys=remaining_keys,
+            )
+            if opening_reconcile is not None and opening_reconcile.adjusted_keys:
+                convergence = evaluate_physical_refresh_balance_convergence(
+                    db,
+                    ledger_generation_id=int(fork.ledger_generation_id),
+                    balance_snapshot=balance_snapshot,
+                )
         # Retain the diagnostic and completed import even when convergence is
         # false; neither operation moves the public planning-truth pointer.
         db.commit()
         if not convergence.valid:
-            raise PhysicalRefreshOrchestratorError(
+            raise PhysicalRefreshBalanceConvergenceError(
+                int(fork.ledger_generation_id),
                 f"Balance convergence failed: {convergence.mismatched} mismatches"
                 f" ({_mismatch_digest(convergence)})"
             )
@@ -350,6 +554,7 @@ def run_physical_refresh(
             replay_from=replay_from,
             odata_client=client,
             expected_parent_id=int(parent.id),
+            planning_pool_by_warehouse=pool_mapping,
         )
         fixed_run_ids = tuple(
             int(run_id)
@@ -357,17 +562,6 @@ def run_physical_refresh(
             .filter(models.PlanningRun.status == "FIXED_SNAPSHOT")
             .order_by(models.PlanningRun.run_id.asc())
             .all()
-        )
-        # Accepting a generation rebuilds the read snapshots that carry their own
-        # accepted status, but not these two: the purchase journal is only ever
-        # written as a candidate, and MRP result snapshots are per fixed run.
-        # Both promotions live in the obligation refresh publisher, which this
-        # path deliberately does not run, so without this every physical refresh
-        # leaves the purchase and MRP screens unavailable.
-        _publish_refresh_read_snapshots(
-            db,
-            generation=physical_generation,
-            fixed_run_ids=fixed_run_ids,
         )
         db.commit()
         return PhysicalRefreshOrchestrationResult(

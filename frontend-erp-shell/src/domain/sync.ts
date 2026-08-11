@@ -29,19 +29,9 @@ export type SyncAction = {
   note?: string
 }
 
-export type WarehouseItem = {
-  warehouse_id: number
-  warehouse_ref1c: string
-  warehouse_code: string
-  warehouse_name: string
-  is_selected: boolean
-}
+export type WarehouseItem = ApiSchemas['StockWarehouseResponse']
 
-export type NomenclatureGroupItem = {
-  id: string
-  code: string
-  name: string
-}
+export type NomenclatureGroupItem = ApiSchemas['NomenclatureGroupResponse']
 
 export type SyncLogEntry = {
   at: string
@@ -81,3 +71,6 @@ export const fullSyncOrder: SyncActionId[] = [
   'productionFacts',
   'supplierOrders',
 ]
+import type { components } from '../lib/apiTypes'
+
+type ApiSchemas = components['schemas']

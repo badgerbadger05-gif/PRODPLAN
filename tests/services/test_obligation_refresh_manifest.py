@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -110,6 +111,46 @@ def test_manifest_allows_first_add_only_and_exact_retry(db_session):
     assert again.entries == first.entries
 
 
+def test_manifest_replaces_run_on_saved_remainder_of_same_plan(db_session):
+    accepted, target, parents = _fixture(db_session, plans=1)
+    plan, parent = parents[0]
+    item = models.Item(item_code="ROOT-12", item_name="Root", status="active")
+    db_session.add(item)
+    db_session.flush()
+    line = models.ProductionPlanLine(
+        plan_id=int(plan.id),
+        item_id=int(item.item_id),
+        bucket_date=date(2026, 7, 1),
+        qty=Decimal("12"),
+        accepted_output_qty=Decimal("10"),
+        remaining_output_qty=Decimal("2"),
+        locked_by_run_id=int(parent.run_id),
+    )
+    db_session.add(line)
+    db_session.commit()
+
+    result = _create(
+        db_session,
+        accepted,
+        target,
+        replace_plan_ids=(int(plan.id),),
+    )
+
+    replace = next(row for row in result.entries if row["action"] == "replace")
+    assert int(replace["plan_id"]) == int(plan.id)
+    assert int(replace["parent_run_id"]) == int(parent.run_id)
+    candidate = db_session.get(models.PlanningRun, int(replace["candidate_run_id"]))
+    assert int(candidate.source_plan_id) == int(plan.id)
+    assert int(candidate.prior_run_id) == int(parent.run_id)
+    assert db_session.query(models.ProductionPlanHeader).count() == 1
+    root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(candidate.run_id), plan_line_id=int(line.id)
+    ).one()
+    assert root.planned_qty == Decimal("2")
+    assert root.accepted_qty == Decimal("0")
+    assert root.remaining_qty == Decimal("2")
+
+
 def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lineage(db_session):
     accepted, target, _parents = _fixture(db_session, plans=0)
     plan = models.ProductionPlanHeader(
@@ -119,7 +160,7 @@ def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lin
     db_session.add(plan)
     item = models.Item(
         item_code="RESH-PLAN", item_name="Item", unit="шт", replenishment_method="Покупка",
-        replenishment_time=3, stock_qty=0, status="active",
+        replenishment_time=3, status="active",
     )
     db_session.add(item)
     db_session.flush()

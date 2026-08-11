@@ -7,7 +7,6 @@ const pump = {
   item_article: 'НАС-01',
   unit: 'шт',
   replenishment_method: 'Производство',
-  stock_qty: 2,
   spec_id: 10,
   spec_name: 'СП-10',
   has_children: true,

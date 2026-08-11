@@ -190,6 +190,9 @@ restore_db() {
 
 start_workers() {
   require_env
+  # sync-worker has its own Compose image tag.  Rebuild it explicitly so an
+  # automation restart cannot silently reuse code from an older shadow commit.
+  compose --profile automation build sync-worker
   compose --profile automation up -d sync-worker
   info "shadow sync-worker включён; legacy MRP reconcile-worker удалён"
 }

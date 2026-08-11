@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ..services.odata_config import (
     load_odata_config,
@@ -41,6 +41,21 @@ class ODataConfig(BaseModel):
 
 class GroupsSelection(BaseModel):
     ids: List[str]
+
+
+class NomenclatureGroupResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    code: str
+    name: str
+
+
+class NomenclatureGroupsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[NomenclatureGroupResponse]
+    selected_ids: list[str]
 
 
 def _load_config() -> Dict[str, Any]:
@@ -217,31 +232,57 @@ def export_release_facts_csv(
         raise HTTPException(status_code=502, detail=f"Release facts export failed: {e}")
 
 
-@router.get("/groups")
-def get_saved_groups():
-    """Возвращает сохранённые группы номенклатуры из файла."""
+def _load_selected_group_ids() -> list[str]:
+    if GROUPS_SELECTED.exists():
+        try:
+            ids = json.loads(GROUPS_SELECTED.read_text("utf-8") or "[]")
+            if isinstance(ids, list):
+                return [str(value) for value in ids]
+        except Exception:
+            pass
+    return []
+
+
+@router.get("/groups", response_model=NomenclatureGroupsResponse)
+def get_saved_groups() -> NomenclatureGroupsResponse:
+    """Canonical UI view over the independent 1C cache and manual selection."""
+    raw_rows: list[Any] = []
     if not GROUPS_JSON.exists():
-        return {"value": []}
-    try:
-        data = json.loads(GROUPS_JSON.read_text("utf-8") or "{}")
-        if isinstance(data, dict) and "value" in data:
-            return {"value": data.get("value") or []}
-        return {"value": data or []}
-    except Exception:
-        return {"value": []}
+        data: Any = []
+    else:
+        try:
+            data = json.loads(GROUPS_JSON.read_text("utf-8") or "{}")
+        except Exception:
+            data = []
+    if isinstance(data, dict):
+        candidate = data.get("value")
+        raw_rows = candidate if isinstance(candidate, list) else []
+    elif isinstance(data, list):
+        raw_rows = data
+
+    items = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        group_id = str(row.get("Ref_Key") or "").strip()
+        if not group_id:
+            continue
+        items.append(
+            {
+                "id": group_id,
+                "code": str(row.get("Code") or ""),
+                "name": str(row.get("Description") or ""),
+            }
+        )
+    return NomenclatureGroupsResponse.model_validate(
+        {"items": items, "selected_ids": _load_selected_group_ids()}
+    )
 
 
 @router.get("/groups/selection")
 def get_groups_selection():
     """Возвращает выбранные Ref_Key групп (для индексации)."""
-    if GROUPS_SELECTED.exists():
-        try:
-            ids = json.loads(GROUPS_SELECTED.read_text("utf-8") or "[]")
-            if isinstance(ids, list):
-                return {"ids": [str(x) for x in ids]}
-        except Exception:
-            pass
-    return {"ids": []}
+    return {"ids": _load_selected_group_ids()}
 
 
 @router.post("/groups/selection")

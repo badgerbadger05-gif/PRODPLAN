@@ -17,18 +17,22 @@ from decimal import Decimal
 import pytest
 
 from app.models import (
+    AssemblyRate,
     DefaultSpecification,
     Item,
     LedgerGeneration,
     MrpRequirement,
+    ProductionMaterialCustodyProjectionManifest,
     PhysicalImportBatch,
     PlannedOrder,
     PlanningRun,
     PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionResource,
     SpecComponent,
     Specification,
+    StockWarehouse,
 )
 from app.services import period_plan_service
 from app.services.period_plan_service import (
@@ -48,7 +52,8 @@ FLOOR = date(2026, 7, 23)
 def _accepted_planning_truth(db_session):
     batch = PhysicalImportBatch(
         batch_key="freeze-contract", status="completed", cutoff=CUTOFF,
-        source_watermarks={}, completed_at=CUTOFF,
+        source_watermarks={"opening_at": "2026-06-01T00:00:00+00:00"},
+        completed_at=CUTOFF,
     )
     generation = LedgerGeneration(
         generation_key="freeze-contract", status="accepted", cutoff=CUTOFF,
@@ -61,21 +66,54 @@ def _accepted_planning_truth(db_session):
         },
         physical_import_batch=batch, algorithm_version="test",
     )
-    db_session.add(generation)
+    db_session.add_all([
+        generation,
+        StockWarehouse(
+            warehouse_ref1c="WH-FREEZE-PLAN",
+            warehouse_name="Freeze planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+    ])
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=generation.cutoff,
+            built_at=generation.cutoff,
+        )
+    )
+    resource = ProductionResource(
+        resource_name="Freeze contract assembly",
+        planning_range=30,
+        capacity=Decimal("100"),
+    )
+    db_session.add(resource)
+    db_session.flush()
     db_session.commit()
     db_session.info["generation_id"] = int(generation.id)
+    db_session.info["assembly_resource_id"] = int(resource.resource_id)
     return generation
 
 
 def _item(db, code, *, method="Производство") -> Item:
     item = Item(
         item_code=code, item_name=code, item_article=code, unit="шт",
-        stock_qty=0.0, replenishment_method=method, replenishment_time=3,
+replenishment_method=method, replenishment_time=3,
         status="active",
     )
     db.add(item)
+    db.flush()
+    db.add(AssemblyRate(
+        resource_id=int(db.info["assembly_resource_id"]),
+        item_id=int(item.item_id),
+        qty_per_capacity=Decimal("1"),
+    ))
     db.flush()
     return item
 

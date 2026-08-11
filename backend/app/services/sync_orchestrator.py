@@ -38,6 +38,7 @@ from .nomenclature_sync import sync_nomenclature_from_odata
 from .category_sync import sync_categories_from_odata
 from .units_sync import UNIT_CLASSIFIER_ENTITY, sync_units_from_odata, backfill_units_from_items
 from .specification_sync import sync_specifications_from_odata
+from .specification_rebase_worker import run_one_pending_specification_rebase
 from .default_specification_sync import sync_default_specifications_from_odata
 from .production_stage_sync import sync_production_stages_from_odata
 from .production_kind_sync import sync_production_kinds_from_odata
@@ -45,7 +46,6 @@ from .operations_sync import sync_operations_from_odata
 from .employee_sync import sync_employees_from_odata
 from .odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_odata
 from .production_order_sync import sync_production_orders_from_odata, sync_production_facts
-from .production_control_material_availability import recalculate_production_coverage
 from .supplier_order_sync import sync_supplier_orders_from_odata
 from .processing_stock_sync import (
     processing_stock_status,
@@ -53,8 +53,17 @@ from .processing_stock_sync import (
 )
 from .nomenclature_groups_sync import refresh_nomenclature_groups
 from .item_ledger.ingest import is_retryable_error, _build_client
-from .item_ledger.reconcile import build_balance_snapshot
-from .item_ledger.physical_refresh_orchestrator import run_physical_refresh
+from .item_ledger.reconcile import (
+    BalanceSnapshotItemResolutionError,
+    build_balance_snapshot,
+)
+from .item_ledger.physical_refresh_discard import (
+    discard_physical_refresh_candidate,
+)
+from .item_ledger.physical_refresh_orchestrator import (
+    PhysicalRefreshBalanceConvergenceError,
+    run_physical_refresh,
+)
 from .odata_client import get_stock_from_1c_odata
 from .. import models
 
@@ -124,14 +133,20 @@ def _run_nomenclature_groups(db: Session, config: Dict[str, Any]) -> Dict[str, A
 
 def _run_stock(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
     stock = sync_stock_from_odata(db, _build_payload(config, "AccumulationRegister_ЗапасыНаСкладах"))
-    coverage = recalculate_production_coverage(db)
-    return {"stock": stock, "production_coverage": coverage}
+    return {"stock": stock}
 
 
 def _single(entity: str, service: Callable[[Session, ODataSyncRequest], Any]) -> Callable[[Session, Dict[str, Any]], Any]:
     def runner(db: Session, config: Dict[str, Any]) -> Any:
         return service(db, _build_payload(config, entity))
     return runner
+
+
+def _run_specification_rebase(db: Session, _config: Dict[str, Any]) -> Any:
+    return run_one_pending_specification_rebase(
+        db,
+        started_by="sync_orchestrator:specification_rebase",
+    )
 
 
 @dataclass(frozen=True)
@@ -153,6 +168,17 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("brigades", "Бригады", 86_400, _single("Catalog_Бригады", sync_employees_from_odata)),
     SyncJob("operations", "Операции", 43_200, _single("Catalog_Спецификации_Операции", sync_operations_from_odata)),
     SyncJob("specifications", "Спецификации", 43_200, _single("Catalog_Спецификации", sync_specifications_from_odata)),
+    # Sync fills the durable queue, but automatic consumption stays disabled
+    # until the run-scoped rebase implementation is accepted. The previous
+    # plan-successor/full-refresh worker took 7-8 hours and produced invalid
+    # plan execution, so it must never become enabled merely because state has
+    # no explicit per-job override.
+    SyncJob(
+        "specificationRebase",
+        "Пересчёт MRP по изменённым спецификациям",
+        3_600,
+        _run_specification_rebase,
+    ),
     SyncJob("defaultSpecifications", "Спецификации по умолчанию", 43_200, _single("InformationRegister_СпецификацииПоУмолчанию", sync_default_specifications_from_odata)),
     SyncJob("productionStages", "Этапы производства", 86_400, _single("Catalog_ЭтапыПроизводства", sync_production_stages_from_odata)),
     SyncJob("warehouses", "Склады", 86_400, _single("AccumulationRegister_ЗапасыНаСкладах", sync_stock_warehouses_from_odata)),
@@ -177,6 +203,8 @@ _PHYSICAL_REFRESH_RETRY_BASE_SECONDS = 300
 _PHYSICAL_REFRESH_RETRY_MAX_SECONDS = 3600
 _PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
 _PHYSICAL_REFRESH_ENTITY = "AccumulationRegister_ЗапасыНаСкладах/Balance"
+_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK = timedelta(days=7)
+_PHYSICAL_REFRESH_SETTLE_LAG = timedelta(minutes=5)
 # Signed bigint, stable across processes and deployments.
 _SYNC_ORCHESTRATOR_LOCK_KEY = 0x73796E632D6F7263  # 'sync-orc'
 
@@ -260,7 +288,9 @@ def _interval_for(state: Dict[str, Any], job: SyncJob) -> int:
 
 def _is_enabled(state: Dict[str, Any], job_id: str) -> bool:
     val = _job_state(state, job_id).get("enabled")
-    return True if val is None else bool(val)
+    if val is None:
+        return job_id != "specificationRebase"
+    return bool(val)
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:
@@ -587,32 +617,20 @@ def _run_physical_refresh_job(
             "result": {"accepted": True, "candidate_runs": 0, "recovered": True},
         }
     client = _build_client()
-    filter_query = f"Period le datetime'{_odata_datetime(target_cutoff)}'"
-    balance_rows = get_stock_from_1c_odata(
-        base_url=client.base_url,
-        entity_name=_PHYSICAL_REFRESH_ENTITY,
-        username=client.username,
-        password=client.password,
-        token=client.token,
-        filter_query=filter_query,
-    )
-    balance_snapshot = build_balance_snapshot(db, balance_rows, strict=True)
 
-    def _load_opening_balance(opening_at: datetime) -> Dict[Any, Any]:
-        """1C's Balance as of the anchor, re-asked on every refresh.
-
-        Documents backdated behind the anchor change this answer after the seed
-        was taken; the refresh materializes the difference as an adjustment.
-        """
-        rows = get_stock_from_1c_odata(
+    def _balance_snapshot_at(cutoff: datetime):
+        filter_query = f"Period le datetime'{_odata_datetime(cutoff)}'"
+        balance_rows = get_stock_from_1c_odata(
             base_url=client.base_url,
             entity_name=_PHYSICAL_REFRESH_ENTITY,
             username=client.username,
             password=client.password,
             token=client.token,
-            filter_query=f"Period le datetime'{_odata_datetime(opening_at)}'",
+            filter_query=filter_query,
         )
-        return build_balance_snapshot(db, rows, strict=True)
+        return build_balance_snapshot(db, balance_rows, strict=True)
+
+    balance_snapshot = _balance_snapshot_at(target_cutoff)
 
     result = run_physical_refresh(
         db,
@@ -620,7 +638,22 @@ def _run_physical_refresh_job(
         target_cutoff=target_cutoff,
         client=client,
         balance_snapshot=balance_snapshot,
-        opening_balance_loader=_load_opening_balance,
+        # A late-posted/cancelled movement before the retained T0 changes 1C's
+        # answer at the opening boundary without appearing in the post-T0
+        # recorder manifest.  Reconcile that one persisted prefix directly;
+        # it writes only key deltas and does not replay historical documents.
+        opening_balance_loader=_balance_snapshot_at,
+        # The automatic path advances current facts incrementally.  Re-auditing
+        # every historical recorder turned each hourly refresh into a
+        # multi-hour historical replay. Full audit remains available only to
+        # the explicit maintenance workflow.
+        # Keep automatic discovery bounded.  A full retained-history scan can
+        # classify thousands of old recorders as revised and turn this hourly
+        # maintenance path into the multi-hour historical replay it replaced.
+        # Explicitly queued recorders are still processed regardless of age;
+        # the bounded scan catches ordinary late/backdated operational changes.
+        discovery_lookback=_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK,
+        audit_all_known_recorders=False,
     )
     return {
         "parent_generation_id": result.parent_generation_id,
@@ -787,6 +820,29 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         )
         block_changed = _record_physical_block(physical_state, physical_block, now)
 
+        # A checked admin/automatic discard can move the persisted retry
+        # candidate out of BUILDING while its failure backoff is still active.
+        # Clear that dead identity before evaluating retry readiness; otherwise
+        # the supported discard path leaves current truth stale until the old
+        # candidate's timeout expires.
+        persisted_active_key = str(
+            physical_state.get("active_generation_key") or ""
+        ).strip()
+        if persisted_active_key:
+            persisted_candidate = (
+                db.query(models.LedgerGeneration)
+                .filter(models.LedgerGeneration.generation_key == persisted_active_key)
+                .one_or_none()
+            )
+            if (
+                persisted_candidate is not None
+                and str(persisted_candidate.status) != "building"
+            ):
+                physical_state["active_cutoff"] = None
+                physical_state["active_generation_key"] = None
+                physical_state["next_retry_at"] = None
+                physical_state["failure_count"] = 0
+
         # The physical slot competes with the reference schedule; both the
         # "queue has work" and the "interval elapsed" reasons must respect the
         # failure backoff, otherwise a permanently failing refresh retries every
@@ -823,7 +879,13 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                     )
                     active_key = str(candidate.generation_key)
                 else:
-                    active_cutoff = _to_utc(now).replace(microsecond=0)
+                    # 1C publishes register rows and Balance independently.
+                    # Reading the moving edge makes the two sources disagree
+                    # while documents are being posted.  Refresh a short,
+                    # already-settled prefix instead of the current second.
+                    active_cutoff = (
+                        _to_utc(now) - _PHYSICAL_REFRESH_SETTLE_LAG
+                    ).replace(microsecond=0)
                     active_key = (
                         f"physical-refresh:{active_parent.id}:"
                         f"{active_cutoff.isoformat()}"
@@ -851,6 +913,43 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 result = {"status": "ok", "job": "physicalRefresh", "summary": summary}
             except Exception as exc:  # noqa: BLE001
                 _rollback_if_possible(db)
+                dependency_job_forced_due = None
+                discarded_candidate_id = None
+                if isinstance(exc, PhysicalRefreshBalanceConvergenceError):
+                    # Convergence compares an immutable candidate cutoff with
+                    # a balance snapshot read from 1C.  Once that comparison
+                    # fails, reusing the same candidate on a later tick can
+                    # never prove a current snapshot: 1C keeps moving while
+                    # the candidate remains frozen.  Roll it back through the
+                    # checked discard path and let the next retry fork from the
+                    # accepted parent with a new cutoff.
+                    discard_physical_refresh_candidate(
+                        db,
+                        ledger_generation_id=exc.ledger_generation_id,
+                        reason="automatic rotation after balance convergence failure",
+                    )
+                    db.commit()
+                    discarded_candidate_id = exc.ledger_generation_id
+                    physical_state["active_cutoff"] = None
+                    physical_state["active_generation_key"] = None
+                if isinstance(exc, BalanceSnapshotItemResolutionError):
+                    # A new item may appear in stock or production between the
+                    # daily nomenclature pulls. Do not leave physical truth
+                    # stale until the next 24-hour slot: force the parent
+                    # reference job due, then the normal fairness rule runs it
+                    # before the backed-off physical retry.
+                    nomenclature_state = dict(
+                        _job_state(state, "nomenclature")
+                    )
+                    nomenclature_state["last_run_at"] = None
+                    nomenclature_state["forced_due_at"] = now.isoformat()
+                    nomenclature_state["forced_due_reason"] = (
+                        "physical_refresh_missing_item"
+                    )
+                    state.setdefault("jobs", {})["nomenclature"] = (
+                        nomenclature_state
+                    )
+                    dependency_job_forced_due = "nomenclature"
                 failures = int(physical_state.get("failure_count") or 0) + 1
                 backoff = min(
                     _PHYSICAL_REFRESH_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
@@ -864,6 +963,12 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 physical_state["last_duration_ms"] = int((time.time() - started) * 1000)
                 physical_state["last_cutoff"] = _to_utc(now).isoformat()
                 result = {"status": "error", "job": "physicalRefresh", "error": str(exc)}
+                if dependency_job_forced_due is not None:
+                    result["dependency_job_forced_due"] = (
+                        dependency_job_forced_due
+                    )
+                if discarded_candidate_id is not None:
+                    result["discarded_candidate_id"] = discarded_candidate_id
             _save_state(state, required=True)
             result["duration_ms"] = physical_state["last_duration_ms"]
             return result

@@ -61,7 +61,6 @@ def upsert_missing_items(db: Session, records: Iterable[Dict[str, Any]], existin
             replenishment_method=replenishment_method,
             replenishment_time=replenishment_time,
             unit=unit_key,
-            stock_qty=0.0,
             status="active",
         )
         db.add(item)

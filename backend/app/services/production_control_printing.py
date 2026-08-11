@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import html
 from datetime import date, datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    DefaultSpecification,
     IgnoredWarehouse,
     Item,
     MrpRequirement,
@@ -31,9 +30,16 @@ from ..models import (
 from .production_control_common import looks_like_guid as _looks_like_guid, to_float as _to_float
 from . import planning_truth
 from .one_c_production_order_export import PRODUCTION_ORDER_ENTITY
+from .bom_specification_resolver import BomSpecificationResolver
+from .production_output_truth import accepted_product_output
+
+
+ROUTE_SHEET_SNAPSHOT_VERSION = 1
 
 
 def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
+    # Legacy behavior: keep automatic chain expansion for direct callers that
+    # still operate on operational IDs.
     ids = [int(pid) for pid in product_ids]
     if not ids:
         return 0
@@ -41,6 +47,28 @@ def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
     # Строки цепочки «окраска↔сварка» штампуются вместе: лист один на оба заказа.
     render_ids, weld_pid_by_paint_pid = _paint_weld_chain_for_ids(db, ids)
     unique_ids = sorted(set(ids) | set(render_ids) | set(weld_pid_by_paint_pid.values()))
+    return _persist_route_sheets_printed_by_ids(db, unique_ids, return_ids=ids)
+
+
+def mark_route_sheets_printed_by_snapshot_members(
+    db: Session,
+    product_ids: Iterable[int],
+) -> int:
+    # Exact write path for snapshot-backed prints: caller already owns exact members.
+    ids = [int(pid) for pid in product_ids]
+    return _persist_route_sheets_printed_by_ids(db, ids, return_ids=ids)
+
+
+def _persist_route_sheets_printed_by_ids(
+    db: Session,
+    ids: Sequence[int],
+    *,
+    return_ids: Sequence[int] | None = None,
+) -> int:
+    unique_ids = sorted({pid for pid in ids if pid is not None})
+    if not unique_ids:
+        return 0
+
     existing_ids = {
         int(row.product_id)
         for row in db.query(ProductionProduct.product_id)
@@ -76,7 +104,9 @@ def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
             )
         )
     db.commit()
-    return sum(1 for pid in ids if pid in existing_ids)
+    compare_ids = return_ids if return_ids is not None else unique_ids
+    requested = [pid for pid in compare_ids if pid is not None]
+    return sum(1 for pid in requested if pid in existing_ids)
 
 
 def _date_ru(value: Any) -> str:
@@ -128,19 +158,12 @@ def _first_default_specs(db: Session, item_ids: Sequence[int]) -> Dict[int, int]
     ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
     if not ids:
         return {}
-
-    result: Dict[int, int] = {}
-    rows = (
-        db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id.in_(ids))
-        .order_by(DefaultSpecification.item_id.asc(), DefaultSpecification.id.asc())
-        .all()
-    )
-    for item_id, spec_id in rows:
-        item_id_int = int(item_id)
-        if item_id_int not in result:
-            result[item_id_int] = int(spec_id)
-    return result
+    resolver = BomSpecificationResolver(db)
+    return {
+        item_id: int(spec_id)
+        for item_id in ids
+        if (spec_id := resolver.default_spec_id(item_id)) is not None
+    }
 
 
 def _components_by_spec(db: Session, spec_ids: Sequence[int]) -> Dict[int, List[Tuple[SpecComponent, Item]]]:
@@ -213,18 +236,26 @@ def _unit_display_by_raw(db: Session, raw_units: Sequence[Any]) -> Dict[str, str
     return result
 
 
-def _multi_stock_warehouse_item_ids(db: Session, item_ids: Sequence[int]) -> set[int]:
+def _multi_stock_warehouse_item_ids(
+    db: Session,
+    item_ids: Sequence[int],
+    *,
+    ledger_generation_id: int | None = None,
+) -> set[int]:
     ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
     if not ids:
         return set()
 
-    try:
-        truth = planning_truth.get_truth_state(db)
-    except Exception:
-        return set()
-    if not truth.generation_id:
-        return set()
-    accepted_generation_id = int(truth.generation_id)
+    if ledger_generation_id is None:
+        try:
+            truth = planning_truth.get_truth_state(db)
+        except Exception:
+            return set()
+        if not truth.generation_id:
+            return set()
+        ledger_generation_id = int(truth.generation_id)
+    else:
+        ledger_generation_id = int(ledger_generation_id)
 
     ignored_refs = {
         str(row.warehouse_ref1c or "").strip()
@@ -241,7 +272,7 @@ def _multi_stock_warehouse_item_ids(db: Session, item_ids: Sequence[int]) -> set
     rows = (
         db.query(StockBin.item_id, StockBin.warehouse_ref1c)
         .filter(
-            StockBin.ledger_generation_id == accepted_generation_id,
+            StockBin.ledger_generation_id == ledger_generation_id,
             StockBin.item_id.in_(ids),
             StockBin.on_hand > 0,
         )
@@ -263,58 +294,7 @@ def _bom_descendant_ids_by_root(db: Session, root_item_ids: Sequence[int]) -> Di
     roots = sorted({int(item_id) for item_id in root_item_ids if item_id is not None})
     if not roots:
         return {}
-
-    descendants: Dict[int, set[int]] = {root: {root} for root in roots}
-    frontier_by_root: Dict[int, set[int]] = {root: {root} for root in roots}
-    seen_specs_by_root: Dict[int, set[int]] = {root: set() for root in roots}
-    spec_by_item: Dict[int, Optional[int]] = {}
-    components_by_loaded_spec: Dict[int, List[int]] = {}
-
-    while any(frontier_by_root.values()):
-        frontier_items = {
-            item_id
-            for item_ids in frontier_by_root.values()
-            for item_id in item_ids
-            if item_id not in spec_by_item
-        }
-        if frontier_items:
-            found = _first_default_specs(db, sorted(frontier_items))
-            for item_id in frontier_items:
-                spec_by_item[item_id] = found.get(item_id)
-
-        active_specs: set[int] = set()
-        for root, item_ids in frontier_by_root.items():
-            for item_id in item_ids:
-                spec_id = spec_by_item.get(item_id)
-                if spec_id and spec_id not in seen_specs_by_root[root]:
-                    active_specs.add(int(spec_id))
-
-        missing_specs = sorted(active_specs - set(components_by_loaded_spec))
-        if missing_specs:
-            for spec_id in missing_specs:
-                components_by_loaded_spec[spec_id] = []
-            rows = (
-                db.query(SpecComponent.spec_id, SpecComponent.item_id)
-                .filter(SpecComponent.spec_id.in_(missing_specs))
-                .all()
-            )
-            for spec_id, item_id in rows:
-                components_by_loaded_spec.setdefault(int(spec_id), []).append(int(item_id))
-
-        next_frontier_by_root: Dict[int, set[int]] = {root: set() for root in roots}
-        for root, item_ids in frontier_by_root.items():
-            for item_id in item_ids:
-                spec_id = spec_by_item.get(item_id)
-                if not spec_id or spec_id in seen_specs_by_root[root]:
-                    continue
-                seen_specs_by_root[root].add(int(spec_id))
-                for child_id in components_by_loaded_spec.get(int(spec_id), []):
-                    if child_id not in descendants[root]:
-                        descendants[root].add(child_id)
-                        next_frontier_by_root[root].add(child_id)
-        frontier_by_root = next_frontier_by_root
-
-    return descendants
+    return BomSpecificationResolver(db).descendant_ids_by_root(roots)
 
 
 def _route_contexts_for_products(
@@ -602,9 +582,74 @@ def _paint_weld_chain_for_ids(
     return render_ids, weld_pid_by_paint_pid
 
 
+def _paint_weld_anchor_by_product(
+    db: Session, product_ids: Sequence[int]
+) -> Dict[int, int]:
+    ids = [int(product_id) for product_id in product_ids]
+    if not ids:
+        return {}
+    anchors: Dict[int, int] = {product_id: int(product_id) for product_id in ids}
+
+    order_by_product_id = {
+        int(product_id): int(order_id)
+        for product_id, order_id in (
+            db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+            .filter(ProductionProduct.product_id.in_(sorted(set(ids))))
+            .all()
+        )
+        if order_id is not None
+    }
+    if not order_by_product_id:
+        return anchors
+
+    links = (
+        db.query(PaintWeldChainLink)
+        .filter(
+            (PaintWeldChainLink.painted_order_id.in_(order_by_product_id.values()))
+            | (PaintWeldChainLink.welded_order_id.in_(order_by_product_id.values()))
+        )
+        .all()
+    )
+    if not links:
+        return anchors
+
+    chain_order_ids = sorted(
+        {int(link.painted_order_id) for link in links}
+        | {int(link.welded_order_id) for link in links}
+    )
+    if not chain_order_ids:
+        return anchors
+
+    pid_by_order: Dict[int, int] = {}
+    for pid, oid in (
+        db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+        .filter(ProductionProduct.order_id.in_(chain_order_ids))
+        .order_by(
+            ProductionProduct.order_id.asc(),
+            ProductionProduct.line_number.asc(),
+            ProductionProduct.product_id.asc(),
+        )
+        .all()
+    ):
+        if oid is not None:
+            pid_by_order.setdefault(int(oid), int(pid))
+
+    for link in links:
+        paint_pid = pid_by_order.get(int(link.painted_order_id))
+        weld_pid = pid_by_order.get(int(link.welded_order_id))
+        if paint_pid is None or weld_pid is None:
+            continue
+        anchors[int(weld_pid)] = int(paint_pid)
+        anchors.setdefault(int(paint_pid), int(paint_pid))
+
+    return anchors
+
+
 def _route_sheet_print_data(
     db: Session,
     product_ids: Sequence[int],
+    *,
+    ledger_generation_id: int | None = None,
 ) -> Tuple[
     List[ProductionProduct],
     Dict[int, List[Dict[str, Any]]],
@@ -654,11 +699,15 @@ def _route_sheet_print_data(
         for _comp, item in rows
         if item.item_id is not None
     }
-    multi_stock_item_ids = _multi_stock_warehouse_item_ids(db, sorted(component_item_ids))
+    multi_stock_item_ids = _multi_stock_warehouse_item_ids(
+        db,
+        sorted(component_item_ids),
+        ledger_generation_id=ledger_generation_id,
+    )
     components_by_product_id: Dict[int, List[Dict[str, Any]]] = {}
     for product in products:
         spec_id = spec_id_by_product_id.get(int(product.product_id))
-        qty = _to_float(product.remaining_qty) or _to_float(product.quantity)
+        qty = _to_float(accepted_product_output(product).remaining_qty)
         component_rows: List[Dict[str, Any]] = []
         for comp, item in components_by_spec.get(int(spec_id), []) if spec_id else []:
             required = _to_float(comp.quantity) * qty
@@ -703,7 +752,7 @@ def _route_sheet_print_data(
         )
         chain_info_by_product_id[paint_pid] = {
             "weld_product_id": weld_pid,
-            "weld_qty": _to_float(weld_product.remaining_qty) or _to_float(weld_product.quantity),
+            "weld_qty": _to_float(accepted_product_output(weld_product).remaining_qty),
             "weld_one_c": (route_contexts.get(weld_pid) or {}).get("one_c_number", ""),
             "weld_order_number": str(weld_product.order.order_number or "") if weld_product.order else "",
         }
@@ -717,6 +766,146 @@ def _route_sheet_print_data(
         unit_by_raw,
         chain_info_by_product_id,
     )
+
+
+def _route_sheet_payload_from_data(
+    payload_product: ProductionProduct,
+    components_by_product_id: Mapping[int, List[Dict[str, Any]]],
+    operations_by_product_id: Mapping[int, List[Dict[str, Any]]],
+    route_contexts: Mapping[int, Dict[str, str]],
+    transfer_rows_by_product_id: Mapping[int, List[Dict[str, str]]],
+    unit_by_raw: Mapping[str, str],
+    chain_info_by_product_id: Mapping[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    product = payload_product
+    product_id = int(product.product_id)
+    route_ctx = route_contexts.get(product_id, {})
+    components = components_by_product_id.get(product_id, [])
+    operations = operations_by_product_id.get(product_id, [])
+    transfer_rows = transfer_rows_by_product_id.get(product_id, [])
+    product_unit = unit_by_raw.get(str(product.item.unit or "").strip(), "")
+    chain_info = chain_info_by_product_id.get(product_id)
+
+    weld_operations: List[Dict[str, Any]] = []
+    chain_payload: Dict[str, Any] = {}
+    if chain_info:
+        weld_product_id = int(chain_info.get("weld_product_id") or -1)
+        weld_operations = list(operations_by_product_id.get(weld_product_id, []))
+        chain_payload = {
+            "weld_product_id": weld_product_id,
+            "weld_qty": _to_float(chain_info.get("weld_qty")),
+            "weld_one_c": str(chain_info.get("weld_one_c") or ""),
+            "weld_order_number": str(chain_info.get("weld_order_number") or ""),
+        }
+
+    return {
+        "product_id": product_id,
+        "order_id": int(product.order_id),
+        "order_number": str(product.order.order_number or ""),
+        "order_date": _datetime_ru(product.order.order_date),
+        "one_c_number": str(route_ctx.get("one_c_number") or ""),
+        "item_name": str(product.item.item_name or ""),
+        "item_article": str(product.item.item_article or ""),
+        "item_code": str(product.item.item_code or ""),
+        "unit": product_unit,
+        "remaining_qty": _to_float(accepted_product_output(product).remaining_qty),
+        "components": [
+            {
+                "component_item_id": int(component.get("component_item_id", -1)),
+                "item_code": str(component.get("item_code") or ""),
+                "item_name": str(component.get("item_name") or ""),
+                "item_article": str(component.get("item_article") or ""),
+                "qty_per_unit": _to_float(component.get("qty_per_unit")),
+                "required_qty": _to_float(component.get("required_qty")),
+                "multi_stock_warning": bool(component.get("multi_stock_warning")),
+            }
+            for component in components
+        ],
+        "operations": [
+            {
+                "number": int(op.get("number") or 0),
+                "stage_name": str(op.get("stage_name") or ""),
+                "operation_name": str(op.get("operation_name") or ""),
+                "time_norm": _to_float(op.get("time_norm")),
+            }
+            for op in operations
+        ],
+        "chain": chain_payload,
+        "weld_operations": [
+            {
+                "number": int(op.get("number") or 0),
+                "stage_name": str(op.get("stage_name") or ""),
+                "operation_name": str(op.get("operation_name") or ""),
+                "time_norm": _to_float(op.get("time_norm")),
+            }
+            for op in weld_operations
+        ],
+        "transfer_rows": [
+            {
+                "transfer_number": str(row.get("transfer_number") or ""),
+                "workshop_name": str(row.get("workshop_name") or ""),
+                "source_warehouse": str(row.get("source_warehouse") or ""),
+                "destination_warehouse": str(row.get("destination_warehouse") or ""),
+            }
+            for row in transfer_rows
+        ],
+        "route_context": {
+            "plan_name": str(route_ctx.get("plan_name") or ""),
+            "plan_period": str(route_ctx.get("plan_period") or ""),
+            "root_item": str(route_ctx.get("root_item") or ""),
+        },
+    }
+
+
+def build_route_sheet_snapshot_payloads(
+    db: Session,
+    product_ids: Sequence[int],
+    *,
+    ledger_generation_id: int | None = None,
+) -> Dict[int, Dict[str, Any]]:
+    ids = [int(product_id) for product_id in product_ids]
+    if not ids:
+        return {}
+    (
+        ordered,
+        components_by_product_id,
+        operations_by_product_id,
+        route_contexts,
+        transfer_rows_by_product_id,
+        unit_by_raw,
+        chain_info_by_product_id,
+    ) = _route_sheet_print_data(
+        db,
+        ids,
+        ledger_generation_id=ledger_generation_id,
+    )
+
+    payload_by_anchor: Dict[int, Dict[str, Any]] = {}
+    for product in ordered:
+        anchor_payload = _route_sheet_payload_from_data(
+            payload_product=product,
+            components_by_product_id=components_by_product_id,
+            operations_by_product_id=operations_by_product_id,
+            route_contexts=route_contexts,
+            transfer_rows_by_product_id=transfer_rows_by_product_id,
+            unit_by_raw=unit_by_raw,
+            chain_info_by_product_id=chain_info_by_product_id,
+        )
+        payload_by_anchor[int(product.product_id)] = {
+            "version": ROUTE_SHEET_SNAPSHOT_VERSION,
+            "anchor_product_id": int(product.product_id),
+            "sheet": anchor_payload,
+        }
+
+    anchors_by_product = _paint_weld_anchor_by_product(db, ids)
+    result: Dict[int, Dict[str, Any]] = {}
+    for product_id in ids:
+        anchor_product_id = int(anchors_by_product.get(product_id, product_id))
+        anchor_payload = payload_by_anchor.get(anchor_product_id)
+        if anchor_payload is None:
+            continue
+        result[int(product_id)] = anchor_payload
+    return result
 
 
 def _operation_rows_html(operations: Sequence[Dict[str, Any]]) -> str:
@@ -740,62 +929,61 @@ def _operation_block_header_html(label: str) -> str:
     return f"<tr><td colspan='10' class='op-block'><b>{html.escape(label)}</b></td></tr>"
 
 
-def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_print: bool = False) -> str:
-    (
-        ordered,
-        components_by_product_id,
-        operations_by_product_id,
-        route_contexts,
-        transfer_rows_by_product_id,
-        unit_by_raw,
-        chain_info_by_product_id,
-    ) = _route_sheet_print_data(db, product_ids)
+def _render_route_sheets_html_from_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    auto_print: bool = False,
+) -> str:
     now = datetime.now().strftime("%d.%m.%Y")
     sheets: List[str] = []
-    for product in ordered:
-        components = components_by_product_id.get(int(product.product_id), [])
-        operations = operations_by_product_id.get(int(product.product_id), [])
-        order_date = _datetime_ru(product.order.order_date)
-        route_ctx = route_contexts.get(int(product.product_id), {})
-        transfer_rows_data = transfer_rows_by_product_id.get(int(product.product_id), [])
-        product_unit = unit_by_raw.get(str(product.item.unit or "").strip(), "")
-        order_number = html.escape(str(product.order.order_number or ""))
-        one_c_number = html.escape(route_ctx.get("one_c_number") or "—")
-        title = f"МАРШРУТНЫЙ ЛИСТ № {order_number} от {now}"
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        raw_sheet = payload.get("sheet")
+        if isinstance(raw_sheet, Mapping):
+            sheet = dict(raw_sheet)
+        else:
+            sheet = dict(payload)
+        components = sheet.get("components", [])
+        operations = sheet.get("operations", [])
+        route_ctx = sheet.get("route_context", {})
+        transfer_rows_data = sheet.get("transfer_rows", [])
+        chain = sheet.get("chain") or {}
+        weld_operations = sheet.get("weld_operations", [])
+        product_unit = str(sheet.get("unit") or "")
+        order_number = html.escape(str(sheet.get("order_number") or ""))
+        one_c_number = html.escape(str(sheet.get("one_c_number") or "—"))
+        title = f"МАРШРУТНЫЙ ЛИСТ № {order_number} от {now}" if order_number else "МАРШРУТНЫЙ ЛИСТ"
         warehouse_warning_html = ' <strong class="warehouse-warning">проверь склады</strong>'
         transfer_rows = "".join(
             "<tr>"
-            f"<td colspan='2' class='text strong-value'>{html.escape(row['workshop_name'] or '—')}</td>"
-            f"<td colspan='2' class='text'>{html.escape(row['transfer_number'] or '—')}</td>"
-            f"<td colspan='3' class='text strong-value'>{html.escape(row['source_warehouse'] or '—')}</td>"
-            f"<td colspan='3' class='text strong-value'>{html.escape(row['destination_warehouse'] or '—')}</td>"
+            f"<td colspan='2' class='text strong-value'>{html.escape(row.get('workshop_name') or '—')}</td>"
+            f"<td colspan='2' class='text'>{html.escape(row.get('transfer_number') or '—')}</td>"
+            f"<td colspan='3' class='text strong-value'>{html.escape(row.get('source_warehouse') or '—')}</td>"
+            f"<td colspan='3' class='text strong-value'>{html.escape(row.get('destination_warehouse') or '—')}</td>"
             "</tr>"
             for row in transfer_rows_data
         ) or "<tr><td colspan='10'>Перемещения материалов не созданы</td></tr>"
         component_rows = "".join(
             "<tr>"
-            f"<td colspan='2' class='text'>{html.escape(c['item_name'])}"
-            f"{warehouse_warning_html if c.get('multi_stock_warning') else ''}</td>"
-            f"<td class='text strong-value'>{html.escape(c['item_article'])}</td>"
-            f"<td class='num'>{c['qty_per_unit']:.3f}</td>"
-            f"<td colspan='6' class='num'>{c['required_qty']:.3f}</td>"
+            f"<td colspan='2' class='text'>{html.escape(str(row.get('item_name') or ''))}"
+            f"{warehouse_warning_html if row.get('multi_stock_warning') else ''}</td>"
+            f"<td class='text strong-value'>{html.escape(str(row.get('item_article') or ''))}</td>"
+            f"<td class='num'>{_to_float(row.get('qty_per_unit')):.3f}</td>"
+            f"<td colspan='6' class='num'>{_to_float(row.get('required_qty')):.3f}</td>"
             "</tr>"
-            for c in components
+            for row in components
         ) or "<tr><td colspan='10'>Материалы по спецификации не найдены</td></tr>"
         empty_ops_row = "<tr><td colspan='10'>Операции по спецификации не найдены</td></tr>"
-        chain = chain_info_by_product_id.get(int(product.product_id))
         if chain:
-            # Цепочка «окраска↔сварка»: два блока операций, каждый со своим
-            # 1С-заказом; количество сварки может отличаться (частичный остаток).
-            weld_ops = operations_by_product_id.get(int(chain["weld_product_id"]), [])
-            weld_no = chain["weld_one_c"] or chain["weld_order_number"] or "—"
-            paint_no = route_ctx.get("one_c_number") or str(product.order.order_number or "") or "—"
-            paint_qty = _to_float(product.remaining_qty) or _to_float(product.quantity)
+            paint_qty = _to_float(sheet.get("remaining_qty"))
+            weld_no = str(chain.get("weld_one_c") or chain.get("weld_order_number") or "—")
+            paint_no = str(sheet.get("one_c_number") or order_number or "—")
             op_rows = (
                 _operation_block_header_html(
-                    f"Сварка — заказ 1С №{weld_no} · {chain['weld_qty']:g} {product_unit}".rstrip()
+                    f"Сварка — заказ 1С №{weld_no} · {_to_float(chain.get('weld_qty')):g} {product_unit}".rstrip()
                 )
-                + (_operation_rows_html(weld_ops) or empty_ops_row)
+                + (_operation_rows_html(weld_operations) or empty_ops_row)
                 + _operation_block_header_html(
                     f"Окраска — заказ 1С №{paint_no} · {paint_qty:g} {product_unit}".rstrip()
                 )
@@ -824,18 +1012,18 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
                   <td colspan="5" class="order">
                     <b>Заказ PRODPLAN:</b> №{order_number}<br>
                     <b>Номер 1С:</b> <strong class="strong-value">{one_c_number}</strong><br>
-                    <b>Дата заказа:</b> {html.escape(order_date)}
+                    <b>Дата заказа:</b> {html.escape(str(sheet.get('order_date') or '—'))}
                   </td>
                 </tr>
                 <tr>
-                  <td colspan="5" class="product-name"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
-                  <td class="product-article"><b>Артикул:</b><br><strong class="strong-value">{html.escape(str(product.item.item_article or ""))}</strong></td>
-                  <td colspan="4"><b>Количество:</b><br>{_to_float(product.remaining_qty) or _to_float(product.quantity):g} {html.escape(product_unit)}</td>
+                  <td colspan="5" class="product-name"><b>Наименование:</b><br>{html.escape(str(sheet.get('item_name') or ''))}</td>
+                  <td class="product-article"><b>Артикул:</b><br><strong class="strong-value">{html.escape(str(sheet.get('item_article') or ''))}</strong></td>
+                  <td colspan="4"><b>Количество:</b><br>{_to_float(sheet.get('remaining_qty')):g} {html.escape(product_unit)}</td>
                 </tr>
                 <tr>
-                  <td colspan="5"><b>План:</b><br>{html.escape(route_ctx.get("plan_name") or "—")}</td>
-                  <td><b>Период:</b><br>{html.escape(route_ctx.get("plan_period") or "—")}</td>
-                  <td colspan="4"><b>Корневое изделие:</b><br>{html.escape(route_ctx.get("root_item") or "—")}</td>
+                  <td colspan="5"><b>План:</b><br>{html.escape(str(route_ctx.get("plan_name") or "—"))}</td>
+                  <td><b>Период:</b><br>{html.escape(str(route_ctx.get("plan_period") or "—"))}</td>
+                  <td colspan="4"><b>Корневое изделие:</b><br>{html.escape(str(route_ctx.get("root_item") or "—"))}</td>
                 </tr>
                 <tr><td colspan="10"><b>Маршрут перемещения материалов</b></td></tr>
                 <tr><th colspan="2">Участок получатель</th><th colspan="2">№ перемещения</th><th colspan="3">Склад отправитель</th><th colspan="3">Склад получатель</th></tr>
@@ -852,6 +1040,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
             </section>
             """
         )
+
     auto_print_script = (
         "<script>window.addEventListener('load', () => setTimeout(() => window.print(), 250));</script>"
         if auto_print
@@ -901,3 +1090,12 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
   {auto_print_script}
 </body>
 </html>"""
+
+
+def render_route_sheets_from_snapshots(
+    route_sheet_payloads: Sequence[Mapping[str, Any]],
+    *,
+    auto_print: bool = False,
+) -> str:
+    ordered: List[Mapping[str, Any]] = [payload for payload in route_sheet_payloads if payload]
+    return _render_route_sheets_html_from_payloads(ordered, auto_print=auto_print)

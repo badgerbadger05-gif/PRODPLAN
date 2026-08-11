@@ -5,24 +5,16 @@ import { KeyboardShortcutShell, type KeyboardShortcut } from './platform'
 import { frontendResources } from './resourceRegistry'
 import { canAccessResource } from './resourceRegistry'
 import { LoginPage, useSession } from './session'
-import { DeploymentContourBanner } from './DeploymentContourBanner'
 
-const DbrDrumBoardPage = lazy(() => import('./pages/DbrDrumBoardPage').then((module) => ({ default: module.DbrDrumBoardPage })))
-const DbrFeederPage = lazy(() => import('./pages/DbrFeederPage').then((module) => ({ default: module.DbrFeederPage })))
-const DbrProgramsPage = lazy(() => import('./pages/DbrProgramsPage').then((module) => ({ default: module.DbrProgramsPage })))
-const DbrPurchasePage = lazy(() => import('./pages/DbrPurchasePage').then((module) => ({ default: module.DbrPurchasePage })))
-const DbrSettingsPage = lazy(() => import('./pages/DbrSettingsPage').then((module) => ({ default: module.DbrSettingsPage })))
 const HomePage = lazy(() => import('./pages/HomePage').then((module) => ({ default: module.HomePage })))
 const LedgerWorkspaceRoute = lazy(() => import('./pages/LedgerWorkspacePage').then((module) => ({ default: module.LedgerWorkspaceRoute })))
 const MrpResultPage = lazy(() => import('./pages/MrpResultPage').then((module) => ({ default: module.MrpResultPage })))
 const MrpRunsPage = lazy(() => import('./pages/MrpRunsPage').then((module) => ({ default: module.MrpRunsPage })))
 const PeriodPlanPage = lazy(() => import('./pages/PeriodPlanPage').then((module) => ({ default: module.PeriodPlanPage })))
-const PlanningComparisonPage = lazy(() => import('./pages/PlanningComparisonPage').then((module) => ({ default: module.PlanningComparisonPage })))
 const ProductionControlPage = lazy(() => import('./pages/ProductionControlPage').then((module) => ({ default: module.ProductionControlPage })))
 const PurchaseControlPage = lazy(() => import('./pages/PurchaseControlPage').then((module) => ({ default: module.PurchaseControlPage })))
 const ResourcesPage = lazy(() => import('./pages/ResourcesPage').then((module) => ({ default: module.ResourcesPage })))
 const SpecificationPage = lazy(() => import('./pages/SpecificationPage').then((module) => ({ default: module.SpecificationPage })))
-const StageDistributionPage = lazy(() => import('./pages/StageDistributionPage').then((module) => ({ default: module.StageDistributionPage })))
 const SyncPage = lazy(() => import('./pages/SyncPage').then((module) => ({ default: module.SyncPage })))
 const TransferRequestsPage = lazy(() => import('./pages/TransferRequestsPage').then((module) => ({ default: module.TransferRequestsPage })))
 const WorkshopBindingReviewPage = lazy(() => import('./pages/WorkshopBindingReviewPage').then((module) => ({ default: module.WorkshopBindingReviewPage })))
@@ -58,7 +50,6 @@ export function App() {
 
   return (
     <div className="app">
-      <DeploymentContourBanner />
       <KeyboardShortcutShell shortcuts={navigationShortcuts} />
       <aside className="nav">
         <div className="brand">
@@ -95,12 +86,6 @@ export function App() {
             <Route path="/" element={<HomePage />} />
             <Route path="/period-plan" element={guard('period_plan', <PeriodPlanPage />)} />
             <Route path="/period-plan/:planId" element={guard('period_plan', <PeriodPlanPage />)} />
-            <Route path="/planning-comparison" element={guard('planning_comparison', <PlanningComparisonPage />)} />
-            <Route path="/dbr" element={guard('dbr', <DbrDrumBoardPage />)} />
-            <Route path="/dbr/programs" element={guard('dbr', <DbrProgramsPage />)} />
-            <Route path="/dbr/feeder" element={guard('dbr', <DbrFeederPage />)} />
-            <Route path="/dbr/purchase" element={guard('dbr', <DbrPurchasePage />)} />
-            <Route path="/dbr/settings" element={guard('dbr', <DbrSettingsPage />)} />
             <Route path="/production-control" element={guard('production_order', <ProductionControlPage />)} />
             <Route path="/purchase-control" element={guard('purchase_order', <PurchaseControlPage />)} />
             <Route path="/transfer-requests" element={guard('material_transfer', <TransferRequestsPage />)} />
@@ -110,7 +95,6 @@ export function App() {
             <Route path="/ledger/items/:itemId" element={guard('ledger', <LedgerWorkspaceRoute />)} />
             <Route path="/resources" element={guard('resources', <ResourcesPage />)} />
             <Route path="/workshop-binding-review" element={guard('workshop_binding', <WorkshopBindingReviewPage />)} />
-            <Route path="/stage-distribution" element={guard('stage_distribution', <StageDistributionPage />)} />
             <Route path="/specification" element={guard('specification', <SpecificationPage />)} />
             <Route path="/sync" element={guard('sync', <SyncPage />)} />
             <Route

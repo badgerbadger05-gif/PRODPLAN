@@ -14,7 +14,7 @@ from typing import Iterable, Literal, Optional, Tuple
 
 
 Mode = Literal["make", "buy"]
-MatchRule = Literal["fifo"]
+MatchRule = Literal["fifo", "pegged"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,7 @@ class Allocation:
     reserve_id: str
     qty: Decimal
     match_rule: MatchRule
+    is_addressed: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,18 @@ def _fact_key(fact: Fact) -> tuple:
     return (fact.posting_at, fact.fact_id)
 
 
+def _is_addressed_match(fact: Fact, reserve: Reserve) -> bool:
+    if fact.requirement_id is not None and fact.requirement_id == reserve.requirement_id:
+        return True
+    if (
+        fact.requirement_id is None
+        and fact.order_ref is not None
+        and fact.order_ref in reserve.order_refs
+    ):
+        return True
+    return False
+
+
 def _validate(facts: tuple[Fact, ...], reserves: tuple[Reserve, ...]) -> None:
     fact_ids = [fact.fact_id for fact in facts]
     reserve_ids = [reserve.reserve_id for reserve in reserves]
@@ -136,8 +149,9 @@ def allocate_historical_facts(
 ) -> ReplayResult:
     """Allocate accepted historical facts without mutating either input.
 
-    Every accepted positive replenishment uses the same oldest-first FIFO.
-    Requirement/order identity is provenance only and never gates quantity.
+    Positive replenishment always favors exact requirement/order matches (pegged),
+    then continues with deterministic global FIFO. Unknown or ambiguous identity
+    takes FIFO directly.
     """
 
     fact_rows = tuple(facts)
@@ -150,7 +164,14 @@ def allocate_historical_facts(
     allocations: list[Allocation] = []
     surplus: list[SurplusFact] = []
 
-    def place(fact: Fact, qty: Decimal, candidates: Iterable[Reserve], rule: MatchRule) -> Decimal:
+    def place(
+        fact: Fact,
+        qty: Decimal,
+        candidates: Iterable[Reserve],
+        rule: MatchRule,
+        *,
+        is_addressed: bool = False,
+    ) -> Decimal:
         left = qty
         for reserve in candidates:
             if left <= 0:
@@ -159,7 +180,15 @@ def allocate_historical_facts(
             if available <= 0:
                 continue
             take = min(left, available)
-            allocations.append(Allocation(fact.fact_id, reserve.reserve_id, take, rule))
+            allocations.append(
+                Allocation(
+                    fact.fact_id,
+                    reserve.reserve_id,
+                    take,
+                    rule,
+                    is_addressed=is_addressed,
+                )
+            )
             remaining[reserve.reserve_id] -= take
             realized[reserve.reserve_id] += take
             left -= take
@@ -175,6 +204,17 @@ def allocate_historical_facts(
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
         ]
+        exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
+        # One requirement may legitimately have several dated reserve slices.
+        # An order reference shared by different requirements is ambiguous and
+        # must not invent a peg.
+        exact_requirement_ids = {reserve.requirement_id for reserve in exact}
+        address_is_unambiguous = bool(exact) and (
+            fact.requirement_id is not None or len(exact_requirement_ids) == 1
+        )
+        if address_is_unambiguous:
+            left = place(fact, left, exact, "pegged", is_addressed=True)
+
         if left > 0:
             left = place(fact, left, compatible, "fifo")
 

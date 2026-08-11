@@ -19,11 +19,15 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.item_ledger.candidate_future_supply import capture_candidate_future_supply
+from app.services.planning_pool_resolver import (
+    effective_planning_pool_by_warehouse,
+)
 from app.services.item_ledger.candidate_realization_replay import replay_candidate_realizations
 from app.services.item_ledger.generation_lifecycle import (
     GenerationValidationError,
     validate_obligation_refresh_build,
 )
+from app.services.item_ledger.future_supply_capture import _as_utc
 from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
     fork_obligation_generation,
@@ -32,6 +36,12 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
 )
 from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
+from app.services.production_control_journal_snapshot import (
+    build_candidate_snapshot as build_production_journal_candidate,
+)
+from app.services.production_material_custody_projection import (
+    build_material_custody_projection,
+)
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import (
     build_mrp_result_candidate_snapshot,
@@ -55,17 +65,25 @@ from app.services.item_ledger.drum_schedule_persistence import (
 from app.services.item_ledger.replenishment_work_item_builder import (
     materialize_replenishment_work_items,
 )
+from app.services.item_ledger.reservation_consumption_persistence import (
+    ALGORITHM_VERSION as RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
+    materialize_reservation_consumption_allocations,
+)
+from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+)
 from app.services.item_ledger.shelf_projection_persistence import (
     materialize_shelf_projections,
 )
 
 
-_VERSION = "obligation-refresh-orchestrator/1"
+_VERSION = "obligation-refresh-orchestrator/2"
 _CORE_CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
     "replenishment_work_item": True,
     "execution_allocations": True,
+    "reservation_consumption_allocation": True,
     "supplier_receipt_coverage": True,
     "planning_snapshots": True,
     "assembly_output_allocation": True,
@@ -73,6 +91,7 @@ _CORE_CAPABILITIES = {
     "drum_schedule": True,
     "shelf_projection": True,
     "purchase_control_journal": True,
+    "production_control_journal": True,
     "future_supply": True,
 }
 
@@ -117,6 +136,13 @@ def _single_stage(
     db: Session, target_id: int, stage: str, generation_key: str
 ) -> models.LedgerBuildBatch:
     key = _batch_key(generation_key, stage)
+    expected_algorithm_version = (
+        RESERVATION_CONSUMPTION_ALGORITHM_VERSION
+        if stage == "execution_allocation"
+        else FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION
+        if stage == "future_supply_capture"
+        else _VERSION
+    )
     rows = db.query(models.LedgerBuildBatch).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target_id),
         models.LedgerBuildBatch.stage == stage,
@@ -125,12 +151,14 @@ def _single_stage(
         raise ObligationRefreshOrchestratorError(f"target has duplicate {stage} batches")
     if rows:
         row = rows[0]
-        if str(row.batch_key) != key or str(row.algorithm_version) != _VERSION:
+        if str(row.batch_key) != key:
             raise ObligationRefreshOrchestratorError(f"target {stage} batch conflicts")
+        if str(row.algorithm_version) != expected_algorithm_version:
+            row.algorithm_version = expected_algorithm_version
         return row
     row = models.LedgerBuildBatch(
         ledger_generation_id=int(target_id), stage=stage, batch_key=key,
-        status="building", algorithm_version=_VERSION, metrics={},
+        status="building", algorithm_version=expected_algorithm_version, metrics={},
     )
     db.add(row)
     db.flush()
@@ -138,6 +166,15 @@ def _single_stage(
 
 
 def _complete(batch: models.LedgerBuildBatch, metrics: Mapping[str, Any]) -> None:
+    if batch.stage == "future_supply_capture":
+        generation = getattr(batch, "ledger_generation", None)
+        if generation is not None and generation.cutoff is not None:
+            metrics = {
+                **dict(metrics),
+                "generation_id": int(generation.id),
+                "cutoff": _as_utc(generation.cutoff).isoformat(),
+                "algorithm_version": str(batch.algorithm_version),
+            }
     if str(batch.status) == "completed":
         if dict(batch.metrics or {}) != dict(metrics):
             raise ObligationRefreshOrchestratorError(
@@ -154,6 +191,7 @@ def _complete(batch: models.LedgerBuildBatch, metrics: Mapping[str, Any]) -> Non
 def _manifest_request_matches(
     target: models.LedgerGeneration,
     *, add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
+    replace_plan_ids: Iterable[int],
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
@@ -170,6 +208,7 @@ def _manifest_request_matches(
         expected = {
             "plan_ids": sorted(int(v) for v in add_plan_ids),
             "retire_plan_ids": sorted(int(v) for v in retire_plan_ids),
+            "replace_plan_ids": sorted(int(v) for v in replace_plan_ids),
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": dict(config_snapshot),
@@ -205,20 +244,27 @@ def _publish_retained_mrp_snapshots(
     db: Session,
     generation_id: int,
     retained_run_ids: Iterable[int],
+    *,
+    allow_stale_truth: bool = False,
 ) -> None:
     for run_id in sorted({int(value) for value in retained_run_ids}):
-        build_mrp_result_snapshot(db, run_id)
+        build_mrp_result_snapshot(
+            db, run_id, allow_stale_truth=bool(allow_stale_truth)
+        )
 
 
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
+    replace_plan_ids: Iterable[int],
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
+    allow_stale_parent: bool = False,
 ) -> ObligationRefreshOrchestrationResult:
     _manifest_request_matches(
         target, add_plan_ids=add_plan_ids, retire_plan_ids=retire_plan_ids,
+        replace_plan_ids=replace_plan_ids,
         horizon_days=horizon_days,
                               config_version_id=config_version_id, config_snapshot=config_snapshot,
                               planning_pool_by_warehouse=planning_pool_by_warehouse)
@@ -242,7 +288,12 @@ def _retry_published(
         if isinstance(manifest, dict)
         else []
     )
-    _publish_retained_mrp_snapshots(db, int(target.id), retained_ids)
+    _publish_retained_mrp_snapshots(
+        db,
+        int(target.id),
+        retained_ids,
+        allow_stale_truth=bool(allow_stale_parent),
+    )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
@@ -256,6 +307,7 @@ def run_obligation_refresh(
     generation_key: str,
     add_plan_ids: Iterable[int] = (),
     retire_plan_ids: Iterable[int] = (),
+    replace_plan_ids: Iterable[int] = (),
     started_by: str | None = None,
     horizon_days: int | None = None,
     config_version_id: int | None = None,
@@ -263,6 +315,7 @@ def run_obligation_refresh(
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
     explicit_make_transfer_recorders: set[str] | None = None,
     accepted_at: datetime | None = None,
+    allow_stale_parent: bool = False,
 ) -> ObligationRefreshOrchestrationResult:
     """Build and atomically publish every refresh/add candidate.
 
@@ -272,15 +325,27 @@ def run_obligation_refresh(
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
+    pool_mapping = effective_planning_pool_by_warehouse(
+        db,
+        planning_pool_by_warehouse,
+    )
     config = dict(config_snapshot or {})
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
     retire_ids = tuple(sorted(int(v) for v in retire_plan_ids))
+    replace_ids = tuple(sorted(int(v) for v in replace_plan_ids))
+    incremental_rebase = bool(replace_ids) and not add_ids and not retire_ids
     if len(add_ids) != len(set(add_ids)) or any(v <= 0 for v in add_ids):
         raise ValueError("add_plan_ids must be unique positive ids")
     if len(retire_ids) != len(set(retire_ids)) or any(v <= 0 for v in retire_ids):
         raise ValueError("retire_plan_ids must be unique positive ids")
-    if set(add_ids).intersection(retire_ids):
-        raise ValueError("a plan cannot be added and retired together")
+    if len(replace_ids) != len(set(replace_ids)) or any(v <= 0 for v in replace_ids):
+        raise ValueError("replace_plan_ids must be unique positive ids")
+    if (
+        set(add_ids).intersection(retire_ids)
+        or set(add_ids).intersection(replace_ids)
+        or set(retire_ids).intersection(replace_ids)
+    ):
+        raise ValueError("add, retire and replace plan sets must be disjoint")
     if len(add_ids) > 1:
         # The freeze anchors the shared stock baseline at the earliest
         # period_from of the batch: mixing periods would net a later plan
@@ -327,8 +392,10 @@ def run_obligation_refresh(
         return _retry_published(
             db, existing, parent_generation_id=original_parent_id,
             add_plan_ids=add_ids, retire_plan_ids=retire_ids,
+            replace_plan_ids=replace_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
-            planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+            planning_pool_by_warehouse=pool_mapping,
+            allow_stale_parent=bool(allow_stale_parent),
         )
     if existing is not None and str(existing.status) != "building":
         raise ObligationRefreshOrchestratorError("generation_key exists in non-retryable state")
@@ -348,9 +415,10 @@ def run_obligation_refresh(
     target_id = int(fork.ledger_generation_id)
     manifest = create_obligation_refresh_manifest(
         db, int(parent_generation_id), target_id, add_ids,
-        retire_plan_ids=retire_ids, started_by=started_by,
+        retire_plan_ids=retire_ids, replace_plan_ids=replace_ids,
+        started_by=started_by,
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
-        planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+        planning_pool_by_warehouse=pool_mapping,
     )
     candidate_ids = tuple(sorted(
         int(entry["candidate_run_id"])
@@ -367,20 +435,45 @@ def run_obligation_refresh(
         parent_generation_id=int(parent_generation_id),
         target_generation_id=target_id,
         retained_run_ids=retained_run_ids,
+        preserve_realization=incremental_rebase,
     )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
+    execution_batch = _single_stage(db, target_id, "execution_allocation", key)
     replenishment_batch = _single_stage(db, target_id, "replenishment_work_item", key)
+    future_supply_capture_batch = _single_stage(db, target_id, "future_supply_capture", key)
     snapshot_batch = _single_stage(db, target_id, "snapshot_build", key)
     capture = capture_candidate_future_supply(
-        db, int(parent_generation_id), target_id, int(snapshot_batch.id),
-        planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+        db,
+        int(parent_generation_id),
+        target_id,
+        int(future_supply_capture_batch.id),
+        planning_pool_by_warehouse=pool_mapping,
         explicit_make_transfer_recorders=explicit_make_transfer_recorders,
     )
+    future_supply_capture = _json_value(capture)
+    _complete(
+        future_supply_capture_batch,
+        {
+            "future_supply_capture": future_supply_capture,
+            **future_supply_capture,
+        },
+    )
+    reservation_count = db.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.ledger_generation_id == target_id,
+        models.ReservationEntry.run_id.in_(candidate_ids),
+    ).count()
+    reservation_consumption = materialize_reservation_consumption_allocations(
+        db,
+        target_id,
+        int(execution_batch.id),
+    )
+    _complete(execution_batch, reservation_consumption)
     freeze = (
         freeze_candidate_snapshots(
             db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
             candidate_run_ids=candidate_ids,
+            allow_stale_parent=bool(allow_stale_parent),
         )
         if candidate_ids
         else {
@@ -389,10 +482,6 @@ def run_obligation_refresh(
             "frozen": 0,
         }
     )
-    reservation_count = db.query(models.ReservationEntry.id).filter(
-        models.ReservationEntry.ledger_generation_id == target_id,
-        models.ReservationEntry.run_id.in_(candidate_ids),
-    ).count()
     reservation_metrics = {
         "candidate_run_ids": list(candidate_ids),
         "retained_run_ids": list(retained_run_ids),
@@ -402,23 +491,59 @@ def run_obligation_refresh(
         "input_checksum": sha256(_canonical({"candidate_run_ids": candidate_ids, "freeze": freeze}).encode()).hexdigest(),
     }
     _complete(reservation_batch, reservation_metrics)
+    if incremental_rebase:
+        # Same physical cutoff: retained folds are copied as persisted state,
+        # while replacement reservations intentionally start empty. Replaying
+        # the historical prefix would assign old facts to the new MRP and was
+        # the multi-hour source of the previous implementation.
+        replay = {"status": "skipped_same_cutoff_rebase", "facts": 0}
+        supplier_summary = {
+            "provenance_count": 0,
+            "exact_fact_count": 0,
+            "allocation_count": 0,
+            "surplus_qty": "0",
+        }
+        replay_batch = _single_stage(db, target_id, "reservation_replay", key)
+        _complete(replay_batch, {
+            "replay_summary": _json_value(replay),
+            "supplier_receipt_summary": _json_value(supplier_summary),
+        })
+    else:
+        replay = replay_candidate_realizations(db, target_id)
+        supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+            db,
+            ledger_generation_id=target_id,
+            cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
+        )
+        supplier_summary = {
+            "provenance_count": supplier.provenance_count,
+            "exact_fact_count": supplier.exact_fact_count,
+            "allocation_count": supplier.allocation_count,
+            "surplus_qty": supplier.surplus_qty,
+        }
+    # Work items are a persisted projection of the reservation fold.  Both
+    # make and supplier realizations must therefore be applied first; building
+    # this projection earlier freezes stale ``fulfilled_qty``/``remaining_qty``
+    # and can offer the same replenishment for ordering again.
     replenishment_summary = materialize_replenishment_work_items(
         db,
         target_id,
         int(replenishment_batch.id),
     )
     _complete(replenishment_batch, replenishment_summary)
-    replay = replay_candidate_realizations(db, target_id)
     assembly_outputs = materialize_assembly_output_allocations(db, target_id)
     drum_schedule = materialize_drum_schedule(db, target_id)
     shelf_projection = materialize_shelf_projections(db, target_id)
-    supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
-        db,
-        ledger_generation_id=target_id,
-        cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
-    )
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
+    custody_projection = build_material_custody_projection(
+        db, ledger_generation_id=target_id
+    )
+    production_journal_snapshot = build_production_journal_candidate(
+        db,
+        target_id,
+        accepted_run_ids=(*candidate_ids, *retained_run_ids),
+    )
     assembly_queue_snapshot = build_assembly_queue_snapshot(db, target_id)
     target = db.get(models.LedgerGeneration, target_id)
     if target is None or str(target.status) != "building":
@@ -435,19 +560,18 @@ def run_obligation_refresh(
         "candidate_run_ids": list(candidate_ids),
         "candidate_read_snapshot_ids": snapshots,
         "future_supply_captured": True,
-        "future_supply_capture": _json_value(capture),
+        "future_supply_capture_batch_id": int(future_supply_capture_batch.id),
+        "future_supply_capture": future_supply_capture,
+        "material_custody_projection": _json_value(custody_projection),
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
+        "reservation_consumption_summary": _json_value(reservation_consumption),
         "assembly_output_summary": _json_value(assembly_outputs),
         "drum_schedule_summary": _json_value(drum_schedule),
         "shelf_projection_summary": _json_value(shelf_projection),
-        "supplier_receipt_summary": _json_value({
-            "provenance_count": supplier.provenance_count,
-            "exact_fact_count": supplier.exact_fact_count,
-            "allocation_count": supplier.allocation_count,
-            "surplus_qty": supplier.surplus_qty,
-        }),
+        "supplier_receipt_summary": _json_value(supplier_summary),
         "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
+        "production_control_journal_snapshot_id": int(production_journal_snapshot.id),
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
     }
     _complete(snapshot_batch, snapshot_metrics)
@@ -470,7 +594,12 @@ def run_obligation_refresh(
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
     )
     _publish_execution_snapshots(db, target_id)
-    _publish_retained_mrp_snapshots(db, target_id, retained_run_ids)
+    _publish_retained_mrp_snapshots(
+        db,
+        target_id,
+        retained_run_ids,
+        allow_stale_truth=bool(allow_stale_parent),
+    )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,

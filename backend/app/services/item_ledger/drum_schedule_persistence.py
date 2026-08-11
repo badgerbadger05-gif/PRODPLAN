@@ -6,12 +6,12 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from app import models
 from app.services.work_calendar_service import is_workday
 
+from .assembly_queue_snapshot import materialize_assembly_queue_lines
 from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
@@ -21,149 +21,6 @@ ALGORITHM_VERSION = "drum-schedule/1"
 
 def _d(value: Any) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value or 0))
-
-
-def _priority(period_from: date, period_to: date, plan_id: int, line_id: int) -> list[Any]:
-    return [period_from.isoformat(), period_to.isoformat(), int(plan_id), int(line_id)]
-
-
-def _sort_key(period_from: date, period_to: date, plan_id: int, line_id: int) -> str:
-    return (
-        f"{period_from.isoformat()}|{period_to.isoformat()}|"
-        f"{int(plan_id):010d}|{int(line_id):010d}"
-    )
-
-
-def _source_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
-    allocations = (
-        db.query(
-            models.AssemblyOutputAllocation.plan_line_id.label("plan_line_id"),
-            func.sum(models.AssemblyOutputAllocation.allocated_qty).label("accepted_qty"),
-        )
-        .filter(
-            models.AssemblyOutputAllocation.ledger_generation_id == int(generation_id)
-        )
-        .group_by(models.AssemblyOutputAllocation.plan_line_id)
-        .subquery()
-    )
-    rows = (
-        db.query(
-            models.ProductionPlanLine,
-            models.ProductionPlanHeader,
-            models.PlanningRun,
-            func.coalesce(allocations.c.accepted_qty, 0),
-        )
-        .join(
-            models.ProductionPlanHeader,
-            models.ProductionPlanHeader.id == models.ProductionPlanLine.plan_id,
-        )
-        .join(
-            models.PlanningRun,
-            and_(
-                models.PlanningRun.source_plan_id == models.ProductionPlanHeader.id,
-                models.PlanningRun.status == "FIXED_SNAPSHOT",
-                models.PlanningRun.ledger_generation_id == int(generation_id),
-            ),
-        )
-        .outerjoin(
-            allocations,
-            allocations.c.plan_line_id == models.ProductionPlanLine.id,
-        )
-        .filter(
-            models.ProductionPlanHeader.status == "fixed",
-            models.ProductionPlanLine.qty > 0,
-        )
-        .order_by(
-            models.PlanningRun.period_from.asc(),
-            models.PlanningRun.period_to.asc(),
-            models.ProductionPlanHeader.id.asc(),
-            models.ProductionPlanLine.id.asc(),
-        )
-        .all()
-    )
-    result: list[dict[str, Any]] = []
-    for line, plan, run, accepted in rows:
-        planned = _d(line.qty)
-        accepted_qty = _d(accepted)
-        remaining = max(planned - accepted_qty, Decimal("0"))
-        if remaining == 0:
-            continue
-        period_from = run.period_from or plan.period_from
-        period_to = run.period_to or plan.period_to
-        result.append(
-            {
-                "planning_run_id": int(run.run_id),
-                "plan_id": int(plan.id),
-                "plan_line_id": int(line.id),
-                "item_id": int(line.item_id),
-                "bucket_date": line.bucket_date,
-                "period_from": period_from,
-                "period_to": period_to,
-                "planned_output_qty": planned,
-                "accepted_plan_output_qty": accepted_qty,
-                "assembly_remaining_qty": remaining,
-                "original_priority": _priority(
-                    period_from, period_to, int(plan.id), int(line.id)
-                ),
-                "sort_key": _sort_key(
-                    period_from, period_to, int(plan.id), int(line.id)
-                ),
-            }
-        )
-    return result
-
-
-def _assert_queue_matches(
-    source: list[dict[str, Any]], persisted: list[models.AssemblyQueueLine]
-) -> None:
-    by_line = {int(row.plan_line_id): row for row in persisted}
-    if set(by_line) != {int(row["plan_line_id"]) for row in source}:
-        raise ValueError("persisted assembly queue differs from fixed plan")
-    for expected in source:
-        actual = by_line[int(expected["plan_line_id"])]
-        for field in (
-            "planning_run_id",
-            "plan_id",
-            "item_id",
-            "bucket_date",
-            "period_from",
-            "period_to",
-            "sort_key",
-        ):
-            if getattr(actual, field) != expected[field]:
-                raise ValueError("persisted assembly queue differs from fixed plan")
-        for field in (
-            "planned_output_qty",
-            "accepted_plan_output_qty",
-            "assembly_remaining_qty",
-        ):
-            if _d(getattr(actual, field)) != _d(expected[field]):
-                raise ValueError("persisted assembly queue differs from fixed plan")
-
-
-def _persist_queue(
-    db: Session, generation_id: int, source: list[dict[str, Any]]
-) -> list[models.AssemblyQueueLine]:
-    existing = (
-        db.query(models.AssemblyQueueLine)
-        .filter(models.AssemblyQueueLine.ledger_generation_id == int(generation_id))
-        .order_by(models.AssemblyQueueLine.sort_key.asc())
-        .all()
-    )
-    if existing:
-        _assert_queue_matches(source, existing)
-        return existing
-    rows = [
-        models.AssemblyQueueLine(
-            ledger_generation_id=int(generation_id),
-            line_status="open",
-            **payload,
-        )
-        for payload in source
-    ]
-    db.add_all(rows)
-    db.flush()
-    return rows
 
 
 def _rates_and_capacity(
@@ -193,9 +50,15 @@ def _rates_and_capacity(
         )
     normalized = {item_id: tuple(values) for item_id, values in rates.items()}
     for item_id in item_ids:
-        if len(normalized.get(item_id, ())) != 1:
-            reason = "missing" if item_id not in normalized else "ambiguous"
-            raise ValueError(f"{reason} assembly rate for item {item_id}")
+        profiles = normalized.get(item_id, ())
+        # A missing rate means that the queue row is outside the drum contour.
+        # It remains in AssemblyQueueLine and can still be closed by an accepted
+        # physical output.  Ambiguous or invalid configured rates remain a hard
+        # data error: silently choosing between two resources would be unsafe.
+        if len(profiles) > 1:
+            raise ValueError(f"ambiguous assembly rate for item {item_id}")
+        if profiles and _d(profiles[0].qty_per_capacity) <= 0:
+            raise ValueError(f"invalid assembly rate for item {item_id}")
 
     resource_ids = sorted(
         {profile.resource_id for values in normalized.values() for profile in values}
@@ -225,6 +88,8 @@ def _plan(
     queue_rows: list[models.AssemblyQueueLine],
 ):
     rates, capacity, horizon, horizon_by_resource = _rates_and_capacity(db, queue_rows)
+    scheduled_rows = [row for row in queue_rows if int(row.item_id) in rates]
+    excluded_rows = [row for row in queue_rows if int(row.item_id) not in rates]
     schedule_from = generation.cutoff.date()
     schedule_to = schedule_from + timedelta(days=horizon - 1)
     resource_horizon_end = {
@@ -236,7 +101,7 @@ def _plan(
     while cursor <= schedule_to:
         calendar[cursor] = is_workday(db, cursor)
         cursor += timedelta(days=1)
-    return build_drum_plan(
+    plan = build_drum_plan(
         tuple(
             QueueLine(
                 queue_line_id=int(row.id),
@@ -248,7 +113,7 @@ def _plan(
                 accepted_plan_output_qty=_d(row.accepted_plan_output_qty),
                 original_priority=tuple(row.original_priority or ()),
             )
-            for row in queue_rows
+            for row in scheduled_rows
         ),
         rates,
         calendar,
@@ -257,32 +122,50 @@ def _plan(
         resource_capacity_by_id=capacity,
         resource_horizon_end_by_id=resource_horizon_end,
     )
+    excluded_open_qty = sum(
+        (_d(row.assembly_remaining_qty) for row in excluded_rows), Decimal("0")
+    )
+    return type(plan)(
+        schedule_from=plan.schedule_from,
+        schedule_to=plan.schedule_to,
+        slots=plan.slots,
+        gaps=plan.gaps,
+        queue_signature=plan.queue_signature,
+        slot_signature=plan.slot_signature,
+        gap_signature=plan.gap_signature,
+        metrics={
+            **dict(plan.metrics),
+            "queue_lines": len(queue_rows),
+            "excluded_lines": len(excluded_rows),
+            "excluded_open_qty": str(excluded_open_qty),
+            "excluded_item_ids": sorted({int(row.item_id) for row in excluded_rows}),
+        },
+    )
 
 
-def _assert_schedule_matches(
-    db: Session, schedule: models.DrumSchedule, plan
+def _validate_persisted_checkpoint(
+    db: Session,
+    schedule: models.DrumSchedule,
+    batch: models.LedgerBuildBatch,
 ) -> None:
-    slots = (
-        db.query(models.DrumSlot)
-        .filter(models.DrumSlot.drum_schedule_id == int(schedule.id))
-        .all()
-    )
-    gaps = (
-        db.query(models.DrumCapacityGap)
-        .filter(models.DrumCapacityGap.drum_schedule_id == int(schedule.id))
-        .all()
-    )
+    slot_count = db.query(models.DrumSlot).filter(
+        models.DrumSlot.drum_schedule_id == int(schedule.id)
+    ).count()
+    gap_count = db.query(models.DrumCapacityGap).filter(
+        models.DrumCapacityGap.drum_schedule_id == int(schedule.id)
+    ).count()
     if (
-        schedule.queue_signature != plan.queue_signature
-        or schedule.slot_signature != plan.slot_signature
-        or schedule.gap_signature != plan.gap_signature
-        or len(slots) != len(plan.slots)
-        or len(gaps) != len(plan.gaps)
-        or _d(schedule.total_open_qty) != _d(plan.metrics["total_open_qty"])
-        or _d(schedule.total_slot_qty) != _d(plan.metrics["total_slot_qty"])
-        or _d(schedule.total_gap_qty) != _d(plan.metrics["total_gap_qty"])
+        schedule.status != "completed"
+        or batch.status != "completed"
+        or schedule.algorithm_version != ALGORITHM_VERSION
+        or batch.algorithm_version != ALGORITHM_VERSION
+        or slot_count != int(schedule.slot_row_count)
+        or gap_count != int(schedule.gap_row_count)
+        or dict(batch.metrics or {}) != dict(schedule.metrics or {})
+        or _d(schedule.total_open_qty)
+        != _d(schedule.total_slot_qty) + _d(schedule.total_gap_qty)
     ):
-        raise ValueError("persisted drum schedule drifted from canonical input")
+        raise ValueError("persisted drum checkpoint is incomplete or inconsistent")
 
 
 def materialize_drum_schedule(
@@ -296,9 +179,6 @@ def materialize_drum_schedule(
     if generation.cutoff is None:
         raise ValueError("drum schedule requires generation cutoff")
 
-    source = _source_rows(db, int(generation.id))
-    queue_rows = _persist_queue(db, int(generation.id), source)
-    plan = _plan(db, generation, queue_rows)
     existing = (
         db.query(models.DrumSchedule)
         .filter(models.DrumSchedule.ledger_generation_id == int(generation.id))
@@ -317,13 +197,20 @@ def materialize_drum_schedule(
     if existing is not None or batch is not None:
         if existing is None or batch is None:
             raise ValueError("partial drum checkpoint exists")
-        _assert_schedule_matches(db, existing, plan)
+        _validate_persisted_checkpoint(db, existing, batch)
         return {
             "ledger_generation_id": int(generation.id),
             "schedule_id": int(existing.id),
             "batch_id": int(batch.id),
             **dict(existing.metrics or {}),
         }
+
+    queue_rows = [
+        row
+        for row in materialize_assembly_queue_lines(db, int(generation.id))
+        if _d(row.assembly_remaining_qty) > 0
+    ]
+    plan = _plan(db, generation, queue_rows)
 
     schedule = models.DrumSchedule(
         ledger_generation_id=int(generation.id),

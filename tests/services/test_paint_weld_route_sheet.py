@@ -30,8 +30,9 @@ from app.models import (
 )
 from app.services.one_c_production_order_export import PRODUCTION_ORDER_ENTITY
 from app.services.production_control_printing import (
+    build_route_sheet_snapshot_payloads,
     mark_route_sheets_printed,
-    render_route_sheets_html,
+    render_route_sheets_from_snapshots,
 )
 
 
@@ -174,10 +175,37 @@ def _setup_chain(db):
     return paint_product, weld_product, painted, welded, metal
 
 
+def _render_route_sheets_snapshot_html(
+    db_session,
+    product_ids: list[int],
+    *,
+    auto_print: bool = False,
+) -> str:
+    payload_by_product = build_route_sheet_snapshot_payloads(
+        db_session,
+        product_ids,
+        ledger_generation_id=int(db_session.info.get("production_journal_generation_id") or 0)
+        or None,
+    )
+    unique_payloads: list[dict[str, object]] = []
+    seen_anchors: set[int] = set()
+    for product_id in product_ids:
+        payload = payload_by_product.get(int(product_id))
+        if not isinstance(payload, dict):
+            continue
+        anchor_product_id = int(payload.get("anchor_product_id") or payload.get("sheet", {}).get("product_id", 0))
+        if anchor_product_id <= 0 or anchor_product_id in seen_anchors:
+            continue
+        seen_anchors.add(anchor_product_id)
+        unique_payloads.append(payload)
+    return render_route_sheets_from_snapshots(unique_payloads, auto_print=auto_print)
+
+
+
 def test_chain_route_sheet_is_single_with_two_operation_blocks(db_session):
     paint_product, weld_product, painted, welded, metal = _setup_chain(db_session)
 
-    html = render_route_sheets_html(db_session, [paint_product.product_id])
+    html = _render_route_sheets_snapshot_html(db_session, [paint_product.product_id])
 
     assert html.count('<section class="sheet">') == 1
     # два блока операций с 1С-номерами соответствующих заказов
@@ -193,10 +221,28 @@ def test_chain_route_sheet_is_single_with_two_operation_blocks(db_session):
     assert "Кронштейн после покраски" in html
 
 
+def test_route_sheet_quantities_ignore_corrupt_remaining_cache(db_session):
+    paint_product, weld_product, *_ = _setup_chain(db_session)
+    paint_product.produced_qty = 2
+    paint_product.remaining_qty = 999
+    weld_product.produced_qty = 2
+    weld_product.remaining_qty = 999
+    db_session.commit()
+
+    html = _render_route_sheets_snapshot_html(db_session, [paint_product.product_id])
+
+    # Weld remaining is 6 - 2 = 4, therefore steel is 4 * 2.5 = 10.
+    assert "Сварка — заказ 1С №1C-WELD-1 · 4 шт" in html
+    assert "10.000" in html
+    # Paint quantity is 10 - 2 = 8.
+    assert "Окраска — заказ 1С №1C-PAINT-1 · 8 шт" in html
+    assert "999 шт" not in html
+
+
 def test_chain_route_sheet_deduplicates_both_sides_selected(db_session):
     paint_product, weld_product, *_ = _setup_chain(db_session)
 
-    html = render_route_sheets_html(
+    html = _render_route_sheets_snapshot_html(
         db_session, [paint_product.product_id, weld_product.product_id]
     )
 
@@ -207,7 +253,7 @@ def test_chain_route_sheet_deduplicates_both_sides_selected(db_session):
 def test_chain_route_sheet_from_welded_side_renders_same_combined_sheet(db_session):
     paint_product, weld_product, *_ = _setup_chain(db_session)
 
-    html = render_route_sheets_html(db_session, [weld_product.product_id])
+    html = _render_route_sheets_snapshot_html(db_session, [weld_product.product_id])
 
     assert html.count('<section class="sheet">') == 1
     assert "Сварка — заказ 1С №1C-WELD-1" in html
@@ -244,7 +290,7 @@ def test_chain_route_sheet_includes_transfers_of_both_orders(db_session):
     )
     db.commit()
 
-    html = render_route_sheets_html(db_session, [paint_product.product_id])
+    html = _render_route_sheets_snapshot_html(db_session, [paint_product.product_id])
 
     assert "MT-WELD-1" in html
     assert "MT-PAINT-1" in html
@@ -296,7 +342,7 @@ def test_route_sheet_without_chain_unchanged(db_session):
     db.add(solo_product)
     db.commit()
 
-    html = render_route_sheets_html(db_session, [solo_product.product_id])
+    html = _render_route_sheets_snapshot_html(db_session, [solo_product.product_id])
 
     assert html.count('<section class="sheet">') == 1
     assert "Одиночная деталь" in html

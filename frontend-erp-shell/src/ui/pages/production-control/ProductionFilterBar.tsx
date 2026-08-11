@@ -11,7 +11,7 @@ type Props = {
   onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
-const coverageOptions = ['shortage', 'partial', 'ready', 'to_move', 'assembled'] as const
+const coverageOptions = ['unknown', 'shortage', 'partial', 'ready'] as const
 
 export function ProductionFilterBar({ filters, resources, onChange, onSubmit, onToggleSort }: Props) {
   return (

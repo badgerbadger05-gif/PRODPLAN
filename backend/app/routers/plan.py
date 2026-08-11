@@ -1,7 +1,7 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..database import get_db
 from ..services.stage_directory import fetch_stages
@@ -22,13 +22,6 @@ from ..services.planning_service import (
     get_active_planning_config_full
 )
 from ..schemas import ProductionGroupedResponse, PurchaseCategoryGroupedResponse, ReworkGroupedResponse
-from ..models import ForcedOrderRequest
-
-from ..services.forced_orders import (
-    create_forced_order_request,
-    process_forced_order_request,
-    export_forced_order_xlsx,
-)
 from ..services.mrp_result_snapshot import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
@@ -66,6 +59,9 @@ def _read_all_mrp_snapshot_rows(
     snapshot_id: Optional[int],
     item_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
+    supplier_ref1c: Optional[str] = None,
+    category_id: Optional[int] = None,
+    category_ref1c: Optional[str] = None,
     area_id: Optional[int] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -83,6 +79,9 @@ def _read_all_mrp_snapshot_rows(
             snapshot_id=pinned_snapshot_id,
             item_id=item_id,
             root_item_id=root_item_id,
+            supplier_ref1c=supplier_ref1c,
+            category_id=category_id,
+            category_ref1c=category_ref1c,
             area_id=area_id,
             date_from=date_from,
             date_to=date_to,
@@ -301,10 +300,7 @@ class PeriodPlanFixRequest(BaseModel):
 
 
 class PeriodPlanMrpSnapshotRequest(BaseModel):
-    # Optional by contract: the refresh key is infrastructure, resolved by the
-    # server from the current accepted Ledger generation.  It stays accepted for
-    # operator/worker callers that must pin an exact retry key.
-    generation_key: Optional[str] = None
+    # Transport hint only. The server chooses the deterministic refresh key.
     started_by: Optional[str] = None
 
 
@@ -319,16 +315,167 @@ class PeriodPlanUpdateRequest(BaseModel):
     comment: Optional[str] = None
 
 
-# ===== Forced orders (manual/override) =====
+class ExecutionJournalTruthMeta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    accepted_at: str | None = None
+    accepted_by: str | None = None
+    truth_source: str | None = None
+    unavailable_sections: list[str] | None = None
+    unavailable_reason: str | None = None
 
 
-class ForcedOrderCreateRequest(BaseModel):
-    run_id: Optional[int] = None
+class ExecutionJournalInformationLinkEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: int
+    url: str
+
+
+class ExecutionJournalInformationLinks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_events: list[ExecutionJournalInformationLinkEvent] = []
+
+
+class ExecutionJournalLedgerEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: int
+    reservation_id: int
+    sle_id: int | None = None
+    fact_ref: str | None = None
+    fact_line_ref: str | None = None
+    match_rule: str | None = None
+
+
+class ExecutionJournalLedgerLinks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     item_id: int
-    need_date: str
-    requested_qty: float
-    created_by: Optional[str] = None
-    reason: Optional[str] = None
+    reservation_ids: list[int] = []
+    events: list[ExecutionJournalLedgerEvent] = []
+
+
+class ExecutionJournalWorkItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["production_order", "planned_order", "planned_purchase", "planned_rework"]
+    qty: float
+    product_id: int | None = None
+    order_id: int | None = None
+    order_number: str | None = None
+    order_ref1c: str | None = None
+    order_source: str | None = None
+    one_c_opened: bool | None = None
+    opened_at: str | None = None
+    order_state: str | None = None
+    purchase_id: int | None = None
+    rework_id: int | None = None
+    completed_qty: float | None = None
+    remaining_qty: float | None = None
+    need_date: str | None = None
+    order_date: str | None = None
+    lead_time_days: int | None = None
+    forecast_date: str | None = None
+    forecast_shift_days: int | None = None
+    forecast_reason: str | None = None
+    forecast_status: Literal["early", "on_time", "delayed", "critical", "unavailable"] | None = None
+
+
+class ExecutionJournalRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    req_id: int
+    item_id: int
+    item_code: str
+    item_name: str
+    flow: Literal["production", "purchase", "rework"]
+    bom_level: int
+    gross_qty: float
+    net_qty: float
+    ordered_qty: float
+    completed_qty: float | None
+    coverage_pct: float | None
+    remaining_qty: float | None
+    work_items: list[ExecutionJournalWorkItem]
+    status: Literal["net_zero", "covered", "partial", "ordered", "none", "execution_unavailable"]
+    root_item_ids: list[int] = []
+    information_links: ExecutionJournalInformationLinks
+    reservation_ids: list[int] = []
+    execution_events: list[dict[str, object]] = []
+    execution_allocations: list[dict[str, object]] = []
+    ledger_links: ExecutionJournalLedgerLinks | None = None
+    item_article: str | None = None
+    stock_qty: float | None = None
+    covered_qty: float | None = None
+    progress_base_qty: float | None = None
+    execution_available: bool | None = None
+    execution_unavailable_reason: str | None = None
+    execution_source: str | None = None
+    need_date: str | None = None
+    status_label: str | None = None
+    forecast_date: str | None = None
+    forecast_shift_days: int | None = None
+    forecast_reason: str | None = None
+    forecast_status: Literal["early", "on_time", "delayed", "critical", "unavailable"] | None = None
+    purchase_covered_qty: float | None = None
+    purchase_to_order_qty: float | None = None
+    unassigned_qty: float | None = None
+
+
+class ExecutionJournalSummaryByFlow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    completed_qty: float
+    base_qty: float
+    execution_pct: float | None
+    available: bool = True
+    total_base_qty: float | None = None
+    confirmed_pct: float | None = None
+    covered_pct: float | None = None
+    to_order_pct: float | None = None
+    purchase_covered_qty: float | None = None
+    purchase_to_order_qty: float | None = None
+
+
+class ExecutionJournalSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    truth_status: str
+    total_items: int
+    execution_completed_qty: float | None = None
+    execution_base_qty: float | None = None
+    execution_available_base_qty: float | None = None
+    execution_pct: float | None = None
+    execution_confirmed_pct: float | None = None
+    execution_partial: bool | None = None
+    fully_covered: int | None = None
+    partially_covered: int | None = None
+    not_covered: int | None = None
+    net_zero: int | None = None
+    execution_by_flow: dict[str, ExecutionJournalSummaryByFlow] | None = None
+
+
+class ExecutionJournalResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan: dict[str, object]
+    run_id: int
+    rows: list[ExecutionJournalRow]
+    summary: ExecutionJournalSummary
+    total: int
+    limit: int
+    offset: int
+    truth_status: str | None = None
+    ledger_generation: str | int | None = None
+    truth_generation_id: int | None = None
+    cutoff: str | None = None
+    truth_cutoff: str | None = None
+    truth_meta: ExecutionJournalTruthMeta | dict[str, object] | None = None
+    truth_reason: str | None = None
+    reason: str | None = None
+    facets: dict[str, list[int]] | None = None
 
 
 class PurchaseOrder1CExportRequest(BaseModel):
@@ -508,14 +655,13 @@ async def period_plans_mrp_snapshot(
     Основной сценарий — атомарный `POST /period-plans/{id}/fix`. Этот маршрут
     остаётся идемпотентным повтором: если у плана уже есть снимок в текущем
     принятом поколении, он возвращается как есть и ничего не форкается.
-    `generation_key` необязателен — сервер выводит его из текущего принятого
+    Ключ формируется сервером автоматически из плана и текущего принятого
     поколения.
     """
     try:
         result = create_mrp_snapshot_for_plan(
             db,
             plan_id,
-            generation_key=req.generation_key,
             started_by=req.started_by or "api",
         )
         db.commit()
@@ -551,21 +697,42 @@ async def period_plans_repair_duplicate_snapshots(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/period-plans/{plan_id}/execution-journal")
+@router.get(
+    "/period-plans/{plan_id}/execution-journal",
+    response_model=ExecutionJournalResponse,
+)
 async def period_plans_execution_journal(
     plan_id: int,
     run_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
     bom_level: Optional[int] = None,
     flow: Optional[str] = None,
+    status: Optional[str] = None,
+    include_net_zero: bool = True,
+    sort_by: Literal["bom_level", "item_article", "item_code", "item_name", "flow", "gross_qty", "net_qty", "ordered_qty", "completed_qty", "remaining_qty", "need_date", "coverage_pct", "status"] = "bom_level",
+    sort_dir: Literal["asc", "desc"] = "asc",
+    limit: int = 100,
+    offset: int = 0,
     db: Session = Depends(get_db),
-):
+) -> ExecutionJournalResponse:
     try:
-        return get_period_plan_execution_journal(
-            db, plan_id, run_id=run_id, root_item_id=root_item_id, bom_level=bom_level, flow=flow
+        payload = get_period_plan_execution_journal(
+            db,
+            plan_id,
+            run_id=run_id,
+            root_item_id=root_item_id,
+            bom_level=bom_level,
+            flow=flow,
+            status=status,
+            include_net_zero=include_net_zero,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            limit=limit,
+            offset=offset,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    return ExecutionJournalResponse.model_validate(payload)
 
 
 @router.get("/anchor")
@@ -764,6 +931,9 @@ async def get_planning_result_purchases(
     item_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
+    supplier_ref1c: Optional[str] = None,
+    category_id: Optional[int] = None,
+    category_ref1c: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 100,
@@ -782,6 +952,9 @@ async def get_planning_result_purchases(
             snapshot_id=snapshot_id,
             item_id=item_id,
             root_item_id=root_item_id,
+            supplier_ref1c=supplier_ref1c,
+            category_id=category_id,
+            category_ref1c=category_ref1c,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
@@ -1022,87 +1195,6 @@ async def get_planning_result_capacity(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/forced_orders")
-async def create_forced_order(
-    req: ForcedOrderCreateRequest,
-    db: Session = Depends(get_db),
-):
-    """Создать заявку на «принудительный заказ» (не влияет на основной MRP run)"""
-    try:
-        rec = create_forced_order_request(
-            db,
-            run_id=req.run_id,
-            item_id=int(req.item_id),
-            need_date=str(req.need_date),
-            requested_qty=float(req.requested_qty or 0.0),
-            created_by=req.created_by,
-            reason=req.reason,
-        )
-        db.commit()
-        return {"status": "ok", "request_id": int(rec.id)}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/forced_orders")
-async def list_forced_orders(
-    limit: int = 50,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-):
-    """Список заявок на принудительные заказы"""
-    try:
-        q = db.query(ForcedOrderRequest).order_by(ForcedOrderRequest.created_at.desc())
-        total = q.count()
-        rows = q.offset(max(0, int(offset))).limit(max(1, min(int(limit or 50), 500))).all()
-        out = []
-        for r in rows:
-            out.append(
-                {
-                    "id": int(r.id),
-                    "run_id": int(r.run_id) if r.run_id is not None else None,
-                    "item_id": int(r.item_id),
-                    "need_date": r.need_date.isoformat() if getattr(r, "need_date", None) else None,
-                    "requested_qty": float(getattr(r, "requested_qty", 0.0) or 0.0),
-                    "status": getattr(r, "status", None),
-                    "created_by": getattr(r, "created_by", None),
-                    "reason": getattr(r, "reason", None),
-                    "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
-                }
-            )
-        return {"status": "ok", "rows": out, "total": int(total), "limit": int(limit), "offset": int(offset)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/forced_orders/{request_id}/process")
-async def process_forced_order(
-    request_id: int,
-    db: Session = Depends(get_db),
-):
-    """Посчитать принудительный заказ (комплектующие не блокируют, но дефицит фиксируется в diagnostics)"""
-    try:
-        result = process_forced_order_request(db=db, request_id=int(request_id))
-        db.commit()
-        return {"status": "ok", "data": result}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/forced_orders/{request_id}/export")
-async def export_forced_order(
-    request_id: int,
-    db: Session = Depends(get_db),
-):
-    """Экспорт принудительного заказа в XLSX (base64)"""
-    try:
-        return export_forced_order_xlsx(db=db, request_id=int(request_id))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @router.get("/stages")
 async def get_stages(db: Session = Depends(get_db)):
     """Получить список этапов производства"""
@@ -1317,6 +1409,9 @@ async def export_planning_result_purchases(
     format: str = "csv",
     root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
+    supplier_ref1c: Optional[str] = None,
+    category_id: Optional[int] = None,
+    category_ref1c: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
@@ -1335,6 +1430,9 @@ async def export_planning_result_purchases(
             "purchase",
             snapshot_id=snapshot_id,
             root_item_id=root_item_id,
+            supplier_ref1c=supplier_ref1c,
+            category_id=category_id,
+            category_ref1c=category_ref1c,
             date_from=date_from,
             date_to=date_to,
             sort_dir=sort_dir,
@@ -1409,13 +1507,22 @@ class ReconcileRequest(BaseModel):
     dry_run: bool = False
 
 
+class SpecificationRebaseRequest(BaseModel):
+    dry_run: bool = False
+    changed_spec_refs: List[str] = Field(default_factory=list)
+
+
+class PendingSpecificationRebaseRequest(BaseModel):
+    dry_run: bool = False
+
+
 @router.post("/mrp/run/{run_id}/close")
 async def close_mrp_run(
     run_id: int,
     req: ReconcileRequest = ReconcileRequest(),
     db: Session = Depends(get_db),
 ):
-    """Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).
+    """Явно закрыть плановый прогон (FIXED_SNAPSHOT -> CLOSED).
 
     Закрытие убирает активные резервы из рабочих очередей (release),
     требования и закупочные строки не перезаписывает. Доступно только для
@@ -1428,6 +1535,55 @@ async def close_mrp_run(
     except ValueError as e:
         detail = str(e)
         raise HTTPException(status_code=404 if "не найден" in detail else 400, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/mrp/run/{run_id}/rebase-specification")
+async def rebase_mrp_run_for_specification(
+    run_id: int,
+    req: SpecificationRebaseRequest = SpecificationRebaseRequest(),
+    db: Session = Depends(get_db),
+):
+    """Create a successor MRP only for the predecessor's unproduced roots."""
+    from ..services.specification_mrp_rebase import (
+        rebase_fixed_plan_remaining_roots,
+    )
+
+    try:
+        return rebase_fixed_plan_remaining_roots(
+            db,
+            int(run_id),
+            changed_spec_refs=req.changed_spec_refs,
+            started_by=f"api:specification_rebase:{int(run_id)}",
+            dry_run=bool(req.dry_run),
+        )
+    except ValueError as e:
+        detail = str(e)
+        raise HTTPException(
+            status_code=404 if "не найден" in detail else 400,
+            detail=detail,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/mrp/specification-rebase/run-pending")
+async def run_pending_specification_rebase(
+    req: PendingSpecificationRebaseRequest = PendingSpecificationRebaseRequest(),
+    db: Session = Depends(get_db),
+):
+    """Run/preview one durable automatic rebase item (benchmark entrypoint)."""
+    from ..services.specification_rebase_worker import (
+        run_one_pending_specification_rebase,
+    )
+
+    try:
+        return run_one_pending_specification_rebase(
+            db,
+            dry_run=bool(req.dry_run),
+            started_by="api:pending_specification_rebase",
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1526,4 +1682,3 @@ async def export_planning_result_rework(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-

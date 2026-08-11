@@ -60,12 +60,7 @@ def _accepted_generation(db: Session, ledger_generation_id: int) -> models.Ledge
 
 
 def _pool_mapping(mapping: Mapping[str, str] | None) -> dict[str, str]:
-    """Normalize an injected, authoritative destination -> planning-pool map.
-
-    There is currently no authoritative database mapping for this boundary.
-    In particular, ``StockWarehouse.is_selected`` is a UI/configuration flag,
-    not proof that incoming WIP belongs to a planning pool.
-    """
+    """Normalize the live planning-contour mapping resolved by orchestration."""
     return {
         _text(warehouse): _text(pool)
         for warehouse, pool in (mapping or {}).items()
@@ -199,6 +194,9 @@ def collect_wip_future_supply_evidence(
         elif not destination:
             status, reason = "rejected", "missing destination warehouse mapping"
         elif not planning_pool:
+            # Production lines are read without any state/date filter, so a
+            # finished-goods or retired destination is normal input: reject the
+            # line, never the whole capture.
             status, reason = "rejected", "planning_pool_not_mapped"
         elif invalid_reasons.get(product_id):
             status, reason = "rejected", "; ".join(sorted(invalid_reasons[product_id]))
@@ -215,6 +213,7 @@ def collect_wip_future_supply_evidence(
             source_ref=order_ref or None,
             source_line_ref=line_ref or None,
             source_local_id=f"production_product:{product_id}",
+            source_requirement_id=product.source_mrp_requirement_id,
             ordered_qty_at_cutoff=_decimal(product.quantity),
             realized_qty_at_cutoff=realized[product_id],
             eta_date=eta,

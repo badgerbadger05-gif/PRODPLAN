@@ -22,7 +22,7 @@ from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
-from .reconcile import contour_warehouse_refs
+from .recorder_identity import SYNC_LINK_FACT_STATUSES
 from .reservation import append_realization_event, fold_reservation_entry
 
 
@@ -42,7 +42,7 @@ def bucket_capacity_for_mode(
     mode: str,
 ) -> Decimal:
     mode_key = str(mode or "").lower()
-    if mode_key == "make":
+    if mode_key in ("make", "rework"):
         return max(_decimal(bucket.net_qty), Decimal("0"))
     if mode_key == "buy":
         return max(_decimal(bucket.net_qty), Decimal("0"))
@@ -107,10 +107,12 @@ def _identity_for_sle(
     ).first():
         order_refs.add(recorder)
 
-    # Relevant successful export links may identify the local source document.
+    # Exported or subsequently read-back-as-posted links may identify the local
+    # source document. The link is provenance only; the fact itself is still
+    # the visible StockLedgerEntry of this explicit generation.
     links = db.query(models.SyncLink).filter(
         models.SyncLink.target_ref_key == recorder,
-        models.SyncLink.status == "success",
+        models.SyncLink.status.in_(SYNC_LINK_FACT_STATUSES),
         models.SyncLink.source_doctype == "material_issue",
     ).all()
     order_ids: set[int] = set()
@@ -220,7 +222,6 @@ def run_historical_replay(
     reserves: list[Reserve] = []
     entry_by_core_id: dict[str, ReservationEntry] = {}
     pools_by_key: dict[tuple[int, str, str], set[str]] = {}
-    contour_refs = contour_warehouse_refs(db)
     has_warehouse_policy = db.query(models.StockWarehouse).count() > 0
     visible_candidates = [
         row
@@ -249,7 +250,12 @@ def run_historical_replay(
         reserve = Reserve(
             reserve_id=core_id,
             item_id=int(row.item_id),
-            mode=str(row.realization_mode),  # validated by pure core
+            # ``rework`` is known rework with no executor, not an
+            # unknown fact class.  Physical assembly output is still a make
+            # fact and therefore realizes this frozen reserve address-first,
+            # then FIFO.  Keep that mapping at the persistence boundary so
+            # the pure allocator remains a two-fact-kind core.
+            mode="make" if str(row.realization_mode) == "rework" else str(row.realization_mode),
             reserved_qty=_decimal(row.replenishment_required_qty),
             due_date=row.priority_period_to,
             plan_period_from=row.priority_period_from,
@@ -289,28 +295,19 @@ def run_historical_replay(
             ignored_rows.append(row)
             continue
         mode = _fact_mode(row)
-        if (
-            mode == "make"
-            and (
-                not has_warehouse_policy
-                or not str(row.warehouse_ref1c or "").strip()
-                or str(row.warehouse_ref1c).strip() in contour_refs
-            )
-        ):
-            excluded_make_facts += 1
-            excluded_make_qty += abs(_decimal(row.qty))
-            excluded_make_samples.append({
-                "sle_id": int(row.id),
-                "warehouse_ref1c": str(row.warehouse_ref1c or ""),
-                "reason": (
-                    "warehouse_policy_missing"
-                    if not has_warehouse_policy
-                    else "ambiguous"
-                    if not str(row.warehouse_ref1c or "").strip()
-                    else "contour"
-                ),
-            })
-            continue
+        if mode == "make":
+            sle_id = int(row.id)
+            warehouse_ref = str(row.warehouse_ref1c or "").strip()
+            if not has_warehouse_policy:
+                raise ValueError(
+                    f"historical replay rejected make fact sle_id={sle_id}: "
+                    f"reason=warehouse_policy_missing"
+                )
+            if not warehouse_ref:
+                raise ValueError(
+                    f"historical replay rejected make fact sle_id={sle_id}: "
+                    f"reason=warehouse_ref_missing"
+                )
         exact_key = (
             int(row.item_id),
             "",

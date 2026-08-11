@@ -158,7 +158,55 @@ def test_supplier_return_unwinds_latest_receipts_fifo_by_item():
     assert [(row.reservation.requirement_id, row.qty) for row in allocations] == [
         (10, Decimal("3")),
         (20, Decimal("2")),
+        (10, Decimal("-2")),
+    ]
+    assert unplanned == 0
+
+
+def test_supplier_return_same_order_line_unwinds_newest_then_global_fifo():
+    allocations, unplanned = allocate_supplier_receipts(
+        [
+            _fact(1, 2),
+            _fact(2, 2),
+            _fact(3, 5, order="order-2", line="2"),
+            _fact(4, -6),
+        ],
+        {
+            1: [_reservation(1, 10, 2), _reservation(2, 20, 2), _reservation(3, 30, 6)],
+        },
+    )
+    assert [(row.reservation.requirement_id, row.qty) for row in allocations] == [
+        (10, Decimal("2")),
+        (20, Decimal("2")),
+        (30, Decimal("5")),
         (20, Decimal("-2")),
+        (10, Decimal("-2")),
+        (30, Decimal("-2")),
+    ]
+    assert unplanned == 0
+
+
+def test_exact_order_line_allocation_is_capped_then_global_fifo():
+    reservations = {
+        1: [
+            _reservation(1, 10, 10),
+            _reservation(2, 20, 10),
+        ],
+    }
+    allocations, unplanned = allocate_supplier_receipts(
+        [_fact(1, 9)],
+        reservations,
+        exact_allocation_caps={
+            (1, "order-1", "1"): {
+                1: Decimal("2"),
+                2: Decimal("2"),
+            },
+        },
+    )
+    assert [(row.reservation.id, row.qty) for row in allocations] == [
+        (1, Decimal("2")),
+        (2, Decimal("2")),
+        (1, Decimal("5")),
     ]
     assert unplanned == 0
 

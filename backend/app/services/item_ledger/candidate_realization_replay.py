@@ -28,10 +28,10 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _manifest_candidate_runs(
+def _manifest_replay_runs(
     db: Session,
     target: models.LedgerGeneration,
-) -> list[models.PlanningRun]:
+) -> tuple[list[models.PlanningRun], tuple[int, ...]]:
     marks = dict(target.source_watermarks or {})
     manifest = marks.get("obligation_refresh_manifest")
     content_hash = marks.get("obligation_refresh_manifest_hash")
@@ -85,6 +85,10 @@ def _manifest_candidate_runs(
             retired_ids.add(retired_id)
             plan_ids.add(plan_id)
             continue
+        if action != "add":
+            raise CandidateRealizationReplayError(
+                "obligation_refresh_manifest contains unsupported action"
+            )
         try:
             candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -143,7 +147,11 @@ def _manifest_candidate_runs(
     ).first()
     if outside is not None:
         raise CandidateRealizationReplayError("target reservation run is outside sealed manifest")
-    return sorted(by_id.values(), key=lambda row: (row.period_from, row.period_to, row.run_id))
+    replay_run_ids = tuple(sorted(candidate_ids | retained_ids))
+    return (
+        sorted(by_id.values(), key=lambda row: (row.period_from, row.period_to, row.run_id)),
+        replay_run_ids,
+    )
 
 
 def _replay_from(value: Any) -> datetime:
@@ -198,16 +206,17 @@ def replay_candidate_realizations(
         raise CandidateRealizationReplayError(
             "target does not reuse the current accepted physical prefix"
         )
-    runs = _manifest_candidate_runs(db, target)
+    runs, replay_run_ids = _manifest_replay_runs(db, target)
     lower_bound = replay_from
     result = run_historical_replay(
         db,
         int(target.id),
         replay_from=lower_bound,
-        run_ids=tuple(int(row.run_id) for row in runs),
+        run_ids=replay_run_ids,
     )
     return {
         **result,
         "candidate_run_ids": [int(row.run_id) for row in runs],
+        "replay_run_ids": list(replay_run_ids),
         "replay_from": lower_bound.isoformat(),
     }

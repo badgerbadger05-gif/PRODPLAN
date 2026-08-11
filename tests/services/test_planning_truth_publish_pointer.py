@@ -42,6 +42,16 @@ def _accepted(db, key: str, *, cutoff: datetime | None = None):
     )
     db.add(generation)
     db.flush()
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(generation.id),
+        cutoff=generation.cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=generation.cutoff,
+        built_at=generation.cutoff,
+    ))
+    db.flush()
     return generation
 
 

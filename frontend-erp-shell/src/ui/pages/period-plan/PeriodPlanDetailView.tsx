@@ -9,7 +9,6 @@ import type {
   PeriodPlanRun,
 } from '../../../domain/planning'
 import {
-  coverageClass,
   flowClass,
   flowLabel,
   journalRowStatus,
@@ -24,17 +23,12 @@ import { dateRu, dateTimeRu, qty } from '../../../lib/format'
 import { searchNomenclature } from '../../../services/productionPlan'
 import {
   addItemToPeriodPlan,
-  reconcileRun,
-  archivePeriodPlan,
   bulkUpsertPeriodPlanLines,
-  createMrpSnapshot,
-  createProductionOrdersFromRequirements,
   deleteItemFromPeriodPlan,
   fixPeriodPlan,
   getExecutionJournal,
   getPeriodPlanMatrix,
   listPeriodPlanRuns,
-  unarchivePeriodPlan,
   updatePeriodPlanHeader,
 } from '../../../services/periodPlan'
 import { DocumentWindow } from '../../layout/DocumentWindow'
@@ -48,7 +42,7 @@ import { ForecastShift } from './ForecastShift'
 
 type Tab = 'matrix' | 'journal'
 
-type JournalCoverageFilter = '' | 'covered' | 'partial' | 'ordered' | 'none' | 'net_zero' | 'incomplete'
+type JournalCoverageFilter = '' | 'incomplete' | 'covered' | 'partial' | 'ordered' | 'none' | 'net_zero' | 'execution_unavailable'
 
 interface DetailViewProps {
   planId: number
@@ -84,6 +78,8 @@ const periodPlanJournalColumns = [
   { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false, tooltip: 'Число заказов/заданий по строке; клик по строке раскрывает список' },
 ] as const satisfies TableColumnDoctype[]
 
+const JOURNAL_LIMIT = 100
+
 export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [plan, setPlan] = useState<PeriodPlan | null>(null)
   const [tab, setTab] = useState<Tab>('matrix')
@@ -105,6 +101,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [journalRootDialogOpen, setJournalRootDialogOpen] = useState(false)
   const [journalSortBy, setJournalSortBy] = useState<JournalSortKey>('bom_level')
   const [journalSortDir, setJournalSortDir] = useState<SortDir>('asc')
+  const [journalOffset, setJournalOffset] = useState(0)
   const [expandedReq, setExpandedReq] = useState<number | null>(null)
   const [lastRunId, setLastRunId] = useState<number | null>(null)
 
@@ -138,10 +135,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const matrixInputRefs = useRef<Record<string, HTMLInputElement | null>>({})
 
   const isDraft = plan?.status === 'draft'
-  const isFixed = plan?.status === 'fixed'
-  const isArchived = plan?.status === 'archived'
   const hasDirty = Object.keys(dirty).length > 0
-  const hasRuns = runs.length > 0 || lastRunId !== null
   const activeRunId = selectedRunId ?? lastRunId ?? runs[0]?.run_id ?? null
 
   const loadMatrix = useCallback(async () => {
@@ -172,12 +166,41 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }, [planId, selectedRunId])
 
-  const loadJournal = useCallback(async (flow = journalFlow, runId?: number, rootItemId = journalRootItemId) => {
+  const loadJournal = useCallback(async (
+    options: {
+      run_id?: number | null
+      flow?: string
+      root_item_id?: number | null
+      bom_level?: string
+      status?: JournalCoverageFilter
+      include_net_zero?: boolean
+      sort_by?: JournalSortKey
+      sort_dir?: SortDir
+      offset?: number
+    } = {},
+  ) => {
+    const nextRunId = options.run_id ?? activeRunId
+    const hasRootItemFilter = Object.prototype.hasOwnProperty.call(options, 'root_item_id')
+    const bomLevel = options.bom_level ?? journalBomLevel
+    const status = options.status ?? journalCoverage
+    const includeNetZero = options.include_net_zero ?? (journalShowNetZero || status === 'net_zero')
     setJournalLoading(true)
     setJournalError('')
     try {
-      const data = await getExecutionJournal(planId, { flow: flow || undefined, run_id: runId, root_item_id: rootItemId })
+      const data = await getExecutionJournal(planId, {
+        flow: (options.flow ?? journalFlow) || undefined,
+        run_id: nextRunId ?? undefined,
+        root_item_id: hasRootItemFilter ? options.root_item_id : journalRootItemId,
+        bom_level: bomLevel ? Number(bomLevel) : undefined,
+        status: status === 'execution_unavailable' ? status : status || undefined,
+        include_net_zero: includeNetZero,
+        sort_by: options.sort_by ?? journalSortBy,
+        sort_dir: options.sort_dir ?? journalSortDir,
+        limit: JOURNAL_LIMIT,
+        offset: options.offset ?? journalOffset,
+      })
       setJournal(data)
+      setJournalOffset(data.offset)
       setLastRunId(data.run_id)
       if (!selectedRunId) setSelectedRunId(data.run_id)
       setPlan(data.plan)
@@ -187,15 +210,29 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     } finally {
       setJournalLoading(false)
     }
-  }, [journalFlow, journalRootItemId, planId, selectedRunId])
+  }, [
+    activeRunId,
+    journalBomLevel,
+    journalCoverage,
+    journalFlow,
+    journalRootItemId,
+    journalShowNetZero,
+    journalSortBy,
+    journalSortDir,
+    journalOffset,
+    planId,
+    selectedRunId,
+  ])
 
   useEffect(() => { void loadMatrix() }, [loadMatrix])
   useEffect(() => { void loadRuns() }, [loadRuns])
 
   useEffect(() => {
     if (tab === 'matrix' && !matrix) void loadMatrix()
-    if (tab === 'journal' && !journal) void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
-  }, [journal, loadJournal, loadMatrix, matrix, tab, journalFlow, activeRunId, journalRootItemId])
+    if (tab === 'journal') {
+      void loadJournal({ run_id: activeRunId ?? undefined })
+    }
+  }, [activeRunId, loadJournal, loadMatrix, matrix, tab])
 
   // Autofocus search input on entering draft matrix
   useEffect(() => {
@@ -219,11 +256,11 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       allowInInteractive: true,
       run: () => {
         if (tab === 'matrix') void loadMatrix()
-        else void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
+        else void loadJournal({ run_id: activeRunId, offset: journalOffset })
         void loadRuns()
       },
     },
-  ], [activeRunId, journalFlow, journalRootItemId, loadJournal, loadMatrix, loadRuns, onBack, tab])
+  ], [activeRunId, loadJournal, loadMatrix, loadRuns, journalOffset, onBack, tab])
 
   function nonEmptyMatrix() {
     if (!matrix) return false
@@ -243,44 +280,13 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       setError('Нельзя зафиксировать пустой план. Введите хотя бы одно ненулевое количество.')
       return
     }
-    if (!confirm('Зафиксировать план? После фиксации редактирование уже введённых значений недоступно (можно только дозаполнять новые ячейки), и план можно прогнать через MRP-снимок.')) return
+    if (!confirm('Зафиксировать план? После фиксации редактирование уже введённых значений недоступно (можно только дозаполнять новые ячейки).')) return
     setActing(true)
     setError('')
     setMessage('')
     try {
       await fixPeriodPlan(planId)
-      setMessage('План зафиксирован. Теперь доступна кнопка «MRP снимок».')
-      await loadMatrix()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleArchive() {
-    if (!confirm('Отправить план в архив? Архивные планы скрываются из активной работы.')) return
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      await archivePeriodPlan(planId)
-      setMessage('План отправлен в архив')
-      await loadMatrix()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleUnarchive() {
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      await unarchivePeriodPlan(planId)
-      setMessage('План возвращён из архива')
+      setMessage('План зафиксирован.')
       await loadMatrix()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -317,72 +323,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       setMessage('Шапка плана сохранена')
       setEditingHeader(false)
       await loadMatrix()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleSnapshot() {
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await createMrpSnapshot(planId)
-      setLastRunId(result.run_id)
-      setSelectedRunId(result.run_id)
-      setMessage(`MRP-снимок создан: run #${result.run_id}, требований: ${result.requirement_count}, закупок: ${result.purchase_count}, переработок: ${result.rework_count}`)
-      setTab('journal')
-      await Promise.all([loadJournal(journalFlow, result.run_id, journalRootItemId), loadRuns()])
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleAllocate() {
-    const runId = activeRunId
-    if (!runId) return
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      const res = await reconcileRun(runId)
-      const prod = res.production_added?.length ?? 0
-      const purch = res.purchase_added?.length ?? 0
-      const moved = res.rescheduled?.floating ?? 0
-      setMessage(`Пересчёт: производство +${prod}, закупки +${purch}, перепланировано ${moved} строк`)
-      await loadJournal(journalFlow, runId, journalRootItemId)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleCreateProductionOrders() {
-    if (!journal) return
-    const reqIds = journal.rows
-      .filter((r) => r.flow === 'production' && r.remaining_qty > 1e-9)
-      .map((r) => r.req_id)
-    if (!reqIds.length) return
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await createProductionOrdersFromRequirements(reqIds)
-      const created = (result.created as unknown[]).length
-      const reused = (result.reused as unknown[]).length
-      const skipped = (result.skipped as unknown[]).length
-      const parts: string[] = []
-      if (created) parts.push(`создано ${created}`)
-      if (reused) parts.push(`уже было ${reused}`)
-      if (skipped) parts.push(`пропущено ${skipped}`)
-      setMessage(`Заказы производства: ${parts.join(', ') || 'нет изменений'}`)
-      if (result.errors?.length) setError(result.errors.join('; '))
-      await loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -460,33 +400,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     next?.select()
   }
 
-  function handleSpreadEvenly(itemId: number) {
-    if (!matrix) return
-    const row = matrix.rows.find((r) => r.item_id === itemId)
-    if (!row) return
-    const total = matrix.buckets.reduce((s, b) => s + cellValue(row, b), 0)
-    if (!total) return
-    const editable = matrix.buckets.filter((b) => !row.locked_buckets[b])
-    if (!editable.length) return
-    const per = Math.floor(total / editable.length)
-    const rem = total - per * editable.length
-    const newDirty: Record<string, number> = {}
-    editable.forEach((b, i) => { newDirty[b] = per + (i < rem ? 1 : 0) })
-    setDirty((prev) => ({ ...prev, [itemId]: { ...(prev[itemId] ?? {}), ...newDirty } }))
-  }
-
-  function handleCopyAcrossRow(itemId: number, sourceBucket: string) {
-    if (!matrix) return
-    const row = matrix.rows.find((r) => r.item_id === itemId)
-    if (!row) return
-    const val = cellValue(row, sourceBucket)
-    const newDirty: Record<string, number> = {}
-    matrix.buckets.forEach((b) => {
-      if (!row.locked_buckets[b]) newDirty[b] = val
-    })
-    setDirty((prev) => ({ ...prev, [itemId]: { ...(prev[itemId] ?? {}), ...newDirty } }))
-  }
-
   useEffect(() => {
     const query = searchQuery.trim()
     if (query.length < 2) {
@@ -556,60 +469,58 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }
 
   function toggleJournalSort(key: JournalSortKey) {
-    if (journalSortBy === key) setJournalSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
-    else { setJournalSortBy(key); setJournalSortDir('asc') }
+    const nextDir = journalSortBy === key && journalSortDir === 'asc' ? 'desc' : 'asc'
+    setJournalSortBy(key)
+    setJournalSortDir(nextDir)
+    setJournalOffset(0)
   }
   function jSortArrow(key: JournalSortKey) {
     if (journalSortBy !== key) return ''
     return journalSortDir === 'asc' ? ' ▲' : ' ▼'
   }
 
-  const filteredJournalRows = useMemo(() => {
-    if (!journal) return []
-    let rows = journal.rows.slice()
-    if (journalBomLevel !== '') {
-      const lvl = Number(journalBomLevel)
-      rows = rows.filter((r) => r.bom_level === lvl)
-    }
-    if (!journalShowNetZero && journalCoverage !== 'net_zero') {
-      rows = rows.filter((r) => journalRowStatus(r) !== 'net_zero')
-    }
-    if (journalCoverage) {
-      if (journalCoverage === 'incomplete') {
-        rows = rows.filter((r) => {
-          const status = journalRowStatus(r)
-          return status === 'partial' || status === 'ordered' || status === 'none'
-        })
-      } else {
-        rows = rows.filter((r) => journalRowStatus(r) === journalCoverage)
-      }
-    }
-    const dir = journalSortDir === 'asc' ? 1 : -1
-    rows.sort((a, b) => {
-      if (journalSortBy === 'status') {
-        return journalRowStatusLabel(journalRowStatus(a)).localeCompare(journalRowStatusLabel(journalRowStatus(b)), 'ru') * dir
-      }
-      const va: unknown = (a as unknown as Record<JournalSortKey, unknown>)[journalSortBy]
-      const vb: unknown = (b as unknown as Record<JournalSortKey, unknown>)[journalSortBy]
-      if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir
-      return String(va ?? '').localeCompare(String(vb ?? ''), 'ru') * dir
-    })
-    return rows
-  }, [journal, journalBomLevel, journalCoverage, journalShowNetZero, journalSortBy, journalSortDir])
+  const journalRows = journal?.rows ?? []
+
+  const journalOffsetPage = journal
+    ? Math.max(1, Math.floor(journal.offset / Math.max(1, journal.limit)) + 1)
+    : 1
+  const journalTotalPages = journal
+    ? Math.max(1, Math.ceil(journal.total / Math.max(1, journal.limit)))
+    : 1
+  const journalOffsetFrom = journal ? Math.min(journal.total, journal.offset + 1) : 0
+  const journalOffsetTo = journal ? Math.min(journal.total, journal.offset + journal.limit) : 0
+  const journalCanPrev = journalOffset > 0
+  const journalCanNext = journal ? journal.offset + journal.limit < journal.total : false
+
+  function jumpJournalOffset(nextOffset: number) {
+    setJournalOffset(Math.max(0, nextOffset))
+  }
+
+  function setJournalFilters(next: {
+    flow?: string
+    root_item_id?: number | null
+    bom_level?: string
+    status?: JournalCoverageFilter
+    include_net_zero?: boolean
+  }) {
+    if (typeof next.flow === 'string') setJournalFlow(next.flow)
+    if ('root_item_id' in next) setJournalRootItemId(next.root_item_id ?? null)
+    if (typeof next.bom_level === 'string') setJournalBomLevel(next.bom_level)
+    if (typeof next.status === 'string') setJournalCoverage(next.status)
+    if (typeof next.include_net_zero === 'boolean') setJournalShowNetZero(next.include_net_zero)
+    setJournalOffset(0)
+  }
 
   const bomLevels = useMemo(() => {
     if (!journal) return [] as number[]
+    if (journal.facets?.bom_levels?.length) return [...new Set(journal.facets.bom_levels)].sort((a, b) => a - b)
     return Array.from(new Set(journal.rows.map((r) => r.bom_level))).sort((a, b) => a - b)
   }, [journal])
 
   const journalExecutionPct = useMemo(() => {
     if (!journal || !isPlanningTruthAccepted(journal)) return null
     if (typeof journal.summary.execution_pct === 'number') return journal.summary.execution_pct
-    if (journal.summary.execution_pct === null) return null
-    const base = journal.rows.reduce((sum, row) => sum + (row.progress_base_qty ?? row.net_qty ?? 0), 0)
-    if (base <= 1e-9) return 100
-    const completed = journal.rows.reduce((sum, row) => sum + (row.completed_qty ?? 0), 0)
-    return Math.round((completed / base) * 1000) / 10
+    return null
   }, [journal])
 
   const journalExecutionByFlow = useMemo(() => {
@@ -644,14 +555,14 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           confirmedPct: source[flow]?.confirmed_pct ?? null,
           toOrderPct: null,
           base: source[flow]?.base_qty ?? 0,
-          available: source[flow]?.available !== false,
+          available: source[flow]?.available === true,
         }))
       const purchase = {
         ...purchaseRowBase,
         pct: source.purchase?.covered_pct ?? null,
         toOrderPct: source.purchase?.to_order_pct ?? null,
         base: source.purchase?.base_qty ?? 0,
-        available: source.purchase?.available !== false,
+        available: source.purchase?.available === true,
       }
       const knownFlows = new Set(['production', 'rework', 'purchase'])
       const extras = Object.keys(source)
@@ -663,31 +574,19 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           confirmedPct: source[flow]?.confirmed_pct ?? null,
           toOrderPct: null,
           base: source[flow]?.base_qty ?? 0,
-          available: source[flow]?.available !== false,
+          available: source[flow]?.available === true,
         }))
       return [...productionAndRework, purchase, ...extras].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
     }
-    const grouped = new Map<string, { completed: number; base: number }>()
-    journal.rows.forEach((row) => {
-      const base = row.progress_base_qty ?? row.net_qty ?? 0
-      const entry = grouped.get(row.flow) ?? { completed: 0, base: 0 }
-      entry.completed += row.completed_qty ?? 0
-      entry.base += base
-      grouped.set(row.flow, entry)
-    })
-    const productionAndRework = ['production', 'rework']
-      .map((flow) => {
-        const entry = grouped.get(flow)
-        const base = entry?.base ?? 0
-        const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
-        return { flow, label: flowLabel(flow), pct, confirmedPct: pct, toOrderPct: null, base, available: true }
-      })
-      .filter((row) => row.base > 1e-9)
-    const purchase = {
-      ...purchaseRowBase,
-      base: journal.rows.some((row) => row.flow === 'purchase') ? 1 : 0,
-    }
-    return [...productionAndRework, purchase].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
+    return ['production', 'rework', 'purchase'].map((flow) => ({
+      flow,
+      label: flowLabel(flow),
+      pct: null,
+      confirmedPct: null,
+      toOrderPct: null,
+      base: 0,
+      available: false,
+    }))
   }, [journal])
 
   const journalTruthAccepted = isPlanningTruthAccepted(journal)
@@ -704,13 +603,12 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   function downloadJournalCsv() {
     if (!journal) return
-    const rows = filteredJournalRows
     const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность (брутто)', 'Чистая потребность', 'Оформлено', 'Не оформлено', 'Выполнено', 'Осталось выполнить', 'Срок', 'Статус', 'Выполнение %', 'Заданий']
     const esc = (v: unknown) => {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
-    const body = rows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 0, r.completed_qty, r.remaining_qty, r.need_date ?? '', journalRowStatusLabel(journalRowStatus(r)), r.coverage_pct, r.work_items.length].map(esc).join(';'))
+    const body = journalRows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 0, r.completed_qty, r.remaining_qty, r.need_date ?? '', r.status_label || journalRowStatusLabel(journalRowStatus(r)), r.coverage_pct, r.work_items.length].map(esc).join(';'))
     const csv = '﻿' + [headers.join(';'), ...body].join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -821,17 +719,8 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     return links
   }
 
-  // Column sums for matrix footer
-  const matrixColSums = useMemo(() => {
-    if (!matrix) return {} as Record<string, number>
-    const sums: Record<string, number> = {}
-    matrix.buckets.forEach((b) => { sums[b] = 0 })
-    matrix.rows.forEach((row) => {
-      matrix.buckets.forEach((b) => { sums[b] += cellValue(row, b) })
-    })
-    return sums
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [matrix, dirty])
+  const matrixBucketTotals = matrix?.bucket_totals ?? {}
+  const matrixGrandTotal = matrix?.grand_total ?? matrix?.total_qty ?? 0
 
   const planTitle = plan ? plan.name : `План #${planId}`
   const planSubtitle = plan
@@ -871,24 +760,12 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           {isDraft && (
             <>
               <button onClick={() => void handleFix()} disabled={acting || hasDirty}>Зафиксировать</button>
-              {!editingHeader && <button onClick={startEditHeader} disabled={acting}>Изменить шапку</button>}
-            </>
-          )}
-          {isFixed && (
-            <button className="primary" onClick={() => void handleSnapshot()} disabled={acting}>MRP снимок</button>
-          )}
-          {hasRuns && (
-            <button onClick={() => void handleAllocate()} disabled={acting || !activeRunId} title="Пересчитать остаточную потребность: добор недопокрытия и перепланировка ещё не открытых в 1С заказов от сегодня">Пересчёт</button>
-          )}
-          {isFixed && (
-            <button onClick={() => void handleArchive()} disabled={acting}>В архив</button>
-          )}
-          {isArchived && (
-            <button onClick={() => void handleUnarchive()} disabled={acting}>Из архива</button>
-          )}
-          {hasDirty && tab === 'matrix' && (
-            <>
-              <div className="barSeparator" />
+                {!editingHeader && <button onClick={startEditHeader} disabled={acting}>Изменить шапку</button>}
+              </>
+            )}
+            {hasDirty && tab === 'matrix' && (
+              <>
+                <div className="barSeparator" />
               <button className="primary" onClick={() => void handleSaveMatrix()} disabled={saving}>Сохранить</button>
               <button onClick={() => { setDirty({}); void loadMatrix() }} disabled={saving}>Отмена</button>
             </>
@@ -1065,7 +942,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     {matrix.buckets.map((b) => (
                       <th key={b} style={{ width: 90, textAlign: 'right' }}>{bucketLabel(b)}</th>
                     ))}
-                    {isDraft && <th style={{ width: 38, textAlign: 'center' }} title="Распределить итого равномерно по доступным неделям">≡</th>}
                     {isDraft && <th style={{ width: 34, textAlign: 'center' }}>×</th>}
                   </tr>
                 </thead>
@@ -1080,7 +956,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           {row.item_article && <span className="muted">{row.item_article}</span>}
                         </td>
                         <td className="numCell">
-                          <strong>{qty(matrix.buckets.reduce((s, b) => s + cellValue(row, b), 0))}</strong>
+                          <strong>{qty(row.total_qty ?? 0)}</strong>
                         </td>
                         {matrix.buckets.map((b) => {
                           const locked = row.locked_buckets[b] !== undefined
@@ -1094,8 +970,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                 key={b}
                                 className="weekPlanCell"
                                 style={isDirtyCell ? { background: '#fff9e0' } : undefined}
-                                onDoubleClick={() => handleCopyAcrossRow(row.item_id, b)}
-                                title="Двойной клик — скопировать значение во все ячейки строки"
                               >
                                 <input
                                   ref={(el) => { matrixInputRefs.current[cellRefKey(row.item_id, b)] = el }}
@@ -1128,18 +1002,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                         {isDraft && (
                           <td style={{ textAlign: 'center', padding: 0 }}>
                             <button
-                              onClick={() => handleSpreadEvenly(row.item_id)}
-                              disabled={rowLocked}
-                              title={rowLocked ? 'Строка частично зафиксирована' : 'Распределить итого равномерно'}
-                              style={{ minHeight: 22, padding: '0 6px' }}
-                            >
-                              ≡
-                            </button>
-                          </td>
-                        )}
-                        {isDraft && (
-                          <td style={{ textAlign: 'center', padding: 0 }}>
-                            <button
                               onClick={() => void handleDeleteRow(row.item_id, row.item_name)}
                               disabled={rowLocked || deletingItemId === row.item_id}
                               title={rowLocked ? 'Строка зафиксирована MRP-прогоном' : 'Удалить строку'}
@@ -1164,12 +1026,17 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 {matrix.rows.length > 0 && (
                   <tfoot>
                     <tr style={{ position: 'sticky', bottom: 0, background: 'linear-gradient(#eef1f5,#dfe4ea)', fontWeight: 700 }}>
-                      <td colSpan={2} style={{ textAlign: 'right', paddingRight: 6 }}>Итого по неделям</td>
+                      <td colSpan={2} style={{ textAlign: 'right', paddingRight: 6 }}>
+                        Итого по неделям
+                        <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 6 }}>
+                          (серверно)
+                        </span>
+                      </td>
                       <td className="numCell">
-                        <strong>{qty(matrix.buckets.reduce((s, b) => s + (matrixColSums[b] ?? 0), 0))}</strong>
+                        <strong>{qty(matrixGrandTotal)}</strong>
                       </td>
                       {matrix.buckets.map((b) => (
-                        <td key={b} className="numCell"><strong>{qty(matrixColSums[b] ?? 0)}</strong></td>
+                        <td key={b} className="numCell"><strong>{qty(matrixBucketTotals[b] ?? 0)}</strong></td>
                       ))}
                       {isDraft && <td />}
                       {isDraft && <td />}
@@ -1184,17 +1051,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         {/* Journal tab */}
         {tab === 'journal' && (
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-            <div className="commandBar">
-              <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)} disabled={journalLoading}>Обновить</button>
+          <div className="commandBar">
+              <button onClick={() => void loadJournal({ run_id: activeRunId ?? undefined, flow: journalFlow, root_item_id: journalRootItemId })} disabled={journalLoading}>Обновить</button>
               <button onClick={downloadJournalCsv} disabled={!journal || !journalTruthAccepted || journalLoading}>CSV</button>
               <div className="barSeparator" />
-              <button
-                onClick={() => void handleCreateProductionOrders()}
-                disabled={acting || !journal || !journalTruthAccepted || !journal.rows.some((r) => r.flow === 'production' && r.remaining_qty > 1e-9)}
-                title="Создать заказы производства для незакрытых строк производственного потока"
-              >
-                Создать заказы производства
-              </button>
               {journal && (
                 <>
                   <div className="barSeparator" />
@@ -1217,7 +1077,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   ))}
                   <button
                     className="filterBtn"
-                    onClick={() => setJournalCoverage((v) => (v === 'covered' ? '' : 'covered'))}
+                    onClick={() => {
+                      const status = journalCoverage === 'covered' ? '' : 'covered'
+                      setJournalFilters({ status })
+                    }}
                     title="Показать только закрытые строки"
                   >
                     Закрыто: {journal.summary.fully_covered} / {journal.summary.total_items}
@@ -1226,7 +1089,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     <button
                       className="filterBtn"
                       style={{ color: 'var(--red)' }}
-                      onClick={() => setJournalCoverage((v) => (v === 'none' ? '' : 'none'))}
+                      onClick={() => {
+                        const status = journalCoverage === 'none' ? '' : 'none'
+                        setJournalFilters({ status })
+                      }}
                       title="Показать только строки без оформленных заказов"
                     >
                       Не начато: {journal.summary.not_covered}
@@ -1236,20 +1102,13 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     <button
                       className="filterBtn"
                       style={{ color: 'var(--orange)' }}
-                      onClick={() => setJournalCoverage((v) => (v === 'partial' ? '' : 'partial'))}
+                      onClick={() => {
+                        const status = journalCoverage === 'partial' ? '' : 'partial'
+                        setJournalFilters({ status })
+                      }}
                       title="Показать только частично выполненные строки"
                     >
                       Частично: {journal.summary.partially_covered}
-                    </button>
-                  )}
-                  {journal.summary.not_covered + journal.summary.partially_covered > 0 && (
-                    <button
-                      className="filterBtn"
-                      style={{ color: 'var(--red)' }}
-                      onClick={() => setJournalCoverage((v) => (v === 'incomplete' ? '' : 'incomplete'))}
-                      title="Показать строки с неполным выполнением"
-                    >
-                      Невыполнено: {journal.summary.not_covered + journal.summary.partially_covered}
                     </button>
                   )}
                   {journal.summary.net_zero > 0 && (
@@ -1257,11 +1116,19 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       <input
                         type="checkbox"
                         checked={journalShowNetZero}
-                        onChange={(e) => setJournalShowNetZero(e.target.checked)}
+                        onChange={(e) => setJournalFilters({ include_net_zero: e.target.checked })}
                       />
                       Покрытые складом: {journal.summary.net_zero}
                     </label>
                   )}
+                  <span className="toolbarText">Записей: {journalOffsetFrom} — {journalOffsetTo} из {journal.total}</span>
+                  <span className="toolbarText">Стр. {journalOffsetPage} / {journalTotalPages}</span>
+                  <button className="filterBtn" onClick={() => jumpJournalOffset(journalOffset - JOURNAL_LIMIT)} disabled={!journalCanPrev}>
+                    ← Предыдущая
+                  </button>
+                  <button className="filterBtn" onClick={() => jumpJournalOffset(journalOffset + JOURNAL_LIMIT)} disabled={!journalCanNext}>
+                    Следующая →
+                  </button>
                 </>
               )}
             </div>
@@ -1311,7 +1178,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       <td>
                         <label className="columnFilterControl">
                           <span>Поток</span>
-                          <select value={journalFlow} onChange={(e) => { setJournalFlow(e.target.value); void loadJournal(e.target.value, activeRunId ?? undefined, journalRootItemId) }}>
+                          <select value={journalFlow} onChange={(e) => { setJournalFilters({ flow: e.target.value }) }}>
                             <option value="">Все</option>
                             <option value="production">Производство</option>
                             <option value="purchase">Закупка</option>
@@ -1322,7 +1189,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       <td>
                         <label className="columnFilterControl">
                           <span>BOM ур.</span>
-                          <select value={journalBomLevel} onChange={(e) => setJournalBomLevel(e.target.value)}>
+                          <select value={journalBomLevel} onChange={(e) => setJournalFilters({ bom_level: e.target.value })}>
                             <option value="">Все</option>
                             {bomLevels.map((lvl) => <option key={lvl} value={lvl}>{lvl}</option>)}
                           </select>
@@ -1333,13 +1200,13 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       <td>
                         <label className="columnFilterControl">
                           <span>Статус</span>
-                          <select value={journalCoverage} onChange={(e) => setJournalCoverage(e.target.value as JournalCoverageFilter)}>
+                          <select value={journalCoverage} onChange={(e) => setJournalFilters({ status: e.target.value as JournalCoverageFilter })}>
                             <option value="">Все</option>
+                            <option value="incomplete">Незавершённые</option>
                             <option value="covered">Закрыто</option>
                             <option value="partial">Частично</option>
                             <option value="ordered">Оформлено</option>
                             <option value="none">Не оформлено</option>
-                            <option value="incomplete">Невыполнено</option>
                             <option value="net_zero">Покрыто складом</option>
                           </select>
                         </label>
@@ -1374,7 +1241,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredJournalRows.map((row) => {
+                    {journalRows.map((row) => {
                       const rowLedgerLinks = ledgerLinksControls(row)
                       return (
                       <React.Fragment key={row.req_id}>
@@ -1401,7 +1268,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           <td style={{ textAlign: 'center' }}>{row.bom_level}</td>
                           <td
                             className="numCell"
-                            title={`Потребность с припусками: ${qty(row.gross_qty)} · Остаток склада: ${qty(row.stock_qty ?? Math.max(0, row.gross_qty - row.net_qty))}`}
+                            title={`Потребность с припусками: ${qty(row.gross_qty)} · Остаток принятого Ledger: ${row.stock_qty == null ? 'н/д' : qty(row.stock_qty)}`}
                           >
                             <strong>{qty(row.net_qty)}</strong>
                           </td>
@@ -1419,8 +1286,8 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                 ? qty(row.completed_qty ?? 0)
                                 : <span className="muted">—</span>}
                           </td>
-                          <td className="numCell" style={{ color: row.remaining_qty > 0 ? 'var(--red)' : undefined }}>
-                            {journalTruthAccepted && row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
+                          <td className="numCell" style={{ color: (row.remaining_qty ?? 0) > 0 ? 'var(--red)' : undefined }}>
+                            {journalTruthAccepted && (row.remaining_qty ?? 0) > 0 ? qty(row.remaining_qty ?? 0) : '—'}
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {row.need_date ? dateRu(row.need_date) : '—'}
@@ -1435,7 +1302,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {journalTruthAccepted && row.coverage_pct !== null
-                              ? <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
+                              ? <span className={`miniPill ${journalRowStatusClass(journalRowStatus(row))}`}>{row.coverage_pct}%</span>
                               : <span className="muted">—</span>}
                           </td>
                           <td style={{ textAlign: 'center' }}>
@@ -1493,8 +1360,8 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                     {unassignedQty !== null && unassignedQty > 0 && (
                                       <> · не оформлено: <strong style={{ color: 'var(--red)' }}>{qty(unassignedQty)}</strong></>
                                     )}
-                                    {' '}· выполнено: <strong>{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</strong>
-                                    {' '}· осталось: <strong>{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</strong>
+                                    {' '}· выполнено: <strong>{wi.completed_qty != null && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</strong>
+                                    {' '}· осталось: <strong>{wi.remaining_qty != null ? qty(wi.remaining_qty) : '—'}</strong>
                                     {wi.need_date && <> · срок: <strong>{dateRu(wi.need_date)}</strong></>}
                                   </span>
                                   <ForecastShift forecast={wi} />
@@ -1530,7 +1397,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       </React.Fragment>
                       )
                     })}
-                    {!filteredJournalRows.length && (
+                    {!journalRows.length && (
                       <tr><td colSpan={12}><div className="emptyDetail">Нет данных по выбранному фильтру</div></td></tr>
                     )}
                   </tbody>
@@ -1545,9 +1412,8 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         options={rootOptions}
         value={journalRootItemId}
         onApply={(value) => {
-          setJournalRootItemId(value)
           setJournalRootDialogOpen(false)
-          void loadJournal(journalFlow, activeRunId ?? undefined, value)
+          setJournalFilters({ root_item_id: value })
         }}
         onClose={() => setJournalRootDialogOpen(false)}
       />

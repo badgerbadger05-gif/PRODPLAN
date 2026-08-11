@@ -18,6 +18,7 @@ def reserve(
     flow: str = "make",
     period_from: date = date(2026, 6, 1),
     run_id: int = 1,
+    order_refs: tuple[str, ...] = (),
 ) -> Reserve:
     return Reserve(
         reserve_id=reserve_id,
@@ -29,6 +30,7 @@ def reserve(
         plan_period_to=date(period_from.year, period_from.month, 28),
         run_id=run_id,
         requirement_id=requirement_id,
+        order_refs=order_refs,
         organization_ref="ORG",
         planning_stock_pool="selected",
     )
@@ -57,7 +59,7 @@ def fact(
 
 def test_make_replenishment_fills_oldest_reserve_first() -> None:
     result = allocate_historical_facts(
-        [fact("receipt", "7", requirement_id=20)],
+        [fact("receipt", "7")],
         [
             reserve("july", 20, "5", period_from=date(2026, 7, 1), run_id=2),
             reserve("june", 10, "5"),
@@ -70,25 +72,88 @@ def test_make_replenishment_fills_oldest_reserve_first() -> None:
     ]
 
 
-def test_buy_uses_the_same_fifo_and_order_identity_is_only_provenance() -> None:
+def test_exact_address_match_is_pegged_and_excess_continues_fifo() -> None:
     result = allocate_historical_facts(
-        [fact("receipt", "6", flow="buy", requirement_id=20, order_ref="PO-20")],
         [
-            reserve("older", 10, "4", flow="buy"),
+            fact(
+                "receipt",
+                "7",
+                flow="buy",
+                requirement_id=20,
+                order_ref="PO-20",
+            ),
+        ],
+        [
+            reserve("exact-old", 20, "2", flow="buy", period_from=date(2026, 6, 1), run_id=1),
+            reserve("exact-mid", 20, "2", flow="buy", period_from=date(2026, 6, 2), run_id=1),
             reserve(
-                "linked",
-                20,
+                "fifo-non-addressed",
+                10,
                 "4",
                 flow="buy",
                 period_from=date(2026, 7, 1),
-                run_id=2,
+                run_id=3,
             ),
         ],
     )
 
-    assert [(row.reserve_id, row.qty) for row in result.allocations] == [
-        ("older", Decimal("4")),
-        ("linked", Decimal("2")),
+    assert [(row.reserve_id, row.qty, row.match_rule, row.is_addressed) for row in result.allocations] == [
+        ("exact-old", Decimal("2"), "pegged", True),
+        ("exact-mid", Decimal("2"), "pegged", True),
+        ("fifo-non-addressed", Decimal("3"), "fifo", False),
+    ]
+
+
+def test_unknown_or_ambiguous_identity_uses_global_fifo() -> None:
+    result = allocate_historical_facts(
+        [fact("receipt", "6", flow="buy", requirement_id=99)],
+        [
+            reserve("older", 10, "3", flow="buy", period_from=date(2026, 6, 1), run_id=1),
+            reserve("newer", 20, "3", flow="buy", period_from=date(2026, 6, 2), run_id=1),
+        ],
+    )
+
+    assert [(row.reserve_id, row.qty, row.match_rule, row.is_addressed) for row in result.allocations] == [
+        ("older", Decimal("3"), "fifo", False),
+        ("newer", Decimal("3"), "fifo", False),
+    ]
+
+
+def test_order_reference_matching_multiple_reserves_is_fifo_only() -> None:
+    result = allocate_historical_facts(
+        [fact("receipt", "4", flow="buy", order_ref="PO-SHARED")],
+        [
+            reserve("older", 10, "2", flow="buy", order_refs=("PO-SHARED",)),
+            reserve(
+                "newer",
+                20,
+                "2",
+                flow="buy",
+                period_from=date(2026, 7, 1),
+                run_id=2,
+                order_refs=("PO-SHARED",),
+            ),
+        ],
+    )
+
+    assert [(row.reserve_id, row.match_rule, row.is_addressed) for row in result.allocations] == [
+        ("older", "fifo", False),
+        ("newer", "fifo", False),
+    ]
+
+
+def test_exact_identity_does_not_disable_fifo_for_excess() -> None:
+    result = allocate_historical_facts(
+        [fact("receipt", "12", flow="buy", requirement_id=20)],
+        [
+            reserve("exact", 20, "5", flow="buy", period_from=date(2026, 6, 1), run_id=1),
+            reserve("fifo", 10, "10", flow="buy", period_from=date(2026, 6, 2), run_id=2),
+        ],
+    )
+
+    assert [(row.reserve_id, row.qty, row.match_rule, row.is_addressed) for row in result.allocations] == [
+        ("exact", Decimal("5"), "pegged", True),
+        ("fifo", Decimal("7"), "fifo", False),
     ]
 
 

@@ -1,13 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import items
-from app.database import engine
-from app.models import Base
 from app.routers import sync as sync_router
 from app.routers import odata as odata_router
 from app.routers import plan as plan_router
 from app.routers import nomenclature as nomenclature_router
-from app.routers import stages as stages_router
 from app.routers import specification as specification_router
 from app.routers import specification_repair as specification_repair_router
 from app.routers import resources as resources_router
@@ -23,12 +20,6 @@ import os
 import logging
 
 app = FastAPI(title="PRODPLAN API", version="1.0.0")
-
-# Страховка для тестов и локальных прогонов на пустой SQLite.
-# Схема воспроизводима из миграций: `alembic upgrade head` на чистой БД даёт
-# ровно Base.metadata (см. tests/test_alembic_schema_reproducibility.py).
-# Новые таблицы добавляем миграцией, а не полагаясь на этот вызов.
-Base.metadata.create_all(bind=engine)
 
 # Logging configuration for spec tree debug
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +61,6 @@ app.include_router(sync_router.router, prefix="/api")
 app.include_router(odata_router.router, prefix="/api")
 app.include_router(plan_router.router, prefix="/api")
 app.include_router(nomenclature_router.router, prefix="/api")
-app.include_router(stages_router.router, prefix="/api")
 app.include_router(specification_router.router, prefix="/api")
 app.include_router(specification_repair_router.router, prefix="/api")
 app.include_router(resources_router.router, prefix="/api")

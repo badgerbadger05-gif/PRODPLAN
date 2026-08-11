@@ -88,8 +88,7 @@ def _mk_item(db, *, code: str, ref1c: str) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit=f"unit-ref-{code}",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(it)
     db.flush()
@@ -181,6 +180,44 @@ def _stub_odata_config(monkeypatch, *, base_url: str) -> None:
         "_load_odata_config",
         lambda: {"base_url": base_url, "username": "u", "password": "p"},
     )
+
+
+def _stub_close_config(monkeypatch, *, base_url: str, done_state_ref: str = "done-state-ref", done_variant_ref: str = "done-variant-ref") -> None:
+    monkeypatch.setattr(
+        exporter,
+        "_load_odata_config",
+        lambda: {
+            "base_url": base_url,
+            "username": "u",
+            "password": "p",
+            "default_production_order_done_state_ref1c": done_state_ref,
+            "default_production_order_done_variant_ref1c": done_variant_ref,
+        },
+    )
+
+
+def _mk_sync_link_for_order(
+    db,
+    order,
+    *,
+    target_ref_key: str = "00000000-0000-0000-0000-000000000123",
+    status: str = "success",
+) -> SyncLink:
+    run = db.get(models.PlanningRun, order.source_run_id) if order.source_run_id else None
+    link = SyncLink(
+        source_doctype="production_order",
+        source_id=int(order.order_id),
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_system="1C",
+        target_ref_key=target_ref_key,
+        target_number="MRP-1",
+        status=status,
+        payload_hash="close-payload-hash",
+        ledger_generation_id=int(run.ledger_generation_id) if run and run.ledger_generation_id is not None else None,
+    )
+    db.add(link)
+    db.flush()
+    return link
 
 
 # -----------------------------
@@ -503,6 +540,99 @@ def test_mismatched_retry_payload_fails_closed_before_network(db_session, monkey
     assert order.order_ref1c == "existing-order-ref"
 
 
+def test_successful_order_link_survives_later_accepted_generation():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=10,
+        number="PP000000010",
+        source_run_id=2,
+        ledger_generation_id=160,
+        freeze_version=1,
+        document_date=datetime(2026, 8, 10),
+    )
+    link = SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=10,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP000000010",
+        target_ref_key="existing-order-ref",
+        payload_hash="payload-from-generation-137",
+        status="success",
+        ledger_generation_id=137,
+    )
+
+    verified = exporter._validate_existing_retry_link(
+        entry=entry,
+        link=link,
+        expected_payload_hash="payload-materialized-in-generation-160",
+        order_ref1c="existing-order-ref",
+    )
+
+    assert verified == "existing-order-ref"
+
+
+def test_successful_order_link_survives_canonical_rebuild_lineage_clear():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=10,
+        number="PP000000010",
+        source_run_id=2,
+        ledger_generation_id=160,
+        freeze_version=1,
+        document_date=datetime(2026, 8, 10),
+    )
+    link = SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=10,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP000000010",
+        target_ref_key="existing-order-ref",
+        payload_hash="historical-payload",
+        status="success",
+        ledger_generation_id=None,
+    )
+
+    assert exporter._validate_existing_retry_link(
+        entry=entry,
+        link=link,
+        expected_payload_hash="current-payload",
+        order_ref1c="existing-order-ref",
+    ) == "existing-order-ref"
+
+
+def test_failed_order_link_from_another_generation_still_fails_closed():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=10,
+        number="PP000000010",
+        source_run_id=2,
+        ledger_generation_id=160,
+        freeze_version=1,
+        document_date=datetime(2026, 8, 10),
+    )
+    link = SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=10,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP000000010",
+        target_ref_key=None,
+        payload_hash="old-attempt",
+        status="error",
+        ledger_generation_id=137,
+    )
+
+    with pytest.raises(exporter.MrpMutationLineageError, match="another Ledger generation"):
+        exporter._validate_existing_retry_link(
+            entry=entry,
+            link=link,
+            expected_payload_hash="current-attempt",
+            order_ref1c="",
+        )
+
+
 def test_missing_durable_order_date_fails_before_payload_hash():
     entry = exporter.ProductionOrderExportEntry(
         order_id=1,
@@ -552,8 +682,7 @@ def test_skipped_rows_for_invalid_orders(db_session, monkeypatch):
         item_article="P-NOREF",
         item_ref1c=None,
         unit="шт",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(item_noref)
     db.flush()
@@ -622,3 +751,118 @@ def test_partial_failure_keeps_other_orders_committed(db_session, monkeypatch):
     )
     assert link_bad.status == "error"
     assert "simulated failure" in (link_bad.last_error or "")
+
+
+def test_close_dry_run_without_network(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PC", ref1c="cccccccc-cccc-cccc-cccc-cccccccccccc")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=1)
+    order.order_ref1c = "e2d7f3f0-0000-0000-0000-000000000123"
+    _mk_sync_link_for_order(db, order, target_ref_key=order.order_ref1c)
+    db.commit()
+
+    _stub_close_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo")
+    fake = _FakeClient()
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("Network client must not be used in dry-run close"),
+    )
+
+    result = exporter.close_production_orders_to_1c(db, [order.order_id], dry_run=True)
+
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+    assert result["orders_eligible"] == 1
+    assert result["orders_closed"] == 0
+    assert result["orders_error"] == 0
+    assert len(result["payloads"]) == 1
+    payload = result["payloads"][0]["payload"]
+    assert payload["СостояниеЗаказа_Key"] == "done-state-ref"
+    assert payload["ВариантЗавершения"] == "done-variant-ref"
+    assert "Date" not in payload
+    assert "ДатаЗакрытия" not in payload
+    assert "Комментарий" not in payload
+
+
+def test_close_live_writes_patch_to_1c_without_mutating_local_order(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PXC", ref1c="dddddddd-dddd-dddd-dddd-dddddddddddd")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=2)
+    order.order_ref1c = "22222222-2222-2222-2222-222222222222"
+    _mk_sync_link_for_order(db, order, target_ref_key=order.order_ref1c)
+    db.commit()
+
+    _stub_close_config(monkeypatch, base_url="http://erp-prod/odata/unf")
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.close_production_orders_to_1c(
+        db,
+        [order.order_id],
+        dry_run=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["orders_closed"] == 1
+    assert result["orders_error"] == 0
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0] == "Document_ЗаказНаПроизводство(guid'22222222-2222-2222-2222-222222222222')"
+    assert fake.patches[0][1]["СостояниеЗаказа_Key"] == "done-state-ref"
+    assert fake.patches[0][1]["ВариантЗавершения"] == "done-variant-ref"
+    assert "Date" not in fake.patches[0][1]
+    assert "ДатаЗакрытия" not in fake.patches[0][1]
+    assert "Комментарий" not in fake.patches[0][1]
+    db.expire_all()
+    unchanged = db.get(ProductionOrder, order.order_id)
+    assert unchanged is not None
+    assert unchanged.deletion_mark is False
+    assert unchanged.order_state_key == order.order_state_key
+
+
+def test_close_fails_closed_when_link_missing_or_ineligible(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PNL", ref1c="eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=3)
+    order.order_ref1c = "33333333-3333-3333-3333-333333333333"
+    db.commit()
+
+    _stub_close_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("close should be skipped when SyncLink/lineage is missing"),
+    )
+
+    result = exporter.close_production_orders_to_1c(
+        db, [order.order_id], dry_run=False
+    )
+
+    assert result["status"] == "ok"
+    assert result["orders_eligible"] == 0
+    assert len(result["payloads"]) == 0
+    assert len(result["skipped_rows"]) == 1
+    assert "SyncLink не найден" in result["skipped_rows"][0]["reason"]
+
+
+def test_close_requires_done_variant_in_config(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PXA", ref1c="ffffffff-ffff-ffff-ffff-ffffffffffff")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=1)
+    order.order_ref1c = "44444444-4444-4444-4444-444444444444"
+    _mk_sync_link_for_order(db, order, target_ref_key=order.order_ref1c)
+    db.commit()
+
+    _stub_close_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo", done_variant_ref="")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("close should fail before network when variant is not configured"),
+    )
+
+    with pytest.raises(exporter.MrpMutationLineageError, match="done_variant_ref1c"):
+        exporter.close_production_orders_to_1c(db, [order.order_id], dry_run=False)

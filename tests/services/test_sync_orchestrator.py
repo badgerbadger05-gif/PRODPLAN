@@ -111,6 +111,14 @@ def test_registry_covers_employees_warehouses_and_groups():
     assert orch._ORDER_INDEX["nomenclatureGroups"] == orch._ORDER_INDEX["nomenclature"] + 1
 
 
+def test_specification_rebase_is_disabled_by_default():
+    job = next(job for job in orch.SYNC_JOBS if job.id == "specificationRebase")
+
+    assert job.default_interval_s == 3_600
+    assert orch._is_enabled({}, job.id) is False
+    assert orch._is_enabled({"jobs": {job.id: {"enabled": True}}}, job.id) is True
+
+
 def test_status_reports_all_jobs(tmp_state, monkeypatch):
     monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
     snap = orch.status()
@@ -224,6 +232,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     parent = _accepted_parent_fixture(db_session)
     got_filter: list[str] = []
     got_strict = {"value": False}
+    opening_at = datetime(2026, 5, 31, 20, 59, 59, tzinfo=timezone.utc)
 
     class DummyClient:
         base_url = "https://example.local/odata"
@@ -252,7 +261,12 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     def _mock_run(*args, **kwargs):
         assert kwargs["generation_key"].startswith(f"physical-refresh:{parent.id}:")
         assert kwargs["target_cutoff"].tzinfo is not None
-        return Result()
+        assert kwargs["discovery_lookback"] == timedelta(days=7)
+        assert kwargs["audit_all_known_recorders"] is False
+        assert kwargs["opening_balance_loader"](opening_at) == {}
+        result = Result()
+        result.cutoff = kwargs["target_cutoff"]
+        return result
 
     monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
     monkeypatch.setattr(orch, "pull_queue_health", lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0})
@@ -264,14 +278,21 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
     result = orch.tick(db=db_session, now=now)
     assert result["job"] == "physicalRefresh"
-    expected_cutoff = now.astimezone(ZoneInfo("Europe/Moscow")).replace(
+    settled_cutoff = now - timedelta(minutes=5)
+    expected_cutoff = settled_cutoff.astimezone(ZoneInfo("Europe/Moscow")).replace(
         tzinfo=None, microsecond=0
     ).isoformat()
-    assert got_filter == [f"Period le datetime'{expected_cutoff}'"]
+    expected_opening = opening_at.astimezone(ZoneInfo("Europe/Moscow")).replace(
+        tzinfo=None, microsecond=0
+    ).isoformat()
+    assert got_filter == [
+        f"Period le datetime'{expected_cutoff}'",
+        f"Period le datetime'{expected_opening}'",
+    ]
     assert got_strict["value"] is True
     state = orch.status()["physical_refresh"]
     assert state["last_status"] == "ok"
-    assert state["last_cutoff"] == now.isoformat()
+    assert state["last_cutoff"] == settled_cutoff.isoformat()
     assert state["last_result"]["published"] is True
 
 
@@ -294,7 +315,8 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
     status = orch.status()["physical_refresh"]
     assert status["failure_count"] == 1
     assert status["next_retry_at"] is not None
-    assert status["active_cutoff"] == now.isoformat()
+    settled_cutoff = now - timedelta(minutes=5)
+    assert status["active_cutoff"] == settled_cutoff.isoformat()
     active_key = status["active_generation_key"]
     assert active_key
     next_retry = datetime.fromisoformat(status["next_retry_at"])
@@ -306,7 +328,7 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
 
     monkeypatch.setattr(orch, "_build_client", lambda: type("Client", (), {"base_url": "https://example.local/odata", "username": None, "password": None, "token": None}))
     def _resume(db, cutoff, key):
-        assert cutoff == now
+        assert cutoff == settled_cutoff
         assert key == active_key
         return {"parent_generation_id": 1, "physical_generation_id": 1, "published_generation_id": 1, "target_cutoff": cutoff.isoformat(), "published": True, "result": {"ok": True}}
 
@@ -314,6 +336,175 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
     done = orch.tick(db=db_session, now=next_retry + timedelta(seconds=1))
     assert done["status"] == "ok"
     assert done["job"] == "physicalRefresh"
+    assert orch.status()["physical_refresh"]["active_generation_key"] is None
+
+
+def test_missing_balance_item_forces_nomenclature_before_physical_retry(
+    tmp_state, db_session, monkeypatch
+):
+    _accepted_parent_fixture(db_session)
+    monkeypatch.setattr(
+        orch,
+        "load_odata_config",
+        lambda: {"base_url": "http://x/unf_demo/odata"},
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {
+            "pending": 0,
+            "error_retryable": 0,
+            "error_exhausted": 0,
+            "ready": 0,
+        },
+    )
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            orch.BalanceSnapshotItemResolutionError("new-item-ref")
+        ),
+    )
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    orch._save_state(
+        {"jobs": {"nomenclature": {"last_run_at": now.isoformat()}}},
+        required=True,
+    )
+
+    failed = orch.tick(db=db_session, now=now)
+
+    assert failed["status"] == "error"
+    assert failed["dependency_job_forced_due"] == "nomenclature"
+    state = orch._load_state()
+    nomenclature = state["jobs"]["nomenclature"]
+    assert nomenclature["last_run_at"] is None
+    assert nomenclature["forced_due_reason"] == "physical_refresh_missing_item"
+    assert nomenclature["forced_due_at"] == now.isoformat()
+
+
+def test_convergence_failure_discards_stale_candidate_before_retry(
+    tmp_state, db_session, monkeypatch
+):
+    _accepted_parent_fixture(db_session)
+    monkeypatch.setattr(
+        orch,
+        "load_odata_config",
+        lambda: {"base_url": "http://x/unf_demo/odata"},
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {
+            "pending": 0,
+            "error_retryable": 0,
+            "error_exhausted": 0,
+            "ready": 0,
+        },
+    )
+    discarded: list[int] = []
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            orch.PhysicalRefreshBalanceConvergenceError(51, "moved balance")
+        ),
+    )
+    monkeypatch.setattr(
+        orch,
+        "discard_physical_refresh_candidate",
+        lambda _db, *, ledger_generation_id, reason: discarded.append(
+            ledger_generation_id
+        ),
+    )
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    failed = orch.tick(db=db_session, now=now)
+
+    assert failed["status"] == "error"
+    assert failed["discarded_candidate_id"] == 51
+    assert discarded == [51]
+    state = orch.status()["physical_refresh"]
+    assert state["active_cutoff"] is None
+    assert state["active_generation_key"] is None
+
+
+def test_physical_refresh_drops_identity_of_discarded_candidate(
+    tmp_state, db_session, monkeypatch
+):
+    """An admin discard flips the candidate out of BUILDING behind the
+    orchestrator's back; the persisted retry identity must not resurrect the
+    dead cutoff, and the backoff earned by the dead candidate must reset."""
+    parent = _accepted_parent_fixture(db_session)
+    monkeypatch.setattr(
+        orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"}
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0},
+    )
+
+    class DummyClient:
+        base_url = "https://example.local/odata"
+        username = None
+        password = None
+        token = None
+
+    monkeypatch.setattr(orch, "_build_client", lambda: DummyClient())
+    monkeypatch.setattr(
+        orch,
+        "get_stock_from_1c_odata",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    assert orch.tick(db=db_session, now=now)["status"] == "error"
+    stale = orch.status()["physical_refresh"]
+    stale_key = stale["active_generation_key"]
+    assert stale_key and stale["failure_count"] == 1
+
+    db_session.add(
+        models.LedgerGeneration(
+            generation_key=stale_key,
+            status="rejected",
+            cutoff=now,
+            physical_import_batch_id=parent.physical_import_batch_id,
+            source_watermarks={
+                "generation_kind": "physical_refresh",
+                "parent_generation_id": parent.id,
+            },
+            capabilities={},
+            algorithm_version="ledger-physical-refresh-generation/1",
+        )
+    )
+    db_session.commit()
+
+    seen = {}
+
+    def _fresh(db, target_cutoff, generation_key):
+        seen.update(cutoff=target_cutoff, key=generation_key)
+        return {
+            "parent_generation_id": parent.id,
+            "physical_generation_id": 1,
+            "published_generation_id": 1,
+            "target_cutoff": target_cutoff.isoformat(),
+            "published": True,
+            "result": {"ok": True},
+        }
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _fresh)
+    monkeypatch.setattr(orch, "_due_jobs", lambda state, current: [])
+    before_retry = now + timedelta(seconds=1)
+    assert before_retry < datetime.fromisoformat(stale["next_retry_at"])
+    result = orch.tick(db=db_session, now=before_retry)
+
+    assert result["status"] == "ok"
+    assert result["job"] == "physicalRefresh"
+    assert seen["key"] != stale_key
+    assert seen["cutoff"] == (
+        before_retry - timedelta(minutes=5)
+    ).replace(microsecond=0)
     assert orch.status()["physical_refresh"]["active_generation_key"] is None
 
 

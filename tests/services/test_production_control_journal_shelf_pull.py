@@ -285,14 +285,14 @@ def _journal_line(db, *, run, item, planned_dates: bool):
     return product
 
 
-def test_journal_row_uses_the_shelf_latest_start_date_over_capacity_scheduler(db_session):
+def test_journal_row_uses_shelf_latest_start_date_over_fixed_plan_dates(db_session):
     generation, run, item, _work = _scope(db_session, key="journal")
     _shelf(db_session, generation=generation, item=item)
     _journal_line(db_session, run=run, item=item, planned_dates=False)
 
     row = list_journal(db_session)["rows"][0]
 
-    # The legacy PlannedOrder said 2026-08-26 / 2026-08-28.
+    # The fixed-plan obligation says 2026-08-26 / 2026-08-28.
     assert row["planned_start_date"] == "2026-08-04"
     assert row["planned_finish_date"] == "2026-08-09"
     assert row["launch_source"] == "shelf_pull"
@@ -302,14 +302,14 @@ def test_journal_row_uses_the_shelf_latest_start_date_over_capacity_scheduler(db
     assert row["shelf_warehouse_ref1c"] == "SHELF"
 
 
-def test_journal_row_without_shelf_keeps_capacity_scheduler_dates(db_session):
+def test_journal_row_without_shelf_uses_accepted_plan_dates(db_session):
     _generation, run, item, _work = _scope(db_session, key="journal-legacy")
     _journal_line(db_session, run=run, item=item, planned_dates=False)
 
     row = list_journal(db_session)["rows"][0]
 
-    assert row["planned_start_date"] == "2026-08-26"
-    assert row["planned_finish_date"] == "2026-08-28"
+    assert row["planned_start_date"] == "2026-08-01"
+    assert row["planned_finish_date"] == "2026-08-31"
     assert row["launch_source"] == "mrp_remaining"
     assert row["shelf_latest_start_date"] is None
 

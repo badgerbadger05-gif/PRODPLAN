@@ -2,12 +2,13 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import {
   ItemLedgerMovementsTable,
+  ItemLedgerFutureSupplyTable,
   ItemLedgerPositionSummary,
   ItemLedgerReservationEventsTimeline,
   ItemLedgerReservationsTable,
 } from './index'
 import { qty } from '../../lib/format'
-import type { ItemLedgerMovementRow, ItemLedgerPosition, ItemLedgerReservationsResponse, ItemLedgerReservationEventsResponse } from '../../domain/itemLedger'
+import type { ItemLedgerFutureSupplyResponse, ItemLedgerMovementRow, ItemLedgerPosition, ItemLedgerReservationsResponse, ItemLedgerReservationEventsResponse } from '../../domain/itemLedger'
 
 const truthMeta = {
   ledger_generation: 4,
@@ -63,12 +64,31 @@ const movements: ItemLedgerMovementRow[] = [
     record_type: 'Expense',
     recorder_type: 'Document_СборкаЗапасов',
     recorder_ref: 'r-1',
+    recorder_number: '',
+    basis_order_number: 'PP001305968',
     line_no: '2',
     ingest_source: 'document_pull',
     characteristic_ref: '',
     organization_ref: 'org-1',
   },
 ]
+
+const futureSupply: ItemLedgerFutureSupplyResponse['rows'] = [{
+  id: 21,
+  supply_kind: 'wip_order',
+  source_ref: 'b0d16efe-6553-11f1-9270-9ee51454587f',
+  source_number: 'PP001305968',
+  source_line_ref: '1',
+  ordered_qty: 20,
+  received_qty: 0,
+  open_qty: 20,
+  eta_date: '2026-08-11',
+  destination_warehouse_ref1c: 'MAIN',
+  destination_warehouse_name: 'Основной склад',
+  source_state_key: 'state-guid',
+  source_state_name: 'Запущен',
+  evidence_status: 'exact',
+}]
 
 const reservations: ItemLedgerReservationsResponse['rows'] = [
   {
@@ -132,13 +152,23 @@ describe('item-ledger presentation primitives', () => {
     render(<ItemLedgerMovementsTable rows={movements} />)
     expect(screen.getByRole('table', { name: 'Движения номенклатуры' })).toBeInTheDocument()
     expect(screen.getByText(qty(-40))).toBeInTheDocument()
+    expect(screen.getByText('Сборка запасов')).toBeInTheDocument()
+    expect(screen.getByText('Заказ PP001305968')).toBeInTheDocument()
+    expect(screen.queryByText('org-1')).not.toBeInTheDocument()
+  })
+
+  it('renders live orders with business numbers and warehouse names', () => {
+    render(<ItemLedgerFutureSupplyTable rows={futureSupply} />)
+    expect(screen.getByText('PP001305968')).toBeInTheDocument()
+    expect(screen.getByText('Основной склад')).toBeInTheDocument()
+    expect(screen.queryByText('b0d16efe-6553-11f1-9270-9ee51454587f')).not.toBeInTheDocument()
   })
 
   it('renders reservations table, labels modes, and returns selected reservation', () => {
     const onSelect = vi.fn()
     render(<ItemLedgerReservationsTable rows={reservations} onSelect={onSelect} />)
-    expect(screen.getByText('Списание (consume)')).toBeInTheDocument()
-    expect(screen.getByText('Выпуск (make)')).toBeInTheDocument()
+    expect(screen.getByText('Расход')).toBeInTheDocument()
+    expect(screen.getByText('Производство')).toBeInTheDocument()
     const row = screen.getByRole('row', { name: /Резерв 101/ })
     fireEvent.click(row)
     expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ reservation_id: 101 }))

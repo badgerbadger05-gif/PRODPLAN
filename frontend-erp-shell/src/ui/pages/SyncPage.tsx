@@ -62,9 +62,8 @@ export function SyncPage() {
   async function loadGroups() {
     try {
       const data = await listNomenclatureGroups()
-      const rows = data.items ?? data.rows ?? []
-      setGroups(rows)
-      setSelectedGroups(new Set(data.selected_ids ?? []))
+      setGroups(data.items)
+      setSelectedGroups(new Set(data.selected_ids))
     } catch (e) {
       reportError(e instanceof Error ? e.message : String(e))
     }

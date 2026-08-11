@@ -31,6 +31,7 @@ from ..models import (
     ProductionResource,
 )
 from .production_control_common import to_float as _to_float
+from .production_output_truth import accepted_product_output
 from .workshop_resolution import (
     PROBLEM_REASON_CODES,
     REASON_NO_WAREHOUSE_BINDING,
@@ -104,13 +105,13 @@ def _manual_binding_diagnoses(
 
 
 def _catalog_problem_rows(db: Session) -> List[Dict[str, Any]]:
-    pairs: Dict[int, int] = {}
-    for row in (
-        db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .order_by(DefaultSpecification.id.asc())
-        .all()
-    ):
-        pairs.setdefault(int(row.item_id), int(row.spec_id))
+    from .workshop_resolution import default_spec_ids_for_items
+
+    item_ids = [
+        int(item_id)
+        for (item_id,) in db.query(DefaultSpecification.item_id).distinct().all()
+    ]
+    pairs = default_spec_ids_for_items(db, item_ids)
     if not pairs:
         return []
 
@@ -289,7 +290,9 @@ def list_item_lines(db: Session, item_id: int) -> Dict[str, Any]:
                 "order_id": int(order.order_id),
                 "order_number": str(order.order_number or ""),
                 "quantity": _to_float(product.quantity),
-                "remaining_qty": _to_float(product.remaining_qty),
+                "remaining_qty": float(
+                    accepted_product_output(product).remaining_qty
+                ),
                 "status": str(state.status) if state else "shortage",
                 "workshop_id": int(state.workshop_id) if state and state.workshop_id else None,
                 "planned_start_date": (

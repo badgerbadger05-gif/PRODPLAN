@@ -2,11 +2,14 @@ import { coverageLabels, productionStatusOptions, productionStatusSelectValue, t
 import { dateRu, qty } from '../../../lib/format'
 import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from '../../tableDoctype'
 import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
+import { ForecastShift } from '../period-plan/ForecastShift'
+import { productionRowId } from './model'
 
 type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
   selectedIds: Set<number>
+  launchQtyByWorkItem: Readonly<Record<number, number>>
   sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
   onSelectIds: (ids: Set<number>) => void
   onActivate: (id: number) => void
@@ -15,20 +18,12 @@ type Props = {
   onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
-const manualProductionStatusOptions = productionStatusOptions.filter(([value]) => value !== 'completed')
-
-function ForecastShift({ row }: { row: OrderRow }) {
-  if (row.forecast_shift_days === null || row.forecast_shift_days === undefined) return null
-  const days = Number(row.forecast_shift_days)
-  if (!Number.isFinite(days) || days === 0) return null
-  const cls = days > 5 ? 'late' : days > 0 ? 'warn' : 'early'
-  const label = `${days > 0 ? '+' : ''}${days} дн`
-  const dateText = row.forecast_date ? dateRu(row.forecast_date).slice(0, 5) : ''
-  const title = [row.forecast_reason, row.forecast_date ? `прогноз ${dateRu(row.forecast_date)}` : null].filter(Boolean).join(' · ')
-  return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
-}
+const manualProductionStatusOptions = productionStatusOptions.filter(
+  ([value]) => value !== 'completed' && value !== 'not_created',
+)
 
 function orderSubline(row: OrderRow) {
+  if (row.product_id == null) return 'Расчёт MRP · заказ ещё не создан'
   if (row.order_ref1c) return row.order_one_c_number || (row.order_source === '1c' ? row.order_number : 'Открыт в 1С')
   return `${dateRu(row.order_date)} · стр. ${row.line_number || '—'}`
 }
@@ -37,14 +32,7 @@ function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
 }
 
-function planningZoneLabel(zone?: string | null) {
-  if (zone === 'red') return 'Красная зона'
-  if (zone === 'yellow') return 'Жёлтая зона'
-  if (zone === 'green') return 'Зелёная зона'
-  return zone || 'DBR'
-}
-
-export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
+export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyByWorkItem, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
       <colgroup>
@@ -73,25 +61,32 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
         </tr>
       </thead>
       <tbody>
-        {rows.map((row) => (
+        {rows.map((row) => {
+          const rowId = productionRowId(row)
+          const isProposal = row.product_id == null
+          const launchQuantity = row.work_item_id != null
+            ? launchQtyByWorkItem[row.work_item_id] ?? row.launchable_qty ?? row.remaining_qty
+            : row.remaining_qty
+          const chain = row.paint_weld_chain
+          return (
           <tr
-            key={row.product_id}
-            className={row.product_id === activeRow?.product_id ? 'activeRow' : ''}
+            key={row.journal_row_key || rowId}
+            className={rowId === (activeRow ? productionRowId(activeRow) : null) ? 'activeRow' : ''}
             tabIndex={0}
-            aria-selected={row.product_id === activeRow?.product_id}
-            onClick={() => onActivate(row.product_id)}
-            onDoubleClick={() => onOpenMaterials(row)}
+            aria-selected={rowId === (activeRow ? productionRowId(activeRow) : null)}
+            onClick={() => onActivate(rowId)}
+            onDoubleClick={() => { if (!isProposal) onOpenMaterials(row) }}
             onKeyDown={(event) => {
               if (event.target !== event.currentTarget) return
               if (event.key === 'Enter') {
                 event.preventDefault()
-                onActivate(row.product_id)
-                onOpenMaterials(row)
+                onActivate(rowId)
+                if (!isProposal) onOpenMaterials(row)
               } else if (event.key === ' ') {
                 event.preventDefault()
                 const next = new Set(selectedIds)
-                if (next.has(row.product_id)) next.delete(row.product_id)
-                else next.add(row.product_id)
+                if (next.has(rowId)) next.delete(rowId)
+                else next.add(rowId)
                 onSelectIds(next)
               }
             }}
@@ -100,11 +95,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <input
                 type="checkbox"
                 aria-label={`Выбрать заказ ${orderMainLine(row)}`}
-                checked={selectedIds.has(row.product_id)}
+                checked={selectedIds.has(rowId)}
                 onChange={(e) => {
                   const next = new Set(selectedIds)
-                  if (e.target.checked) next.add(row.product_id)
-                  else next.delete(row.product_id)
+                  if (e.target.checked) next.add(rowId)
+                  else next.delete(rowId)
                   onSelectIds(next)
                 }}
                 onClick={(e) => e.stopPropagation()}
@@ -113,6 +108,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               <strong title={orderMainLine(row)}>{orderMainLine(row)}</strong>
               <span title={orderSubline(row)}>{orderSubline(row)}</span>
+              {chain?.counterpart_product_id && (
+                <span className="muted">
+                  Сварка: {chain.counterpart_order_prodplan_number || chain.counterpart_order_number || '—'}
+                </span>
+              )}
             </td>
             <td
               className={`itemCell ${row.route_sheet_printed_at ? 'printedRouteSheetCell' : ''}`}
@@ -133,48 +133,62 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               </strong>
               <span title={row.item_article || row.item_code || ''}>
                 {row.item_article || row.item_code || ''}
-                {row.planning?.contour === 'dbr_feeder' && (
-                  <span
-                    className={`planningBadge ${row.planning.zone || 'dbr'}`}
-                    title={[
-                      planningZoneLabel(row.planning.zone),
-                      row.planning.priority != null ? `приоритет ${row.planning.priority}` : null,
-                      row.planning.signal_type,
-                    ].filter(Boolean).join(' · ')}
-                  >
-                    DBR{row.planning.priority != null ? ` ${row.planning.priority}` : ''}
-                  </span>
-                )}
+                {row.source === 'mrp' && <span className="planningBadge mrp">MRP</span>}
               </span>
+              {chain?.counterpart_product_id && (
+                <span className="muted" title={chain.counterpart_item_name || ''}>
+                  Сварка: {chain.counterpart_item_name || '—'}
+                </span>
+              )}
             </td>
             <td className="numCell">
-              <strong>{qty(row.remaining_qty)}</strong>
+              <strong>{qty(launchQuantity)}</strong>
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
+              {isProposal && launchQuantity !== row.remaining_qty && (
+                <span className="muted">запуск / остаток {qty(row.remaining_qty)}</span>
+              )}
+              {chain?.counterpart_product_id && (
+                <span className="muted">
+                  св. {qty(chain.counterpart_remaining_qty)} / {qty(chain.counterpart_quantity)}
+                </span>
+              )}
             </td>
             <td className="dateCell">
               <span>
-                {row.planning?.contour === 'dbr_feeder' ? 'Нужно' : 'С'}: {dateRu(row.planning?.required_date || row.planned_start_date) || '—'}
+                {row.source === 'mrp' ? 'Нужно' : 'С'}: {dateRu(row.planned_start_date) || '—'}
               </span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
-              <ForecastShift row={row} />
+              <ForecastShift forecast={row} />
             </td>
             <td>
               <strong>{row.workshop_name || 'Не назначен'}</strong>
               <span className="muted">{row.stage_name || ''}</span>
+              {chain?.counterpart_product_id && (
+                <span className="muted">
+                  Сварка: {chain.counterpart_workshop_name || '—'}
+                </span>
+              )}
             </td>
             <td>
-              <select aria-label={`Статус заказа ${orderMainLine(row)}`} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
-                {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-              </select>
+              {isProposal ? (
+                <span className="muted">Не создан</span>
+              ) : (
+                <select aria-label={`Статус заказа ${orderMainLine(row)}`} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
+                  {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              )}
             </td>
             <td>
               <span className={`pill ${row.coverage_status || row.status || 'unknown'}`}>
-                {row.coverage_label || coverageLabels[String(row.coverage_status || row.status || '')] || row.coverage_status || row.status || '—'}
+                {row.coverage_status === 'unknown'
+                  ? coverageLabels.unknown
+                  : row.coverage_label || coverageLabels[String(row.coverage_status || '')] || row.coverage_status || '—'}
               </span>
               {!!row.issue_count && <span className="muted issueCount">док. {row.issue_count}</span>}
             </td>
           </tr>
-        ))}
+          )
+        })}
       </tbody>
     </table>
   )

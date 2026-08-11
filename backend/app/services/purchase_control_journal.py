@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.services.item_ledger.reservation import replenishment_execution_pct
 from .purchase_control_snapshot import read_snapshot
 
 _EPS = 1e-9
@@ -19,18 +20,22 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _coverage_percent(part: float, total: float) -> float:
-    if total <= 0:
-        return 0.0
-    return round(max(part, 0.0) / total * 100.0, 6)
-
-
 def _horizon_filter_inclusive(value: Any, horizon_iso: Optional[str]) -> bool:
     if horizon_iso is None:
         return True
     if value is None:
         return False
     return str(value) <= horizon_iso
+
+
+def _materialization_action(row: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+    if row.get("row_generator") != _BUY_ROW_GENERATOR:
+        return False, "Строка не является MRP-снабжением"
+    if row.get("line_status") != "to_order":
+        return False, "Строка не требует нового заказа"
+    if _to_float(row.get("to_order_qty")) <= _EPS:
+        return False, "Количество к заказу отсутствует"
+    return True, None
 
 
 def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -72,6 +77,12 @@ def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[st
     period_label = ordered_labels[0] if ordered_labels else _period_label(_parse_date(last_period_to))
 
     projected = dict(row)
+    to_order_pct = replenishment_execution_pct(required, to_order)
+    open_order_covered_pct = replenishment_execution_pct(
+        required,
+        open_order_covered,
+    )
+
     projected.update(
         {
             "run_id": run_ids[0] if len(run_ids) == 1 else None,
@@ -85,8 +96,12 @@ def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[st
             "realized_qty": realized,
             "open_order_covered_qty": open_order_covered,
             "to_order_qty": to_order,
-            "to_order_pct": _coverage_percent(to_order, required),
-            "open_order_covered_pct": _coverage_percent(open_order_covered, required),
+            "to_order_pct": float(to_order_pct) if to_order_pct is not None else None,
+            "open_order_covered_pct": (
+                float(open_order_covered_pct)
+                if open_order_covered_pct is not None
+                else None
+            ),
             "plan_period_from": first_period_from,
             "plan_period_to": last_period_to,
             "period_label": period_label,
@@ -94,7 +109,13 @@ def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[st
             "quantity": required,
             "remaining_qty": to_order,
             "received_qty": realized,
-            "line_status": "to_order" if to_order > _EPS else "received",
+            "line_status": (
+                "to_order"
+                if to_order > _EPS
+                else "expected"
+                if open_order_covered > _EPS
+                else "received"
+            ),
         }
     )
     return projected
@@ -218,6 +239,10 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
         )
         if projected is not None
     ]
+    for row in rows:
+        can_materialize, disabled_reason = _materialization_action(row)
+        row["can_materialize"] = can_materialize
+        row["materialize_disabled_reason"] = disabled_reason
 
     if line_status:
         rows = [r for r in rows if r.get("line_status") == str(line_status)]

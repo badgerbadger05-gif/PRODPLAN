@@ -1,7 +1,7 @@
 """Immutable Ledger-native read boundary for the purchase control journal."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import math
 from typing import Any
 
@@ -9,7 +9,10 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.item_ledger.reservation import replenishment_remaining
+from app.services.item_ledger.reservation import (
+    replenishment_execution_pct,
+    replenishment_remaining,
+)
 from app.services.planning_truth import (
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_PLANNING_SNAPSHOTS,
@@ -19,6 +22,8 @@ from app.services.planning_truth import (
     get_latest_read_snapshot,
     get_truth_state,
 )
+from app.services.odata_config import load_odata_config as _load_odata_config
+from app.services.production_control_common import to_float_strict as _to_float
 
 
 CONSUMER = "purchase_control_journal"
@@ -74,13 +79,6 @@ def _unavailable(db: Session, reason: str, truth: dict[str, Any] | None = None):
     if truth:
         detail["truth"] = jsonable_encoder(truth)
     return PurchaseJournalSnapshotUnavailable(detail)
-
-
-def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        raise ValueError("numeric field is malformed")
 
 
 def validate_purchase_control_journal_buy_row(row: Any) -> None:
@@ -155,10 +153,48 @@ def _clean_ref(value: Any) -> str:
     return str(value).strip()
 
 
-def _coverage_percent(part: float, total: float) -> float:
-    if total <= 0:
-        return 0.0
-    return round(max(part, 0.0) / total * 100.0, 6)
+def _overdue_days(need_date_iso: Any, cutoff_date: date | None) -> int:
+    """Days the demand date is already in the past at the truth cutoff.
+
+    The journal is an immutable projection pinned to a Ledger cutoff, so the
+    only honest "today" is that cutoff. Wall-clock time would make the frozen
+    snapshot answer differently on every read.
+    """
+    if cutoff_date is None or not need_date_iso:
+        return 0
+    try:
+        need = date.fromisoformat(str(need_date_iso))
+    except ValueError:
+        return 0
+    return max((cutoff_date - need).days, 0)
+
+
+def order_block_reason(
+    *,
+    to_order_qty: float,
+    supplier_id: Any,
+    item_ref1c: Any,
+    unit: Any,
+    planning_stock_pool: Any,
+) -> str | None:
+    """Why this demand row cannot be turned into a supplier order, if it cannot.
+
+    The read boundary owns action availability (see `.docs/api.md`,
+    "Общий контракт ответа": готовые флаги разрешённых действий). The checks
+    mirror the preconditions `purchase_control_materialization` enforces, so a
+    row flagged orderable does not explode on export.
+    """
+    if to_order_qty <= _EPS_FLOAT:
+        return "нет остатка потребности к заказу"
+    if supplier_id is None:
+        return "у номенклатуры не указан поставщик"
+    if not str(item_ref1c or "").strip():
+        return "у номенклатуры нет ссылки 1С"
+    if not str(unit or "").strip():
+        return "у номенклатуры не задана единица измерения"
+    if not str(planning_stock_pool or "").strip():
+        return "не определён пул планирования"
+    return None
 
 
 def _run_horizons(db: Session, run_ids: set[int]) -> dict[int, dict[str, Any]]:
@@ -176,6 +212,213 @@ def _run_horizons(db: Session, run_ids: set[int]) -> dict[int, dict[str, Any]]:
         }
         for row in rows
     }
+
+
+def open_supplier_coverage_by_reservation(
+    db: Session,
+    generation_id: int,
+    entries: list[tuple[Any, Any, Any]],
+) -> tuple[dict[int, float], dict[int, list[dict[str, Any]]]]:
+    """Allocate frozen supplier-order remainder to active BUY reservations.
+
+    ``MrpFreezeAllocation`` is the immutable obligation-to-order lineage.
+    ``LedgerFutureSupply`` is the generation-pinned fact for what remains open
+    on that order line at the cutoff.  Joining those saved sources keeps open
+    orders out of physical fulfillment while preventing them from being
+    proposed for purchase a second time.
+    """
+    if not entries:
+        return {}, {}
+
+    reservation_by_requirement: dict[int, models.ReservationEntry] = {}
+    outstanding_by_reservation: dict[int, float] = {}
+    for work_item, reservation, _item in entries:
+        requirement_id = int(work_item.requirement_id)
+        current = reservation_by_requirement.get(requirement_id)
+        if current is not None and int(current.id) != int(reservation.id):
+            raise ValueError("buy requirement maps to multiple active reservations")
+        reservation_by_requirement[requirement_id] = reservation
+        outstanding_by_reservation[int(reservation.id)] = _to_float(
+            work_item.replenishment_remaining_qty
+        )
+
+    supplies: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    for supply in (
+        db.query(models.LedgerFutureSupply)
+        .filter(
+            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
+            models.LedgerFutureSupply.supply_kind == "supplier_order",
+            models.LedgerFutureSupply.evidence_status == "exact",
+            models.LedgerFutureSupply.open_qty_at_cutoff > _EPS_FLOAT,
+        )
+        .order_by(
+            models.LedgerFutureSupply.eta_date.asc(),
+            models.LedgerFutureSupply.id.asc(),
+        )
+        .all()
+    ):
+        source_ref = _clean_ref(supply.source_ref)
+        source_line_ref = _clean_ref(supply.source_line_ref)
+        pool = _clean_ref(supply.planning_stock_pool)
+        if not source_ref or not source_line_ref or not pool:
+            raise ValueError("exact supplier future supply lacks stable identity")
+        if supply.eta_date is None:
+            raise ValueError("exact supplier future supply lacks ETA")
+        key = (int(supply.item_id), pool, source_ref, source_line_ref)
+        if key in supplies:
+            raise ValueError("supplier future supply identity is duplicated")
+        supplies[key] = {
+            "initial": _to_float(supply.open_qty_at_cutoff),
+            "remaining": _to_float(supply.open_qty_at_cutoff),
+            "eta": supply.eta_date,
+            "id": int(supply.id),
+        }
+
+    if not supplies:
+        return {}, {}
+
+    requirement_ids = sorted(reservation_by_requirement)
+    claims = (
+        db.query(models.MrpFreezeAllocation)
+        .filter(
+            models.MrpFreezeAllocation.requirement_id.in_(requirement_ids),
+            models.MrpFreezeAllocation.source_type == "supplier_order",
+        )
+        .all()
+    )
+    claims.sort(
+        key=lambda allocation: (
+            reservation_by_requirement[int(allocation.requirement_id)].priority_period_from,
+            reservation_by_requirement[int(allocation.requirement_id)].priority_period_to,
+            int(allocation.run_id),
+            int(allocation.id),
+        )
+    )
+
+    covered_by_reservation: dict[int, float] = {}
+    slices_by_reservation: dict[int, list[dict[str, Any]]] = {}
+    for allocation in claims:
+        reservation = reservation_by_requirement.get(int(allocation.requirement_id))
+        if reservation is None:
+            continue
+        if (
+            int(allocation.run_id) != int(reservation.run_id or -1)
+            or int(allocation.freeze_version) != int(reservation.freeze_version)
+        ):
+            continue
+        reservation_id = int(reservation.id)
+        reservation_left = max(
+            outstanding_by_reservation.get(reservation_id, 0.0)
+            - covered_by_reservation.get(reservation_id, 0.0),
+            0.0,
+        )
+        if reservation_left <= _EPS_FLOAT:
+            continue
+
+        key = (
+            int(allocation.item_id),
+            _clean_ref(allocation.planning_stock_pool),
+            _clean_ref(allocation.source_ref),
+            _clean_ref(allocation.source_line_ref),
+        )
+        supply = supplies.get(key)
+        line_left = _to_float(supply["remaining"]) if supply is not None else 0.0
+        if line_left <= _EPS_FLOAT:
+            continue
+        take = min(_to_float(allocation.alloc_qty), line_left, reservation_left)
+        if take <= _EPS_FLOAT:
+            continue
+
+        supply["remaining"] = max(line_left - take, 0.0)
+        covered_by_reservation[reservation_id] = (
+            covered_by_reservation.get(reservation_id, 0.0) + take
+        )
+        slices_by_reservation.setdefault(reservation_id, []).append(
+            {
+                "source_type": "supplier_order",
+                "source_ref": key[2],
+                "source_line_ref": key[3],
+                "covered_qty": round(take, 6),
+            }
+        )
+
+    # A supplier order created directly in 1C has no immutable
+    # MrpFreezeAllocation because it did not exist when the plan was frozen.
+    # Allocate every still-unclaimed exact line by the canonical obligation
+    # order.  The persisted generation snapshot makes this deterministic and
+    # immutable; item/pool equality prevents cross-contour coverage.
+    reservations = sorted(
+        (
+            reservation
+            for reservation in reservation_by_requirement.values()
+            if outstanding_by_reservation.get(int(reservation.id), 0.0)
+            > _EPS_FLOAT
+        ),
+        key=lambda reservation: (
+            reservation.priority_period_from,
+            reservation.priority_period_to,
+            int(reservation.run_id),
+            int(reservation.id),
+        ),
+    )
+    supply_keys = sorted(
+        supplies,
+        key=lambda key: (
+            supplies[key]["eta"] or date.min,
+            key[2],
+            key[3],
+            supplies[key]["id"],
+        ),
+    )
+    for key in supply_keys:
+        supply = supplies[key]
+        line_left = _to_float(supply["remaining"])
+        if line_left <= _EPS_FLOAT:
+            continue
+        for reservation in reservations:
+            reservation_id = int(reservation.id)
+            if (
+                int(reservation.item_id) != key[0]
+                or _clean_ref(reservation.planning_stock_pool) != key[1]
+            ):
+                continue
+            reservation_left = max(
+                outstanding_by_reservation.get(reservation_id, 0.0)
+                - covered_by_reservation.get(reservation_id, 0.0),
+                0.0,
+            )
+            if reservation_left <= _EPS_FLOAT:
+                continue
+            take = min(line_left, reservation_left)
+            if take <= _EPS_FLOAT:
+                continue
+            line_left = max(line_left - take, 0.0)
+            supply["remaining"] = line_left
+            covered_by_reservation[reservation_id] = (
+                covered_by_reservation.get(reservation_id, 0.0) + take
+            )
+            slices_by_reservation.setdefault(reservation_id, []).append(
+                {
+                    "source_type": "supplier_order",
+                    "source_ref": key[2],
+                    "source_line_ref": key[3],
+                    "covered_qty": round(take, 6),
+                }
+            )
+            if line_left <= _EPS_FLOAT:
+                break
+
+    for reservation_id, covered in covered_by_reservation.items():
+        if covered > outstanding_by_reservation.get(reservation_id, 0.0) + _EPS_FLOAT:
+            raise ValueError("supplier future supply exceeds reservation remainder")
+    for supply in supplies.values():
+        if (
+            _to_float(supply["remaining"]) < -_EPS_FLOAT
+            or _to_float(supply["remaining"]) > _to_float(supply["initial"]) + _EPS_FLOAT
+        ):
+            raise ValueError("supplier future supply allocation violates conservation")
+
+    return covered_by_reservation, slices_by_reservation
 
 
 def _build_supplier_card_rows(
@@ -293,7 +536,12 @@ def _build_buyer_rows(
     db: Session,
     generation_id: int,
     to_order_by_period: list[dict[str, Any]],
+    cutoff_date: date | None = None,
 ) -> list[dict[str, Any]]:
+    configured_destination_warehouse_ref1c = _clean_ref(
+        _load_odata_config().get("purchase_destination_warehouse_ref1c")
+    )
+
     entries = (
         db.query(
             models.ReplenishmentWorkItem,
@@ -324,6 +572,12 @@ def _build_buyer_rows(
     )
     if not entries:
         return []
+
+    open_covered_by_reservation, open_coverage_slices = (
+        open_supplier_coverage_by_reservation(
+            db, int(generation_id), entries
+        )
+    )
 
     supplier_refs = {
         _clean_ref(s.supplier_ref1c).lower(): int(s.supplier_id)
@@ -361,17 +615,19 @@ def _build_buyer_rows(
 
         required = _to_float(work_item.replenishment_required_qty)
         realized = _to_float(work_item.replenishment_fulfilled_qty)
-        # Open orders are not physical receipts and cannot mutate the frozen
-        # obligation. They are represented by their own saved supply facts.
-        open_order_covered = 0.0
-        to_order = _to_float(work_item.replenishment_remaining_qty)
+        remaining_after_receipts = _to_float(work_item.replenishment_remaining_qty)
+        open_order_covered = min(
+            open_covered_by_reservation.get(int(reservation.id), 0.0),
+            remaining_after_receipts,
+        )
+        to_order = max(remaining_after_receipts - open_order_covered, 0.0)
 
-        if required < 0 or realized < 0 or to_order < 0:
+        if required < 0 or realized < 0 or remaining_after_receipts < 0:
             raise ValueError("buy reservation has invalid quantities")
         if realized > required + _EPS_FLOAT:
             raise ValueError("buy reservation realized exceeds reserved")
         if not math.isclose(
-            to_order,
+            remaining_after_receipts,
             float(replenishment_remaining(required, realized)),
             abs_tol=_EPS_FLOAT,
         ):
@@ -389,6 +645,7 @@ def _build_buyer_rows(
                 "item_name": str(item.item_name or ""),
                 "unit": item.unit,
                 "planning_stock_pool": pool,
+                "item_ref1c": _clean_ref(item.item_ref1c),
                 "supplier_ref1c": _clean_ref(item.supplier_ref1c).lower(),
                 "requirement_ids": set(),
                 "reservation_ids": set(),
@@ -412,6 +669,18 @@ def _build_buyer_rows(
         target["open_order_covered_qty"] += open_order_covered
         target["to_order_qty"] += to_order
 
+        # The demand date belongs to the requirement, not to the plan window:
+        # the horizon cut must trim by "когда нужно", not by "когда кончается
+        # план". Plan bounds stay as the fallback for legacy reservations.
+        need_from = reservation.priority_period_from or period_from
+        need_to = reservation.priority_period_to or period_to
+
+        to_order_pct = replenishment_execution_pct(required, to_order)
+        open_order_covered_pct = replenishment_execution_pct(
+            required,
+            open_order_covered,
+        )
+
         target["slices"].append(
             {
                 "reservation_id": int(reservation.id),
@@ -420,14 +689,22 @@ def _build_buyer_rows(
                 "run_id": run_id,
                 "plan_period_from": period_from.isoformat() if period_from else None,
                 "plan_period_to": period_to.isoformat() if period_to else None,
+                "need_date": need_from.isoformat() if need_from else None,
+                "need_period_to": need_to.isoformat() if need_to else None,
                 "period_label": _period_label(period_to),
                 "required_qty": required,
                 "realized_qty": realized,
                 "open_order_covered_qty": open_order_covered,
                 "to_order_qty": to_order,
-                "to_order_pct": _coverage_percent(to_order, required),
-                "open_order_covered_pct": _coverage_percent(open_order_covered, required),
-                "coverage_slices": [],
+                "to_order_pct": float(to_order_pct) if to_order_pct is not None else None,
+                "open_order_covered_pct": (
+                    float(open_order_covered_pct)
+                    if open_order_covered_pct is not None
+                    else None
+                ),
+                "coverage_slices": list(
+                    open_coverage_slices.get(int(reservation.id), [])
+                ),
             }
         )
         target["horizon_buckets"].append(target["slices"][-1])
@@ -486,6 +763,12 @@ def _build_buyer_rows(
                 }
             )
 
+        to_order_pct = replenishment_execution_pct(required_qty, to_order_qty)
+        open_order_covered_pct = replenishment_execution_pct(
+            required_qty,
+            open_order_covered_qty,
+        )
+
         row = {
             "row_key": f"buy:{payload['item_id']}:{payload['planning_stock_pool']}",
             "line_id": None,
@@ -512,7 +795,13 @@ def _build_buyer_rows(
             "delivery_date": last_bucket["plan_period_to"],
             "need_date": first_bucket["plan_period_from"],
             "overdue_days": 0,
-            "line_status": "to_order" if to_order_qty > _EPS_FLOAT else "received",
+            "line_status": (
+                "to_order"
+                if to_order_qty > _EPS_FLOAT
+                else "expected"
+                if open_order_covered_qty > _EPS_FLOAT
+                else "received"
+            ),
             "price": 0.0,
             "amount": 0.0,
             "run_id": sorted_runs[0] if len(sorted_runs) == 1 else None,
@@ -524,14 +813,39 @@ def _build_buyer_rows(
             "realized_qty": realized_qty,
             "open_order_covered_qty": open_order_covered_qty,
             "to_order_qty": to_order_qty,
-            "to_order_pct": _coverage_percent(to_order_qty, required_qty),
-            "open_order_covered_pct": _coverage_percent(open_order_covered_qty, required_qty),
+            "to_order_pct": float(to_order_pct) if to_order_pct is not None else None,
+            "open_order_covered_pct": (
+                float(open_order_covered_pct)
+                if open_order_covered_pct is not None
+                else None
+            ),
             "plan_period_from": first_bucket["plan_period_from"],
             "plan_period_to": last_bucket["plan_period_to"],
             "period_label": first_bucket["period_label"],
             "horizon_bucket_count": len(payload["horizon_buckets"]),
             "horizon_buckets": payload["horizon_buckets"],
             "slices": payload["slices"],
+            "materialization_input": {
+                "version": 1,
+                "supplier_ref1c": payload["supplier_ref1c"],
+                "item_ref1c": payload["item_ref1c"],
+                "unit_ref1c": _clean_ref(payload["unit"]),
+                "destination_warehouse_ref1c": configured_destination_warehouse_ref1c,
+                "slices": [
+                    {
+                        "reservation_id": int(slice_row["reservation_id"]),
+                        "work_item_id": int(slice_row["work_item_id"]),
+                        "requirement_id": int(slice_row["requirement_id"]),
+                        "run_id": int(slice_row["run_id"]),
+                        "plan_period_from": slice_row["plan_period_from"],
+                        "plan_period_to": slice_row["plan_period_to"],
+                        "need_date": slice_row["need_date"],
+                        "need_period_to": slice_row["need_period_to"],
+                        "to_order_qty": round(float(slice_row["to_order_qty"]), 6),
+                    }
+                    for slice_row in payload["slices"]
+                ],
+            },
             "row_generator": _BUY_ROW_GENERATOR,
             "fact_status": "available",
             "fact_source": "ledger",
@@ -558,7 +872,12 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
     _, cards = _build_supplier_card_rows(db, generation)
     merged_rows = [
         dict(row)
-        for row in _build_buyer_rows(db, int(generation.id), to_order_buckets)
+        for row in _build_buyer_rows(
+            db,
+            int(generation.id),
+            to_order_buckets,
+            cutoff_date=generation.cutoff.date(),
+        )
         if float(row.get("remaining_qty") or 0) >= 0
     ]
 

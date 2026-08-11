@@ -401,6 +401,48 @@ def test_correction_receipt_minus_one_requires_typed_original_receipt(db_session
     assert result.evidence[0].correction_receipt_ref == "original-receipt"
 
 
+def test_correction_named_agreed_change_is_accepted_as_correction(db_session):
+    """УНФ ЗСМ называет операцию корректировки «СогласованноеИзменение»;
+    ключ операции остаётся каноническим CORRECTION-префиксом, и такой
+    документ обязан проходить как корректировка, а не ронять refresh
+    диагностикой wrong_operation."""
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        doc_type="Document_КорректировкаПоступления",
+        ref="agreed-change-ref",
+        qty="-1",
+    )
+    doc = _doc(
+        "agreed-change-ref",
+        CORRECTION_OPERATION,
+        "СогласованноеИзменение",
+        qty="-1",
+    )
+    doc["Запасы"][0].update({
+        "Количество": "29",
+        "КоличествоДоИзменения": "30",
+        "КоличествоПослеИзменения": "29",
+    })
+    doc.update({
+        "ИсправляемыйДокументПоступления": "original-receipt",
+        "ИсправляемыйДокументПоступления_Type":
+            "StandardODATA.Document_ПриходнаяНакладная",
+    })
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_КорректировкаПоступления(guid'agreed-change-ref')": doc
+        }),
+        [entry],
+    )
+
+    assert not result.diagnostics
+    assert result.evidence[0].signed_qty == Decimal("-1")
+    assert result.evidence[0].correction_receipt_ref == "original-receipt"
+
+
 def test_supplier_return_expense_normalizes_positive_document_qty_negative(db_session):
     item = _item(db_session)
     entry = _sle(

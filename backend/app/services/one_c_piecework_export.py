@@ -27,10 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    DefaultSpecification,
     ProductionManufacture,
     ProductionManufactureOperation,
-    ProductionOrder,
     ProductionProduct,
     Employee,
     Operation,
@@ -61,17 +59,14 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import piecework_number
 from .one_c_manufacture_export import (
-    commanded_qty_by_product as _commanded_qty_by_product,
     export_manufactures_to_1c,
 )
+from .bom_specification_resolver import BomSpecificationResolver
 
 
 PIECEWORK_ENTITY = "Document_СдельныйНаряд"
-PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 BASIS_TYPE = "StandardODATA.Document_СборкаЗапасов"
 ORDER_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
-DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-ORDER_COMPLETION_SUCCESS = "Успешно"
 PIECEWORK_PRICE_REGISTER = "InformationRegister_ЦеныНоменклатуры"
 DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C = "81c4a02c-991b-11eb-e39a-fa163e61326a"
 
@@ -115,7 +110,6 @@ class PieceworkExportEntry:
     status: str = "planned"
     error: Optional[str] = None
     reason: Optional[str] = None
-    order_closed: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -272,13 +266,7 @@ def _piecework_spec_id(db: Session, product: Optional[ProductionProduct]) -> Opt
     item_id = getattr(product, "item_id", None)
     if not item_id:
         return None
-    row = (
-        db.query(DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id == int(item_id))
-        .order_by(DefaultSpecification.id.asc())
-        .first()
-    )
-    return int(row.spec_id) if row else None
+    return BomSpecificationResolver(db).default_spec_id(int(item_id))
 
 
 def _piecework_operation_defaults(
@@ -732,73 +720,6 @@ def _record_manufacture_export_error(db: Session, manufacture_id: int, error: st
     m_row.export_error = f"СдельныйНаряд: {error}"
 
 
-def _order_is_fully_commanded(db: Session, order_id: int) -> bool:
-    """
-    True when every line of the production order is fully handed to executive
-    1C documents (or already reported as produced).
-
-    Closing Document_ЗаказНаПроизводство tells 1C the order is finished, so a
-    partial выпуск must not trigger it — the uncommanded remainder would be
-    silently written off together with the order.
-    """
-    rows = (
-        db.query(
-            ProductionProduct.product_id,
-            ProductionProduct.quantity,
-            ProductionProduct.produced_qty,
-        )
-        .filter(ProductionProduct.order_id == int(order_id))
-        .all()
-    )
-    if not rows:
-        # Unknown scope — never close the 1C order on a guess.
-        return False
-    commanded = _commanded_qty_by_product(db, [int(row[0]) for row in rows])
-    for product_id, quantity, produced_qty in rows:
-        covered = max(
-            commanded.get(int(product_id), 0.0),
-            float(produced_qty or 0),
-        )
-        if covered + 1e-6 < float(quantity or 0):
-            return False
-    return True
-
-
-def _close_production_order(
-    db: Session,
-    client: OData1CClient,
-    entry: PieceworkExportEntry,
-) -> bool:
-    """
-    Mark the parent Document_ЗаказНаПроизводство as finished in 1C and locally.
-    No-op (returns False) while the order still has an uncommanded remainder.
-    """
-    order_ref = _clean_ref1c(entry.order_ref1c)
-    if not order_ref:
-        return False
-    if not _order_is_fully_commanded(db, int(entry.order_id)):
-        return False
-    patch = getattr(client, "patch", None)
-    if patch is None:
-        raise RuntimeError("OData client cannot patch production order completion state")
-    patch(
-        f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
-        {
-            "СостояниеЗаказа_Key": DONE_STATE_KEY,
-            "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
-        },
-    )
-    order = (
-        db.query(ProductionOrder)
-        .filter(ProductionOrder.order_id == int(entry.order_id))
-        .one_or_none()
-    )
-    if order is not None:
-        order.order_state_key = DONE_STATE_KEY
-        order.order_state_name = "Завершен"
-    return True
-
-
 def _chain_export_parent_manufactures(
     db: Session,
     manufacture_ids: List[int],
@@ -966,7 +887,9 @@ def export_piecework_to_1c(
             unpost_first=False,
         )
         # 1C can move Date to the posting moment. Keep the business timestamp
-        # identical to creation time and mark the order closed explicitly.
+        # identical to creation time and mark the piecework document closed.
+        # The parent Document_ЗаказНаПроизводство is never touched: its state is
+        # set in 1C by the operator and only read back into PRODPLAN by the sync.
         patch = getattr(client, "patch", None)
         if patch is not None and entry.document_datetime:
             patch(
@@ -977,9 +900,6 @@ def export_piecework_to_1c(
                     "ДатаЗакрытия": entry.document_datetime,
                 },
             )
-        # A выпуск closes the 1C order only when nothing is left uncommanded on
-        # it: partial production must keep Document_ЗаказНаПроизводство open.
-        entry.order_closed = _close_production_order(db, client, entry)
 
     def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
         _record_manufacture_export_error(db, entry.manufacture_id, error)
@@ -1009,8 +929,8 @@ def export_piecework_to_1c(
 # Комбинированный сдельный цепочки «окраска↔сварка» (этап 4).
 # См. .docs/paint_weld_chain_logic.md п.6: бумага одна, операции сварки и
 # окраски в одном документе, у каждой строки свой ЗаказНаПроизводство_Key и
-# участок, основание — окрасочная СборкаЗапасов, оба заказа закрываются
-# одновременно этим же экспортом.
+# участок, основание — окрасочная СборкаЗапасов. Состояние самих заказов
+# экспорт не пишет: заказ закрывает оператор в 1С.
 # ---------------------------------------------------------------------------
 
 
@@ -1090,10 +1010,10 @@ def export_chain_piecework_to_1c(
     Один комбинированный Document_СдельныйНаряд на цепочку «окраска↔сварка».
 
     Основание — окрасочная СборкаЗапасов; строки сварки и окраски несут каждая
-    свой ЗаказНаПроизводство_Key, участок и номенклатуру. Успешный экспорт
-    закрывает ОБА заказа («Успешно», Завершен) — одно закрытие из одного окна.
-    Идемпотентно: sync_link 'piecework' пишется на оба manufacture с одним
-    target_ref_key, повтор — no-op.
+    свой ЗаказНаПроизводство_Key, участок и номенклатуру. Состояние самих
+    заказов экспорт не трогает — его ставит оператор в 1С, PRODPLAN только
+    читает его обратно синком. Идемпотентно: sync_link 'piecework' пишется на
+    оба manufacture с одним target_ref_key; повтор — no-op.
     """
     parent_export = _chain_export_parent_manufactures(
         db,
@@ -1223,11 +1143,8 @@ def export_chain_piecework_to_1c(
                 f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
                 {"Date": when, "Закрыт": True, "ДатаЗакрытия": when},
             )
-        # Закрытие обоих заказов цепочки — одним действием, но только тех, по
-        # которым не осталось нескомандованного остатка (частичный выпуск не
-        # закрывает заказ).
-        for chain_entry in (weld_entry, paint_entry):
-            chain_entry.order_closed = _close_production_order(db, client, chain_entry)
+        # Состояние заказов цепочки не пишется: заказ закрывает оператор в 1С,
+        # PRODPLAN узнаёт об этом только read-back синком.
 
     def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
         for chain_entry in (weld_entry, paint_entry):

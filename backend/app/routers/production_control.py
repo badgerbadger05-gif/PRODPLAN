@@ -1,21 +1,25 @@
 from __future__ import annotations
 
-from typing import Annotated, List, Optional, Union
+from typing import Annotated, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..services import planning_truth
 from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..database import get_db
-from ..models import DefaultSpecification, Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
+from ..models import Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
+from ..services.bom_specification_resolver import BomSpecificationResolver
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_piecework_export import export_piecework_to_1c
-from ..services.one_c_production_order_export import export_production_orders_to_1c
+from ..services.one_c_production_order_export import (
+    close_production_orders_to_1c,
+    export_production_orders_to_1c,
+)
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control_material_issues import (
     assemble_material_issue,
@@ -27,17 +31,25 @@ from ..services.production_control_material_issues import (
 from ..services.production_control_journal import (
     materialize_make_work_items,
     cancel_local_order,
-    dedupe_mrp_production_orders,
-    list_journal,
     update_line_state,
-    update_product_quantity,
+)
+from ..services.production_control_journal_snapshot import (
+    RouteSheetSnapshotUnavailable,
+    ProductionControlJournalSnapshotUnavailable,
+    list_root_product_options,
+    read_snapshot as read_production_control_journal_snapshot,
+    read_route_sheet_snapshot_rows,
 )
 from ..services.production_control_material_availability import (
+    MaterialCoverageSnapshotUnavailable,
     get_materials_snapshot,
-    preview_materials,
-    refresh_materials_snapshot,
+    preview_make_work_item_materials,
 )
-from ..services.production_control_printing import mark_route_sheets_printed, render_route_sheets_html
+from ..services.paint_weld_chain import open_paint_chains_for_products
+from ..services.production_control_printing import (
+    mark_route_sheets_printed_by_snapshot_members,
+    render_route_sheets_from_snapshots,
+)
 from ..services.production_control_production_flow import (
     produce_line,
     return_leftover_components,
@@ -47,6 +59,25 @@ from .production_control_settings import router as settings_router
 
 
 router = APIRouter(prefix="/v1/production-control", tags=["production-control"])
+
+
+def _route_sheet_snapshot_error(exc: RouteSheetSnapshotUnavailable) -> dict[str, object]:
+    detail = exc.as_dict()
+    detail.setdefault("code", "route_sheet_snapshot_unavailable")
+    return detail
+
+
+def _route_sheet_member_ids(payloads: List[dict]) -> List[int]:
+    members: set[int] = set()
+    for payload in payloads:
+        sheet = payload.get("sheet") if isinstance(payload, dict) else None
+        if not isinstance(sheet, dict):
+            continue
+        members.add(int(sheet["product_id"]))
+        chain = sheet.get("chain")
+        if isinstance(chain, dict) and chain.get("weld_product_id") is not None:
+            members.add(int(chain["weld_product_id"]))
+    return sorted(members)
 
 
 class AssemblyQueueRow(BaseModel):
@@ -76,6 +107,25 @@ class AssemblyQueueResponse(BaseModel):
     limit: int
     offset: int
     truth_meta: TruthMeta
+
+
+class ProductionMaterialsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ledger_generation_id: int
+    truth_status: str
+    cutoff: str
+    product_id: Optional[int] = None
+    work_item_id: Optional[int] = None
+    order_number: str
+    item_name: str
+    item_article: str
+    qty: float
+    spec_id: int | None
+    components: list[dict]
+    coverage: str
+    coverage_status: str
+    coverage_label: str
 
 
 class DrumSlotRow(BaseModel):
@@ -431,7 +481,24 @@ def get_shelf_projections(
     )
 
 
-@router.get("/employees", response_model=dict)
+class ProductionEmployeeOptionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    employee_id: int
+    employee_ref1c: str
+    employee_type: Literal["employee", "brigade"]
+    employee_code: str | None = None
+    employee_name: str
+
+
+class ProductionEmployeeListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[ProductionEmployeeOptionResponse]
+    total: int
+
+
+@router.get("/employees", response_model=ProductionEmployeeListResponse)
 def list_employees(
     search: Optional[str] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 500,
@@ -454,7 +521,7 @@ def list_employees(
             {
                 "employee_id": int(row.employee_id),
                 "employee_ref1c": row.employee_ref1c,
-                "employee_type": getattr(row, "employee_type", "employee") or "employee",
+                "employee_type": row.employee_type,
                 "employee_code": row.employee_code,
                 "employee_name": row.employee_name,
             }
@@ -464,7 +531,32 @@ def list_employees(
     }
 
 
-@router.get("/orders/{product_id}/operations", response_model=dict)
+class ProductionOperationOptionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    line_number: int
+    spec_id: int
+    spec_ref1c: str | None = None
+    spec_operation_id: int
+    operation_id: int
+    operation_ref1c: str
+    operation_name: str | None = None
+    stage_id: int | None = None
+    stage_name: str | None = None
+    time_norm: float
+
+
+class ProductionOperationsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[ProductionOperationOptionResponse]
+    total: int
+
+
+@router.get(
+    "/orders/{product_id}/operations",
+    response_model=ProductionOperationsResponse,
+)
 def get_order_line_operations(
     product_id: int,
     db: Session = Depends(get_db),
@@ -478,13 +570,7 @@ def get_order_line_operations(
         raise HTTPException(status_code=404, detail="Строка заказа не найдена")
     spec_id = product.spec_id
     if not spec_id:
-        default_spec = (
-            db.query(DefaultSpecification.spec_id)
-            .filter(DefaultSpecification.item_id == int(product.item_id))
-            .order_by(DefaultSpecification.id.asc())
-            .first()
-        )
-        spec_id = int(default_spec.spec_id) if default_spec else None
+        spec_id = BomSpecificationResolver(db).default_spec_id(int(product.item_id))
     if not spec_id:
         return {"rows": [], "total": 0}
     spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).one_or_none()
@@ -531,17 +617,21 @@ class MaterialIssueCreatePayload(BaseModel):
     source_warehouse_ref1c: Optional[str] = None
 
 
+class MakeWorkItemLaunchPayload(BaseModel):
+    work_item_id: int
+    launch_qty: float = Field(gt=0)
+    expected_materialized_qty: float = Field(default=0, ge=0)
+
+
 class OrdersFromWorkItemsPayload(BaseModel):
-    work_item_ids: List[int]
+    work_item_ids: List[int] = Field(default_factory=list)
+    work_items: List[MakeWorkItemLaunchPayload] = Field(default_factory=list)
     initiated_by: Optional[str] = None
 
 
-class DedupeMrpOrdersPayload(BaseModel):
-    dry_run: bool = True
-
-
-class UpdateQuantityPayload(BaseModel):
-    quantity: float
+class OpenPaintWeldChainsPayload(BaseModel):
+    product_ids: List[int]
+    initiated_by: Optional[str] = None
 
 
 class ExportProductionOrdersPayload(BaseModel):
@@ -560,10 +650,16 @@ class ExportMaterialIssuesPayload(BaseModel):
 
 
 class ProduceLinePayload(BaseModel):
-    qty: float
+    # The executable quantity is server-owned.  An explicit value remains
+    # accepted for non-UI integrations but is bounded again by the service.
+    qty: Optional[float] = None
     executor: Optional[str] = None
     operation_executors: Optional[List[dict]] = None
     comment: Optional[str] = None
+
+
+class CloseProductionOrderPayload(BaseModel):
+    dry_run: bool = True
 
 
 class ExportManufacturesPayload(BaseModel):
@@ -605,15 +701,26 @@ class PaintWeldChainResponse(BaseModel):
     link_id: int
     counterpart_order_id: Optional[int] = None
     counterpart_product_id: Optional[int] = None
+    counterpart_order_number: Optional[str] = None
+    counterpart_order_prodplan_number: Optional[str] = None
+    counterpart_item_name: Optional[str] = None
+    counterpart_item_article: Optional[str] = None
+    counterpart_item_code: Optional[str] = None
+    counterpart_quantity: Optional[float] = None
+    counterpart_remaining_qty: Optional[float] = None
+    counterpart_unit: Optional[str] = None
+    counterpart_workshop_name: Optional[str] = None
 
 
 class ProductionOrderJournalRowResponse(BaseModel):
-    """One real production line in the unified production-control journal."""
+    """One executor order or saved MRP proposal in the unified journal."""
 
     model_config = ConfigDict(extra="forbid")
 
-    product_id: int
-    order_id: int
+    journal_row_key: Optional[str] = None
+    work_item_id: Optional[int] = None
+    product_id: Optional[int] = None
+    order_id: Optional[int] = None
     order_number: str
     order_prodplan_number: Optional[str] = None
     order_date: Optional[str] = None
@@ -643,12 +750,14 @@ class ProductionOrderJournalRowResponse(BaseModel):
     forecast_date: Optional[str] = None
     forecast_shift_days: Optional[int] = None
     forecast_reason: Optional[str] = None
+    forecast_status: Optional[Literal["early", "on_time", "delayed", "critical", "unavailable"]] = None
     opened_at: Optional[str] = None
     workshop_id: Optional[int] = None
     workshop_name: Optional[str] = None
     stage_id: Optional[int] = None
     stage_name: Optional[str] = None
     spec_id: Optional[int] = None
+    spec_revision_hash: Optional[str] = None
     issue_count: int
     route_sheet_printed_at: Optional[str] = None
     comment: str
@@ -663,12 +772,15 @@ class ProductionOrderJournalRowResponse(BaseModel):
     mrp_req_net_qty: Optional[float] = None
     mrp_req_covered_qty: Optional[float] = None
     mrp_req_remaining_qty: Optional[float] = None
+    available_actions: list[str] = []
     # DBR shelf pull: what drives this launch, how much and onto which shelf.
     launch_source: str = "mrp_remaining"
     shelf_warehouse_ref1c: Optional[str] = None
     shelf_pull_qty: Optional[float] = None
     shelf_materialized_qty: Optional[float] = None
     shelf_latest_start_date: Optional[str] = None
+    materialized_order_qty: Optional[float] = None
+    launchable_qty: Optional[float] = None
     paint_weld_chain: Optional[PaintWeldChainResponse] = None
 
 
@@ -682,6 +794,37 @@ class ProductionOrderJournalResponse(BaseModel):
     latest_run_id: Optional[int] = None
     latest_source_plan_id: Optional[int] = None
     truth_meta: TruthMeta
+
+
+class ProductionControlRootProductOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    item_name: str
+    item_article: Optional[str] = None
+    item_code: Optional[str] = None
+
+
+class ProductionControlRootProductOptionsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: List[ProductionControlRootProductOption]
+    total: int
+
+
+@router.get("/orders/root-products", response_model=ProductionControlRootProductOptionsResponse)
+def list_root_products(
+    db: Session = Depends(get_db),
+):
+    try:
+        options = list_root_product_options(db)
+        return {"rows": options, "total": len(options)}
+    except ProductionControlJournalSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/orders", response_model=ProductionOrderJournalResponse)
@@ -707,9 +850,8 @@ def get_orders_journal(
 ):
     try:
         truth = planning_truth.require_accepted_truth(db, "production_control.orders")
-        journal = list_journal(
+        journal = read_production_control_journal_snapshot(
             db,
-            truth=truth,
             product_id=product_id,
             order_id=order_id,
             root_item_id=root_item_id,
@@ -729,23 +871,10 @@ def get_orders_journal(
         return journal
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except ProductionControlJournalSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.patch("/orders/{product_id}/quantity", response_model=dict)
-def patch_order_line_quantity(product_id: int, payload: UpdateQuantityPayload, db: Session = Depends(get_db)):
-    """
-    Adjust the planned quantity of a production line.
-    Cannot be set below already-produced qty.
-    Recalculates remaining_qty automatically.
-    """
-    try:
-        return update_product_quantity(db, int(product_id), float(payload.quantity))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.patch("/orders/{product_id}/state", response_model=dict)
@@ -768,48 +897,58 @@ def delete_local_order(product_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/orders/dedupe-mrp", response_model=dict)
-def post_dedupe_mrp_orders(payload: DedupeMrpOrdersPayload, db: Session = Depends(get_db)):
-    """
-    Repair local MRP production-order overcoverage.
-
-    Dry-run by default. The applied mode only touches local PRODPLAN MRP rows
-    that are not linked to 1C: duplicates are cancelled, and a single oversized
-    row is reduced to the latest MRP requirement.
-    """
-    try:
-        return dedupe_mrp_production_orders(db, dry_run=bool(payload.dry_run))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/orders/{product_id}/materials", response_model=dict)
+@router.get("/orders/{product_id}/materials", response_model=ProductionMaterialsResponse)
 def get_order_line_materials(
     product_id: int,
-    # Kept temporarily so old clients do not break. GET never honours this as
-    # a mutation; explicit recalculation moved to POST below.
-    refresh: bool = False,
     db: Session = Depends(get_db),
 ):
     try:
         return get_materials_snapshot(db, int(product_id))
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except MaterialCoverageSnapshotUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/orders/{product_id}/materials/refresh", response_model=dict)
-def post_order_line_materials_refresh(
-    product_id: int,
+@router.get("/work-items/{work_item_id}/materials", response_model=ProductionMaterialsResponse)
+def get_work_item_materials(
+    work_item_id: int,
+    qty: Optional[float] = None,
     db: Session = Depends(get_db),
 ):
+    """Preview BOM coverage for a saved MRP row without creating an order."""
     try:
-        return refresh_materials_snapshot(db, int(product_id))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        truth = planning_truth.require_accepted_truth(
+            db, "production_control.work_item_materials"
+        )
+        work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
+        if work is None or int(work.ledger_generation_id) != int(truth.generation_id):
+            raise HTTPException(status_code=404, detail="Актуальная расчётная строка не найдена")
+        launch_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
+        if launch_qty <= 0 or launch_qty > float(work.replenishment_remaining_qty) + 1e-6:
+            raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
+        payload = preview_make_work_item_materials(
+            db,
+            work_item_id=int(work.id),
+            item_id=int(work.item_id),
+            quantity=launch_qty,
+            spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
+            ledger_generation_id=int(truth.generation_id),
+            order_number=f"MRP-R-{int(work.requirement_id)}",
+        )
+        payload["truth_status"] = "accepted"
+        payload["cutoff"] = truth.cutoff.isoformat()
+        return payload
+    except HTTPException:
+        raise
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _export_failure_detail(
@@ -854,7 +993,7 @@ def post_produce_line(
         command = produce_line(
             db,
             int(product_id),
-            qty=float(payload.qty),
+            qty=payload.qty,
             executor=payload.executor,
             operation_executors=payload.operation_executors,
             comment=payload.comment,
@@ -904,6 +1043,31 @@ def post_produce_line(
             "piecework_export": piecework_export,
             "ledger_readback": "queued",
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/orders/{product_id}/close", response_model=dict)
+def post_close_production_order(
+    product_id: int,
+    payload: CloseProductionOrderPayload,
+    db: Session = Depends(get_db),
+):
+    try:
+        product = (
+            db.query(ProductionProduct)
+            .filter(ProductionProduct.product_id == int(product_id))
+            .first()
+        )
+        if product is None or product.order_id is None:
+            raise ValueError("ProductionProduct для close не найден")
+        return close_production_orders_to_1c(
+            db,
+            [int(product.order_id)],
+            dry_run=bool(payload.dry_run),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1001,16 +1165,49 @@ def post_orders_from_work_items(
 
     Frozen requirement, reservation and work-item quantities are not changed.
     """
-    if not payload.work_item_ids:
+    selected_ids = [int(x) for x in payload.work_item_ids]
+    launch_requests = {}
+    for row in payload.work_items:
+        work_id = int(row.work_item_id)
+        selected_ids.append(work_id)
+        launch_requests[work_id] = {
+            "launch_qty": float(row.launch_qty),
+            "expected_materialized_qty": float(row.expected_materialized_qty),
+        }
+    selected_ids = list(dict.fromkeys(selected_ids))
+    if not selected_ids:
         raise HTTPException(status_code=400, detail="Не выбраны рабочие строки")
     try:
         return materialize_make_work_items(
             db,
-            [int(x) for x in payload.work_item_ids],
+            selected_ids,
             initiated_by=payload.initiated_by,
+            launch_requests=launch_requests or None,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/open-paint-weld-chains", response_model=dict)
+def post_open_paint_weld_chains(
+    payload: OpenPaintWeldChainsPayload,
+    db: Session = Depends(get_db),
+):
+    """Открыть сварочную сторону для выбранных окрасочных строк и вернуть
+    полный набор product_id, который должен пройти выдачу материалов и печать.
+    """
+    if not payload.product_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны строки заказов")
+    result = open_paint_chains_for_products(
+        db,
+        product_ids=payload.product_ids,
+        initiated_by=payload.initiated_by,
+    )
+    if result.get("status") == "partial_error":
+        errors = result.get("errors") or []
+        detail = "; ".join(str(row.get("error") or "ошибка цепочки") for row in errors)
+        raise HTTPException(status_code=400, detail=detail or "Не удалось открыть цепочку окраска-сварка")
+    return result
 
 
 @router.post("/orders/export-to-1c", response_model=dict)
@@ -1110,7 +1307,7 @@ def post_export_material_issues_to_1c(
 ):
     """
     Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов
-    (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
+    (Posted=false). Идемпотентно через sync_link.
 
     - `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.
     - `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.
@@ -1163,7 +1360,7 @@ def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_
 @router.get("/route-sheets/print", response_class=HTMLResponse)
 def print_route_sheets(
     product_ids: str = Query(..., description="Comma-separated production product ids"),
-    mark_printed: bool = True,
+    mark_printed: bool = False,
     auto_print: bool = False,
     db: Session = Depends(get_db),
 ):
@@ -1171,10 +1368,15 @@ def print_route_sheets(
         ids = [int(x) for x in product_ids.split(",") if x.strip()]
         if not ids:
             raise ValueError("Не выбраны строки заказа")
-        html = render_route_sheets_html(db, ids, auto_print=auto_print)
-        if mark_printed:
-            mark_route_sheets_printed(db, ids)
+        route_payloads = read_route_sheet_snapshot_rows(db, ids)
+        html = render_route_sheets_from_snapshots(route_payloads, auto_print=auto_print)
+        # Compatibility-only query parameter.  GET is strictly read-only even
+        # when an old bookmark sends mark_printed=true; persistence belongs to
+        # the explicit POST endpoint below.
+        _ = mark_printed
         return HTMLResponse(content=html)
+    except RouteSheetSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=_route_sheet_snapshot_error(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1188,10 +1390,13 @@ def post_print_route_sheets(
         ids = [int(x) for x in payload.product_ids if x is not None]
         if not ids:
             raise ValueError("Не выбраны строки заказа")
-        html = render_route_sheets_html(db, ids, auto_print=bool(payload.auto_print))
+        route_payloads = read_route_sheet_snapshot_rows(db, ids)
+        html = render_route_sheets_from_snapshots(route_payloads, auto_print=bool(payload.auto_print))
         if payload.mark_printed:
-            mark_route_sheets_printed(db, ids)
+            mark_route_sheets_printed_by_snapshot_members(db, _route_sheet_member_ids(route_payloads))
         return HTMLResponse(content=html)
+    except RouteSheetSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=_route_sheet_snapshot_error(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

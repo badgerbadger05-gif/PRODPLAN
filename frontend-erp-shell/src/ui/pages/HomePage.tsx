@@ -95,7 +95,6 @@ export function HomePage() {
               {available.has('ledger') && <button onClick={() => navigate('/ledger')}>Ledger</button>}
               {available.has('sync') && <button onClick={() => navigate('/sync')}>Синхронизация</button>}
               {available.has('resources') && <button onClick={() => navigate('/resources')}>Ресурсы</button>}
-              {available.has('stage_distribution') && <button onClick={() => navigate('/stage-distribution')}>Распределение этапов</button>}
               {available.has('specification') && <button onClick={() => navigate('/specification')}>Спецификации</button>}
             </div>
           </section>

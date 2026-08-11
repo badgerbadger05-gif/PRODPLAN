@@ -12,7 +12,6 @@ import type {
 import { downloadBase64File } from '../../lib/download'
 import { getPeriodPlanMatrix } from '../../services/periodPlan'
 import {
-  createProductionControlOrdersFromMrp,
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
   exportPlanningResultRework,
@@ -28,7 +27,6 @@ import { MrpResultPage } from './MrpResultPage'
 vi.mock('../../lib/download', () => ({ downloadBase64File: vi.fn() }))
 vi.mock('../../services/periodPlan', () => ({ getPeriodPlanMatrix: vi.fn() }))
 vi.mock('../../services/planning', () => ({
-  createProductionControlOrdersFromMrp: vi.fn(),
   exportPlanningResultProduction: vi.fn(),
   exportPlanningResultPurchases: vi.fn(),
   exportPlanningResultRework: vi.fn(),
@@ -59,7 +57,13 @@ const summary: MrpSummary = {
     purchase_requests: 3,
     rework_requests: 1,
   },
-  capacity: { overloaded_buckets: 1 },
+  capacity: { overloaded_buckets: 1, overload_total: 12.5 },
+  snapshot_total_qty: {
+    production: 505,
+    purchase: 404,
+    rework: 303,
+    capacity: 0,
+  },
 }
 
 const productionRows: MrpProductionRow[] = [
@@ -101,6 +105,11 @@ const purchaseRows: MrpPurchaseRow[] = [
     supplier_name: 'ООО Альфа',
     category_id: 11,
     category_name: 'Комплектующие',
+    requested_qty: 10,
+    supplier_covered_qty: 4,
+    supplier_coverage_pct: 40,
+    supplier_coverage_status: 'partial',
+    supplier_coverage_label: '4 / 10 шт (40%)',
   },
   {
     purchase_id: 2002,
@@ -114,6 +123,11 @@ const purchaseRows: MrpPurchaseRow[] = [
     supplier_name: 'ООО Бета',
     category_ref1c: 'category-metal',
     category_name: 'Металл',
+    requested_qty: 20,
+    supplier_covered_qty: 12,
+    supplier_coverage_pct: 60,
+    supplier_coverage_status: 'partial',
+    supplier_coverage_label: '12 / 20 кг (60%)',
   },
   {
     purchase_id: 2003,
@@ -124,6 +138,11 @@ const purchaseRows: MrpPurchaseRow[] = [
     qty: 1,
     supplier_ref1c: 'missing-name-ref',
     supplier_name: ' ',
+    requested_qty: 1,
+    supplier_covered_qty: 1,
+    supplier_coverage_pct: 100,
+    supplier_coverage_status: 'full',
+    supplier_coverage_label: '1 / 1 шт (100%)',
   },
 ]
 
@@ -142,6 +161,7 @@ const capacityRows: MrpCapacityRow[] = [{
   hours_planned: 12,
   hours_available: 8,
   overload_hours: 4,
+  capacity_status: 'overloaded',
 }]
 
 function paged<T>(rows: T[], total = rows.length, offset = 0) {
@@ -202,6 +222,7 @@ describe('MrpResultPage characterization', () => {
         period_to: '2026-07-31',
       },
       buckets: [],
+      bucket_totals: {},
       rows: [{
         item_id: 501,
         item_code: 'PUMP-01',
@@ -211,9 +232,10 @@ describe('MrpResultPage characterization', () => {
         buckets: {},
         locked_buckets: {},
       }],
+      total_qty: 5,
+      grand_total: 5,
       total: 1,
     })
-    vi.mocked(createProductionControlOrdersFromMrp).mockResolvedValue({ created: 2 })
     vi.mocked(exportPurchasesTo1C).mockResolvedValue({ exported: 2 })
     const exported = {
       data_base64: 'WA==',
@@ -230,6 +252,10 @@ describe('MrpResultPage characterization', () => {
 
     expect(await screen.findByText('Насос ГА-1')).toBeVisible()
     expect(screen.getByText('Успешно')).toBeVisible()
+    expect(screen.getByText('505 шт.')).toBeVisible()
+    expect(screen.getByText('404 шт.')).toBeVisible()
+    expect(screen.getByText('303 шт.')).toBeVisible()
+    expect(screen.getByText('12,5 н/ч')).toBeVisible()
     expect(getPlanningRunSummary).toHaveBeenCalledWith(41)
     expect(getPlanningResultProduction).toHaveBeenCalledWith(41, {
       snapshot_id: 901,
@@ -264,7 +290,6 @@ describe('MrpResultPage characterization', () => {
     ]) {
       expect(reader).toHaveBeenCalledWith(41, expect.objectContaining({ snapshot_id: 901 }))
     }
-    expect(createProductionControlOrdersFromMrp).not.toHaveBeenCalled()
     expect(exportPurchasesTo1C).not.toHaveBeenCalled()
   })
 
@@ -284,7 +309,6 @@ describe('MrpResultPage characterization', () => {
     expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
     expect(getPlanningResultProduction).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'XLSX' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Создать заказы (0)' })).toBeDisabled()
   })
 
   it('clears rows when a tab response does not match the pinned snapshot', async () => {
@@ -355,30 +379,15 @@ describe('MrpResultPage characterization', () => {
     }))
   })
 
-  it('uses aggregated production IDs and excludes zero-quantity rows from selection', async () => {
-    const user = userEvent.setup()
-    renderPage()
-    await screen.findByText('Насос ГА-1')
-
-    const selectable = screen.getByRole('checkbox', { name: 'Выбрать Насос ГА-1' })
-    const zero = screen.getByRole('checkbox', { name: 'Выбрать Нулевая потребность' })
-    expect(zero).toBeDisabled()
-    await user.click(selectable)
-    expect(screen.getByRole('button', { name: 'Создать заказы (2)' })).toBeEnabled()
-    await user.click(screen.getByRole('button', { name: 'Создать заказы (2)' }))
-
-    expect(createProductionControlOrdersFromMrp).toHaveBeenCalledWith({
-      run_id: 41,
-      date_from: undefined,
-      date_to: undefined,
-      planned_order_ids: [101, 102],
-    })
-    expect(await screen.findByText('Создание заказов: выполнено, новых 2')).toBeVisible()
-    expect(getPlanningRunSummary).toHaveBeenCalledTimes(2)
-    expect(getPlanningResultProduction).toHaveBeenCalledTimes(2)
-  })
-
   it('keeps page-local purchase filters and exports aggregated IDs with the exact 1C flags', async () => {
+    vi.mocked(getPlanningResultPurchases).mockImplementation(async (_runId, params) => {
+      let rows = purchaseRows
+      if (params?.supplier_ref1c) rows = rows.filter((row) => row.supplier_ref1c === params.supplier_ref1c)
+      if (params?.category_id != null) rows = rows.filter((row) => row.category_id === params.category_id)
+      if (params?.category_ref1c) rows = rows.filter((row) => row.category_ref1c === params.category_ref1c)
+      return Promise.resolve(paged(rows, rows.length, params?.offset ?? 0))
+    })
+
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Насос ГА-1')
@@ -387,10 +396,26 @@ describe('MrpResultPage characterization', () => {
 
     expect(screen.getByRole('option', { name: 'Без наименования' })).toBeVisible()
     await user.selectOptions(screen.getByRole('combobox', { name: 'Фильтр по поставщику' }), 'supplier-a')
-    expect(screen.getByText('Подшипник')).toBeVisible()
+    await waitFor(() => expect(
+      vi.mocked(getPlanningResultPurchases).mock.calls.some((call) => call[1] && call[1].supplier_ref1c === 'supplier-a'),
+    ).toBe(true))
     expect(screen.queryByText('Лист стальной')).not.toBeInTheDocument()
     await user.selectOptions(screen.getByRole('combobox', { name: 'Фильтр по категории' }), '11')
+    await waitFor(() => expect(
+      vi.mocked(getPlanningResultPurchases).mock.calls.some((call) => call[1]?.supplier_ref1c === 'supplier-a' && call[1]?.category_id === 11),
+    ).toBe(true))
     expect(screen.getByText('Подшипник')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'XLSX' }))
+    await waitFor(() => expect(exportPlanningResultPurchases).toHaveBeenCalledWith(
+      41,
+      expect.objectContaining({
+        snapshot_id: 901,
+        supplier_ref1c: 'supplier-a',
+        category_id: 11,
+        root_item_id: null,
+        format: 'xlsx',
+      }),
+    ))
 
     await user.click(screen.getByRole('checkbox', { name: 'Выбрать Подшипник' }))
     await user.click(screen.getByRole('button', { name: 'Выгрузить в 1С (2)' }))
@@ -402,6 +427,13 @@ describe('MrpResultPage characterization', () => {
       allow_production: true,
     })
     expect(await screen.findByText('Выгрузка закупок в 1С: выполнено, новых 2')).toBeVisible()
+  })
+
+  it('shows the backend-owned supplier coverage label', async () => {
+    renderPage('/mrp-runs/41?tab=purchases')
+    await screen.findByText('Подшипник')
+    expect(screen.getByText(/4 \/ 10 шт \(40%\)/)).toBeVisible()
+    expect(screen.getByText(/12 \/ 20 кг \(60%\)/)).toBeVisible()
   })
 
   it('dispatches XLSX export by active tab and downloads each response', async () => {
@@ -464,23 +496,6 @@ describe('MrpResultPage characterization', () => {
       expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
       expect(screen.getByText('99 дн.')).toBeVisible()
     })
-  })
-
-  it('allows only one production mutation while the first request is pending', async () => {
-    const pending = deferred<Record<string, unknown>>()
-    vi.mocked(createProductionControlOrdersFromMrp).mockImplementation(() => pending.promise)
-    const user = userEvent.setup()
-    renderPage()
-    await screen.findByText('Насос ГА-1')
-    await user.click(screen.getByRole('checkbox', { name: 'Выбрать Насос ГА-1' }))
-
-    const action = screen.getByRole('button', { name: 'Создать заказы (2)' })
-    fireEvent.click(action)
-    fireEvent.click(action)
-    expect(createProductionControlOrdersFromMrp).toHaveBeenCalledTimes(1)
-
-    pending.resolve({ created: 2 })
-    expect(await screen.findByText('Создание заказов: выполнено, новых 2')).toBeVisible()
   })
 
   it('allows only one purchase mutation while the first request is pending', async () => {

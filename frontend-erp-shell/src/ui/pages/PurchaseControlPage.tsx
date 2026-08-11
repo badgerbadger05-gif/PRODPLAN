@@ -67,16 +67,46 @@ export function PurchaseControlPage() {
       access={access}
       breadcrumbs="Закупки / Журнал закупок"
       renderTopBadge={(state) => {
-        const meta = state.listMeta.meta as { ledger_generation?: number; snapshot_id?: number } | undefined
+        const meta = state.listMeta.meta as {
+          ledger_generation?: number | null
+          snapshot_id?: number | null
+          truth_status?: string | null
+          truth_reason?: string | null
+          cutoff?: string | null
+        } | undefined
         const snapshot = Number(meta?.snapshot_id ?? 0)
         const ledger = Number(meta?.ledger_generation ?? state.listMeta.ledger_generation_id)
+        const truthStatus = meta?.truth_status || 'unavailable'
+        const cutoff = meta?.cutoff || 'н/д'
+        const reason = meta?.truth_reason || null
+        if (state.listLoading && !snapshot && !ledger) {
+          return <>Снимок: загрузка… · Ledger: загрузка…</>
+        }
+        if (state.error && !snapshot && !ledger) {
+          return (
+            <>
+              Снимок: недоступен · Ledger: недоступен · Истина: {truthStatus}
+              {reason ? ` · ${reason}` : ' · Статус не подтверждён'}
+            </>
+          )
+        }
         return (
           <>
-            Снимок: {snapshot || '—'} · Ledger: {ledger || '—'}
+            Снимок: {snapshot || '—'}
+            {' · '}
+            Ledger: {ledger || '—'}
+            {' · '}
+            Истина: {truthStatus}
+            {' · '}
+            Cutoff: {cutoff}
+            {reason ? ` · ${reason}` : null}
           </>
         )
       }}
       renderFilters={() => null}
+      splitClassName="purchaseJournalSplit"
+      loadingLabel="Загрузка журнала закупок…"
+      emptyLabel="В журнале закупок нет строк"
       renderTable={(state) => (
         <div className="tablePane">
           <PurchaseFilterBar

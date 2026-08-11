@@ -12,23 +12,32 @@ inside an already-closed forward window: the forward scan never revisits it and
 the audit, which only re-pulls recorders the ledger already knows, never learns
 it exists.  Such a recorder is invisible forever and the gap accumulates with
 every refresh.  The audit therefore re-discovers the retained horizon
-``(opening_at, parent_cutoff]`` on every run and folds anything new into the set
-it verifies.
+``(opening_at, parent_cutoff]`` on every run and folds new, revised, and now
+absent recorders into the set it verifies.  Re-pulling an absent recorder as
+empty supersedes movements left behind by a cancelled/unposted document.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
 
-from .historical_register_scan import scan_historical_register_range
-from .ingest import DEFAULT_MAX_ATTEMPTS, pull_recorder_movements
+from .historical_register_scan import (
+    balance_content_hash,
+    balance_movement_payload,
+    scan_historical_register_range,
+)
+from .ingest import (
+    DEFAULT_MAX_ATTEMPTS,
+    HistoricalPullBeyondCutoffError,
+    pull_recorder_movements,
+)
 from .opening_balance_reconcile import (
     ADJUSTMENT_RECORDER_TYPE,
     opening_boundary,
@@ -38,10 +47,10 @@ from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 
 
-ALGORITHM_VERSION = "ledger-physical-refresh-import/2"
+ALGORITHM_VERSION = "ledger-physical-refresh-import/3"
 GENERATION_KIND = "physical_refresh"
 CHECKPOINT_KEY_PREFIX = "physical-refresh-recorder-audit"
-CHECKPOINT_VERSION = "2"
+CHECKPOINT_VERSION = "3"
 
 # Discovery re-reads the register only for recorder identities ($select is four
 # columns), so a wide window is cheap next to the per-recorder pulls that follow.
@@ -69,6 +78,8 @@ class PhysicalRefreshImportResult:
     from_checkpoint: bool
     discovered_recorders: int = 0
     backdated_recorders: int = 0
+    revised_recorders: int = 0
+    vanished_recorders: int = 0
 
 
 def _utc(value: datetime | str | None, field: str) -> datetime:
@@ -188,19 +199,15 @@ def _discovery_range(
     return floor, parent_cutoff
 
 
-def _discover_recorder_identities(
+def _discover_recorder_states(
     client: Any,
     *,
     from_exclusive: datetime,
     to_inclusive: datetime,
     window_size: timedelta,
     page_size: int,
-) -> tuple[tuple[str, str], ...]:
-    """Recorder identities present in the register over a closed historical range.
-
-    Discovery reads identities only: no recorder contents, no ledger write and
-    no watermark advance.  The caller decides which of them still need a pull.
-    """
+) -> tuple[tuple[str, str, int, str], ...]:
+    """Recorder identities and balance-content states over a historical range."""
     scan = scan_historical_register_range(
         client,
         from_exclusive=from_exclusive,
@@ -209,7 +216,12 @@ def _discover_recorder_identities(
         page_size=page_size,
     )
     return tuple(
-        (discovered.identity.recorder_type, discovered.identity.recorder_ref)
+        (
+            discovered.identity.recorder_type,
+            discovered.identity.recorder_ref,
+            int(discovered.row_count),
+            str(discovered.balance_content_hash),
+        )
         for discovered in scan.recorders
     )
 
@@ -260,6 +272,95 @@ def _collect_recorder_identities(
         if recorder_ref:
             identities.add((recorder_type, recorder_ref))
 
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
+def _visible_recorder_states(
+    db: Session,
+    parent_generation_id: int,
+) -> dict[tuple[str, str], tuple[int, str]]:
+    """Visible accepted movement count and balance hash per real recorder."""
+    rows = visible_sles_for_generation(db, parent_generation_id)
+    item_refs = {
+        int(item_id): str(item_ref or "")
+        for item_id, item_ref in db.query(
+            models.Item.item_id,
+            models.Item.item_ref1c,
+        ).filter(
+            models.Item.item_id.in_({int(row.item_id) for row in rows})
+        ).all()
+    }
+    payloads: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in rows:
+        identity = (
+            str(row.recorder_type or ""),
+            str(row.recorder_ref or ""),
+        )
+        if identity[0] in _SYNTHETIC_RECORDER_TYPES or not identity[1]:
+            continue
+        payloads.setdefault(identity, []).append(balance_movement_payload(
+            item_ref=item_refs.get(int(row.item_id), ""),
+            characteristic_ref=row.characteristic_ref,
+            organization_ref=row.organization_ref,
+            warehouse_ref=row.warehouse_ref1c,
+            signed_qty=row.qty,
+            record_type=row.record_type,
+            line_no=row.line_no,
+        ))
+    return {
+        identity: (len(values), balance_content_hash(values))
+        for identity, values in payloads.items()
+    }
+
+
+def _collect_due_recorder_identities(
+    db: Session,
+) -> tuple[tuple[str, str], ...]:
+    """Recorder identities explicitly queued as new or changed by sync links."""
+    identities: set[tuple[str, str]] = set()
+    queued_rows = db.query(models.StockRecorderPull).filter(
+        (models.StockRecorderPull.status == "pending")
+        | (
+            (models.StockRecorderPull.status == "error")
+            & (models.StockRecorderPull.attempts < DEFAULT_MAX_ATTEMPTS)
+        ),
+    ).all()
+    for row in queued_rows:
+        recorder_type = str(row.recorder_type or "")
+        recorder_ref = str(row.recorder_ref or "")
+        if recorder_type in _SYNTHETIC_RECORDER_TYPES:
+            continue
+        if recorder_ref:
+            identities.add((recorder_type, recorder_ref))
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
+def _collect_pull_state_drift_identities(
+    db: Session,
+    visible_states: Mapping[tuple[str, str], tuple[int, str]],
+) -> tuple[tuple[str, str], ...]:
+    """Recorders whose latest observed pull differs from accepted Ledger.
+
+    A rejected physical-refresh candidate restores the accepted SLE prefix but
+    intentionally keeps ``stock_recorder_pull`` as the latest observation of
+    1C.  Without this comparison a bounded discovery window can miss an older
+    recorder that the rejected candidate had already found, leaving the
+    accepted Ledger permanently behind its known line count.
+    """
+    identities: set[tuple[str, str]] = set()
+    rows = db.query(models.StockRecorderPull).filter(
+        models.StockRecorderPull.status.in_(["done", "empty"]),
+    ).all()
+    for row in rows:
+        identity = (
+            str(row.recorder_type or ""),
+            str(row.recorder_ref or ""),
+        )
+        if identity[0] in _SYNTHETIC_RECORDER_TYPES or not identity[1]:
+            continue
+        visible_count = int(visible_states.get(identity, (0, ""))[0])
+        if visible_count != int(row.line_count or 0):
+            identities.add(identity)
     return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
 
 
@@ -379,6 +480,7 @@ def run_physical_recorder_audit(
     discovery_lookback: timedelta | None = None,
     discovery_window_size: timedelta = DISCOVERY_WINDOW_SIZE,
     discovery_page_size: int = DISCOVERY_PAGE_SIZE,
+    audit_all_known_recorders: bool = True,
 ) -> PhysicalRefreshImportResult:
     """Run recorder-audit refresh for one physical-refresh BUILDING generation.
 
@@ -420,6 +522,8 @@ def run_physical_recorder_audit(
             from_checkpoint=True,
             discovered_recorders=int(discovery.get("discovered_recorders") or 0),
             backdated_recorders=int(discovery.get("backdated_recorders") or 0),
+            revised_recorders=int(discovery.get("revised_recorders") or 0),
+            vanished_recorders=int(discovery.get("vanished_recorders") or 0),
         )
 
     if int(generation.physical_import_batch_id) != start_boundary_id:
@@ -430,17 +534,36 @@ def run_physical_recorder_audit(
 
     # Discovery precedes the known set: a recorder that only 1C knows about must
     # join this audit, otherwise it can never enter the ledger at all.
-    known_recorders = _collect_recorder_identities(db, int(parent_generation_id))
+    # Keep the complete parent identity set even on the incremental path.  The
+    # light-weight historical scan below is specifically meant to find a
+    # recorder that 1C posted today with an old document Period.  Comparing it
+    # only with the due queue made every historical identity look "new" and
+    # turned the incremental refresh back into a full recorder audit.
+    visible_states = _visible_recorder_states(
+        db, int(parent_generation_id)
+    )
+    all_known_recorders = tuple(sorted(visible_states))
+    due_recorders = _collect_due_recorder_identities(db)
+    pull_state_drift = _collect_pull_state_drift_identities(db, visible_states)
+    audit_recorders = (
+        _merge_recorder_identities(
+            all_known_recorders,
+            due_recorders,
+            pull_state_drift,
+        )
+        if audit_all_known_recorders
+        else _merge_recorder_identities(due_recorders, pull_state_drift)
+    )
     discovery_range = _discovery_range(
         db,
         parent_cutoff=parent_cutoff,
         lookback=discovery_lookback,
     )
-    discovered: tuple[tuple[str, str], ...] = ()
+    discovered_states: tuple[tuple[str, str, int, str], ...] = ()
     if discovery_range is not None:
         discovery_from, discovery_to = discovery_range
         try:
-            discovered = _discover_recorder_identities(
+            discovered_states = _discover_recorder_states(
                 client,
                 from_exclusive=discovery_from,
                 to_inclusive=discovery_to,
@@ -451,7 +574,27 @@ def run_physical_recorder_audit(
             raise PhysicalRefreshImportError(
                 f"backdated recorder discovery failed: {exc}"
             ) from exc
-    backdated = tuple(sorted(set(discovered) - set(known_recorders)))
+    discovered_content = {
+        (recorder_type, recorder_ref): (row_count, content_hash)
+        for recorder_type, recorder_ref, row_count, content_hash in discovered_states
+    }
+    discovered = tuple(sorted(discovered_content))
+    known_set = set(all_known_recorders)
+    discovered_set = set(discovered)
+    backdated = tuple(sorted(discovered_set - known_set))
+    revised = tuple(sorted(
+        identity
+        for identity in discovered_set & known_set
+        if discovered_content[identity] != visible_states[identity]
+    ))
+    # Absence is meaningful only when discovery covered the complete retained
+    # horizon.  A disabled or bounded maintenance scan cannot prove that a
+    # known recorder vanished from 1C.
+    vanished = (
+        tuple(sorted(known_set - discovered_set))
+        if discovery_range is not None and discovery_lookback is None
+        else ()
+    )
     discovery_metrics = {
         "from_exclusive": discovery_range[0].isoformat() if discovery_range else None,
         "to_inclusive": discovery_range[1].isoformat() if discovery_range else None,
@@ -459,15 +602,32 @@ def run_physical_recorder_audit(
         "discovered_recorders": len(discovered),
         "backdated_recorders": len(backdated),
         "backdated": list(_result_summary(backdated)),
+        "revised_recorders": len(revised),
+        "revised": list(_result_summary(revised)),
+        "vanished_recorders": len(vanished),
+        "vanished": list(_result_summary(vanished)),
+        "pull_state_drift_recorders": len(pull_state_drift),
+        "pull_state_drift": list(_result_summary(pull_state_drift)),
     }
 
-    target_recorders = _merge_recorder_identities(known_recorders, discovered)
+    # Existing historical recorders are re-pulled only by the explicit full
+    # audit.  Automatic refresh pulls the queue plus identities that are truly
+    # absent from the accepted parent (late-posted/backdated documents), whose
+    # line set changed, or which disappeared from the current 1C register.
+    target_recorders = _merge_recorder_identities(
+        audit_recorders,
+        backdated,
+        revised,
+        vanished,
+    )
     recorder_manifest = list(_result_summary(target_recorders))
     input_checksum = canonical_content_hash(recorder_manifest)
 
     run_rows: list[dict[str, Any]] = []
     changed_recorders = 0
     expected_terminal_id = start_boundary_id
+    pull_state_drift_set = set(pull_state_drift)
+    deferred_pull_state_drift: list[tuple[str, str]] = []
 
     try:
         for recorder_type, recorder_ref in target_recorders:
@@ -481,9 +641,29 @@ def run_physical_recorder_audit(
                 max_posting_at=generation.cutoff,
                 strict_historical=True,
             )
-            result = pull_recorder_movements(
-                db, recorder_type, recorder_ref, **pull_kwargs
-            )
+            try:
+                result = pull_recorder_movements(
+                    db, recorder_type, recorder_ref, **pull_kwargs
+                )
+            except HistoricalPullBeyondCutoffError:
+                identity = (recorder_type, recorder_ref)
+                if identity not in pull_state_drift_set:
+                    raise
+                # The pull journal describes the latest 1C state, which may
+                # have been observed after this candidate's immutable cutoff.
+                # Leave the accepted prefix unchanged and keep the count drift
+                # so the next candidate retries the recorder at a later cutoff.
+                deferred_pull_state_drift.append(identity)
+                run_rows.append({
+                    "recorder_type": recorder_type,
+                    "recorder_ref": recorder_ref,
+                    "status": "deferred_beyond_cutoff",
+                    "inserted": 0,
+                    "line_count": 0,
+                    "deleted": 0,
+                    "touched_keys": 0,
+                })
+                continue
             if result.status not in {"done", "empty"}:
                 raise PhysicalRefreshImportError(
                     f"recorder {recorder_type} {recorder_ref} failed with status {result.status}"
@@ -577,6 +757,9 @@ def run_physical_recorder_audit(
                 "input_checksum": input_checksum,
                 "recorder_count": len(target_recorders),
                 "discovery": discovery_metrics,
+                "deferred_pull_state_drift": list(
+                    _result_summary(tuple(deferred_pull_state_drift))
+                ),
             },
         }
 
@@ -600,6 +783,9 @@ def run_physical_recorder_audit(
                 "recorders": recorder_manifest,
                 "audit_rows": run_rows,
                 "discovery": discovery_metrics,
+                "deferred_pull_state_drift": list(
+                    _result_summary(tuple(deferred_pull_state_drift))
+                ),
             },
             completed_at=datetime.now(timezone.utc),
         )
@@ -619,6 +805,8 @@ def run_physical_recorder_audit(
             from_checkpoint=False,
             discovered_recorders=len(discovered),
             backdated_recorders=len(backdated),
+            revised_recorders=len(revised),
+            vanished_recorders=len(vanished),
         )
     except PhysicalRefreshImportError:
         db.rollback()

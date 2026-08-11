@@ -37,7 +37,8 @@ def _accepted_world(db):
     """One accepted generation + one purchased item, the shared starting truth."""
     physical = models.PhysicalImportBatch(
         batch_key="retire-physical", status="completed", cutoff=CUTOFF,
-        source_watermarks={}, completed_at=CUTOFF,
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
+        completed_at=CUTOFF,
     )
     accepted = models.LedgerGeneration(
         generation_key="retire-accepted", status="accepted", cutoff=CUTOFF,
@@ -53,9 +54,36 @@ def _accepted_world(db):
         item_code="RETIRE-BUY", item_name="покупная деталь",
         replenishment_method="Покупка", replenishment_time=3, status="active",
     )
-    db.add_all([physical, accepted, item])
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="WH-RETIRE-PLAN",
+        warehouse_name="Retire planning contour",
+        is_selected=True,
+        is_finished_goods=False,
+    )
+    db.add_all([physical, accepted, item, warehouse])
     db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(accepted.id),
+        cutoff=accepted.cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=accepted.cutoff,
+        built_at=accepted.cutoff,
+    ))
+    resource = models.ProductionResource(
+        resource_name="Retire assembly",
+        planning_range=30,
+        capacity=Decimal("100"),
+    )
+    db.add(resource)
+    db.flush()
+    db.add(models.AssemblyRate(
+        resource_id=int(resource.resource_id),
+        item_id=int(item.item_id),
+        qty_per_capacity=Decimal("1"),
+    ))
     db.commit()
     return accepted, item
 
@@ -188,10 +216,12 @@ def test_refresh_can_retire_one_plan_while_adding_another(db_session):
     accepted, item = _accepted_world(db_session)
     retired_plan = _draft_plan(db_session, item, name="retired")
     retired_plan.status = "fixed"
+    retired_plan.fixed_at = CUTOFF
     db_session.commit()
     retired_run = _parent_run(db_session, accepted, retired_plan)
     added_plan = _draft_plan(db_session, item, name="added", qty="7")
     added_plan.status = "fixed"
+    added_plan.fixed_at = CUTOFF
     db_session.commit()
 
     result = workflow.run_obligation_refresh(

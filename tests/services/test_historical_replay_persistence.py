@@ -13,6 +13,7 @@ from app.models import (
     MrpRequirementBucket,
     PhysicalImportBatch,
     PlanningRun,
+    ProductionMaterialIssue,
     ProductionOrder,
     ProductionProduct,
     ReservationEntry,
@@ -20,9 +21,13 @@ from app.models import (
     StockLedgerFactSupersession,
     StockLedgerEntry,
     StockRecorderPull,
+    SyncLink,
 )
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
-from app.services.item_ledger.historical_replay_persistence import run_historical_replay
+from app.services.item_ledger.historical_replay_persistence import (
+    _identity_for_sle,
+    run_historical_replay,
+)
 from app.services.item_ledger.historical_obligations import (
     ALGORITHM_VERSION as OBLIGATION_ALGORITHM_VERSION,
 )
@@ -208,6 +213,195 @@ def test_replay_is_idempotent_and_folds_realized_cache(db_session):
     assert db_session.query(LedgerBuildBatch).filter_by(
         ledger_generation_id=generation.id
     ).count() == 1
+
+
+def test_assembly_output_closes_executorless_rework_reservation(db_session):
+    generation, reservation = _generation_scope(
+        db_session, "REWORK", realization_mode="rework", reserve_qty="5"
+    )
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["allocated_qty"]) == Decimal("5")
+    db_session.refresh(reservation)
+    assert reservation.realization_mode == "rework"
+    assert reservation.replenishment_received_qty == Decimal("5")
+    assert reservation.realized_qty == Decimal("5")
+
+
+@pytest.mark.parametrize(
+    ("link_status", "has_identity"),
+    [("posted", True), ("planned", False), ("error", False)],
+)
+def test_replay_accepts_only_fact_eligible_material_issue_provenance(
+    db_session,
+    link_status,
+    has_identity,
+):
+    generation, reservation = _generation_scope(
+        db_session,
+        f"ISSUE-{link_status}",
+        fact_qty="4",
+        reserve_qty="4",
+    )
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    order = ProductionOrder(
+        order_number=f"ORDER-{link_status}",
+        order_date=fact.posting_at,
+        order_ref1c=f"ORDER-REF-{link_status}",
+        deletion_mark=False,
+        source="1c",
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=reservation.item_id,
+        line_number=1,
+        quantity=4,
+        produced_qty=0,
+        remaining_qty=4,
+        source_mrp_requirement_id=reservation.requirement_id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    issue = ProductionMaterialIssue(
+        document_number=f"MI-{link_status}",
+        product_id=product.product_id,
+        order_id=order.order_id,
+        status=link_status,
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    db_session.add(SyncLink(
+        source_doctype="material_issue",
+        source_id=issue.issue_id,
+        target_entity="Document_ПеремещениеЗапасов",
+        target_ref_key=fact.recorder_ref,
+        status=link_status,
+    ))
+    db_session.flush()
+
+    requirement_id, order_ref, ambiguous = _identity_for_sle(db_session, fact)
+    result = run_historical_replay(db_session, generation.id)
+    event = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+    ).one()
+
+    assert result["allocated_qty"] == "4.000"
+    assert event.match_rule == ("pegged" if has_identity else "fifo")
+    assert ambiguous is False
+    assert requirement_id == (
+        reservation.requirement_id if has_identity else None
+    )
+    assert order_ref == (order.order_ref1c if has_identity else None)
+
+
+def test_replay_ambiguous_identity_allocates_by_fifo_and_preserves_conservation(
+    db_session,
+):
+    generation, reservation = _generation_scope(
+        db_session,
+        "AMBIGUOUS-IDENTITY",
+        fact_qty="6",
+        reserve_qty="4",
+    )
+    planning_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add(planning_run)
+    db_session.flush()
+    second_requirement = MrpRequirement(
+        run_id=planning_run.run_id,
+        item_id=reservation.item_id,
+        total_required_qty=4,
+        net_required_qty=4,
+        period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31),
+        bom_level=0,
+    )
+    db_session.add(second_requirement)
+    db_session.flush()
+    second_reservation = ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=reservation.item_id,
+        characteristic_ref="",
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool="selected",
+        run_id=planning_run.run_id,
+        freeze_version=1,
+        requirement_id=second_requirement.id,
+        priority_period_from=reservation.priority_period_from,
+        priority_period_to=reservation.priority_period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("4"),
+        realized_qty=Decimal("0"),
+        lifecycle_status="active",
+    )
+    db_session.add(second_reservation)
+    db_session.flush()
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    order = ProductionOrder(
+        order_number="ORDER-AMBI",
+        order_date=fact.posting_at,
+        order_ref1c="ORDER-REF-AMBI",
+        deletion_mark=False,
+        source="1c",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add_all([
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=reservation.item_id,
+            line_number=1,
+            quantity=4,
+            produced_qty=0,
+            remaining_qty=4,
+            source_mrp_requirement_id=reservation.requirement_id,
+        ),
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=reservation.item_id,
+            line_number=2,
+            quantity=4,
+            produced_qty=0,
+            remaining_qty=4,
+            source_mrp_requirement_id=second_requirement.id,
+        ),
+    ])
+    fact.recorder_ref = order.order_ref1c
+    db_session.flush()
+
+    requirement_id, order_ref, ambiguous = _identity_for_sle(db_session, fact)
+    result = run_historical_replay(db_session, generation.id)
+    events = (
+        db_session.query(ReservationEvent)
+        .filter_by(ledger_generation_id=generation.id)
+        .order_by(ReservationEvent.id.asc())
+        .all()
+    )
+
+    assert requirement_id is None
+    assert order_ref is None
+    assert ambiguous is True
+    assert result["ambiguous_identity_facts"] == 1
+    assert Decimal(result["fact_qty"]) == Decimal(result["allocated_qty"]) + Decimal(
+        result["surplus_qty"]
+    )
+    assert Decimal(result["fact_qty"]) == Decimal("6")
+    assert Decimal(result["allocated_qty"]) == Decimal("6")
+    assert Decimal(result["surplus_qty"]) == Decimal("0")
+    assert len(events) == 2
+    assert {event.match_rule for event in events} == {"fifo"}
+    assert events[0].reservation_id == reservation.id
+    assert events[0].realized_delta == Decimal("4")
+    assert events[1].reservation_id == second_reservation.id
+    assert events[1].realized_delta == Decimal("2")
 
 
 def test_replay_is_strictly_isolated_by_generation_and_import_batch(db_session):
@@ -888,7 +1082,7 @@ def test_replay_uses_frozen_make_reservation_when_bucket_net_is_zero(db_session)
     ).one().realized_delta == Decimal("26")
 
 
-def test_replay_excludes_make_facts_for_selected_non_fg_contour_warehouse(db_session):
+def test_replay_allows_make_facts_for_selected_non_fg_contour_warehouse(db_session):
     generation, reservation = _generation_scope(
         db_session,
         "MAKE-IN-CONTOUR",
@@ -917,18 +1111,31 @@ def test_replay_excludes_make_facts_for_selected_non_fg_contour_warehouse(db_ses
 
     result = run_historical_replay(db_session, generation.id)
 
-    assert result["facts"] == 0
-    assert result["allocations"] == 0
-    assert result["surplus_facts"] == 0
-    assert Decimal(result["excluded_make_facts"]) == Decimal("1")
-    assert Decimal(result["excluded_make_qty"]) == Decimal("5")
-    assert Decimal(result["allocated_qty"]) == Decimal("0")
-    assert Decimal(result["surplus_qty"]) == Decimal("0")
-    assert db_session.query(ReservationEvent).filter_by(
-        ledger_generation_id=generation.id
-    ).count() == 0
+    assert result["facts"] == 1
+    assert Decimal(result["allocated_qty"]) == Decimal("5")
     db_session.refresh(reservation)
-    assert reservation.realized_qty == Decimal("0")
+    assert reservation.realized_qty == Decimal("5")
+
+
+def test_replay_rejects_make_with_missing_warehouse_ref(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "MAKE-NO-WAREHOUSE-REF",
+        fact_qty="5",
+        reserve_qty="5",
+        realization_mode="make",
+    )
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    fact.warehouse_ref1c = ""
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="historical replay rejected make fact") as exc_info:
+        run_historical_replay(db_session, generation.id)
+
+    assert f"sle_id={fact.id}" in str(exc_info.value)
+    assert "reason=warehouse_ref_missing" in str(exc_info.value)
 
 
 def test_replay_excludes_make_when_warehouse_policy_is_missing(db_session):
@@ -940,18 +1147,15 @@ def test_replay_excludes_make_when_warehouse_policy_is_missing(db_session):
         realization_mode="make",
         add_default_warehouse_policy=False,
     )
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
 
-    result = run_historical_replay(db_session, generation.id)
+    with pytest.raises(ValueError, match="historical replay rejected make fact") as exc_info:
+        run_historical_replay(db_session, generation.id)
 
-    assert result["facts"] == 0
-    assert result["excluded_make_facts"] == 1
-    assert result["excluded_make_samples"][0]["reason"] == "warehouse_policy_missing"
-    assert result["allocated_qty"] == "0"
-    assert db_session.query(ReservationEvent).filter_by(
-        ledger_generation_id=generation.id
-    ).count() == 0
-    db_session.refresh(reservation)
-    assert reservation.realized_qty == Decimal("0")
+    assert f"sle_id={fact.id}" in str(exc_info.value)
+    assert "reason=warehouse_policy_missing" in str(exc_info.value)
 
 
 def test_replay_allows_make_facts_for_outside_contour_warehouse(db_session):

@@ -26,17 +26,24 @@ from app.services.mrp_freeze import (
 
 
 CUTOFF = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
+OPENING_AT = datetime(2026, 5, 1, tzinfo=timezone.utc)
 
 
 def _seal(target, parents, candidates):
     entries = [
         {
-            "action": "refresh",
+            "action": "retain",
             "plan_id": int(parent.source_plan_id),
             "parent_run_id": int(parent.run_id),
-            "candidate_run_id": int(candidate.run_id),
+            "candidate_run_id": None,
         }
-        for parent, candidate in zip(parents, candidates)
+        for parent in parents
+    ] + [
+        {
+            "action": "add", "plan_id": int(candidate.source_plan_id),
+            "parent_run_id": None, "candidate_run_id": int(candidate.run_id),
+        }
+        for candidate in candidates
     ]
     payload = {
         "version": 1,
@@ -64,7 +71,7 @@ def _freeze_candidate_generation(db, *, suffix: str = "scope"):
         batch_key=f"freeze-physical-{suffix}",
         status="completed",
         cutoff=CUTOFF,
-        source_watermarks={},
+        source_watermarks={"opening_at": OPENING_AT.isoformat()},
         completed_at=CUTOFF,
     )
     generation = models.LedgerGeneration(
@@ -87,9 +94,6 @@ def _item(db, code, *, method="Покупка"):
         item_name=code,
         item_article=code,
         unit="шт",
-        # Deliberately poisonous: candidate freeze must not read this legacy
-        # field.  Authoritative stock is written only to target StockBin below.
-        stock_qty=9999,
         replenishment_method=method,
         replenishment_time=3 if method == "Покупка" else 0,
         status="active",
@@ -120,7 +124,7 @@ def _world(db, demands, *, root=None, stock=None, future=None):
         batch_key=f"freeze-physical-{id(demands)}",
         status="completed",
         cutoff=CUTOFF,
-        source_watermarks={},
+        source_watermarks={"opening_at": OPENING_AT.isoformat()},
         completed_at=CUTOFF,
     )
     accepted = models.LedgerGeneration(
@@ -249,11 +253,27 @@ def _world(db, demands, *, root=None, stock=None, future=None):
         )
         db.add_all([line, parent])
         db.flush()
+        candidate_plan = models.ProductionPlanHeader(
+            name=f"candidate {index}",
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            status="fixed",
+        )
+        db.add(candidate_plan)
+        db.flush()
+        db.add(
+            models.ProductionPlanLine(
+                plan_id=candidate_plan.id,
+                item_id=root.item_id,
+                bucket_date=plan.period_from,
+                qty=qty,
+            )
+        )
         candidate = models.PlanningRun(
             status="BUILDING_SNAPSHOT",
             ledger_generation_id=target.id,
-            prior_run_id=parent.run_id,
-            source_plan_id=plan.id,
+            prior_run_id=None,
+            source_plan_id=candidate_plan.id,
             period_from=plan.period_from,
             period_to=plan.period_to,
             config_snapshot={},
@@ -344,6 +364,29 @@ def test_freeze_uses_target_stockbin_not_legacy_item_stock_qty(db_session):
     )
     assert float(reservation.covered_from_stock_at_freeze_qty) == pytest.approx(4)
     assert _purchase(db_session, candidates[0], item) == pytest.approx(6)
+
+
+def test_freeze_reservation_coverage_uses_stock_allocations_only(db_session):
+    item = _item(db_session, "RESERVE-ALLOC")
+    accepted, target, _, _parents, candidates, _lines = _world(
+        db_session, [10], root=item, stock={item: 4}, future={item: 3}
+    )
+
+    _freeze(db_session, accepted, target, candidates)
+    req = _req(db_session, candidates[0], item)
+
+    reservation = (
+        db_session.query(models.ReservationEntry)
+        .filter_by(
+            ledger_generation_id=target.id,
+            requirement_id=req.id,
+        )
+        .one()
+    )
+    assert float(reservation.covered_from_stock_at_freeze_qty) == pytest.approx(4)
+    assert float(reservation.replenishment_required_qty) == pytest.approx(6)
+    assert float(_req(db_session, candidates[0], item).net_required_qty) == pytest.approx(6)
+    assert _purchase(db_session, candidates[0], item) == pytest.approx(3)
 
 
 def test_freeze_rows_are_target_scoped_and_published_parent_is_immutable(db_session):
@@ -614,7 +657,7 @@ def test_build_shared_pools_selected_only_foreign_orgs_gives_zero_stock(db_sessi
         models.StockBin(
             ledger_generation_id=target.id,
             item_id=item.item_id,
-            characteristic_ref="",
+            characteristic_ref="CHARACTERISTIC-FOREIGN",
             organization_ref="ORG-B",
             warehouse_ref1c="WH-SELECTED",
             on_hand=5,
@@ -631,7 +674,7 @@ def test_build_shared_pools_selected_only_foreign_orgs_gives_zero_stock(db_sessi
     assert pools.stock.get(item.item_id, 0.0) == pytest.approx(0.0)
 
 
-def test_build_shared_pools_collapses_all_characteristics_in_zsm_warehouse(db_session):
+def test_build_shared_pools_rejects_characteristic_stock_in_target_generation(db_session):
     item = _item(db_session, "SCOPE-CHAR-COLLAPSE")
     target = _freeze_candidate_generation(db_session, suffix="char-collapse")
     db_session.add(
@@ -643,42 +686,56 @@ def test_build_shared_pools_collapses_all_characteristics_in_zsm_warehouse(db_se
         models.StockBin(
             ledger_generation_id=target.id,
             item_id=item.item_id,
-            characteristic_ref="",
+            characteristic_ref="CHARACTERISTIC-DEFAULT",
             organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c="WH-SELECTED",
-            on_hand=2,
-        ),
-        models.StockBin(
-            ledger_generation_id=target.id,
-            item_id=item.item_id,
-            characteristic_ref="00000000-0000-0000-0000-000000000000",
-            organization_ref=DEFAULT_ORGANIZATION_REF1C,
-            warehouse_ref1c="WH-SELECTED",
-            on_hand=3,
-        ),
-        models.StockBin(
-            ledger_generation_id=target.id,
-            item_id=item.item_id,
-            characteristic_ref="CHARACTERISTIC-A",
-            organization_ref=DEFAULT_ORGANIZATION_REF1C,
-            warehouse_ref1c="WH-SELECTED",
-            on_hand=5,
-        ),
-        models.StockBin(
-            ledger_generation_id=target.id,
-            item_id=item.item_id,
-            characteristic_ref="CHARACTERISTIC-B",
-            organization_ref=DEFAULT_ORGANIZATION_REF1C,
-            warehouse_ref1c="WH-SELECTED",
-            on_hand=7,
+            on_hand=10,
         ),
     ])
     db_session.flush()
 
-    pools = build_shared_pools(
-        db_session,
-        [],
-        ledger_generation_id=target.id,
-        relevant_item_ids=[item.item_id],
+    with pytest.raises(LedgerPoolUnavailable, match="physical pool qualifier unavailable"):
+        build_shared_pools(
+            db_session,
+            [],
+            ledger_generation_id=target.id,
+            relevant_item_ids=[item.item_id],
+        )
+
+
+def test_build_shared_pools_rejects_characteristic_stock_in_historical_baseline(db_session):
+    item = _item(db_session, "SCOPE-CHAR-BASELINE")
+    target = _freeze_candidate_generation(db_session, suffix="char-baseline")
+    db_session.add(
+        models.StockWarehouse(
+            warehouse_ref1c="WH", warehouse_name="Selected", is_selected=True
+        )
     )
-    assert pools.stock[item.item_id] == pytest.approx(17)
+    db_session.add_all([
+        models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash="hist-char",
+            item_id=item.item_id,
+            characteristic_ref="CHARACTERISTIC-HIST",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("11"),
+            qty_after=Decimal("11"),
+            posting_at=datetime(2026, 5, 31, 12, 0),
+            record_type="Receipt",
+            movement_kind="receipt",
+            ingest_source="test",
+            active=True,
+        ),
+    ])
+    db_session.flush()
+
+    baseline_at = datetime(2026, 6, 1, 0, 0) - timedelta(microseconds=1)
+    with pytest.raises(LedgerPoolUnavailable, match="physical pool qualifier unavailable"):
+        build_shared_pools(
+            db_session,
+            [],
+            ledger_generation_id=target.id,
+            relevant_item_ids=[item.item_id],
+            stock_baseline_at=baseline_at,
+        )

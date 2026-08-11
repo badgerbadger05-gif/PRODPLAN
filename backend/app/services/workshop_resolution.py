@@ -21,7 +21,6 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import (
-    DefaultSpecification,
     ProductionKind,
     ProductionOrderLineState,
     ProductionProduct,
@@ -34,6 +33,7 @@ from ..models import (
     Specification,
     WorkshopWarehouseBinding,
 )
+from .bom_specification_resolver import BomSpecificationResolver
 from .production_control_common import to_float as _to_float
 
 REASON_OK = "OK"
@@ -133,15 +133,12 @@ def default_spec_ids_for_items(db: Session, item_ids: Sequence[int]) -> Dict[int
     ids = sorted({int(item_id) for item_id in item_ids if item_id})
     if not ids:
         return {}
-    result: Dict[int, int] = {}
-    for row in (
-        db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id.in_(ids))
-        .order_by(DefaultSpecification.id.asc())
-        .all()
-    ):
-        result.setdefault(int(row.item_id), int(row.spec_id))
-    return result
+    resolver = BomSpecificationResolver(db)
+    return {
+        item_id: int(spec_id)
+        for item_id in ids
+        if (spec_id := resolver.default_spec_id(item_id)) is not None
+    }
 
 
 def spec_id_for_product(db: Session, product: ProductionProduct) -> Optional[int]:

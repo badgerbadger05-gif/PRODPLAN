@@ -14,11 +14,11 @@ const draftPlan = {
   line_count: 1,
 }
 
-const archivedPlan = {
+const closedPlan = {
   ...draftPlan,
   id: 122,
   name: 'АПРЕЛЬ 2026',
-  status: 'archived',
+  status: 'closed',
   period_from: '2026-04-03',
   period_to: '2026-04-24',
   comment: 'Закрытый план',
@@ -30,7 +30,7 @@ async function mockPeriodPlanApi(page: Page) {
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     if (url.pathname === '/api/v1/plan/period-plans') {
-      await route.fulfill({ json: { rows: [draftPlan, archivedPlan], total: 2 } })
+      await route.fulfill({ json: { rows: [draftPlan, closedPlan], total: 2 } })
       return
     }
     if (url.pathname === '/api/v1/plan/period-plans/123/matrix') {
@@ -38,6 +38,12 @@ async function mockPeriodPlanApi(page: Page) {
         json: {
           plan: draftPlan,
           buckets: ['2026-05-01', '2026-05-08', '2026-05-15', '2026-05-22'],
+          bucket_totals: {
+            '2026-05-01': 4,
+            '2026-05-08': 6,
+            '2026-05-15': 8,
+            '2026-05-22': 6,
+          },
           rows: [{
             item_id: 501,
             item_code: 'C-501',
@@ -52,6 +58,8 @@ async function mockPeriodPlanApi(page: Page) {
             },
             locked_buckets: {},
           }],
+          total_qty: 24,
+          grand_total: 24,
           total: 24,
         },
       })

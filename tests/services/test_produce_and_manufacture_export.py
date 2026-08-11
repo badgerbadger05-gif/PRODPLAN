@@ -61,8 +61,7 @@ def _mk_item(db, *, code: str, ref1c: str | None = None) -> Item:
         item_article=code,
         item_ref1c=ref1c,
         unit=f"unit-ref-{code}",
-        stock_qty=0,
-        status="active",
+                status="active",
     )
     db.add(it)
     db.flush()
@@ -187,6 +186,38 @@ def _stock_kit_on_workshop(db, product: ProductionProduct, component: Item, qty:
             line_status="issued",
         )
     )
+    pointer = db.get(PlanningTruthState, 1)
+    if pointer is None or pointer.current_generation_id is None:
+        _attach_current_mrp_lineage(db, product)
+        pointer = db.get(PlanningTruthState, 1)
+    generation_id = int(pointer.current_generation_id)
+    watermark_row = (
+        db.query(models.ProductionMaterialCustodyEvent.id)
+        .order_by(models.ProductionMaterialCustodyEvent.id.desc())
+        .first()
+    )
+    watermark = int(watermark_row[0]) if watermark_row else 0
+    if db.get(models.ProductionMaterialCustodyProjectionManifest, generation_id) is None:
+        generation = db.get(LedgerGeneration, generation_id)
+        db.add(
+            models.ProductionMaterialCustodyProjectionManifest(
+                ledger_generation_id=generation_id,
+                cutoff=generation.cutoff,
+                status="complete",
+                source_event_high_watermark_id=watermark,
+            )
+        )
+    db.add(
+        models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=generation_id,
+            product_id=product.product_id,
+            component_item_id=component.item_id,
+            location_kind="workshop",
+            warehouse_ref1c="workshop-ref",
+            reserved_qty=qty,
+            source_event_high_watermark_id=watermark,
+        )
+    )
     db.commit()
 
 
@@ -278,6 +309,36 @@ def test_produce_full_creates_command_without_recording_fact(db_session):
     assert float(manufacture.qty) == 5.0
     assert manufacture.executor == "иван"
     assert manufacture.status == "draft"
+
+
+def test_produce_without_client_qty_uses_server_owned_executable_remainder(db_session):
+    db = db_session
+    item = _mk_item(db, code="PRD-SERVER-QTY", ref1c="ref-prd-server-qty")
+    product = _mk_product(db, item, qty=6.0)
+
+    result = produce_line(db, product.product_id, executor="operator")
+
+    assert result["qty"] == 6.0
+    assert result["command_remaining_qty"] == 0.0
+    manufacture = db.query(ProductionManufacture).filter_by(product_id=product.product_id).one()
+    assert float(manufacture.qty) == 6.0
+
+
+def test_produce_gate_and_response_ignore_corrupt_remaining_cache(db_session):
+    db = db_session
+    item = _mk_item(db, code="PRD-CORRUPT", ref1c="ref-prd-corrupt")
+    product = _mk_product(db, item, qty=5.0)
+    product.produced_qty = 2
+    product.remaining_qty = 999
+    db.commit()
+
+    with pytest.raises(ValueError, match="остаток"):
+        produce_line(db, product.product_id, qty=4)
+
+    result = produce_line(db, product.product_id, qty=1)
+    assert result["produced_qty_total"] == 2.0
+    assert result["remaining_qty"] == 3.0
+    assert result["command_remaining_qty"] == 2.0
 
 
 def test_produce_line_saves_operation_executors(db_session):
@@ -445,6 +506,64 @@ def test_produce_refreshes_1c_spec_before_reservation_guard(db_session, monkeypa
     assert float(product.remaining_qty) == 16.0
 
 
+def test_produce_allows_command_if_workshop_custody_holds_material_despite_prior_output(
+    db_session,
+):
+    db = db_session
+    item = _mk_item(db, code="PRD-HOLD", ref1c="ref-prd-hold")
+    component = _mk_item(db, code="COMP-HOLD", ref1c="ref-comp-hold")
+    product = _mk_product(db, item, qty=2.0)
+
+    spec = Specification(spec_name="Hold spec", spec_ref1c="spec-hold-ref")
+    db.add(spec)
+    db.flush()
+    product.spec_id = spec.spec_id
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=2,
+            component_type="Материал",
+        )
+    )
+    # Simulate partially consumed previous production; old reservation engine
+    # incorrectly subtracted consumedQty * bom from held workshop stock.
+    product.produced_qty = 1
+    product.remaining_qty = 1
+    db.commit()
+
+    _stock_kit_on_workshop(db, product, component, qty=2.0)
+
+    result = produce_line(db, product.product_id, qty=1)
+
+    assert result["status"] == "pending_1c_fact"
+    assert float(product.quantity) == 2.0
+
+
+def test_produce_blocks_without_sufficient_workshop_held_material(db_session):
+    db = db_session
+    item = _mk_item(db, code="PRD-BLOCK", ref1c="ref-prd-block")
+    component = _mk_item(db, code="COMP-BLOCK", ref1c="ref-comp-block")
+    product = _mk_product(db, item, qty=1.0)
+
+    spec = Specification(spec_name="Block spec", spec_ref1c="spec-block-ref")
+    db.add(spec)
+    db.flush()
+    product.spec_id = spec.spec_id
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=2,
+            component_type="Материал",
+        )
+    )
+    _stock_kit_on_workshop(db, product, component, qty=1.0)
+
+    with pytest.raises(ValueError, match="Недостаточно компонентов"):
+        produce_line(db, product.product_id, qty=1)
+
+
 # ---------------------------------------------------------------------------
 # one_c_manufacture_export
 # ---------------------------------------------------------------------------
@@ -471,11 +590,11 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     payload = pl["payload"]
     assert payload["Posted"] is False
     assert payload["Number"].startswith("MF")
-    # Manufacture is linked to the parent production order through the UNF
-    # dedicated field. Its generic basis type does not accept production orders.
+    # Manufacture is linked to the parent production order both through the UNF
+    # dedicated field and canonical Document_Основание fields.
     assert payload["ЗаказНаПроизводство_Key"] == "order-ref-{}".format(item.item_id)
-    assert "ДокументОснование" not in payload
-    assert "ДокументОснование_Type" not in payload
+    assert payload["ДокументОснование"] == "order-ref-{}".format(item.item_id)
+    assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
     [prod_row] = payload["Продукция"]
     assert prod_row["Номенклатура_Key"] == "item-ref-exp"
     assert prod_row["ЕдиницаИзмерения"] == item.unit
@@ -1305,6 +1424,7 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
             period_from=start,
             period_to=date(2026, 12, 31),
             status="fixed",
+            fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
         )
         db.add(plan)
         db.flush()
@@ -1317,6 +1437,7 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
             source_plan_id=int(plan.id),
             period_from=start,
             period_to=date(2026, 12, 31),
+            fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
         ))
         line = models.ProductionPlanLine(
             plan_id=int(plan.id),
@@ -1364,6 +1485,9 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
     )
     assert pulled.status == "done"
     generation.physical_import_batch_id = int(pulled.physical_import_batch_id)
+    # This part of the test exercises the documented FIFO fallback for a
+    # migrated/legacy product whose immutable plan-line identity is absent.
+    product.source_mrp_requirement_id = None
     db.flush()
     result = materialize_assembly_output_allocations(db, int(generation.id))
     allocations = (

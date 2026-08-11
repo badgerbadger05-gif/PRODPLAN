@@ -29,7 +29,8 @@ def create_item(db: Session, item: ItemCreate):
 def update_item(db: Session, item_id: int, item: ItemUpdate):
     db_item = db.query(Item).filter(Item.item_id == item_id).first()
     if db_item:
-        for key, value in item.model_dump().items():
+        changes = item.model_dump(exclude_unset=True)
+        for key, value in changes.items():
             setattr(db_item, key, value)
         db.commit()
         db.refresh(db_item)
@@ -37,18 +38,11 @@ def update_item(db: Session, item_id: int, item: ItemUpdate):
 
 
 def update_item_partial(db: Session, item_id: int, patch: ItemPatch):
-    """Write only the attributes the caller actually sent.
-
-    `update_item()` assigns every `ItemUpdate` field, so an omitted `stock_qty`
-    silently becomes its 0.0 default. A partial update touches nothing else, and
-    never `stock_qty`: the schema rejects it, and the pop below keeps that true
-    even if a future field set reintroduces it.
-    """
+    """Write only the master-data attributes the caller actually sent."""
     db_item = db.query(Item).filter(Item.item_id == item_id).first()
     if db_item is None:
         return None
     changes = patch.model_dump(exclude_unset=True)
-    changes.pop("stock_qty", None)
     if not changes:
         return db_item
     for key, value in changes.items():

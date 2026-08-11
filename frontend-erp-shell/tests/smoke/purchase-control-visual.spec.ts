@@ -28,6 +28,8 @@ const buyRow = {
   fact_status: 'available',
   fact_source: 'ledger',
   row_generator: 'mrp_reservation',
+  can_materialize: true,
+  materialize_disabled_reason: null,
   supply_phase: 'no_goods',
   counts_in_mrp: true,
   price: 100,
@@ -158,7 +160,7 @@ test('purchase control visual contract', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Журнал закупок' })).toBeVisible()
   await expect(page.getByText('Ledger: 23')).toBeVisible()
   await expect(page.getByText('Под заказ (MRP)', { exact: true }).first()).toBeVisible()
-  await expect(page.getByText(/оформлено 0% · к заказу 66,667%/)).toBeVisible()
+  await expect(page.getByText(/в живых заказах 0 шт \(0%\) · к заказу 8 шт \(66,667%\)/)).toBeVisible()
   await expect(page.getByText('Ожидается за 7 дн: 1')).toBeVisible()
 
   await expect(page.locator('.app')).toHaveScreenshot('purchase-control.png', {

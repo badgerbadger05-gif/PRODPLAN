@@ -21,6 +21,7 @@ from app import models
 from app.services.planning_run_candidate import (
     PlanningRunCandidateError,
     create_added_candidate_run,
+    create_replacement_candidate_run,
     _resolve_parent_generation_id,
 )
 
@@ -125,6 +126,7 @@ def _payload(
     *,
     add_plan_ids: list[int],
     retire_plan_ids: list[int],
+    replace_plan_ids: list[int],
     horizon_days: int | None,
     config_version_id: int | None,
     config_snapshot: dict[str, Any],
@@ -136,6 +138,7 @@ def _payload(
         "add_request": {
             "plan_ids": add_plan_ids,
             "retire_plan_ids": retire_plan_ids,
+            "replace_plan_ids": replace_plan_ids,
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": config_snapshot,
@@ -216,6 +219,10 @@ def _existing_result(
                     f"target {action} manifest lineage conflicts"
                 )
             continue
+        if action not in {"add", "replace"}:
+            raise ObligationRefreshManifestError(
+                "target refresh manifest contains unsupported action"
+            )
         try:
             candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -223,20 +230,21 @@ def _existing_result(
                 "target refresh manifest candidate identity is malformed"
             ) from exc
         candidate = db.get(models.PlanningRun, candidate_id)
+        source_plan = db.get(models.ProductionPlanHeader, plan_id)
         if (
             candidate is None
+            or source_plan is None
             or str(candidate.status) != "BUILDING_SNAPSHOT"
             or int(candidate.ledger_generation_id or -1) != int(target.id)
             or int(candidate.source_plan_id or -1) != plan_id
             or (
-                entry.get("action") == "refresh"
-                and int(candidate.prior_run_id or -1) != int(expected_parent or -1)
+                action == "add"
+                and candidate.prior_run_id != source_plan.predecessor_run_id
             )
             or (
-                entry.get("action") == "add"
-                and candidate.prior_run_id is not None
+                action == "replace"
+                and int(candidate.prior_run_id or -1) != int(expected_parent or -1)
             )
-            or action not in {"refresh", "add"}
         ):
             raise ObligationRefreshManifestError(
                 "target refresh manifest candidate lineage conflicts"
@@ -265,6 +273,7 @@ def create_obligation_refresh_manifest(
     target_generation_id: int,
     add_plan_ids: Iterable[int],
     retire_plan_ids: Iterable[int] = (),
+    replace_plan_ids: Iterable[int] = (),
     *,
     started_by: str | None,
     horizon_days: int | None,
@@ -282,8 +291,13 @@ def create_obligation_refresh_manifest(
         raise ObligationRefreshManifestError("config_snapshot must be a mapping")
     add_ids = _normalise_add_ids(add_plan_ids)
     retire_ids = _normalise_add_ids(retire_plan_ids)
-    if set(add_ids).intersection(retire_ids):
-        raise ObligationRefreshManifestError("a plan cannot be added and retired together")
+    replace_ids = _normalise_add_ids(replace_plan_ids)
+    if (
+        set(add_ids).intersection(retire_ids)
+        or set(add_ids).intersection(replace_ids)
+        or set(retire_ids).intersection(replace_ids)
+    ):
+        raise ObligationRefreshManifestError("add, retire and replace plan sets must be disjoint")
     pool_mapping = _normalise_pool_mapping(planning_pool_by_warehouse)
     parent, target = _require_target(db, parent_generation_id, target_generation_id)
     existing = _existing_result(db, target)
@@ -294,6 +308,7 @@ def create_obligation_refresh_manifest(
         expected = _payload(
             list(existing.entries), add_plan_ids=add_ids,
             retire_plan_ids=retire_ids,
+            replace_plan_ids=replace_ids,
             horizon_days=horizon_days, config_version_id=config_version_id,
             config_snapshot=deepcopy(config_snapshot),
             planning_pool_by_warehouse=pool_mapping,
@@ -319,20 +334,39 @@ def create_obligation_refresh_manifest(
         raise ObligationRefreshManifestError(
             f"add plan already has current FIXED_SNAPSHOT: {min(overlap)}"
         )
+    missing_replace = set(replace_ids) - current_plan_ids
+    if missing_replace:
+        raise ObligationRefreshManifestError(
+            f"replace plan has no current FIXED_SNAPSHOT: {min(missing_replace)}"
+        )
 
     entries: list[dict[str, int | str | None]] = []
     try:
         for parent_run in parents:
-            entries.append({
-                "action": (
-                    "retire"
-                    if int(parent_run.source_plan_id) in set(retire_ids)
-                    else "retain"
-                ),
-                "plan_id": int(parent_run.source_plan_id),
-                "parent_run_id": int(parent_run.run_id),
-                "candidate_run_id": None,
-            })
+            plan_id = int(parent_run.source_plan_id)
+            if plan_id in set(replace_ids):
+                candidate = create_replacement_candidate_run(
+                    db,
+                    int(parent_run.run_id),
+                    int(target.id),
+                    started_by,
+                    horizon_days=horizon_days,
+                    config_version_id=config_version_id,
+                    config_snapshot=deepcopy(config_snapshot),
+                )
+                entries.append({
+                    "action": "replace",
+                    "plan_id": plan_id,
+                    "parent_run_id": int(parent_run.run_id),
+                    "candidate_run_id": int(candidate.run_id),
+                })
+            else:
+                entries.append({
+                    "action": "retire" if plan_id in set(retire_ids) else "retain",
+                    "plan_id": plan_id,
+                    "parent_run_id": int(parent_run.run_id),
+                    "candidate_run_id": None,
+                })
         for plan_id in add_ids:
             candidate = create_added_candidate_run(
                 db, plan_id, int(target.id), started_by,
@@ -349,6 +383,7 @@ def create_obligation_refresh_manifest(
     entries.sort(key=lambda row: (int(row["plan_id"]), str(row["action"])))
     payload = _payload(
         entries, add_plan_ids=add_ids, retire_plan_ids=retire_ids,
+        replace_plan_ids=replace_ids,
         horizon_days=horizon_days,
         config_version_id=config_version_id, config_snapshot=deepcopy(config_snapshot),
         planning_pool_by_warehouse=pool_mapping,

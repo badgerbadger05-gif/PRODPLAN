@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Iterable, Union
+from typing import Iterable, Literal, Union
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -15,6 +16,9 @@ EPS = Decimal("1e-9")
 Number = Union[int, float, Decimal, str]
 MAKE = "make"
 BUY = "buy"
+# A known rework demand has no execution journal yet.  It is nevertheless a
+# frozen reservation and an assembly receipt may realize it.
+REWORK = "rework"
 
 
 def _dec(value: Number) -> Decimal:
@@ -59,6 +63,30 @@ def replenishment_execution_pct(
     return received / required * Decimal("100")
 
 
+ExecutionProgressStatus = Literal[
+    "unavailable", "not_started", "in_progress", "complete", "lower_bound"
+]
+
+
+def replenishment_execution_status(
+    required_qty: Number,
+    received_qty: Number,
+    *,
+    partial_truth: bool = False,
+) -> ExecutionProgressStatus:
+    required = max(_dec(required_qty), Decimal("0"))
+    if required <= EPS:
+        return "unavailable"
+    received = min(max(_dec(received_qty), Decimal("0")), required)
+    if partial_truth:
+        return "lower_bound"
+    if received <= EPS:
+        return "not_started"
+    if received >= required - EPS:
+        return "complete"
+    return "in_progress"
+
+
 @dataclass(frozen=True)
 class ReservationFold:
     reserved_qty: Decimal
@@ -88,14 +116,23 @@ def fold_reservation_entry(
     session: Session,
     reservation_id: int,
 ) -> ReservationFold:
+    entry = session.get(models.ReservationEntry, reservation_id)
+
+    event_query = session.query(models.ReservationEvent).filter(
+        models.ReservationEvent.reservation_id == reservation_id,
+    )
+    if entry is not None:
+        event_query = event_query.filter(
+            models.ReservationEvent.ledger_generation_id == entry.ledger_generation_id,
+        )
+
     events = (
-        session.query(models.ReservationEvent)
-        .filter(models.ReservationEvent.reservation_id == reservation_id)
+        event_query
         .order_by(models.ReservationEvent.id.asc())
         .all()
     )
     fold = fold_reservation_events(events)
-    entry = session.get(models.ReservationEntry, reservation_id)
+
     if entry is not None:
         entry.reserved_qty = fold.reserved_qty
         entry.realized_qty = fold.realized_qty
@@ -133,6 +170,50 @@ def append_realization_event(
     )
     if exists is not None:
         return False
+    delta = _dec(realized_delta)
+    if sle_id is not None and delta != 0:
+        sle = session.get(models.StockLedgerEntry, int(sle_id))
+        if sle is None:
+            raise ValueError(f"realization references missing SLE {sle_id}")
+        physical_qty = _dec(sle.qty)
+        if physical_qty == 0 or (physical_qty > 0) != (delta > 0):
+            raise ValueError(
+                f"realization sign conflicts with physical SLE {sle_id}"
+            )
+        same_allocation = (
+            session.query(models.ReservationEvent)
+            .filter(
+                models.ReservationEvent.ledger_generation_id == generation_id,
+                models.ReservationEvent.reservation_id == int(entry.id),
+                models.ReservationEvent.sle_id == int(sle_id),
+                models.ReservationEvent.realized_delta != 0,
+            )
+            .one_or_none()
+        )
+        if same_allocation is not None:
+            if (
+                _dec(same_allocation.realized_delta) == delta
+                and str(same_allocation.fact_ref or "") == str(fact_ref or "")
+                and str(same_allocation.fact_line_ref or "")
+                == str(fact_line_ref or "")
+            ):
+                return False
+            raise ValueError(
+                "one physical SLE cannot be allocated to the same reservation twice"
+            )
+        allocated = _dec(
+            session.query(func.coalesce(func.sum(models.ReservationEvent.realized_delta), 0))
+            .filter(
+                models.ReservationEvent.ledger_generation_id == generation_id,
+                models.ReservationEvent.sle_id == int(sle_id),
+                models.ReservationEvent.realized_delta != 0,
+            )
+            .scalar()
+        )
+        if abs(allocated + delta) > abs(physical_qty):
+            raise ValueError(
+                f"realization allocations exceed physical SLE {sle_id}"
+            )
     if reserved_delta is None:
         seeded = (
             session.query(models.ReservationEvent.id)
@@ -144,7 +225,6 @@ def append_realization_event(
             is not None
         )
         reserved_delta = 0 if seeded else entry.reserved_qty
-    delta = _dec(realized_delta)
     session.add(
         models.ReservationEvent(
             ledger_generation_id=generation_id,

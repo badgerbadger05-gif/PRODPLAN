@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { productionStatusLabel, type MaterialsResponse, type OrderRow } from '../../../domain/productionControl'
 import { dateRu, qty } from '../../../lib/format'
+import { ItemLedgerSummaryBlock } from '../../item-ledger/ItemLedgerSummaryBlock'
 
 type Props = {
   activeRow: OrderRow | null
@@ -11,7 +12,8 @@ type Props = {
   onProduce: () => void
   onReturnLeftovers: () => void
   onOptimalBatchSave: (itemId: number, value: number | null) => Promise<void>
-  onQuantitySave: (productId: number, value: number) => Promise<void>
+  launchQuantity: number | null
+  onLaunchQuantityChange: (value: number) => void
 }
 
 export function ProductionDetailPane({
@@ -23,21 +25,33 @@ export function ProductionDetailPane({
   onProduce,
   onReturnLeftovers,
   onOptimalBatchSave,
-  onQuantitySave,
+  launchQuantity,
+  onLaunchQuantityChange,
 }: Props) {
   const [batchValue, setBatchValue] = useState('')
-  const [quantityValue, setQuantityValue] = useState('')
   const [batchSaving, setBatchSaving] = useState(false)
-  const [quantitySaving, setQuantitySaving] = useState(false)
   const [batchError, setBatchError] = useState('')
-  const [quantityError, setQuantityError] = useState('')
+  const [launchValue, setLaunchValue] = useState('')
 
   useEffect(() => {
     setBatchValue(activeRow?.optimal_batch != null ? String(activeRow.optimal_batch) : '')
-    setQuantityValue(activeRow?.quantity != null ? String(activeRow.quantity) : '')
     setBatchError('')
-    setQuantityError('')
-  }, [activeRow?.product_id, activeRow?.optimal_batch, activeRow?.quantity])
+  }, [activeRow?.journal_row_key, activeRow?.optimal_batch])
+
+  useEffect(() => {
+    setLaunchValue(launchQuantity == null ? '' : String(launchQuantity))
+  }, [activeRow?.journal_row_key, launchQuantity])
+
+  function commitLaunchQuantity() {
+    if (activeRow?.work_item_id == null) return
+    const value = Number(launchValue)
+    const max = activeRow.launchable_qty ?? activeRow.quantity
+    if (!Number.isFinite(value) || value <= 0 || value > max) {
+      setLaunchValue(String(launchQuantity ?? max))
+      return
+    }
+    onLaunchQuantityChange(value)
+  }
 
   async function handleBatchSave() {
     if (!activeRow?.item_id) return
@@ -58,48 +72,31 @@ export function ProductionDetailPane({
     }
   }
 
-  async function handleQuantitySave() {
-    if (!activeRow?.product_id) return
-    const value = Number(quantityValue.trim() || 0)
-    if (Number.isNaN(value) || value < 0) {
-      setQuantityError('Некорректное значение')
-      return
-    }
-    setQuantityError('')
-    setQuantitySaving(true)
-    try {
-      await onQuantitySave(activeRow.product_id, value)
-    } catch {
-      setQuantityError('Ошибка сохранения')
-    } finally {
-      setQuantitySaving(false)
-    }
-  }
-
   const rowSource = activeRow?.order_source || activeRow?.source
-  const canEditQuantity = rowSource === 'mrp' && !activeRow?.source_mrp_allocation_key?.startsWith('1C')
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
-  const mrpRemaining = activeRow?.mrp_req_remaining_qty ?? 0
-  const canUseMaterialCoverage = !activeRow?.issue_status || activeRow?.issue_status === 'not_requested'
-  const activeCoverageStatus = (canUseMaterialCoverage ? materials?.coverage_status : '')
+  const mrpRemaining = activeRow?.mrp_req_remaining_qty
+  const activeCoverageStatus = materials?.coverage_status
     || activeRow?.coverage_status
     || activeRow?.status
     || 'unknown'
-  const activeCoverageLabel = (canUseMaterialCoverage ? materials?.coverage_label : '')
-    || activeRow?.coverage_label
+  const activeCoverageLabel = materials?.coverage_label
+    || (activeRow?.coverage_status === 'unknown' ? coverageLabels.unknown : activeRow?.coverage_label)
     || coverageLabels[String(activeCoverageStatus)]
     || activeCoverageStatus
+  const activeStatusLabel = activeRow?.product_id == null ? 'Не создан' : productionStatusLabel(activeRow.status)
   const planSourceLabel = activeRow?.source_plan_name
     || (activeRow?.source_plan_id ? `План #${activeRow.source_plan_id}` : '')
-  const dbrPlanning = activeRow?.planning?.contour === 'dbr_feeder' ? activeRow.planning : null
-  const sourceDisplayLabel = dbrPlanning ? 'DBR · очередь мехцеха' : (planSourceLabel || rowSource || '1C')
+  const sourceDisplayLabel = planSourceLabel || activeRow?.launch_source || rowSource || '1C'
+  const hasShelfLaunchData = Boolean(
+    activeRow?.launch_source
+    || activeRow?.shelf_warehouse_ref1c
+    || activeRow?.shelf_pull_qty != null
+    || activeRow?.shelf_materialized_qty != null
+    || activeRow?.shelf_latest_start_date,
+  )
 
-  function queueStateLabel(state?: string | null) {
-    if (state === 'ready') return 'Готов к запуску'
-    if (state === 'blocked') return 'Заблокирован материалами'
-    if (state === 'not_due') return 'Срок запуска не наступил'
-    if (state === 'diagnostic') return 'Требует разбора'
-    return state || '—'
+  function shelfQty(value?: number | null) {
+    return value == null ? '—' : `${qty(value)} ${activeRow?.unit || ''}`.trim()
   }
 
   function sourceLabel(source?: string | null) {
@@ -132,8 +129,8 @@ export function ProductionDetailPane({
         return `${sourceLabel(eta.source)} ${ref}: ${when}${amount}`
       }).join('; ')
     }
-    if ((m.missing_qty ?? 0) > 0) return 'В заказах нет'
-    return 'На складе'
+    const status = String(m.coverage_status || m.availability_status || '')
+    return m.coverage_label || coverageLabels[status] || 'Недоступно'
   }
 
   function activeOrderNumber() {
@@ -177,23 +174,33 @@ export function ProductionDetailPane({
             <span>Источник</span><strong>{sourceDisplayLabel}</strong>
             <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>
-            <span className="batchEditCell">
-              <input
-                type="number"
-                min={0}
-                step={1}
-                value={quantityValue}
-                disabled={!canEditQuantity || quantitySaving}
-                className={quantityError ? 'inputError' : ''}
-                onChange={(e) => { setQuantityValue(e.target.value); setQuantityError('') }}
-                onBlur={() => void handleQuantitySave()}
-                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
-              />
-              {activeRow.unit && <span className="batchUnit">{activeRow.unit}</span>}
-              {quantitySaving && <span className="batchHint">...</span>}
-              {quantityError && <span className="batchHint error">{quantityError}</span>}
-            </span>
-            <span>Статус</span><strong>{productionStatusLabel(activeRow.status)}</strong>
+            {activeRow.work_item_id != null ? (
+              <span className="batchEditCell">
+                <input
+                  type="number"
+                  aria-label="Количество запуска"
+                  min={0.001}
+                  max={activeRow.launchable_qty ?? activeRow.quantity}
+                  step={1}
+                  value={launchValue}
+                  onChange={(event) => {
+                    const next = event.target.value
+                    setLaunchValue(next)
+                    const value = Number(next)
+                    const max = activeRow.launchable_qty ?? activeRow.quantity
+                    if (next !== '' && Number.isFinite(value) && value > 0 && value <= max) {
+                      onLaunchQuantityChange(value)
+                    }
+                  }}
+                  onBlur={commitLaunchQuantity}
+                  onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
+                />
+                {activeRow.unit && <span className="batchUnit">{activeRow.unit}</span>}
+              </span>
+            ) : (
+              <strong>{qty(activeRow.quantity)} {activeRow.unit}</strong>
+            )}
+            <span>Статус</span><strong>{activeStatusLabel}</strong>
             <span>Обеспечение</span>
             <strong>
               <span className={`pill ${activeCoverageStatus}`}>
@@ -220,26 +227,39 @@ export function ProductionDetailPane({
               {batchError && <span className="batchHint error">{batchError}</span>}
             </span>
           </div>
-          {dbrPlanning && (
-            <div className="dbrPlanningBlock">
-              <div className="dbrPlanningTitle">
-                <span>Планирование DBR</span>
-                <span className={`planningBadge ${dbrPlanning.zone || 'dbr'}`}>
-                  {dbrPlanning.zone === 'red' ? 'Красная зона' : dbrPlanning.zone === 'yellow' ? 'Жёлтая зона' : dbrPlanning.zone === 'green' ? 'Зелёная зона' : 'DBR'}
+          {activeRow.paint_weld_chain?.counterpart_product_id && (
+            <div className="mrpCoverageBlock">
+              <div className="mrpCoverageTitle">Агрегированная цепочка «сварка → окраска»</div>
+              <div className="detailGrid">
+                <span>Окраска</span><strong>{activeOrderNumber()} · {activeRow.item_name}</strong>
+                <span>Сварка</span>
+                <strong>
+                  {activeRow.paint_weld_chain.counterpart_order_prodplan_number
+                    || activeRow.paint_weld_chain.counterpart_order_number} · {activeRow.paint_weld_chain.counterpart_item_name}
+                </strong>
+                <span>Остаток сварки</span>
+                <strong>
+                  {qty(activeRow.paint_weld_chain.counterpart_remaining_qty)} {activeRow.paint_weld_chain.counterpart_unit}
+                </strong>
+                <span>Действие</span><strong>Совместный выпуск и один сдельный наряд</strong>
+              </div>
+            </div>
+          )}
+          <ItemLedgerSummaryBlock itemId={activeRow.item_id} unit={activeRow.unit} />
+          {hasShelfLaunchData && (
+            <div className="shelfLaunchBlock">
+              <div className="shelfLaunchTitle">
+                <span>Запуск с полки</span>
+                <span className={`planningBadge ${activeRow?.launch_source || 'mrp'}`}>
+                  {activeRow?.launch_source || 'MRP'}
                 </span>
               </div>
               <div className="detailGrid">
-                <span>Сигнал</span><strong>#{activeRow.source_dbr_signal_id || dbrPlanning.source_id || '—'}</strong>
-                <span>Тип</span><strong>{dbrPlanning.signal_type || '—'}</strong>
-                <span>Приоритет</span><strong>{dbrPlanning.priority ?? '—'}</strong>
-                <span>Требуется</span><strong>{dateRu(dbrPlanning.required_date) || '—'}</strong>
-                <span>Слот барабана</span><strong>{dbrPlanning.slot_id ? `#${dbrPlanning.slot_id}` : '—'}</strong>
-                <span>Состояние очереди</span><strong>{queueStateLabel(dbrPlanning.queue_state)}</strong>
-                {dbrPlanning.reason && (
-                  <>
-                    <span>Причина</span><strong>{dbrPlanning.reason}</strong>
-                  </>
-                )}
+                <span>Источник запуска</span><strong>{activeRow?.launch_source || '—'}</strong>
+                <span>Полка</span><strong>{activeRow?.shelf_warehouse_ref1c || '—'}</strong>
+                <span>Требуется с полки</span><strong>{shelfQty(activeRow?.shelf_pull_qty)}</strong>
+                <span>Материализовано на полке</span><strong>{shelfQty(activeRow?.shelf_materialized_qty)}</strong>
+                <span>Дата запуска с полки</span><strong>{dateRu(activeRow?.shelf_latest_start_date) || '—'}</strong>
               </div>
             </div>
           )}
@@ -250,38 +270,41 @@ export function ProductionDetailPane({
                 <span>Потребность</span><strong>{qty(activeRow.mrp_req_net_qty)} {activeRow.unit}</strong>
                 <span>Закрыто</span><strong>{qty(activeRow.mrp_req_covered_qty)} {activeRow.unit}</strong>
                 <span>Остаток</span>
-                <strong className={mrpRemaining > 0.001 ? 'mrpRemainingWarn' : 'mrpRemainingOk'}>
-                  {qty(mrpRemaining)} {activeRow.unit}
+                <strong className={mrpRemaining == null ? '' : mrpRemaining > 0.001 ? 'mrpRemainingWarn' : 'mrpRemainingOk'}>
+                  {mrpRemaining == null ? '—' : qty(mrpRemaining)} {activeRow.unit}
                 </strong>
               </div>
-              {mrpRemaining <= 0.001 && (
+              {mrpRemaining != null && mrpRemaining <= 0.001 && (
                 <div className="mrpCoveredBadge">Потребность закрыта полностью</div>
               )}
             </div>
           )}
           <div className="detailActions">
-            <button onClick={onLoadMaterials}>Обновить материалы</button>
-            <button onClick={onPrint}>Печать листа</button>
-            {activeRow && (
+            <button onClick={onLoadMaterials}>Повторить загрузку</button>
+            <button onClick={onPrint} disabled={!activeRow?.product_id}>Печать листа</button>
+            {activeRow?.product_id && (
               <button
                 onClick={onProduce}
-                disabled={Number(activeRow.remaining_qty) <= 0}
                 title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back"
               >
-                Произвести строку
+                {activeRow.paint_weld_chain ? 'Произвести цепочку' : 'Произвести строку'}
               </button>
             )}
-            {activeRow && (
+            {activeRow?.product_id && (
               <button
                 onClick={onReturnLeftovers}
-                disabled={activeRow.status !== 'produced_partial'}
-                title="Вернуть остатки компонентов с участка обратно на исходный склад"
+                title="Запросить возврат; backend проверит принятый выпуск, исходящую выдачу и фактический остаток"
               >
                 Вернуть остатки
               </button>
             )}
           </div>
-          <h3>Комплектующие</h3>
+          <h3>
+            Комплектующие
+            {activeRow.work_item_id != null && materials?.qty != null
+              ? ` на ${qty(materials.qty)} ${activeRow.unit || ''}`
+              : ''}
+          </h3>
           <div className="materialsList">
             {(materials?.components ?? []).map((m) => (
               <div className={`materialRow ${m.availability_status || m.coverage_status || 'unknown'}`} key={m.component_item_id}>

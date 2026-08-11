@@ -54,6 +54,7 @@ from .mrp_mutation_guard import (
     MrpMutationLineageError,
     require_materialized_orders,
 )
+from .item_ledger.production_output_cache import accepted_product_output
 from .one_c_document_numbers import production_order_number
 from .one_c_production_order_export import export_production_orders_to_1c
 from .workshop_resolution import default_spec_ids_for_items, resolve_workshop_for_spec
@@ -712,6 +713,99 @@ def open_paint_chain(
         raise
 
 
+def open_paint_chains_for_products(
+    db: Session,
+    *,
+    product_ids: List[int],
+    initiated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Открыть применимые цепочки и вернуть полный набор строк запуска.
+
+    Непарные строки остаются без изменений. Уже созданные цепочки раскрываются
+    в обе стороны. Исторические строки 1С без принятой MRP-линии не меняются.
+    """
+    requested = list(dict.fromkeys(int(value) for value in product_ids if int(value) > 0))
+    expanded: set[int] = set(requested)
+    entries: List[Dict[str, Any]] = []
+
+    def _expand_link(link: PaintWeldChainLink) -> None:
+        linked_products = (
+            db.query(ProductionProduct.product_id)
+            .filter(
+                ProductionProduct.order_id.in_(
+                    [int(link.painted_order_id), int(link.welded_order_id)]
+                )
+            )
+            .all()
+        )
+        expanded.update(int(row.product_id) for row in linked_products)
+
+    for product_id in requested:
+        product = db.get(ProductionProduct, product_id)
+        if product is None:
+            entries.append({"product_id": product_id, "status": "error", "error": "строка заказа не найдена"})
+            continue
+        order = db.get(ProductionOrder, int(product.order_id))
+        link = (
+            db.query(PaintWeldChainLink)
+            .filter(
+                (PaintWeldChainLink.painted_order_id == int(product.order_id))
+                | (PaintWeldChainLink.welded_order_id == int(product.order_id))
+            )
+            .one_or_none()
+        )
+        if link is not None:
+            _expand_link(link)
+            entries.append({"product_id": product_id, "status": "existing", "link_id": int(link.id)})
+            continue
+
+        pair = (
+            db.query(PaintWeldPair)
+            .filter(
+                PaintWeldPair.painted_item_id == int(product.item_id),
+                PaintWeldPair.is_active.is_(True),
+            )
+            .one_or_none()
+        )
+        if pair is None:
+            entries.append({"product_id": product_id, "status": "not_paired"})
+            continue
+        if order is None or order.source_run_id is None or product.ledger_generation_id is None:
+            entries.append({"product_id": product_id, "status": "historical_unlinked"})
+            continue
+        try:
+            opened = open_paint_chain(
+                db,
+                painted_product_id=product_id,
+                dry_run=False,
+                initiated_by=initiated_by,
+            )
+            link = (
+                db.query(PaintWeldChainLink)
+                .filter(PaintWeldChainLink.painted_order_id == int(product.order_id))
+                .one_or_none()
+            )
+            if link is not None:
+                _expand_link(link)
+            entries.append({
+                "product_id": product_id,
+                "status": str(opened.get("status") or "ok"),
+                "verdict": opened.get("verdict"),
+                "link_id": int(link.id) if link is not None else None,
+            })
+        except Exception as exc:
+            db.rollback()
+            entries.append({"product_id": product_id, "status": "error", "error": str(exc)})
+
+    errors = [entry for entry in entries if entry.get("status") in {"error", "partial_error"}]
+    return {
+        "status": "partial_error" if errors else "ok",
+        "product_ids": sorted(expanded),
+        "entries": entries,
+        "errors": errors,
+    }
+
+
 def _active_pair(db: Session, painted_item_id: int) -> PaintWeldPair:
     pair = (
         db.query(PaintWeldPair)
@@ -806,9 +900,11 @@ def close_paint_chain(
     экспорт обеих СборкаЗапасов → один комбинированный СдельныйНаряд
     (основание — окрасочная СборкаЗапасов), закрывающий оба заказа.
 
-    Количества по умолчанию — remaining_qty строк; если сторона уже
-    произведена полностью, переиспользуется её последний выпуск. Требования
-    штатного produce_line (проведённые перемещения материалов) сохраняются.
+    Количества по умолчанию — физический остаток из принятого Ledger-кэша
+    (`quantity - produced_qty`), а не многописательное legacy-поле
+    `remaining_qty`. Если сторона уже произведена полностью, переиспользуется
+    её последний выпуск. Quantity-commanded гейт штатного ``produce_line``
+    остаётся окончательным владельцем допустимого количества команды.
 
     dry_run=True — предпросмотр: что будет произведено и, если оба выпуска уже
     существуют, payload комбинированного сдельного.
@@ -833,7 +929,7 @@ def close_paint_chain(
     def _plan_side(
         product: ProductionProduct, qty: Optional[float]
     ) -> Dict[str, Any]:
-        remaining = _to_float(product.remaining_qty)
+        remaining = _to_float(accepted_product_output(product).remaining_qty)
         planned = _to_float(qty) if qty is not None else remaining
         existing = _latest_manufacture(db, int(product.product_id))
         if planned <= 0 and existing is None:

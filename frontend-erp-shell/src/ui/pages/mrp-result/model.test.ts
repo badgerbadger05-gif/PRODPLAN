@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow } from '../../../domain/planning'
+import type { MrpProductionRow, MrpPurchaseRow } from '../../../domain/planning'
 import {
-  filterPurchaseRows,
+  buildPurchaseCategoryFilterParam,
+  PURCHASE_FILTER_MISSING_CATEGORY,
+  PURCHASE_FILTER_MISSING_SUPPLIER,
   formatActionResult,
   isProductionRowSelectable,
-  mrpResultTotals,
   parseMrpResultTab,
   parsePositiveId,
   productionSourceIds,
@@ -25,39 +26,28 @@ describe('MRP result model', () => {
     expect(parsePositiveId('abc')).toBeNull()
   })
 
-  it('builds stable supplier and category options and filters by their keys', () => {
+  it('builds stable supplier and category options', () => {
     const rows = [
       purchase({ purchase_id: 1, supplier_name: ' Альфа ', supplier_ref1c: 'supplier-a', category_id: 7, category_name: 'Металл' }),
       purchase({ purchase_id: 2, supplier_name: '', supplier_ref1c: 'hidden-ref', category_ref1c: 'category-b', category_name: 'Крепёж' }),
       purchase({ purchase_id: 3, supplier_name: 'Альфа', supplier_ref1c: 'supplier-a', category_id: 7, category_name: 'Металл' }),
+      purchase({ purchase_id: 4, supplier_name: ' ', supplier_ref1c: 'missing-name-ref' }),
     ]
 
     expect(purchaseFilterOptions(rows)).toEqual({
       suppliers: [
         { value: 'supplier-a', label: 'Альфа' },
-        { value: '__missing_supplier_name', label: 'Без наименования' },
+        { value: PURCHASE_FILTER_MISSING_SUPPLIER, label: 'Без наименования' },
       ],
       categories: [
+        { value: PURCHASE_FILTER_MISSING_CATEGORY, label: 'Без товарной группы' },
         { value: 'category-b', label: 'Крепёж' },
         { value: '7', label: 'Металл' },
       ],
     })
-    expect(filterPurchaseRows(rows, '__missing_supplier_name', 'category-b')).toEqual([rows[1]])
-    expect(filterPurchaseRows(rows, '', '7')).toEqual([rows[0], rows[2]])
-  })
-
-  it('calculates quantities across result sections', () => {
-    expect(mrpResultTotals(
-      [production({ qty: 2 }), production({ qty: '3' as unknown as number })],
-      [purchase({ qty: 4 })],
-      [{ qty: 5 } as MrpReworkRow],
-      [{ overload_hours: 1.5 }, { overload_hours: 2 }] as MrpCapacityRow[],
-    )).toEqual({
-      productionQty: 5,
-      purchaseQty: 4,
-      reworkQty: 5,
-      overloadHours: 3.5,
-    })
+    expect(buildPurchaseCategoryFilterParam('11')).toEqual({ category_id: 11 })
+    expect(buildPurchaseCategoryFilterParam('category-b')).toEqual({ category_ref1c: 'category-b' })
+    expect(buildPurchaseCategoryFilterParam('')).toEqual({})
   })
 
   it('expands aggregate source IDs and detects selectable production rows', () => {

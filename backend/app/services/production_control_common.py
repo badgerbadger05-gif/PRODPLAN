@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import math
 from typing import Any, Optional
 
 
@@ -28,6 +29,28 @@ def to_float(val: Any) -> float:
         return float(val or 0.0)
     except Exception:
         return 0.0
+
+
+def to_float_strict(
+    value: Any,
+    *,
+    field: str | None = None,
+) -> float:
+    try:
+        if value is None or isinstance(value, bool):
+            raise ValueError("numeric field is malformed")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("numeric field is malformed")
+        numeric = float(value)
+    except (TypeError, ValueError):
+        suffix = f" {field}" if field else ""
+        raise ValueError(f"numeric field{suffix} is malformed") from None
+    if not math.isfinite(numeric):
+        suffix = f" {field}" if field else ""
+        raise ValueError(f"numeric field{suffix} is non-finite")
+    return numeric
 
 
 def date_to_iso(val: Any) -> Optional[str]:

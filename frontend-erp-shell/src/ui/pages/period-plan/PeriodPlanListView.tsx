@@ -54,17 +54,18 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
   const [deleting, setDeleting] = useState(false)
 
   const selected = plans.find((p) => p.id === selectedId) ?? null
-  const canDelete = selected?.status !== 'archived' // backend will reject if there are SUCCESS MRP runs
+  const canDelete = selected?.status !== 'closed' // backend will reject if there are SUCCESS MRP runs
   const dateOrderInvalid = !!(newFrom && newTo && newFrom > newTo)
 
-  function executionPillClass(pct: number) {
-    if (pct >= 100) return 'ready'
-    if (pct > 0) return 'partial'
-    return 'shortage'
+  function executionPillClass(status: PeriodPlan['execution_progress_status']) {
+    if (status === 'complete') return 'ready'
+    if (status === 'in_progress' || status === 'lower_bound') return 'partial'
+    if (status === 'not_started') return 'shortage'
+    return 'unavailable'
   }
 
   const flowPctFmt = (pct: number) =>
-    Math.min(100, Math.max(0, pct)).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+    pct.toLocaleString('ru-RU', { maximumFractionDigits: 1 })
 
   // Compact per-flow abbreviations for the list cell; full label lives in the tooltip.
   function flowAbbr(flow: string) {
@@ -88,7 +89,7 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
         const entry = source[flow]
         const base = entry?.base_qty ?? 0
         const pct = entry?.execution_pct ?? null
-        const available = entry?.available !== false && pct !== null
+        const available = entry?.available === true && pct !== null
         return { flow, base, available, pct }
       })
       // Skip available flows with no demand (net-zero); always surface an
@@ -105,13 +106,13 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
       }
       return <span className="muted">{plan.execution_reason ? `Недоступно: ${plan.execution_reason}` : 'Недоступно'}</span>
     }
-    const value = Math.max(0, plan.execution_pct)
-    const pct = Math.min(100, value).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+    const value = plan.execution_pct
+    const pct = value.toLocaleString('ru-RU', { maximumFractionDigits: 1 })
     const flows = executionFlowRows(plan.execution_by_flow)
     return (
       <span style={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4 }}>
         <span
-          className={`miniPill ${executionPillClass(value)}`}
+          className={`miniPill ${executionPillClass(plan.execution_progress_status)}`}
           title={plan.execution_partial ? 'Подтверждённый минимум; часть фактов недоступна' : undefined}
         >
           {plan.execution_partial ? '≥' : ''}{pct}%
@@ -326,14 +327,14 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                 <td>
                   <label className="columnFilterControl">
                     <span>Статус</span>
-                    <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
+                      <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
                       <option value="">Все</option>
                       <option value="draft">Черновик</option>
                       <option value="fixed">Зафиксирован</option>
-                      <option value="archived">Архив</option>
-                    </select>
-                  </label>
-                </td>
+                      <option value="closed">Закрыт</option>
+                      </select>
+                    </label>
+                  </td>
                 <td colSpan={2}>
                   <div className="columnFilterRange">
                     <label className="columnFilterControl">
@@ -385,10 +386,10 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
             </thead>
             <tbody>
               {plans.map((plan) => (
-                <tr
-                  key={plan.id}
-                  className={plan.id === selectedId ? 'activeRow' : ''}
-                  style={{ cursor: 'pointer', opacity: plan.status === 'archived' ? 0.62 : undefined }}
+                  <tr
+                    key={plan.id}
+                    className={plan.id === selectedId ? 'activeRow' : ''}
+                  style={{ cursor: 'pointer', opacity: plan.status === 'closed' ? 0.62 : undefined }}
                   onClick={() => setSelectedId(plan.id === selectedId ? null : plan.id)}
                   onDoubleClick={() => onOpenPlan(plan.id)}
                 >

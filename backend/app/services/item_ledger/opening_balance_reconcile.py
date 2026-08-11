@@ -14,10 +14,10 @@ difference as one explicit adjustment movement per key, dated at T0.  The
 ledger's history stays append-only, its present balance matches 1C again, and
 the next run recomputes a zero difference — so the correction does not repeat.
 
-Adjustments are derived from 1C's own answer for the T0 prefix, never from a
-convergence mismatch.  That distinction matters: a plug taken from our own
-disagreement would silently absorb exactly the post-anchor import bugs the
-convergence check exists to catch.
+Adjustment quantities are always derived from 1C's own answer for the T0
+prefix, never from a convergence delta.  Automatic refresh may use the final
+convergence mismatch only to bound which T0 keys are compared; this prevents
+unrelated opening changes from masking a compensating post-anchor discrepancy.
 """
 
 from __future__ import annotations
@@ -42,9 +42,9 @@ from .physical import (
 from .physical_visibility import visible_sle_query
 
 
-ALGORITHM_VERSION = "ledger-opening-balance-reconcile/1"
+ALGORITHM_VERSION = "ledger-opening-balance-reconcile/2"
 CHECKPOINT_KEY_PREFIX = "opening-balance-reconcile"
-CHECKPOINT_VERSION = "1"
+CHECKPOINT_VERSION = "2"
 STAGE = "physical_import"
 ADJUSTMENT_SOURCE = "opening_adjustment"
 ADJUSTMENT_RECORDER_TYPE = "opening_adjustment"
@@ -211,6 +211,7 @@ def reconcile_opening_balance(
     *,
     ledger_generation_id: int,
     opening_snapshot: Mapping[Any, Any],
+    only_keys: set[AggregateKey] | None = None,
     eps: Decimal = EPS,
     max_adjusted_keys: int = MAX_ADJUSTED_KEYS,
 ) -> OpeningBalanceReconcileResult:
@@ -259,8 +260,15 @@ def reconcile_opening_balance(
         opening_at=opening_at,
     )
 
+    comparison_keys = set(balance) | set(ledger)
+    if only_keys is not None:
+        comparison_keys &= {
+            (int(key[0]), str(key[1] or ""), str(key[2] or ""))
+            for key in only_keys
+        }
+
     adjustments: list[OpeningBalanceAdjustment] = []
-    for key in sorted(set(balance) | set(ledger)):
+    for key in sorted(comparison_keys):
         balance_qty = balance.get(key, Decimal("0"))
         ledger_qty = ledger.get(key, Decimal("0"))
         delta = balance_qty - ledger_qty
@@ -275,7 +283,7 @@ def reconcile_opening_balance(
             delta_qty=canonical_decimal(delta),
         ))
 
-    compared = len(set(balance) | set(ledger))
+    compared = len(comparison_keys)
     content_hash = canonical_content_hash([
         [row.item_id, row.organization_ref, row.warehouse_ref1c, row.delta_qty]
         for row in adjustments
@@ -378,6 +386,7 @@ def reconcile_opening_balance(
     metrics = {
         "checkpoint_version": CHECKPOINT_VERSION,
         "opening_at": opening_at.isoformat(),
+        "scope": "targeted" if only_keys is not None else "full",
         "compared": compared,
         "adjusted_keys": len(adjustments),
         "net_delta": net_delta,

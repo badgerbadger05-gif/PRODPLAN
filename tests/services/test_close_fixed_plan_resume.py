@@ -36,7 +36,8 @@ class InjectedFault(RuntimeError):
 def _accepted_world(db):
     physical = models.PhysicalImportBatch(
         batch_key="resume-physical", status="completed", cutoff=CUTOFF,
-        source_watermarks={}, completed_at=CUTOFF,
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
+        completed_at=CUTOFF,
     )
     accepted = models.LedgerGeneration(
         generation_key="resume-accepted", status="accepted", cutoff=CUTOFF,
@@ -52,9 +53,40 @@ def _accepted_world(db):
         item_code="RESUME-BUY", item_name="покупная деталь",
         replenishment_method="Покупка", replenishment_time=3, status="active",
     )
-    db.add_all([physical, accepted, item])
+    db.add_all([
+        physical,
+        accepted,
+        item,
+        models.StockWarehouse(
+            warehouse_ref1c="WH-RESUME-PLAN",
+            warehouse_name="Resume planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+    ])
     db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(accepted.id),
+        cutoff=accepted.cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=accepted.cutoff,
+        built_at=accepted.cutoff,
+    ))
+    resource = models.ProductionResource(
+        resource_name="Close resume assembly",
+        planning_range=30,
+        capacity=Decimal("100"),
+    )
+    db.add(resource)
+    db.flush()
+    db.add(models.AssemblyRate(
+        resource_id=int(resource.resource_id),
+        item_id=int(item.item_id),
+        qty_per_capacity=Decimal("1"),
+    ))
     db.commit()
     return accepted, item
 

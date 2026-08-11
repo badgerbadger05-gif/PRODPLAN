@@ -19,6 +19,9 @@ from ..models import (
     WorkshopWarehouseBinding,
 )
 from ..schemas import ODataSyncRequest
+from .item_ledger.production_output_cache import (
+    update_accepted_product_output_cache,
+)
 
 
 PRODUCTION_ORDER_SYNC_FROM = datetime(2026, 5, 1)
@@ -44,6 +47,13 @@ class ProductionOrderSyncStats:
 def _chunked(seq: List[str], size: int) -> Iterable[List[str]]:
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
+
+
+def _require_not_truncated(client, entity_name: str, *, context: str = "read") -> None:
+    if getattr(client, "last_result_truncated", False):
+        raise RuntimeError(
+            f"OData {entity_name} {context} is truncated; refusing to sync"
+        )
 
 
 def _parse_1c_datetime(val) -> Optional[datetime]:
@@ -265,6 +275,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             max_pages=1000,
             order_by="Ref_Key",
         )
+        _require_not_truncated(client, req.entity_name, context="header read")
 
         # Дублируем фильтр на уровне приложения: 1С / прокси иногда игнорируют часть условий.
         removed_by_dm = 0
@@ -272,6 +283,12 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         removed_by_missing_filter_fields = 0
         filtered_orders = []
         for rec in order_data:
+            if "СостояниеЗаказа_Key" not in rec:
+                raise RuntimeError(
+                    "Order synchronization payload is missing required field "
+                    "'СостояниеЗаказа_Key'"
+                )
+
             # Проверяем наличие обязательных полей
             if rec.get("СостояниеЗаказа_Key") is None:
                 removed_by_missing_filter_fields += 1
@@ -327,7 +344,8 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         products_entity = "Document_ЗаказНаПроизводство_Продукция"
         # Важно: 1С OData может не содержать некоторых полей (например, "Этап_Key"),
         # и тогда запрос с $select падает с 400.
-        # Поэтому для MVP берём минимально-надёжный набор полей (как в `.docs/production_orders_odata_queries.md`).
+        # Поэтому берём минимально-надёжный набор полей; общая политика
+        # чтения OData зафиксирована в `.docs/odata.md`.
         products_select = [
             "Ref_Key",
             "LineNumber",
@@ -375,6 +393,11 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                             max_pages=1000,
                             order_by="LineNumber",
                         )
+                        _require_not_truncated(
+                            client,
+                            products_entity,
+                            context=f"line read for {len(batch_keys)} orders",
+                        )
                     except Exception:
                         if not use_extended_products_select:
                             raise
@@ -389,12 +412,19 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                             max_pages=1000,
                             order_by="LineNumber",
                         )
+                        _require_not_truncated(
+                            client,
+                            products_entity,
+                            context=f"fallback line read for {len(batch_keys)} orders",
+                        )
                     for pr in rows:
                         rk = str((pr.get("Ref_Key") or "")).strip()
                         if rk:
                             products_by_order[rk].append(pr)
                 except Exception as e:
                     # Если пакет не загрузился, помечаем все заказы из пакета как failed
+                    if isinstance(e, RuntimeError):
+                        raise
                     for ok in batch_keys:
                         stats.products_failed += 1
                         stats.errors.append(f"Products load failed for order_ref1c={ok}: {e}")
@@ -525,29 +555,31 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                             db, prod_data, record, existing_product
                         )
 
+                        sync_product_fields = getattr(current_order, "source", "1c") != "mrp"
                         if existing_product:
-                            # Нечего подставить — оставляем как есть, иначе каждая
-                            # синхронизация обнуляла бы привязку спецификации/этапа.
-                            target_spec_id = (
-                                spec_id if spec_id is not None else existing_product.spec_id
-                            )
-                            target_stage_id = (
-                                stage_id if stage_id is not None else existing_product.stage_id
-                            )
-                            if (existing_product.quantity != quantity or
-                                existing_product.spec_id != target_spec_id or
-                                existing_product.stage_id != target_stage_id or
-                                getattr(existing_product, "line_number", None) != line_number or
-                                getattr(existing_product, "characteristic_ref1c", None) != characteristic_key or
-                                existing_product.destination_warehouse_ref1c != destination_ref):
-                                existing_product.quantity = quantity
-                                existing_product.spec_id = target_spec_id
-                                existing_product.stage_id = target_stage_id
-                                existing_product.line_number = line_number
-                                existing_product.characteristic_ref1c = characteristic_key
-                                existing_product.destination_warehouse_ref1c = destination_ref
-                                products_updated += 1
-                        else:
+                            if sync_product_fields:
+                                # Нечего подставить — оставляем как есть, иначе каждая
+                                # синхронизация обнуляла бы привязку спецификации/этапа.
+                                target_spec_id = (
+                                    spec_id if spec_id is not None else existing_product.spec_id
+                                )
+                                target_stage_id = (
+                                    stage_id if stage_id is not None else existing_product.stage_id
+                                )
+                                if (existing_product.quantity != quantity or
+                                    existing_product.spec_id != target_spec_id or
+                                    existing_product.stage_id != target_stage_id or
+                                    getattr(existing_product, "line_number", None) != line_number or
+                                    getattr(existing_product, "characteristic_ref1c", None) != characteristic_key or
+                                    existing_product.destination_warehouse_ref1c != destination_ref):
+                                    existing_product.quantity = quantity
+                                    existing_product.spec_id = target_spec_id
+                                    existing_product.stage_id = target_stage_id
+                                    existing_product.line_number = line_number
+                                    existing_product.characteristic_ref1c = characteristic_key
+                                    existing_product.destination_warehouse_ref1c = destination_ref
+                                    products_updated += 1
+                        elif sync_product_fields:
                             # Создаём новую строку продукции
                             # remaining_qty = quantity т.к. produced_qty = 0 для новой строки
                             new_product = ProductionProduct(
@@ -584,23 +616,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         if req.dry_run:
             db.rollback()
         else:
-            # Правило: "отсутствует в загрузке = закрыт" действует только в
-            # синхронизируемом горизонте. Старые локальные заказы до 2026-05-01
-            # не трогаем, иначе date-фильтр превращает их в ложные удаления.
-            loaded_order_refs = set(order_keys)
-            orders_to_close = []
-            for order in db.query(ProductionOrder).filter(
-                ProductionOrder.deletion_mark == False,
-                ProductionOrder.order_date >= PRODUCTION_ORDER_SYNC_FROM,
-            ).all():
-                if order.order_ref1c and order.order_ref1c not in loaded_order_refs:
-                    orders_to_close.append(order)
-            
-            if orders_to_close:
-                print(f"[SYNC] Closing {len(orders_to_close)} orders not found in 1C load")
-                for order in orders_to_close:
-                    order.deletion_mark = True
-            
             db.commit()
 
             # Новые/изменённые строки заказа сдвигают плановое количество, а
@@ -625,24 +640,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
 FACT_CACHE_CONSUMER = "production_fact_cache"
 
 
-def _cache_line_states(db: Session, product_ids: List[int]) -> Dict[int, str]:
-    """Статусы строк пакетно; отсутствие строки статуса = пустой статус."""
-    statuses: Dict[int, str] = {}
-    for chunk in _chunked(product_ids, 500):
-        rows = (
-            db.query(
-                ProductionOrderLineState.product_id,
-                ProductionOrderLineState.status,
-            )
-            .filter(ProductionOrderLineState.product_id.in_(chunk))
-            .all()
-        )
-        statuses.update(
-            {int(product_id): str(status or "") for product_id, status in rows}
-        )
-    return statuses
-
-
 def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -> Dict[str, Any]:
     """
     Пересчитать кэш факта выпуска из ПРИНЯТОГО поколения Item Ledger.
@@ -657,11 +654,10 @@ def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -
     поколения кэш НЕ переписывается и НЕ обнуляется, а сводка возвращает
     `status="unavailable"` с причиной.
 
-    `remaining_qty` пересчитывается по той же формуле, что и ручная
-    корректировка `production_control_journal.update_product_quantity`
-    (`max(0, quantity - produced_qty)`), но терминальные строки
-    (`completed` / `cancelled`) не воскрешаются: их обнулённый остаток —
-    решение оператора, а не производная факта.
+    `remaining_qty` — только совместимый кэш той же принятой проекции:
+    `max(0, quantity - produced_qty)`. Терминальное состояние является
+    отдельным операционным решением и не имеет права подменять физический
+    остаток нулём.
     """
     from .planning_truth import (
         CAPABILITY_PHYSICAL_LEDGER,
@@ -670,9 +666,6 @@ def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -
     )
     from .item_ledger.physical_visibility import PhysicalVisibilityError
     from .item_ledger.production_fact_projection import derive_production_output
-    # Владелец терминальных статусов строки — производственный журнал.
-    from .production_control_journal import _TERMINAL_LINE_STATUSES
-
     dry_run = bool(getattr(req, "dry_run", False))
 
     try:
@@ -718,24 +711,18 @@ def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -
         }
 
     products = db.query(ProductionProduct).all()
-    line_status_by_product = _cache_line_states(
-        db, [int(product.product_id) for product in products]
-    )
-
     products_updated = 0
     products_unchanged = 0
     zero = Decimal("0")
     for product in products:
         product_id = int(product.product_id)
         derived = projection.produced_by_product.get(product_id, zero)
-        cached = Decimal(str(product.produced_qty or 0))
-        if cached == derived:
+        if not update_accepted_product_output_cache(
+            product,
+            produced_qty=derived,
+        ):
             products_unchanged += 1
             continue
-        product.produced_qty = derived
-        if line_status_by_product.get(product_id, "") not in _TERMINAL_LINE_STATUSES:
-            planned = Decimal(str(product.quantity or 0))
-            product.remaining_qty = max(planned - derived, zero)
         products_updated += 1
 
     if dry_run:

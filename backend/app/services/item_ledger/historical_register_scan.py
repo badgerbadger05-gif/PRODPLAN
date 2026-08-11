@@ -1,8 +1,10 @@
 """Read-only historical scanner for the 1C warehouse movement register.
 
-The scanner discovers recorder identities only. It does not pull recorder
-contents, write Ledger rows, or advance a database watermark. Progress is
-exposed exclusively at completed, non-overlapping window boundaries.
+The scanner discovers recorder identities plus a compact hash of the
+balance-relevant row fields already present in the flat register. It does not
+pull document contents, write Ledger rows, or advance a database watermark.
+Progress is exposed exclusively at completed, non-overlapping window
+boundaries.
 """
 
 from __future__ import annotations
@@ -11,13 +13,26 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 from typing import Any, Mapping, Sequence
 
 
 REGISTER_RECORD_ENTITY = "AccumulationRegister_ЗапасыНаСкладах_RecordType"
 REGISTER_ORDER_BY = "Period,Recorder_Type,Recorder,LineNumber"
-REGISTER_SELECT_FIELDS = ("Period", "Recorder", "Recorder_Type", "LineNumber")
+REGISTER_SELECT_FIELDS = (
+    "Period",
+    "Recorder",
+    "Recorder_Type",
+    "LineNumber",
+    "Active",
+    "RecordType",
+    "Номенклатура_Key",
+    "Характеристика_Key",
+    "Организация_Key",
+    "СтруктурнаяЕдиница_Key",
+    "Количество",
+)
 _MOSCOW = ZoneInfo("Europe/Moscow")
 
 
@@ -35,6 +50,8 @@ class RecorderIdentity:
 class DiscoveredRecorder:
     identity: RecorderIdentity
     first_period: datetime
+    row_count: int
+    balance_content_hash: str
 
 
 @dataclass(frozen=True)
@@ -108,7 +125,76 @@ def _normalize_recorder_ref(value: Any) -> str:
     raw = str(value or "").strip()
     if raw.startswith("guid'") and raw.endswith("'"):
         raw = raw[5:-1]
-    return raw.strip("{}").strip()
+    normalized = raw.strip("{}").strip()
+    return "" if normalized == "00000000-0000-0000-0000-000000000000" else normalized
+
+
+def _canonical_decimal(value: Any) -> str:
+    normalized = Decimal(str(value or 0)).normalize()
+    if normalized == 0:
+        return "0"
+    return format(normalized, "f")
+
+
+def balance_movement_payload(
+    *,
+    item_ref: Any,
+    characteristic_ref: Any,
+    organization_ref: Any,
+    warehouse_ref: Any,
+    signed_qty: Any,
+    record_type: Any,
+    line_no: Any,
+) -> dict[str, str]:
+    """Canonical balance-relevant movement fields shared with accepted Ledger."""
+    return {
+        "item_ref": _normalize_recorder_ref(item_ref),
+        "characteristic_ref": _normalize_recorder_ref(characteristic_ref),
+        "organization_ref": _normalize_recorder_ref(organization_ref),
+        "warehouse_ref": _normalize_recorder_ref(warehouse_ref),
+        "qty": _canonical_decimal(signed_qty),
+        "record_type": str(record_type or ""),
+        "line_no": str(line_no or ""),
+    }
+
+
+def balance_content_hash(payloads: Sequence[Mapping[str, Any]]) -> str:
+    ordered = sorted(
+        (dict(payload) for payload in payloads),
+        key=lambda payload: json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    return hashlib.sha256(
+        json.dumps(
+            ordered,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _register_movement_payload(row: Mapping[str, Any]) -> dict[str, str] | None:
+    if row.get("Active") is False:
+        return None
+    quantity = Decimal(str(row.get("Количество") or 0))
+    if quantity == 0:
+        return None
+    record_type = str(row.get("RecordType") or "")
+    signed_qty = -quantity if record_type == "Expense" else quantity
+    return balance_movement_payload(
+        item_ref=row.get("Номенклатура_Key"),
+        characteristic_ref=row.get("Характеристика_Key"),
+        organization_ref=row.get("Организация_Key"),
+        warehouse_ref=row.get("СтруктурнаяЕдиница_Key"),
+        signed_qty=signed_qty,
+        record_type=record_type,
+        line_no=row.get("LineNumber"),
+    )
 
 
 def _page_hash(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -129,7 +215,10 @@ def _scan_window(
     to_inclusive: datetime,
     page_size: int,
     max_pages: int,
-) -> tuple[WindowCheckpoint, dict[RecorderIdentity, datetime]]:
+) -> tuple[
+    WindowCheckpoint,
+    dict[RecorderIdentity, tuple[datetime, list[dict[str, str]]]],
+]:
     filter_query = (
         f"Period gt datetime'{_odata_datetime(from_exclusive)}' and "
         f"Period le datetime'{_odata_datetime(to_inclusive)}'"
@@ -138,7 +227,10 @@ def _scan_window(
     pages_read = 0
     rows_read = 0
     seen_page_hashes: set[str] = set()
-    recorder_periods: dict[RecorderIdentity, datetime] = {}
+    recorder_states: dict[
+        RecorderIdentity,
+        tuple[datetime, list[dict[str, str]]],
+    ] = {}
     row_hashes: list[str] = []
 
     while True:
@@ -196,9 +288,14 @@ def _scan_window(
                 raise HistoricalRegisterScanError(
                     "register row has incomplete Recorder identity"
                 )
-            previous = recorder_periods.get(identity)
-            if previous is None or period < previous:
-                recorder_periods[identity] = period
+            payload = _register_movement_payload(row)
+            if payload is None:
+                continue
+            previous = recorder_states.get(identity)
+            recorder_states[identity] = (
+                period if previous is None else min(previous[0], period),
+                [payload] if previous is None else [*previous[1], payload],
+            )
 
         rows_read += len(rows)
         if len(rows) < page_size:
@@ -212,10 +309,10 @@ def _scan_window(
             to_inclusive=to_inclusive,
             pages_read=pages_read,
             rows_read=rows_read,
-            recorder_count=len(recorder_periods),
+            recorder_count=len(recorder_states),
             content_hash=content_hash,
         ),
-        recorder_periods,
+        recorder_states,
     )
 
 
@@ -251,7 +348,10 @@ def scan_historical_register_range(
 
     cursor = resume
     windows: list[WindowCheckpoint] = []
-    recorder_periods: dict[RecorderIdentity, datetime] = {}
+    recorder_states: dict[
+        RecorderIdentity,
+        tuple[datetime, list[dict[str, str]]],
+    ] = {}
     while cursor < to_inclusive:
         window_end = min(cursor + window_size, to_inclusive)
         checkpoint, discovered = _scan_window(
@@ -262,18 +362,25 @@ def scan_historical_register_range(
             max_pages=max_pages_per_window,
         )
         windows.append(checkpoint)
-        for identity, period in discovered.items():
-            previous = recorder_periods.get(identity)
-            if previous is None or period < previous:
-                recorder_periods[identity] = period
+        for identity, (period, payloads) in discovered.items():
+            previous = recorder_states.get(identity)
+            recorder_states[identity] = (
+                period if previous is None else min(previous[0], period),
+                payloads if previous is None else [*previous[1], *payloads],
+            )
         cursor = window_end
 
     recorders = tuple(
-        DiscoveredRecorder(identity, period)
-        for identity, period in sorted(
-            recorder_periods.items(),
+        DiscoveredRecorder(
+            identity,
+            state[0],
+            len(state[1]),
+            balance_content_hash(state[1]),
+        )
+        for identity, state in sorted(
+            recorder_states.items(),
             key=lambda pair: (
-                pair[1],
+                pair[1][0],
                 pair[0].recorder_type,
                 pair[0].recorder_ref,
             ),

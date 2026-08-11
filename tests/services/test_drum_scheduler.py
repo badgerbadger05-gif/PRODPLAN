@@ -46,6 +46,32 @@ def test_drum_splits_fifo_and_exposes_horizon_gap() -> None:
     assert Decimal(result.metrics["total_gap_qty"]) == Decimal("3")
 
 
+def test_drum_does_not_persist_sub_quantum_decimal_capacity_residue() -> None:
+    """Repeated division must not turn exhausted capacity into a 0.000 slot."""
+    only_day = date(2026, 7, 27)
+    lines = tuple(
+        _line(index, qty, sort_key=f"{index:02d}")
+        for index, qty in enumerate(("1", "2", "3", "5", "7", "1"), start=1)
+    )
+
+    result = build_drum_plan(
+        lines,
+        {1: (AssemblyRateProfile(10, Decimal("2.250")),)},
+        {only_day: True},
+        schedule_from=only_day,
+        schedule_to=only_day,
+        resource_capacity_by_id={10: Decimal("8.000")},
+    )
+
+    assert all(slot.slot_qty >= Decimal("0.001") for slot in result.slots)
+    assert [(gap.queue_line_id, gap.gap_qty) for gap in result.gaps] == [
+        (6, Decimal("1.000"))
+    ]
+    assert Decimal(result.metrics["total_open_qty"]) == Decimal("19")
+    assert Decimal(result.metrics["total_slot_qty"]) == Decimal("18")
+    assert Decimal(result.metrics["total_gap_qty"]) == Decimal("1")
+
+
 def test_drum_is_deterministic_and_respects_non_workday() -> None:
     kwargs = dict(
         queue_lines=(_line(2, "4", sort_key="b"), _line(1, "4", sort_key="a")),
