@@ -374,6 +374,149 @@ def test_candidate_snapshot_contains_unmaterialized_make_proposal(db_session):
     assert db_session.query(models.ProductionOrder).count() == 0
 
 
+def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_session):
+    generation = _building_generation(db_session, "production-journal-paint-weld")
+    run, painted_work = _make_proposal(db_session, generation)
+    painted_item = db_session.get(models.Item, int(painted_work.item_id))
+    welded_item = models.Item(
+        item_code="SNAP-WELDED-PROPOSAL",
+        item_name="Сварная деталь",
+        item_article="SNAP-WELDED",
+        unit="шт",
+        replenishment_method="Производство",
+        status="active",
+    )
+    raw_item = models.Item(
+        item_code="SNAP-WELD-RAW",
+        item_name="Сырьё сварки",
+        item_article="SNAP-RAW",
+        unit="шт",
+        replenishment_method="Закупка",
+        status="active",
+    )
+    db_session.add_all([welded_item, raw_item])
+    db_session.flush()
+    db_session.add(
+        models.PaintWeldPair(
+            painted_item_id=int(painted_item.item_id),
+            welded_item_id=int(welded_item.item_id),
+            source="manual",
+            is_active=True,
+        )
+    )
+    db_session.add(
+        models.MrpFreezeComponent(
+            run_id=int(run.run_id),
+            freeze_version=1,
+            parent_item_id=int(welded_item.item_id),
+            component_item_id=int(raw_item.item_id),
+            spec_ref="frozen-weld-spec",
+            spec_version="v1",
+            norm_qty_per_unit=2,
+            unit_coef=1,
+        )
+    )
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="paint-weld-stock",
+        warehouse_code="PWS",
+        warehouse_name="Paint weld stock",
+        is_selected=True,
+    )
+    db_session.add(warehouse)
+    db_session.flush()
+    db_session.add(
+        models.StockBin(
+            ledger_generation_id=int(generation.id),
+            item_id=int(raw_item.item_id),
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c=warehouse.warehouse_ref1c,
+            on_hand=20,
+        )
+    )
+
+    welded_requirement = models.MrpRequirement(
+        run_id=int(run.run_id),
+        item_id=int(welded_item.item_id),
+        total_required_qty=10,
+        net_required_qty=10,
+        period_from=run.period_from,
+        period_to=run.period_to,
+        bom_level=1,
+        freeze_version=1,
+    )
+    db_session.add(welded_requirement)
+    db_session.flush()
+    welded_reservation = models.ReservationEntry(
+        ledger_generation_id=int(generation.id),
+        item_id=int(welded_item.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=int(run.run_id),
+        freeze_version=1,
+        requirement_id=int(welded_requirement.id),
+        priority_period_from=run.period_from,
+        priority_period_to=run.period_to,
+        realization_mode="make",
+        reserved_qty=10,
+        covered_from_stock_at_freeze_qty=0,
+        replenishment_required_qty=10,
+        replenishment_received_qty=0,
+        realized_qty=0,
+        lifecycle_status="active",
+    )
+    db_session.add(welded_reservation)
+    db_session.flush()
+    welded_work = models.ReplenishmentWorkItem(
+        ledger_generation_id=int(generation.id),
+        reservation_id=int(welded_reservation.id),
+        plan_id=int(painted_work.plan_id),
+        run_id=int(run.run_id),
+        requirement_id=int(welded_requirement.id),
+        item_id=int(welded_item.item_id),
+        replenishment_method="make",
+        replenishment_required_qty=10,
+        replenishment_fulfilled_qty=0,
+        replenishment_remaining_qty=10,
+    )
+    db_session.add(welded_work)
+    db_session.flush()
+
+    materials = material_availability.preview_make_work_item_materials(
+        db_session,
+        work_item_id=int(painted_work.id),
+        item_id=int(painted_work.item_id),
+        quantity=10,
+        spec_id=None,
+        ledger_generation_id=int(generation.id),
+        order_number=f"MRP-R-{int(painted_work.requirement_id)}",
+        run_id=int(run.run_id),
+    )
+    assert materials["coverage_basis"] == "welded_bom"
+    assert materials["coverage_basis_item_id"] == welded_item.item_id
+    assert [row["component_item_id"] for row in materials["components"]] == [raw_item.item_id]
+    assert materials["components"][0]["required_qty"] == 20
+
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    rows = {
+        row.row_key: row.payload
+        for row in db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).all()
+    }
+    painted_row = rows[f"work-item:{painted_work.id}"]
+    welded_row = rows[f"work-item:{welded_work.id}"]
+    assert painted_row["coverage_status"] == "ready"
+    assert painted_row["paint_weld_pair"]["role"] == "painted"
+    assert painted_row["paint_weld_pair"]["counterpart_item_id"] == welded_item.item_id
+    assert welded_row["paint_weld_pair"]["role"] == "welded"
+    assert welded_row["available_actions"] == []
+    assert "запуск выполняется из окрашенной строки" in welded_row["selection_disabled_reason"]
+
+
 def test_route_sheet_snapshot_builder_uses_candidate_generation_for_stock_bins(
     db_session,
     monkeypatch,

@@ -68,10 +68,20 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
             ? launchQtyByWorkItem[row.work_item_id] ?? row.launchable_qty ?? row.remaining_qty
             : row.remaining_qty
           const chain = row.paint_weld_chain
+          const pair = row.paint_weld_pair
+          const chainRole = pair?.role || chain?.role
+          const weldedRow = chainRole === 'welded'
+          const selectionDisabled = Boolean(row.selection_disabled_reason || pair?.selection_disabled_reason)
+          const counterpartName = pair?.counterpart_item_name || chain?.counterpart_item_name
+          const counterpartArticle = pair?.counterpart_item_article || pair?.counterpart_item_code
+            || chain?.counterpart_item_article || chain?.counterpart_item_code
+          const chainLabel = weldedRow
+            ? 'Цепочка сварка → окраска: сварная строка'
+            : 'Цепочка сварка → окраска: запуск из окрашенной строки'
           return (
           <tr
             key={row.journal_row_key || rowId}
-            className={rowId === (activeRow ? productionRowId(activeRow) : null) ? 'activeRow' : ''}
+            className={`${rowId === (activeRow ? productionRowId(activeRow) : null) ? 'activeRow ' : ''}${weldedRow ? 'weldedPaintWeldRow' : ''}`.trim()}
             tabIndex={0}
             aria-selected={rowId === (activeRow ? productionRowId(activeRow) : null)}
             onClick={() => onActivate(rowId)}
@@ -84,6 +94,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
                 if (!isProposal) onOpenMaterials(row)
               } else if (event.key === ' ') {
                 event.preventDefault()
+                if (selectionDisabled) return
                 const next = new Set(selectedIds)
                 if (next.has(rowId)) next.delete(rowId)
                 else next.add(rowId)
@@ -95,6 +106,8 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
               <input
                 type="checkbox"
                 aria-label={`Выбрать заказ ${orderMainLine(row)}`}
+                disabled={selectionDisabled}
+                title={selectionDisabled ? row.selection_disabled_reason || pair?.selection_disabled_reason || 'Сварная строка запускается через окрашенную деталь' : undefined}
                 checked={selectedIds.has(rowId)}
                 onChange={(e) => {
                   const next = new Set(selectedIds)
@@ -108,9 +121,10 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               <strong title={orderMainLine(row)}>{orderMainLine(row)}</strong>
               <span title={orderSubline(row)}>{orderSubline(row)}</span>
-              {chain?.counterpart_product_id && (
-                <span className="muted">
-                  Сварка: {chain.counterpart_order_prodplan_number || chain.counterpart_order_number || '—'}
+              {(pair || chain) && (
+                <span className="paintWeldChainLabel">
+                  {chainLabel}
+                  {selectionDisabled && ` · ${row.selection_disabled_reason || pair?.selection_disabled_reason || 'выбор через окрашенную деталь'}`}
                 </span>
               )}
             </td>
@@ -120,24 +134,17 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
             >
               <strong title={row.item_name}>
                 {row.item_name}
-                {row.paint_weld_chain && (
-                  <span
-                    className="muted"
-                    title={row.paint_weld_chain.role === 'painted'
-                      ? 'Цепочка окраска↔сварка: окрасочный (родительский) заказ'
-                      : 'Цепочка окраска↔сварка: сварочный заказ (на основании окрасочного)'}
-                  >
-                    {row.paint_weld_chain.role === 'painted' ? ' ⛓🎨' : ' ⛓⚙'}
-                  </span>
-                )}
               </strong>
               <span title={row.item_article || row.item_code || ''}>
                 {row.item_article || row.item_code || ''}
                 {row.source === 'mrp' && <span className="planningBadge mrp">MRP</span>}
               </span>
-              {chain?.counterpart_product_id && (
-                <span className="muted" title={chain.counterpart_item_name || ''}>
-                  Сварка: {chain.counterpart_item_name || '—'}
+              {(pair || chain) && (
+                <span className="paintWeldChainLabel" title={counterpartName || ''}>
+                  {weldedRow ? 'Окрашенная деталь' : 'Сварная деталь'}: {counterpartName || '—'}
+                  {counterpartArticle
+                    ? ` · ${counterpartArticle}`
+                    : ''}
                 </span>
               )}
             </td>

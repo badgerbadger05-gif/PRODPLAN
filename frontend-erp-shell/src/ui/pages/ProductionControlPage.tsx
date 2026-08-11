@@ -414,6 +414,17 @@ export function ProductionControlPage() {
         ]))
       }
       if (!ids.length) throw new Error('Не удалось создать исполнительные заказы из расчёта MRP')
+      const weldedNames = rows
+        .filter((row) => row.product_id != null
+          && ids.includes(row.product_id)
+          && row.paint_weld_pair?.role === 'painted')
+        .map((row) => row.paint_weld_pair?.counterpart_item_name)
+        .filter((name): name is string => Boolean(name))
+      if (weldedNames.length > 0 && !window.confirm(
+        `Будет открыта цепочка сварка → окраска. Сначала будет запущена сварная деталь: ${Array.from(new Set(weldedNames)).join(', ')}. Продолжить?`,
+      )) {
+        return
+      }
       const chains = await openPaintWeldChains(ids)
       ids = Array.from(new Set(chains.product_ids ?? ids))
       printWindow = prepareRouteSheetWindow()
@@ -697,7 +708,9 @@ export function ProductionControlPage() {
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
           onRefresh={() => void load(offset)}
-          onSelectAll={() => setSelectedIds(new Set(rows.map(productionRowId)))}
+          onSelectAll={() => setSelectedIds(new Set(rows
+            .filter((row) => !row.selection_disabled_reason)
+            .map(productionRowId)))}
           onClearSelection={() => setSelectedIds(new Set())}
           rootProductLabel={rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}
           onOpenRootProductFilter={() => setRootDialogOpen(true)}

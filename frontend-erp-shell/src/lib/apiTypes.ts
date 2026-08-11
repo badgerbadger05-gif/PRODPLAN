@@ -2667,7 +2667,7 @@ export interface paths {
         put?: never;
         /**
          * Chain Preview
-         * @description Предпросмотр цепочки «окраска - сварка» (dry-run, ничего не пишет).
+         * @description Предпросмотр цепочки «сварка → окраска» (dry-run, ничего не пишет).
          */
         post: operations["chain_preview_api_v1_paint_weld_chain_preview_post"];
         delete?: never;
@@ -2688,7 +2688,7 @@ export interface paths {
         /**
          * Chain Open
          * @description Открыть цепочку. dry_run=true (по умолчанию) — предпросмотр; dry_run=false —
-         *     реальное создание в 1С (окраска, затем сварка на основании).
+         *     реальное создание в 1С (сварка, затем окраска на основании сварочного заказа).
          */
         post: operations["chain_open_api_v1_paint_weld_chain_open_post"];
         delete?: never;
@@ -4535,6 +4535,26 @@ export interface components {
             /** Counterpart Workshop Name */
             counterpart_workshop_name?: string | null;
         };
+        /** PaintWeldPairResponse */
+        PaintWeldPairResponse: {
+            /** Pair Id */
+            pair_id: number;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "painted" | "welded";
+            /** Counterpart Item Id */
+            counterpart_item_id: number;
+            /** Counterpart Item Code */
+            counterpart_item_code: string;
+            /** Counterpart Item Name */
+            counterpart_item_name: string;
+            /** Counterpart Item Article */
+            counterpart_item_article: string;
+            /** Selection Disabled Reason */
+            selection_disabled_reason?: string | null;
+        };
         /** PendingSpecificationRebaseRequest */
         PendingSpecificationRebaseRequest: {
             /**
@@ -4826,6 +4846,18 @@ export interface components {
             coverage_status: string;
             /** Coverage Label */
             coverage_label: string;
+            /**
+             * Coverage Basis
+             * @default direct_bom
+             * @enum {string}
+             */
+            coverage_basis: "direct_bom" | "welded_bom";
+            /** Coverage Basis Item Id */
+            coverage_basis_item_id?: number | null;
+            /** Coverage Basis Item Name */
+            coverage_basis_item_name?: string | null;
+            /** Coverage Basis Item Article */
+            coverage_basis_item_article?: string | null;
         };
         /** ProductionOperationOptionResponse */
         ProductionOperationOptionResponse: {
@@ -4993,6 +5025,8 @@ export interface components {
              * @default []
              */
             available_actions: string[];
+            /** Selection Disabled Reason */
+            selection_disabled_reason?: string | null;
             /**
              * Launch Source
              * @default mrp_remaining
@@ -5011,6 +5045,7 @@ export interface components {
             /** Launchable Qty */
             launchable_qty?: number | null;
             paint_weld_chain?: components["schemas"]["PaintWeldChainResponse"] | null;
+            paint_weld_pair?: components["schemas"]["PaintWeldPairResponse"] | null;
         };
         /** ProductionResource */
         ProductionResource: {

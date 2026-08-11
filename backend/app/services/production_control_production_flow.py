@@ -29,6 +29,7 @@ from .one_c_manufacture_export import commanded_qty_by_product
 from .one_c_piecework_export import PIECEWORK_ENTITY
 from .production_output_truth import accepted_product_output
 from .production_material_custody_events import append_material_issue_custody_event
+from .paint_weld_pairs import is_welded_blocked
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,31 @@ def _refresh_product_spec_from_1c(db: Session, product: ProductionProduct) -> bo
     reservation guard and 1C manufacture payload are built.
     """
     spec_id = _default_spec_id(db, product)
+    pinned_revision = str(product.spec_revision_hash or "").strip()
+    if pinned_revision:
+        if not spec_id:
+            raise ValueError(
+                "У строки закреплена ревизия спецификации, но сама "
+                "спецификация не найдена; выпуск заблокирован"
+            )
+        pinned_spec = (
+            db.query(Specification)
+            .filter(Specification.spec_id == int(spec_id))
+            .with_for_update()
+            .one_or_none()
+        )
+        current_revision = str(
+            getattr(pinned_spec, "content_hash", None) or ""
+        ).strip()
+        if current_revision != pinned_revision:
+            raise ValueError(
+                "Закреплённая спецификация изменилась после расчёта; "
+                "автоматическая подмена BOM запрещена, выпуск заблокирован"
+            )
+        # A pinned MRP line is historical truth. Refreshing it from current 1C
+        # would mutate the very Specification/SpecComponent rows used by the
+        # material issue and silently change the chain after launch.
+        return False
     if not spec_id:
         return False
     spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).first()
@@ -102,6 +128,19 @@ def _ensure_workshop_reservation_covers(
         .filter(SpecComponent.spec_id == int(spec_id))
         .all()
     )
+    pinned_revision = str(product.spec_revision_hash or "").strip()
+    if pinned_revision:
+        revision_after_components = str(
+            db.query(Specification.content_hash)
+            .filter(Specification.spec_id == int(spec_id))
+            .scalar()
+            or ""
+        ).strip()
+        if revision_after_components != pinned_revision:
+            raise ValueError(
+                "Закреплённая спецификация изменилась во время подготовки "
+                "выпуска; выпуск заблокирован"
+            )
     if not spec_rows:
         return
     per_unit = {int(row.item_id): _to_float(row.quantity) for row in spec_rows}
@@ -195,6 +234,7 @@ def produce_line(
     executor: Optional[str] = None,
     operation_executors: Optional[List[Dict[str, Any]]] = None,
     comment: Optional[str] = None,
+    allow_paint_weld_chain: bool = False,
 ) -> Dict[str, Any]:
     """
     Record an operator command to create production documents in 1C.
@@ -218,6 +258,16 @@ def produce_line(
     )
     if product is None:
         raise ValueError(f"product_id={product_id}: строка заказа не найдена")
+
+    if (
+        not allow_paint_weld_chain
+        and is_welded_blocked(db, [int(product.item_id)])
+    ):
+        raise ValueError(
+            "Сварная деталь входит в цепочку «сварка → окраска» и не "
+            "может быть выпущена отдельно. Запустите и закройте цепочку "
+            "через окрашенную строку."
+        )
 
     order_quantity = _to_float(product.quantity)
     commanded_before = commanded_qty_by_product(db, [int(product.product_id)]).get(

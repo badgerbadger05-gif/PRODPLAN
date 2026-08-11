@@ -2,19 +2,43 @@ import type { components } from '../lib/apiTypes'
 
 type ApiSchemas = components['schemas']
 
-export type OrderRow = ApiSchemas['ProductionOrderJournalRowResponse'] & {
+export type OrderRow = Omit<ApiSchemas['ProductionOrderJournalRowResponse'], 'paint_weld_chain' | 'paint_weld_pair' | 'selection_disabled_reason'> & {
   materialized_order_qty?: number | null
   launchable_qty?: number | null
+  paint_weld_chain?: PaintWeldChainInfo | null
+  paint_weld_pair?: PaintWeldPairInfo | null
+  selection_disabled_reason?: string | null
 }
 export type OrdersResponse = ApiSchemas['ProductionOrderJournalResponse']
 export type TruthMeta = OrdersResponse['truth_meta']
 
 // Цепочка «окраска↔сварка»: строка входит в связанную пару заказов.
 export type PaintWeldChainInfo = {
-  role: 'painted' | 'welded'
+  // API types are regenerated separately and currently expose this as string.
+  // Keep the known roles explicit while accepting an unknown backend value.
+  role: 'painted' | 'welded' | (string & {})
   link_id: number
   counterpart_order_id?: number | null
   counterpart_product_id?: number | null
+  counterpart_order_number?: string | null
+  counterpart_order_prodplan_number?: string | null
+  counterpart_item_name?: string | null
+  counterpart_item_article?: string | null
+  counterpart_item_code?: string | null
+  counterpart_quantity?: number | null
+  counterpart_remaining_qty?: number | null
+  counterpart_unit?: string | null
+  counterpart_workshop_name?: string | null
+}
+
+export type PaintWeldPairInfo = {
+  pair_id: number
+  role: 'painted' | 'welded'
+  counterpart_item_id: number
+  counterpart_item_name: string
+  counterpart_item_article: string
+  counterpart_item_code: string
+  selection_disabled_reason?: string | null
 }
 
 export type MaterialRow = {
@@ -56,6 +80,9 @@ export type EmployeesResponse = ApiSchemas['ProductionEmployeeListResponse']
 
 export type MaterialsResponse = Omit<ApiSchemas['ProductionMaterialsResponse'], 'components'> & {
   components: MaterialRow[]
+  coverage_basis_item_name?: string | null
+  coverage_basis_item_article?: string | null
+  coverage_basis_item_code?: string | null
 }
 
 export type ControlWarehouse = {

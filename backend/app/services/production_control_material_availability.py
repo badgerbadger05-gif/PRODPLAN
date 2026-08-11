@@ -5,10 +5,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..models import (
+    DefaultSpecification,
     Item,
     LedgerFutureSupply,
+    MrpFreezeComponent,
+    PaintWeldChainLink,
+    PaintWeldPair,
+    PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -59,8 +65,13 @@ class MaterialCoverageSnapshotUnavailable(RuntimeError):
         super().__init__(self.detail["reason"])
 
 
-def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-    spec_id = _default_spec_id(db, product)
+def _components_for_product(
+    db: Session,
+    product: ProductionProduct,
+    *,
+    spec_id_override: int | None = None,
+) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    spec_id = int(spec_id_override) if spec_id_override is not None else _default_spec_id(db, product)
     if not spec_id:
         return None, []
     rows = (
@@ -89,6 +100,110 @@ def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Op
             }
         )
     return spec_id, components
+
+
+def _frozen_components_for_product(
+    db: Session,
+    product: ProductionProduct,
+    *,
+    parent_item_id: int,
+) -> List[Dict[str, Any]] | None:
+    order = getattr(product, "order", None)
+    run_id = getattr(order, "source_run_id", None)
+    if str(getattr(order, "source", "") or "").lower() != "mrp" or run_id is None:
+        return None
+    run = db.get(PlanningRun, int(run_id))
+    if run is None or run.active_freeze_version is None:
+        return []
+    rows = (
+        db.query(MrpFreezeComponent, Item)
+        .join(Item, Item.item_id == MrpFreezeComponent.component_item_id)
+        .filter(
+            MrpFreezeComponent.run_id == int(run.run_id),
+            MrpFreezeComponent.freeze_version == int(run.active_freeze_version),
+            MrpFreezeComponent.parent_item_id == int(parent_item_id),
+        )
+        .order_by(Item.item_name.asc(), MrpFreezeComponent.id.asc())
+        .all()
+    )
+    remaining_qty = _to_float_strict(
+        accepted_product_output(product).remaining_qty,
+        field="production_output.remaining_qty",
+    )
+    components: List[Dict[str, Any]] = []
+    for frozen, item in rows:
+        qty_per_unit = _to_float_strict(
+            frozen.norm_qty_per_unit,
+            field="mrp_freeze_component.norm_qty_per_unit",
+        ) * _to_float_strict(
+            frozen.unit_coef,
+            field="mrp_freeze_component.unit_coef",
+        )
+        required_qty = qty_per_unit * remaining_qty
+        if required_qty <= 0:
+            continue
+        components.append(
+            {
+                "component_item_id": int(item.item_id),
+                "item_code": str(item.item_code or ""),
+                "item_name": str(item.item_name or ""),
+                "item_article": str(item.item_article or ""),
+                "unit": _unit_display(db, item.unit),
+                "qty_per_unit": qty_per_unit,
+                "required_qty": required_qty,
+                "source_spec_id": None,
+                "source_spec_ref": str(frozen.spec_ref or ""),
+                "source_spec_version": str(frozen.spec_version or "") or None,
+            }
+        )
+    return components
+
+
+def _paint_weld_material_basis(
+    db: Session,
+    product: ProductionProduct,
+) -> tuple[int | None, Item | None, int]:
+    """Resolve the BOM and custody owner used to cover one journal row.
+
+    The painted row is the operator-facing entry point of a weld -> paint
+    chain.  Its launch readiness is therefore owned by the welded item's BOM,
+    not by stock of the welded intermediate.  If the welded executor already
+    exists, its own custody reservations must count as this chain's coverage.
+    """
+    pair = (
+        db.query(PaintWeldPair)
+        .filter(
+            PaintWeldPair.painted_item_id == int(product.item_id),
+            PaintWeldPair.is_active.is_(True),
+        )
+        .one_or_none()
+    )
+    if pair is None:
+        return None, None, int(product.product_id)
+
+    welded_item = db.get(Item, int(pair.welded_item_id))
+    welded_spec_id = None
+    if welded_item is not None:
+        preview = ProductionProduct(item_id=int(welded_item.item_id))
+        welded_spec_id = _default_spec_id(db, preview)
+
+    custody_product_id = int(product.product_id)
+    if product.order_id is not None:
+        link = (
+            db.query(PaintWeldChainLink)
+            .filter(PaintWeldChainLink.painted_order_id == int(product.order_id))
+            .one_or_none()
+        )
+        if link is not None:
+            welded_product_id = (
+                db.query(ProductionProduct.product_id)
+                .filter(ProductionProduct.order_id == int(link.welded_order_id))
+                .order_by(ProductionProduct.line_number.asc(), ProductionProduct.product_id.asc())
+                .scalar()
+            )
+            if welded_product_id is not None:
+                custody_product_id = int(welded_product_id)
+    return welded_spec_id, welded_item, custody_product_id
 
 
 def _future_supply_eta_by_item(
@@ -285,7 +400,23 @@ def preview_materials(
     )
     if not product:
         raise ValueError("Строка заказа не найдена")
-    spec_id, components = _components_for_product(db, product)
+    basis_spec_id, basis_item, custody_product_id = _paint_weld_material_basis(db, product)
+    frozen_components = (
+        _frozen_components_for_product(
+            db,
+            product,
+            parent_item_id=int(basis_item.item_id),
+        )
+        if basis_item is not None
+        else None
+    )
+    spec_id, components = _components_for_product(
+        db,
+        product,
+        spec_id_override=basis_spec_id,
+    )
+    if frozen_components is not None:
+        components = frozen_components
 
     comp_ids = [int(c["component_item_id"]) for c in components]
     from .item_ledger import item_ledger_position
@@ -311,13 +442,13 @@ def preview_materials(
     # already holds (in transit or delivered to its workshop) count as its own
     # coverage instead of re-entering the pool.
     reservations = reservation_state.total_by_item(
-        exclude_product_id=int(product.product_id)
+        exclude_product_id=custody_product_id
     )
-    own_reservation = reservation_state.for_product(int(product.product_id))
+    own_reservation = reservation_state.for_product(custody_product_id)
     reserved_orders_by_item = _reservation_orders_by_item(
         db,
         reservation_state,
-        exclude_product_id=int(product.product_id),
+        exclude_product_id=custody_product_id,
     )
     future_supply_eta = _future_supply_eta_by_item(
         db,
@@ -397,6 +528,10 @@ def preview_materials(
         "coverage": order_coverage,
         "coverage_status": order_coverage,
         "coverage_label": _ui_coverage_label(order_coverage),
+        "coverage_basis": "welded_bom" if basis_item is not None else "direct_bom",
+        "coverage_basis_item_id": int(basis_item.item_id) if basis_item is not None else int(product.item_id),
+        "coverage_basis_item_name": str(basis_item.item_name or "") if basis_item is not None else str(product.item.item_name or ""),
+        "coverage_basis_item_article": str(basis_item.item_article or "") if basis_item is not None else str(product.item.item_article or ""),
     }
     return payload
 
@@ -410,6 +545,7 @@ def preview_make_work_item_materials(
     spec_id: int | None,
     ledger_generation_id: int,
     order_number: str,
+    run_id: int | None = None,
 ) -> Dict[str, Any]:
     """Preview one saved MAKE obligation without creating an executor order."""
     item = db.get(Item, int(item_id))
@@ -420,8 +556,12 @@ def preview_make_work_item_materials(
         quantity=float(quantity), produced_qty=0, remaining_qty=float(quantity),
         spec_id=int(spec_id) if spec_id is not None else None,
     )
-    preview_product.item = item
-    preview_product.order = ProductionOrder(order_number=str(order_number or ""))
+    set_committed_value(preview_product, "item", item)
+    set_committed_value(preview_product, "order", ProductionOrder(
+        order_number=str(order_number or ""),
+        source="mrp" if run_id is not None else "1c",
+        source_run_id=int(run_id) if run_id is not None else None,
+    ))
     payload = preview_materials(
         db, -int(work_item_id), ledger_generation_id=int(ledger_generation_id),
         _product_override=preview_product,
@@ -452,7 +592,69 @@ def preview_make_work_items_coverage(
     if not proposals:
         return {}
 
-    spec_ids = sorted({int(row["spec_id"]) for row in proposals})
+    painted_item_ids = sorted({int(row["item_id"]) for row in proposals})
+    welded_by_painted = {
+        int(painted_id): int(welded_id)
+        for painted_id, welded_id in (
+            db.query(PaintWeldPair.painted_item_id, PaintWeldPair.welded_item_id)
+            .filter(
+                PaintWeldPair.is_active.is_(True),
+                PaintWeldPair.painted_item_id.in_(painted_item_ids),
+            )
+            .all()
+        )
+    }
+    welded_spec_by_item = {
+        int(item_id): int(spec_id)
+        for item_id, spec_id in (
+            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+            .filter(DefaultSpecification.item_id.in_(sorted(set(welded_by_painted.values())) or [-1]))
+            .order_by(DefaultSpecification.id.asc())
+            .all()
+        )
+    }
+
+    proposal_run_ids = sorted({int(row["source_run_id"]) for row in proposals if row.get("source_run_id") is not None})
+    freeze_by_run = {
+        int(run_id): int(freeze_version)
+        for run_id, freeze_version in (
+            db.query(PlanningRun.run_id, PlanningRun.active_freeze_version)
+            .filter(PlanningRun.run_id.in_(proposal_run_ids))
+            .filter(PlanningRun.active_freeze_version.isnot(None))
+            .all()
+        )
+    }
+    welded_parent_ids = sorted(set(welded_by_painted.values()))
+    frozen_norms: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
+    if proposal_run_ids and welded_parent_ids:
+        for frozen in (
+            db.query(MrpFreezeComponent)
+            .filter(
+                MrpFreezeComponent.run_id.in_(proposal_run_ids),
+                MrpFreezeComponent.parent_item_id.in_(welded_parent_ids),
+            )
+            .order_by(MrpFreezeComponent.id.asc())
+            .all()
+        ):
+            if freeze_by_run.get(int(frozen.run_id)) != int(frozen.freeze_version):
+                continue
+            frozen_norms.setdefault(
+                (int(frozen.run_id), int(frozen.parent_item_id)), []
+            ).append(
+                (
+                    int(frozen.component_item_id),
+                    _to_float_strict(frozen.norm_qty_per_unit, field="mrp_freeze_component.norm_qty_per_unit")
+                    * _to_float_strict(frozen.unit_coef, field="mrp_freeze_component.unit_coef"),
+                )
+            )
+
+    def _proposal_spec_id(row: Mapping[str, Any]) -> int:
+        welded_item_id = welded_by_painted.get(int(row["item_id"]))
+        if welded_item_id is not None and welded_item_id in welded_spec_by_item:
+            return int(welded_spec_by_item[welded_item_id])
+        return int(row["spec_id"])
+
+    spec_ids = sorted({_proposal_spec_id(row) for row in proposals})
     component_rows = (
         db.query(
             SpecComponent.spec_id,
@@ -464,7 +666,11 @@ def preview_make_work_items_coverage(
         .all()
     )
     components_by_spec: Dict[int, List[Tuple[int, float]]] = {}
-    component_ids: set[int] = set()
+    component_ids: set[int] = {
+        component_id
+        for norms in frozen_norms.values()
+        for component_id, _qty in norms
+    }
     for spec_id, item_id, quantity in component_rows:
         component_id = int(item_id)
         components_by_spec.setdefault(int(spec_id), []).append(
@@ -491,7 +697,14 @@ def preview_make_work_items_coverage(
     for row in proposals:
         labels: List[str] = []
         quantity = _to_float_strict(row.get("quantity"), field="proposal.quantity")
-        for component_id, qty_per_unit in components_by_spec.get(int(row["spec_id"]), []):
+        welded_item_id = welded_by_painted.get(int(row["item_id"]))
+        run_id = int(row["source_run_id"]) if row.get("source_run_id") is not None else None
+        component_norms = (
+            frozen_norms.get((run_id, welded_item_id), [])
+            if run_id is not None and welded_item_id is not None
+            else components_by_spec.get(_proposal_spec_id(row), [])
+        )
+        for component_id, qty_per_unit in component_norms:
             required = qty_per_unit * quantity
             on_hand = _to_float_strict(
                 positions.get(component_id, {}).get("on_hand", 0.0),

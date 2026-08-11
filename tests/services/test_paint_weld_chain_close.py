@@ -572,9 +572,9 @@ def test_journal_rows_carry_chain_info(db_session):
     by_pid = {row["product_id"]: row for row in rows}
     paint_row = by_pid[int(ctx["paint"]["product"].product_id)]
     weld_product_id = int(ctx["weld"]["product"].product_id)
-    assert weld_product_id not in by_pid
+    assert weld_product_id in by_pid
     assert journal["total"] == len(rows)
-    weld_row = list_journal(db_session, product_id=weld_product_id)["rows"][0]
+    weld_row = by_pid[weld_product_id]
 
     assert weld_row["paint_weld_chain"]["role"] == "welded"
     assert weld_row["paint_weld_chain"]["counterpart_product_id"] == paint_row["product_id"]

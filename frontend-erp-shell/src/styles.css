@@ -712,6 +712,25 @@ input:focus, select:focus {
   width: auto;
 }
 
+.journalTable tr.weldedPaintWeldRow td {
+  background: #eef0f3;
+  color: #7b8490;
+}
+
+.journalTable tr.weldedPaintWeldRow:hover td,
+.journalTable tr.weldedPaintWeldRow.activeRow td {
+  background: #e4e7eb;
+}
+
+.paintWeldChainLabel {
+  display: block;
+  color: #66717f;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .transferTable .itemCell {
   width: auto;
 }

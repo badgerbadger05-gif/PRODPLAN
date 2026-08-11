@@ -12,6 +12,7 @@ from app.models import (
     Employee,
     Item,
     Operation,
+    PaintWeldPair,
     ProductionManufacture,
     ProductionManufactureOperation,
     ProductionMaterialIssue,
@@ -440,6 +441,59 @@ def test_produce_zero_or_negative_raises(db_session):
 def test_produce_unknown_product_raises(db_session):
     with pytest.raises(ValueError, match="не найдена"):
         produce_line(db_session, 999_999, qty=1)
+
+
+def test_produce_rejects_direct_welded_chain_execution(db_session):
+    db = db_session
+    painted = _mk_item(db, code="CHAIN-PAINT", ref1c="ref-chain-paint")
+    welded = _mk_item(db, code="CHAIN-WELD", ref1c="ref-chain-weld")
+    welded.replenishment_method = "Производство"
+    product = _mk_product(db, welded, qty=4.0)
+    db.add(
+        PaintWeldPair(
+            painted_item_id=painted.item_id,
+            welded_item_id=welded.item_id,
+            source="manual",
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    with pytest.raises(ValueError, match="не может быть выпущена отдельно"):
+        produce_line(db, product.product_id, qty=1)
+
+    assert (
+        db.query(ProductionManufacture)
+        .filter_by(product_id=product.product_id)
+        .count()
+        == 0
+    )
+
+
+def test_produce_fails_closed_when_pinned_spec_revision_changed(db_session):
+    db = db_session
+    item = _mk_item(db, code="PINNED-SPEC", ref1c="ref-pinned-spec")
+    product = _mk_product(db, item, qty=4.0)
+    spec = Specification(
+        spec_name="Pinned spec",
+        spec_ref1c="ref-spec-pinned",
+        content_hash="current-revision",
+    )
+    db.add(spec)
+    db.flush()
+    product.spec_id = int(spec.spec_id)
+    product.spec_revision_hash = "frozen-revision"
+    db.commit()
+
+    with pytest.raises(ValueError, match="автоматическая подмена BOM запрещена"):
+        produce_line(db, product.product_id, qty=1)
+
+    assert (
+        db.query(ProductionManufacture)
+        .filter_by(product_id=product.product_id)
+        .count()
+        == 0
+    )
 
 
 def test_produce_requires_posted_material_issue(db_session):
