@@ -23,6 +23,10 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.bom_specification_resolver import BomSpecificationResolver
 from app.services.production_control_printing import build_route_sheet_snapshot_payloads
+from app.services.production_control_live_launch import (
+    overlay_launch_facts,
+    route_sheets_after_cutoff,
+)
 from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
@@ -234,6 +238,17 @@ def _root_product_options(
         )
     )
     return options
+
+
+def _generation_cutoff(db: Session, generation_id: int | None):
+    """Cutoff поколения, которому принадлежит снимок.
+
+    Граница между «уже в снимке» и «появилось позже» — только этот cutoff.
+    """
+    if generation_id is None:
+        return None
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    return generation.cutoff if generation is not None else None
 
 
 def _unavailable(
@@ -814,6 +829,19 @@ def read_route_sheet_snapshot_rows(
                     break
         missing_ids = sorted(missing_set)
     if missing_ids:
+        # Изделие, созданное после cutoff принятого поколения, в снимок попасть
+        # не могло.  Маршрутный лист — документ по физическому заказу, а не
+        # плановая гипотеза, поэтому он печатается сразу после запуска.
+        live_payloads = route_sheets_after_cutoff(
+            db,
+            missing_ids,
+            cutoff=_generation_cutoff(db, snapshot.ledger_generation_id),
+            ledger_generation_id=int(snapshot.ledger_generation_id),
+        )
+        for product_id, payload in live_payloads.items():
+            route_snapshot_by_product_id[int(product_id)] = dict(payload)
+        missing_ids = sorted(set(missing_ids) - set(live_payloads))
+    if missing_ids:
         raise _route_sheet_unavailable(
             db,
             "accepted production-control route-sheets snapshot does not contain "
@@ -967,6 +995,13 @@ def read_snapshot(
         # dedicated /materials reader.  They are not part of the public journal
         # row contract and must never leak through its strict response model.
         public_rows.append(row)
+    # Заказ, открытый после cutoff этого поколения, в снимок попасть не мог.
+    # Накладываем исполнительный факт на строку-предложение, иначе оператор
+    # видит «Не создан» по уже существующему документу 1С.  Плановые величины
+    # строки при этом остаются снимочными.
+    overlay_launch_facts(
+        db, public_rows, cutoff=_generation_cutoff(db, snapshot.ledger_generation_id)
+    )
     return {
         "rows": public_rows,
         "total": total,
