@@ -191,12 +191,6 @@ def rebase_fixed_plan_remaining_roots(
         _read_period_plan_execution_payload_for_run,
     )
 
-    execution_payload = _read_period_plan_execution_payload_for_run(
-        db,
-        plan=predecessor_plan,
-        run=predecessor,
-        generation_id=parent_generation_id,
-    )
     closed_snapshot = _latest_closed_plan_snapshot(
         db,
         plan_id=int(predecessor_plan.id),
@@ -209,12 +203,33 @@ def rebase_fixed_plan_remaining_roots(
                 run_id=int(predecessor.run_id),
                 ledger_generation_id=parent_generation_id,
                 cutoff=generation.cutoff,
-                payload=execution_payload,
+                payload=_read_period_plan_execution_payload_for_run(
+                    db,
+                    plan=predecessor_plan,
+                    run=predecessor,
+                    generation_id=parent_generation_id,
+                ),
                 closed_at=datetime.now(timezone.utc),
             )
         )
-    elif dict(closed_snapshot.payload or {}) != execution_payload:
-        raise ValueError("closed plan snapshot payload conflicts with current execution")
+    else:
+        # A ClosedPlanSnapshot is the immutable record of this run's execution
+        # at the generation where it was closed.  Verify it the same way
+        # ``close_fixed_plan`` does: re-derive the execution payload AT THE
+        # SNAPSHOT'S OWN GENERATION, not the current accepted truth.  Reading it
+        # at ``parent_generation_id`` bakes the ever-advancing generation/cutoff
+        # metadata into the comparison, so once truth moves past the close the
+        # equality can never hold and every re-rebase of the same run wrongly
+        # fails with a phantom "payload conflicts" error (which otherwise
+        # deadlocks the automatic rebase queue on the earliest such run).
+        existing_payload = _read_period_plan_execution_payload_for_run(
+            db,
+            plan=predecessor_plan,
+            run=predecessor,
+            generation_id=int(closed_snapshot.ledger_generation_id),
+        )
+        if dict(closed_snapshot.payload or {}) != existing_payload:
+            raise ValueError("closed plan snapshot payload conflicts with current execution")
 
     old_remaining_by_item: dict[int, Decimal] = defaultdict(lambda: ZERO)
     old_reservations = db.query(models.ReservationEntry).filter(
