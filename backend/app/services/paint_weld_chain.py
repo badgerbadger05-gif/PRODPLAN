@@ -932,6 +932,41 @@ def _active_pair(db: Session, painted_item_id: int) -> PaintWeldPair:
     return pair
 
 
+def chain_supplied_component_item_ids(
+    db: Session, product: ProductionProduct
+) -> set[int]:
+    """Компоненты окрасочной строки, которые производит сама цепочка.
+
+    Сварная деталь приходит на окраску не перемещением, а производством: при
+    закрытии сварочного заказа получателем указывается следующий участок. Пока
+    сварка не закрыта, детали не существует ни на одном складе, поэтому попытка
+    завести на неё перемещение не находит источник, требует ручного выбора
+    склада и обрывает весь запуск — до экспорта в 1С и до печати маршрутного
+    листа.
+
+    Возвращает item_id таких компонентов для строки окраски, у которой есть
+    живая связь цепочки. Для непарных строк и для сварной стороны — пустое
+    множество: там перемещения комплектующих обычные.
+    """
+    order_id = getattr(product, "order_id", None)
+    if order_id is None:
+        return set()
+    link = (
+        db.query(PaintWeldChainLink)
+        .filter(PaintWeldChainLink.painted_order_id == int(order_id))
+        .one_or_none()
+    )
+    if link is None:
+        return set()
+    welded_item_ids = {
+        int(item_id)
+        for (item_id,) in db.query(ProductionProduct.item_id).filter(
+            ProductionProduct.order_id == int(link.welded_order_id)
+        )
+    }
+    return welded_item_ids
+
+
 # ---------------------------------------------------------------------------
 # Этап 4: одновременное закрытие обоих заказов цепочки из одного окна журнала.
 # Выпуски обеих строк → СборкаЗапасов обоих заказов → ОДИН комбинированный

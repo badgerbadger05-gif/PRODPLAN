@@ -28,6 +28,7 @@ from .production_control_common import (
     to_float as _to_float,
 )
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
+from .paint_weld_chain import chain_supplied_component_item_ids
 from .production_control_material_availability import _components_for_product
 from .one_c_export_common import (
     clean_ref1c as _clean_ref1c,
@@ -952,11 +953,26 @@ def create_material_issues(
             continue
 
         spec_id, components = _components_for_product(db, product)
+        # Сварную деталь на окраску не возят: её приносит производство при
+        # закрытии сварочного заказа, получателем указан следующий участок.
+        # Без этого запуск цепочки упирался в требование выбрать склад-источник
+        # для детали, которой ещё не существует, и обрывался до экспорта в 1С.
+        chain_supplied = chain_supplied_component_item_ids(db, product)
+        if chain_supplied:
+            components = [
+                comp
+                for comp in components
+                if int(comp["component_item_id"]) not in chain_supplied
+            ]
         if not components:
             if not spec_id:
                 errors.append(
                     format_diagnosis_error(f"product_id={pid}", diagnose_product(db, product))
                 )
+            elif chain_supplied:
+                # Вся потребность строки закрывается самой цепочкой — это не
+                # ошибка спецификации, перемещать просто нечего.
+                continue
             else:
                 errors.append(f"product_id={pid}: в спецификации нет материалов")
             continue
