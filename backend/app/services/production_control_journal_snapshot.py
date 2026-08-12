@@ -652,7 +652,18 @@ def validate_candidate_snapshot(
                 or work_item_id in work_item_ids
                 or payload_row.get("product_id") is not None
                 or payload_row.get("order_id") is not None
-                or payload_row.get("available_actions") != ["materialize"]
+                or payload_row.get("available_actions") != (
+                    # A MAKE proposal is materializable unless it is a welded
+                    # part of a weld→paint chain, which ``list_make_proposals``
+                    # marks with a ``selection_disabled_reason`` and an empty
+                    # action set (launch happens from the painted row).  The
+                    # promoter must accept that shape; requiring ``["materialize"]``
+                    # unconditionally rejected every chained welded proposal and
+                    # blocked the whole journal candidate promotion.
+                    []
+                    if payload_row.get("selection_disabled_reason")
+                    else ["materialize"]
+                )
                 or row.row_key != f"work-item:{work_item_id}"
                 or payload_row.get("journal_row_key") != row.row_key
                 or int(row.item_id or -1) != item_id
