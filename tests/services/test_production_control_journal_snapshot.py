@@ -516,6 +516,21 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
     assert welded_row["available_actions"] == []
     assert "запуск выполняется из окрашенной строки" in welded_row["selection_disabled_reason"]
 
+    # Promotion must accept the disabled welded proposal shape.  The promoter
+    # previously required available_actions == ["materialize"] for every
+    # proposal and rejected the welded row (available_actions == []) as a
+    # "malformed proposal row", which blocked promotion of the whole
+    # production-control journal candidate — and therefore every generation
+    # acceptance that contained a weld→paint chain.
+    _accept(db_session, generation, snapshot)
+    promoted_welded = (
+        db_session.query(models.PlanningReadRow)
+        .filter_by(snapshot_id=snapshot.id, row_key=f"work-item:{welded_work.id}")
+        .one()
+    )
+    assert promoted_welded.payload["available_actions"] == []
+    assert snapshot.truth_status == "accepted"
+
 
 def test_route_sheet_snapshot_builder_uses_candidate_generation_for_stock_bins(
     db_session,
