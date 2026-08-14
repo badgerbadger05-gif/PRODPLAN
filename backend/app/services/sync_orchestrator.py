@@ -616,6 +616,21 @@ def _run_physical_refresh_job(
             "published": True,
             "result": {"accepted": True, "candidate_runs": 0, "recovered": True},
         }
+
+    # Nomenclature syncs on a daily cadence, but this recalc runs hourly. A 1C
+    # item created since the last daily sync would otherwise make the movement
+    # import and the balance snapshot below abort on an unresolvable item ref.
+    # Refresh the fast nomenclature package (units → categories → items) first
+    # so newly-created items are always current before the recalc. Best-effort:
+    # a transient sync failure must not block the refresh, which fails loudly on
+    # a genuinely unknown item anyway.
+    try:
+        _run_nomenclature(db, load_odata_config())
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.warning("pre-refresh nomenclature sync failed: %s", exc)
+
     client = _build_client()
 
     def _balance_snapshot_at(cutoff: datetime):
