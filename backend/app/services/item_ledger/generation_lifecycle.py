@@ -796,6 +796,7 @@ def _supplier_provenance_checkpoint(
     generation: models.LedgerGeneration,
     *,
     require_full_coverage: bool,
+    rejected_sle_ids: frozenset[int] = frozenset(),
 ) -> tuple[
     list[models.StockLedgerSupplierReceiptProvenance],
     dict[int, models.StockLedgerEntry],
@@ -824,20 +825,11 @@ def _supplier_provenance_checkpoint(
         raise GenerationValidationError(
             "supplier receipt provenance must reference supplier candidates"
         )
-    # Supplier receipts whose 1C document was edited behind the cutoff are
-    # rejected at accept time (recorded here) and legitimately have no
-    # provenance; exclude them from the full-coverage requirement rather than
-    # failing the whole generation. The accept gate bounds how many may be
-    # rejected before it fails closed.
-    rejected_sle_ids = {
-        int(value)
-        for value in (
-            dict(generation.source_watermarks or {})
-            .get("supplier_evidence_rejected", {})
-            .get("rejected_sle_ids", [])
-        )
-    }
-    required_ids = supplier_physical_ids - rejected_sle_ids
+    # Receipts whose 1C document was edited behind the cutoff are rejected at
+    # accept time and legitimately have no provenance; exclude them from the
+    # full-coverage requirement (the accept gate bounds how many may be rejected
+    # before it fails closed) rather than freezing truth on one edited document.
+    required_ids = supplier_physical_ids - set(rejected_sle_ids)
     if require_full_coverage and provenance_ids != required_ids:
         raise GenerationValidationError(
             "supplier receipt evidence must cover all supplier candidate rows"
@@ -962,6 +954,7 @@ def validate_generation_build(
     generation_id: int,
     *,
     explicit_empty_physical: bool = False,
+    rejected_supplier_sle_ids: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
     """Dry, read-only validation.  Raises before truth publication on any gap."""
     generation = _building_generation(db, generation_id)
@@ -1063,7 +1056,10 @@ def validate_generation_build(
         excluded_ids,
         supplier_status_counts,
     ) = _supplier_provenance_checkpoint(
-        db, generation, require_full_coverage=True
+        db,
+        generation,
+        require_full_coverage=True,
+        rejected_sle_ids=rejected_supplier_sle_ids,
     )
     supplier_relevant_ids = {
         int(row.stock_ledger_entry_id)
@@ -1411,6 +1407,7 @@ def accept_generation_build(
                 f"reservation consumption allocation build failed: {exc}"
             ) from exc
         supplier_candidates = _supplier_candidates(db, int(generation.id))
+        rejected_supplier_sle_ids: set[int] = set()
         if supplier_candidates and odata_client is None:
             raise GenerationValidationError(
                 "supplier document evidence requires an OData client"
@@ -1431,7 +1428,7 @@ def accept_generation_build(
                 (str(row.recorder_type or ""), str(row.recorder_ref or ""))
                 for row in supplier_candidates
             }
-            rejected_sle_ids = {
+            rejected_supplier_sle_ids = {
                 int(row.id)
                 for row in supplier_candidates
                 if row.id is not None
@@ -1468,7 +1465,7 @@ def accept_generation_build(
                 "supplier_evidence_rejected": {
                     "rejected_documents": len(rejected_docs),
                     "candidate_documents": len(candidate_docs),
-                    "rejected_sle_ids": sorted(rejected_sle_ids),
+                    "rejected_sle_ids": sorted(rejected_supplier_sle_ids),
                     "codes": sorted({str(d.code) for d in extraction.diagnostics}),
                     "sample": [
                         {
@@ -1521,6 +1518,7 @@ def accept_generation_build(
             db,
             int(generation.id),
             explicit_empty_physical=explicit_empty_physical,
+            rejected_supplier_sle_ids=frozenset(rejected_supplier_sle_ids),
         )
         try:
             from ..period_plan_service import (

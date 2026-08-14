@@ -1739,6 +1739,51 @@ def test_validation_rejects_supplier_receipt_candidate_rows_without_provenance(d
         validate_generation_build(db_session, generation.id)
 
 
+def test_validation_excludes_rejected_supplier_receipts_from_coverage(db_session):
+    generation, requirement = _synthetic(db_session, "rejected-provenance")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="0",
+    )
+    _add_matching_reservation_event(db_session, generation, requirement)
+    rejected = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="rejected-provenance",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH",
+        qty=Decimal("-2"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Expense",
+        movement_kind="supplier_return",
+        recorder_type="Document_РасходнаяНакладная",
+        recorder_ref="rejected-provenance",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(rejected)
+    db_session.commit()
+
+    # Passing the rejected receipt's SLE id excludes it from the full-coverage
+    # requirement: the coverage error must not fire (other unrelated checkpoints
+    # of this minimal fixture may still fail — that is acceptable here).
+    try:
+        validate_generation_build(
+            db_session,
+            generation.id,
+            rejected_supplier_sle_ids=frozenset({int(rejected.id)}),
+        )
+    except GenerationValidationError as exc:
+        assert (
+            "supplier receipt evidence must cover all supplier candidate rows"
+            not in str(exc)
+        )
+
+
 def test_accept_rejects_ignored_supplier_entries_if_not_candidate_rows(db_session, monkeypatch):
     generation, requirement = _synthetic(db_session, "supplier-foreign-ignored")
     db_session.add(models.StockLedgerEntry(
