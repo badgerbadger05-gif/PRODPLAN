@@ -824,7 +824,21 @@ def _supplier_provenance_checkpoint(
         raise GenerationValidationError(
             "supplier receipt provenance must reference supplier candidates"
         )
-    if require_full_coverage and provenance_ids != supplier_physical_ids:
+    # Supplier receipts whose 1C document was edited behind the cutoff are
+    # rejected at accept time (recorded here) and legitimately have no
+    # provenance; exclude them from the full-coverage requirement rather than
+    # failing the whole generation. The accept gate bounds how many may be
+    # rejected before it fails closed.
+    rejected_sle_ids = {
+        int(value)
+        for value in (
+            dict(generation.source_watermarks or {})
+            .get("supplier_evidence_rejected", {})
+            .get("rejected_sle_ids", [])
+        )
+    }
+    required_ids = supplier_physical_ids - rejected_sle_ids
+    if require_full_coverage and provenance_ids != required_ids:
         raise GenerationValidationError(
             "supplier receipt evidence must cover all supplier candidate rows"
         )
@@ -1417,6 +1431,13 @@ def accept_generation_build(
                 (str(row.recorder_type or ""), str(row.recorder_ref or ""))
                 for row in supplier_candidates
             }
+            rejected_sle_ids = {
+                int(row.id)
+                for row in supplier_candidates
+                if row.id is not None
+                and (str(row.recorder_type or ""), str(row.recorder_ref or ""))
+                in rejected_docs
+            }
             # A wholesale failure means the import itself is broken, not isolated
             # backdating: keep failing closed so it is not silently papered over.
             if candidate_docs and (
@@ -1447,6 +1468,7 @@ def accept_generation_build(
                 "supplier_evidence_rejected": {
                     "rejected_documents": len(rejected_docs),
                     "candidate_documents": len(candidate_docs),
+                    "rejected_sle_ids": sorted(rejected_sle_ids),
                     "codes": sorted({str(d.code) for d in extraction.diagnostics}),
                     "sample": [
                         {
