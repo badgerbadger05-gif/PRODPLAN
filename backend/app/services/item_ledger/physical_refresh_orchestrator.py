@@ -32,7 +32,16 @@ from .opening_balance_reconcile import (
     opening_boundary,
     reconcile_opening_balance,
 )
-from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, SEED_RECORDER_TYPE, physical_sequence_lock_context
+from .physical import (
+    CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+    LedgerKey,
+    PHYSICAL_SEQUENCE_LOCK_KEY,
+    SEED_RECORDER_TYPE,
+    canonical_content_hash,
+    guard_physical_batch_writer,
+    physical_sequence_lock_context,
+    rebuild_running_balance,
+)
 from .physical_visibility import visible_sle_query
 from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
 from .physical_refresh_import import (
@@ -196,6 +205,123 @@ def _normalized_recorder_type(value: Any) -> str:
     raw = str(value or "").strip()
     prefix = "StandardODATA."
     return raw[len(prefix):] if raw.startswith(prefix) else raw
+
+
+# A wholesale divergence means the physical import itself failed; snapping the
+# entire inventory to Balance would silently paper over it. Refuse above this
+# fraction of the compared cells instead. Normal backdated drift is a tiny
+# fraction (hundreds of cells out of ~14k), so this never blocks the steady
+# state — it only guards against masking a broken import.
+_MAX_SNAP_FRACTION = 0.5
+
+
+def _snap_balance_at_cutoff(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    convergence: BalanceConvergenceResult,
+) -> int:
+    """Close the residual by snapping the ledger to 1C's Balance at the cutoff.
+
+    1C lets documents be re-posted behind an already-frozen cutoff (backdating),
+    so an append-only movement replay can never stay converged: chasing every
+    changed recorder is unbounded and eventually exceeds any safety budget.
+    1C's Balance register, by contrast, is always self-consistent and already
+    reflects every backdated change. This writes one synthetic adjustment
+    movement per mismatched cell (``delta = 1C balance - ledger``), dated at the
+    generation cutoff, so the ledger's present balance matches 1C again. It is
+    bounded by the number of mismatched cells, not by recorder fan-out, and
+    converges even against 1C's own negative balances (they are mirrored).
+
+    Planning-relevant flows (production output, supplier receipts, order-linked
+    consumption) are still imported as real movements upstream; only the
+    residual left by untracked or backdated adjustments is absorbed here. Each
+    generation recomputes the residual from scratch, so a later re-import of a
+    document this snap already absorbed is self-correcting (the next residual
+    swings the other way and is re-snapped) — the level stays right.
+    """
+    bad = [delta for delta in convergence.deltas if not delta.matched]
+    if not bad:
+        return 0
+    if convergence.compared and len(bad) > convergence.compared * _MAX_SNAP_FRACTION:
+        raise PhysicalRefreshOrchestratorError(
+            f"balance snap refused: {len(bad)} of {convergence.compared} cells "
+            "diverge (>50%); the physical import likely failed and a snap would "
+            "mask it"
+        )
+
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    content_hash = canonical_content_hash(
+        [
+            [int(d.item_id), str(d.organization_ref), str(d.warehouse_ref1c), str(d.balance_qty)]
+            for d in bad
+        ]
+    )
+    guard_physical_batch_writer(db)
+    batch = models.PhysicalImportBatch(
+        batch_key=f"cutoff-balance-snap:{int(generation.id)}:{content_hash[:40]}",
+        status="completed",
+        cutoff=generation.cutoff,
+        completed_at=datetime.now(timezone.utc),
+        source_watermarks={
+            "source": CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+            "generation_id": int(generation.id),
+            "adjusted_keys": len(bad),
+            "content_hash": content_hash,
+            "previous_import_batch_id": int(generation.physical_import_batch_id),
+        },
+    )
+    db.add(batch)
+    db.flush()
+
+    for delta in bad:
+        key = LedgerKey(
+            int(delta.item_id),
+            "",
+            str(delta.organization_ref or ""),
+            str(delta.warehouse_ref1c or ""),
+        )
+        qty = Decimal(delta.balance_qty) - Decimal(delta.ledger_qty)
+        recorder_ref = canonical_content_hash(
+            {
+                "generation_id": int(generation.id),
+                "item_id": key.item_id,
+                "organization_ref": key.organization_ref,
+                "warehouse_ref1c": key.warehouse_ref1c,
+            }
+        )[:40]
+        db.add(
+            models.StockLedgerEntry(
+                ingest_batch_id=int(batch.id),
+                source_content_hash=recorder_ref,
+                item_id=key.item_id,
+                characteristic_ref="",
+                organization_ref=key.organization_ref,
+                warehouse_ref1c=key.warehouse_ref1c,
+                qty=qty,
+                posting_at=generation.cutoff,
+                record_type="Receipt" if qty > 0 else "Expense",
+                movement_kind=CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+                recorder_type=CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+                recorder_ref=recorder_ref,
+                line_no="0",
+                ingest_source=CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+            )
+        )
+        db.flush()
+        rebuild_running_balance(db, key, ledger_generation_id=int(generation.id))
+
+    generation.physical_import_batch_id = int(batch.id)
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "cutoff_balance_snap": {
+            "adjusted_keys": len(bad),
+            "cutoff": cutoff.isoformat(),
+            "content_hash": content_hash,
+        },
+    }
+    db.flush()
+    return len(bad)
 
 
 def _repair_mismatched_recorders(
@@ -480,13 +606,12 @@ def run_physical_refresh(
                 raise PhysicalRefreshOrchestratorError(
                     "physical refresh generation disappeared before targeted repair"
                 )
-            repaired = _repair_mismatched_recorders(
+            snapped = _snap_balance_at_cutoff(
                 db,
                 generation=physical_generation,
-                client=client,
                 convergence=convergence,
             )
-            if repaired:
+            if snapped:
                 convergence = evaluate_physical_refresh_balance_convergence(
                     db,
                     ledger_generation_id=int(fork.ledger_generation_id),

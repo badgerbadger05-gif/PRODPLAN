@@ -1,6 +1,7 @@
 """Targeted contract tests for the physical refresh orchestrator."""
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -719,3 +720,126 @@ def test_accept_exception_rolls_back_intermediate_pointer(db_session, monkeypatc
     assert calls == ["fork", "audit", "import", "balance", "accept"]
     assert commit_calls == ["commit"]
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
+
+
+def _building_physical_generation(db_session, parent, parent_batch):
+    generation = models.LedgerGeneration(
+        generation_key="balance-snap-child",
+        status="building",
+        cutoff=parent.cutoff + timedelta(days=1),
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": parent.id,
+        },
+        physical_import_batch=parent_batch,
+        algorithm_version="physical-refresh/test",
+        replay_version="physical-refresh/test",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    return generation
+
+
+def _seed_sle(db_session, batch, generation, item, *, qty):
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id),
+        source_content_hash=f"seed-{item.item_id}",
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="org-ref",
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        qty=Decimal(str(qty)),
+        qty_after=Decimal(str(qty)),
+        posting_at=generation.cutoff,
+        record_type="Receipt",
+        movement_kind="test_seed",
+        recorder_type="test_seed",
+        recorder_ref=f"seed-{item.item_id}",
+        line_no="0",
+        ingest_source="test",
+    ))
+    db_session.flush()
+
+
+def test_balance_snap_closes_backdated_residual_at_cutoff(db_session):
+    parent, parent_batch = _accepted_parent(db_session, generation_key="balance-snap")
+    generation = _building_physical_generation(db_session, parent, parent_batch)
+    # One cell 1C moved behind the cutoff (ledger 1, 1C 2) plus two agreeing
+    # cells so the mismatch is a small fraction of the compared set.
+    drift = models.Item(item_code="SNAP-DRIFT", item_name="Drift", item_ref1c="drift")
+    ok_a = models.Item(item_code="SNAP-OK-A", item_name="Ok A", item_ref1c="ok-a")
+    ok_b = models.Item(item_code="SNAP-OK-B", item_name="Ok B", item_ref1c="ok-b")
+    db_session.add_all([drift, ok_a, ok_b])
+    db_session.flush()
+    _seed_sle(db_session, parent_batch, generation, drift, qty=1)
+    _seed_sle(db_session, parent_batch, generation, ok_a, qty=5)
+    _seed_sle(db_session, parent_batch, generation, ok_b, qty=5)
+    db_session.commit()
+
+    snapshot = {
+        (int(drift.item_id), "", "org-ref", "WH-PHYSICAL-PLAN"): Decimal("2"),
+        (int(ok_a.item_id), "", "org-ref", "WH-PHYSICAL-PLAN"): Decimal("5"),
+        (int(ok_b.item_id), "", "org-ref", "WH-PHYSICAL-PLAN"): Decimal("5"),
+    }
+
+    before = bootstrap.evaluate_physical_refresh_balance_convergence(
+        db_session, ledger_generation_id=generation.id, balance_snapshot=snapshot,
+    )
+    assert before.valid is False
+    assert before.mismatched == 1
+
+    snapped = workflow._snap_balance_at_cutoff(
+        db_session, generation=generation, convergence=before,
+    )
+    assert snapped == 1
+
+    # Exactly one synthetic cutoff adjustment, dated at the cutoff, for the
+    # drifted cell, carrying the delta that closes it (1C 2 - ledger 1 = 1).
+    adjustments = db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_type="cutoff_balance_adjustment",
+    ).all()
+    assert len(adjustments) == 1
+    assert int(adjustments[0].item_id) == int(drift.item_id)
+    assert Decimal(adjustments[0].qty) == Decimal("1")
+    assert adjustments[0].posting_at == generation.cutoff
+
+    after = bootstrap.evaluate_physical_refresh_balance_convergence(
+        db_session, ledger_generation_id=generation.id, balance_snapshot=snapshot,
+    )
+    assert after.valid is True
+    assert after.mismatched == 0
+
+
+def test_balance_snap_refuses_wholesale_divergence(db_session):
+    parent, parent_batch = _accepted_parent(db_session, generation_key="snap-catastrophe")
+    generation = _building_physical_generation(db_session, parent, parent_batch)
+    db_session.commit()
+    # 2 of 2 cells diverge (100% > 50%): a broken import, not backdated drift.
+    deltas = tuple(
+        bootstrap.BalanceConvergenceDelta(
+            item_id=1000 + i,
+            organization_ref="org-ref",
+            warehouse_ref1c="WH-PHYSICAL-PLAN",
+            balance_qty="2",
+            ledger_qty="1",
+            delta_qty="1",
+            matched=False,
+        )
+        for i in range(2)
+    )
+    convergence = bootstrap.BalanceConvergenceResult(
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff.isoformat(),
+        checked_at=generation.cutoff.isoformat(),
+        valid=False,
+        content_hash="catastrophe",
+        compared=2,
+        matched=0,
+        mismatched=2,
+        terminal_batch_id=parent_batch.id,
+        deltas=deltas,
+    )
+    with pytest.raises(workflow.PhysicalRefreshOrchestratorError, match="balance snap refused"):
+        workflow._snap_balance_at_cutoff(
+            db_session, generation=generation, convergence=convergence,
+        )
