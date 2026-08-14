@@ -1428,12 +1428,28 @@ def accept_generation_build(
                 (str(row.recorder_type or ""), str(row.recorder_ref or ""))
                 for row in supplier_candidates
             }
+            # A diagnostic is emitted per document ROW, and other rows of the
+            # same document may verify fine — so reject only the exact rows
+            # (recorder + line), not the whole document, or verified rows would
+            # be wrongly excluded from the coverage requirement.
+            rejected_rows = {
+                (
+                    str(d.recorder_type or ""),
+                    str(d.recorder_ref or ""),
+                    str(d.line_no or ""),
+                )
+                for d in extraction.diagnostics
+            }
             rejected_supplier_sle_ids = {
                 int(row.id)
                 for row in supplier_candidates
                 if row.id is not None
-                and (str(row.recorder_type or ""), str(row.recorder_ref or ""))
-                in rejected_docs
+                and (
+                    str(row.recorder_type or ""),
+                    str(row.recorder_ref or ""),
+                    str(row.line_no or ""),
+                )
+                in rejected_rows
             }
             # A wholesale failure means the import itself is broken, not isolated
             # backdating: keep failing closed so it is not silently papered over.
