@@ -1932,3 +1932,88 @@ def test_supplier_candidates_only_include_default_organization_rows(
         ledger_generation_id=generation.id,
         stock_ledger_entry_id=foreign.id,
     ).count() == 0
+
+
+def _mrp_gate_lineage(db, *, key):
+    """An accepted anchor carrying one live run, plus a fact-only child fork."""
+    anchor = _generation(db, f"{key}-anchor")
+    anchor.status = "accepted"
+    anchor.accepted_at = anchor.cutoff
+    plan = models.ProductionPlanHeader(
+        name=f"Gate plan {key}",
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="fixed",
+    )
+    db.add(plan)
+    db.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=int(anchor.id),
+        ledger_cutoff=anchor.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+    )
+    db.add(run)
+    db.flush()
+    child = _generation(
+        db,
+        f"{key}-child",
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": int(anchor.id),
+        },
+    )
+    return anchor, run, child
+
+
+def test_mrp_quantity_gate_still_sees_a_run_inherited_by_a_physical_refresh(db_session):
+    """The gate must count the live scope, not runs re-anchored to this fork.
+
+    Scoping it to ``ledger_generation_id == generation.id`` matched nothing after
+    the first physical refresh, so the gate silently validated zero requirements
+    on every hourly publish.
+    """
+    from app.services.item_ledger.generation_lifecycle import _mrp_quantity_checkpoint
+
+    _anchor, run, child = _mrp_gate_lineage(db_session, key="mrp-gate-ok")
+    item = models.Item(item_code="GATE-OK", item_name="Gate ok")
+    db_session.add(item)
+    db_session.flush()
+    db_session.add(models.MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        freeze_version=1,
+        total_required_qty=Decimal("10"),
+        net_required_qty=Decimal("4"),
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="open",
+    ))
+    db_session.flush()
+
+    assert _mrp_quantity_checkpoint(db_session, child) == 1
+
+
+def test_mrp_quantity_gate_rejects_an_inherited_run_with_net_above_gross(db_session):
+    from app.services.item_ledger.generation_lifecycle import _mrp_quantity_checkpoint
+
+    _anchor, run, child = _mrp_gate_lineage(db_session, key="mrp-gate-bad")
+    item = models.Item(item_code="GATE-BAD", item_name="Gate bad")
+    db_session.add(item)
+    db_session.flush()
+    db_session.add(models.MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        freeze_version=1,
+        total_required_qty=Decimal("2"),
+        net_required_qty=Decimal("5"),
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="open",
+    ))
+    db_session.flush()
+
+    with pytest.raises(GenerationValidationError, match="0 <= net <= gross"):
+        _mrp_quantity_checkpoint(db_session, child)

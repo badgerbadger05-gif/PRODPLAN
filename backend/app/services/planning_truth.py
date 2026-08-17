@@ -7,7 +7,7 @@ an accepted generation identity or stop their calculation with
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 import os
 from typing import Any, Mapping
 
@@ -443,8 +443,22 @@ def get_latest_read_snapshot(
     snapshot_key: str | None = None,
     required_capabilities: Iterable[str] = (),
     allow_stale: bool = False,
+    sealed_lineage: Sequence[int] | None = None,
 ) -> models.PlanningReadSnapshot | None:
-    """Read the latest snapshot only for the current accepted truth lineage."""
+    """Read the latest snapshot only for the current accepted truth lineage.
+
+    By default a snapshot belongs to exactly one accepted generation and cutoff:
+    anything projecting facts must be rebuilt whenever facts move.
+
+    ``sealed_lineage`` opts a consumer into the wider, obligation-shaped rule:
+    the caller passes the sealed ``parent_generation_id`` chain of the accepted
+    generation, and the newest snapshot anchored anywhere in that chain is
+    returned.  Only a payload that projects a *frozen obligation* may use this —
+    such a payload does not change when a fact-only fork advances the pointer,
+    so republishing it per generation would rewrite identical rows hourly.  The
+    returned snapshot keeps reporting the generation and cutoff it was actually
+    published at; the caller must not restate it as the current one.
+    """
     truth = require_accepted_truth(
         db,
         consumer,
@@ -453,9 +467,23 @@ def get_latest_read_snapshot(
     )
     query = select(models.PlanningReadSnapshot).where(
             models.PlanningReadSnapshot.consumer == consumer,
+            models.PlanningReadSnapshot.truth_status == "accepted",
+        )
+    if sealed_lineage is None:
+        query = query.where(
             models.PlanningReadSnapshot.ledger_generation_id == truth.generation_id,
             models.PlanningReadSnapshot.cutoff == truth.cutoff,
-            models.PlanningReadSnapshot.truth_status == "accepted",
+        )
+    else:
+        lineage_ids = [int(value) for value in sealed_lineage]
+        if not lineage_ids:
+            raise ValueError("sealed lineage must not be empty")
+        if int(truth.generation_id) not in lineage_ids:
+            raise ValueError(
+                "sealed lineage does not contain the accepted Ledger generation"
+            )
+        query = query.where(
+            models.PlanningReadSnapshot.ledger_generation_id.in_(lineage_ids),
         )
     if snapshot_key is not None:
         query = query.where(
@@ -464,6 +492,7 @@ def get_latest_read_snapshot(
     return db.execute(
         query
         .order_by(
+            models.PlanningReadSnapshot.ledger_generation_id.desc(),
             models.PlanningReadSnapshot.published_at.desc(),
             models.PlanningReadSnapshot.id.desc(),
         )

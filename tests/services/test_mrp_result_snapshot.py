@@ -582,6 +582,158 @@ def test_builder_rejects_legacy_obligation_without_generation(db_session):
     assert db_session.query(models.PlanningReadSnapshot).count() == 0
 
 
+def _physical_refresh_fork(db, parent, *, key, cutoff):
+    """Publish a fact-only fork and advance the pointer, sealing the lineage."""
+    physical = models.PhysicalImportBatch(
+        batch_key=f"{key}-physical",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    db.add(physical)
+    db.flush()
+    child = models.LedgerGeneration(
+        generation_key=key,
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        capabilities=dict(parent.capabilities or {}),
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": int(parent.id),
+        },
+        physical_import_batch_id=physical.id,
+        algorithm_version="test",
+    )
+    db.add(child)
+    db.flush()
+    pointer = db.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = int(child.id)
+    db.flush()
+    return child
+
+
+def _fixed_purchase_run(db, generation, *, code):
+    """One fixed run whose obligation is frozen against ``generation``."""
+    item = models.Item(item_code=code, item_name=f"Item {code}")
+    db.add(item)
+    db.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+    )
+    db.add(run)
+    db.flush()
+    db.add(
+        models.PlannedPurchase(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            requested_qty=Decimal("9"),
+            planned_qty=Decimal("9"),
+            qty=Decimal("9"),
+            need_date=datetime(2026, 8, 1).date(),
+            order_date=datetime(2026, 7, 1).date(),
+            lead_time_days=1,
+            bucket_date=datetime(2026, 8, 1).date(),
+            ledger_generation_id=generation.id,
+        )
+    )
+    db.flush()
+    return run
+
+
+def test_builder_accepts_a_run_inherited_through_a_physical_refresh(db_session):
+    """A fact-only fork does not re-anchor an obligation, so the run stays live.
+
+    Requiring the run to carry the accepted generation id is what killed this
+    page on the live contour: ten runs stayed anchored to their freeze
+    generation while the hourly refresh advanced the pointer far past it.
+    """
+    anchor = _accepted_generation(db_session)
+    run = _fixed_purchase_run(db_session, anchor, code="INHERIT-PURCHASE")
+    child = _physical_refresh_fork(
+        db_session, anchor, key="inherit-child", cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc)
+    )
+
+    snapshot = build_mrp_result_snapshot(db_session, run.run_id)
+
+    # The snapshot is published at the accepted generation, and it honestly
+    # reports that generation rather than the run's older freeze anchor.
+    assert int(snapshot.ledger_generation_id) == int(child.id)
+    manifest = read_mrp_result_manifest(db_session, run.run_id)
+    assert manifest["snapshot_id"] == snapshot.id
+    assert manifest["ledger_generation"] == int(child.id)
+    assert manifest["snapshot_counts"]["purchase"] == 1
+
+
+def test_inherited_obligation_snapshot_is_reused_by_the_next_refresh(db_session):
+    """The payload projects a frozen obligation, so a fact fork must not rebuild it."""
+    anchor = _accepted_generation(db_session)
+    run = _fixed_purchase_run(db_session, anchor, code="REUSE-PURCHASE")
+    first_child = _physical_refresh_fork(
+        db_session, anchor, key="reuse-child", cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc)
+    )
+    first = build_mrp_result_snapshot(db_session, run.run_id)
+    rows_after_first = db_session.query(models.PlanningReadRow).count()
+
+    _physical_refresh_fork(
+        db_session,
+        first_child,
+        key="reuse-grandchild",
+        cutoff=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    repeated = build_mrp_result_snapshot(db_session, run.run_id)
+
+    assert repeated.id == first.id
+    assert db_session.query(models.PlanningReadSnapshot).count() == 1
+    assert db_session.query(models.PlanningReadRow).count() == rows_after_first
+    # Reads keep resolving it through the lineage, still stamped with the
+    # generation it was actually published at.
+    manifest = read_mrp_result_manifest(db_session, run.run_id)
+    assert manifest["snapshot_id"] == first.id
+    assert manifest["ledger_generation"] == int(first_child.id)
+
+
+def test_builder_rejects_a_run_anchored_outside_the_sealed_lineage(db_session):
+    anchor = _accepted_generation(db_session)
+    run = _fixed_purchase_run(db_session, anchor, code="FOREIGN-PURCHASE")
+    foreign = _physical_refresh_fork(
+        db_session, anchor, key="foreign-branch", cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc)
+    )
+    run.ledger_generation_id = int(foreign.id)
+    run.ledger_cutoff = foreign.cutoff
+    db_session.flush()
+    # A sibling fork of the same parent: accepted truth never descends from it.
+    _physical_refresh_fork(
+        db_session, anchor, key="accepted-branch", cutoff=datetime(2026, 7, 25, tzinfo=timezone.utc)
+    )
+
+    with pytest.raises(ValueError, match="outside the sealed lineage"):
+        build_mrp_result_snapshot(db_session, run.run_id)
+
+    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+
+
+def test_builder_rejects_a_run_whose_cutoff_left_its_anchor(db_session):
+    """Inheritance widens the generation check, never the frozen cutoff."""
+    anchor = _accepted_generation(db_session)
+    run = _fixed_purchase_run(db_session, anchor, code="CUTOFF-PURCHASE")
+    child = _physical_refresh_fork(
+        db_session, anchor, key="cutoff-child", cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc)
+    )
+    run.ledger_cutoff = child.cutoff
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="cutoff differs from the cutoff of"):
+        build_mrp_result_snapshot(db_session, run.run_id)
+
+    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+
+
 def test_builder_failure_rolls_back_manifest_rows_and_memberships(
     db_session, monkeypatch
 ):

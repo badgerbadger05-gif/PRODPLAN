@@ -18,6 +18,10 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services import planning_service
+from app.services.item_ledger.live_plan_scope import (
+    sealed_generation_lineage_ids,
+    sealed_run_anchor,
+)
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PLANNING_SNAPSHOTS,
@@ -137,24 +141,24 @@ def _frozen_root_membership(
     return result
 
 
+def _accepted_generation(
+    db: Session, generation_id: int
+) -> models.LedgerGeneration:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError(f"Ledger generation {int(generation_id)} not found")
+    return generation
+
+
 def _validate_obligation_lineage(
     db: Session,
     run_id: int,
     generation_id: int,
 ) -> None:
     """Reject every obligation row whose accepted-generation origin is unknown."""
-    allowed_generation_ids = {int(generation_id)}
-    cursor = db.get(models.LedgerGeneration, int(generation_id))
-    while cursor is not None:
-        marks = dict(cursor.source_watermarks or {})
-        try:
-            parent_id = int(marks["parent_generation_id"])
-        except (KeyError, TypeError, ValueError):
-            break
-        if parent_id in allowed_generation_ids:
-            break
-        allowed_generation_ids.add(parent_id)
-        cursor = db.get(models.LedgerGeneration, parent_id)
+    allowed_generation_ids = set(
+        sealed_generation_lineage_ids(db, _accepted_generation(db, generation_id))
+    )
     for model in (models.PlannedOrder, models.PlannedPurchase, models.PlannedRework):
         lineage_column = getattr(model, "ledger_generation_id", None)
         base = db.query(func.count()).select_from(model).filter(
@@ -491,9 +495,16 @@ def build_mrp_result_snapshot(
 ) -> models.PlanningReadSnapshot:
     """Build and publish one immutable result snapshot for a fixed run.
 
-    The run must already be bound to the currently accepted Ledger generation.
-    Planned result tables are treated as frozen obligations; no legacy fact
-    fields are consulted here.
+    The run must be a live obligation of the accepted truth: anchored anywhere
+    in its sealed lineage, with its own frozen cutoff.  A fact-only fork never
+    re-anchors an obligation, so requiring the run to carry the accepted
+    generation id is exactly what killed this page after the first physical
+    refresh.
+
+    The payload is a projection of frozen obligation tables, so an existing
+    snapshot from anywhere in that lineage is reused verbatim instead of being
+    rebuilt per generation.  Planned result tables are treated as frozen
+    obligations; no legacy fact fields are consulted here.
     """
     truth = require_accepted_truth(
         db,
@@ -506,10 +517,9 @@ def build_mrp_result_snapshot(
         raise ValueError(f"planning run {run_id} not found")
     if str(run.status or "") != "FIXED_SNAPSHOT":
         raise ValueError("MRP result snapshot requires a fixed run")
-    if run.ledger_generation_id != truth.generation_id:
-        raise ValueError("fixed run is not bound to the accepted Ledger generation")
-    if run.ledger_cutoff != truth.cutoff:
-        raise ValueError("fixed run cutoff differs from the accepted Ledger cutoff")
+    accepted = _accepted_generation(db, int(truth.generation_id))
+    lineage = sealed_generation_lineage_ids(db, accepted)
+    sealed_run_anchor(db, run, accepted)
     _validate_obligation_lineage(db, int(run_id), int(truth.generation_id))
 
     existing = get_latest_read_snapshot(
@@ -518,6 +528,7 @@ def build_mrp_result_snapshot(
         snapshot_key=_snapshot_key(run_id),
         required_capabilities=REQUIRED_CAPABILITIES,
         allow_stale=bool(allow_stale_truth),
+        sealed_lineage=lineage,
     )
     if existing is not None:
         return existing
@@ -608,11 +619,25 @@ def build_mrp_result_snapshot(
 def _resolve_snapshot(
     db: Session, run_id: int, snapshot_id: int | None
 ) -> models.PlanningReadSnapshot | None:
+    """Read the newest obligation snapshot of the accepted sealed lineage.
+
+    The obligation is not republished by a fact-only fork, so the snapshot that
+    is current for this run lives at the generation which last froze it.  It is
+    returned with its own generation and cutoff, never restated as today's.
+    """
+    truth = require_accepted_truth(
+        db,
+        CONSUMER,
+        required_capabilities=REQUIRED_CAPABILITIES,
+    )
     latest = get_latest_read_snapshot(
         db,
         consumer=CONSUMER,
         snapshot_key=_snapshot_key(run_id),
         required_capabilities=REQUIRED_CAPABILITIES,
+        sealed_lineage=sealed_generation_lineage_ids(
+            db, _accepted_generation(db, int(truth.generation_id))
+        ),
     )
     if latest is None:
         return None

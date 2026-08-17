@@ -8,11 +8,15 @@ gate as live writes: an unsafe preview is still an unsafe promise.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.item_ledger.live_plan_scope import (
+    RunAnchorError,
+    sealed_generation_lineage_ids,
+    sealed_run_anchor,
+)
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -32,14 +36,16 @@ class MrpMutationLineageError(ValueError):
     """Selected MRP rows do not belong to the currently accepted truth."""
 
 
-def _same_instant(left: datetime | None, right: datetime | None) -> bool:
-    if left is None or right is None:
-        return False
-    if left.tzinfo is None:
-        left = left.replace(tzinfo=timezone.utc)
-    if right.tzinfo is None:
-        right = right.replace(tzinfo=timezone.utc)
-    return left.astimezone(timezone.utc) == right.astimezone(timezone.utc)
+def _accepted_lineage(db: Session, generation_id: int) -> tuple[int, ...]:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise MrpMutationLineageError(
+            f"accepted Ledger generation {int(generation_id)} not found"
+        )
+    try:
+        return sealed_generation_lineage_ids(db, generation)
+    except ValueError as exc:
+        raise MrpMutationLineageError(str(exc)) from exc
 
 
 def require_current_run(
@@ -48,6 +54,14 @@ def require_current_run(
     *,
     consumer: str,
 ) -> tuple[models.PlanningRun, int]:
+    """Require a live obligation of the accepted truth, not a re-anchored run.
+
+    The run must be anchored anywhere in the accepted generation's sealed
+    lineage and carry the cutoff of that anchor.  Demanding the accepted
+    generation id here blocked every materialization and 1C export from the
+    first physical refresh onwards, because a fact-only fork deliberately
+    leaves obligations where they were frozen.
+    """
     truth = require_accepted_truth(
         db,
         consumer,
@@ -61,14 +75,15 @@ def require_current_run(
             f"planning run {run_id} is not a FIXED_SNAPSHOT"
         )
     generation_id = int(truth.generation_id)
-    if run.ledger_generation_id is None or int(run.ledger_generation_id) != generation_id:
+    generation = db.get(models.LedgerGeneration, generation_id)
+    if generation is None:
         raise MrpMutationLineageError(
-            f"planning run {run_id} is not bound to accepted Ledger generation {generation_id}"
+            f"accepted Ledger generation {generation_id} not found"
         )
-    if not _same_instant(run.ledger_cutoff, truth.cutoff):
-        raise MrpMutationLineageError(
-            f"planning run {run_id} cutoff does not match accepted Ledger cutoff"
-        )
+    try:
+        sealed_run_anchor(db, run, generation)
+    except (RunAnchorError, ValueError) as exc:
+        raise MrpMutationLineageError(str(exc)) from exc
     if run.active_freeze_version is None:
         raise MrpMutationLineageError(f"planning run {run_id} has no active freeze")
     return run, generation_id
@@ -82,7 +97,16 @@ def require_selected_proposals(
     generation_id: int,
     consumer: str,
 ) -> None:
+    """Require every selected proposal to belong to this run's frozen obligation.
+
+    A proposal row stays anchored to the generation that froze it, so its
+    lineage is checked against the accepted generation's sealed chain.  Run
+    identity and the active freeze version below are what pin the row to the
+    *current* obligation; the generation only proves it is not from a foreign
+    branch of truth.
+    """
     del consumer  # retained for uniform, explicit call sites and future telemetry
+    allowed_generation_ids = set(_accepted_lineage(db, generation_id))
     for row in rows:
         row_id = getattr(row, "purchase_id", getattr(row, "order_id", "?"))
         if int(getattr(row, "run_id")) != int(run.run_id):
@@ -90,7 +114,7 @@ def require_selected_proposals(
                 f"proposal {row_id} belongs to another planning run"
             )
         row_generation = getattr(row, "ledger_generation_id", None)
-        if row_generation is None or int(row_generation) != generation_id:
+        if row_generation is None or int(row_generation) not in allowed_generation_ids:
             raise MrpMutationLineageError(
                 f"proposal {row_id} is null, mixed or stale Ledger lineage"
             )
@@ -144,6 +168,11 @@ def require_materialized_orders(
         raise MrpMutationLineageError("selected orders do not belong to a fixed MRP run")
     if run.active_freeze_version is None:
         raise MrpMutationLineageError(f"planning run {run.run_id} has no active freeze")
+    # A materialized product is stamped with the generation accepted when the
+    # operator materialized it.  Fact-only forks advance the pointer past that
+    # stamp without touching the obligation, so provenance is proved against
+    # the accepted generation's sealed lineage.
+    allowed_generation_ids = set(_accepted_lineage(db, generation_id))
     for order in orders:
         products = list(order.products)
         if not products:
@@ -152,7 +181,7 @@ def require_materialized_orders(
             if product.source_planned_order_id is not None:
                 if (
                     product.ledger_generation_id is None
-                    or int(product.ledger_generation_id) != generation_id
+                    or int(product.ledger_generation_id) not in allowed_generation_ids
                 ):
                     raise MrpMutationLineageError(
                         f"production product {product.product_id} is null, mixed or stale Ledger lineage"

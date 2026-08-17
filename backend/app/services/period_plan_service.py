@@ -54,6 +54,7 @@ from .mrp_stock_helpers import (
 )
 from .planning_run_candidate import _resolve_parent_generation_id
 from .forecast import forecast_payload as _forecast_payload
+from .item_ledger.live_plan_scope import live_plan_run_ids
 from .item_ledger.reservation import (
     replenishment_execution_pct,
     replenishment_execution_status,
@@ -546,7 +547,13 @@ def update_period_plan_header(
 
 
 def list_mrp_runs_for_plan(db: Session, plan_id: int, *, limit: int = 50) -> Dict[str, Any]:
-    """Return only published snapshots from the exact current Ledger truth."""
+    """Return only the live runs of the accepted Ledger truth for this plan.
+
+    Live scope is the sealed lineage scope, not "anchored to the accepted
+    generation id": a physical refresh publishes facts and never re-anchors an
+    obligation, so the strict comparison returned an empty list for every plan
+    from the first refresh onwards.
+    """
     _get_plan(db, plan_id)  # validates existence
     truth = db.get(PlanningTruthState, 1)
     if truth is None or truth.current_generation_id is None:
@@ -554,11 +561,14 @@ def list_mrp_runs_for_plan(db: Session, plan_id: int, *, limit: int = 50) -> Dic
     generation = db.get(LedgerGeneration, int(truth.current_generation_id))
     if generation is None or str(generation.status) != "accepted":
         raise ValueError("Current accepted Ledger truth is unavailable")
+    live_run_ids = live_plan_run_ids(db, generation)
+    if not live_run_ids:
+        return {"rows": [], "total": 0}
     runs = (
         db.query(PlanningRun)
         .filter(
             PlanningRun.source_plan_id == int(plan_id),
-            PlanningRun.ledger_generation_id == int(truth.current_generation_id),
+            PlanningRun.run_id.in_(live_run_ids),
             PlanningRun.status == "FIXED_SNAPSHOT",
         )
         .order_by(PlanningRun.run_id.desc())
