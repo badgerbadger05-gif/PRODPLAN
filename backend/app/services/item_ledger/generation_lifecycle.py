@@ -56,6 +56,10 @@ from .reservation_consumption_persistence import (
     materialize_reservation_consumption_allocations,
 )
 from .reservation import replenishment_remaining
+from .live_plan_scope import (
+    live_plan_run_ids,
+    sealed_generation_lineage_ids,
+)
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.purchase_control_snapshot import (
     PurchaseJournalPromotionError,
@@ -508,20 +512,9 @@ def _ancestor_generation_ids(
     their events legitimately keep the cycle of the generation which first
     recorded them.  Walking the sealed ``parent_generation_id`` lineage is the
     only structural way to tell such provenance from a genuinely foreign event.
+    The walk itself is owned by :mod:`live_plan_scope`; this is a set view of it.
     """
-    seen = {int(generation.id)}
-    current: models.LedgerGeneration | None = generation
-    while current is not None:
-        marks = dict(current.source_watermarks or {})
-        try:
-            parent_id = int(marks["parent_generation_id"])
-        except (KeyError, TypeError, ValueError):
-            break
-        if parent_id in seen:
-            break
-        seen.add(parent_id)
-        current = db.get(models.LedgerGeneration, parent_id)
-    return seen
+    return set(sealed_generation_lineage_ids(db, generation))
 
 
 def _cycle_names_foreign_generation(cycle_id: str, allowed_ids: set[int]) -> bool:
@@ -705,12 +698,21 @@ def _mrp_quantity_checkpoint(
     db: Session,
     generation: models.LedgerGeneration,
 ) -> int:
-    """Reject a publish when any generation-owned gross/net pair is invalid."""
-    run_ids = (
-        db.query(models.PlanningRun.run_id)
-        .filter(models.PlanningRun.ledger_generation_id == int(generation.id))
-        .scalar_subquery()
-    )
+    """Reject a publish when any live-scope gross/net pair is invalid.
+
+    The scope is the sealed live-plan scope, not "runs anchored to this
+    generation id": a fact-only fork never re-anchors an obligation, so the
+    strict filter matched nothing and turned this gate into a no-op that
+    validated zero requirements on every physical refresh.
+    """
+    try:
+        run_ids = live_plan_run_ids(db, generation)
+    except ValueError as exc:
+        raise GenerationValidationError(
+            f"generation {int(generation.id)} cannot resolve its live-plan scope: {exc}"
+        ) from exc
+    if not run_ids:
+        return 0
     bad_requirements = (
         db.query(models.MrpRequirement.id)
         .filter(
@@ -1313,14 +1315,20 @@ def _promote_accepted_generation_read_snapshots(
         expected_parent_id=expected_parent_id,
     )
 
+    # Only the live obligations of this generation get a result snapshot, and
+    # "live" is the sealed lineage scope — a fact-only fork inherits its runs
+    # instead of re-anchoring them, so comparing the run's anchor with this
+    # generation's id skipped all ten real runs on every refresh.  The builder
+    # reuses an existing snapshot from anywhere in that lineage, so a refresh
+    # that changed no obligation writes no rows here.
+    try:
+        live_run_ids = set(live_plan_run_ids(db, generation))
+    except ValueError as exc:
+        raise GenerationValidationError(
+            f"generation {int(generation.id)} cannot resolve its live-plan scope: {exc}"
+        ) from exc
     for run_id in fixed_run_ids:
-        run = db.get(models.PlanningRun, int(run_id))
-        if run is None:
-            continue
-        if (
-            int(run.ledger_generation_id or 0) != int(generation.id)
-            or run.ledger_cutoff != generation.cutoff
-        ):
+        if int(run_id) not in live_run_ids:
             continue
         try:
             build_mrp_result_snapshot(db, int(run_id))

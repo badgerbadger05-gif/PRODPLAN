@@ -56,6 +56,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Свободный S0 нового плана | принятый физический остаток минус динамические удержания старших живых резервов; удержание освобождает только назначенный физический расход (§16) |
 | Срок пополнения MRP | `Item.replenishment_time`, синхронизированный из `СрокПополнения` 1С; ноль валиден (§17) |
 | Защитное окно полки | отдельный `ShelfPolicy.replenishment_time_days`; не подменяет срок MRP (§17) |
+| Живая область планов поколения и привязка run | sealed-цепочка `parent_generation_id`: манифест `obligation_refresh` либо унаследованная область фактового форка; run жив при привязке внутри цепочки и cutoff, равном cutoff его поколения-анкера (§27) |
 | Маршрут пополнения | только явно распознанный маршрут; пустое и неизвестное дают `unavailable` и блокируют публикацию. Явная «Переработка» создаёт сохранённый `rework`-резерв без `PlannedOrder`/`PlannedPurchase`/журнальной строки; маршрут и исполнение показываются `unavailable`, но принятый `assembly_in` адресно, затем FIFO закрывает такой резерв (§18) |
 
 ## Реестр канонических модулей
@@ -74,6 +75,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py`; пул строится ОДИН раз, базис — исторический SLE-баланс, net после заморозки неизменяем; единственная точка расширения пулов — `pool_key_for` |
 | Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
 | Единая спецификация сборки: узлы и комплектовки со складов | контракт `unified-assembly-specification.md` (§26); развёртка — существующие `backend/app/services/mrp_freeze.py`, `planning_service.py`, `bom_specification_resolver.py`, без второго движка |
+| Живая область планов и привязка run к поколению | `backend/app/services/item_ledger/live_plan_scope.py`; обход sealed-цепочки существует только здесь |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
 | Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
@@ -134,6 +136,12 @@ PRODPLAN состоит из четырёх последовательно св�
 - строить барабан по одному выбранному плану или `program_id`;
 - создавать отдельный спрос, NFP или буфер сверх MRP-потребности;
 - строить кросс-валидатор двух копий одной величины — это тоже дубль;
+- резолвить живой run строгим равенством `PlanningRun.ledger_generation_id` и
+  принятого поколения либо сравнением его `ledger_cutoff` с текущим cutoff:
+  фактовый форк не переанкоривает обязательство (§27);
+- переанкоривать retained-run или строки его обязательства при фактовом форке;
+- обходить sealed-цепочку `parent_generation_id` где-либо, кроме
+  `live_plan_scope.py`;
 - терять невыполненную плитку при смене даты или поколения;
 - приписывать физический факт произвольному заказу;
 - считать поступление освобождением удержанного старшим резервом склада;

@@ -136,6 +136,44 @@ def test_run_list_and_delete_guard_use_only_exact_current_published_truth(db_ses
         service.delete_period_plan(db_session, plan.id)
 
 
+def test_run_list_keeps_a_run_inherited_through_a_physical_refresh(db_session):
+    """A fact-only fork inherits obligations instead of re-anchoring them.
+
+    Resolving the list by ``ledger_generation_id == accepted`` returned an empty
+    run list for every plan on the live contour, because the hourly refresh had
+    moved the pointer far past the generation that froze the runs.
+    """
+    anchor, plan = _truth_and_plan(db_session)
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", source_plan_id=plan.id,
+        ledger_generation_id=anchor.id, ledger_cutoff=anchor.cutoff,
+        config_snapshot={}, pinned=True,
+    )
+    db_session.add(run)
+    db_session.flush()
+    child = models.LedgerGeneration(
+        generation_key="period-refresh-fact-fork",
+        status="accepted",
+        cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc),
+        accepted_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
+        algorithm_version="test",
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": int(anchor.id),
+        },
+        capabilities={"physical_ledger": True},
+        physical_import_batch_id=anchor.physical_import_batch_id,
+    )
+    db_session.add(child)
+    db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(child.id)
+    db_session.commit()
+
+    assert [row["run_id"] for row in service.list_mrp_runs_for_plan(
+        db_session, plan.id
+    )["rows"]] == [run.run_id]
+
+
 def test_delete_guard_also_preserves_historical_snapshot_lineage(db_session):
     current, plan = _truth_and_plan(db_session)
     historical = models.LedgerGeneration(

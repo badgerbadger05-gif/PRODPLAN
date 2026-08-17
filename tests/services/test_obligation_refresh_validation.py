@@ -114,6 +114,16 @@ def _obligation_world(db):
     )
     db.add(requirement)
     db.flush()
+    # The orchestrator seals the manifest right after forking the target and
+    # long before it validates, so a candidate reaching this gate always
+    # carries its live-plan scope.  Quantity checks read that scope.
+    target.source_watermarks = {
+        **dict(target.source_watermarks or {}),
+        "obligation_refresh_manifest": {
+            "entries": [{"action": "retain", "parent_run_id": int(run.run_id)}]
+        },
+    }
+    db.flush()
     return parent, target, item, run, requirement
 
 
@@ -275,8 +285,7 @@ def test_corrupt_frozen_reservation_amounts_are_rejected(db_session):
 
 
 def test_generation_with_net_above_gross_is_rejected(db_session):
-    _parent, target, _item, run, requirement = _obligation_world(db_session)
-    run.ledger_generation_id = int(target.id)
+    _parent, target, _item, _run, requirement = _obligation_world(db_session)
     requirement.total_required_qty = Decimal("5")
     requirement.net_required_qty = Decimal("6")
     db_session.flush()

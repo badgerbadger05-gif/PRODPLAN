@@ -15,13 +15,35 @@ every rebuild.  A physical refresh publishes new *facts*, not new obligations â€
 losing the live scope there is what silently emptied the assembly queue, the
 drum and plan execution while the reservations of the very same generation kept
 carrying all ten runs.
+
+The same chain answers the narrower question "is *this* run live for *this*
+generation?".  ``sealed_run_anchor`` is the single owner of that answer: a run
+is live when it is anchored anywhere in the sealed lineage and its own
+``ledger_cutoff`` still matches the cutoff of the generation it is anchored to.
+Comparing a run's anchor with the *accepted* generation id instead is the same
+defect as above, one run at a time: it fails every read path after the first
+physical refresh, because an obligation is deliberately never re-anchored by a
+fact-only fork.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
 from app import models
+
+
+def _same_instant(left: datetime | None, right: datetime | None) -> bool:
+    """Compare two cutoffs as instants, never as naive/aware representations."""
+    if left is None or right is None:
+        return False
+    if left.tzinfo is None:
+        left = left.replace(tzinfo=timezone.utc)
+    if right.tzinfo is None:
+        right = right.replace(tzinfo=timezone.utc)
+    return left.astimezone(timezone.utc) == right.astimezone(timezone.utc)
 
 
 def _obligation_refresh_run_ids(marks: dict) -> tuple[int, ...]:
@@ -84,6 +106,50 @@ def sealed_generation_lineage_ids(
             )
         current = parent
     return tuple(lineage)
+
+
+class RunAnchorError(ValueError):
+    """A planning run is not a live obligation of the given Ledger generation."""
+
+
+def sealed_run_anchor(
+    db: Session,
+    run: models.PlanningRun,
+    generation: models.LedgerGeneration,
+) -> models.LedgerGeneration:
+    """Return the sealed generation ``run`` is anchored to, or fail closed.
+
+    The returned generation is the one that last re-anchored the obligation â€”
+    an ``obligation_refresh``, or the historical bootstrap.  Every fact-only
+    fork after it inherits the run without touching it, so the run's frozen
+    ``ledger_cutoff`` must equal that anchor's cutoff and *not* the cutoff of
+    the generation being read.  A run anchored outside the lineage belongs to
+    another branch of truth and is rejected rather than silently read.
+    """
+    anchor_id = run.ledger_generation_id
+    if anchor_id is None:
+        raise RunAnchorError(
+            f"planning run {int(run.run_id)} has no Ledger generation"
+        )
+    lineage = sealed_generation_lineage_ids(db, generation)
+    if int(anchor_id) not in lineage:
+        raise RunAnchorError(
+            f"planning run {int(run.run_id)} is anchored to Ledger generation "
+            f"{int(anchor_id)}, which is outside the sealed lineage of "
+            f"generation {int(generation.id)}"
+        )
+    anchor = db.get(models.LedgerGeneration, int(anchor_id))
+    if anchor is None:
+        raise RunAnchorError(
+            f"planning run {int(run.run_id)} lost its anchor Ledger generation "
+            f"{int(anchor_id)}"
+        )
+    if not _same_instant(run.ledger_cutoff, anchor.cutoff):
+        raise RunAnchorError(
+            f"planning run {int(run.run_id)} cutoff differs from the cutoff of "
+            f"its anchor Ledger generation {int(anchor_id)}"
+        )
+    return anchor
 
 
 def _inherited_run_ids(
