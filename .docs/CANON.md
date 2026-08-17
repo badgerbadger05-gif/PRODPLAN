@@ -66,6 +66,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Остаток принятого поколения | `backend/app/services/item_ledger/physical_visibility.py` |
 | Формулы резерва и выполнения | `backend/app/services/item_ledger/reservation.py` |
 | События и fold резервов | `backend/app/services/item_ledger/reservation_ledger.py` |
+| Чистый выпуск документа сборки (`max(sum(assembly_in) - sum(assembly_out), 0)` в пределах одного документа) | `backend/app/services/item_ledger/document_net_output.py`; читатели — реплей пополнения и аллокация выпуска плана, собственного отбора фактов у них нет |
 | Атрибуция фактов (пополнение: точный живой резерв первым, излишек и безадресные факты FIFO; расход: адресное удержание первым, иначе FIFO; агрегированная закупка и возвраты по §§14–15) | `backend/app/services/item_ledger/historical_replay_core.py`, `historical_replay_persistence.py`, `supplier_receipt_allocation.py` |
 | Выпуск производственной строки (`produced`, `remaining`) | `backend/app/services/production_output_truth.py`; `remaining_qty` в таблице — только compatibility cache и никогда не читается как факт |
 | Обеспеченность производственной строки материалами | чистый расчёт `production_control_material_availability.py`, сохранённый только внутри generation-scoped `production_control_journal_snapshot.py`; operational `ProductionOrderLineState` не владеет coverage |

@@ -1206,3 +1206,245 @@ def test_replay_allows_make_facts_for_outside_contour_warehouse(db_session):
     ).count() == 1
     db_session.refresh(reservation)
     assert reservation.realized_qty == Decimal("5")
+
+
+def _document_line(
+    seed: StockLedgerEntry,
+    *,
+    key: str,
+    warehouse_ref1c: str,
+    qty: str,
+    movement_kind: str,
+    line_no: str,
+) -> StockLedgerEntry:
+    """Another register line of the very same 1C document as ``seed``."""
+    return StockLedgerEntry(
+        ingest_batch_id=seed.ingest_batch_id,
+        source_content_hash=f"hash-{key}",
+        item_id=seed.item_id,
+        characteristic_ref=seed.characteristic_ref or "",
+        organization_ref=seed.organization_ref,
+        warehouse_ref1c=warehouse_ref1c,
+        qty=Decimal(qty),
+        qty_after=Decimal("0"),
+        posting_at=seed.posting_at,
+        record_type="Receipt" if movement_kind == "assembly_in" else "Expense",
+        movement_kind=movement_kind,
+        recorder_type=seed.recorder_type,
+        recorder_ref=seed.recorder_ref,
+        line_no=line_no,
+        ingest_source="pull",
+        active=True,
+    )
+
+
+def test_replay_nets_internal_transfer_of_one_assembly_document(db_session):
+    """``+N -N +N`` of one ``СборкаЗапасов`` is an output of N, never 2N."""
+    generation, reservation = _generation_scope(
+        db_session,
+        "INTERNAL-TRANSFER",
+        fact_qty="6",
+        reserve_qty="12",
+    )
+    db_session.add(StockWarehouse(
+        warehouse_ref1c="WH-FG",
+        warehouse_name="Finished goods, outside the planning contour",
+        is_selected=False,
+        is_finished_goods=False,
+    ))
+    seed = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add_all([
+        _document_line(
+            seed,
+            key="internal-transfer-out",
+            warehouse_ref1c="WH",
+            qty="-6",
+            movement_kind="assembly_out",
+            line_no="2",
+        ),
+        _document_line(
+            seed,
+            key="internal-transfer-in-fg",
+            warehouse_ref1c="WH-FG",
+            qty="6",
+            movement_kind="assembly_in",
+            line_no="3",
+        ),
+    ])
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 1
+    assert Decimal(result["fact_qty"]) == Decimal("6")
+    assert Decimal(result["allocated_qty"]) == Decimal("6")
+    assert Decimal(result["surplus_qty"]) == Decimal("0")
+    assert result["netted_internal_transfer_facts"] == 1
+    assert Decimal(result["netted_internal_transfer_qty"]) == Decimal("6")
+    events = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).all()
+    assert len(events) == 1
+    assert Decimal(str(events[0].realized_delta)) == Decimal("6")
+    surviving = db_session.get(StockLedgerEntry, int(events[0].sle_id))
+    # The surviving fact is the leg where the stock actually stayed, even when
+    # that warehouse is outside the planning contour.
+    assert surviving.warehouse_ref1c == "WH-FG"
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("6")
+
+
+def test_replay_nets_component_transit_of_one_document_to_zero(db_session):
+    """A component moved in and consumed by the same document produces nothing."""
+    generation, reservation = _generation_scope(
+        db_session,
+        "COMPONENT-TRANSIT",
+        fact_qty="6",
+        reserve_qty="6",
+    )
+    db_session.add(StockWarehouse(
+        warehouse_ref1c="WH-SRC",
+        warehouse_name="Source store",
+        is_selected=True,
+        is_finished_goods=False,
+    ))
+    seed = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add_all([
+        _document_line(
+            seed,
+            key="component-transit-source-out",
+            warehouse_ref1c="WH-SRC",
+            qty="-6",
+            movement_kind="assembly_out",
+            line_no="2",
+        ),
+        _document_line(
+            seed,
+            key="component-transit-consumed",
+            warehouse_ref1c="WH",
+            qty="-6",
+            movement_kind="assembly_out",
+            line_no="3",
+        ),
+    ])
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 0
+    assert Decimal(result["fact_qty"]) == Decimal("0")
+    assert Decimal(result["allocated_qty"]) == Decimal("0")
+    assert result["netted_internal_transfer_facts"] == 1
+    assert Decimal(result["netted_internal_transfer_qty"]) == Decimal("6")
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("0")
+
+
+def test_replay_nets_across_warehouses_when_output_exceeds_transfer(db_session):
+    """Netting caps the document at ``max(sum(in) - sum(out), 0)``."""
+    generation, reservation = _generation_scope(
+        db_session,
+        "PARTIAL-NET",
+        fact_qty="6",
+        reserve_qty="10",
+    )
+    db_session.add_all([
+        StockWarehouse(
+            warehouse_ref1c="WH-FG",
+            warehouse_name="Finished goods",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+        StockWarehouse(
+            warehouse_ref1c="WH-SRC",
+            warehouse_name="Source store",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+    ])
+    seed = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add_all([
+        _document_line(
+            seed,
+            key="partial-net-in-fg",
+            warehouse_ref1c="WH-FG",
+            qty="6",
+            movement_kind="assembly_in",
+            line_no="2",
+        ),
+        _document_line(
+            seed,
+            key="partial-net-out",
+            warehouse_ref1c="WH-SRC",
+            qty="-4",
+            movement_kind="assembly_out",
+            line_no="3",
+        ),
+    ])
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 2
+    assert Decimal(result["fact_qty"]) == Decimal("8")
+    assert Decimal(result["allocated_qty"]) == Decimal("8")
+    assert result["netted_internal_transfer_facts"] == 0
+    assert Decimal(result["netted_internal_transfer_qty"]) == Decimal("4")
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("8")
+
+
+def test_replay_keeps_separate_documents_independent(db_session):
+    """Netting never crosses document boundaries."""
+    generation, _reservation = _generation_scope(
+        db_session,
+        "CROSS-DOCUMENT",
+        fact_qty="6",
+        reserve_qty="6",
+    )
+    seed = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    other = _document_line(
+        seed,
+        key="cross-document-out",
+        warehouse_ref1c="WH",
+        qty="-6",
+        movement_kind="assembly_out",
+        line_no="1",
+    )
+    other.recorder_ref = "REC-CROSS-DOCUMENT-OTHER"
+    db_session.add(other)
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 1
+    assert Decimal(result["allocated_qty"]) == Decimal("6")
+    assert result["netted_internal_transfer_facts"] == 0
+    assert Decimal(result["netted_internal_transfer_qty"]) == Decimal("0")
+
+
+def test_replay_refuses_batch_written_by_another_algorithm_version(db_session):
+    generation, _reservation = _generation_scope(db_session, "ALGO-DRIFT")
+
+    run_historical_replay(db_session, generation.id)
+    db_session.commit()
+    batch = db_session.query(LedgerBuildBatch).filter_by(
+        ledger_generation_id=generation.id,
+        stage="reservation_replay",
+    ).one()
+    batch.algorithm_version = "historical-replay-persistence/1"
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="discard generation"):
+        run_historical_replay(db_session, generation.id)

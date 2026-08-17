@@ -20,13 +20,14 @@ from app.models import (
 from app import models
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
+from .document_net_output import net_document_output_qty
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
 from .recorder_identity import SYNC_LINK_FACT_STATUSES
 from .reservation import append_realization_event, fold_reservation_entry
 
 
-_ALGORITHM_VERSION = "historical-replay-persistence/1"
+_ALGORITHM_VERSION = "historical-replay-persistence/2"
 _SAFE_REALIZATION_KINDS = frozenset({"assembly_in"})
 _IGNORED_FACT_KINDS = frozenset({"assembly_out", "writeoff", "receipt", "expense"})
 _UNRESOLVED_POOL_PREFIX = "__unresolved_pool__"
@@ -241,6 +242,9 @@ def run_historical_replay(
         row for row in candidate_rows
         if str(row.movement_kind or "") in _IGNORED_FACT_KINDS
     ]
+    # One document is netted before anything becomes a fact: its internal
+    # transport legs are physical truth, but not production output.
+    realizable_qty_by_sle = net_document_output_qty(candidate_rows)
     for row in entries:
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")
@@ -290,9 +294,16 @@ def run_historical_replay(
     ambiguous_pool_facts = 0
     ambiguous_identity_facts = 0
     legacy_identity_collapsed_pool_facts = 0
+    netted_internal_transfer_facts = 0
+    netted_internal_transfer_qty = Decimal("0")
     for row in physical_rows:
         if str(row.organization_ref or "").strip() != DEFAULT_ORGANIZATION_REF1C:
             ignored_rows.append(row)
+            continue
+        realizable_qty = realizable_qty_by_sle.get(int(row.id), Decimal("0"))
+        netted_internal_transfer_qty += abs(_decimal(row.qty)) - realizable_qty
+        if realizable_qty <= 0:
+            netted_internal_transfer_facts += 1
             continue
         mode = _fact_mode(row)
         if mode == "make":
@@ -333,7 +344,7 @@ def run_historical_replay(
             fact_id=core_id,
             item_id=int(row.item_id),
             mode=mode,  # type: ignore[arg-type]
-            qty=abs(_decimal(row.qty)),
+            qty=realizable_qty,
             posting_at=row.posting_at,
             characteristic_ref=fact_characteristic,
             organization_ref="",
@@ -383,6 +394,9 @@ def run_historical_replay(
             "qty": str(abs(_decimal(row.qty))),
             "kind": row.movement_kind,
             "eligible": str(row.movement_kind or "") in _SAFE_REALIZATION_KINDS,
+            "realizable_qty": str(
+                realizable_qty_by_sle.get(int(row.id), Decimal("0"))
+            ),
         }
         for row in candidate_rows
     ]
@@ -406,6 +420,8 @@ def run_historical_replay(
         "excluded_make_facts": excluded_make_facts,
         "excluded_make_qty": str(excluded_make_qty),
         "excluded_make_samples": excluded_make_samples,
+        "netted_internal_transfer_facts": netted_internal_transfer_facts,
+        "netted_internal_transfer_qty": str(netted_internal_transfer_qty),
         "excluded_pre_replay_facts": excluded_pre_replay,
         "replay_from": lower_bound.isoformat(),
         "input_checksum": _checksum(input_rows),
@@ -433,6 +449,18 @@ def run_historical_replay(
         )
         db.add(batch)
     else:
+        # Realization events are append-only and keyed by ``sle_id``.  A batch
+        # written by another fact selection already persisted events this run
+        # can no longer reproduce, so folding both together would publish a
+        # silently mixed truth.  Fail closed: the generation must be discarded
+        # and rebuilt.
+        if str(batch.algorithm_version or "") != _ALGORITHM_VERSION:
+            raise ValueError(
+                f"historical replay batch {int(batch.id)} was produced by "
+                f"algorithm {str(batch.algorithm_version or '')!r}; discard "
+                f"generation {int(generation.id)} and rebuild it with "
+                f"{_ALGORITHM_VERSION}"
+            )
         batch.status = "completed"
         batch.metrics = metrics
         batch.completed_at = datetime.now(timezone.utc)

@@ -1,7 +1,8 @@
 """Persist assembly-output allocation decisions for a BUILDING generation.
 
 The stage is deterministic:
-- read only visible positive ``assembly_in`` facts
+- read only the net output of every visible assembly document
+  (``document_net_output.py``), never the raw ``assembly_in`` lines
 - allocate only against the generation's sealed live-plan scope and fixed headers
 - sort candidates by fixed planning FIFO order
 - share remaining candidate capacities across facts
@@ -25,12 +26,17 @@ from app.services.item_ledger.assembly_output_core import (
     QueueCandidate,
     allocate_output_fact,
 )
+from app.services.item_ledger.document_net_output import (
+    NETTED_MOVEMENT_KINDS,
+    OUTPUT_MOVEMENT_KIND,
+    net_document_output_qty,
+)
 from app.services.item_ledger.physical_visibility import visible_sle_query
 from app.services.item_ledger.recorder_identity import build_recorder_identity_index
 from app.services.item_ledger.assembly_queue_snapshot import materialize_assembly_queue_lines
 
 _STAGE = "assembly_output_allocation"
-_ALGORITHM_VERSION = "assembly-output-allocation/2"
+_ALGORITHM_VERSION = "assembly-output-allocation/3"
 _BATCH_INTERNAL_KEYS = {"batch_version", "fact_signature", "allocation_signature"}
 
 
@@ -111,6 +117,9 @@ def _load_visible_facts(
             current_generation_allocated_sle
         )
     )
+    # Netting reads the whole visible document, including the lines already
+    # accepted by an ancestor generation: the net output of one document must
+    # not depend on which of its lines this generation still owns.
     rows = (
         visible_sle_query(
             db,
@@ -118,9 +127,9 @@ def _load_visible_facts(
             cutoff=generation.cutoff,
         )
         .filter(
-            models.StockLedgerEntry.movement_kind == "assembly_in",
-            models.StockLedgerEntry.qty > 0,
-            ~models.StockLedgerEntry.id.in_(already_accepted_sle),
+            models.StockLedgerEntry.movement_kind.in_(
+                sorted(NETTED_MOVEMENT_KINDS)
+            ),
         )
         .order_by(
             models.StockLedgerEntry.posting_at.asc(),
@@ -128,19 +137,27 @@ def _load_visible_facts(
         )
         .all()
     )
+    net_qty_by_sle = net_document_output_qty(rows)
+    accepted_ids = {
+        int(value) for (value,) in already_accepted_sle.all() if value is not None
+    }
 
     return tuple(
         _OutputFact(
             stock_ledger_entry_id=int(row.id),
             item_id=int(row.item_id),
             posting_at=row.posting_at,
-            qty=_dec(row.qty),
+            qty=net_qty_by_sle[int(row.id)],
             source_content_hash=_text(row.source_content_hash),
             recorder_type=_text(row.recorder_type),
             recorder_ref=_text(row.recorder_ref),
             line_no=_text(row.line_no),
         )
         for row in rows
+        if _text(row.movement_kind) == OUTPUT_MOVEMENT_KIND
+        and _dec(row.qty) > 0
+        and int(row.id) not in accepted_ids
+        and net_qty_by_sle.get(int(row.id), Decimal("0")) > 0
     )
 
 

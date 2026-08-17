@@ -50,6 +50,8 @@ def _sline(
     recorder="REC",
     movement_kind="assembly_in",
     content_hash="c" * 64,
+    warehouse_ref1c="",
+    line_no="1",
 ):
     row = models.StockLedgerEntry(
         ingest_batch_id=int(batch.id),
@@ -57,7 +59,7 @@ def _sline(
         item_id=int(item.item_id),
         characteristic_ref="",
         organization_ref="",
-        warehouse_ref1c="",
+        warehouse_ref1c=warehouse_ref1c,
         qty=Decimal(str(qty)),
         qty_after=Decimal(str(qty)),
         posting_at=at,
@@ -65,7 +67,7 @@ def _sline(
         movement_kind=movement_kind,
         recorder_type="Production",
         recorder_ref=recorder,
-        line_no="1",
+        line_no=line_no,
         ingest_source="pull",
         active=True,
     )
@@ -874,3 +876,260 @@ def test_fully_allocated_queue_line_is_fulfilled_and_excluded_from_snapshot(
 
     repeated = materialize_assembly_output_allocations(db_session, generation.id)
     assert repeated["allocations"] == 1
+
+
+def test_physical_refresh_child_allocates_output_to_inherited_live_scope(db_session):
+    """Reproduces the empty-queue defect: runs anchored to the parent generation.
+
+    A physical refresh forks only physical lineage and never re-anchors the
+    frozen runs, so its live-plan scope must be inherited.  Without that the
+    queue is empty, every accepted output becomes surplus, and plan execution
+    silently stays at zero.
+    """
+    parent_cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _building_generation(db_session, key="inherit-parent", cutoff=parent_cutoff)
+    parent.status = "accepted"
+    item = _item(db_session, "ASM-INHERIT")
+    plan, run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("10"),
+        period_from=date(2026, 7, 1),
+    )
+
+    child_cutoff = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    child = _building_generation(db_session, key="inherit-child", cutoff=child_cutoff)
+    child.source_watermarks = {
+        "parent_generation_id": int(parent.id),
+        "generation_kind": "physical_refresh",
+    }
+    db_session.flush()
+    _sline(
+        db_session,
+        batch=child.physical_import_batch,
+        item=item,
+        qty="4",
+        at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        movement_kind="assembly_in",
+        recorder="inherit-1",
+        content_hash="e" * 64,
+    )
+
+    result = materialize_assembly_output_allocations(db_session, int(child.id))
+
+    assert result["allocations"] == 1
+    assert Decimal(result["surplus_total"]) == Decimal("0")
+
+    facts = (
+        db_session.query(models.ProductionPlanExecutionFact)
+        .filter_by(plan_line_id=int(line.id))
+        .all()
+    )
+    assert [Decimal(str(row.allocated_qty)) for row in facts] == [Decimal("4")]
+    assert [int(row.run_id) for row in facts] == [int(run.run_id)]
+
+    db_session.refresh(line)
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("4")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("6")
+
+    queue_row = (
+        db_session.query(models.AssemblyQueueLine)
+        .filter_by(ledger_generation_id=int(child.id), plan_line_id=int(line.id))
+        .one()
+    )
+    assert Decimal(str(queue_row.accepted_plan_output_qty)) == Decimal("4")
+    assert Decimal(str(queue_row.assembly_remaining_qty)) == Decimal("6")
+
+
+def _assembly_document(db, *, batch, item, at, recorder, qty, destination):
+    """One ``СборкаЗапасов``: ``+N`` in production, ``-N`` out, ``+N`` on stock."""
+    _sline(
+        db,
+        batch=batch,
+        item=item,
+        qty=qty,
+        at=at,
+        recorder=recorder,
+        movement_kind="assembly_in",
+        warehouse_ref1c="WH-PROD",
+        line_no="1",
+    )
+    _sline(
+        db,
+        batch=batch,
+        item=item,
+        qty=f"-{qty}",
+        at=at,
+        recorder=recorder,
+        movement_kind="assembly_out",
+        warehouse_ref1c="WH-PROD",
+        line_no="2",
+    )
+    return _sline(
+        db,
+        batch=batch,
+        item=item,
+        qty=qty,
+        at=at,
+        recorder=recorder,
+        movement_kind="assembly_in",
+        warehouse_ref1c=destination,
+        line_no="3",
+    )
+
+
+def test_internal_transfer_of_one_document_is_not_plan_output(db_session):
+    """``+N -N +N`` of one document closes N of the plan line, never 2N."""
+    cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="net-output", cutoff=cutoff)
+    item = _item(db_session, "ASM-NET")
+
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("12"),
+        period_from=date(2026, 8, 1),
+    )
+    destination = _assembly_document(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        recorder="net-output-1",
+        qty="6",
+        destination="WH-FG",
+    )
+
+    result = materialize_assembly_output_allocations(db_session, generation.id)
+
+    assert result["facts"] == 1
+    assert Decimal(result["fact_qty"]) == Decimal("6")
+    assert Decimal(result["allocated_qty"]) == Decimal("6")
+    assert Decimal(result["surplus_total"]) == Decimal("0")
+    allocations = db_session.query(models.AssemblyOutputAllocation).filter_by(
+        ledger_generation_id=generation.id,
+    ).all()
+    assert len(allocations) == 1
+    # The surviving fact is the leg where the stock actually stayed.
+    assert int(allocations[0].stock_ledger_entry_id) == int(destination.id)
+    queue = (
+        db_session.query(models.AssemblyQueueLine)
+        .filter_by(ledger_generation_id=generation.id, plan_line_id=line.id)
+        .one()
+    )
+    assert queue.accepted_plan_output_qty == Decimal("6")
+    assert queue.assembly_remaining_qty == Decimal("6")
+
+
+def test_component_transit_of_one_document_is_not_plan_output(db_session):
+    """A component moved in and consumed by the same document closes nothing."""
+    cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="net-transit", cutoff=cutoff)
+    item = _item(db_session, "ASM-TRANSIT")
+
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("6"),
+        period_from=date(2026, 8, 1),
+    )
+    at = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="-6",
+        at=at,
+        recorder="net-transit-1",
+        movement_kind="assembly_out",
+        warehouse_ref1c="WH-SRC",
+        line_no="1",
+    )
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="6",
+        at=at,
+        recorder="net-transit-1",
+        movement_kind="assembly_in",
+        warehouse_ref1c="WH-PROD",
+        line_no="2",
+    )
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="-6",
+        at=at,
+        recorder="net-transit-1",
+        movement_kind="assembly_out",
+        warehouse_ref1c="WH-PROD",
+        line_no="3",
+    )
+
+    result = materialize_assembly_output_allocations(db_session, generation.id)
+
+    assert result["facts"] == 0
+    assert Decimal(result["fact_qty"]) == Decimal("0")
+    assert result["allocations"] == 0
+    queue = (
+        db_session.query(models.AssemblyQueueLine)
+        .filter_by(ledger_generation_id=generation.id, plan_line_id=line.id)
+        .one()
+    )
+    assert queue.accepted_plan_output_qty == Decimal("0")
+    assert queue.assembly_remaining_qty == Decimal("6")
+
+
+def test_separate_documents_never_net_against_each_other(db_session):
+    """Netting is bounded by one document, so two outputs stay two outputs."""
+    cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="net-two-docs", cutoff=cutoff)
+    item = _item(db_session, "ASM-TWO-DOCS")
+
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("12"),
+        period_from=date(2026, 8, 1),
+    )
+    _assembly_document(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        recorder="net-two-docs-1",
+        qty="6",
+        destination="WH-FG",
+    )
+    _assembly_document(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+        recorder="net-two-docs-2",
+        qty="6",
+        destination="WH-FG",
+    )
+
+    result = materialize_assembly_output_allocations(db_session, generation.id)
+
+    assert result["facts"] == 2
+    assert Decimal(result["fact_qty"]) == Decimal("12")
+    assert Decimal(result["allocated_qty"]) == Decimal("12")
+    queue = (
+        db_session.query(models.AssemblyQueueLine)
+        .filter_by(ledger_generation_id=generation.id, plan_line_id=line.id)
+        .one()
+    )
+    assert queue.accepted_plan_output_qty == Decimal("12")
+    assert queue.assembly_remaining_qty == Decimal("0")
