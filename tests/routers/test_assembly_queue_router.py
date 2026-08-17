@@ -118,6 +118,8 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
                 "accepted_plan_output_qty": 3.0,
                 "assembly_remaining_qty": 7.0,
                 "priority_key": ["2026-08-01", "2026-08-31", 4001, 4101],
+                "sort_key": "2026-08-01|2026-08-31|0000004001|0000004101",
+                "eligible_from": "2026-08-01T00:00:00.000000Z",
             },
             {
                 "run_id": 3002,
@@ -133,6 +135,8 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
                 "accepted_plan_output_qty": 5.0,
                 "assembly_remaining_qty": 15.0,
                 "priority_key": ["2026-09-01", "2026-09-30", 4002, 4102],
+                "sort_key": "2026-09-01|2026-09-30|0000004002|0000004102",
+                "eligible_from": "2026-09-01T00:00:00.000000Z",
             },
         ],
         "total_rows": 2,
@@ -173,6 +177,10 @@ def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_sessi
             "accepted_plan_output_qty": 0.0,
             "assembly_remaining_qty": 10.0,
             "priority_key": ["2026-08-01", "2026-08-31", 4000 + index, 4100 + index],
+            "sort_key": (
+                f"2026-08-01|2026-08-31|{4000 + index:010d}|{4100 + index:010d}"
+            ),
+            "eligible_from": "2026-08-01T00:00:00.000000Z",
         }
         for index in range(5)
     ]

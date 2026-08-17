@@ -96,6 +96,11 @@ class AssemblyQueueRow(BaseModel):
     accepted_plan_output_qty: float
     assembly_remaining_qty: float
     priority_key: list[Union[str, int]]
+    # Frozen ordering of the snapshot row: the queue is published with both, and
+    # the endpoint never saw them only because the queue had been empty since
+    # the live-plan scope was lost.
+    sort_key: str
+    eligible_from: Optional[str] = None
 
 
 class AssemblyQueueResponse(BaseModel):

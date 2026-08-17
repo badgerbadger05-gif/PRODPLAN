@@ -3225,6 +3225,10 @@ export interface components {
             assembly_remaining_qty: number;
             /** Priority Key */
             priority_key: (string | number)[];
+            /** Sort Key */
+            sort_key: string;
+            /** Eligible From */
+            eligible_from?: string | null;
         };
         /** AssemblyRateListResponse */
         AssemblyRateListResponse: {
