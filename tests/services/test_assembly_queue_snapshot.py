@@ -6,6 +6,7 @@ import pytest
 from app import models
 from app.services.item_ledger import assembly_queue_snapshot
 from app.services.item_ledger import drum_schedule_persistence
+from app.services.item_ledger import live_plan_scope
 from app.services.item_ledger.drum_schedule_persistence import (
     materialize_drum_schedule,
 )
@@ -535,3 +536,146 @@ def test_assembly_queue_snapshot_ignores_live_plan_changes_after_materialization
 
     with pytest.raises(ValueError, match="conflicts"):
         assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
+
+
+def _forked_generation(db, *, key: str, parent, kind: str, cutoff, watermarks=None):
+    """Fork a child generation the way the real lifecycle seals its lineage."""
+    generation = _building_generation(db, key=key, cutoff=cutoff)
+    generation.source_watermarks = {
+        "parent_generation_id": int(parent.id),
+        "generation_kind": kind,
+        **(watermarks or {}),
+    }
+    db.flush()
+    return generation
+
+
+def _live_plan_fixture(db, *, key: str, cutoff):
+    """One accepted generation carrying one live run, plan and plan line."""
+    parent = _building_generation(db, key=key, cutoff=cutoff)
+    parent.status = "accepted"
+    item = models.Item(item_code=f"FG-{key.upper()}", item_name=f"Inherited {key}")
+    plan = _production_plan(db, start=date(2026, 8, 1), end=date(2026, 8, 31))
+    db.add_all((item, plan))
+    db.flush()
+    run = _run(db, generation=parent, plan=plan)
+    line = _plan_line(db, plan=plan, item=item, bucket_date=date(2026, 8, 4), qty="12")
+    db.flush()
+    return parent, plan, run, line
+
+
+def test_physical_refresh_inherits_live_plan_scope_from_sealed_lineage(db_session):
+    """A physical refresh publishes new facts, not new obligations.
+
+    The runs stay anchored to the ancestor which last re-anchored them, so the
+    child must inherit that scope instead of resolving an empty one and wiping
+    the assembly queue.
+    """
+    cutoff = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    parent, plan, run, line = _live_plan_fixture(db_session, key="inherit", cutoff=cutoff)
+
+    child = _forked_generation(
+        db_session,
+        key="inherit-child",
+        parent=parent,
+        kind="physical_refresh",
+        cutoff=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    child.status = "accepted"
+    grandchild = _forked_generation(
+        db_session,
+        key="inherit-grandchild",
+        parent=child,
+        kind="physical_refresh",
+        cutoff=datetime(2026, 8, 16, tzinfo=timezone.utc),
+    )
+
+    assert live_plan_scope.live_plan_run_ids(db_session, grandchild) == (int(run.run_id),)
+
+    snapshot = assembly_queue_snapshot.build_assembly_queue_snapshot(
+        db_session, int(grandchild.id)
+    )
+    assert snapshot.payload["total_rows"] == 1
+    assert snapshot.payload["total_queue_qty"] == 12.0
+    queue_rows = (
+        db_session.query(models.AssemblyQueueLine)
+        .filter_by(ledger_generation_id=int(grandchild.id))
+        .all()
+    )
+    assert [int(row.plan_line_id) for row in queue_rows] == [int(line.id)]
+    assert [int(row.planning_run_id) for row in queue_rows] == [int(run.run_id)]
+
+
+def test_inherited_live_plan_scope_drops_a_closed_run(db_session):
+    cutoff = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    parent, _plan, run, _line = _live_plan_fixture(db_session, key="closed", cutoff=cutoff)
+    child = _forked_generation(
+        db_session,
+        key="closed-child",
+        parent=parent,
+        kind="physical_refresh",
+        cutoff=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+
+    run.status = "CLOSED"
+    db_session.flush()
+
+    assert live_plan_scope.live_plan_run_ids(db_session, child) == ()
+    snapshot = assembly_queue_snapshot.build_assembly_queue_snapshot(
+        db_session, int(child.id)
+    )
+    assert snapshot.payload["total_rows"] == 0
+
+
+def test_obligation_refresh_manifest_still_owns_its_scope(db_session):
+    """Inheritance must not leak into the retain/retire manifest branch."""
+    cutoff = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    parent, _plan, run, _line = _live_plan_fixture(db_session, key="manifest", cutoff=cutoff)
+    child = _forked_generation(
+        db_session,
+        key="manifest-child",
+        parent=parent,
+        kind="obligation_refresh",
+        cutoff=datetime(2026, 8, 15, tzinfo=timezone.utc),
+        watermarks={
+            "obligation_refresh_manifest": {
+                "entries": [{"action": "retire", "parent_run_id": int(run.run_id)}]
+            }
+        },
+    )
+
+    assert live_plan_scope.live_plan_run_ids(db_session, child) == ()
+
+    retained = _forked_generation(
+        db_session,
+        key="manifest-retained",
+        parent=parent,
+        kind="obligation_refresh",
+        cutoff=datetime(2026, 8, 16, tzinfo=timezone.utc),
+        watermarks={
+            "obligation_refresh_manifest": {
+                "entries": [{"action": "retain", "parent_run_id": int(run.run_id)}]
+            }
+        },
+    )
+    assert live_plan_scope.live_plan_run_ids(db_session, retained) == (int(run.run_id),)
+
+
+def test_inherited_live_plan_scope_fails_closed_on_broken_lineage(db_session):
+    cutoff = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    parent, _plan, _run, _line = _live_plan_fixture(db_session, key="broken", cutoff=cutoff)
+    child = _forked_generation(
+        db_session,
+        key="broken-child",
+        parent=parent,
+        kind="physical_refresh",
+        cutoff=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+    child.source_watermarks = {
+        **dict(child.source_watermarks or {}),
+        "parent_generation_id": int(parent.id) + 10_000,
+    }
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="lost its sealed parent"):
+        live_plan_scope.live_plan_run_ids(db_session, child)
