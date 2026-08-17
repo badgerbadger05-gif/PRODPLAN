@@ -11197,6 +11197,21 @@
             },
             "type": "array",
             "title": "Priority Key"
+          },
+          "sort_key": {
+            "type": "string",
+            "title": "Sort Key"
+          },
+          "eligible_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eligible From"
           }
         },
         "additionalProperties": false,
@@ -11214,7 +11229,8 @@
           "planned_output_qty",
           "accepted_plan_output_qty",
           "assembly_remaining_qty",
-          "priority_key"
+          "priority_key",
+          "sort_key"
         ],
         "title": "AssemblyQueueRow"
       },
