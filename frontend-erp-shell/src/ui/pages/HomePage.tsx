@@ -82,6 +82,7 @@ export function HomePage() {
               <button className="primary" onClick={() => navigate('/period-plan')}>Планирование выпуска</button>
               <button onClick={() => navigate('/production-control')}>Журнал заказов</button>
               <button onClick={() => navigate('/production-report-week')}>Выпуск недельный</button>
+              <button onClick={() => navigate('/release-feasibility')}>Проверка выпуска</button>
               <button onClick={() => navigate('/mrp-runs')}>MRP прогоны</button>
               <button onClick={() => navigate('/sync')}>Синхронизация</button>
               <button onClick={() => navigate('/resources')}>Ресурсы</button>
