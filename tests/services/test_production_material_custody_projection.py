@@ -452,6 +452,98 @@ def test_projection_orders_late_recovered_issue_opening_before_same_time_transfe
     assert custody.at_workshop[int(component.item_id)] == pytest.approx(93.0)
 
 
+def test_projection_orders_issue_opening_before_a_subsecond_later_transfer(
+    db_session,
+):
+    """1C publishes whole seconds; the opening carries microseconds.
+
+    The shadow stand froze on exactly this: an issue created at 10:50:28.269806
+    was exported and posted in 1C at 10:50:28, so the transfer looked 0.27 s
+    older than the reservation it consumes.  The fold went negative, the whole
+    Ledger refresh failed closed, and with it every planning consumer.
+    """
+    base = _generation(
+        db_session,
+        key="custody-proj-subsecond-base",
+        cutoff=datetime(2026, 7, 29, tzinfo=timezone.utc),
+    )
+    target = _generation(
+        db_session,
+        key="custody-proj-subsecond-target",
+        cutoff=datetime(2026, 7, 31, tzinfo=timezone.utc),
+    )
+    product, _parent, component = _product(db_session, item_code="SUBSECOND")
+    issue = ProductionMaterialIssue(
+        document_number="MT-SUBSECOND-1",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WH-DEST",
+        source_warehouse_ref1c="WH-SRC",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    posted_at = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+    created_at = posted_at + timedelta(microseconds=269806)
+    outbound = StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="c" * 64,
+        item_id=component.item_id,
+        warehouse_ref1c="WH-SRC",
+        qty=-20,
+        posting_at=posted_at,
+        movement_kind="transfer_out",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="transfer-subsecond",
+        line_no="1",
+    )
+    inbound = StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="d" * 64,
+        item_id=component.item_id,
+        warehouse_ref1c="WH-DEST",
+        qty=20,
+        posting_at=posted_at,
+        movement_kind="transfer_in",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="transfer-subsecond",
+        line_no="2",
+    )
+    db_session.add_all([outbound, inbound])
+    db_session.flush()
+    # The opening is stamped by PRODPLAN with microseconds, the physical events
+    # by 1C with whole seconds — so the opening looks the *newest* of the three.
+    _event(
+        db_session, source_kind="issue_created", issue_id=issue.issue_id,
+        product_id=product.product_id, component_id=component.item_id,
+        location="transit", warehouse="WH-SRC", qty=20,
+        key="custody:event:subsecond:opening", effective_at=created_at,
+    )
+    _event(
+        db_session, source_kind="transfer_posted", issue_id=issue.issue_id,
+        product_id=product.product_id, component_id=component.item_id,
+        location="transit", warehouse="WH-SRC", qty=-20,
+        key="custody:event:subsecond:out", effective_at=posted_at,
+        source_sle_id=outbound.id,
+    )
+    _event(
+        db_session, source_kind="transfer_posted", issue_id=issue.issue_id,
+        product_id=product.product_id, component_id=component.item_id,
+        location="workshop", warehouse="WH-DEST", qty=20,
+        key="custody:event:subsecond:in", effective_at=posted_at,
+        source_sle_id=inbound.id,
+    )
+    _manifest(db_session, generation_id=base.id, source_event_high_watermark_id=0)
+    _manifest(db_session, generation_id=target.id, source_event_high_watermark_id=3)
+    db_session.commit()
+
+    state = load_material_custody_projection(db_session, ledger_generation_id=target.id)
+    custody = state.for_product(int(product.product_id))
+    assert custody.in_transit == {}
+    assert custody.at_workshop[int(component.item_id)] == pytest.approx(20.0)
+
+
 def test_projection_ignores_late_duplicate_events_from_exact_sle_reimport(db_session):
     base = _generation(
         db_session, key="custody-proj-reimport-base",

@@ -57,6 +57,12 @@ from .item_ledger.reconcile import (
     BalanceSnapshotItemResolutionError,
     build_balance_snapshot,
 )
+from .item_ledger.physical_refresh_candidacy import (
+    CANDIDATE_CURRENT,
+    CANDIDATE_SUPERSEDED,
+    building_physical_refresh_candidates,
+    classify_physical_refresh_candidate,
+)
 from .item_ledger.physical_refresh_discard import (
     discard_physical_refresh_candidate,
 )
@@ -363,78 +369,48 @@ def _has_current_accepted_parent(db: Optional[Session]) -> bool:
         return False
 
 
-def _building_physical_refreshes(
-    db: Session,
-    parent_generation_id: int,
-) -> list[models.LedgerGeneration]:
-    result: list[models.LedgerGeneration] = []
-    for generation in (
-        db.query(models.LedgerGeneration)
-        .filter(models.LedgerGeneration.status == "building")
-        .order_by(models.LedgerGeneration.id.asc())
-        .all()
-    ):
-        marks = dict(generation.source_watermarks or {})
-        if (
-            marks.get("generation_kind") == "physical_refresh"
-            and int(marks.get("parent_generation_id") or -1)
-            == int(parent_generation_id)
-        ):
-            result.append(generation)
-    return result
+def _empty_physical_inventory() -> Dict[str, Any]:
+    return {
+        "total": 0,
+        "recoverable": [],
+        "superseded": [],
+        "unexpected": [],
+    }
 
 
 def _physical_refresh_inventory(
-    db: Optional[Session], parent_generation_id: Optional[int]
+    db: Optional[Session],
+    accepted_parent: Optional[models.LedgerGeneration],
 ) -> Dict[str, Any]:
-    """Inventory every BUILDING generation that looks like a physical refresh."""
-    inventory: Dict[str, Any] = {
-        "total": 0,
-        "recoverable": [],
-        "unexpected": [],
-    }
+    """Inventory every BUILDING generation that looks like a physical refresh.
+
+    Three outcomes, not two: a candidate of the current pointer is resumable, a
+    candidate of a sealed ancestor was outrun by the pointer and is rolled back
+    automatically, and anything else is a foreign or malformed row an operator
+    must look at.
+    """
+    inventory = _empty_physical_inventory()
     if db is None or not hasattr(db, "query"):
         return inventory
-    rows = (
-        db.query(models.LedgerGeneration)
-        .filter(models.LedgerGeneration.status == "building")
-        .order_by(models.LedgerGeneration.id.asc())
-        .all()
-    )
-    for generation in rows:
-        marks = dict(generation.source_watermarks or {})
-        key = str(generation.generation_key or "")
-        algorithm = str(generation.algorithm_version or "")
-        looks_like = (
-            marks.get("generation_kind") == "physical_refresh"
-            or key.startswith("physical-refresh:")
-            or "physical-refresh" in algorithm
-        )
-        if not looks_like:
-            continue
+    for generation in building_physical_refresh_candidates(db):
         inventory["total"] += 1
-        parent_id = marks.get("parent_generation_id")
-        valid_parent = False
-        try:
-            valid_parent = parent_generation_id is not None and int(parent_id) == int(parent_generation_id)
-        except (TypeError, ValueError):
-            valid_parent = False
-        well_formed = (
-            marks.get("generation_kind") == "physical_refresh"
-            and valid_parent
-            and generation.cutoff is not None
-            and bool(key)
+        marks = dict(generation.source_watermarks or {})
+        verdict = classify_physical_refresh_candidate(
+            db, generation, accepted_parent
         )
-        if well_formed:
+        if verdict == CANDIDATE_CURRENT:
             inventory["recoverable"].append(generation)
+            continue
+        if verdict == CANDIDATE_SUPERSEDED:
+            inventory["superseded"].append(generation)
             continue
         inventory["unexpected"].append({
             "generation_id": int(generation.id),
-            "generation_key": key,
-            "parent_generation_id": parent_id,
+            "generation_key": str(generation.generation_key or ""),
+            "parent_generation_id": marks.get("parent_generation_id"),
             "generation_kind": marks.get("generation_kind"),
-            "algorithm_version": algorithm,
-            "reason": "malformed_or_non_current_parent",
+            "algorithm_version": str(generation.algorithm_version or ""),
+            "reason": "malformed_or_foreign_parent",
         })
     return inventory
 
@@ -460,7 +436,6 @@ def _physical_terminal_preflight(
     result["global_physical_terminal_id"] = int(global_id) if global_id is not None else None
     if accepted_id is None or global_id is None or int(global_id) == accepted_id:
         return result
-    current_parent_id = int(parent_generation.id) if parent_generation is not None else None
     explained = (
         db.query(models.LedgerGeneration)
         .filter(
@@ -470,12 +445,13 @@ def _physical_terminal_preflight(
         .all()
     )
     for generation in explained:
-        marks = dict(generation.source_watermarks or {})
-        try:
-            same_parent = int(marks.get("parent_generation_id")) == current_parent_id
-        except (TypeError, ValueError):
-            same_parent = False
-        if marks.get("generation_kind") == "physical_refresh" and same_parent:
+        # A candidate of a sealed ancestor explains the terminal just as well as
+        # a candidate of the pointer itself: both are our own build holding its
+        # own batches.  Only the second is resumable, but neither is the
+        # unexplained terminal this preflight exists to catch.
+        if classify_physical_refresh_candidate(
+            db, generation, parent_generation
+        ) in {CANDIDATE_CURRENT, CANDIDATE_SUPERSEDED}:
             result["explained_by_generation_id"] = int(generation.id)
             return result
     batch = db.get(models.PhysicalImportBatch, int(global_id))
@@ -508,7 +484,28 @@ def _physical_refresh_block(
     These conditions used to abort the whole tick. They are local to the
     physical contour, so they now fence that one slot: the 15 reference syncs
     keep their schedule while an operator reviews the conflict.
+
+    A candidate the pointer has outrun is one of them, and deliberately so: the
+    rollback is destructive and its cause — a rebase that moved the pointer under
+    a live build — is worth a human look before the evidence is deleted.  What
+    the lineage check buys is the right diagnosis and a one-command recovery
+    instead of an unexplained terminal conflict that fences the contour for good.
     """
+    superseded = inventory.get("superseded") or []
+    if superseded:
+        return {
+            "code": "superseded_building_refresh",
+            "message": (
+                "physical refresh candidate(s) "
+                + ", ".join(str(int(generation.id)) for generation in superseded)
+                + " descend from a Ledger generation the planning-truth pointer "
+                "has already left, so they can never be published and still hold "
+                "the physical terminal. Roll one back with POST "
+                "/api/v1/item-ledger/admin/physical-refresh/discard "
+                "{ledger_generation_id, reason} after checking why it stopped."
+            ),
+            "details": [int(generation.id) for generation in superseded],
+        }
     if terminal_preflight.get("terminal_conflict"):
         return {
             "code": "terminal_conflict",
@@ -812,8 +809,7 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         active_parent_for_inventory = _current_accepted_parent(db) if _has_current_accepted_parent(db) else None
         terminal_preflight = _physical_terminal_preflight(db, active_parent_for_inventory)
         physical_inventory = _physical_refresh_inventory(
-            db,
-            int(active_parent_for_inventory.id) if active_parent_for_inventory is not None else None,
+            db, active_parent_for_inventory
         )
         physical_block = _physical_refresh_block(
             terminal_preflight, physical_inventory, physical_state
@@ -1046,22 +1042,17 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "next_due_at": next_due,
             "due_now": last is None or (now - last).total_seconds() >= interval,
         })
-    current_parent_id: int | None = None
-    physical_inventory: Dict[str, Any] = {
-        "total": 0,
-        "recoverable": [],
-        "unexpected": [],
-    }
+    current_parent: Optional[models.LedgerGeneration] = (
+        _current_accepted_parent(db)
+        if db is not None and _has_current_accepted_parent(db)
+        else None
+    )
+    physical_inventory: Dict[str, Any] = _empty_physical_inventory()
     terminal_preflight: Dict[str, Any] = _physical_terminal_preflight(
-        db,
-        _current_accepted_parent(db) if db is not None and _has_current_accepted_parent(db) else None,
+        db, current_parent
     )
     if db is not None:
-        try:
-            current_parent_id = int(_current_accepted_parent(db).id)
-        except Exception:
-            pass
-        physical_inventory = _physical_refresh_inventory(db, current_parent_id)
+        physical_inventory = _physical_refresh_inventory(db, current_parent)
     physical_state = _physical_refresh_state(state)
     if db is not None:
         block = _physical_refresh_block(
@@ -1100,6 +1091,12 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "last_result": _physical_refresh_state(state).get("last_result"),
             "building_inventory_total": int(physical_inventory["total"]),
             "recoverable_building_count": len(physical_inventory["recoverable"]),
+            # Unpublishable by construction; an operator rolls them back.
+            "superseded_building_count": len(physical_inventory["superseded"]),
+            "superseded_buildings": [
+                int(generation.id)
+                for generation in physical_inventory["superseded"]
+            ],
             "unexpected_building_count": len(physical_inventory["unexpected"]),
             "unexpected_buildings": physical_inventory["unexpected"],
             "accepted_physical_terminal_id": terminal_preflight["accepted_physical_terminal_id"],

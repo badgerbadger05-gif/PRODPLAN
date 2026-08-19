@@ -18,8 +18,17 @@ ledger then double-counts every recorder the candidate had touched.
 
 This module performs the whole rollback as one checked unit and refuses to
 commit anything it cannot prove: the accepted parent's visible truth must come
-out byte-identical, no recorder line may end up with two live revisions, and the
-active flag must agree with the supersession graph in both directions.
+out byte-identical, the rollback must not leave a single recorder line with more
+live revisions than it found, and the active flag must agree with the
+supersession graph in both directions.
+
+The revision check is deliberately differential.  Damage below the boundary
+predates the candidate and no rollback can repair it; judging it as an absolute
+post-condition made two lines broken weeks earlier veto every future rollback,
+so the physical contour stayed fenced, the Ledger cutoff froze and a day later
+every consumer failed closed on the freshness threshold.  Such damage is
+reported, never silently accepted, and never confused with damage this rollback
+would cause.
 """
 
 from __future__ import annotations
@@ -38,6 +47,9 @@ from .physical_visibility import visible_sle_query
 
 
 ALGORITHM_VERSION = "ledger-physical-refresh-discard/1"
+#: Rows imported from a 1C recorder document, as opposed to synthetic
+#: adjustments (balance snaps, opening reconciliation) and the historical seed.
+DOCUMENT_PULL_SOURCE = "document_pull"
 REJECTED_STATUS = "rejected"
 REASON_KEY = "rejected_reason"
 DISCARDED_BOUNDARY_KEY = "rejected_physical_import_batch_id"
@@ -60,6 +72,8 @@ class PhysicalRefreshDiscardResult:
     deleted_generation_rows: dict[str, int]
     reactivated_entries: int
     parent_fingerprint: tuple[int, str]
+    #: Damage that predates this candidate: not repaired, never hidden.
+    preexisting_live_revision_conflicts: int
 
 
 def _fingerprint(db: Session, physical_import_batch_id: int) -> tuple[int, str]:
@@ -116,20 +130,35 @@ def _active_invariant_violations(db: Session) -> int:
 
 
 def _live_revision_conflicts(db: Session) -> int:
-    """Recorder lines left with more than one unsuperseded revision."""
+    """Pulled document lines left with more than one unsuperseded revision.
+
+    Scoped to ``document_pull`` on purpose.  "One live revision per recorder
+    line" is a property of a 1C document: a re-pull retires the previous
+    revision and records the supersession edge.  Synthetic rows do not work that
+    way — a balance snap writes ``1C minus ledger`` per cell under a recorder ref
+    keyed by the generation, so a second pass inside one build legitimately adds
+    a second row to the same line and the two are *meant* to add up.  Counting
+    those as damage reported corruption that does not exist and, worse, made two
+    healthy adjustment rows veto every rollback.
+
+    Measured before and after the rollback, never as an absolute verdict: a line
+    damaged below the boundary cannot be repaired by a discard that only removes
+    rows above it.
+    """
     return int(db.execute(text(
         """
         SELECT count(*) FROM (
             SELECT e.recorder_ref, e.line_no
             FROM stock_ledger_entry e
-            WHERE NOT EXISTS (
+            WHERE e.ingest_source = :document_pull
+              AND NOT EXISTS (
                 SELECT 1 FROM stock_ledger_fact_supersession s
                 WHERE s.old_sle_id = e.id)
             GROUP BY e.recorder_ref, e.line_no
             HAVING count(*) > 1
         ) conflicting
         """
-    )).scalar() or 0)
+    ), {"document_pull": DOCUMENT_PULL_SOURCE}).scalar() or 0)
 
 
 def _generation_scoped_tables() -> list[Any]:
@@ -217,6 +246,7 @@ def discard_physical_refresh_candidate(
     generation, parent, cut = _require_discardable(db, ledger_generation_id)
     boundary_before = int(generation.physical_import_batch_id or cut)
     expected_fingerprint = _fingerprint(db, cut)
+    conflicts_before = _live_revision_conflicts(db)
 
     deleted_generation_rows: dict[str, int] = {}
     for model in _generation_scoped_tables():
@@ -267,8 +297,11 @@ def discard_physical_refresh_candidate(
     if violations:
         problems.append(f"{violations} rows disagree with the supersession graph")
     conflicts = _live_revision_conflicts(db)
-    if conflicts:
-        problems.append(f"{conflicts} recorder lines have more than one live revision")
+    if conflicts > conflicts_before:
+        problems.append(
+            f"{conflicts} recorder lines have more than one live revision, "
+            f"{conflicts_before} before the rollback"
+        )
     terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
     if terminal is None or int(terminal) != cut:
         problems.append(f"physical terminal is {terminal}, expected {cut}")
@@ -289,4 +322,5 @@ def discard_physical_refresh_candidate(
         deleted_generation_rows=deleted_generation_rows,
         reactivated_entries=int(reactivated),
         parent_fingerprint=fingerprint,
+        preexisting_live_revision_conflicts=int(conflicts),
     )

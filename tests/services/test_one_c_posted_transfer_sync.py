@@ -21,6 +21,7 @@ from app.models import (
 from app.services import one_c_posted_transfer_sync as posted_sync
 from app.services.one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 from app.services.production_material_custody_events import (
+    append_material_issue_custody_event,
     project_transfer_custody_events_for_recorder,
 )
 
@@ -355,6 +356,151 @@ def test_ledger_projector_posts_transfer_custody_events(db_session, monkeypatch)
         .all()
     )
     assert len(events_after) == 3
+
+
+def test_ledger_projector_holds_only_what_was_reserved(db_session):
+    """Shipping more than was reserved is ordinary, and the surplus is not ours.
+
+    On the shadow stand four issue lines were posted in 1C above their
+    reservation (40.644 reserved, 49 moved).  Custody closes the reservation and
+    stops there: the surplus does reach the workshop, but as free stock for the
+    next issue, not as this product's hold.  Folding the whole movement drove
+    the transit cell negative and failed the entire Ledger build behind it.
+    """
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-surplus",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    line = issue.lines[0]
+    # The operator reserved 0.6 …
+    append_material_issue_custody_event(
+        db,
+        issue=issue,
+        line=line,
+        delta_qty=0.6,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        source_ref1c="WH-SRC",
+    )
+    db.flush()
+    batch = _mk_transfer_batch(db, batch_key="batch-surplus")
+    posting_at = datetime(2026, 7, 30, 12, 0, 0)
+    # … the storekeeper shipped 1.0.
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-surplus",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-1.0, posting_at=posting_at, line_no=1,
+    )
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-surplus",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=1.0, posting_at=posting_at, line_no=2,
+    )
+    db.commit()
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-surplus").all()
+
+    appended = project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-surplus",
+        stock_ledger_entries=rows,
+    )
+    db.commit()
+
+    assert appended == 2          # outbound and inbound, both clamped
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id))
+        .all()
+    )
+    transit = [e for e in events if e.location_kind == "transit"]
+    workshop = [e for e in events if e.location_kind == "workshop"]
+    # The reservation is closed exactly, never overdrawn …
+    assert sum(float(e.delta_qty) for e in transit) == pytest.approx(0.0)
+    # … and only the reserved part is held for this product at the workshop.
+    assert sum(float(e.delta_qty) for e in workshop) == pytest.approx(0.6)
+
+    # A replay changes nothing.
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-surplus",
+        stock_ledger_entries=rows,
+    ) == 0
+
+
+def test_ledger_projector_never_rewrites_a_transfer_it_already_recorded(db_session):
+    """Rows written by the older rule stay as they are — repair is not automatic.
+
+    A transfer recorded at its full quantity before custody was clamped leaves
+    the cell negative.  The projector must not quietly invent compensating
+    history for it: that is a one-off data correction someone decides on, with
+    the failure visible instead of silently absorbed.
+    """
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-legacy",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    line = issue.lines[0]
+    append_material_issue_custody_event(
+        db, issue=issue, line=line, delta_qty=0.6,
+        source_kind="issue_created", location_kind="transit",
+        warehouse_ref1c="WH-SRC", source_ref1c="WH-SRC",
+    )
+    batch = _mk_transfer_batch(db, batch_key="batch-legacy")
+    posting_at = datetime(2026, 7, 30, 12, 0, 0)
+    outbound = _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-legacy",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-1.0, posting_at=posting_at, line_no=1,
+    )
+    inbound = _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-legacy",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=1.0, posting_at=posting_at, line_no=2,
+    )
+    append_material_issue_custody_event(
+        db, issue=issue, line=line, delta_qty=-1.0,
+        source_kind="transfer_posted", location_kind="transit",
+        warehouse_ref1c="WH-SRC", source_ref1c="WH-SRC",
+        source_sle_id=int(outbound.id), effective_at=posting_at,
+    )
+    append_material_issue_custody_event(
+        db, issue=issue, line=line, delta_qty=1.0,
+        source_kind="transfer_posted", location_kind="workshop",
+        warehouse_ref1c="WH-DEST", source_ref1c="WH-SRC",
+        source_sle_id=int(inbound.id), effective_at=posting_at,
+    )
+    db.commit()
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-legacy").all()
+
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-legacy",
+        stock_ledger_entries=rows,
+    ) == 0
+    transit = [
+        event
+        for event in db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id))
+        .all()
+        if event.location_kind == "transit"
+    ]
+    assert sum(float(event.delta_qty) for event in transit) == pytest.approx(-0.4)
 
 
 def test_ledger_projector_dedupes_same_physical_transfer_reimport(db_session):

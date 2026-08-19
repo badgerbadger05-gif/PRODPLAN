@@ -31,10 +31,20 @@ def _batch(db_session, key, **kw):
     return batch
 
 
-def _entry(db_session, batch, *, recorder_ref, qty, item_id, line_no="1", active=True):
+def _entry(
+    db_session,
+    batch,
+    *,
+    recorder_ref,
+    qty,
+    item_id,
+    line_no="1",
+    active=True,
+    content_hash="h" * 64,
+):
     row = models.StockLedgerEntry(
         ingest_batch_id=int(batch.id),
-        source_content_hash="h" * 64,
+        source_content_hash=content_hash,
         item_id=item_id,
         characteristic_ref="",
         organization_ref="ORG",
@@ -313,3 +323,82 @@ def test_candidate_without_parent_lineage_is_refused(db_session):
         discard_physical_refresh_candidate(
             db_session, ledger_generation_id=int(candidate.id), reason="no"
         )
+
+
+def test_damage_below_the_boundary_does_not_veto_the_rollback(db_session):
+    """Two lines broken weeks earlier must not fence the physical contour.
+
+    The shadow stand carried exactly this: a recorder line with two live
+    revisions from an old incident, far below the accepted boundary.  Judged as
+    an absolute post-condition it made every rollback unprovable, so the stuck
+    candidate kept the physical terminal, the Ledger cutoff stopped moving and a
+    day later every consumer failed closed on the freshness threshold.
+    """
+    parent, candidate, _kept, item = _world(db_session)
+    parent_batch = db_session.get(
+        models.PhysicalImportBatch, int(parent.physical_import_batch_id)
+    )
+    # Pre-existing damage: one recorder line with two unsuperseded revisions,
+    # both below the boundary this rollback returns to.
+    _entry(
+        db_session,
+        parent_batch,
+        recorder_ref="doc-b",
+        qty="5",
+        item_id=item.item_id,
+        content_hash="d" * 64,
+    )
+    db_session.commit()
+
+    result = discard_physical_refresh_candidate(
+        db_session,
+        ledger_generation_id=int(candidate.id),
+        reason="rollback under pre-existing damage",
+    )
+    db_session.commit()
+
+    assert result.boundary_after == int(parent.physical_import_batch_id)
+    # Reported, never hidden — and never repaired by a rollback either.
+    assert result.preexisting_live_revision_conflicts == 1
+    assert (
+        db_session.get(models.LedgerGeneration, int(candidate.id)).status
+        == "rejected"
+    )
+
+
+def test_rollback_that_would_add_a_live_revision_is_still_refused(db_session):
+    """The differential rule still fails closed on damage the rollback causes."""
+    parent, candidate, kept, item = _world(db_session)
+    candidate_batch = db_session.get(
+        models.PhysicalImportBatch, int(candidate.physical_import_batch_id)
+    )
+    # A second parent-side revision of `doc-a` that only the candidate's edge
+    # retires: deleting that edge leaves two live revisions of one line.
+    second = _entry(
+        db_session,
+        db_session.get(
+            models.PhysicalImportBatch, int(parent.physical_import_batch_id)
+        ),
+        recorder_ref="doc-a",
+        qty="7",
+        item_id=item.item_id,
+        active=False,
+        content_hash="e" * 64,
+    )
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(second.id),
+        new_sle_id=int(kept.id),
+        import_batch_id=int(candidate_batch.id),
+    ))
+    db_session.commit()
+
+    with pytest.raises(PhysicalRefreshDiscardError) as exc:
+        discard_physical_refresh_candidate(
+            db_session,
+            ledger_generation_id=int(candidate.id),
+            reason="rollback that would double-count doc-a",
+        )
+    db_session.rollback()
+
+    assert "more than one live revision" in str(exc.value)
+    assert "0 before the rollback" in str(exc.value)

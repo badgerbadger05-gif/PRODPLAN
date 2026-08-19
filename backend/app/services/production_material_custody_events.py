@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -180,6 +181,44 @@ def append_material_issue_custody_terminal_release(
     )
 
 
+def _custody_balance(
+    db: Session,
+    *,
+    issue: ProductionMaterialIssue,
+    line: ProductionMaterialIssueLine,
+    location_kind: str,
+    warehouse_ref1c: str,
+    exclude_recorder_ref: str,
+) -> float:
+    """What one custody cell holds before a given transfer is folded into it.
+
+    The document's own physical postings are excluded so a replay reads the same
+    balance the first run did: without that, re-projecting a recorder would see
+    its own consumption and refuse to finish a half-written pair.  Reservations
+    of the same document are kept — the opening is exactly what the transfer is
+    allowed to consume.
+    """
+    query = db.query(
+        func.coalesce(func.sum(ProductionMaterialCustodyEvent.delta_qty), 0)
+    ).filter(
+        ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id),
+        ProductionMaterialCustodyEvent.component_item_id
+        == int(line.component_item_id),
+        ProductionMaterialCustodyEvent.location_kind == str(location_kind),
+        ProductionMaterialCustodyEvent.warehouse_ref1c
+        == _clean_ref1c(warehouse_ref1c),
+    )
+    recorder = _clean_ref2c(exclude_recorder_ref)
+    if recorder is not None:
+        query = query.filter(
+            ~and_(
+                ProductionMaterialCustodyEvent.source_kind == "transfer_posted",
+                ProductionMaterialCustodyEvent.source_ref2c == recorder,
+            )
+        )
+    return _to_float(query.scalar() or 0)
+
+
 def _has_transit_issue_opening(
     db: Session,
     *,
@@ -287,6 +326,11 @@ def project_transfer_custody_events_for_recorder(
             )
         lines[component_id] = line
     appended = 0
+    # Two passes.  A transfer may consume only what was reserved for it, and the
+    # outbound and inbound rows of one component have to agree on that number
+    # whatever order the Ledger hands them over in.
+    movements: list[tuple[StockLedgerEntry, ProductionMaterialIssueLine, str, float]] = []
+    outbound_qty: dict[int, float] = {}
     for sle in stock_ledger_entries:
         if (
             str(sle.recorder_type or "") != _STOCK_TRANSFER_ENTITY
@@ -299,33 +343,78 @@ def project_transfer_custody_events_for_recorder(
         qty = abs(_to_float_strict(sle.qty, field="ledger_event.qty"))
         if line is None or qty <= _EPSILON:
             continue
+        movements.append((sle, line, movement, qty))
+        if direction == "issue" and movement == "transfer_out":
+            component = int(line.component_item_id)
+            outbound_qty[component] = outbound_qty.get(component, 0.0) + qty
+
+    # How much of the shipment this issue actually holds.  A storekeeper may
+    # ship more than was reserved (40.644 reserved, 49 moved).  The surplus does
+    # arrive at the workshop, but it is nobody's reservation: it stays free
+    # stock there for the next issue.  Folding it as custody of this product
+    # instead drove the transit cell negative and failed the whole Ledger build
+    # behind it.
+    covered: dict[int, float] = {}
+    for sle, line, movement, qty in movements:
+        if direction != "issue" or movement != "transfer_out":
+            continue
+        component = int(line.component_item_id)
+        if component in covered:
+            continue
+        warehouse = str(sle.warehouse_ref1c or "")
+        # An older issue writer could export a transfer without recording the
+        # reservation it was made for at all.  That is a lost record, not a
+        # surplus: establish the opening from the physical fact once.
+        if not _has_transit_issue_opening(db, issue=issue, line=line):
+            if append_material_issue_custody_event(
+                db,
+                issue=issue,
+                line=line,
+                delta_qty=outbound_qty[component],
+                source_kind="issue_created",
+                location_kind="transit",
+                warehouse_ref1c=warehouse,
+                source_ref1c=source,
+                source_ref2c=ref,
+                effective_at=sle.posting_at,
+            ):
+                appended += 1
+            db.flush()
+        covered[component] = max(
+            0.0,
+            min(
+                outbound_qty[component],
+                _custody_balance(
+                    db,
+                    issue=issue,
+                    line=line,
+                    location_kind="transit",
+                    warehouse_ref1c=warehouse,
+                    exclude_recorder_ref=ref,
+                ),
+            ),
+        )
+    transit_left = dict(covered)
+    workshop_left = dict(covered)
+
+    for sle, line, movement, qty in movements:
+        component = int(line.component_item_id)
         if direction == "return":
             if movement != "transfer_out":
                 continue
             source_kind, location, delta = "transfer_returned", "workshop", -qty
         elif movement == "transfer_out":
-            # Older issue writers could export a transfer without recording its
-            # transit reservation.  Establish the append-only opening before
-            # the first physical outbound event, using the physical fact's
-            # quantity and timestamp.  The lookup makes retries and later
-            # recorder replays idempotent.
-            if not _has_transit_issue_opening(db, issue=issue, line=line):
-                if append_material_issue_custody_event(
-                    db,
-                    issue=issue,
-                    line=line,
-                    delta_qty=qty,
-                    source_kind="issue_created",
-                    location_kind="transit",
-                    warehouse_ref1c=str(sle.warehouse_ref1c or ""),
-                    source_ref1c=source,
-                    source_ref2c=ref,
-                    effective_at=sle.posting_at,
-                ):
-                    appended += 1
-            source_kind, location, delta = "transfer_posted", "transit", -qty
+            take = min(qty, transit_left.get(component, 0.0))
+            transit_left[component] = transit_left.get(component, 0.0) - take
+            if take <= _EPSILON:
+                continue
+            source_kind, location, delta = "transfer_posted", "transit", -take
         elif movement == "transfer_in":
-            source_kind, location, delta = "transfer_posted", "workshop", qty
+            take = min(qty, workshop_left.get(component, 0.0))
+            workshop_left[component] = workshop_left.get(component, 0.0) - take
+            if take <= _EPSILON:
+                continue
+            source_kind, location, delta = "transfer_posted", "workshop", take
         else:
             continue
         if _has_equivalent_physical_custody_event(

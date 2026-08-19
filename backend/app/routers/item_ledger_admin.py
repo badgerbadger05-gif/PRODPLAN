@@ -538,6 +538,10 @@ def discard_physical_refresh(
             "rows": result.parent_fingerprint[0],
             "total_qty": result.parent_fingerprint[1],
         },
+        # Damage the rollback found below the boundary and did not touch.
+        "preexisting_live_revision_conflicts": (
+            result.preexisting_live_revision_conflicts
+        ),
     }
 
 

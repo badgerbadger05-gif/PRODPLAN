@@ -6,6 +6,9 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.services import sync_orchestrator as orch
+from app.services.item_ledger.physical_refresh_discard import (
+    discard_physical_refresh_candidate,
+)
 from app.services.sync_orchestrator import SyncJob
 from app import models
 
@@ -845,3 +848,210 @@ def test_cluster_lock_contention_is_still_busy(monkeypatch, tmp_state):
     res = orch.tick(db=DB())
     assert res["status"] == "busy"
     assert res["lock"] == "busy"
+
+
+def _superseded_candidate_fixture(
+    db_session, parent: models.LedgerGeneration
+) -> tuple[models.LedgerGeneration, models.LedgerGeneration]:
+    """Reproduce the shadow deadlock: a rebase outruns a building refresh.
+
+    The refresh forks the accepted generation and commits its own physical
+    batch; a specification rebase then publishes a fact-identical fork of the
+    same parent, so the truth pointer walks past the candidate while the
+    candidate keeps the global physical terminal.
+    """
+    candidate_batch = models.PhysicalImportBatch(
+        batch_key=f"historical:{int(parent.id)}:candidate",
+        status="completed",
+        cutoff=parent.cutoff + timedelta(hours=1),
+        source_watermarks={"source": "AccumulationRegister_ЗапасыНаСкладах"},
+    )
+    db_session.add(candidate_batch)
+    db_session.flush()
+    candidate = models.LedgerGeneration(
+        generation_key=f"physical-refresh:{int(parent.id)}:candidate",
+        status="building",
+        cutoff=parent.cutoff + timedelta(hours=1),
+        physical_import_batch_id=int(candidate_batch.id),
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": int(parent.id),
+        },
+        capabilities={},
+        algorithm_version="ledger-physical-refresh-generation/1",
+    )
+    rebased = models.LedgerGeneration(
+        generation_key=f"spec-rebase-g{int(parent.id)}-r2",
+        status="accepted",
+        cutoff=parent.cutoff,
+        accepted_at=parent.cutoff,
+        physical_import_batch_id=int(parent.physical_import_batch_id),
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities={"physical_ledger": True},
+        algorithm_version="test",
+    )
+    db_session.add_all([candidate, rebased])
+    db_session.flush()
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = int(rebased.id)
+    db_session.commit()
+    return candidate, rebased
+
+
+def test_superseded_building_refresh_is_named_not_mistaken_for_a_conflict(
+    tmp_state, db_session, monkeypatch
+):
+    """The pointer outrunning a candidate must be diagnosable, not a mystery.
+
+    Strict parent equality reported this as a terminal conflict: the physical
+    slot stayed fenced with a message about an unexplained import batch, nobody
+    could tell it from a foreign branch of truth, the cutoff stopped moving and
+    a day later every consumer failed closed on the freshness threshold.  The
+    rollback itself stays manual — it deletes the evidence of the race that
+    caused it.
+    """
+    parent = _accepted_parent_fixture(db_session)
+    candidate, _rebased = _superseded_candidate_fixture(db_session, parent)
+    candidate_id = int(candidate.id)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(
+        orch, "load_odata_config", lambda: {"base_url": "http://configured"}
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 1, "error_retryable": 0, "error_exhausted": 0, "ready": 1},
+    )
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *a, **k: pytest.fail("the slot stays fenced until the rollback"),
+    )
+
+    res = orch.tick(
+        db=db_session, now=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    )
+
+    # The reference schedule keeps running; only the physical slot is fenced.
+    assert res["job"] == "alpha"
+    blocked = res["physical_refresh_blocked_reason"]
+    assert str(candidate_id) in blocked
+    assert "physical-refresh/discard" in blocked
+    snapshot = orch.status(db_session)["physical_refresh"]
+    assert snapshot["blocked_code"] == "superseded_building_refresh"
+    assert snapshot["superseded_buildings"] == [candidate_id]
+    # Not the misdiagnosis it used to be: the terminal is explained.
+    assert snapshot["terminal_conflict"] is False
+    assert snapshot["terminal_explained_by_generation_id"] == candidate_id
+    assert snapshot["unexpected_building_count"] == 0
+    assert (
+        str(db_session.get(models.LedgerGeneration, candidate_id).status)
+        == "building"
+    )
+
+
+def test_superseded_candidate_rollback_reopens_the_slot(
+    tmp_state, db_session, monkeypatch
+):
+    """The documented recovery has to actually unfence the contour."""
+    parent = _accepted_parent_fixture(db_session)
+    candidate, rebased = _superseded_candidate_fixture(db_session, parent)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(
+        orch, "load_odata_config", lambda: {"base_url": "http://configured"}
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 1, "error_retryable": 0, "error_exhausted": 0, "ready": 1},
+    )
+    refreshed: list[str] = []
+
+    def _refresh(db, cutoff, key):
+        refreshed.append(key)
+        return {
+            "parent_generation_id": int(rebased.id),
+            "physical_generation_id": int(rebased.id) + 1,
+            "published_generation_id": int(rebased.id) + 2,
+            "target_cutoff": cutoff.isoformat(),
+            "published": True,
+            "result": {"ok": True},
+        }
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _refresh)
+
+    discard_physical_refresh_candidate(
+        db_session,
+        ledger_generation_id=int(candidate.id),
+        reason="operator rollback after a rebase outran the candidate",
+    )
+    db_session.commit()
+
+    res = orch.tick(
+        db=db_session, now=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    )
+
+    assert res["job"] == "physicalRefresh"
+    assert refreshed
+    assert res.get("physical_refresh_blocked_reason") is None
+    assert (
+        db_session.query(models.PhysicalImportBatch)
+        .filter(
+            models.PhysicalImportBatch.id
+            > int(parent.physical_import_batch_id)
+        )
+        .count()
+        == 0
+    )
+
+
+def test_foreign_building_refresh_still_waits_for_an_operator(
+    tmp_state, db_session, monkeypatch
+):
+    """Automatic rollback covers our own lineage only, never a foreign branch."""
+    parent = _accepted_parent_fixture(db_session)
+    foreign_batch = models.PhysicalImportBatch(
+        batch_key="historical:999:foreign",
+        status="completed",
+        cutoff=parent.cutoff + timedelta(hours=1),
+    )
+    db_session.add(foreign_batch)
+    db_session.flush()
+    db_session.add(
+        models.LedgerGeneration(
+            generation_key="physical-refresh:999:foreign",
+            status="building",
+            cutoff=parent.cutoff + timedelta(hours=1),
+            physical_import_batch_id=int(foreign_batch.id),
+            source_watermarks={
+                "generation_kind": "physical_refresh",
+                "parent_generation_id": 999,
+            },
+            capabilities={},
+            algorithm_version="ledger-physical-refresh-generation/1",
+        )
+    )
+    db_session.commit()
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(
+        orch, "load_odata_config", lambda: {"base_url": "http://configured"}
+    )
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *a, **k: pytest.fail("a foreign candidate must fence the slot"),
+    )
+
+    res = orch.tick(
+        db=db_session, now=datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    )
+
+    assert res["job"] == "alpha"
+    assert "terminal conflicts" in res["physical_refresh_blocked_reason"]
+    snapshot = orch.status(db_session)["physical_refresh"]
+    assert snapshot["terminal_conflict"] is True
+    assert snapshot["unexpected_building_count"] == 1
+    assert snapshot["superseded_building_count"] == 0

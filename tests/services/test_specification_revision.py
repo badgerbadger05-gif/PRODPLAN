@@ -176,6 +176,105 @@ def test_worker_drains_one_stale_run_and_completes_request(db_session, monkeypat
     assert queued.attempt_count == 1
 
 
+def test_worker_repairs_live_drift_without_pending_queue(db_session, monkeypatch):
+    """A return to an already-seen revision must not be hidden by queue state."""
+    spec = models.Specification(
+        spec_code="S",
+        spec_name="Specification",
+        spec_ref1c="spec-ref",
+        content_hash="current-hash",
+    )
+    item = models.Item(item_code="R", item_name="Root", status="active")
+    plan = models.ProductionPlanHeader(
+        name="Plan",
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="fixed",
+        fixed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    db_session.add_all([spec, item, plan])
+    db_session.flush()
+    run = models.PlanningRun(
+        source_plan_id=int(plan.id),
+        status="FIXED_SNAPSHOT",
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=plan.fixed_at,
+        active_freeze_version=1,
+        pinned=True,
+        config_snapshot={},
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(
+        models.MrpFreezeComponent(
+            run_id=int(run.run_id),
+            freeze_version=1,
+            parent_item_id=int(item.item_id),
+            parent_characteristic_ref="",
+            parent_organization_ref="",
+            parent_planning_stock_pool="default",
+            component_item_id=int(item.item_id),
+            component_characteristic_ref="",
+            component_organization_ref="",
+            component_planning_stock_pool="default",
+            spec_ref="spec-ref",
+            spec_version="older-hash",
+            norm_qty_per_unit=Decimal("1"),
+            unit_coef=Decimal("1"),
+        )
+    )
+    db_session.commit()
+
+    from app.services import specification_rebase_worker as worker
+
+    def fake_rebase(db, run_id, **kwargs):
+        assert kwargs["changed_spec_refs"] == ("spec-ref",)
+        old = db.get(models.PlanningRun, int(run_id))
+        old.status = "CLOSED"
+        successor = models.PlanningRun(
+            source_plan_id=int(plan.id),
+            prior_run_id=int(old.run_id),
+            status="FIXED_SNAPSHOT",
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            fixed_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
+            active_freeze_version=1,
+            pinned=True,
+            config_snapshot={},
+        )
+        db.add(successor)
+        db.flush()
+        db.add(
+            models.MrpFreezeComponent(
+                run_id=int(successor.run_id),
+                freeze_version=1,
+                parent_item_id=int(item.item_id),
+                parent_characteristic_ref="",
+                parent_organization_ref="",
+                parent_planning_stock_pool="default",
+                component_item_id=int(item.item_id),
+                component_characteristic_ref="",
+                component_organization_ref="",
+                component_planning_stock_pool="default",
+                spec_ref="spec-ref",
+                spec_version="current-hash",
+                norm_qty_per_unit=Decimal("1"),
+                unit_coef=Decimal("1"),
+            )
+        )
+        db.commit()
+        return {"status": "rebased", "predecessor_run_id": int(run_id)}
+
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", fake_rebase)
+
+    result = run_one_pending_specification_rebase(db_session)
+
+    assert result["status"] == "rebased"
+    assert result["affected_runs_before"] == 1
+    assert result["affected_runs_after"] == 0
+
+
 def test_new_order_is_blocked_when_mrp_has_older_spec_revision(db_session):
     root = models.Item(item_code="ROOT", item_name="Root", status="active")
     component = models.Item(item_code="COMP", item_name="Component", status="active")
@@ -231,3 +330,90 @@ def test_new_order_is_blocked_when_mrp_has_older_spec_revision(db_session):
 
     with pytest.raises(MrpMutationLineageError, match="successor-MRP"):
         _frozen_spec_identity_for_requirement(db_session, requirement)
+
+
+def test_worker_stands_aside_while_a_physical_refresh_builds(
+    db_session, monkeypatch
+):
+    """Retiring runs under a live fact build is what froze the Ledger cutoff.
+
+    The candidate carries the accepted generation's live runs forward; closing
+    one of them mid-build fails that build, and the failed build then holds the
+    global physical terminal so nothing can fork again.
+    """
+    spec = models.Specification(
+        spec_code="S",
+        spec_name="Specification",
+        spec_ref1c="spec-ref",
+        content_hash="new-hash",
+    )
+    db_session.add(spec)
+    db_session.flush()
+    revision = models.SpecificationRevision(
+        spec_id=int(spec.spec_id),
+        content_hash="new-hash",
+        payload={"version": 1},
+        source="test",
+    )
+    db_session.add(revision)
+    db_session.flush()
+    request = models.SpecificationRebaseQueue(
+        spec_id=int(spec.spec_id),
+        revision_id=int(revision.id),
+        old_content_hash="old-hash",
+        new_content_hash="new-hash",
+        status="pending",
+    )
+    cutoff = datetime(2026, 8, 18, 6, 32, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(
+        batch_key="physical-accepted", status="completed", cutoff=cutoff
+    )
+    db_session.add_all([request, batch])
+    db_session.flush()
+    accepted = models.LedgerGeneration(
+        generation_key="accepted-truth",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        physical_import_batch_id=int(batch.id),
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        algorithm_version="test",
+    )
+    db_session.add(accepted)
+    db_session.flush()
+    db_session.add_all([
+        models.PlanningTruthState(id=1, current_generation_id=int(accepted.id)),
+        models.LedgerGeneration(
+            generation_key=f"physical-refresh:{int(accepted.id)}:candidate",
+            status="building",
+            cutoff=cutoff,
+            physical_import_batch_id=int(batch.id),
+            source_watermarks={
+                "generation_kind": "physical_refresh",
+                "parent_generation_id": int(accepted.id),
+            },
+            capabilities={},
+            algorithm_version="ledger-physical-refresh-generation/1",
+        ),
+    ])
+    db_session.commit()
+
+    from app.services import specification_rebase_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "rebase_fixed_plan_remaining_roots",
+        lambda *a, **k: pytest.fail("rebase must wait for the candidate"),
+    )
+
+    result = run_one_pending_specification_rebase(db_session)
+
+    assert result["status"] == "deferred"
+    assert result["reason"] == "physical_refresh_building"
+    db_session.expire_all()
+    # The durable queue keeps the work: standing aside costs one tick.
+    assert (
+        db_session.get(models.SpecificationRebaseQueue, int(request.id)).status
+        == "pending"
+    )

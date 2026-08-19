@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Sequence, Tuple
 
-from sqlalchemy import case, func, or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -261,6 +261,34 @@ def _visible_source_sle_for_event(
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _custody_fold_order_key(
+    event: models.ProductionMaterialCustodyEvent,
+) -> tuple[Any, ...]:
+    """Order custody events at the resolution 1C actually publishes.
+
+    A physical transfer event carries ``posting_at`` from 1C, which is whole
+    seconds; the issue's own opening carries the microsecond at which the
+    operator created it.  A transfer posted 0.3 s *after* its issue therefore
+    sorts 0.3 s *before* it, and the fold consumes a transit reservation that
+    does not exist yet — the projection then fails closed on a movement which is
+    perfectly consistent, and with it the whole Ledger refresh.
+
+    Comparing at one second and only then by causality keeps an opening in front
+    of the transfer it covers.  Ordering openings first can never turn a healthy
+    fold negative: it only ever adds the reservation earlier.
+    """
+    effective = event.effective_at
+    truncated = (
+        effective.replace(microsecond=0) if effective is not None else effective
+    )
+    return (
+        truncated,
+        0 if str(event.source_kind or "") == "issue_created" else 1,
+        effective,
+        int(event.id),
+    )
+
+
 def _select_visible_custody_events(
     db: Session,
     *,
@@ -329,31 +357,23 @@ def _select_visible_custody_events(
                 models.ProductionMaterialCustodyEvent.source_sle_id.in_(visible_sle_ids),
             )
         )
-        .order_by(
-            models.ProductionMaterialCustodyEvent.effective_at.asc(),
-            # Recovery may append a missing issue opening after its physical
-            # SLE-backed transfer was already recorded at the same 1C time.
-            # Fold the semantic opening first rather than relying on append ID.
-            case(
-                (
-                    models.ProductionMaterialCustodyEvent.source_kind == "issue_created",
-                    0,
-                ),
-                else_=1,
-            ).asc(),
-            models.ProductionMaterialCustodyEvent.id.asc(),
-        )
+        # Fold order is owned by ``_custody_fold_order_key`` alone; this is only
+        # a stable read order, never a second ordering rule.
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
         .all()
     )
-    return [
-        event
-        for event in events
-        if not _is_reimport_duplicate_physical_event(
-            db,
-            event,
-            original_high_watermark_id=baseline_high_watermark_id,
-        )
-    ]
+    return sorted(
+        (
+            event
+            for event in events
+            if not _is_reimport_duplicate_physical_event(
+                db,
+                event,
+                original_high_watermark_id=baseline_high_watermark_id,
+            )
+        ),
+        key=_custody_fold_order_key,
+    )
 
 
 def initialize_material_custody_baseline(
