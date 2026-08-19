@@ -296,15 +296,16 @@ def _entry_origin_token(entry: StockTransferExportEntry) -> str:
 
 
 def _origin_transfer_number(entry: StockTransferExportEntry, *, attempt: int = 0) -> str:
-    token = str(entry.origin_token or "")
-    if not token:
+    if not entry.origin_token:
         raise ValueError("material issue export has no durable origin token")
-    if attempt:
-        token = _origin_token("material_issue_number", {"token": token, "attempt": attempt})
     prefix = "RT" if str(entry.direction or "issue") == "return" else "MT"
     # 2 + 9 = the 11-character limit of Document_ПеремещениеЗапасов.Number.
-    # Hex keeps 36 bits of the durable origin and avoids reused local DB ids.
-    return f"{prefix}{token[:9].upper()}"
+    # Keep the familiar stable-contour format (MT000002982) for operators.
+    # Linear probing is used only when that human-facing number is already
+    # owned by another local or 1C document; durable ownership and retry
+    # recovery continue to rely on prodplan-origin, not on the display number.
+    number_part = (int(entry.issue_id) + int(attempt)) % 1_000_000_000
+    return f"{prefix}{number_part:09d}"
 
 
 def _document_by_number(client: Any, number: str) -> Optional[Dict[str, Any]]:

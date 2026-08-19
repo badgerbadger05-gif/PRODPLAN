@@ -265,8 +265,9 @@ def test_dry_run_returns_payload_with_both_structural_units(db_session, monkeypa
     [pl] = result["payloads"]
     payload = pl["payload"]
     assert payload["Posted"] is False
-    assert payload["Number"].startswith("MT")
+    assert payload["Number"] == material_issue_number(db, issue)
     assert len(payload["Number"]) == 11
+    assert payload["Number"][2:].isdigit()
     assert payload["СтруктурнаяЕдиница_Key"] == "src-warehouse-guid"
     assert payload["СтруктурнаяЕдиницаПолучатель_Key"] == "dst-warehouse-guid"
     assert payload["ДокументОснование"] == f"order-ref-{parent.item_id}"
@@ -692,6 +693,8 @@ def test_foreign_number_collision_allocates_another_number_without_adoption(
     assert result["status"] == "ok"
     assert result["issues_created"] == 1
     assert issue.document_number != first_number
+    assert issue.document_number == f"MT{issue.issue_id + 1:09d}"
+    assert issue.document_number[2:].isdigit()
     assert fake.patches == []
     assert len(fake.posts) == 1
     assert fake.posts[0][1]["Number"] == issue.document_number
