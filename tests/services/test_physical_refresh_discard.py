@@ -402,3 +402,47 @@ def test_rollback_that_would_add_a_live_revision_is_still_refused(db_session):
 
     assert "more than one live revision" in str(exc.value)
     assert "0 before the rollback" in str(exc.value)
+
+
+def test_discard_takes_the_candidate_custody_events_with_it(db_session):
+    """A custody event is derived from a fact — it cannot outlive it.
+
+    Left behind, the event names an SLE row the rollback deleted: the fold
+    cannot see it, so the issue keeps an open transit reservation nothing ever
+    consumes, while the projector refuses to re-append the pair on the next
+    import because it still recognises the orphan by its stable identity.  On
+    the shadow stand that combination made every launch fail with a negative
+    workshop reservation.
+    """
+    _parent, candidate, _kept, item = _world(db_session)
+    candidate_entry = (
+        db_session.query(models.StockLedgerEntry)
+        .filter(
+            models.StockLedgerEntry.ingest_batch_id
+            == int(candidate.physical_import_batch_id)
+        )
+        .one()
+    )
+    db_session.add(models.ProductionMaterialCustodyEvent(
+        issue_id=4242,
+        product_id=99,
+        component_item_id=int(item.item_id),
+        source_kind="transfer_posted",
+        source_sle_id=int(candidate_entry.id),
+        effective_at=CUTOFF,
+        location_kind="transit",
+        warehouse_ref1c="WH",
+        delta_qty=Decimal("-7"),
+        idempotency_key="custody-event:rolled-back-fact",
+    ))
+    db_session.commit()
+
+    result = discard_physical_refresh_candidate(
+        db_session,
+        ledger_generation_id=int(candidate.id),
+        reason="rollback drops the facts, so it drops what was derived from them",
+    )
+    db_session.commit()
+
+    assert result.deleted_custody_events == 1
+    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 0

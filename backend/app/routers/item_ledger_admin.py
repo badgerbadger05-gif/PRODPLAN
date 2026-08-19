@@ -532,6 +532,7 @@ def discard_physical_refresh(
         "deleted_ledger_entries": result.deleted_ledger_entries,
         "deleted_supersessions": result.deleted_supersessions,
         "deleted_anchors": result.deleted_anchors,
+        "deleted_custody_events": result.deleted_custody_events,
         "deleted_generation_rows": result.deleted_generation_rows,
         "reactivated_entries": result.reactivated_entries,
         "parent_fingerprint": {

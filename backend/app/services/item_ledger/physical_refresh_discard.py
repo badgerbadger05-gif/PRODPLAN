@@ -70,6 +70,7 @@ class PhysicalRefreshDiscardResult:
     deleted_ledger_entries: int
     deleted_supersessions: int
     deleted_anchors: int
+    deleted_custody_events: int
     deleted_generation_rows: dict[str, int]
     reactivated_entries: int
     parent_fingerprint: tuple[int, str]
@@ -275,6 +276,24 @@ def discard_physical_refresh_candidate(
     }
     db.flush()
 
+    # A custody event carrying ``source_sle_id`` is derived from one physical
+    # line, so it has to go back with the fact it was derived from.  Left
+    # behind, it names a row that no longer exists: the fold cannot see it, the
+    # issue keeps an open transit reservation nothing ever consumes, and the
+    # workshop never receives its side — while the projector refuses to re-append
+    # the pair on the next import, because it still recognises the orphan by its
+    # stable physical identity.  That is how one rolled-back candidate silently
+    # blocked every launch with a negative workshop reservation.
+    deleted_custody_events = db.query(
+        models.ProductionMaterialCustodyEvent
+    ).filter(
+        models.ProductionMaterialCustodyEvent.source_sle_id.in_(
+            db.query(models.StockLedgerEntry.id).filter(
+                models.StockLedgerEntry.ingest_batch_id > cut
+            )
+        )
+    ).delete(synchronize_session=False)
+
     # Physical rows, referenced side first.
     deleted_anchors = db.query(models.StockLedgerAnchor).filter(
         models.StockLedgerAnchor.ingest_batch_id > cut
@@ -326,6 +345,7 @@ def discard_physical_refresh_candidate(
         deleted_ledger_entries=int(deleted_entries),
         deleted_supersessions=int(deleted_supersessions),
         deleted_anchors=int(deleted_anchors),
+        deleted_custody_events=int(deleted_custody_events),
         deleted_generation_rows=deleted_generation_rows,
         reactivated_entries=int(reactivated),
         parent_fingerprint=fingerprint,
