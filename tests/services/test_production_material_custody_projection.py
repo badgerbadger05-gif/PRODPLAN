@@ -238,6 +238,65 @@ def test_current_accepted_custody_folds_local_events_after_cutoff(db_session):
     assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 5
 
 
+def test_current_accepted_custody_refolds_an_event_dated_inside_the_cutoff(
+    db_session,
+):
+    """A document projected after the fact must not block production launch.
+
+    The tail used to be everything appended after the projection was built, and
+    anything of that dated inside the accepted cutoff was declared impossible.
+    A recorder re-pull projecting an 18.08 transfer on 19.08 is not impossible —
+    it is the normal way custody events appear — and the error it raised stopped
+    every "Запустить в 1С" on the stand.
+    """
+    base_cutoff = datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    base = _generation(db_session, key="custody-refold-live-base", cutoff=base_cutoff)
+    generation = _generation(db_session, key="custody-refold-live", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="LIVEREFOLD")
+    issue = ProductionMaterialIssue(
+        document_number="MT-LIVE-REFOLD",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-DST",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    base_manifest = _manifest(
+        db_session, generation_id=base.id, source_event_high_watermark_id=0
+    )
+    base_manifest.is_baseline = True
+    _manifest(db_session, generation_id=generation.id, source_event_high_watermark_id=0)
+    db_session.commit()
+
+    # Appended now, dated inside the accepted window.
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="transit",
+        warehouse="WH-SRC",
+        qty=7,
+        key="custody:live:late-dated",
+        effective_at=cutoff - timedelta(hours=1),
+    )
+    db_session.commit()
+
+    generation_id, state = load_current_accepted_material_custody(
+        db_session,
+        consumer="test.live_refold",
+    )
+
+    assert generation_id == generation.id
+    assert state.for_product(product.product_id).in_transit[component.item_id] == 7
+
+
 def test_current_accepted_custody_ignores_unaccepted_physical_tail(db_session):
     cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
     generation = _generation(db_session, key="custody-live-physical", cutoff=cutoff)

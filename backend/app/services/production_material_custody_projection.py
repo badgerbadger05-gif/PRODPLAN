@@ -1198,28 +1198,20 @@ def load_current_accepted_material_custody(
             reason="accepted custody Ledger generation has no cutoff",
         )
 
+    # The tail is defined by date, not by append order.  Everything dated at or
+    # before the cutoff belongs to the accepted projection, which refolds itself
+    # when such an event arrives late — a document projected days after it was
+    # posted is ordinary traffic.  Selecting by id instead made every one of
+    # those events an error and blocked the launch of production orders.
     tail = (
         db.query(models.ProductionMaterialCustodyEvent)
-        .filter(models.ProductionMaterialCustodyEvent.id > manifest_watermark)
+        .filter(
+            models.ProductionMaterialCustodyEvent.effective_at > generation.cutoff
+        )
         .order_by(models.ProductionMaterialCustodyEvent.id.asc())
         .all()
     )
     for event in tail:
-        if event.effective_at <= generation.cutoff:
-            if event.source_sle_id is not None and _is_reimport_duplicate_physical_event(
-                db,
-                event,
-                original_high_watermark_id=manifest_watermark,
-            ):
-                continue
-            raise MaterialCustodySnapshotUnavailable(
-                product_id=int(event.product_id),
-                component_item_id=int(event.component_item_id),
-                manifest_generation_id=generation_id,
-                expected_generation_id=generation_id,
-                stored_generation_id=generation_id,
-                reason="late custody event falls inside the accepted physical cutoff",
-            )
         # A physical event is accepted only together with the physical Ledger
         # generation that proves its source SLE.  Until then the preceding
         # local transit/workshop reservation remains the safe current state.
