@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 
+from .physical import guard_physical_batch_writer
 from .physical_visibility import visible_sle_query
 
 
@@ -243,6 +244,12 @@ def discard_physical_refresh_candidate(
     if not text_reason:
         raise ValueError("reason is required when discarding a candidate")
 
+    # Take the physical-sequence lock before reading anything: a refresh may be
+    # building right now, and deleting its rows underneath it made SQLAlchemy
+    # fail mid-flush ("expected to update N rows; 0 were matched"), leaving a
+    # half-built candidate nobody could explain.  The refresh's own automatic
+    # rollback already owns this lock, so it is skipped there.
+    guard_physical_batch_writer(db)
     generation, parent, cut = _require_discardable(db, ledger_generation_id)
     boundary_before = int(generation.physical_import_batch_id or cut)
     expected_fingerprint = _fingerprint(db, cut)

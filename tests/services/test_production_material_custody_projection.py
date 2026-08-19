@@ -23,6 +23,7 @@ from app.models import (
 )
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
+    build_material_custody_projection,
     _same_1c_timestamp,
     load_current_accepted_material_custody,
     load_material_custody_projection,
@@ -597,7 +598,8 @@ def test_projection_ignores_late_duplicate_events_from_exact_sle_reimport(db_ses
     assert state.for_product(int(product.product_id)).at_workshop[int(component.item_id)] == pytest.approx(93.0)
 
 
-def test_projection_fails_when_event_after_baseline_watermark_is_pre_cutoff(db_session):
+def test_projection_fails_when_no_baseline_can_place_a_late_event(db_session):
+    """With nothing older to fold from, a late-dated event is a real break."""
     base = _generation(
         db_session,
         key="custody-proj-base-stale",
@@ -653,7 +655,157 @@ def test_projection_fails_when_event_after_baseline_watermark_is_pre_cutoff(db_s
 
     with pytest.raises(MaterialCustodySnapshotUnavailable) as caught:
         load_material_custody_projection(db_session, ledger_generation_id=target.id)
-    assert "strictly after baseline cutoff" in caught.value.detail["reason"]
+    assert "behind every available baseline" in caught.value.detail["reason"]
+
+
+def test_projection_rewinds_to_an_older_baseline_for_a_late_event(db_session):
+    """A movement projected after its own posting must not stop the Ledger.
+
+    The custody events of a transfer are appended when the recorder is pulled,
+    which can be long after the transfer was posted.  Judged against the newest
+    baseline such an event looks impossible — it is dated inside a window that
+    was already closed — and the refresh failed closed, so no new generation
+    could be published at all and planning truth went stale behind it.  An
+    older baseline still covers it: fold from there instead.
+    """
+    old_base = _generation(
+        db_session,
+        key="custody-rewind-old-base",
+        cutoff=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+    recent_base = _generation(
+        db_session,
+        key="custody-rewind-recent-base",
+        cutoff=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    target = _generation(
+        db_session,
+        key="custody-rewind-target",
+        cutoff=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    product, _parent, component = _product(db_session, item_code="REWIND")
+    issue = ProductionMaterialIssue(
+        document_number="MT-REWIND-1",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-SRC",
+    )
+    db_session.add(issue)
+    db_session.flush()
+
+    _manifest(db_session, generation_id=old_base.id, source_event_high_watermark_id=0)
+    # Posted between the two baselines, but projected only now: its id lands
+    # above the newer baseline's watermark while its date lands below its cutoff.
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="workshop",
+        warehouse="WH-MAIN",
+        qty=4.0,
+        key="custody:event:rewind-late",
+        effective_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+    )
+    _manifest(
+        db_session, generation_id=recent_base.id, source_event_high_watermark_id=0
+    )
+    db_session.commit()
+
+    target.status = "building"          # the builder runs on a candidate
+    db_session.flush()
+    result = build_material_custody_projection(
+        db_session, ledger_generation_id=target.id
+    )
+    target.status = "accepted"
+    db_session.commit()
+
+    assert result["valid"] is True
+    # Folded from the older baseline, not from the one the event slipped behind.
+    assert result["baseline_generation_id"] == int(old_base.id)
+    state = load_material_custody_projection(
+        db_session, ledger_generation_id=target.id
+    )
+    assert state.for_product(int(product.product_id)).at_workshop[
+        int(component.item_id)
+    ] == pytest.approx(4.0)
+
+
+def test_projection_read_refolds_when_the_watermark_moved_under_it(db_session):
+    """A stored projection is a cache, not an answer that may go dark.
+
+    An event appended after the projection was built moves the visible
+    watermark; refusing to read then took every material-coverage consumer down
+    with it.  The read folds again instead.
+    """
+    base = _generation(
+        db_session,
+        key="custody-refold-base",
+        cutoff=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+    target = _generation(
+        db_session,
+        key="custody-refold-target",
+        cutoff=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    product, _parent, component = _product(db_session, item_code="REFOLD")
+    issue = ProductionMaterialIssue(
+        document_number="MT-REFOLD-1",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-SRC",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    _manifest(db_session, generation_id=base.id, source_event_high_watermark_id=0)
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="workshop",
+        warehouse="WH-MAIN",
+        qty=3.0,
+        key="custody:event:refold-known",
+        effective_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+    )
+    db_session.commit()
+    target.status = "building"
+    db_session.flush()
+    build_material_custody_projection(db_session, ledger_generation_id=target.id)
+    target.status = "accepted"
+    db_session.commit()
+
+    # Appended after the projection was built, dated inside its window.
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="workshop",
+        warehouse="WH-MAIN",
+        qty=2.0,
+        key="custody:event:refold-late",
+        effective_at=datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+    db_session.commit()
+
+    state = load_material_custody_projection(
+        db_session, ledger_generation_id=target.id
+    )
+
+    assert state.for_product(int(product.product_id)).at_workshop[
+        int(component.item_id)
+    ] == pytest.approx(5.0)
 
 
 def test_projection_replays_event_by_time_even_if_its_id_is_not_after_baseline_watermark(db_session):

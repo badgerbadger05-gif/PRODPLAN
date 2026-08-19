@@ -1,6 +1,8 @@
 """Append-only custody events and projected fold for planning material coverage."""
 from __future__ import annotations
 
+import logging
+
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Sequence, Tuple
 
@@ -13,6 +15,8 @@ from .production_material_custody import MaterialCustodyState, ProductMaterialCu
 from .production_material_custody_events import stable_physical_sle_identity
 from .item_ledger.physical_visibility import visible_sle_query
 
+
+logger = logging.getLogger(__name__)
 
 _EPSILON = 1.0e-9
 
@@ -140,15 +144,15 @@ def _require_manifest_cutoff(
         )
 
 
-def _latest_projection_manifest(
+def _projection_baseline_candidates(
     db: Session,
     *,
     cutoff: datetime,
     current_generation_id: int,
-) -> int | None:
-    """Latest completed manifest before the target generation cutoff."""
-    row = (
-        db.query(models.ProductionMaterialCustodyProjectionManifest)
+) -> list[int]:
+    """Completed manifests a fold could start from, newest first."""
+    rows = (
+        db.query(models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id)
         .join(
             models.LedgerGeneration,
             models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id
@@ -164,11 +168,22 @@ def _latest_projection_manifest(
             models.LedgerGeneration.cutoff.desc(),
             models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id.desc(),
         )
-        .first()
+        .all()
     )
-    if row is None:
-        return None
-    return int(row.ledger_generation_id)
+    return [int(row[0]) for row in rows]
+
+
+def _latest_projection_manifest(
+    db: Session,
+    *,
+    cutoff: datetime,
+    current_generation_id: int,
+) -> int | None:
+    """Latest completed manifest before the target generation cutoff."""
+    candidates = _projection_baseline_candidates(
+        db, cutoff=cutoff, current_generation_id=current_generation_id
+    )
+    return candidates[0] if candidates else None
 
 
 def _event_high_watermark_id_at_cutoff(
@@ -289,6 +304,133 @@ def _custody_fold_order_key(
     )
 
 
+def _late_events_behind_baseline(
+    db: Session,
+    *,
+    baseline_cutoff: datetime,
+    baseline_high_watermark_id: int,
+    target_high_watermark_id: int,
+) -> list[int]:
+    """Events appended after a baseline was built, yet dated inside its window.
+
+    Such an event is invisible to an incremental fold: the fold replays only what
+    is dated *after* the baseline cutoff, so a movement discovered later but
+    posted earlier would silently never be applied.  Ordinary operation produces
+    them all the time — a recorder re-pull projects custody for a document posted
+    days ago, a backdated transfer arrives, a repair appends a missing
+    reservation — so this is a signal to fold from an older baseline, not a
+    defect.  Only a re-import of a physical line an older event already carries
+    is exempt: it changes nothing.
+    """
+    return [
+        int(event_id)
+        for (event_id,) in (
+            db.query(models.ProductionMaterialCustodyEvent.id)
+            .filter(
+                models.ProductionMaterialCustodyEvent.id > int(baseline_high_watermark_id)
+            )
+            .filter(
+                models.ProductionMaterialCustodyEvent.id <= int(target_high_watermark_id)
+            )
+            .filter(
+                models.ProductionMaterialCustodyEvent.effective_at <= baseline_cutoff
+            )
+            .all()
+        )
+        if not _is_reimport_duplicate_physical_event(
+            db,
+            db.get(models.ProductionMaterialCustodyEvent, int(event_id)),
+            original_high_watermark_id=int(baseline_high_watermark_id),
+        )
+    ]
+
+
+def _resolve_projection_baseline(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    target_high_watermark_id: int,
+) -> tuple[int, models.ProductionMaterialCustodyProjectionManifest, models.LedgerGeneration]:
+    """Newest baseline whose own window no later append has changed.
+
+    Starting from the newest manifest is only correct while every event dated
+    inside it was already counted in it.  When a later append breaks that — the
+    normal case for a document projected long after it was posted — the fold
+    rewinds to an older baseline instead of failing closed.  That failure is what
+    stopped the Ledger from refreshing at all: nothing in the pipeline could
+    produce a new generation, so the cutoff froze and planning truth went stale
+    behind it.
+
+    Rewinding is safe because a baseline is a full projection, not a delta: an
+    older one simply means replaying more events.  If even the oldest manifest is
+    behind such an event, the event predates the explicit cutover baseline and no
+    fold can place it — that is a real break, and it fails closed.
+    """
+    candidates = _projection_baseline_candidates(
+        db,
+        cutoff=generation.cutoff,
+        current_generation_id=int(generation.id),
+    )
+    if not candidates:
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=int(generation.id),
+            stored_generation_id=None,
+            reason=(
+                "custody snapshot baseline is missing; no completed manifest exists "
+                "for earlier Ledger generation"
+            ),
+        )
+    rewound_past: list[int] = []
+    for baseline_generation_id in candidates:
+        manifest = _read_manifest(db, generation_id=baseline_generation_id)
+        if manifest is None:
+            raise MaterialCustodySnapshotUnavailable(
+                manifest_generation_id=baseline_generation_id,
+                expected_generation_id=int(generation.id),
+                stored_generation_id=None,
+                reason="custody snapshot baseline manifest record is missing",
+            )
+        baseline_generation = db.get(models.LedgerGeneration, baseline_generation_id)
+        if baseline_generation is None:
+            raise MaterialCustodySnapshotUnavailable(
+                manifest_generation_id=baseline_generation_id,
+                expected_generation_id=int(generation.id),
+                stored_generation_id=baseline_generation_id,
+                reason="custody snapshot baseline Ledger generation is missing",
+            )
+        _require_manifest_cutoff(manifest, baseline_generation)
+        watermark = int(manifest.source_event_high_watermark_id)
+        if watermark > int(target_high_watermark_id):
+            rewound_past.append(baseline_generation_id)
+            continue
+        if _late_events_behind_baseline(
+            db,
+            baseline_cutoff=baseline_generation.cutoff,
+            baseline_high_watermark_id=watermark,
+            target_high_watermark_id=int(target_high_watermark_id),
+        ):
+            rewound_past.append(baseline_generation_id)
+            continue
+        if rewound_past:
+            logger.info(
+                "custody projection for generation %s rewound past baseline(s) %s "
+                "to %s: later appends are dated inside their windows",
+                int(generation.id),
+                ", ".join(str(value) for value in rewound_past),
+                baseline_generation_id,
+            )
+        return baseline_generation_id, manifest, baseline_generation
+    raise MaterialCustodySnapshotUnavailable(
+        expected_generation_id=int(generation.id),
+        stored_generation_id=candidates[-1],
+        reason=(
+            "custody events were appended behind every available baseline "
+            "(checked " + ", ".join(str(value) for value in candidates) + "); "
+            "they predate the explicit cutover and no fold can place them"
+        ),
+    )
+
+
 def _select_visible_custody_events(
     db: Session,
     *,
@@ -313,23 +455,12 @@ def _select_visible_custody_events(
             reason="custody snapshot target watermark cannot be older than baseline watermark",
         )
 
-    baseline_cutoff_events = (
-        db.query(models.ProductionMaterialCustodyEvent.id)
-        .filter(models.ProductionMaterialCustodyEvent.id > baseline_high_watermark_id)
-        .filter(models.ProductionMaterialCustodyEvent.id <= target_high_watermark_id)
-        .filter(models.ProductionMaterialCustodyEvent.effective_at <= baseline_cutoff)
-        .all()
-    )
-    genuinely_late_baseline_events = [
-        event_id
-        for (event_id,) in baseline_cutoff_events
-        if not _is_reimport_duplicate_physical_event(
-            db,
-            db.get(models.ProductionMaterialCustodyEvent, int(event_id)),
-            original_high_watermark_id=baseline_high_watermark_id,
-        )
-    ]
-    if genuinely_late_baseline_events:
+    if _late_events_behind_baseline(
+        db,
+        baseline_cutoff=baseline_cutoff,
+        baseline_high_watermark_id=baseline_high_watermark_id,
+        target_high_watermark_id=target_high_watermark_id,
+    ):
         raise MaterialCustodySnapshotUnavailable(
             manifest_generation_id=int(generation.id),
             expected_generation_id=int(generation.id),
@@ -700,48 +831,14 @@ def build_material_custody_projection(
             reason="custody projection rows exist without a manifest",
         )
 
-    baseline_generation_id = _latest_projection_manifest(
-        db,
-        cutoff=generation.cutoff,
-        current_generation_id=int(generation.id),
+    baseline_generation_id, baseline_manifest, baseline_generation = (
+        _resolve_projection_baseline(
+            db,
+            generation=generation,
+            target_high_watermark_id=target_high_watermark_id,
+        )
     )
-    if baseline_generation_id is None:
-        raise MaterialCustodySnapshotUnavailable(
-            expected_generation_id=int(generation.id),
-            stored_generation_id=None,
-            reason=(
-                "custody snapshot baseline is missing; no completed manifest exists "
-                "for earlier Ledger generation"
-            ),
-        )
-
-    baseline_manifest = _read_manifest(db, generation_id=baseline_generation_id)
-    if baseline_manifest is None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=None,
-            reason="custody snapshot baseline manifest record is missing",
-        )
-
-    baseline_generation = db.get(models.LedgerGeneration, baseline_generation_id)
-    if baseline_generation is None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=baseline_generation_id,
-            reason="custody snapshot baseline Ledger generation is missing",
-        )
-    _require_manifest_cutoff(baseline_manifest, baseline_generation)
-
     baseline_high_watermark_id = int(baseline_manifest.source_event_high_watermark_id)
-    if baseline_high_watermark_id > target_high_watermark_id:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=baseline_generation_id,
-            reason="custody snapshot baseline watermark exceeds target watermark",
-        )
 
     _, target_rows = _build_projection_from_seed_and_events(
         db,
@@ -979,7 +1076,10 @@ def load_material_custody_projection(
         cutoff=generation.cutoff,
     )
     target_watermark = int(manifest.source_event_high_watermark_id)
-    if target_watermark != observed_watermark:
+    stale_cache = target_watermark != observed_watermark
+    if stale_cache and bool(manifest.is_baseline):
+        # The cutover baseline is stated, not derived: nothing older exists to
+        # fold it from, so a movement dated inside it is a real break.
         raise MaterialCustodySnapshotUnavailable(
             manifest_generation_id=int(manifest.ledger_generation_id),
             expected_generation_id=int(generation.id),
@@ -994,6 +1094,16 @@ def load_material_custody_projection(
     )
     if bool(manifest.is_baseline):
         return _state_from_projection_rows(existing_rows)
+    if stale_cache:
+        # Events dated inside this generation's window were appended after its
+        # projection was built — a recorder re-pull projecting an older posting,
+        # a backdated transfer, a repair.  The stored rows are a cache keyed by
+        # the watermark they were built at, so a moved watermark means "fold
+        # again", not "refuse to answer": every consumer of material coverage
+        # went dark on this, which is a far worse answer than a slightly more
+        # expensive read.
+        target_watermark = observed_watermark
+        existing_rows = []
     if existing_rows:
         distinct_counts = {
             int(row.source_event_high_watermark_id)
@@ -1014,46 +1124,14 @@ def load_material_custody_projection(
             )
         return _state_from_projection_rows(existing_rows)
 
-    baseline_generation_id = _latest_projection_manifest(
-        db,
-        cutoff=generation.cutoff,
-        current_generation_id=int(generation.id),
+    baseline_generation_id, baseline_manifest, baseline_generation = (
+        _resolve_projection_baseline(
+            db,
+            generation=generation,
+            target_high_watermark_id=target_watermark,
+        )
     )
-    if baseline_generation_id is None:
-        raise MaterialCustodySnapshotUnavailable(
-            expected_generation_id=int(generation.id),
-            stored_generation_id=None,
-            reason=(
-                "custody snapshot baseline is missing; no completed manifest exists "
-                "for earlier Ledger generation"
-            ),
-        )
-
-    baseline_manifest = _read_manifest(db, generation_id=baseline_generation_id)
-    if baseline_manifest is None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=None,
-            reason="custody snapshot baseline manifest record is missing",
-        )
-    baseline_generation = db.get(models.LedgerGeneration, baseline_generation_id)
-    if baseline_generation is None or baseline_generation.cutoff is None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=baseline_generation_id,
-            reason="custody snapshot baseline Ledger generation is missing",
-        )
-
     baseline_high_watermark_id = int(baseline_manifest.source_event_high_watermark_id)
-    if baseline_high_watermark_id > target_watermark:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=baseline_generation_id,
-            reason="custody snapshot baseline watermark exceeds target watermark",
-        )
 
     state, _ = _build_projection_from_seed_and_events(
         db,
