@@ -42,7 +42,7 @@ from .opening_balance_reconcile import (
     ADJUSTMENT_RECORDER_TYPE,
     opening_boundary,
 )
-from .physical import SEED_RECORDER_TYPE
+from .physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE, SEED_RECORDER_TYPE
 from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 
@@ -165,7 +165,9 @@ def _require_target_generation(
 # audit must never try. Derived from the constants that produce them rather than
 # spelled out again, because a synthetic type added later would otherwise fail
 # only on the next refresh, long after the code that introduced it.
-_SYNTHETIC_RECORDER_TYPES = frozenset({SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE})
+_SYNTHETIC_RECORDER_TYPES = frozenset(
+    {SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE, CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE}
+)
 
 
 def _opening_boundary_at(db: Session) -> datetime | None:

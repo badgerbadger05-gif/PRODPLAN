@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
+import logging
 import re
 from typing import Any, Callable, Mapping
 
@@ -75,6 +76,16 @@ from app.services.production_material_custody_projection import (
     build_material_custody_projection,
 )
 from app.services.mrp_result_snapshot import build_mrp_result_snapshot
+
+
+logger = logging.getLogger(__name__)
+
+# 1C permits editing a posted supplier document behind the accepted cutoff, so a
+# handful of receipts can legitimately fail provenance verification at any time.
+# Reject those individually rather than the whole generation. Above this
+# fraction of the candidate documents, though, treat it as a broken import and
+# still fail closed.
+_MAX_SUPPLIER_EVIDENCE_REJECT_FRACTION = 0.25
 
 
 CAPABILITIES = {
@@ -787,6 +798,7 @@ def _supplier_provenance_checkpoint(
     generation: models.LedgerGeneration,
     *,
     require_full_coverage: bool,
+    rejected_sle_ids: frozenset[int] = frozenset(),
 ) -> tuple[
     list[models.StockLedgerSupplierReceiptProvenance],
     dict[int, models.StockLedgerEntry],
@@ -815,7 +827,12 @@ def _supplier_provenance_checkpoint(
         raise GenerationValidationError(
             "supplier receipt provenance must reference supplier candidates"
         )
-    if require_full_coverage and provenance_ids != supplier_physical_ids:
+    # Receipts whose 1C document was edited behind the cutoff are rejected at
+    # accept time and legitimately have no provenance; exclude them from the
+    # full-coverage requirement (the accept gate bounds how many may be rejected
+    # before it fails closed) rather than freezing truth on one edited document.
+    required_ids = supplier_physical_ids - set(rejected_sle_ids)
+    if require_full_coverage and provenance_ids != required_ids:
         raise GenerationValidationError(
             "supplier receipt evidence must cover all supplier candidate rows"
         )
@@ -939,6 +956,7 @@ def validate_generation_build(
     generation_id: int,
     *,
     explicit_empty_physical: bool = False,
+    rejected_supplier_sle_ids: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
     """Dry, read-only validation.  Raises before truth publication on any gap."""
     generation = _building_generation(db, generation_id)
@@ -1040,7 +1058,10 @@ def validate_generation_build(
         excluded_ids,
         supplier_status_counts,
     ) = _supplier_provenance_checkpoint(
-        db, generation, require_full_coverage=True
+        db,
+        generation,
+        require_full_coverage=True,
+        rejected_sle_ids=rejected_supplier_sle_ids,
     )
     supplier_relevant_ids = {
         int(row.stock_ledger_entry_id)
@@ -1394,6 +1415,7 @@ def accept_generation_build(
                 f"reservation consumption allocation build failed: {exc}"
             ) from exc
         supplier_candidates = _supplier_candidates(db, int(generation.id))
+        rejected_supplier_sle_ids: set[int] = set()
         if supplier_candidates and odata_client is None:
             raise GenerationValidationError(
                 "supplier document evidence requires an OData client"
@@ -1406,11 +1428,80 @@ def accept_generation_build(
         )
         if extraction is not None and extraction.diagnostics:
             first = extraction.diagnostics[0]
-            raise GenerationValidationError(
-                "supplier document evidence is incomplete: "
-                f"{first.code} at {first.recorder_type}/"
-                f"{first.recorder_ref}/{first.line_no}"
+            rejected_docs = {
+                (str(d.recorder_type or ""), str(d.recorder_ref or ""))
+                for d in extraction.diagnostics
+            }
+            candidate_docs = {
+                (str(row.recorder_type or ""), str(row.recorder_ref or ""))
+                for row in supplier_candidates
+            }
+            # A diagnostic is emitted per document ROW, and other rows of the
+            # same document may verify fine — so reject only the exact rows
+            # (recorder + line), not the whole document, or verified rows would
+            # be wrongly excluded from the coverage requirement.
+            rejected_rows = {
+                (
+                    str(d.recorder_type or ""),
+                    str(d.recorder_ref or ""),
+                    str(d.line_no or ""),
+                )
+                for d in extraction.diagnostics
+            }
+            rejected_supplier_sle_ids = {
+                int(row.id)
+                for row in supplier_candidates
+                if row.id is not None
+                and (
+                    str(row.recorder_type or ""),
+                    str(row.recorder_ref or ""),
+                    str(row.line_no or ""),
+                )
+                in rejected_rows
+            }
+            # A wholesale failure means the import itself is broken, not isolated
+            # backdating: keep failing closed so it is not silently papered over.
+            if candidate_docs and (
+                len(rejected_docs)
+                > len(candidate_docs) * _MAX_SUPPLIER_EVIDENCE_REJECT_FRACTION
+            ):
+                raise GenerationValidationError(
+                    "supplier document evidence is incomplete for "
+                    f"{len(rejected_docs)}/{len(candidate_docs)} documents: "
+                    f"{first.code} at {first.recorder_type}/"
+                    f"{first.recorder_ref}/{first.line_no}"
+                )
+            # Isolated backdated/edited documents: reject only their receipts
+            # (their demand simply stays un-netted, which is conservative), keep
+            # the verified evidence, and record what was dropped for audit.
+            logger.warning(
+                "supplier document evidence rejected for %d of %d documents; "
+                "proceeding without their coverage (first: %s at %s/%s/%s)",
+                len(rejected_docs),
+                len(candidate_docs),
+                first.code,
+                first.recorder_type,
+                first.recorder_ref,
+                first.line_no,
             )
+            generation.source_watermarks = {
+                **dict(generation.source_watermarks or {}),
+                "supplier_evidence_rejected": {
+                    "rejected_documents": len(rejected_docs),
+                    "candidate_documents": len(candidate_docs),
+                    "rejected_sle_ids": sorted(rejected_supplier_sle_ids),
+                    "codes": sorted({str(d.code) for d in extraction.diagnostics}),
+                    "sample": [
+                        {
+                            "code": str(d.code),
+                            "recorder_type": str(d.recorder_type),
+                            "recorder_ref": str(d.recorder_ref),
+                            "line_no": str(d.line_no),
+                        }
+                        for d in extraction.diagnostics[:20]
+                    ],
+                },
+            }
         supplier = rebuild_supplier_receipt_coverage(
             db,
             ledger_generation_id=int(generation.id),
@@ -1451,6 +1542,7 @@ def accept_generation_build(
             db,
             int(generation.id),
             explicit_empty_physical=explicit_empty_physical,
+            rejected_supplier_sle_ids=frozenset(rejected_supplier_sle_ids),
         )
         try:
             from ..period_plan_service import (

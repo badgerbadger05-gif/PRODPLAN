@@ -261,6 +261,13 @@ def rebuild_running_balance(
 # re-pull synthetic rows from 1C can reference it instead of the literal.
 SEED_RECORDER_TYPE = "seed"
 
+# Recorder identity of a cutoff balance snap: one synthetic adjustment movement
+# per (item, org, warehouse) cell that closes the residual between the ledger's
+# movement-derived balance and 1C's authoritative Balance register at the
+# generation cutoff. Like the seed and opening adjustment it is NOT a 1C
+# document and must never be re-pulled from 1C.
+CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE = "cutoff_balance_adjustment"
+
 
 def seed_from_balance(
     session: Session,

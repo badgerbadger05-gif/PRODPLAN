@@ -13,6 +13,15 @@ from app.services.sync_orchestrator import SyncJob
 from app import models
 
 
+@pytest.fixture(autouse=True)
+def _stub_prerefresh_nomenclature(monkeypatch):
+    # The physical refresh job now runs a fast nomenclature package before its
+    # import so newly-created 1C items resolve. Stub it to a no-op by default so
+    # tests exercising the real job make no OData calls; the ordering test
+    # overrides this with its own recording stub.
+    monkeypatch.setattr(orch, "_run_nomenclature", lambda db, config: {})
+
+
 @pytest.fixture
 def tmp_state(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "STATE_PATH", tmp_path / "sync_schedule.json")
@@ -235,7 +244,12 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     parent = _accepted_parent_fixture(db_session)
     got_filter: list[str] = []
     got_strict = {"value": False}
+    call_order: list[str] = []
     opening_at = datetime(2026, 5, 31, 20, 59, 59, tzinfo=timezone.utc)
+
+    def _mock_nomenclature(db, config):
+        call_order.append("nomenclature")
+        return {}
 
     class DummyClient:
         base_url = "https://example.local/odata"
@@ -262,6 +276,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
         return {}
 
     def _mock_run(*args, **kwargs):
+        call_order.append("refresh")
         assert kwargs["generation_key"].startswith(f"physical-refresh:{parent.id}:")
         assert kwargs["target_cutoff"].tzinfo is not None
         assert kwargs["discovery_lookback"] == timedelta(days=7)
@@ -277,10 +292,14 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
     monkeypatch.setattr(orch, "get_stock_from_1c_odata", _mock_balance)
     monkeypatch.setattr(orch, "build_balance_snapshot", _mock_snapshot)
     monkeypatch.setattr(orch, "run_physical_refresh", _mock_run)
+    monkeypatch.setattr(orch, "_run_nomenclature", _mock_nomenclature)
 
     now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
     result = orch.tick(db=db_session, now=now)
     assert result["job"] == "physicalRefresh"
+    # Nomenclature is refreshed as part of the package right before the recalc,
+    # so a 1C item created since the last daily sync is resolvable at import.
+    assert call_order == ["nomenclature", "refresh"]
     settled_cutoff = now - timedelta(minutes=5)
     expected_cutoff = settled_cutoff.astimezone(ZoneInfo("Europe/Moscow")).replace(
         tzinfo=None, microsecond=0
@@ -309,6 +328,7 @@ def test_physical_refresh_failure_uses_exponential_backoff(tmp_state, db_session
         password = None
         token = None
     monkeypatch.setattr(orch, "_build_client", lambda: DummyClient())
+    monkeypatch.setattr(orch, "_run_nomenclature", lambda db, config: {})
     monkeypatch.setattr(orch, "get_stock_from_1c_odata", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("one-c oops")))
 
     now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)

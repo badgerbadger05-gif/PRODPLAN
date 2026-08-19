@@ -1435,6 +1435,67 @@ def test_structural_supplier_evidence_diagnostic_blocks_before_fifo_and_acceptan
     ).filter_by(ledger_generation_id=generation.id).count() == 0
 
 
+def test_isolated_supplier_evidence_diagnostic_is_tolerated(db_session, monkeypatch):
+    generation, requirement = _synthetic(db_session, "supplier-tolerate")
+    # Five candidate receipt documents; only one was edited behind the cutoff.
+    for i in range(1, 6):
+        db_session.add(models.StockLedgerEntry(
+            ingest_batch_id=generation.physical_import_batch_id,
+            source_content_hash=f"supplier-tolerate-{i}",
+            item_id=requirement.item_id,
+            characteristic_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("1"),
+            posting_at=datetime(2026, 7, 21),
+            record_type="Receipt",
+            movement_kind="supplier_receipt",
+            recorder_type="Document_ПриходнаяНакладная",
+            recorder_ref=f"receipt-{i}",
+            line_no="1",
+            ingest_source="test",
+        ))
+    db_session.commit()
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        lambda *_args, **_kwargs: SupplierEvidenceExtractionResult(
+            evidence=(),
+            diagnostics=(SupplierEvidenceDiagnostic(
+                recorder_type="Document_ПриходнаяНакладная",
+                recorder_ref="receipt-1",
+                line_no="1",
+                code="quantity_mismatch",
+                detail="document line quantity differs from Ledger row",
+            ),),
+            fetched_document_count=5,
+        ),
+    )
+
+    class _ReachedCoverage(Exception):
+        pass
+
+    def _reached(*_args, **_kwargs):
+        raise _ReachedCoverage("gate tolerated one document and reached coverage")
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "rebuild_supplier_receipt_coverage",
+        _reached,
+    )
+
+    # One rejected document out of five (20%, below the guard) must NOT raise
+    # the supplier-evidence error; the gate tolerates it and proceeds to the
+    # coverage rebuild (our sentinel), leaving that receipt simply un-netted.
+    with pytest.raises(_ReachedCoverage):
+        accept_generation_build(
+            db_session,
+            generation.id,
+            replay_from=datetime(2026, 7, 1),
+            odata_client=object(),
+        )
+
+
 def test_supplier_candidates_require_explicit_odata_client(db_session):
     generation, requirement = _synthetic(db_session, "supplier-client")
     db_session.add(models.StockLedgerEntry(
@@ -1676,6 +1737,51 @@ def test_validation_rejects_supplier_receipt_candidate_rows_without_provenance(d
         match="supplier receipt evidence must cover all supplier candidate rows",
     ):
         validate_generation_build(db_session, generation.id)
+
+
+def test_validation_excludes_rejected_supplier_receipts_from_coverage(db_session):
+    generation, requirement = _synthetic(db_session, "rejected-provenance")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="0",
+    )
+    _add_matching_reservation_event(db_session, generation, requirement)
+    rejected = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="rejected-provenance",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH",
+        qty=Decimal("-2"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Expense",
+        movement_kind="supplier_return",
+        recorder_type="Document_РасходнаяНакладная",
+        recorder_ref="rejected-provenance",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(rejected)
+    db_session.commit()
+
+    # Passing the rejected receipt's SLE id excludes it from the full-coverage
+    # requirement: the coverage error must not fire (other unrelated checkpoints
+    # of this minimal fixture may still fail — that is acceptable here).
+    try:
+        validate_generation_build(
+            db_session,
+            generation.id,
+            rejected_supplier_sle_ids=frozenset({int(rejected.id)}),
+        )
+    except GenerationValidationError as exc:
+        assert (
+            "supplier receipt evidence must cover all supplier candidate rows"
+            not in str(exc)
+        )
 
 
 def test_accept_rejects_ignored_supplier_entries_if_not_candidate_rows(db_session, monkeypatch):
