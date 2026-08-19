@@ -246,7 +246,13 @@ def _build_buy_horizon_generation(db):
         physical_import_batch=physical,
         algorithm_version="test",
     )
-    item = models.Item(item_code="RAW-HRZ", item_name="Материал HORZ", unit="шт", supplier_ref1c="SUP-HRZ")
+    item = models.Item(
+        item_code="RAW-HRZ",
+        item_name="Материал HORZ",
+        item_article="ARTICLE-HRZ",
+        unit="шт",
+        supplier_ref1c="SUP-HRZ",
+    )
     supplier = models.Supplier(supplier_ref1c="SUP-HRZ", supplier_name="Гамма")
     db.add_all([generation, item, supplier])
     db.flush()
@@ -459,6 +465,18 @@ def test_filters_sort_pagination_and_summary_use_only_snapshot(db_session):
         "suppliers": [{"supplier_id": 1, "supplier_name": "Альфа"}],
         "states": ["В закупку"],
     }
+
+
+def test_list_journal_searches_buy_rows_by_item_article(db_session):
+    _generation, item, _aug, _sep, _snapshot = _build_buy_horizon_generation(
+        db_session
+    )
+
+    result = list_journal(db_session, search="article-hrz")
+
+    assert result["total"] == 1
+    assert result["rows"][0]["item_id"] == item.item_id
+    assert result["rows"][0]["item_article"] == "ARTICLE-HRZ"
 
 
 def test_missing_or_stale_snapshot_fails_closed(db_session):

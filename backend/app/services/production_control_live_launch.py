@@ -34,6 +34,10 @@ def _iso(value: datetime | date | None) -> str | None:
     return value.isoformat()
 
 
+def _datetime_iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
 def _to_float(value: Any) -> float:
     if value is None:
         return 0.0
@@ -136,6 +140,49 @@ def overlay_launch_facts(
         row["comment"] = (
             "Заказ создан после cutoff принятого поколения; "
             "плановые величины строки обновятся в следующем поколении"
+        )
+
+
+def overlay_execution_state(
+    db: Session,
+    rows: Sequence[MutableMapping[str, Any]],
+) -> None:
+    """Overlay mutable workshop facts on immutable journal rows.
+
+    Printing and material-transfer workflow happen after a Ledger snapshot is
+    accepted.  They are execution facts, not planning math, so the journal must
+    show them immediately while leaving every frozen quantity untouched.
+    """
+    by_product_id = {
+        int(row["product_id"]): row
+        for row in rows
+        if row.get("product_id") is not None
+    }
+    if not by_product_id:
+        return
+
+    states = (
+        db.query(models.ProductionOrderLineState)
+        .filter(
+            models.ProductionOrderLineState.product_id.in_(
+                sorted(by_product_id)
+            )
+        )
+        .all()
+    )
+    for state in states:
+        row = by_product_id.get(int(state.product_id))
+        if row is None:
+            continue
+        line_status = str(state.status or "shortage")
+        row["status"] = (
+            "created" if line_status in {"shortage", "partial"}
+            else "ready" if line_status == "assembled"
+            else line_status
+        )
+        row["issue_status"] = str(state.issue_status or "not_requested")
+        row["route_sheet_printed_at"] = _datetime_iso(
+            state.route_sheet_printed_at
         )
 
 

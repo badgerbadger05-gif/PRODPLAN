@@ -268,7 +268,22 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
         to_order_by_period = []
 
     if search:
-        needle = str(search).casefold(); rows = [r for r in rows if needle in " ".join(str(r.get(k) or "") for k in ("order_number","item_name","item_code","supplier_name")).casefold()]
+        needle = str(search).casefold()
+        rows = [
+            row
+            for row in rows
+            if needle
+            in " ".join(
+                str(row.get(key) or "")
+                for key in (
+                    "order_number",
+                    "item_name",
+                    "item_code",
+                    "item_article",
+                    "supplier_name",
+                )
+            ).casefold()
+        ]
     sort_by = str(kwargs.get("sort_by") or "delivery_date")
     if sort_by not in {"delivery_date", "order_date", "order_number", "item_code", "remaining_qty"}:
         sort_by = "delivery_date"

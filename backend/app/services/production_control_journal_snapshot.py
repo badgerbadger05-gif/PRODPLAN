@@ -24,6 +24,7 @@ from app import models
 from app.services.bom_specification_resolver import BomSpecificationResolver
 from app.services.production_control_printing import build_route_sheet_snapshot_payloads
 from app.services.production_control_live_launch import (
+    overlay_execution_state,
     overlay_launch_facts,
     route_sheets_after_cutoff,
 )
@@ -1013,6 +1014,7 @@ def read_snapshot(
     overlay_launch_facts(
         db, public_rows, cutoff=_generation_cutoff(db, snapshot.ledger_generation_id)
     )
+    overlay_execution_state(db, public_rows)
     return {
         "rows": public_rows,
         "total": total,

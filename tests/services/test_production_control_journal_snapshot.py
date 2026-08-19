@@ -939,6 +939,68 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
     assert row["coverage_status"] == "shortage"
 
 
+def test_journal_overlays_print_and_transfer_state_after_cutoff(db_session):
+    generation = _building_generation(db_session, "production-journal-live-state")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+    _order, product = _launch_after_cutoff(
+        db_session,
+        generation,
+        work,
+        created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
+    )
+    printed_at = generation.cutoff.replace(tzinfo=None) + timedelta(minutes=45)
+    db_session.add(
+        models.ProductionOrderLineState(
+            product_id=product.product_id,
+            status="to_move",
+            issue_status="exported",
+            route_sheet_printed_at=printed_at,
+        )
+    )
+    db_session.commit()
+
+    row = next(
+        item
+        for item in read_snapshot(db_session, limit=100)["rows"]
+        if item["journal_row_key"] == f"work-item:{work.id}"
+    )
+
+    assert row["status"] == "to_move"
+    assert row["issue_status"] == "exported"
+    assert row["route_sheet_printed_at"] == printed_at.isoformat()
+
+
+def test_materials_are_available_for_order_opened_after_cutoff(db_session):
+    generation = _building_generation(db_session, "production-journal-live-materials")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+    _order, product = _launch_after_cutoff(
+        db_session,
+        generation,
+        work,
+        created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
+    )
+
+    materials = get_materials_snapshot(db_session, product.product_id)
+
+    assert materials["product_id"] == product.product_id
+    assert materials["ledger_generation_id"] == generation.id
+    assert materials["truth_status"] == "accepted"
+    assert materials["cutoff"] == snapshot.cutoff.isoformat()
+    assert len(materials["components"]) == 1
+
+
 def test_route_sheet_prints_for_order_opened_after_cutoff(db_session):
     """Маршрутный лист — документ по физическому заказу, а не плановая
     гипотеза: он обязан печататься сразу после запуска."""

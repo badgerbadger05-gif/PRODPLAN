@@ -754,6 +754,35 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         public["truth_status"] = str(snapshot.truth_status)
         public["cutoff"] = snapshot.cutoff.isoformat()
         return public
+
+    # An executor created after the accepted cutoff cannot be a member of the
+    # immutable journal snapshot.  It is nevertheless owned by that exact
+    # generation and must be launchable immediately.  Reuse the same
+    # generation-pinned builder as snapshot publication; do not read newer
+    # stock or current specifications.
+    live_product = (
+        db.query(ProductionProduct)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(
+            ProductionProduct.product_id == int(product_id),
+            ProductionProduct.ledger_generation_id == generation_id,
+            ProductionOrder.deletion_mark.is_(False),
+            ProductionOrder.created_at > snapshot.cutoff,
+        )
+        .one_or_none()
+        if snapshot is not None
+        else None
+    )
+    if live_product is not None:
+        public = preview_materials(
+            db,
+            int(product_id),
+            ledger_generation_id=generation_id,
+            _product_override=live_product,
+        )
+        public["truth_status"] = str(snapshot.truth_status)
+        public["cutoff"] = snapshot.cutoff.isoformat()
+        return public
     raise MaterialCoverageSnapshotUnavailable(
         product_id=int(product_id),
         expected_generation_id=generation_id,
