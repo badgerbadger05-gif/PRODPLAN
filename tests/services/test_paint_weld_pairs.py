@@ -1,8 +1,8 @@
-"""Tests for the paint↔predecessor pairs registry (окраска↔сварка), stage 1.
+"""Tests for the paint↔weld pairs registry (окраска↔сварка), stage 1.
 
 Pairing is by PRODUCTION KIND: an item is "painted" when its default spec's
 production_kind name matches покрас/окрас/маляр. The pair is the spec's single
-'Сборка' component (predecessor after any processing — welding/bending/turning);
+'Сборка' component whose own default spec has a welding production kind;
 extra non-'Сборка' components (расходники) do not break the pair. Only
 predecessors with replenishment_method 'Производство' are greyed (is_welded_blocked).
 Painting specs with 0 or >1 'Сборка' are reported as unpaired (not blocked).
@@ -32,6 +32,7 @@ from app.services.paint_weld_pairs import (
     deactivate_pair,
     UNPAIRED_NO_ASSEMBLY,
     UNPAIRED_MULTIPLE_ASSEMBLY,
+    UNPAIRED_NON_WELD_PREDECESSOR,
 )
 from app.services.bom_specification_resolver import (
     BomSpecificationResolutionError,
@@ -100,6 +101,9 @@ def _painted_with_predecessor(
         predecessor_name or f"Изделие {tag}, после обработки",
         method=predecessor_method,
     )
+    weld_kind = _kind(db, "Сварочное производство")
+    weld_spec = _spec(db, f"s-weld-{tag}", kind=weld_kind)
+    db.add(DefaultSpecification(item_id=predecessor.item_id, spec_id=weld_spec.spec_id))
     kind = _kind(db, kind_name)
     spec = _spec(db, f"s-{tag}", kind=kind)
     db.add(SpecComponent(spec_id=spec.spec_id, item_id=predecessor.item_id, quantity=1, component_type="Сборка"))
@@ -142,13 +146,43 @@ def test_rebuild_ignores_non_paint_kind(db_session):
 
 
 def test_rebuild_predecessor_name_not_filtered(db_session):
-    # predecessor after turning (no "сварка" in name) still forms a pair
+    # Classification comes from production kind, not the item name.
     painted, predecessor, _s = _painted_with_predecessor(
         db_session, "TURN", predecessor_name="Вал, после токарки"
     )
     summary = rebuild_auto_pairs(db_session)
     assert summary["created"] == 1
     assert db_session.query(PaintWeldPair).one().welded_item_id == predecessor.item_id
+
+
+def test_rebuild_rejects_bending_predecessor(db_session):
+    painted, predecessor, _s = _painted_with_predecessor(db_session, "BEND")
+    predecessor_default = (
+        db_session.query(DefaultSpecification)
+        .filter(DefaultSpecification.item_id == predecessor.item_id)
+        .one()
+    )
+    bending_kind = _kind(db_session, "Гибка")
+    bending_spec = _spec(db_session, "s-bend", kind=bending_kind)
+    predecessor_default.spec_id = bending_spec.spec_id
+    db_session.add(
+        PaintWeldPair(
+            painted_item_id=painted.item_id,
+            welded_item_id=predecessor.item_id,
+            source="auto",
+            is_active=True,
+        )
+    )
+    db_session.flush()
+
+    summary = rebuild_auto_pairs(db_session)
+
+    assert summary["created"] == 0
+    assert summary["deactivated"] == 1
+    assert summary["active_pairs"] == 0
+    assert summary["unpaired"]["by_reason"] == {
+        UNPAIRED_NON_WELD_PREDECESSOR: 1
+    }
 
 
 def test_rebuild_extra_material_component_does_not_break_pair(db_session):

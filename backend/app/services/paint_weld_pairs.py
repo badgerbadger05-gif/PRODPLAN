@@ -1,11 +1,11 @@
-"""Справочник пар «окрашенная ↔ предшественник» (окраска ↔ сварка/др.), этап 1.
+"""Справочник пар «окрашенная ↔ сварная», этап 1.
 
 Окрашенная деталь определяется ПО ВИДУ ПРОИЗВОДСТВА: у её default-спеки
 production_kind — красящий (имя содержит «покрас»/«окрас»/«маляр»). В такой
-спеке ровно один компонент типа «Сборка» — это деталь-предшественник (после
-любой обработки: сварка, гибка, токарка, сборка). Дополнительные НЕ-«Сборка»
-компоненты (расходники: резинки, трафареты) пару не ломают. Имя предшественника
-НЕ фильтруется.
+спеке ровно один компонент типа «Сборка», а его default-спека имеет сварочный
+вид производства (имя содержит «свар»). Дополнительные НЕ-«Сборка» компоненты
+(расходники: резинки, трафареты) пару не ломают. Имя номенклатуры
+предшественника НЕ используется для классификации.
 
 Пары строятся автоматически (source='auto'), ручные правки допустимы
 (source='manual'). В welded-блокировку (серость) попадают только предшественники
@@ -41,12 +41,14 @@ from .production_output_truth import accepted_product_remaining_expr
 # Красящий вид производства: имя production_kind содержит любой из маркеров.
 # «окрас» — подстрока «покраска», поэтому ловит и «Узел (покраска)».
 PAINT_KIND_MARKERS = ("покрас", "окрас", "маляр")
+WELD_KIND_MARKERS = ("свар",)
 
 ASSEMBLY_COMPONENT_TYPE = "Сборка"
 
 # Причины, по которым красящаяся позиция не даёт пары (для отчёта rebuild).
 UNPAIRED_NO_ASSEMBLY = "no_assembly_component"
 UNPAIRED_MULTIPLE_ASSEMBLY = "multiple_assembly_components"
+UNPAIRED_NON_WELD_PREDECESSOR = "non_weld_predecessor"
 
 
 def _to_float(value: Any) -> float:
@@ -102,8 +104,9 @@ def _detect_auto_pairs(db: Session) -> Tuple[Dict[int, int], Dict[int, str]]:
 
     Возвращает (pairs, unpaired):
       - pairs: {painted_item_id: predecessor_item_id} — спека с ровно одним
-        компонентом-«Сборка» (предшественник после любой обработки);
-      - unpaired: {painted_item_id: reason} — спека с 0 или >1 «Сборка».
+        компонентом-«Сборка», чей вид производства является сварочным;
+      - unpaired: {painted_item_id: reason} — спека с 0 или >1 «Сборка» либо
+        с единственным несварочным предшественником.
     """
     painted_specs = _painted_specs(db)
     pairs: Dict[int, int] = {}
@@ -121,12 +124,45 @@ def _detect_auto_pairs(db: Session) -> Tuple[Dict[int, int], Dict[int, str]]:
     ):
         assembly_by_spec[int(spec_id)].append(int(comp_item_id))
 
+    predecessor_ids = {
+        item_id for item_ids in assembly_by_spec.values() for item_id in item_ids
+    }
+    resolver = BomSpecificationResolver(db)
+    predecessor_spec_ids = {
+        item_id: resolver.default_spec_id(item_id) for item_id in predecessor_ids
+    }
+    spec_ids = {
+        int(spec_id)
+        for spec_id in predecessor_spec_ids.values()
+        if spec_id is not None
+    }
+    kind_name_by_spec_id = {
+        int(spec_id): str(kind_name or "")
+        for spec_id, kind_name in (
+            db.query(Specification.spec_id, ProductionKind.name)
+            .join(
+                ProductionKind,
+                Specification.production_kind_id == ProductionKind.id,
+            )
+            .filter(Specification.spec_id.in_(spec_ids))
+            .all()
+        )
+    }
+    weld_predecessor_ids = {
+        int(item_id)
+        for item_id, spec_id in predecessor_spec_ids.items()
+        if spec_id is not None
+        and _name_has(kind_name_by_spec_id.get(int(spec_id)), WELD_KIND_MARKERS)
+    }
+
     for painted_id, spec_id in painted_specs.items():
         assemblies = assembly_by_spec.get(spec_id, [])
-        if len(assemblies) == 1:
+        if len(assemblies) == 1 and assemblies[0] in weld_predecessor_ids:
             pairs[painted_id] = assemblies[0]
         elif len(assemblies) == 0:
             unpaired[painted_id] = UNPAIRED_NO_ASSEMBLY
+        elif len(assemblies) == 1:
+            unpaired[painted_id] = UNPAIRED_NON_WELD_PREDECESSOR
         else:
             unpaired[painted_id] = UNPAIRED_MULTIPLE_ASSEMBLY
     return pairs, unpaired

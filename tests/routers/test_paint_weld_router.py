@@ -71,6 +71,18 @@ def _seed_pair(db):
     # Окрашенная определяется по красящему виду производства default-спеки.
     painted = _item(db, "P1", "Вал, окрашенный")
     welded = _item(db, "W1", "Вал, после сварки")
+    weld_kind = ProductionKind(ref_1c="wk-seed", name="Сварочное производство")
+    db.add(weld_kind)
+    db.flush()
+    weld_spec = Specification(
+        spec_code="sw1",
+        spec_name="sw1",
+        spec_ref1c="sw1",
+        production_kind_id=weld_kind.id,
+    )
+    db.add(weld_spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=welded.item_id, spec_id=weld_spec.spec_id))
     kind = _paint_kind(db, "pk-seed")
     spec = Specification(spec_code="s1", spec_name="s1", spec_ref1c="s1", production_kind_id=kind.id)
     db.add(spec)
