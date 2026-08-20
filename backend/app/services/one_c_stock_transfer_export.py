@@ -295,16 +295,40 @@ def _entry_origin_token(entry: StockTransferExportEntry) -> str:
     return _origin_token("material_issue", identity)
 
 
+#: Probes that stay next to the issue's own number before jumping out of the band.
+_LINEAR_TRANSFER_PROBES = 8
+
+
+def _transfer_number_offset(attempt: int) -> int:
+    """Offset of one probe: a few neighbours, then out of the occupied band.
+
+    Two PRODPLAN contours write into the same 1C base and both derive the
+    display number from their own ``material_issue`` id, so one stand's numbers
+    are a solid wall of the other stand's documents (``PRODPLAN
+    source=material_issue/…`` in the comment).  Walking that wall one step at a
+    time exhausts the probe budget and the launch dies with "не удалось выделить
+    уникальный номер" — the neighbours are exactly the range that is guaranteed
+    to be taken.  Doubling jumps clear the band in a handful of calls while the
+    first probes still keep the familiar number whenever it is free.
+    """
+    step = int(attempt)
+    if step < _LINEAR_TRANSFER_PROBES:
+        return step
+    return _LINEAR_TRANSFER_PROBES * (2 ** min(step - _LINEAR_TRANSFER_PROBES + 1, 20))
+
+
 def _origin_transfer_number(entry: StockTransferExportEntry, *, attempt: int = 0) -> str:
     if not entry.origin_token:
         raise ValueError("material issue export has no durable origin token")
     prefix = "RT" if str(entry.direction or "issue") == "return" else "MT"
     # 2 + 9 = the 11-character limit of Document_ПеремещениеЗапасов.Number.
     # Keep the familiar stable-contour format (MT000002982) for operators.
-    # Linear probing is used only when that human-facing number is already
-    # owned by another local or 1C document; durable ownership and retry
-    # recovery continue to rely on prodplan-origin, not on the display number.
-    number_part = (int(entry.issue_id) + int(attempt)) % 1_000_000_000
+    # Probing is used only when that human-facing number is already owned by
+    # another local or 1C document; durable ownership and retry recovery
+    # continue to rely on prodplan-origin, not on the display number.
+    number_part = (
+        int(entry.issue_id) + _transfer_number_offset(attempt)
+    ) % 1_000_000_000
     return f"{prefix}{number_part:09d}"
 
 
@@ -375,7 +399,7 @@ def _allocate_transfer_number(
     """
     marker = f"prodplan-origin={entry.origin_token}"
     db.flush()
-    for attempt in range(32):
+    for attempt in range(28):
         number = _origin_transfer_number(entry, attempt=attempt)
         if reserved is not None and number in reserved:
             continue

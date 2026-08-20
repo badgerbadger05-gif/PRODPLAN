@@ -1055,3 +1055,52 @@ def test_two_issues_of_one_launch_never_take_the_same_number(db_session, monkeyp
     assert first.document_number != second.document_number
     assert first.document_number == f"MT{int(first.issue_id) + 1:09d}"
     assert second.document_number == f"MT{int(second.issue_id) + 1:09d}"
+
+
+def test_number_probing_escapes_a_band_owned_by_another_contour(db_session, monkeypatch):
+    """Two PRODPLAN stands share one 1C base and one number series.
+
+    The other stand's issue ids run ahead, so its documents form a solid wall
+    right where this stand probes: MT000002100…MT000002137, every one of them
+    commented ``PRODPLAN source=material_issue/…``.  Stepping one number at a
+    time never left that wall inside the probe budget and the launch failed
+    with "не удалось выделить уникальный номер перемещения в 1С".
+    """
+    db = db_session
+    parent = _mk_item(db, code="TRP-BAND", ref1c="parent-band-ref")
+    comp = _mk_item(db, code="TRC-BAND", ref1c="comp-band-ref")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-band")
+    base = int(issue.issue_id)
+    # 64 consecutive numbers already belong to the other contour.
+    occupied = {f"MT{base + step:09d}" for step in range(64)}
+
+    class _BandClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
+                return []
+            query = str(kwargs.get("filter_query") or "")
+            if "substringof(" in query:
+                return []
+            for number in occupied:
+                if number in query:
+                    return [{
+                        "Ref_Key": f"other-contour-{number}",
+                        "Number": number,
+                        "Комментарий": "PRODPLAN source=material_issue/other",
+                        "Posted": True,
+                        "DeletionMark": False,
+                    }]
+            return []
+
+    fake = _BandClient(ref_key="band-transfer-ref")
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
+    assert result["status"] == "ok"
+    assert result["issues_created"] == 1
+    db.refresh(issue)
+    assert issue.document_number not in occupied
+    assert issue.document_number.startswith("MT")
+    assert issue.document_number[2:].isdigit()
