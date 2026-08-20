@@ -196,5 +196,55 @@ def test_order_opened_in_1c_survives_the_retirement_of_its_run(db_session):
 
     rows = production_journal(db_session)["rows"]
 
-    # The opened order stays; the proposal of the same retired run does not.
+    # The opened 1C order stays even though its run and plan are both retired.
+    # The local order of that foreign plan does not: it is not this
+    # generation's work at all.
     assert sorted(row["order_number"] for row in rows) == ["LAUNCHED", "LIVE"]
+
+
+def test_local_order_of_a_rebased_run_stays_visible_within_its_plan(db_session):
+    """What nets the launch quantity has to be visible.
+
+    A rebase retires the run but keeps the plan, and the order materialized
+    before it is still that plan's work — its material issues and route sheet
+    are real, and its open quantity is now subtracted from what may be launched.
+    Hiding it while it silently reduces the proposal is the worst of both
+    worlds.
+    """
+    current = _generation(db_session, "current-rebased")
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=current.id))
+    item = models.Item(item_code="J-REBASED", item_name="Rebased part", unit="шт")
+    db_session.add(item)
+    db_session.flush()
+    plan, live_run = _plan_and_run(db_session, generation=current, name="live plan")
+    retired_run = models.PlanningRun(
+        status="CLOSED", config_snapshot={}, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to,
+        ledger_generation_id=current.id,
+    )
+    db_session.add(retired_run)
+    db_session.flush()
+
+    for number, run in (("BEFORE-REBASE", retired_run), ("AFTER-REBASE", live_run)):
+        order = models.ProductionOrder(
+            order_number=number, order_date=datetime(2026, 7, 23), is_posted=True,
+            deletion_mark=False, source="mrp", source_run_id=run.run_id,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = models.ProductionProduct(
+            order_id=order.order_id, item_id=item.item_id, line_number=1,
+            quantity=4, produced_qty=0, remaining_qty=4,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(
+            models.ProductionOrderLineState(product_id=product.product_id, status="shortage")
+        )
+    db_session.commit()
+
+    rows = production_journal(db_session)["rows"]
+
+    assert sorted(row["order_number"] for row in rows) == [
+        "AFTER-REBASE", "BEFORE-REBASE",
+    ]

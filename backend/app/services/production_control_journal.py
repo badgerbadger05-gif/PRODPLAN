@@ -292,6 +292,39 @@ def _accepted_plan_snapshot_run_ids_for_root(
     return {int(row[0]) for row in rows if row[0] is not None}
 
 
+def _plan_scoped_run_ids(db: Session, accepted_run_ids: Sequence[int]) -> List[int]:
+    """Every run belonging to a plan that is live in the accepted generation.
+
+    The accepted scope names the *current* run of each live plan.  Work
+    materialized before the last rebase carries an older run of the same plan,
+    which is not a foreign branch of truth — it is this plan's own history.
+    A plan that is not live at all stays out, so a foreign generation's order
+    still cannot leak in.
+    """
+    run_ids = sorted({int(value) for value in accepted_run_ids})
+    if not run_ids:
+        return []
+    plan_ids = [
+        int(plan_id)
+        for (plan_id,) in db.query(PlanningRun.source_plan_id)
+        .filter(
+            PlanningRun.run_id.in_(run_ids),
+            PlanningRun.source_plan_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    ]
+    if not plan_ids:
+        return run_ids
+    scoped = {
+        int(run_id)
+        for (run_id,) in db.query(PlanningRun.run_id)
+        .filter(PlanningRun.source_plan_id.in_(plan_ids))
+        .all()
+    }
+    return sorted(scoped | set(run_ids))
+
+
 def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[int]:
     rows = (
         db.query(PlanningRun.run_id)
@@ -849,6 +882,14 @@ def list_journal(
             ledger_generation_id=int(truth.generation_id),
         )
     )
+    # Every run of a plan that is live in this generation, retired ones
+    # included.  A materialized order keeps the run it was launched from, and a
+    # rebase or a re-fixed plan retires that run within the hour; the order is
+    # still this plan's work — its material issues, route sheet and open
+    # quantity are real, and the same quantity is now netted off the proposal.
+    # Hiding it while it silently reduces what may be launched is the worst of
+    # both worlds, so visibility and netting share one boundary: the plan.
+    plan_scoped_run_ids = _plan_scoped_run_ids(db, accepted_run_ids)
     # A scalar is retained only for an unambiguous scope.  Never choose the
     # numerically latest run as that can belong to a foreign generation.
     run_id = accepted_run_ids[0] if len(accepted_run_ids) == 1 else None
@@ -894,7 +935,7 @@ def list_journal(
         or_(
             func.lower(func.coalesce(ProductionOrder.source, "1c")) != "mrp",
             func.coalesce(ProductionOrder.order_ref1c, "") != "",
-            ProductionOrder.source_run_id.in_(accepted_run_ids or [-1]),
+            ProductionOrder.source_run_id.in_(plan_scoped_run_ids or [-1]),
         )
     )
 
