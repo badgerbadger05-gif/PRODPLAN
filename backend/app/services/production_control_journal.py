@@ -1405,25 +1405,6 @@ def list_make_proposals(
         int(row.id): row
         for row in db.query(MrpRequirement).filter(MrpRequirement.id.in_(requirement_ids)).all()
     }
-    active_open_by_requirement: Dict[int, float] = {}
-    for requirement_id, quantity, produced_qty in (
-        db.query(
-            ProductionProduct.source_mrp_requirement_id,
-            ProductionProduct.quantity,
-            ProductionProduct.produced_qty,
-        )
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .filter(
-            ProductionOrder.source == "mrp",
-            ProductionOrder.deletion_mark.is_(False),
-            ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
-        )
-        .all()
-    ):
-        rid = int(requirement_id)
-        active_open_by_requirement[rid] = active_open_by_requirement.get(rid, 0.0) + max(
-            0.0, _to_float(quantity) - _to_float(produced_qty)
-        )
     run_rows = (
         db.query(PlanningRun, ProductionPlanHeader)
         .outerjoin(
@@ -1433,6 +1414,55 @@ def list_make_proposals(
         .filter(PlanningRun.run_id.in_(run_ids))
         .all()
     )
+    # Work already launched is netted per part and plan, not per requirement id.
+    # An order keeps the requirement id of the run it was launched from, and a
+    # rebase or a re-fixed plan retires that run within the hour; keying the
+    # open quantity by requirement id therefore lost it, the row offered the
+    # whole remainder again and the same work was launched twice.  CANON
+    # («Коррекция после смены MRP») compares the old MRP's open demand with the
+    # new requirement of the same part, so the plan is the boundary that holds.
+    current_requirement_by_plan_item: Dict[Tuple[Optional[int], int], int] = {}
+    plan_by_run = {
+        int(run.run_id): (int(run.source_plan_id) if run.source_plan_id is not None else None)
+        for run, _plan in run_rows
+    }
+    for requirement_id, requirement in requirements.items():
+        current_requirement_by_plan_item[
+            (plan_by_run.get(int(requirement.run_id)), int(requirement.item_id))
+        ] = int(requirement_id)
+    active_open_by_requirement: Dict[int, float] = {}
+    for quantity, produced_qty, requirement_item_id, requirement_plan_id in (
+        db.query(
+            ProductionProduct.quantity,
+            ProductionProduct.produced_qty,
+            MrpRequirement.item_id,
+            PlanningRun.source_plan_id,
+        )
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .join(
+            MrpRequirement,
+            MrpRequirement.id == ProductionProduct.source_mrp_requirement_id,
+        )
+        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
+        .filter(
+            ProductionOrder.source == "mrp",
+            ProductionOrder.deletion_mark.is_(False),
+            func.coalesce(ProductionProduct.quantity, 0)
+            > func.coalesce(ProductionProduct.produced_qty, 0),
+        )
+        .all()
+    ):
+        target = current_requirement_by_plan_item.get(
+            (
+                int(requirement_plan_id) if requirement_plan_id is not None else None,
+                int(requirement_item_id),
+            )
+        )
+        if target is None:
+            continue
+        active_open_by_requirement[target] = active_open_by_requirement.get(
+            target, 0.0
+        ) + max(0.0, _to_float(quantity) - _to_float(produced_qty))
     run_meta = {
         int(run.run_id): {
             "source_plan_id": int(run.source_plan_id) if run.source_plan_id is not None else None,

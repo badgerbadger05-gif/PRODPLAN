@@ -16,6 +16,7 @@ from decimal import Decimal
 from app import models
 from app.services.production_control_journal import (
     list_journal,
+    list_make_proposals,
     materialize_make_work_items,
 )
 
@@ -325,3 +326,77 @@ def test_explicit_line_state_dates_still_win_over_the_shelf(db_session):
     assert row["planned_finish_date"] == "2026-08-25"
     # The shelf still explains what governs the launch quantity.
     assert row["launch_source"] == "shelf_pull"
+
+
+def test_launched_work_of_a_retired_run_still_nets_the_new_requirement(db_session):
+    """A launch survives the MRP change that follows it.
+
+    An order keeps the requirement id of the run it was launched from, and a
+    rebase or a re-fixed plan retires that run within the hour.  Netting the
+    open quantity by requirement id alone therefore lost it: the row offered the
+    whole remainder again, so the same part was launched twice while its first
+    order was already in production.
+    """
+    generation, run, item, work = _scope(db_session, key="retired-launch")
+    plan_id = int(run.source_plan_id)
+
+    # The run the operator launched from, retired by a later re-fix of the plan.
+    retired_run = models.PlanningRun(
+        status="CLOSED",
+        config_snapshot={},
+        source_plan_id=plan_id,
+        period_from=run.period_from,
+        period_to=run.period_to,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=CUTOFF,
+        active_freeze_version=1,
+    )
+    db_session.add(retired_run)
+    db_session.flush()
+    retired_requirement = models.MrpRequirement(
+        run_id=retired_run.run_id,
+        item_id=item.item_id,
+        total_required_qty=10,
+        net_required_qty=10,
+        period_from=run.period_from,
+        period_to=run.period_to,
+        bom_level=0,
+        freeze_version=1,
+    )
+    db_session.add(retired_requirement)
+    db_session.flush()
+    order = models.ProductionOrder(
+        order_number="LAUNCHED-BEFORE-REFIX",
+        order_date=datetime(2026, 7, 26),
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=retired_run.run_id,
+        order_ref1c="9f1f5690-5345-11f1-9dae-9ee51454587f",
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = models.ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=3,
+        produced_qty=0,
+        remaining_qty=3,
+        source_mrp_requirement_id=retired_requirement.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        models.ProductionOrderLineState(product_id=product.product_id, status="shortage")
+    )
+    db_session.commit()
+
+    [proposal] = list_make_proposals(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        accepted_run_ids=[int(run.run_id)],
+    )
+
+    # 8 remaining minus the 3 already in production against the same part.
+    assert proposal["materialized_order_qty"] == 3.0
+    assert proposal["launchable_qty"] == 5.0
