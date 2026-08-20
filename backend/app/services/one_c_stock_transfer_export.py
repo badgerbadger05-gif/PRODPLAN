@@ -359,10 +359,26 @@ def _allocate_transfer_number(
     db: Session,
     client: Any,
     entry: StockTransferExportEntry,
+    *,
+    reserved: Optional[set[str]] = None,
 ) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Pick a display number nobody else owns, locally or in 1C.
+
+    Two things make "nobody else" harder than one query.  The session does not
+    autoflush, so a number handed to an earlier issue of the *same* export run
+    is still only in memory — flush before probing, or the next issue reads a
+    database that does not know about it yet.  And even flushed, an issue that
+    is only pending in this run has to be excluded explicitly, which is what
+    ``reserved`` carries.  Missing either one let two issues of one launch take
+    the same number and the whole batch died at commit on a duplicate key,
+    leaving the operator unable to tell whether anything reached 1C.
+    """
     marker = f"prodplan-origin={entry.origin_token}"
+    db.flush()
     for attempt in range(32):
         number = _origin_transfer_number(entry, attempt=attempt)
+        if reserved is not None and number in reserved:
+            continue
         local_owner = (
             db.query(ProductionMaterialIssue.issue_id)
             .filter(
@@ -868,6 +884,8 @@ def export_material_issues_to_1c(
     pending_entries: List[StockTransferExportEntry] = []
     pending_payloads: List[Dict[str, Any]] = []
     allocated_locally = False
+    # Numbers handed out inside this run, before the database knows about them.
+    reserved_numbers: set[str] = set()
     for entry, envelope in zip(eligible, payloads):
         if entry.target_ref_key:
             linked_doc = _document_by_ref(client, entry.target_ref_key)
@@ -889,7 +907,10 @@ def export_material_issues_to_1c(
         if doc is not None and bool(doc.get("DeletionMark")):
             doc = None
         if doc is None:
-            number, numbered_doc = _allocate_transfer_number(db, client, entry)
+            number, numbered_doc = _allocate_transfer_number(
+                db, client, entry, reserved=reserved_numbers
+            )
+            reserved_numbers.add(number)
             doc = numbered_doc
             entry.document_number = number
             envelope["number"] = number

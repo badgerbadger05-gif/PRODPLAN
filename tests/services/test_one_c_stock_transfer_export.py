@@ -999,3 +999,59 @@ def test_partial_failure_keeps_other_issues_committed(db_session, monkeypatch):
     assert issue_ok.exported_ref1c == "ok-transfer-ref"
     assert issue_bad.status == "error"
     assert "simulated transfer failure" in (issue_bad.export_error or "")
+
+
+def test_two_issues_of_one_launch_never_take_the_same_number(db_session, monkeypatch):
+    """One launch exports several transfers; their numbers must not collide.
+
+    The display number is the issue id, and a number already taken in 1C makes
+    the allocator probe the next one — straight onto the id of the *next* issue
+    of the same launch.  The session does not autoflush, so the probe used to
+    read a database that knew nothing about the number just handed out, both
+    issues got it, and the whole batch died at commit with a duplicate key.
+    The operator saw a raw psycopg2 error and could not tell whether anything
+    had reached 1C.
+    """
+    db = db_session
+    parent_a = _mk_item(db, code="TRP-RUN-A", ref1c="parent-run-a")
+    comp_a = _mk_item(db, code="TRC-RUN-A", ref1c="comp-run-a")
+    parent_b = _mk_item(db, code="TRP-RUN-B", ref1c="parent-run-b")
+    comp_b = _mk_item(db, code="TRC-RUN-B", ref1c="comp-run-b")
+    first = _mk_issue(db, parent=parent_a, component=comp_a, dest_wh="dst-run-a")
+    second = _mk_issue(db, parent=parent_b, component=comp_b, dest_wh="dst-run-b")
+    # Consecutive ids are what makes the probe land on the neighbour.
+    assert int(second.issue_id) == int(first.issue_id) + 1
+    taken_in_1c = f"MT{int(first.issue_id):09d}"
+
+    class _CollisionClient(_FakeClient):
+        def get_all(self, entity_name, **kwargs):
+            if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
+                return []
+            query = str(kwargs.get("filter_query") or "")
+            if "substringof(" in query:
+                return []
+            if taken_in_1c in query:
+                return [{
+                    "Ref_Key": "foreign-run-ref",
+                    "Number": taken_in_1c,
+                    "Комментарий": "another system document",
+                    "Posted": True,
+                    "DeletionMark": False,
+                }]
+            return []
+
+    fake = _CollisionClient(ref_key="new-run-ref")
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(
+        db, [first.issue_id, second.issue_id], dry_run=False
+    )
+
+    assert result["status"] == "ok"
+    assert result["issues_created"] == 2
+    db.refresh(first)
+    db.refresh(second)
+    assert first.document_number != second.document_number
+    assert first.document_number == f"MT{int(first.issue_id) + 1:09d}"
+    assert second.document_number == f"MT{int(second.issue_id) + 1:09d}"
