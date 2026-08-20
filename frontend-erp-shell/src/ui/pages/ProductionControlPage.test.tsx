@@ -507,6 +507,18 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByText('Болт М8')).toBeInTheDocument()
   })
 
+  it('labels a direct BOM as regular components even when its basis item is named', async () => {
+    vi.mocked(getOrderMaterials).mockResolvedValue({
+      ...fakeMaterials(),
+      coverage_basis: 'direct_bom',
+      coverage_basis_item_name: 'Лыжа, кронштейн крепления, красный',
+    })
+    renderPage()
+
+    expect(await screen.findByRole('heading', { name: 'Комплектующие' })).toBeInTheDocument()
+    expect(screen.queryByText(/Показаны компоненты сварной детали/)).not.toBeInTheDocument()
+  })
+
   it('does not invent warehouse coverage when material truth is unavailable', async () => {
     vi.mocked(getOrderMaterials).mockResolvedValue({
       ...fakeMaterials(),
@@ -749,7 +761,9 @@ describe('ProductionControlPage — characterization', () => {
       truth_meta: fakeTruthMeta,
     })
     vi.mocked(getOrderMaterials).mockResolvedValue({
-      ...fakeMaterials(), coverage_basis_item_name: 'Кронштейн после сварки',
+      ...fakeMaterials(),
+      coverage_basis: 'welded_bom',
+      coverage_basis_item_name: 'Кронштейн после сварки',
     })
     const user = userEvent.setup()
     renderPage()

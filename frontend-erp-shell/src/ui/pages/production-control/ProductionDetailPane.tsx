@@ -302,7 +302,7 @@ export function ProductionDetailPane({
             )}
           </div>
           <h3>
-            {materials?.coverage_basis_item_name
+            {materials?.coverage_basis === 'welded_bom' && materials.coverage_basis_item_name
               ? `Показаны компоненты сварной детали: ${materials.coverage_basis_item_name}`
               : 'Комплектующие'}
             {activeRow.work_item_id != null && materials?.qty != null
