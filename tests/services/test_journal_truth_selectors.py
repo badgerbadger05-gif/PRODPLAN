@@ -151,3 +151,50 @@ def test_production_root_scope_uses_exact_generation_and_fixed_plan(db_session):
 def test_production_journal_is_explicitly_unavailable_without_published_pointer(db_session):
     with pytest.raises(PlanningTruthUnavailable, match="No Item Ledger generation"):
         production_journal(db_session)
+
+
+def test_order_opened_in_1c_survives_the_retirement_of_its_run(db_session):
+    """A launched order is an executive fact, not a projection of a live run.
+
+    A specification rebase or a re-fixed plan retires the run an order was
+    launched from within the hour.  Filtering by run scope then erased real,
+    opened 1C orders from the journal: the row disappeared, its route sheet
+    could not be printed because the published snapshot no longer carried the
+    product, and the demand it was covering was offered for launch again.
+    """
+    current = _generation(db_session, "current-launched")
+    retired = _generation(db_session, "retired-launched")
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=current.id))
+    item = models.Item(item_code="J-LAUNCHED", item_name="Launched part", unit="шт")
+    db_session.add(item)
+    db_session.flush()
+    _live_plan, live_run = _plan_and_run(db_session, generation=current, name="live")
+    _old_plan, retired_run = _plan_and_run(db_session, generation=retired, name="retired")
+
+    for number, run, ref1c in (
+        ("LAUNCHED", retired_run, "6f1f5690-5345-11f1-9dae-9ee51454587f"),
+        ("PROPOSED", retired_run, None),
+        ("LIVE", live_run, None),
+    ):
+        order = models.ProductionOrder(
+            order_number=number, order_date=datetime(2026, 7, 23), is_posted=True,
+            deletion_mark=False, source="mrp", source_run_id=run.run_id,
+            order_ref1c=ref1c,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = models.ProductionProduct(
+            order_id=order.order_id, item_id=item.item_id, line_number=1,
+            quantity=15, produced_qty=0, remaining_qty=15,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(
+            models.ProductionOrderLineState(product_id=product.product_id, status="shortage")
+        )
+    db_session.commit()
+
+    rows = production_journal(db_session)["rows"]
+
+    # The opened order stays; the proposal of the same retired run does not.
+    assert sorted(row["order_number"] for row in rows) == ["LAUNCHED", "LIVE"]

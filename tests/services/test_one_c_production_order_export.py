@@ -413,6 +413,52 @@ def test_successful_export_stamps_sync_link_and_order_ref1c(db_session, monkeypa
     assert link.last_synced_at is not None
 
 
+def test_successful_export_records_where_the_output_lands(db_session, monkeypatch):
+    """Future supply needs the destination the export itself chose.
+
+    The Ledger accepts an open production order as expected arrival only with an
+    exact destination warehouse, and the 1C sync never writes PRODPLAN's own
+    order lines back.  Leaving the column empty rejected every launched order as
+    evidence, so the requirement it was launched for stayed uncovered and the
+    same work was offered for launch again.
+    """
+    db = db_session
+    item = _mk_item(db, code="P-DEST", ref1c="55555555-5555-5555-5555-555555555555")
+    resource = ProductionResource(resource_name="Workshop DEST")
+    db.add(resource)
+    db.flush()
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=resource.resource_id,
+            warehouse_ref1c="workshop-warehouse-ref",
+            production_warehouse_ref1c="production-warehouse-ref",
+        )
+    )
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=4)
+    product = db.query(ProductionProduct).filter_by(order_id=order.order_id).one()
+    assert not (product.destination_warehouse_ref1c or "")
+    db.add(
+        ProductionOrderLineState(
+            product_id=product.product_id,
+            status="ready",
+            issue_status="not_requested",
+            workshop_id=resource.resource_id,
+        )
+    )
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata")
+    fake = _FakeClient(ref_key="2e1f5690-5345-11f1-9dae-9ee51454587f")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+
+    assert result["orders_created"] == 1
+    db.refresh(product)
+    assert product.destination_warehouse_ref1c == "production-warehouse-ref"
+
+
 def test_second_export_is_noop_due_to_existing_link(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="P4", ref1c="44444444-4444-4444-4444-444444444444")

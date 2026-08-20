@@ -602,6 +602,39 @@ def _collect_close_entries(
     return entries, skipped
 
 
+def _persist_line_destinations(
+    db: Session, entry: "ProductionOrderExportEntry"
+) -> None:
+    """Record on the order line where 1C was told the output will land.
+
+    The Ledger counts an open production order as future supply only with an
+    exact destination warehouse, and the 1C sync deliberately never writes
+    PRODPLAN's own order lines back (it would overwrite quantity, spec and
+    stage).  So the only honest place for that value is here — the step that
+    decided it and sent it.
+
+    Without it every launched order was rejected as evidence with "missing
+    destination warehouse mapping": the requirement it was created for stayed
+    uncovered, the item showed zero orders in production, and the same demand
+    was offered for launch again.
+    """
+    for line in entry.lines:
+        destination = _clean_ref1c(line.structural_unit_ref1c)
+        if not destination or line.line_number is None:
+            continue
+        product = (
+            db.query(ProductionProduct)
+            .filter(
+                ProductionProduct.order_id == int(entry.order_id),
+                ProductionProduct.line_number == int(line.line_number),
+            )
+            .one_or_none()
+        )
+        if product is None or _clean_ref1c(product.destination_warehouse_ref1c):
+            continue
+        product.destination_warehouse_ref1c = destination
+
+
 def _export_line_token(entry: ProductionOrderExportEntry, kind: str, axes: Dict[str, Any]) -> int:
     """Versioned deterministic positive Int64 for 1C ``КлючСвязи``."""
     if (
@@ -1169,6 +1202,7 @@ def export_production_orders_to_1c(
             ProductionOrder.order_id == entry.order_id
         ).one()
         order_row.order_ref1c = ref_key
+        _persist_line_destinations(db, entry)
         recovered.append(entry)
     if recovered:
         db.commit()
@@ -1184,6 +1218,7 @@ def export_production_orders_to_1c(
         # treating it as MRP-only.
         order_row = db.query(ProductionOrder).filter(ProductionOrder.order_id == entry.order_id).one()
         order_row.order_ref1c = ref_key
+        _persist_line_destinations(db, entry)
 
     created, errored = _post_export_entries(
         db,

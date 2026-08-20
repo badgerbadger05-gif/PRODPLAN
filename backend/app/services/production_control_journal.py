@@ -882,9 +882,18 @@ def list_journal(
     # source snapshot belongs to the exact published generation and a fixed
     # production plan.  A missing source_run_id is legacy/ambiguous, not a
     # reason to show a made-up current MRP line.
+    #
+    # An order that has already been created in 1C is not a projection any more.
+    # It is an executive document with a number, materials and a route sheet,
+    # and the run it was launched from is transient: a specification rebase or a
+    # re-fixed plan retires that run within the hour.  Filtering it by run scope
+    # therefore erased real, opened orders from the journal — the row vanished,
+    # its route sheet could not be printed (the snapshot no longer carried the
+    # product), and nobody could tell the work had been launched at all.
     query = query.filter(
         or_(
             func.lower(func.coalesce(ProductionOrder.source, "1c")) != "mrp",
+            func.coalesce(ProductionOrder.order_ref1c, "") != "",
             ProductionOrder.source_run_id.in_(accepted_run_ids or [-1]),
         )
     )
@@ -901,7 +910,15 @@ def list_journal(
             int(root_item_id),
             ledger_generation_id=int(truth.generation_id),
         )
-        query = query.filter(ProductionOrder.source_run_id.in_(sorted(active_run_ids) or [-1]))
+        # Same rule as the scope filter above: an order already opened in 1C is
+        # a fact of the executive journal, and the root filter must not hide it
+        # because the run it was launched from has since been retired.
+        query = query.filter(
+            or_(
+                func.coalesce(ProductionOrder.order_ref1c, "") != "",
+                ProductionOrder.source_run_id.in_(sorted(active_run_ids) or [-1]),
+            )
+        )
     if status:
         status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
         query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))
