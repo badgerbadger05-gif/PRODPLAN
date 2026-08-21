@@ -644,11 +644,11 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     payload = pl["payload"]
     assert payload["Posted"] is False
     assert payload["Number"].startswith("MF")
-    # Manufacture is linked to the parent production order both through the UNF
-    # dedicated field and canonical Document_Основание fields.
+    # Manufacture is linked through the dedicated UNF field. The generic
+    # composite basis rejects Document_ЗаказНаПроизводство in live metadata.
     assert payload["ЗаказНаПроизводство_Key"] == "order-ref-{}".format(item.item_id)
-    assert payload["ДокументОснование"] == "order-ref-{}".format(item.item_id)
-    assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
+    assert "ДокументОснование" not in payload
+    assert "ДокументОснование_Type" not in payload
     [prod_row] = payload["Продукция"]
     assert prod_row["Номенклатура_Key"] == "item-ref-exp"
     assert prod_row["ЕдиницаИзмерения"] == item.unit

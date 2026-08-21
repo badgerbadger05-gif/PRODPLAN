@@ -66,7 +66,6 @@ from .bom_specification_resolver import BomSpecificationResolver
 
 
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
-ORDER_BASIS_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 
 
@@ -315,10 +314,9 @@ def _collect_export_entries(
             )
             continue
 
-        # Contract rule (.docs/one_c_export_from_prodplan.md): child documents
-        # (here: Document_СборкаЗапасов) must carry ДокументОснование pointing
-        # at Document_ЗаказНаПроизводство. Without a parent order_ref1c, the
-        # сборка cannot be exported.
+        # 1C UNF links Document_СборкаЗапасов to its production order through
+        # the dedicated ЗаказНаПроизводство_Key field. Without order_ref1c the
+        # assembly cannot be exported.
         order_ref = _clean_ref1c(m.order.order_ref1c) if m.order else None
         if not order_ref:
             skipped.append(
@@ -642,16 +640,14 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     if material_structural_unit:
         payload["СтруктурнаяЕдиницаЗапасов_Key"] = material_structural_unit
     # 1C UNF links assembly to production order through this dedicated field.
-    # Still send the generic basis fields too, as canonical contract requires
-    # Document_СборкаЗапасов to carry an explicit parent link.
+    # Its generic ДокументОснование composite does not accept
+    # StandardODATA.Document_ЗаказНаПроизводство in the live OData metadata.
     if not entry.order_ref1c:
         raise ValueError(
             f"manufacture_id={entry.manufacture_id}: нет order_ref1c — "
             "СборкаЗапасов не может быть создана без основания-заказа"
         )
     payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
-    payload["ДокументОснование"] = entry.order_ref1c
-    payload["ДокументОснование_Type"] = ORDER_BASIS_TYPE
     return payload
 
 
@@ -723,7 +719,7 @@ def export_manufactures_to_1c(
     with Posted=false. Idempotent via sync_link.
 
     Enforces the chain rule: any parent ProductionOrder that is not yet in 1C
-    is exported first (so the manufacture can carry a valid ДокументОснование).
+    is exported first (so the manufacture can carry ЗаказНаПроизводство_Key).
     """
     parent_export = _chain_export_parent_orders(
         db, list(manufacture_ids), dry_run=dry_run
