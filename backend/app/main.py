@@ -15,6 +15,7 @@ from app.routers import paint_weld as paint_weld_router
 from app.routers import item_ledger as item_ledger_router
 from app.routers import item_ledger_admin as item_ledger_admin_router
 from app.routers import planning_rates as planning_rates_router
+from app.routers import release_feasibility as release_feasibility_router
 
 import os
 import logging
@@ -71,6 +72,7 @@ app.include_router(paint_weld_router.router, prefix="/api")
 app.include_router(item_ledger_router.router, prefix="/api")
 app.include_router(item_ledger_admin_router.router, prefix="/api")
 app.include_router(planning_rates_router.router, prefix="/api")
+app.include_router(release_feasibility_router.router, prefix="/api")
 
 @app.get("/")
 async def root():

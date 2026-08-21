@@ -1,0 +1,392 @@
+"""Тесты проверки выпуска: блокирующие узлы и материалы под заданное количество."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+import pytest
+
+from app.models import (
+    DefaultSpecification,
+    IgnoredWarehouse,
+    Item,
+    LedgerGeneration,
+    PhysicalImportBatch,
+    PlanningTruthState,
+    SpecComponent,
+    Specification,
+    StockBin,
+    StockWarehouse,
+)
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+from app.services.release_feasibility import analyze_release, find_items, resolve_item
+
+CUTOFF = datetime(2026, 8, 21, tzinfo=timezone.utc)
+MAIN_WAREHOUSE = "wh-main"
+
+
+@pytest.fixture(autouse=True)
+def accepted_generation(db_session):
+    """Остаток проверки — принятое поколение Item Ledger, а не legacy-таблица."""
+    batch = PhysicalImportBatch(
+        batch_key="release-feasibility", status="completed", cutoff=CUTOFF
+    )
+    generation = LedgerGeneration(
+        generation_key="release-feasibility",
+        status="accepted",
+        cutoff=CUTOFF,
+        accepted_at=CUTOFF,
+        physical_import_batch=batch,
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        algorithm_version="tests/release-feasibility",
+    )
+    db_session.add_all([batch, generation])
+    db_session.flush()
+    db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.add(
+        StockWarehouse(
+            warehouse_ref1c=MAIN_WAREHOUSE,
+            warehouse_name="Основной склад",
+            is_selected=True,
+        )
+    )
+    db_session.flush()
+    return generation
+
+
+def _stock_bin(db, item: Item, qty: float, warehouse: str = MAIN_WAREHOUSE) -> StockBin:
+    generation_id = int(db.query(PlanningTruthState).one().current_generation_id)
+    row = StockBin(
+        ledger_generation_id=generation_id,
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c=warehouse,
+        on_hand=qty,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _mk_item(db, code: str, *, stock: float = 0.0, article: Optional[str] = None) -> Item:
+    item = Item(
+        item_code=code,
+        item_name=f"Изделие {code}",
+        item_article=article if article is not None else f"ART-{code}",
+        unit="шт",
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+    if abs(float(stock)) > 1e-9:
+        _stock_bin(db, item, float(stock))
+    return item
+
+
+def _mk_spec(db, owner: Item, components: Dict[Item, float]) -> Specification:
+    spec = Specification(spec_code=f"SP-{owner.item_code}", spec_name=f"Спека {owner.item_code}")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=int(owner.item_id), spec_id=int(spec.spec_id)))
+    for comp_item, qty in components.items():
+        db.add(
+            SpecComponent(
+                spec_id=int(spec.spec_id),
+                item_id=int(comp_item.item_id),
+                quantity=qty,
+                component_type="Материал",
+            )
+        )
+    db.flush()
+    return spec
+
+
+def _by_article(payload, article: str) -> dict:
+    rows = [row for row in payload["blocking"] if row["item_article"] == article]
+    assert rows, f"позиция {article} не попала в блокирующие: {[r['item_article'] for r in payload['blocking']]}"
+    return rows[0]
+
+
+# ---------------------------------------------------------------------------
+# Базовые сценарии окраски
+# ---------------------------------------------------------------------------
+
+
+def test_enough_stock_everywhere_gives_clean_result(db_session):
+    """Если всех компонентов хватает — блокирующих позиций нет."""
+    product = _mk_item(db_session, "P1")
+    material = _mk_item(db_session, "M1", stock=100.0)
+    _mk_spec(db_session, product, {material: 2.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    assert payload["blocking"] == []
+    assert payload["summary"]["status"] == "ok"
+    assert payload["summary"]["producible_qty"] == 10.0
+    assert payload["summary"]["fully_producible"] is True
+
+
+def test_node_without_stock_but_with_components_is_yellow(db_session):
+    """Узла на складе нет, но всех его компонентов хватает — жёлтый, не блокирующий."""
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=0.0)
+    material = _mk_item(db_session, "M1", stock=1000.0)
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {material: 3.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    node_row = _by_article(payload, "ART-N1")
+    assert node_row["status"] == "make"
+    assert node_row["kind"] == "node"
+    assert node_row["is_blocking"] is False
+    assert node_row["shortage_qty"] == 10.0
+    # Материала хватило — в проблемные он не попал.
+    assert [row["item_article"] for row in payload["blocking"]] == ["ART-N1"]
+    assert payload["summary"]["status"] == "make"
+    assert payload["summary"]["make_count"] == 1
+    assert payload["summary"]["shortage_count"] == 0
+    assert payload["summary"]["fully_producible"] is True
+
+
+def test_missing_component_is_red_and_blocks_the_node_above(db_session):
+    """Не хватает компонента — он красный, а узел над ним уходит в blocked."""
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=0.0)
+    material = _mk_item(db_session, "M1", stock=5.0)
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {material: 3.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    material_row = _by_article(payload, "ART-M1")
+    assert material_row["status"] == "shortage"
+    assert material_row["kind"] == "material"
+    assert material_row["is_blocking"] is True
+    assert material_row["required_qty"] == 30.0
+    assert material_row["stock_on_hand"] == 5.0
+    assert material_row["shortage_qty"] == 25.0
+
+    node_row = _by_article(payload, "ART-N1")
+    assert node_row["status"] == "blocked"
+    assert node_row["is_blocking"] is True
+
+    assert payload["summary"]["status"] == "blocked"
+    assert payload["summary"]["shortage_count"] == 1
+    assert payload["summary"]["blocked_count"] == 1
+    # 5 единиц материала хватает ровно на 1 узел и, значит, на 1 изделие.
+    assert payload["summary"]["producible_qty"] == pytest.approx(1.666, abs=0.01)
+    assert payload["summary"]["fully_producible"] is False
+
+
+def test_node_stock_stops_the_explosion(db_session):
+    """Узел лежит на складе — его состав ниже уже не требуется."""
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=10.0)
+    material = _mk_item(db_session, "M1", stock=0.0)
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {material: 3.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    assert payload["blocking"] == []
+    assert payload["summary"]["status"] == "ok"
+
+
+def test_partial_node_stock_explodes_only_the_remainder(db_session):
+    """Часть узлов есть на складе — вниз уходит только непокрытый остаток."""
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=4.0)
+    material = _mk_item(db_session, "M1", stock=0.0)
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {material: 3.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    node_row = _by_article(payload, "ART-N1")
+    assert node_row["required_qty"] == 10.0
+    assert node_row["allocated_qty"] == 4.0
+    assert node_row["shortage_qty"] == 6.0
+
+    material_row = _by_article(payload, "ART-M1")
+    # Изготовить надо 6 узлов, а не 10.
+    assert material_row["required_qty"] == 18.0
+    assert material_row["shortage_qty"] == 18.0
+
+
+# ---------------------------------------------------------------------------
+# Общий склад на несколько веток
+# ---------------------------------------------------------------------------
+
+
+def test_shared_component_competes_for_one_stock_pool(db_session):
+    """Один и тот же материал под двумя узлами тратит один и тот же остаток."""
+    product = _mk_item(db_session, "P1")
+    left = _mk_item(db_session, "N1")
+    right = _mk_item(db_session, "N2")
+    shared = _mk_item(db_session, "M1", stock=10.0)
+    _mk_spec(db_session, product, {left: 1.0, right: 1.0})
+    _mk_spec(db_session, left, {shared: 2.0})
+    _mk_spec(db_session, right, {shared: 3.0})
+
+    payload = analyze_release(db_session, product, 4.0)
+
+    shared_row = _by_article(payload, "ART-M1")
+    # 4 * 2 + 4 * 3 = 20 при остатке 10.
+    assert shared_row["required_qty"] == 20.0
+    assert shared_row["allocated_qty"] == 10.0
+    assert shared_row["shortage_qty"] == 10.0
+    assert shared_row["status"] == "shortage"
+    assert sorted(parent["item_article"] for parent in shared_row["used_in"]) == ["ART-N1", "ART-N2"]
+
+
+def test_component_on_two_levels_is_netted_after_all_demand_is_collected(db_session):
+    """Материал стоит и в изделии, и в узле — гасится один раз общей потребностью."""
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1")
+    material = _mk_item(db_session, "M1", stock=6.0)
+    _mk_spec(db_session, product, {node: 1.0, material: 1.0})
+    _mk_spec(db_session, node, {material: 1.0})
+
+    payload = analyze_release(db_session, product, 5.0)
+
+    material_row = _by_article(payload, "ART-M1")
+    assert material_row["required_qty"] == 10.0
+    assert material_row["allocated_qty"] == 6.0
+    assert material_row["shortage_qty"] == 4.0
+
+
+# ---------------------------------------------------------------------------
+# Остатки складов
+# ---------------------------------------------------------------------------
+
+
+def test_ignored_warehouse_stock_does_not_cover_demand(db_session):
+    """Остаток на игнорируемом складе виден, но в покрытие не идёт."""
+    product = _mk_item(db_session, "P1")
+    material = _mk_item(db_session, "M1")
+    _mk_spec(db_session, product, {material: 1.0})
+
+    db_session.add(StockWarehouse(warehouse_ref1c="wh-good", warehouse_name="Склад №2", is_selected=True))
+    db_session.add(StockWarehouse(warehouse_ref1c="wh-bad", warehouse_name="Изолятор брака", is_selected=True))
+    db_session.add(IgnoredWarehouse(warehouse_ref1c="wh-bad", warehouse_name="Изолятор брака"))
+    _stock_bin(db_session, material, 4.0, warehouse="wh-good")
+    _stock_bin(db_session, material, 96.0, warehouse="wh-bad")
+    db_session.flush()
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    material_row = _by_article(payload, "ART-M1")
+    assert material_row["stock_on_hand"] == 4.0
+    assert material_row["shortage_qty"] == 6.0
+    warehouses = {row["warehouse_name"]: row for row in material_row["warehouses"]}
+    assert warehouses["Склад №2"]["counted"] is True
+    assert warehouses["Изолятор брака"]["counted"] is False
+    assert warehouses["Изолятор брака"]["qty"] == 96.0
+
+
+# ---------------------------------------------------------------------------
+# Корень, дерево и защитные контуры
+# ---------------------------------------------------------------------------
+
+
+def test_root_stock_never_covers_the_release_task(db_session):
+    """Готовые изделия на складе не отменяют задание на выпуск."""
+    product = _mk_item(db_session, "P1", stock=1000.0)
+    material = _mk_item(db_session, "M1", stock=2.0)
+    _mk_spec(db_session, product, {material: 1.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    assert payload["root"]["stock_on_hand"] == 1000.0
+    material_row = _by_article(payload, "ART-M1")
+    assert material_row["shortage_qty"] == 8.0
+
+
+def test_root_without_specification_is_reported(db_session):
+    product = _mk_item(db_session, "P1")
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    assert payload["root"]["has_spec"] is False
+    assert "ROOT_NO_SPEC" in payload["summary"]["warnings"]
+    assert payload["blocking"] == []
+
+
+def test_tree_is_returned_only_on_demand_and_carries_branch_quantities(db_session):
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=4.0)
+    material = _mk_item(db_session, "M1", stock=0.0)
+    _mk_spec(db_session, product, {node: 2.0})
+    _mk_spec(db_session, node, {material: 3.0})
+
+    lean = analyze_release(db_session, product, 5.0)
+    assert lean["tree"] is None
+
+    full = analyze_release(db_session, product, 5.0, include_tree=True)
+    tree = full["tree"]
+    assert tree["item_article"] == "ART-P1"
+    assert tree["branch_required_qty"] == 5.0
+
+    node_node = tree["children"][0]
+    assert node_node["item_article"] == "ART-N1"
+    assert node_node["qty_per_parent"] == 2.0
+    assert node_node["branch_required_qty"] == 10.0
+    # 4 узла на складе, изготовить надо 6.
+    assert node_node["branch_shortage_qty"] == 6.0
+
+    material_node = node_node["children"][0]
+    assert material_node["item_article"] == "ART-M1"
+    assert material_node["branch_required_qty"] == 18.0
+    assert material_node["status"] == "shortage"
+
+
+def test_cycle_in_bom_is_cut_and_reported(db_session):
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1")
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {product: 1.0})
+
+    payload = analyze_release(db_session, product, 3.0)
+
+    assert "CYCLE_DETECTED" in payload["summary"]["warnings"]
+    assert payload["summary"]["cycles"]
+
+
+# ---------------------------------------------------------------------------
+# Поиск изделия
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_item_prefers_exact_article(db_session):
+    exact = _mk_item(db_session, "P1", article="12-345")
+    _mk_item(db_session, "P2", article="12-345-01")
+
+    item, candidates = resolve_item(db_session, article="12-345")
+
+    assert item is not None
+    assert int(item.item_id) == int(exact.item_id)
+    assert len(candidates) == 1
+
+
+def test_resolve_item_returns_candidates_when_ambiguous(db_session):
+    _mk_item(db_session, "P1", article="12-345-01")
+    _mk_item(db_session, "P2", article="12-345-02")
+
+    item, candidates = resolve_item(db_session, article="12-345")
+
+    assert item is None
+    assert len(candidates) == 2
+
+
+def test_find_items_marks_specification_presence(db_session):
+    with_spec = _mk_item(db_session, "P1", article="AA-1")
+    material = _mk_item(db_session, "M1", article="AA-2")
+    _mk_spec(db_session, with_spec, {material: 1.0})
+
+    rows = {row["item_article"]: row for row in find_items(db_session, "AA-")}
+
+    assert rows["AA-1"]["has_spec"] is True
+    assert rows["AA-2"]["has_spec"] is False

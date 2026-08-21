@@ -2351,3 +2351,57 @@ input:focus, select:focus {
   border-top: 1px solid #e3ebe5;
   font-size: 11px;
 }
+
+/* ------------------------------------------------------------------
+   Проверка выпуска: блокирующие узлы и материалы.
+   Красный — позицию нечем закрыть (или узел из-за неё не собрать),
+   жёлтый — узла нет на складе, но все его компоненты есть.
+   ------------------------------------------------------------------ */
+
+.feasibilityArticleInput input {
+  width: 280px;
+}
+
+.feasibilityPickPane {
+  border: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  max-height: 340px;
+}
+
+.feasibilityStart {
+  margin: 12px;
+}
+
+.feasibilityTable {
+  min-width: 900px;
+}
+
+.feasKindCell { width: 92px; }
+.feasUnitCell { width: 64px; }
+.feasStatusCell { width: 142px; }
+
+.feasibilityTreeTable .bomNameCell strong {
+  padding-left: calc(var(--level, 0) * 18px);
+}
+
+.journalTable.feasibilityTable tr.rowShortage td {
+  background: #ffecec;
+}
+
+.journalTable.feasibilityTable tr.rowShortage:hover td,
+.journalTable.feasibilityTable tr.rowShortage.activeRow td {
+  background: #ffdcdc;
+}
+
+.journalTable.feasibilityTable tr.rowMake td {
+  background: #fff4d8;
+}
+
+.journalTable.feasibilityTable tr.rowMake:hover td,
+.journalTable.feasibilityTable tr.rowMake.activeRow td {
+  background: #ffeab0;
+}
+
+.metricCell strong.metricAlert {
+  color: var(--red);
+}

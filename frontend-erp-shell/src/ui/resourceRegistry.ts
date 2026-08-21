@@ -17,6 +17,7 @@ export const frontendResources: FrontendResource[] = [
   { name: 'production_order', to: '/production-control', title: 'Журнал заказов', view: ['planner', 'shopfloor', 'admin'], kind: 'custom', shortcut: 'Alt+4' },
   { name: 'purchase_order', to: '/purchase-control', title: 'Журнал закупок', view: ['planner', 'buyer', 'admin'], kind: 'doctype', shortcut: 'Alt+5' },
   { name: 'material_transfer', to: '/transfer-requests', title: 'Заявки перемещений', view: ['viewer', 'planner', 'shopfloor', 'admin'], kind: 'doctype', shortcut: 'Alt+6' },
+  { name: 'release_feasibility', to: '/release-feasibility', title: 'Проверка выпуска', view: ['viewer', 'planner', 'shopfloor', 'admin'], kind: 'custom' },
   { name: 'ledger', to: '/ledger', title: 'Ledger', view: ['viewer', 'planner', 'buyer', 'admin'], kind: 'custom', shortcut: 'Alt+7' },
   { name: 'resources', to: '/resources', title: 'Ресурсы', view: ['viewer', 'planner', 'admin'], kind: 'custom', shortcut: 'Alt+8' },
   { name: 'workshop_binding', to: '/workshop-binding-review', title: 'Разбор привязок', view: ['planner', 'admin'], kind: 'doctype' },

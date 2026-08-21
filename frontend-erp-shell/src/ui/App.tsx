@@ -12,6 +12,7 @@ const MrpResultPage = lazy(() => import('./pages/MrpResultPage').then((module) =
 const MrpRunsPage = lazy(() => import('./pages/MrpRunsPage').then((module) => ({ default: module.MrpRunsPage })))
 const PeriodPlanPage = lazy(() => import('./pages/PeriodPlanPage').then((module) => ({ default: module.PeriodPlanPage })))
 const ProductionControlPage = lazy(() => import('./pages/ProductionControlPage').then((module) => ({ default: module.ProductionControlPage })))
+const ReleaseFeasibilityPage = lazy(() => import('./pages/ReleaseFeasibilityPage').then((module) => ({ default: module.ReleaseFeasibilityPage })))
 const PurchaseControlPage = lazy(() => import('./pages/PurchaseControlPage').then((module) => ({ default: module.PurchaseControlPage })))
 const ResourcesPage = lazy(() => import('./pages/ResourcesPage').then((module) => ({ default: module.ResourcesPage })))
 const SpecificationPage = lazy(() => import('./pages/SpecificationPage').then((module) => ({ default: module.SpecificationPage })))
@@ -93,6 +94,7 @@ export function App() {
             <Route path="/mrp-runs/:runId" element={guard('plan_run', <MrpResultPage />)} />
             <Route path="/ledger" element={guard('ledger', <LedgerWorkspaceRoute />)} />
             <Route path="/ledger/items/:itemId" element={guard('ledger', <LedgerWorkspaceRoute />)} />
+            <Route path="/release-feasibility" element={guard('release_feasibility', <ReleaseFeasibilityPage />)} />
             <Route path="/resources" element={guard('resources', <ResourcesPage />)} />
             <Route path="/workshop-binding-review" element={guard('workshop_binding', <WorkshopBindingReviewPage />)} />
             <Route path="/specification" element={guard('specification', <SpecificationPage />)} />
