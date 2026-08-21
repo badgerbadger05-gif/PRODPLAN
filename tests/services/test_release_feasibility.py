@@ -390,3 +390,81 @@ def test_find_items_marks_specification_presence(db_session):
 
     assert rows["AA-1"]["has_spec"] is True
     assert rows["AA-2"]["has_spec"] is False
+
+
+# ---------------------------------------------------------------------------
+# Раскраска полного состава: цвет позиции, а не «нужна ли ветка»
+# ---------------------------------------------------------------------------
+
+
+def _find_node(node: dict, article: str) -> dict:
+    if node["item_article"] == article:
+        return node
+    for child in node["children"]:
+        found = _find_node(child, article)
+        if found is not None:
+            return found
+    return None
+
+
+def test_covered_branch_still_shows_a_position_that_cannot_be_closed(db_session):
+    """Родитель закрыт складом — но позиции нет вовсе и делать её не из чего.
+
+    Ветка в текущем выпуске не участвует, её потребность обнуляется. Красить по
+    ней нельзя: в полном составе такая позиция показывалась зелёным «хватает»,
+    и оператор видел состав, в котором ничего не мешает, хотя мешало.
+    """
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=100.0)          # закрыт складом
+    coating = _mk_item(db_session, "C1")                     # 0, спеки нет
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {coating: 1.0})
+
+    payload = analyze_release(db_session, product, 10.0, include_tree=True)
+
+    row = _find_node(payload["tree"], "ART-C1")
+    assert row["branch_required_qty"] == 0.0
+    assert row["status"] == "shortage"
+    assert row["stock_short"] is True
+    # Выпуску это не мешает: узел взят со склада, блокирующих строк нет.
+    assert payload["blocking"] == []
+
+
+def test_covered_branch_shows_a_position_that_can_still_be_made(db_session):
+    """Позиции нет, но есть из чего делать — жёлтая, даже если ветка не нужна."""
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=100.0)
+    painted = _mk_item(db_session, "PT1")                    # 0 на складе
+    blank = _mk_item(db_session, "BL1", stock=50.0)          # есть из чего делать
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {painted: 1.0})
+    _mk_spec(db_session, painted, {blank: 1.0})
+
+    payload = analyze_release(db_session, product, 10.0, include_tree=True)
+
+    row = _find_node(payload["tree"], "ART-PT1")
+    assert row["status"] == "make"
+    assert _find_node(payload["tree"], "ART-BL1")["status"] == "ok"
+
+
+def test_partial_stock_keeps_the_row_yellow_and_marks_the_stock_cell(db_session):
+    """Остатка не хватает, но собрать можно: строка жёлтая, остаток — красный.
+
+    Это две разные вещи: «позицию можно закрыть» и «имеющегося количества на
+    потребность не хватает». Первое красит строку, второе — ячейку остатка.
+    """
+    product = _mk_item(db_session, "P1")
+    node = _mk_item(db_session, "N1", stock=3.0)             # нужно 15, есть 3
+    component = _mk_item(db_session, "M1", stock=1000.0)
+    _mk_spec(db_session, product, {node: 1.0})
+    _mk_spec(db_session, node, {component: 1.0})
+
+    payload = analyze_release(db_session, product, 15.0, include_tree=True)
+
+    row = _find_node(payload["tree"], "ART-N1")
+    assert row["branch_required_qty"] == 15.0
+    assert row["stock_on_hand"] == 3.0
+    assert row["status"] == "make"
+    assert row["stock_short"] is True
+    # А там, где остатка хватает, ячейка не помечается.
+    assert _find_node(payload["tree"], "ART-M1")["stock_short"] is False

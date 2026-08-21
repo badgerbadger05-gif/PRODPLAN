@@ -2405,3 +2405,10 @@ input:focus, select:focus {
 .metricCell strong.metricAlert {
   color: var(--red);
 }
+
+/* Остатка не хватает на потребность ветки: строка может быть жёлтой
+   («собрать можно»), но само количество на складах — дефицит. */
+.journalTable.feasibilityTable td.numCell.feasStockShort strong {
+  color: var(--red);
+  font-weight: 700;
+}

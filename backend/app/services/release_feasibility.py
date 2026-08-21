@@ -395,6 +395,39 @@ def _classify(
     return status
 
 
+def _classify_structural(
+    order: List[int],
+    edges: Dict[int, Dict[int, float]],
+    stock: Dict[int, float],
+) -> Dict[int, str]:
+    """Цвет позиции по её собственному состоянию, без оглядки на ветку.
+
+    Ветка, чей родитель закрыт складом, не участвует в текущем выпуске, и её
+    потребность обнуляется. Красить по ней нельзя: позиция, которой нет вовсе и
+    делать которую не из чего, показывалась зелёным «хватает» — оператор видел
+    полный состав, в котором ничего не мешает, хотя мешало.
+
+    Здесь вопрос другой и не зависит от количества: чем эту позицию вообще
+    закрыть. Есть остаток — зелёная; нет, но все компоненты доступны — жёлтая
+    (надо изготовить); нет и делать не из чего — красная.
+    """
+    status: Dict[int, str] = {}
+    for item_id in reversed(order):
+        comps = edges.get(item_id) or {}
+        if _to_float(stock.get(item_id, 0.0)) > EPS:
+            status[item_id] = STATUS_OK
+            continue
+        if not comps:
+            status[item_id] = STATUS_SHORTAGE
+            continue
+        blocked = any(
+            status.get(comp_id) in (STATUS_SHORTAGE, STATUS_BLOCKED)
+            for comp_id in comps
+        )
+        status[item_id] = STATUS_BLOCKED if blocked else STATUS_MAKE
+    return status
+
+
 def _has_hard_shortage(
     root_item_id: int,
     order: List[int],
@@ -698,6 +731,7 @@ def analyze_release(
             edges=edges,
             exploded=exploded,
             status_map=status_map,
+            structural_status=_classify_structural(order, edges, stock),
             meta=meta,
             llc=llc,
             depth_limit=depth_limit,
@@ -715,6 +749,7 @@ def _build_tree(
     edges: Dict[int, Dict[int, float]],
     exploded: Dict[int, Dict[str, float]],
     status_map: Dict[int, str],
+    structural_status: Dict[int, str],
     meta: Dict[int, Dict[str, Any]],
     llc: Dict[int, int],
     depth_limit: int,
@@ -743,6 +778,20 @@ def _build_tree(
         info = meta.get(item_id, {})
         own_net = branch_net(item_id, branch_required)
         comps = edges.get(item_id) or {}
+        branch_stock = _to_float(values.get("stock", 0.0))
+        # Нужна ветка — красим по расчёту выпуска; не нужна — по самой позиции.
+        row_status = (
+            status_map.get(item_id, STATUS_OK)
+            if branch_required > EPS
+            else structural_status.get(item_id, STATUS_OK)
+        )
+        # Остатка не хватает на потребность ветки: строка может быть жёлтой
+        # («собрать можно»), но цифру остатка надо показать красной.
+        stock_short = (
+            branch_stock + EPS < branch_required
+            if branch_required > EPS
+            else branch_stock <= EPS
+        )
         payload: Dict[str, Any] = {
             "key": f"{item_id}:{depth}:{budget['nodes']}",
             "item_id": item_id,
@@ -753,7 +802,8 @@ def _build_tree(
             "replenishment_method": info.get("replenishment_method", ""),
             "level": depth,
             "kind": "node" if comps else "material",
-            "status": status_map.get(item_id, STATUS_OK),
+            "status": row_status,
+            "stock_short": bool(stock_short),
             "qty_per_parent": None if qty_per_parent is None else _round_qty(qty_per_parent),
             "branch_required_qty": _round_qty(branch_required),
             "branch_shortage_qty": _round_qty(own_net),

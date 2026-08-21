@@ -387,7 +387,9 @@ export function ReleaseFeasibilityPage() {
                           </td>
                           <td className="numCell"><strong>{row.qty_per_parent == null ? '' : qty(row.qty_per_parent)}</strong></td>
                           <td className="numCell"><strong>{qty(row.branch_required_qty)}</strong></td>
-                          <td className="numCell"><strong>{qty(row.stock_on_hand)}</strong></td>
+                          <td className={`numCell${row.stock_short ? ' feasStockShort' : ''}`}>
+                            <strong>{qty(row.stock_on_hand)}</strong>
+                          </td>
                           <td className="numCell"><strong>{qty(row.shortage_qty)}</strong></td>
                           <td className="feasUnitCell">{row.unit || ''}</td>
                           <td className="feasStatusCell">

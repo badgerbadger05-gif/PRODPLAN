@@ -58,6 +58,8 @@ export type FeasibilityTreeNode = {
   level: number
   kind: 'node' | 'material'
   status: FeasibilityStatus
+  /** Остатка не хватает на потребность ветки — цифру остатка красим. */
+  stock_short: boolean
   qty_per_parent: number | null
   branch_required_qty: number
   branch_shortage_qty: number
