@@ -42,6 +42,8 @@ export type FeasibilityRow = {
   reason: string
   /** Срок пополнения из 1С, дней. */
   replenishment_time?: number | null
+  /** false — это количество позицию не требует: ветка закрыта остатком выше. */
+  needed_now: boolean
   is_blocking: boolean
   required_qty: number
   stock_on_hand: number
@@ -93,6 +95,8 @@ export type FeasibilitySummary = {
   shortage_count: number
   blocked_count: number
   make_count: number
+  /** Красные, которые это количество не требует. */
+  idle_blocker_count: number
   items_checked: number
   max_level: number
   producible_qty: number

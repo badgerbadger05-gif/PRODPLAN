@@ -630,6 +630,7 @@ def analyze_release(
 
     exploded = _explode(root_item_id, root_qty, order, edges, stock)
     status_map = _classify(root_item_id, order, edges, exploded)
+    structural_map = _classify_structural(order, edges, stock)
     meta = _item_meta(db, list(reachable), units)
 
     warnings: List[str] = []
@@ -683,11 +684,61 @@ def analyze_release(
                     bool(edges.get(item_id)),
                 ),
                 "replenishment_time": info.get("replenishment_time"),
+                "needed_now": True,
                 "is_blocking": status in (STATUS_SHORTAGE, STATUS_BLOCKED),
                 "required_qty": _round_qty(values.get("gross", 0.0)),
                 "stock_on_hand": _round_qty(values.get("stock", 0.0)),
                 "allocated_qty": _round_qty(values.get("allocated", 0.0)),
                 "shortage_qty": _round_qty(net),
+                "used_in": [
+                    {
+                        "item_id": parent_id,
+                        "item_article": (meta.get(parent_id) or {}).get("item_article", ""),
+                        "item_name": (meta.get(parent_id) or {}).get("item_name", ""),
+                    }
+                    for parent_id in sorted(parents_by_item.get(item_id, []))[:8]
+                ],
+                "warehouses": [],
+            }
+        )
+
+    # Позиция, которую нечем закрыть, попадает в список даже когда её ветка
+    # закрыта остатком родителя и в этом количестве не нужна.  Иначе оператор
+    # открывает проверку, видит «блокирующих нет» и не знает, что деталь не из
+    # чего сделать: она всплывёт при первом же выпуске, который эту ветку
+    # затронет.  Потребность у такой строки нулевая — это видно в колонке.
+    listed = {int(row["item_id"]) for row in blocking}
+    for item_id in order:
+        if item_id == root_item_id or int(item_id) in listed:
+            continue
+        structural = structural_map.get(item_id, STATUS_OK)
+        if structural not in (STATUS_SHORTAGE, STATUS_BLOCKED):
+            continue
+        values = exploded.get(item_id) or {}
+        info = meta.get(item_id, {})
+        blocking.append(
+            {
+                "item_id": item_id,
+                "item_code": info.get("item_code", ""),
+                "item_article": info.get("item_article", ""),
+                "item_name": info.get("item_name", ""),
+                "unit": info.get("unit", ""),
+                "replenishment_method": info.get("replenishment_method", ""),
+                "level": int(llc.get(item_id, 0)),
+                "kind": "node" if edges.get(item_id) else "material",
+                "status": structural,
+                "reason": _status_reason(
+                    structural,
+                    str(info.get("replenishment_method", "")),
+                    bool(edges.get(item_id)),
+                ),
+                "replenishment_time": info.get("replenishment_time"),
+                "needed_now": False,
+                "is_blocking": True,
+                "required_qty": 0.0,
+                "stock_on_hand": _round_qty(values.get("stock", 0.0)),
+                "allocated_qty": 0.0,
+                "shortage_qty": 0.0,
                 "used_in": [
                     {
                         "item_id": parent_id,
@@ -716,10 +767,15 @@ def analyze_release(
     shortage_rows = [row for row in blocking if row["status"] == STATUS_SHORTAGE]
     blocked_rows = [row for row in blocking if row["status"] == STATUS_BLOCKED]
     make_rows = [row for row in blocking if row["status"] == STATUS_MAKE]
+    # Итог по выпуску считают только позиции, которые это количество реально
+    # требует.  Красная строка из ветки, закрытой остатком выше, показывается
+    # оператору, но заявленный выпуск она не отменяет — иначе «можно выпустить
+    # 15» и «выпуск заблокирован» стояли бы рядом и противоречили друг другу.
+    blocking_now = [row for row in blocking if row.get("needed_now")]
 
-    if shortage_rows:
+    if any(row["status"] == STATUS_SHORTAGE for row in blocking_now):
         overall = STATUS_BLOCKED
-    elif make_rows:
+    elif any(row["status"] == STATUS_MAKE for row in blocking_now):
         overall = STATUS_MAKE
     else:
         overall = STATUS_OK
@@ -738,6 +794,11 @@ def analyze_release(
             "shortage_count": len(shortage_rows),
             "blocked_count": len(blocked_rows),
             "make_count": len(make_rows),
+            # Красные, которые это количество не требует: видны в списке, но
+            # выпуску не мешают.
+            "idle_blocker_count": len(
+                [row for row in blocking if not row.get("needed_now") and row["is_blocking"]]
+            ),
             "items_checked": len(reachable),
             "max_level": max(llc.values()) if llc else 0,
             "producible_qty": _round_qty(producible),
@@ -758,7 +819,7 @@ def analyze_release(
             edges=edges,
             exploded=exploded,
             status_map=status_map,
-            structural_status=_classify_structural(order, edges, stock),
+            structural_status=structural_map,
             meta=meta,
             llc=llc,
             depth_limit=depth_limit,

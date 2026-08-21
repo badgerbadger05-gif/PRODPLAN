@@ -182,7 +182,7 @@ def test_missing_component_is_red_and_blocks_the_node_above(db_session):
 
 
 def test_node_stock_stops_the_explosion(db_session):
-    """Узел лежит на складе — его состав ниже уже не требуется."""
+    """Узел лежит на складе — количества ниже по ветке уже не требуются."""
     product = _mk_item(db_session, "P1")
     node = _mk_item(db_session, "N1", stock=10.0)
     material = _mk_item(db_session, "M1", stock=0.0)
@@ -191,8 +191,12 @@ def test_node_stock_stops_the_explosion(db_session):
 
     payload = analyze_release(db_session, product, 10.0)
 
-    assert payload["blocking"] == []
-    assert payload["summary"]["status"] == "ok"
+    # Выпуску ветка не мешает: узел берётся со склада, требуется 0.
+    [row] = payload["blocking"]
+    assert row["item_article"] == "ART-M1"
+    assert row["required_qty"] == 0.0
+    assert row["needed_now"] is False
+    assert payload["summary"]["producible_qty"] == 10.0
 
 
 def test_partial_node_stock_explodes_only_the_remainder(db_session):
@@ -426,8 +430,15 @@ def test_covered_branch_still_shows_a_position_that_cannot_be_closed(db_session)
     assert row["branch_required_qty"] == 0.0
     assert row["status"] == "shortage"
     assert row["stock_short"] is True
-    # Выпуску это не мешает: узел взят со склада, блокирующих строк нет.
-    assert payload["blocking"] == []
+    # И то же самое видно сразу в списке — оператор не обязан разворачивать
+    # состав, чтобы узнать, что позицию нечем закрыть.
+    [listed] = payload["blocking"]
+    assert listed["item_article"] == "ART-C1"
+    assert listed["status"] == "shortage"
+    assert listed["needed_now"] is False
+    assert listed["required_qty"] == 0.0
+    # На возможность выпустить это не влияет: узел берётся со склада.
+    assert payload["summary"]["producible_qty"] == 10.0
 
 
 def test_covered_branch_shows_a_position_that_can_still_be_made(db_session):

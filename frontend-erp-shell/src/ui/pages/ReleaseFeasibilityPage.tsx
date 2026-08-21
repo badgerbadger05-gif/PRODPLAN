@@ -341,7 +341,9 @@ export function ReleaseFeasibilityPage() {
                             <span>{row.item_article || row.item_code}</span>
                           </td>
                           <td className="feasKindCell">{row.kind === 'node' ? 'узел' : 'материал'}</td>
-                          <td className="numCell"><strong>{qty(row.required_qty)}</strong></td>
+                          <td className="numCell">
+                            <strong>{row.needed_now ? qty(row.required_qty) : '—'}</strong>
+                          </td>
                           <td className="numCell"><strong>{qty(row.stock_on_hand)}</strong></td>
                           <td className="numCell"><strong>{qty(row.shortage_qty)}</strong></td>
                           <td className="feasUnitCell">{row.unit || ''}</td>
