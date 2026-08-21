@@ -544,7 +544,7 @@ def test_rework_operation_is_not_a_blocker(db_session):
     payload = analyze_release(db_session, product, 10.0, include_tree=True)
 
     coating_row = _find_node(payload["tree"], "ART-CT1")
-    assert coating_row["status"] == "rework"
+    assert coating_row["status"] == "non_stock"
     assert coating_row["reason"] == "Переработка: закрывается операцией"
     # Деталь под покрытием изготавливается, а не блокируется.
     assert _find_node(payload["tree"], "ART-PL1")["status"] == "make"
@@ -570,4 +570,52 @@ def test_rework_without_the_part_still_shows_the_part_as_the_blocker(db_session)
     assert by_article["ART-BL1"]["status"] == "shortage"
     assert by_article["ART-PL1"]["status"] == "blocked"
     assert "ART-CT1" not in by_article
+    assert payload["summary"]["producible_qty"] == 0.0
+
+
+def test_service_from_1c_is_not_a_supply_position(db_session):
+    """«Услуга» из 1С складом не закрывается — и блокером не является.
+
+    Травление, гибка на стороне и пошив заведены в 1С как ТипНоменклатуры
+    «Услуга» и остатка не имеют никогда. Пока проверка читала их как закупку,
+    каждая деталь, проходящая через операцию, попадала в блокеры — а мешает
+    выпуску не операция, а металл под ней. Признак берём из 1С, а не из
+    названия позиции.
+    """
+    product = _mk_item(db_session, "P1")
+    plated = _mk_item(db_session, "PL1")
+    blank = _mk_item(db_session, "BL1", stock=500.0)
+    service = _mk_item(db_session, "SV1")
+    service.replenishment_method = "Закупка"      # в 1С у услуг стоит именно так
+    service.item_type = "Услуга"
+    db_session.flush()
+    _mk_spec(db_session, product, {plated: 1.0})
+    _mk_spec(db_session, plated, {blank: 1.0, service: 0.2})
+
+    payload = analyze_release(db_session, product, 10.0, include_tree=True)
+
+    row = _find_node(payload["tree"], "ART-SV1")
+    assert row["status"] == "non_stock"
+    assert row["reason"] == "Услуга: на складе не бывает"
+    assert [r["item_article"] for r in payload["blocking"]] == ["ART-PL1"]
+    assert payload["summary"]["producible_qty"] == 10.0
+
+
+def test_stocked_material_stays_a_blocker_even_if_it_looks_like_an_operation(db_session):
+    """Порошковая краска — запас, а не услуга: она обязана лежать на складе.
+
+    Отсекаем строго по признаку 1С, а не по тому, как позиция называется.
+    """
+    product = _mk_item(db_session, "P1")
+    powder = _mk_item(db_session, "PW1")
+    powder.item_type = "Запас"
+    powder.replenishment_method = "Закупка"
+    db_session.flush()
+    _mk_spec(db_session, product, {powder: 1.0})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    [row] = payload["blocking"]
+    assert row["item_article"] == "ART-PW1"
+    assert row["status"] == "shortage"
     assert payload["summary"]["producible_qty"] == 0.0

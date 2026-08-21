@@ -71,7 +71,8 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         local_select = (req.select_fields or [
             'Ref_Key', 'Code', 'Description', 'Артикул',
             'ЕдиницаИзмерения_Key', 'КатегорияНоменклатуры_Key',
-            'СпособПополнения', 'СрокПополнения', 'Поставщик_Key', 'Поставщик', 'IsFolder'
+            'СпособПополнения', 'СрокПополнения', 'Поставщик_Key', 'Поставщик', 'IsFolder',
+            'ТипНоменклатуры'
         ])
 
         total_count = 0
@@ -253,6 +254,13 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 created_count += 1
                                 target_item = new_item
 
+                    # «Услуга»/«Работа» из 1С: такая позиция не бывает на складе,
+                    # и требовать её остаток бессмысленно.  Пишется один раз для
+                    # всех веток выше, потому что ветка выбирает лишь способ
+                    # сопоставления, а не источник поля.
+                    if target_item is not None and item_type:
+                        target_item.item_type = item_type
+
                     resolved_category = None
 
                     # Обрабатываем категорию номенклатуры
@@ -348,6 +356,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             supplier_ref1c=supplier_ref1c,
                             replenishment_method=replenishment_method or None,
                             replenishment_time=replenishment_time,
+                            item_type=(record.get('ТипНоменклатуры') or '').strip() or None,
                             unit=unit_key or None,
                             status='active'
                         )

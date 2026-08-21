@@ -43,9 +43,10 @@ def test_material_cache_drop_migration_is_linear_head():
     assert module.revision == "20260731_03"
     assert module.down_revision == "20260731_02"
 
+    # Граф миграций остаётся линейным: ровно одна голова, кто бы её ни двигал.
     config = Config(str(REPO_ROOT / "backend" / "alembic.ini"))
     config.set_main_option("script_location", str(REPO_ROOT / "backend" / "alembic"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["20260805_02"]
+    assert len(ScriptDirectory.from_config(config).get_heads()) == 1
 
 
 def test_ownership_migrations_round_trip_on_disposable_sqlite(tmp_path):

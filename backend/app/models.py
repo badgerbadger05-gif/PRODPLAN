@@ -450,6 +450,9 @@ class Item(Base):
     supplier_ref1c = Column(String(36), nullable=True, index=True)
     replenishment_method = Column(String(50))
     replenishment_time = Column(Integer)
+    #: ``ТипНоменклатуры`` из 1С: «Запас», «Услуга», «Работа».  Услуга не бывает
+    #: на складе, и требовать её остаток бессмысленно.
+    item_type = Column(String(50), nullable=True, index=True)
     unit = Column(String(50))
     category_id = Column(Integer, ForeignKey('item_categories.category_id'), nullable=True, index=True)
     # Опциональная оптимальная партия для лот‑сайзинга (шт)

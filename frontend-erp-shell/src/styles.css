@@ -2415,8 +2415,8 @@ input:focus, select:focus {
   font-weight: 700;
 }
 
-/* Переработка: операция на стороне. Ни склад, ни блокер — отдельный вид. */
-.miniPill.rework {
+/* Не запас: услуга или переработка. Ни склад, ни блокер — отдельный вид. */
+.miniPill.nonStock {
   color: #3f4a5a;
   background: #eef1f5;
   border: 1px solid #c8d0da;

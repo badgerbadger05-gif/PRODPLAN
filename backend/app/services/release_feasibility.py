@@ -9,8 +9,9 @@
 * ``shortage`` — материал/покупное, которое нечем закрыть (красный: жёсткая нехватка);
 * ``blocked``  — узел изготовить нельзя, потому что чего-то не хватает внутри
                  (красный: узел заблокирован дефицитом ниже по дереву);
-* ``rework``   — операция на стороне («Переработка»): складом не закрывается и
-                 выпуск не блокирует, деталь уходит на операцию и возвращается.
+* ``non_stock``— позиция вне склада: услуга/работа из 1С (травление, гибка на
+                 стороне, пошив) или маршрут «Переработка». Складом не
+                 закрывается и выпуск не блокирует.
 
 Расчёт чисто аналитический: ничего не пишет в БД и не учитывает открытые заказы,
 резервы и поставки в пути — только текущий свободный остаток. Это ответ на вопрос
@@ -58,13 +59,16 @@ STATUS_OK = "ok"
 STATUS_MAKE = "make"
 STATUS_SHORTAGE = "shortage"
 STATUS_BLOCKED = "blocked"
-#: Операция на стороне (травление, гибка, пошив): её не бывает на складе, и
-#: закрывается она не снабжением, а самой операцией — CANON §18.
-STATUS_REWORK = "rework"
+#: Позиция, которой не бывает на складе: услуга/работа из 1С (травление, гибка
+#: на стороне, пошив) или маршрут «Переработка» (CANON §18).  Требовать с неё
+#: остаток бессмысленно, и выпуск она не блокирует.
+STATUS_NON_STOCK = "non_stock"
 REWORK_METHOD = "Переработка"
+#: ``ТипНоменклатуры`` из 1С у позиций, которые запасом не являются.
+SERVICE_ITEM_TYPES = ("Услуга", "Работа")
 
 _STATUS_RANK = {
-    STATUS_REWORK: 4,
+    STATUS_NON_STOCK: 4,
     STATUS_SHORTAGE: 0,
     STATUS_BLOCKED: 1,
     STATUS_MAKE: 2,
@@ -171,6 +175,7 @@ def _item_meta(db: Session, item_ids: Sequence[int], units: Dict[str, str]) -> D
             "item_name": str(item.item_name or ""),
             "unit": _unit_label(units, item.unit),
             "replenishment_method": str(item.replenishment_method or ""),
+            "item_type": str(item.item_type or ""),
             "replenishment_time": (
                 int(item.replenishment_time)
                 if item.replenishment_time is not None
@@ -375,19 +380,35 @@ def _explode(
     return result
 
 
+def _is_service(item_type: object) -> bool:
+    value = str(item_type or "").strip().casefold()
+    return any(value == kind.casefold() for kind in SERVICE_ITEM_TYPES)
+
+
 def _is_rework(method: object) -> bool:
     return str(method or "").strip().casefold() == REWORK_METHOD.casefold()
 
 
-def _status_reason(status: str, method: str, has_components: bool) -> str:
+def _is_non_stock(method: object, item_type: object) -> bool:
+    """Позиция вне склада: услуга/работа из 1С или явная переработка."""
+    return _is_service(item_type) or _is_rework(method)
+
+
+def _status_reason(
+    status: str, method: str, has_components: bool, item_type: str = ""
+) -> str:
     """Одна строка, объясняющая цвет: чем позицию закрыть.
 
     Оператор видит цвет и должен сразу понимать причину, не наводя курсор:
     зелёная — есть на складе; жёлтая — самой позиции нет, но закрыть её есть
     чем; красная — закрыть нечем вовсе или внутри не хватает компонента.
     """
-    if status == STATUS_REWORK:
-        return "Переработка: закрывается операцией"
+    if status == STATUS_NON_STOCK:
+        return (
+            "Услуга: на складе не бывает"
+            if _is_service(item_type)
+            else "Переработка: закрывается операцией"
+        )
     if status == STATUS_OK:
         return "Есть на складе"
     if status == STATUS_MAKE:
@@ -402,7 +423,7 @@ def _classify(
     order: List[int],
     edges: Dict[int, Dict[int, float]],
     exploded: Dict[int, Dict[str, float]],
-    methods: Dict[int, str],
+    non_stock: Set[int],
 ) -> Dict[int, str]:
     """
     Красит позиции: ok / make (жёлтый) / shortage (красный) / blocked (красный).
@@ -415,11 +436,11 @@ def _classify(
         values = exploded.get(item_id) or {}
         net = _to_float(values.get("net"))
         comps = edges.get(item_id) or {}
-        if _is_rework(methods.get(item_id)):
-            # Операции на стороне на складе не бывает: она и не должна там
+        if item_id in non_stock:
+            # Услуги и переработки на складе не бывает: она и не должна там
             # быть.  Считая её дефицитом, проверка красила в блокеры каждую
             # деталь с покрытием — а мешает выпуску не операция, а металл.
-            status[item_id] = STATUS_REWORK
+            status[item_id] = STATUS_NON_STOCK
             continue
         if net <= EPS and item_id != root_item_id:
             status[item_id] = STATUS_OK
@@ -440,7 +461,7 @@ def _classify_structural(
     order: List[int],
     edges: Dict[int, Dict[int, float]],
     stock: Dict[int, float],
-    methods: Dict[int, str],
+    non_stock: Set[int],
 ) -> Dict[int, str]:
     """Цвет позиции по её собственному состоянию, без оглядки на ветку.
 
@@ -456,8 +477,8 @@ def _classify_structural(
     status: Dict[int, str] = {}
     for item_id in reversed(order):
         comps = edges.get(item_id) or {}
-        if _is_rework(methods.get(item_id)):
-            status[item_id] = STATUS_REWORK
+        if item_id in non_stock:
+            status[item_id] = STATUS_NON_STOCK
             continue
         if _to_float(stock.get(item_id, 0.0)) > EPS:
             status[item_id] = STATUS_OK
@@ -478,7 +499,7 @@ def _has_hard_shortage(
     order: List[int],
     edges: Dict[int, Dict[int, float]],
     exploded: Dict[int, Dict[str, float]],
-    methods: Dict[int, str],
+    non_stock: Set[int],
 ) -> bool:
     for item_id in order:
         if item_id == root_item_id:
@@ -486,7 +507,7 @@ def _has_hard_shortage(
         values = exploded.get(item_id) or {}
         if _to_float(values.get("net")) <= EPS:
             continue
-        if _is_rework(methods.get(item_id)):
+        if item_id in non_stock:
             continue
         if not edges.get(item_id):
             return True
@@ -499,7 +520,7 @@ def _max_producible_qty(
     order: List[int],
     edges: Dict[int, Dict[int, float]],
     stock: Dict[int, float],
-    methods: Dict[int, str],
+    non_stock: Set[int],
 ) -> float:
     """
     Максимальное количество корня, которое сейчас нечем заблокировать.
@@ -509,7 +530,7 @@ def _max_producible_qty(
     """
     def feasible(qty: float) -> bool:
         exploded = _explode(root_item_id, qty, order, edges, stock)
-        return not _has_hard_shortage(root_item_id, order, edges, exploded, methods)
+        return not _has_hard_shortage(root_item_id, order, edges, exploded, non_stock)
 
     if feasible(requested_qty):
         return requested_qty
@@ -658,12 +679,16 @@ def analyze_release(
 
     exploded = _explode(root_item_id, root_qty, order, edges, stock)
     meta = _item_meta(db, list(reachable), units)
-    methods = {
-        int(item_id): str((meta.get(item_id) or {}).get("replenishment_method", ""))
+    non_stock = {
+        int(item_id)
         for item_id in order
+        if _is_non_stock(
+            (meta.get(item_id) or {}).get("replenishment_method"),
+            (meta.get(item_id) or {}).get("item_type"),
+        )
     }
-    status_map = _classify(root_item_id, order, edges, exploded, methods)
-    structural_map = _classify_structural(order, edges, stock, methods)
+    status_map = _classify(root_item_id, order, edges, exploded, non_stock)
+    structural_map = _classify_structural(order, edges, stock, non_stock)
 
     warnings: List[str] = []
     if cycles:
@@ -698,7 +723,7 @@ def analyze_release(
         if net <= EPS:
             continue
         status = status_map.get(item_id, STATUS_OK)
-        if status == STATUS_REWORK:
+        if status == STATUS_NON_STOCK:
             # Операция видна в составе, но в списке мешающих ей не место.
             continue
         info = meta.get(item_id, {})
@@ -717,6 +742,7 @@ def analyze_release(
                     status,
                     str(info.get("replenishment_method", "")),
                     bool(edges.get(item_id)),
+                    str(info.get("item_type", "")),
                 ),
                 "replenishment_time": info.get("replenishment_time"),
                 "needed_now": True,
@@ -766,6 +792,7 @@ def analyze_release(
                     structural,
                     str(info.get("replenishment_method", "")),
                     bool(edges.get(item_id)),
+                    str(info.get("item_type", "")),
                 ),
                 "replenishment_time": info.get("replenishment_time"),
                 "needed_now": False,
@@ -816,7 +843,7 @@ def analyze_release(
         overall = STATUS_OK
 
     producible = (
-        _max_producible_qty(root_item_id, root_qty, order, edges, stock, methods)
+        _max_producible_qty(root_item_id, root_qty, order, edges, stock, non_stock)
         if root_qty > 0
         else 0.0
     )
@@ -934,6 +961,7 @@ def _build_tree(
                 row_status,
                 str(info.get("replenishment_method", "")),
                 bool(comps),
+                str(info.get("item_type", "")),
             ),
             "replenishment_time": info.get("replenishment_time"),
             "stock_short": bool(stock_short),
