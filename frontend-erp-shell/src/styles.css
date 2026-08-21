@@ -2414,3 +2414,10 @@ input:focus, select:focus {
   color: var(--red);
   font-weight: 700;
 }
+
+/* Переработка: операция на стороне. Ни склад, ни блокер — отдельный вид. */
+.miniPill.rework {
+  color: #3f4a5a;
+  background: #eef1f5;
+  border: 1px solid #c8d0da;
+}

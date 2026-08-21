@@ -1,4 +1,4 @@
-export type FeasibilityStatus = 'ok' | 'make' | 'shortage' | 'blocked'
+export type FeasibilityStatus = 'ok' | 'make' | 'shortage' | 'blocked' | 'rework'
 
 export type FeasibilityItem = {
   item_id: number

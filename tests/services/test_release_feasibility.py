@@ -523,3 +523,51 @@ def test_every_row_explains_its_colour_and_carries_the_lead_time(db_session):
     assert tree_rows["ART-M1"]["reason"] == "Есть на складе"
     assert tree_rows["ART-M1"]["replenishment_time"] == 20
     assert tree_rows["ART-B1"]["reason"] == "Есть на складе"
+
+
+def test_rework_operation_is_not_a_blocker(db_session):
+    """Операция на стороне складом не закрывается — и выпуск не блокирует.
+
+    Травление, гибка на стороне, пошив: их не бывает на остатке по самой их
+    природе. Считая их дефицитом, проверка красила в блокеры каждую деталь с
+    покрытием и обнуляла возможный выпуск, хотя мешает не операция, а металл.
+    """
+    product = _mk_item(db_session, "P1")
+    plated = _mk_item(db_session, "PL1")                    # деталь после покрытия
+    blank = _mk_item(db_session, "BL1", stock=500.0)        # заготовка есть
+    coating = _mk_item(db_session, "CT1")                   # операция, остатка нет
+    coating.replenishment_method = "Переработка"
+    db_session.flush()
+    _mk_spec(db_session, product, {plated: 1.0})
+    _mk_spec(db_session, plated, {blank: 1.0, coating: 0.2})
+
+    payload = analyze_release(db_session, product, 10.0, include_tree=True)
+
+    coating_row = _find_node(payload["tree"], "ART-CT1")
+    assert coating_row["status"] == "rework"
+    assert coating_row["reason"] == "Переработка: закрывается операцией"
+    # Деталь под покрытием изготавливается, а не блокируется.
+    assert _find_node(payload["tree"], "ART-PL1")["status"] == "make"
+    assert [row["item_article"] for row in payload["blocking"]] == ["ART-PL1"]
+    assert payload["summary"]["producible_qty"] == 10.0
+    assert payload["summary"]["shortage_count"] == 0
+
+
+def test_rework_without_the_part_still_shows_the_part_as_the_blocker(db_session):
+    """Если нет заготовки — красной становится она, а не операция над ней."""
+    product = _mk_item(db_session, "P1")
+    plated = _mk_item(db_session, "PL1")
+    blank = _mk_item(db_session, "BL1")                     # заготовки нет
+    coating = _mk_item(db_session, "CT1")
+    coating.replenishment_method = "Переработка"
+    db_session.flush()
+    _mk_spec(db_session, product, {plated: 1.0})
+    _mk_spec(db_session, plated, {blank: 1.0, coating: 0.2})
+
+    payload = analyze_release(db_session, product, 10.0)
+
+    by_article = {row["item_article"]: row for row in payload["blocking"]}
+    assert by_article["ART-BL1"]["status"] == "shortage"
+    assert by_article["ART-PL1"]["status"] == "blocked"
+    assert "ART-CT1" not in by_article
+    assert payload["summary"]["producible_qty"] == 0.0
