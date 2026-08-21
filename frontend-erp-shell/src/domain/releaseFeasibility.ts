@@ -38,6 +38,10 @@ export type FeasibilityRow = {
   level: number
   kind: 'node' | 'material'
   status: FeasibilityStatus
+  /** Одна строка: чем позицию закрыть. */
+  reason: string
+  /** Срок пополнения из 1С, дней. */
+  replenishment_time?: number | null
   is_blocking: boolean
   required_qty: number
   stock_on_hand: number
@@ -58,6 +62,8 @@ export type FeasibilityTreeNode = {
   level: number
   kind: 'node' | 'material'
   status: FeasibilityStatus
+  reason: string
+  replenishment_time?: number | null
   /** Остатка не хватает на потребность ветки — цифру остатка красим. */
   stock_short: boolean
   qty_per_parent: number | null

@@ -323,6 +323,8 @@ export function ReleaseFeasibilityPage() {
                         <th className="numCell">На складах</th>
                         <th className="numCell">Не хватает</th>
                         <th className="feasUnitCell">Ед.</th>
+                        <th className="feasReasonCell">Причина</th>
+                        <th className="feasRtCell">RT, дн</th>
                         <th className="feasStatusCell">Статус</th>
                       </tr>
                     </thead>
@@ -343,6 +345,10 @@ export function ReleaseFeasibilityPage() {
                           <td className="numCell"><strong>{qty(row.stock_on_hand)}</strong></td>
                           <td className="numCell"><strong>{qty(row.shortage_qty)}</strong></td>
                           <td className="feasUnitCell">{row.unit || ''}</td>
+                          <td className="feasReasonCell">{row.reason}</td>
+                          <td className="feasRtCell numCell">
+                            {row.replenishment_time == null ? '' : row.replenishment_time}
+                          </td>
                           <td className="feasStatusCell">
                             <span className={`miniPill ${statusPill(row.status)}`}>{STATUS_TITLE[row.status]}</span>
                           </td>
@@ -350,7 +356,7 @@ export function ReleaseFeasibilityPage() {
                       ))}
                       {!blockingRows.length && (
                         <tr>
-                          <td colSpan={7} className="emptyDetail">
+                          <td colSpan={9} className="emptyDetail">
                             {result.root.has_spec
                               ? 'Блокирующих позиций нет — количества хватает на весь выпуск'
                               : 'Состав не развёрнут: у изделия нет спецификации'}
@@ -371,6 +377,8 @@ export function ReleaseFeasibilityPage() {
                         <th className="numCell">На складах</th>
                         <th className="numCell">Не хватает</th>
                         <th className="feasUnitCell">Ед.</th>
+                        <th className="feasReasonCell">Причина</th>
+                        <th className="feasRtCell">RT, дн</th>
                         <th className="feasStatusCell">Статус</th>
                       </tr>
                     </thead>
@@ -392,13 +400,17 @@ export function ReleaseFeasibilityPage() {
                           </td>
                           <td className="numCell"><strong>{qty(row.shortage_qty)}</strong></td>
                           <td className="feasUnitCell">{row.unit || ''}</td>
+                          <td className="feasReasonCell">{row.reason}</td>
+                          <td className="feasRtCell numCell">
+                            {row.replenishment_time == null ? '' : row.replenishment_time}
+                          </td>
                           <td className="feasStatusCell">
                             <span className={`miniPill ${statusPill(row.status)}`}>{STATUS_TITLE[row.status]}</span>
                           </td>
                         </tr>
                       ))}
                       {!visibleTreeRows.length && (
-                        <tr><td colSpan={7} className="emptyDetail">Нечего показать</td></tr>
+                        <tr><td colSpan={9} className="emptyDetail">Нечего показать</td></tr>
                       )}
                     </tbody>
                   </table>

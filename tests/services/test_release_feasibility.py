@@ -468,3 +468,47 @@ def test_partial_stock_keeps_the_row_yellow_and_marks_the_stock_cell(db_session)
     assert row["stock_short"] is True
     # А там, где остатка хватает, ячейка не помечается.
     assert _find_node(payload["tree"], "ART-M1")["stock_short"] is False
+
+
+def test_every_row_explains_its_colour_and_carries_the_lead_time(db_session):
+    """Цвет без причины оператору ничего не даёт: рядом должно стоять «чем закрыть».
+
+    Формулировки согласованы с барабаном ProdFlow, чтобы одна и та же ситуация
+    в двух системах называлась одинаково.
+    """
+    product = _mk_item(db_session, "P1")
+    covered = _mk_item(db_session, "M1", stock=1000.0)
+    bought = _mk_item(db_session, "M2")               # закупное, нечем закрыть
+    node = _mk_item(db_session, "N1")                 # изготавливаемое
+    blank = _mk_item(db_session, "B1", stock=50.0)
+    for item, method, rt in (
+        (covered, "Закупка", 20),
+        (bought, "Закупка", 30),
+        (node, "Производство", 1),
+        (blank, "Закупка", 45),
+    ):
+        item.replenishment_method = method
+        item.replenishment_time = rt
+    db_session.flush()
+    _mk_spec(db_session, product, {covered: 1.0, bought: 1.0, node: 1.0})
+    _mk_spec(db_session, node, {blank: 1.0})
+
+    payload = analyze_release(db_session, product, 10.0, include_tree=True)
+
+    by_article = {row["item_article"]: row for row in payload["blocking"]}
+    assert by_article["ART-M2"]["reason"] == "Не хватает исходной детали"
+    assert by_article["ART-M2"]["replenishment_time"] == 30
+    assert by_article["ART-N1"]["reason"] == "Надо изготовить"
+    assert by_article["ART-N1"]["replenishment_time"] == 1
+
+    tree_rows = {}
+
+    def walk(node_payload):
+        tree_rows[node_payload["item_article"]] = node_payload
+        for child in node_payload["children"]:
+            walk(child)
+
+    walk(payload["tree"])
+    assert tree_rows["ART-M1"]["reason"] == "Есть на складе"
+    assert tree_rows["ART-M1"]["replenishment_time"] == 20
+    assert tree_rows["ART-B1"]["reason"] == "Есть на складе"

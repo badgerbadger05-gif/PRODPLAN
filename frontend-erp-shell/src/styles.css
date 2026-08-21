@@ -2379,6 +2379,8 @@ input:focus, select:focus {
 .feasKindCell { width: 92px; }
 .feasUnitCell { width: 64px; }
 .feasStatusCell { width: 142px; }
+.feasReasonCell { width: 210px; }
+.feasRtCell { width: 72px; }
 
 .feasibilityTreeTable .bomNameCell strong {
   padding-left: calc(var(--level, 0) * 18px);

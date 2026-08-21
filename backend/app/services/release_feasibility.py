@@ -164,6 +164,11 @@ def _item_meta(db: Session, item_ids: Sequence[int], units: Dict[str, str]) -> D
             "item_name": str(item.item_name or ""),
             "unit": _unit_label(units, item.unit),
             "replenishment_method": str(item.replenishment_method or ""),
+            "replenishment_time": (
+                int(item.replenishment_time)
+                if item.replenishment_time is not None
+                else None
+            ),
         }
     return meta
 
@@ -361,6 +366,22 @@ def _explode(
         for comp_id, qty_per in edges.get(item_id, {}).items():
             gross[comp_id] = gross.get(comp_id, 0.0) + net * qty_per
     return result
+
+
+def _status_reason(status: str, method: str, has_components: bool) -> str:
+    """Одна строка, объясняющая цвет: чем позицию закрыть.
+
+    Оператор видит цвет и должен сразу понимать причину, не наводя курсор:
+    зелёная — есть на складе; жёлтая — самой позиции нет, но закрыть её есть
+    чем; красная — закрыть нечем вовсе или внутри не хватает компонента.
+    """
+    if status == STATUS_OK:
+        return "Есть на складе"
+    if status == STATUS_MAKE:
+        return "Надо изготовить" if has_components else "Надо закупить"
+    if status == STATUS_BLOCKED:
+        return "Не хватает компонента"
+    return "Не хватает исходной детали" if str(method) != "Производство" else "Не из чего изготовить"
 
 
 def _classify(
@@ -656,6 +677,12 @@ def analyze_release(
                 "level": int(llc.get(item_id, 0)),
                 "kind": "node" if edges.get(item_id) else "material",
                 "status": status,
+                "reason": _status_reason(
+                    status,
+                    str(info.get("replenishment_method", "")),
+                    bool(edges.get(item_id)),
+                ),
+                "replenishment_time": info.get("replenishment_time"),
                 "is_blocking": status in (STATUS_SHORTAGE, STATUS_BLOCKED),
                 "required_qty": _round_qty(values.get("gross", 0.0)),
                 "stock_on_hand": _round_qty(values.get("stock", 0.0)),
@@ -803,6 +830,12 @@ def _build_tree(
             "level": depth,
             "kind": "node" if comps else "material",
             "status": row_status,
+            "reason": _status_reason(
+                row_status,
+                str(info.get("replenishment_method", "")),
+                bool(comps),
+            ),
+            "replenishment_time": info.get("replenishment_time"),
             "stock_short": bool(stock_short),
             "qty_per_parent": None if qty_per_parent is None else _round_qty(qty_per_parent),
             "branch_required_qty": _round_qty(branch_required),
