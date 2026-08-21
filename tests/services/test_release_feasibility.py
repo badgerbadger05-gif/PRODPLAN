@@ -597,6 +597,7 @@ def test_service_from_1c_is_not_a_supply_position(db_session):
     row = _find_node(payload["tree"], "ART-SV1")
     assert row["status"] == "non_stock"
     assert row["reason"] == "Услуга: на складе не бывает"
+    assert _find_node(payload["tree"], "ART-PL1")["status"] == "make"
     assert [r["item_article"] for r in payload["blocking"]] == ["ART-PL1"]
     assert payload["summary"]["producible_qty"] == 10.0
 
@@ -619,3 +620,22 @@ def test_stocked_material_stays_a_blocker_even_if_it_looks_like_an_operation(db_
     assert row["item_article"] == "ART-PW1"
     assert row["status"] == "shortage"
     assert payload["summary"]["producible_qty"] == 0.0
+
+
+def test_technological_operation_is_not_a_supply_position(db_session):
+    """«Операция» из 1С — тоже не запас: их на стенде 1542 против 484 услуг."""
+    product = _mk_item(db_session, "P1")
+    part = _mk_item(db_session, "PT1")
+    blank = _mk_item(db_session, "BL1", stock=100.0)
+    operation = _mk_item(db_session, "OP1")
+    operation.item_type = "Операция"
+    db_session.flush()
+    _mk_spec(db_session, product, {part: 1.0})
+    _mk_spec(db_session, part, {blank: 1.0, operation: 1.0})
+
+    payload = analyze_release(db_session, product, 5.0, include_tree=True)
+
+    row = _find_node(payload["tree"], "ART-OP1")
+    assert row["status"] == "non_stock"
+    assert row["reason"] == "Операция: на складе не бывает"
+    assert payload["summary"]["producible_qty"] == 5.0
