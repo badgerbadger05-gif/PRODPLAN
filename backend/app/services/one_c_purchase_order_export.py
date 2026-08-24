@@ -103,7 +103,6 @@ def _collect_purchase_groups(
             PlannedPurchase.qty,
             PlannedPurchase.need_date,
             PlannedPurchase.order_date,
-            PlannedPurchase.supplier_ref1c,
             Item.item_ref1c,
             Item.supplier_ref1c.label("item_supplier_ref1c"),
             Item.item_name,
@@ -151,8 +150,12 @@ def _collect_purchase_groups(
     for row in q.all():
         if int(row.purchase_id) in already_exported:
             continue
-        supplier_ref = (row.supplier_ref1c or row.item_supplier_ref1c or "").strip()
-        supplier_ref = _clean_ref1c(supplier_ref)
+        # Поставщик строки закупки — только карточка номенклатуры. Договорённость
+        # с поставщиком — это заказ; пока заказа нет, договорённости нет, и
+        # копия поставщика, снятая в момент прогона, ничего не удостоверяет.
+        # Раньше приоритет был у неё, и заказ уходил тому, кого закупщик уже
+        # заменил в карточке.
+        supplier_ref = _clean_ref1c(str(row.item_supplier_ref1c or "").strip())
         item_ref = _clean_ref1c(row.item_ref1c)
         qty = float(row.qty or 0.0)
         if qty <= 0:

@@ -1571,7 +1571,10 @@ def _freeze_one_run(
                             order_date=order_date,
                             lead_time_days=lead_time,
                             bucket_date=need_date,
-                            supplier_ref1c=getattr(item, "supplier_ref1c", None),
+                            # Поставщика в строку прогона не копируем: договорённость
+                            # с поставщиком — это заказ, а снятая здесь копия через
+                            # месяц показывала того, кого закупщик уже заменил в
+                            # карточке. Все читатели спрашивают карточку.
                             source_mrp_requirement_id=req_id,
                             ledger_generation_id=int(run.ledger_generation_id),
                         ))

@@ -136,6 +136,41 @@ def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int
     return stage_name_by_id, area_id_by_stage, area_name_by_id
 
 
+def _card_supplier_ref_by_item(db: Session, item_ids: List[int]) -> Dict[int, Optional[str]]:
+    """Поставщик каждой номенклатуры по её карточке 1С.
+
+    Единственный владелец ответа на вопрос «у кого покупаем эту позицию», пока
+    заказа поставщику нет. Договорённость с поставщиком — это заказ; копия
+    поставщика, снятая в момент MRP-прогона, ничего не удостоверяет и через
+    месяц показывает того, кого закупщик уже заменил в карточке.
+    """
+    ids = sorted({int(value) for value in item_ids if value is not None})
+    if not ids:
+        return {}
+    try:
+        rows = (
+            db.query(Item.item_id, Item.supplier_ref1c)
+            .filter(Item.item_id.in_(ids))
+            .all()
+        )
+    except Exception:
+        return {}
+    resolved: Dict[int, Optional[str]] = {}
+    for row in rows or []:
+        try:
+            if isinstance(row, (list, tuple)):
+                item_id, supplier_ref = row[0], row[1]
+            else:
+                item_id = getattr(row, "item_id", None)
+                supplier_ref = getattr(row, "supplier_ref1c", None)
+            if item_id is None:
+                continue
+            resolved[int(item_id)] = str(supplier_ref).strip() if supplier_ref else None
+        except Exception:
+            continue
+    return resolved
+
+
 def _load_purchase_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """Map a purchased component to the stage/resource where it is consumed."""
     unique_item_ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
@@ -1152,6 +1187,9 @@ def get_run_purchases(
             PlannedPurchase.lead_time_days,
             PlannedPurchase.priority_index,
             PlannedPurchase.bucket_date,
+            # Легаси-колонка: значение ниже переписывается карточкой
+            # номенклатуры. Остаётся в выборке только чтобы не сдвигать позиции
+            # кортежа, который распаковывается по трём историческим формам.
             PlannedPurchase.supplier_ref1c,
             PlannedPurchase.requested_qty,
         )
@@ -1262,6 +1300,7 @@ def get_run_purchases(
         except Exception:
             continue
     ensure_meta_cached(item_ids_to_cache)
+    card_supplier_by_item = _card_supplier_ref_by_item(db, item_ids_to_cache)
     for row in rows_joined:
         # Support both legacy tuples (with bucket_type) and new tuples (without)
         seq = list(row) if isinstance(row, (tuple, list)) else [row]
@@ -1347,6 +1386,14 @@ def get_run_purchases(
             in_unit_name = getattr(row, "unit_name", None)
             in_unit_code = getattr(row, "unit_code", None)
             bucket_type_val = "daily"
+        # Замороженная в прогоне копия поставщика не участвует: строка отвечает
+        # карточкой номенклатуры, одной и той же для журнала закупок, выгрузки
+        # в 1С и результатов MRP.
+        supplier_ref1c_val = (
+            card_supplier_by_item.get(int(item_id_val))
+            if item_id_val is not None
+            else None
+        )
         include_row = True
         if date_from:
             if bucket_date_val is None or bucket_date_val < _to_date(date_from):
