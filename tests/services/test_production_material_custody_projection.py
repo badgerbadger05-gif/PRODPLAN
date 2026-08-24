@@ -1111,3 +1111,94 @@ def test_event_idempotency_key_is_uniquely_enforced(db_session):
 
     with pytest.raises(IntegrityError):
         db_session.commit()
+
+
+def test_fold_orders_an_issue_line_by_causality_across_a_clock_skew(db_session):
+    """Часы PRODPLAN и 1С расходятся на секунду — порядок держим причинностью.
+
+    На стенде заявка создана в 10:39:01.07, а документ 1С проведён в 10:39:00:
+    сравнение по времени в такой паре проигрывает на любой точности, расход
+    встаёт перед резервом, свёртка уходит в минус и уносит с собой всю сборку
+    поколения Ledger. Строка заявки идёт в поток целиком, а внутри — открытие
+    перед расходом.
+    """
+    base = _generation(
+        db_session,
+        key="custody-skew-base",
+        cutoff=datetime(2026, 8, 20, tzinfo=timezone.utc),
+    )
+    target = _generation(
+        db_session,
+        key="custody-skew-target",
+        cutoff=datetime(2026, 8, 22, tzinfo=timezone.utc),
+    )
+    product, _parent, component = _product(db_session, item_code="SKEW")
+    issue = ProductionMaterialIssue(
+        document_number="MT-SKEW-1",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WH-DEST",
+        source_warehouse_ref1c="WH-SRC",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    posted_at = datetime(2026, 8, 21, 10, 39, 0, tzinfo=timezone.utc)
+    created_at = datetime(2026, 8, 21, 10, 39, 1, 71749, tzinfo=timezone.utc)
+    outbound = StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="s" * 64,
+        item_id=component.item_id,
+        warehouse_ref1c="WH-SRC",
+        qty=-32.936,
+        posting_at=posted_at,
+        movement_kind="transfer_out",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="transfer-skew",
+        line_no="1",
+    )
+    inbound = StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="t" * 64,
+        item_id=component.item_id,
+        warehouse_ref1c="WH-DEST",
+        qty=32.936,
+        posting_at=posted_at,
+        movement_kind="transfer_in",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="transfer-skew",
+        line_no="2",
+    )
+    db_session.add_all([outbound, inbound])
+    db_session.flush()
+    # Резерв заявки — по часам PRODPLAN, на секунду позже документа 1С.
+    _event(
+        db_session, source_kind="issue_created", issue_id=issue.issue_id,
+        product_id=product.product_id, component_id=component.item_id,
+        location="transit", warehouse="WH-SRC", qty=32.936,
+        key="custody:event:skew:opening", effective_at=created_at,
+    )
+    _event(
+        db_session, source_kind="transfer_posted", issue_id=issue.issue_id,
+        product_id=product.product_id, component_id=component.item_id,
+        location="transit", warehouse="WH-SRC", qty=-32.936,
+        key="custody:event:skew:out", effective_at=posted_at,
+        source_sle_id=outbound.id,
+    )
+    _event(
+        db_session, source_kind="transfer_posted", issue_id=issue.issue_id,
+        product_id=product.product_id, component_id=component.item_id,
+        location="workshop", warehouse="WH-DEST", qty=32.936,
+        key="custody:event:skew:in", effective_at=posted_at,
+        source_sle_id=inbound.id,
+    )
+    _manifest(db_session, generation_id=base.id, source_event_high_watermark_id=0)
+    _manifest(db_session, generation_id=target.id, source_event_high_watermark_id=3)
+    db_session.commit()
+
+    state = load_material_custody_projection(db_session, ledger_generation_id=target.id)
+
+    custody = state.for_product(int(product.product_id))
+    assert custody.in_transit == {}
+    assert custody.at_workshop[int(component.item_id)] == pytest.approx(32.936)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -276,29 +276,58 @@ def _visible_source_sle_for_event(
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _custody_fold_anchor(
+    events: Sequence[models.ProductionMaterialCustodyEvent],
+) -> dict[tuple[int, int], datetime]:
+    """Одна временная точка на строку заявки: самое раннее её событие.
+
+    Резерв и его расход живут по разным часам. Открытие заявки штампуется
+    временем PRODPLAN с микросекундами, а проводка перемещения приходит из 1С —
+    целыми секундами и по её часам, которые могут отставать: на стенде заявка
+    создана в 10:39:01.07, а документ проведён в 10:39:00. Сравнение по времени
+    в такой паре всегда проиграет, на какой бы точности его ни вести.
+
+    Поэтому строка заявки сортируется как целое: все её события встают в поток
+    по самому раннему из них, а внутри — по причинности. Между разными строками
+    порядок остаётся временным.
+    """
+    anchors: dict[tuple[int, int], datetime] = {}
+    for event in events:
+        if event.issue_id is None or event.effective_at is None:
+            continue
+        key = (int(event.issue_id), int(event.component_item_id))
+        moment = event.effective_at.replace(microsecond=0)
+        current = anchors.get(key)
+        if current is None or moment < current:
+            anchors[key] = moment
+    return anchors
+
+
 def _custody_fold_order_key(
     event: models.ProductionMaterialCustodyEvent,
+    anchors: Mapping[tuple[int, int], datetime],
 ) -> tuple[Any, ...]:
-    """Order custody events at the resolution 1C actually publishes.
+    """Порядок свёртки: строка заявки целиком, внутри — открытие перед расходом.
 
-    A physical transfer event carries ``posting_at`` from 1C, which is whole
-    seconds; the issue's own opening carries the microsecond at which the
-    operator created it.  A transfer posted 0.3 s *after* its issue therefore
-    sorts 0.3 s *before* it, and the fold consumes a transit reservation that
-    does not exist yet — the projection then fails closed on a movement which is
-    perfectly consistent, and with it the whole Ledger refresh.
-
-    Comparing at one second and only then by causality keeps an opening in front
-    of the transfer it covers.  Ordering openings first can never turn a healthy
-    fold negative: it only ever adds the reservation earlier.
+    Открытие резерва всегда предшествует перемещению, которое этот резерв
+    тратит: документ не может появиться раньше заявки, из которой он выгружен.
+    Раньше порядок определялся временем, и расход вставал перед резервом —
+    свёртка уходила в минус, проекция падала закрыто и уносила с собой всю
+    сборку поколения Ledger.
     """
     effective = event.effective_at
     truncated = (
         effective.replace(microsecond=0) if effective is not None else effective
     )
+    anchor = truncated
+    if event.issue_id is not None and effective is not None:
+        anchor = anchors.get(
+            (int(event.issue_id), int(event.component_item_id)), truncated
+        )
     return (
-        truncated,
+        anchor,
         0 if str(event.source_kind or "") == "issue_created" else 1,
+        truncated,
         effective,
         int(event.id),
     )
@@ -493,18 +522,17 @@ def _select_visible_custody_events(
         .order_by(models.ProductionMaterialCustodyEvent.id.asc())
         .all()
     )
-    return sorted(
-        (
-            event
-            for event in events
-            if not _is_reimport_duplicate_physical_event(
-                db,
-                event,
-                original_high_watermark_id=baseline_high_watermark_id,
-            )
-        ),
-        key=_custody_fold_order_key,
-    )
+    visible = [
+        event
+        for event in events
+        if not _is_reimport_duplicate_physical_event(
+            db,
+            event,
+            original_high_watermark_id=baseline_high_watermark_id,
+        )
+    ]
+    anchors = _custody_fold_anchor(visible)
+    return sorted(visible, key=lambda event: _custody_fold_order_key(event, anchors))
 
 
 def initialize_material_custody_baseline(
