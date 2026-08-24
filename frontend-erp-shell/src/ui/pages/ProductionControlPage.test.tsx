@@ -34,6 +34,7 @@ vi.mock('../../services/productionControl', () => ({
   produceOrderLine: vi.fn(),
   getItem: vi.fn(),
   updateItem: vi.fn(),
+  updateOrderQuantity: vi.fn(),
   deleteProductionOrder: vi.fn(),
 }))
 
@@ -65,6 +66,7 @@ import {
   materializeMakeWorkItems,
   openPaintWeldChains,
   closePaintWeldChain,
+  updateOrderQuantity,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 import {
@@ -680,6 +682,62 @@ describe('ProductionControlPage — characterization', () => {
     }]))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([901], 'erp-shell', undefined))
     expect(getOrderMaterials).not.toHaveBeenCalled()
+  })
+
+  it('re-quantifies a created local order and reloads its components', async () => {
+    const editable = {
+      ...fakeRows()[0],
+      product_id: 901,
+      order_id: 801,
+      order_number: 'MRP-R-701-1',
+      order_prodplan_number: 'MRP-R-701-1',
+      status: 'created',
+      issue_status: 'not_requested',
+      available_actions: ['edit_quantity'],
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [editable], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(getOrderMaterials).mockImplementation(async () => ({
+      ...fakeMaterials(),
+      product_id: 901,
+      qty: 14,
+      components: fakeMaterials().components.map((component) => ({
+        ...component,
+        required_qty: component.qty_per_unit * 14,
+      })),
+    }))
+    vi.mocked(updateOrderQuantity).mockResolvedValue({
+      status: 'ok',
+      product_id: 901,
+      order_id: 801,
+      previous_quantity: 10,
+      quantity: 14,
+      remaining_qty: 14,
+      launchable_qty: 20,
+      material_issues_open: 0,
+    })
+
+    const user = userEvent.setup()
+    renderPage()
+    const input = await screen.findByRole('spinbutton', { name: 'Количество запуска' })
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(901))
+
+    await user.clear(input)
+    await user.type(input, '14')
+    await user.tab()
+
+    await waitFor(() => expect(updateOrderQuantity).toHaveBeenCalledWith(901, 14))
+    // Комплектация перечитывается с сервера, а не пересчитывается страницей.
+    await waitFor(() => expect(vi.mocked(getOrderMaterials).mock.calls.length).toBeGreaterThan(1))
+    expect(await screen.findByText('нужно 56')).toBeInTheDocument()
+  })
+
+  it('keeps the launch quantity read-only once the line is a fact outside', async () => {
+    renderPage()
+    await screen.findByText('Вал')
+    expect(screen.queryByRole('spinbutton', { name: 'Количество запуска' })).toBeNull()
   })
 
   it('runs the canonical produce action for one assembled row', async () => {

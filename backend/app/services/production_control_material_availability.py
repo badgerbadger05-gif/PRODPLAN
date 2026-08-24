@@ -720,6 +720,19 @@ def preview_make_work_items_coverage(
     return result
 
 
+def _snapshot_qty_matches_line(
+    db: Session,
+    product_id: int,
+    material: Dict[str, Any],
+) -> bool:
+    """Снимок комплектации посчитан ровно на то количество, что стоит в строке?"""
+    product = db.get(ProductionProduct, int(product_id))
+    if product is None:
+        return True
+    line_qty = _to_float(accepted_product_output(product).remaining_qty)
+    return abs(line_qty - _to_float(material.get("qty"))) <= 1e-6
+
+
 def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
     """Read coverage only from the accepted production-journal snapshot."""
     from .. import models
@@ -750,7 +763,22 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         )
     material = row.payload.get("material_coverage_snapshot") if row and isinstance(row.payload, dict) else None
     if isinstance(material, dict) and int(material.get("ledger_generation_id") or -1) == generation_id:
-        public = dict(material)
+        # Количество исполнительной строки — исполнительный факт, и оператор
+        # меняет его у локального заказа уже после cutoff. Комплектация снимка
+        # посчитана от прежнего количества: отдать её значило бы показать
+        # компоненты не на то, что запускается. Расхождение пересчитывается тем
+        # же генерационно-закреплённым сборщиком, что и публикация снимка, —
+        # второй формулы потребности компонентов не появляется.
+        if _snapshot_qty_matches_line(db, int(product_id), material):
+            public = dict(material)
+            public["truth_status"] = str(snapshot.truth_status)
+            public["cutoff"] = snapshot.cutoff.isoformat()
+            return public
+        public = preview_materials(
+            db,
+            int(product_id),
+            ledger_generation_id=generation_id,
+        )
         public["truth_status"] = str(snapshot.truth_status)
         public["cutoff"] = snapshot.cutoff.isoformat()
         return public

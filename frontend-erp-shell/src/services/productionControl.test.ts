@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { closeProductionOrder, listProductionOrders, listRootProductOptions, updateItem } from './productionControl'
+import { closeProductionOrder, listProductionOrders, listRootProductOptions, updateItem, updateOrderQuantity } from './productionControl'
 
 describe('production-control item update boundary', () => {
   afterEach(() => {
@@ -107,5 +107,39 @@ describe('production-control close action boundary', () => {
     expect(url).toBe('/api/v1/production-control/orders/101/close')
     expect(init.method).toBe('POST')
     expect(JSON.parse(String(init.body))).toEqual({ dry_run: false })
+  })
+})
+
+describe('production-control launch quantity boundary', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('patches the launch quantity of one production line', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          status: 'ok',
+          product_id: 901,
+          order_id: 801,
+          previous_quantity: 10,
+          quantity: 14,
+          remaining_qty: 14,
+          launchable_qty: 20,
+          material_issues_open: 0,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await updateOrderQuantity(901, 14)
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('/api/v1/production-control/orders/901/quantity')
+    expect(init.method).toBe('PATCH')
+    expect(JSON.parse(String(init.body))).toEqual({ quantity: 14, initiated_by: 'erp-shell' })
+    expect(result.quantity).toBe(14)
   })
 })

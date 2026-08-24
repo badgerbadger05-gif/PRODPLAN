@@ -32,6 +32,7 @@ from ..services.production_control_journal import (
     materialize_make_work_items,
     cancel_local_order,
     update_line_state,
+    update_local_order_quantity,
 )
 from ..services.production_control_journal_snapshot import (
     RouteSheetSnapshotUnavailable,
@@ -638,6 +639,11 @@ class OrdersFromWorkItemsPayload(BaseModel):
     initiated_by: Optional[str] = None
 
 
+class OrderLineQuantityPayload(BaseModel):
+    quantity: float = Field(gt=0)
+    initiated_by: Optional[str] = None
+
+
 class OpenPaintWeldChainsPayload(BaseModel):
     product_ids: List[int]
     initiated_by: Optional[str] = None
@@ -908,6 +914,33 @@ def patch_order_line_state(product_id: int, payload: LineStatePayload, db: Sessi
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/orders/{product_id}/quantity", response_model=dict)
+def patch_order_line_quantity(
+    product_id: int,
+    payload: OrderLineQuantityPayload,
+    db: Session = Depends(get_db),
+):
+    """Изменить количество к запуску у локального заказа, ещё не открытого в 1С.
+
+    Пересчитывает потребность компонентов: уже созданные локальные заявки на
+    перемещение приводятся к новому количеству, выгруженные в 1С — возвращаются
+    как заблокированные, их правит отдельная корректировка.
+    """
+    try:
+        return update_local_order_quantity(
+            db,
+            int(product_id),
+            float(payload.quantity),
+            initiated_by=payload.initiated_by,
+        )
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/orders/{product_id}", response_model=dict)

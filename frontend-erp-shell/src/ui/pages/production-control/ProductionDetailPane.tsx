@@ -14,6 +14,7 @@ type Props = {
   onOptimalBatchSave: (itemId: number, value: number | null) => Promise<void>
   launchQuantity: number | null
   onLaunchQuantityChange: (value: number) => void
+  onOrderQuantitySave: (productId: number, value: number) => Promise<void>
 }
 
 export function ProductionDetailPane({
@@ -27,11 +28,15 @@ export function ProductionDetailPane({
   onOptimalBatchSave,
   launchQuantity,
   onLaunchQuantityChange,
+  onOrderQuantitySave,
 }: Props) {
   const [batchValue, setBatchValue] = useState('')
   const [batchSaving, setBatchSaving] = useState(false)
   const [batchError, setBatchError] = useState('')
   const [launchValue, setLaunchValue] = useState('')
+  const [orderQtyValue, setOrderQtyValue] = useState('')
+  const [orderQtySaving, setOrderQtySaving] = useState(false)
+  const [orderQtyError, setOrderQtyError] = useState('')
 
   useEffect(() => {
     setBatchValue(activeRow?.optimal_batch != null ? String(activeRow.optimal_batch) : '')
@@ -42,6 +47,11 @@ export function ProductionDetailPane({
     setLaunchValue(launchQuantity == null ? '' : String(launchQuantity))
   }, [activeRow?.journal_row_key, launchQuantity])
 
+  useEffect(() => {
+    setOrderQtyValue(activeRow?.quantity == null ? '' : String(activeRow.quantity))
+    setOrderQtyError('')
+  }, [activeRow?.journal_row_key, activeRow?.quantity])
+
   function commitLaunchQuantity() {
     if (activeRow?.work_item_id == null) return
     const value = Number(launchValue)
@@ -51,6 +61,35 @@ export function ProductionDetailPane({
       return
     }
     onLaunchQuantityChange(value)
+  }
+
+  // Потолок берёт на себя бэкенд: он один знает незакрытую потребность MRP по
+  // паре «план + деталь». Здесь проверяется только форма числа, а отказ по
+  // потолку показывается тем текстом, которым его сформулировал расчёт.
+  async function commitOrderQuantity() {
+    const productId = activeRow?.product_id
+    if (productId == null) return
+    const current = activeRow?.quantity ?? 0
+    const value = Number(orderQtyValue)
+    if (!Number.isFinite(value) || value <= 0) {
+      setOrderQtyValue(String(current))
+      setOrderQtyError('Некорректное количество')
+      return
+    }
+    if (Math.abs(value - current) < 1e-9) {
+      setOrderQtyError('')
+      return
+    }
+    setOrderQtyError('')
+    setOrderQtySaving(true)
+    try {
+      await onOrderQuantitySave(productId, value)
+    } catch (e) {
+      setOrderQtyValue(String(current))
+      setOrderQtyError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setOrderQtySaving(false)
+    }
   }
 
   async function handleBatchSave() {
@@ -72,6 +111,11 @@ export function ProductionDetailPane({
     }
   }
 
+  // Заказ уже создан локально, но ещё не стал фактом снаружи: бэкенд отдаёт
+  // действие edit_quantity ровно до выгрузки в 1С, принятого выпуска,
+  // выгруженного перемещения и открытой цепочки сварка-окраска.
+  const canEditOrderQuantity = activeRow?.product_id != null
+    && (activeRow.available_actions ?? []).includes('edit_quantity')
   const rowSource = activeRow?.order_source || activeRow?.source
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty
@@ -196,6 +240,24 @@ export function ProductionDetailPane({
                   onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
                 />
                 {activeRow.unit && <span className="batchUnit">{activeRow.unit}</span>}
+              </span>
+            ) : canEditOrderQuantity ? (
+              <span className="batchEditCell">
+                <input
+                  type="number"
+                  aria-label="Количество запуска"
+                  min={0.001}
+                  step={1}
+                  value={orderQtyValue}
+                  disabled={orderQtySaving}
+                  className={orderQtyError ? 'inputError' : ''}
+                  onChange={(event) => { setOrderQtyValue(event.target.value); setOrderQtyError('') }}
+                  onBlur={() => void commitOrderQuantity()}
+                  onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
+                />
+                {activeRow.unit && <span className="batchUnit">{activeRow.unit}</span>}
+                {orderQtySaving && <span className="batchHint">...</span>}
+                {orderQtyError && <span className="batchHint error">{orderQtyError}</span>}
               </span>
             ) : (
               <strong>{qty(activeRow.quantity)} {activeRow.unit}</strong>

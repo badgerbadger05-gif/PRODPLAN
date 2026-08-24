@@ -22,6 +22,7 @@ import {
   listRootProductOptions,
   listProductionOrders,
   materializeMakeWorkItems,
+  updateOrderQuantity,
   openPaintWeldChains,
   closePaintWeldChain,
   postMaterialIssues,
@@ -503,6 +504,26 @@ export function ProductionControlPage() {
     }
   }
 
+  // Количество уже созданного, но ещё не открытого в 1С заказа. Строку журнала
+  // обновляем сразу, комплектацию перечитываем с сервера: потребность
+  // компонентов считает бэкенд от нового количества, а не эта страница.
+  async function saveOrderQuantity(productId: number, value: number) {
+    setError('')
+    setMessage('')
+    const result = await updateOrderQuantity(productId, value)
+    setRows((list) => list.map((row) => row.product_id === productId
+      ? { ...row, quantity: result.quantity, remaining_qty: result.remaining_qty }
+      : row))
+    const openIssues = result.material_issues_open ?? 0
+    setMessage(
+      `Количество к запуску: ${result.previous_quantity} → ${result.quantity}`
+      + (openIssues
+        ? `; заявок на перемещение ${openIssues} — будут приведены к новому количеству при следующем запросе материалов`
+        : ''),
+    )
+    await loadMaterials(productId)
+  }
+
   async function saveOptimalBatch(itemId: number, value: number | null) {
     await updateItem(itemId, {
       optimal_batch: value,
@@ -793,6 +814,7 @@ export function ProductionControlPage() {
               onReturnLeftovers={() => void returnActiveLeftovers(activeRow?.product_id)}
               onPrint={() => { if (activeRow) openRouteSheets(productionRowProductIds(activeRow)) }}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
+              onOrderQuantitySave={(productId, value) => saveOrderQuantity(productId, value)}
             />
           )}
         </div>

@@ -50,6 +50,7 @@ from .mrp_mutation_guard import (
 from .bom_specification_resolver import BomSpecificationResolver
 from .item_ledger.production_output_cache import (
     accepted_product_output,
+    update_accepted_product_output_cache,
 )
 from .production_material_custody_events import append_material_issue_custody_event
 
@@ -780,15 +781,34 @@ def _frozen_spec_identity_for_requirement(
     return spec_id, frozen_hash or current_hash
 
 
+_CLOSED_WORK_STATUSES = {"completed", "produced_partial", "produced", "cancelled", "done"}
+
+
 def _available_actions_for_journal_row(
     *,
     order: ProductionOrder,
     status: str,
     has_1c_link: bool,
+    produced_qty: float = 0.0,
+    issue_status: str = "not_requested",
+    has_paint_weld_chain: bool = False,
 ) -> list[str]:
-    if has_1c_link and str(order.source or "1c").lower() == "mrp":
-        if status not in {"completed", "produced_partial", "produced", "cancelled", "done"}:
-            return ["close_1c"]
+    source = str(order.source or "1c").lower()
+    if source != "mrp":
+        return []
+    if has_1c_link:
+        return [] if status in _CLOSED_WORK_STATUSES else ["close_1c"]
+    # Локальный заказ ещё не стал фактом снаружи: ни документа 1С, ни принятого
+    # выпуска, ни выгруженного перемещения, ни открытой цепочки. До этой границы
+    # количество к запуску — исполнительное решение оператора, и правится вместе
+    # с потребностью компонентов.
+    if (
+        status not in _CLOSED_WORK_STATUSES
+        and produced_qty <= 1e-9
+        and not has_paint_weld_chain
+        and issue_status not in {"exported", "posted"}
+    ):
+        return ["edit_quantity"]
     return []
 
 
@@ -1291,6 +1311,9 @@ def list_journal(
             order=product.order,
             status=work_status,
             has_1c_link=has_1c_link,
+            produced_qty=_to_float(product.produced_qty),
+            issue_status=issue_status,
+            has_paint_weld_chain=chain_by_order_id.get(int(product.order_id)) is not None,
         )
         pair_metadata = pair_by_item.get(int(product.item_id))
         selection_disabled_reason = (
@@ -1403,6 +1426,76 @@ def list_journal(
     }
 
 
+def _current_requirement_by_plan_item(
+    requirements: Mapping[int, MrpRequirement],
+    plan_by_run: Mapping[int, Optional[int]],
+) -> Dict[Tuple[Optional[int], int], int]:
+    """Текущее требование по каждой паре «план + деталь».
+
+    Заказ хранит id требования того прогона, из которого был запущен, а rebase
+    или повторная фиксация плана выводят прогон из обращения в течение часа.
+    Границей, которая держится, остаётся план: по нему открытое количество и
+    сходится с новым требованием той же детали.
+    """
+    resolved: Dict[Tuple[Optional[int], int], int] = {}
+    for requirement_id, requirement in requirements.items():
+        resolved[
+            (plan_by_run.get(int(requirement.run_id)), int(requirement.item_id))
+        ] = int(requirement_id)
+    return resolved
+
+
+def _active_open_qty_by_requirement(
+    db: Session,
+    current_requirement_by_plan_item: Mapping[Tuple[Optional[int], int], int],
+    *,
+    exclude_product_id: Optional[int] = None,
+) -> Dict[int, float]:
+    """Открытое количество живых MRP-заказов, сведённое к текущему требованию.
+
+    Одна формула неттинга на два потребителя: строка-предложение вычитает её из
+    остатка пополнения, а правка количества уже созданного заказа исключает из
+    неё саму себя (``exclude_product_id``) — иначе строка вычла бы собственное
+    количество и не дала бы себя увеличить.
+    """
+    query = (
+        db.query(
+            ProductionProduct.quantity,
+            ProductionProduct.produced_qty,
+            MrpRequirement.item_id,
+            PlanningRun.source_plan_id,
+        )
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .join(
+            MrpRequirement,
+            MrpRequirement.id == ProductionProduct.source_mrp_requirement_id,
+        )
+        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
+        .filter(
+            ProductionOrder.source == "mrp",
+            ProductionOrder.deletion_mark.is_(False),
+            func.coalesce(ProductionProduct.quantity, 0)
+            > func.coalesce(ProductionProduct.produced_qty, 0),
+        )
+    )
+    if exclude_product_id is not None:
+        query = query.filter(ProductionProduct.product_id != int(exclude_product_id))
+    active_open: Dict[int, float] = {}
+    for quantity, produced_qty, requirement_item_id, requirement_plan_id in query.all():
+        target = current_requirement_by_plan_item.get(
+            (
+                int(requirement_plan_id) if requirement_plan_id is not None else None,
+                int(requirement_item_id),
+            )
+        )
+        if target is None:
+            continue
+        active_open[target] = active_open.get(target, 0.0) + max(
+            0.0, _to_float(quantity) - _to_float(produced_qty)
+        )
+    return active_open
+
+
 def list_make_proposals(
     db: Session,
     *,
@@ -1462,48 +1555,16 @@ def list_make_proposals(
     # whole remainder again and the same work was launched twice.  CANON
     # («Коррекция после смены MRP») compares the old MRP's open demand with the
     # new requirement of the same part, so the plan is the boundary that holds.
-    current_requirement_by_plan_item: Dict[Tuple[Optional[int], int], int] = {}
     plan_by_run = {
         int(run.run_id): (int(run.source_plan_id) if run.source_plan_id is not None else None)
         for run, _plan in run_rows
     }
-    for requirement_id, requirement in requirements.items():
-        current_requirement_by_plan_item[
-            (plan_by_run.get(int(requirement.run_id)), int(requirement.item_id))
-        ] = int(requirement_id)
-    active_open_by_requirement: Dict[int, float] = {}
-    for quantity, produced_qty, requirement_item_id, requirement_plan_id in (
-        db.query(
-            ProductionProduct.quantity,
-            ProductionProduct.produced_qty,
-            MrpRequirement.item_id,
-            PlanningRun.source_plan_id,
-        )
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .join(
-            MrpRequirement,
-            MrpRequirement.id == ProductionProduct.source_mrp_requirement_id,
-        )
-        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
-        .filter(
-            ProductionOrder.source == "mrp",
-            ProductionOrder.deletion_mark.is_(False),
-            func.coalesce(ProductionProduct.quantity, 0)
-            > func.coalesce(ProductionProduct.produced_qty, 0),
-        )
-        .all()
-    ):
-        target = current_requirement_by_plan_item.get(
-            (
-                int(requirement_plan_id) if requirement_plan_id is not None else None,
-                int(requirement_item_id),
-            )
-        )
-        if target is None:
-            continue
-        active_open_by_requirement[target] = active_open_by_requirement.get(
-            target, 0.0
-        ) + max(0.0, _to_float(quantity) - _to_float(produced_qty))
+    current_requirement_by_plan_item = _current_requirement_by_plan_item(
+        requirements, plan_by_run
+    )
+    active_open_by_requirement = _active_open_qty_by_requirement(
+        db, current_requirement_by_plan_item
+    )
     run_meta = {
         int(run.run_id): {
             "source_plan_id": int(run.source_plan_id) if run.source_plan_id is not None else None,
@@ -1744,6 +1805,204 @@ def _material_issue_has_1c_link(db: Session, issue: ProductionMaterialIssue) -> 
         .first()
         is not None
     )
+
+
+def launch_allowance_for_product(
+    db: Session,
+    product: ProductionProduct,
+    *,
+    ledger_generation_id: int,
+) -> Optional[float]:
+    """Потолок количества этой исполнительной строки по незакрытой потребности.
+
+    Возвращает, сколько может стоять в строке, чтобы суммарный запуск по паре
+    «план + деталь» не вышел за остаток пополнения принятого поколения. Канон
+    полок запрещает создавать выпуск сверх общей незакрытой MRP-потребности,
+    поэтому потолок — не подсказка интерфейса, а правило.
+
+    ``None`` — у строки нет MRP-происхождения: потолок из расчёта не выводится,
+    и решение принимает вызывающий (такие строки пришли из 1С и правятся там).
+    """
+    requirement_id = product.source_mrp_requirement_id
+    if requirement_id is None:
+        return None
+    requirement = db.get(MrpRequirement, int(requirement_id))
+    if requirement is None:
+        return None
+    run_ids = _accepted_fixed_run_ids(db, ledger_generation_id=int(ledger_generation_id))
+    if not run_ids:
+        return 0.0
+    work_items = (
+        db.query(ReplenishmentWorkItem)
+        .filter(
+            ReplenishmentWorkItem.ledger_generation_id == int(ledger_generation_id),
+            ReplenishmentWorkItem.run_id.in_(run_ids),
+            ReplenishmentWorkItem.replenishment_method == "make",
+            ReplenishmentWorkItem.item_id == int(requirement.item_id),
+        )
+        .all()
+    )
+    requirement_ids = sorted(
+        {int(row.requirement_id) for row in work_items} | {int(requirement.id)}
+    )
+    requirements = {
+        int(row.id): row
+        for row in db.query(MrpRequirement)
+        .filter(MrpRequirement.id.in_(requirement_ids))
+        .all()
+    }
+    plan_by_run = {
+        int(run.run_id): (int(run.source_plan_id) if run.source_plan_id is not None else None)
+        for run in db.query(PlanningRun)
+        .filter(
+            PlanningRun.run_id.in_(
+                sorted({int(row.run_id) for row in requirements.values()})
+            )
+        )
+        .all()
+    }
+    # Ту же свёртку «план + деталь» использует строка-предложение журнала: одна
+    # формула неттинга, а не вторая для правки количества.
+    current_requirement_by_plan_item = _current_requirement_by_plan_item(
+        requirements, plan_by_run
+    )
+    target_plan_id = plan_by_run.get(int(requirement.run_id))
+    target_requirement_id = current_requirement_by_plan_item.get(
+        (target_plan_id, int(requirement.item_id))
+    )
+    if target_requirement_id is None:
+        return 0.0
+    remaining_total = sum(
+        _to_float(row.replenishment_remaining_qty)
+        for row in work_items
+        if plan_by_run.get(int(requirements[int(row.requirement_id)].run_id))
+        == target_plan_id
+    )
+    other_open = _active_open_qty_by_requirement(
+        db,
+        current_requirement_by_plan_item,
+        exclude_product_id=int(product.product_id),
+    ).get(int(target_requirement_id), 0.0)
+    return max(0.0, remaining_total - other_open)
+
+
+def update_local_order_quantity(
+    db: Session,
+    product_id: int,
+    quantity: float,
+    *,
+    initiated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Изменить количество к запуску у локального, ещё не открытого в 1С заказа.
+
+    Количество исполнительного документа — исполнительный факт, а не плановая
+    величина: замороженная потребность, её резерв и покрытие не трогаются.
+    Правка разрешена ровно до момента, когда заказ становится фактом снаружи —
+    открыт в 1С, по нему принят выпуск, выгружено перемещение или открыта
+    цепочка сварка-окраска.
+
+    Потребность компонентов выводится из количества строки тем же сборщиком,
+    что и всегда, поэтому карточка и маршрутный лист пересчитываются сами.
+    Уже созданные локальные заявки на перемещение здесь не переписываются: их
+    приводит к новому количеству канонический ``create_material_issues`` при
+    следующем запросе материалов — только он умеет вернуть или добрать
+    удержание материалов событиями custody. Второго механизма правки заявок не
+    заводим.
+    """
+    product = (
+        db.query(ProductionProduct)
+        .options(
+            joinedload(ProductionProduct.order),
+            joinedload(ProductionProduct.control_state),
+        )
+        .filter(ProductionProduct.product_id == int(product_id))
+        .one_or_none()
+    )
+    if product is None or product.order is None:
+        raise ValueError("Строка заказа не найдена")
+    order = product.order
+
+    new_qty = _to_float(quantity)
+    if new_qty <= 1e-9:
+        raise ValueError("Количество запуска должно быть больше нуля")
+
+    if _production_order_has_1c_link(db, order):
+        raise ValueError("Заказ уже открыт в 1С: количество меняется в 1С, не здесь")
+
+    state = product.control_state
+    if state is not None and str(state.status or "") in _TERMINAL_LINE_STATUSES:
+        raise ValueError("Строка закрыта: количество не меняется")
+
+    output = accepted_product_output(product)
+    produced_qty = _to_float(output.produced_qty)
+    if produced_qty > 1e-9:
+        raise ValueError(
+            f"По строке уже принят выпуск {produced_qty:g}: количество не меняется"
+        )
+
+    chain_link = (
+        db.query(PaintWeldChainLink)
+        .filter(
+            (PaintWeldChainLink.painted_order_id == int(order.order_id))
+            | (PaintWeldChainLink.welded_order_id == int(order.order_id))
+        )
+        .first()
+    )
+    if chain_link is not None:
+        raise ValueError(
+            "Открыта цепочка сварка-окраска: количество меняется до её открытия"
+        )
+
+    issues = (
+        db.query(ProductionMaterialIssue)
+        .filter(
+            ProductionMaterialIssue.product_id == int(product.product_id),
+            ProductionMaterialIssue.direction == "issue",
+        )
+        .all()
+    )
+    linked_issues = [issue for issue in issues if _material_issue_has_1c_link(db, issue)]
+    if linked_issues:
+        numbers = ", ".join(
+            str(issue.document_number or issue.issue_id) for issue in linked_issues[:5]
+        )
+        raise ValueError(f"Есть перемещения, уже открытые в 1С: {numbers}")
+
+    truth = require_accepted_truth(
+        db, "production_control.update_local_order_quantity"
+    )
+    allowance = launch_allowance_for_product(
+        db, product, ledger_generation_id=int(truth.generation_id)
+    )
+    if allowance is None:
+        raise ValueError(
+            "Строка не создана расчётом MRP: количество меняется в источнике заказа"
+        )
+    previous_qty = _to_float(output.planned_qty)
+    # Уменьшение разрешено всегда: строка идёт к потолку, а не за него. Иначе
+    # заказ, выписанный до того как новое поколение срезало потребность, нельзя
+    # было бы даже сократить — только оставить как есть.
+    if new_qty - max(allowance, previous_qty) > 1e-6:
+        raise ValueError(f"Доступно к запуску {allowance:g}, запрошено {new_qty:g}")
+
+    product.quantity = new_qty
+    update_accepted_product_output_cache(product, produced_qty=produced_qty)
+    db.commit()
+
+    refreshed_output = accepted_product_output(product)
+    return {
+        "status": "ok",
+        "product_id": int(product.product_id),
+        "order_id": int(order.order_id),
+        "previous_quantity": previous_qty,
+        "quantity": _to_float(refreshed_output.planned_qty),
+        "remaining_qty": _to_float(refreshed_output.remaining_qty),
+        "launchable_qty": allowance,
+        # Сколько локальных заявок на перемещение будут приведены к новому
+        # количеству при следующем запросе материалов.
+        "material_issues_open": len(issues),
+        "initiated_by": initiated_by,
+    }
 
 
 def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:

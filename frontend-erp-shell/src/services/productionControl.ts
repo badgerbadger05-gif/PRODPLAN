@@ -70,6 +70,26 @@ export function materializeMakeWorkItems(workItems: number[] | MakeLaunchRequest
   })
 }
 
+export type OrderQuantityUpdateResult = {
+  status: string
+  product_id: number
+  order_id: number
+  previous_quantity: number
+  quantity: number
+  remaining_qty: number
+  launchable_qty: number
+  material_issues_open: number
+}
+
+// Количество уже созданного, но ещё не открытого в 1С заказа. Потребность
+// компонентов пересчитывается на бэкенде от нового количества.
+export function updateOrderQuantity(productId: number, quantity: number) {
+  return api<OrderQuantityUpdateResult>(`/v1/production-control/orders/${productId}/quantity`, {
+    method: 'PATCH',
+    body: JSON.stringify({ quantity, initiated_by: 'erp-shell' }),
+  })
+}
+
 export function listProductionEmployees() {
   return api<EmployeesResponse>('/v1/production-control/employees')
 }
