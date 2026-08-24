@@ -212,6 +212,8 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
         replenishment_method="Покупка",
         unit="u-api-cat",
         category_id=purchase_group.category_id,
+        # Поставщик строки закупки берётся здесь, из карточки номенклатуры.
+        supplier_ref1c="supp-api-1",
         status="active",
     )
     purchase_item_fallback = Item(
@@ -256,7 +258,6 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
                 order_date=datetime.date(2025, 1, 5),
                 lead_time_days=5,
                 bucket_date=datetime.date(2025, 1, 10),
-                supplier_ref1c="supp-api-1",
                 ledger_generation_id=run.ledger_generation_id,
             ),
             PlannedPurchase(

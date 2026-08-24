@@ -21,10 +21,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Mapping, MutableMapping, Sequence
 
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from app import models
-from app.services.production_output_truth import accepted_product_output
 
 
 def _iso(value: datetime | date | None) -> str | None:
@@ -185,42 +184,6 @@ def overlay_execution_state(
         row["route_sheet_printed_at"] = _datetime_iso(
             state.route_sheet_printed_at
         )
-
-    # Количество исполнительного документа — тоже исполнительный факт. Оператор
-    # меняет его у локального заказа до выгрузки, и до следующего поколения
-    # снимок нёс бы прежнее число вместе с пересчитанной по новому количеству
-    # комплектацией. Плановые величины строки (потребность, покрытие, остаток
-    # пополнения) при этом остаются снимочными.
-    products = (
-        db.query(models.ProductionProduct)
-        .options(joinedload(models.ProductionProduct.order))
-        .filter(models.ProductionProduct.product_id.in_(sorted(by_product_id)))
-        .all()
-    )
-    for product in products:
-        row = by_product_id.get(int(product.product_id))
-        if row is None:
-            continue
-        output = accepted_product_output(product)
-        # Строка-предложение, на которую наложили факт запуска, количество
-        # документа не перенимает: её «количество» — это остаток к запуску по
-        # расчёту, и смешивать два разных числа в одном поле нельзя.
-        if row.get("work_item_id") is None:
-            row["quantity"] = float(output.planned_qty)
-            row["produced_qty"] = float(output.produced_qty)
-            row["remaining_qty"] = float(output.remaining_qty)
-        order = getattr(product, "order", None)
-        locked = (
-            bool(order is not None and order.order_ref1c)
-            or float(output.produced_qty) > 1e-9
-            or str(row.get("issue_status") or "") in {"exported", "posted"}
-        )
-        if locked and "edit_quantity" in (row.get("available_actions") or []):
-            row["available_actions"] = [
-                action
-                for action in row["available_actions"]
-                if action != "edit_quantity"
-            ]
 
 
 def route_sheets_after_cutoff(

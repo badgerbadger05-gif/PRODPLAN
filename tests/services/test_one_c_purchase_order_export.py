@@ -122,7 +122,10 @@ def test_purchase_order_export_dry_run_groups_lines_by_supplier(db_session):
                 order_date=datetime.date(2026, 5, 21),
                 lead_time_days=5,
                 bucket_date=datetime.date(2026, 5, 26),
-                supplier_ref1c="supplier-b-override",
+                # Легаси-копия поставщика в строке прогона: она не должна
+                # перебивать карточку номенклатуры. Договорённость с
+                # поставщиком — это заказ, а копия ничего не удостоверяет.
+                supplier_ref1c="supplier-b-stale",
             ),
         ]
     )
@@ -137,7 +140,8 @@ def test_purchase_order_export_dry_run_groups_lines_by_supplier(db_session):
 
     orders = {order["supplier_ref1c"]: order for order in result["orders"]}
     assert orders["supplier-a"]["lines"][0]["qty"] == 5.0
-    assert orders["supplier-b-override"]["lines"][0]["qty"] == 4.0
+    assert "supplier-b-stale" not in orders
+    assert orders["supplier-b"]["lines"][0]["qty"] == 4.0
 
 
 def test_purchase_order_export_skips_rows_without_supplier_or_item_ref(db_session):

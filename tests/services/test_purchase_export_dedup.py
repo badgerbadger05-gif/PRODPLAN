@@ -29,12 +29,13 @@ def _mk_run(db):
 
 
 def _mk_purchase(db, run, item, supplier):
+    # Поставщика держит карточка номенклатуры: строка прогона его не хранит.
     d = datetime.date(2025, 1, 1)
+    item.supplier_ref1c = supplier
     p = PlannedPurchase(
         run_id=run.run_id, item_id=item.item_id,
         requested_qty=5, planned_qty=5, qty=5,
         need_date=d, order_date=d, lead_time_days=1, bucket_date=d,
-        supplier_ref1c=supplier,
     )
     db.add(p)
     db.flush()
