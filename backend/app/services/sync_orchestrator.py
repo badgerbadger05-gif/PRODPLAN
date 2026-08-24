@@ -208,6 +208,10 @@ _ORDER_INDEX: Dict[str, int] = {j.id: i for i, j in enumerate(SYNC_JOBS)}
 _PHYSICAL_REFRESH_RETRY_BASE_SECONDS = 300
 _PHYSICAL_REFRESH_RETRY_MAX_SECONDS = 3600
 _PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
+#: Сколько одинаковых подряд падений считать доказательством, что попытка
+#: не сойдётся уже никогда.  Три хватает: сообщение об ошибке совпадает
+#: дословно только когда повторяется одна и та же замороженная попытка.
+_STUCK_REFRESH_ATTEMPTS = 3
 _PHYSICAL_REFRESH_ENTITY = "AccumulationRegister_ЗапасыНаСкладах/Balance"
 _PHYSICAL_REFRESH_DISCOVERY_LOOKBACK = timedelta(days=7)
 _PHYSICAL_REFRESH_SETTLE_LAG = timedelta(minutes=5)
@@ -506,6 +510,20 @@ def _physical_refresh_block(
             ),
             "details": [int(generation.id) for generation in superseded],
         }
+    stuck_candidate_id = physical_state.get("stuck_candidate_id")
+    if stuck_candidate_id:
+        return {
+            "code": "stuck_building_refresh",
+            "message": (
+                f"кандидат физрефреша {int(stuck_candidate_id)} падает одинаково "
+                f"{int(physical_state.get('repeat_count') or 0)} раз подряд: "
+                f"{str(physical_state.get('last_error') or '')[:300]}. "
+                "Разберите причину и откатите его через POST "
+                "/api/v1/item-ledger/admin/physical-refresh/discard "
+                "{ledger_generation_id, reason}"
+            ),
+            "details": {"ledger_generation_id": int(stuck_candidate_id)},
+        }
     if terminal_preflight.get("terminal_conflict"):
         return {
             "code": "terminal_conflict",
@@ -536,6 +554,72 @@ def _physical_refresh_block(
             "details": [int(g.id) for g in inventory["recoverable"]],
         }
     return None
+
+
+def _release_stuck_refresh_identity(
+    db: Session,
+    physical_state: Dict[str, Any],
+    now: datetime,
+    repeats: int,
+) -> Optional[Dict[str, Any]]:
+    """Отпустить попытку, которая доказала, что не сойдётся.
+
+    Кандидат физрефреша держит неизменный cutoff, а 1С идёт дальше. Если
+    причина падения не разовая, следующий тик повторяет ту же попытку с тем же
+    мёртвым cutoff — и так до бесконечности: на стенде это трижды кончалось
+    сутками замершей истины, каждый раз по новой причине.
+
+    Сторож ничего не публикует и ничего не удаляет. Он отпускает только
+    сохранённый идентификатор попытки — и только когда за ним не осталось
+    ничего долговечного: тогда следующий тик форкнется с новым cutoff, и гонка
+    с часами начнётся заново, а не продолжится проигранной.
+
+    Если строка кандидата уже создана, отпускать нельзя: её батчи стоят выше
+    границы принятого поколения, и второй кандидат рядом с ней — тот самый
+    неопознанный терминал, который однажды зафенчил контур. Такой случай
+    возвращается как блокировка с точной командой отката: удаление фактов —
+    решение оператора, а не фонового процесса.
+    """
+    key = str(physical_state.get("active_generation_key") or "").strip()
+    if not key:
+        return None
+    candidate = (
+        db.query(models.LedgerGeneration)
+        .filter(
+            models.LedgerGeneration.generation_key == key,
+            models.LedgerGeneration.status == "building",
+        )
+        .one_or_none()
+        if hasattr(db, "query")
+        else None
+    )
+    if candidate is not None:
+        physical_state["stuck_candidate_id"] = int(candidate.id)
+        logger.warning(
+            "physical refresh candidate %s failed %s times with the same error; "
+            "an operator has to roll it back",
+            int(candidate.id),
+            repeats,
+        )
+        return {"stuck_candidate_id": int(candidate.id)}
+
+    physical_state["active_cutoff"] = None
+    physical_state["active_generation_key"] = None
+    physical_state["failure_count"] = 0
+    physical_state["next_retry_at"] = None
+    physical_state["repeat_count"] = 0
+    physical_state["stuck_candidate_id"] = None
+    physical_state["last_release_at"] = now.isoformat()
+    physical_state["last_release_reason"] = (
+        f"{repeats} подряд одинаковых падений попытки {key}: "
+        "cutoff заморожен, следующий форк возьмёт новый"
+    )
+    logger.warning(
+        "released stuck physical refresh identity %s after %s identical failures",
+        key,
+        repeats,
+    )
+    return {"released_refresh_identity": key, "identical_failures": repeats}
 
 
 def _record_physical_block(
@@ -913,6 +997,8 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 physical_state["last_status"] = "ok"
                 physical_state["last_error"] = None
                 physical_state["failure_count"] = 0
+                physical_state["repeat_count"] = 0
+                physical_state["stuck_candidate_id"] = None
                 physical_state["next_retry_at"] = None
                 physical_state["last_attempt_at"] = now.isoformat()
                 physical_state["last_success_at"] = now.isoformat()
@@ -966,14 +1052,31 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                     _PHYSICAL_REFRESH_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
                     _PHYSICAL_REFRESH_RETRY_MAX_SECONDS,
                 )
+                # Дословное совпадение ошибки означает, что повторяется одна и
+                # та же замороженная попытка, а не новая беда.
+                signature = str(exc)[:1000]
+                repeats = (
+                    int(physical_state.get("repeat_count") or 0) + 1
+                    if signature == str(physical_state.get("last_error") or "")
+                    else 1
+                )
+                physical_state["repeat_count"] = repeats
+                if repeats < _STUCK_REFRESH_ATTEMPTS:
+                    physical_state["stuck_candidate_id"] = None
                 physical_state["last_status"] = "error"
-                physical_state["last_error"] = str(exc)[:1000]
+                physical_state["last_error"] = signature
                 physical_state["failure_count"] = failures
                 physical_state["next_retry_at"] = (now + timedelta(seconds=backoff)).isoformat()
                 physical_state["last_attempt_at"] = now.isoformat()
                 physical_state["last_duration_ms"] = int((time.time() - started) * 1000)
                 physical_state["last_cutoff"] = _to_utc(now).isoformat()
                 result = {"status": "error", "job": "physicalRefresh", "error": str(exc)}
+                if repeats >= _STUCK_REFRESH_ATTEMPTS:
+                    released = _release_stuck_refresh_identity(
+                        db, physical_state, now, repeats
+                    )
+                    if released:
+                        result.update(released)
                 if dependency_job_forced_due is not None:
                     result["dependency_job_forced_due"] = (
                         dependency_job_forced_due
@@ -1104,6 +1207,10 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "active_generation_key": _physical_refresh_state(state).get("active_generation_key"),
             "last_duration_ms": _physical_refresh_state(state).get("last_duration_ms"),
             "last_result": _physical_refresh_state(state).get("last_result"),
+            "repeat_count": int(physical_state.get("repeat_count") or 0),
+            "stuck_candidate_id": physical_state.get("stuck_candidate_id"),
+            "last_release_at": physical_state.get("last_release_at"),
+            "last_release_reason": physical_state.get("last_release_reason"),
             "building_inventory_total": int(physical_inventory["total"]),
             "recoverable_building_count": len(physical_inventory["recoverable"]),
             # Unpublishable by construction; an operator rolls them back.

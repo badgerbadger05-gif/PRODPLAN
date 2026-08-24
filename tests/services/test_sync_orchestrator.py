@@ -1075,3 +1075,154 @@ def test_foreign_building_refresh_still_waits_for_an_operator(
     assert snapshot["terminal_conflict"] is True
     assert snapshot["unexpected_building_count"] == 1
     assert snapshot["superseded_building_count"] == 0
+
+
+def _tick_until_attempts(db_session, attempts: list, target: int, start: datetime):
+    """Тикать, пока физический слот не отработает нужное число раз.
+
+    Слот честно чередуется со справочными синками, поэтому попытка приходится
+    не на каждый тик.
+    """
+    moment = start
+    for _ in range(target * 4):
+        if len(attempts) >= target:
+            break
+        orch.tick(db=db_session, now=moment)
+        moment += timedelta(hours=1)
+    assert len(attempts) == target, f"слот отработал {len(attempts)} раз из {target}"
+    return moment
+
+
+def test_identical_failures_release_a_retry_identity_that_left_nothing_behind(
+    tmp_state, db_session, monkeypatch
+):
+    """Попытка с замороженным cutoff не может выиграть гонку у часов 1С.
+
+    Пока сохранён её идентификатор, каждый следующий тик повторяет ровно ту же
+    попытку и получает ровно ту же ошибку — на стенде так набралось 27 падений
+    подряд и трое суток замершей истины. После трёх одинаковых сторож отпускает
+    идентификатор: следующий форк возьмёт новый cutoff. Ничего не публикуется и
+    не удаляется — за отпущенной попыткой не осталось строки кандидата.
+    """
+    _accepted_parent_fixture(db_session)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 3, "error_retryable": 0, "error_exhausted": 0, "ready": 3},
+    )
+    cutoffs: list[datetime] = []
+
+    def _job(db, cutoff, key):
+        cutoffs.append(cutoff)
+        raise RuntimeError("recorder movement exceeds historical cutoff")
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _job)
+
+    moment = _tick_until_attempts(
+        db_session, cutoffs, 3, datetime(2026, 8, 24, 9, 0, tzinfo=timezone.utc)
+    )
+
+    state = orch.status(db_session)["physical_refresh"]
+    assert state["active_generation_key"] is None
+    assert state["repeat_count"] == 0
+    assert state["failure_count"] == 0
+    assert "3 подряд" in state["last_release_reason"]
+    assert state["blocked_code"] is None
+
+    # Следующая попытка идёт с новым cutoff, а не с мёртвым.
+    _tick_until_attempts(db_session, cutoffs, 4, moment)
+    assert len(set(cutoffs)) > 1
+
+
+def test_identical_failures_over_a_live_candidate_ask_an_operator_instead(
+    tmp_state, db_session, monkeypatch
+):
+    """Если строка кандидата уже есть, отпускать нельзя — её батчи выше границы.
+
+    Второй кандидат рядом с ней — тот самый неопознанный терминал, который
+    однажды зафенчил контур. Сторож называет проблему и команду отката, а
+    удаление фактов оставляет оператору.
+    """
+    parent = _accepted_parent_fixture(db_session)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 3, "error_retryable": 0, "error_exhausted": 0, "ready": 3},
+    )
+    attempts: list[datetime] = []
+
+    def _job(db, cutoff, key):
+        attempts.append(cutoff)
+        # Кандидат уже создан и закоммичен, как это делает физический импорт.
+        existing = db.query(models.LedgerGeneration).filter(
+            models.LedgerGeneration.generation_key == key
+        ).first()
+        if existing is None:
+            db.add(models.LedgerGeneration(
+                generation_key=key,
+                status="building",
+                cutoff=cutoff,
+                physical_import_batch_id=parent.physical_import_batch_id,
+                source_watermarks={
+                    "generation_kind": "physical_refresh",
+                    "parent_generation_id": int(parent.id),
+                },
+                capabilities={},
+                algorithm_version="ledger-physical-refresh-generation/1",
+            ))
+            db.commit()
+        raise RuntimeError("custody event fold produced negative transit reservation")
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _job)
+
+    moment = _tick_until_attempts(
+        db_session, attempts, 3, datetime(2026, 8, 24, 9, 0, tzinfo=timezone.utc)
+    )
+
+    state = orch.status(db_session)["physical_refresh"]
+    assert state["stuck_candidate_id"] is not None
+    assert state["active_generation_key"] is not None      # ничего не отпущено
+    assert state["blocked_code"] == "stuck_building_refresh"
+    assert "physical-refresh/discard" in state["blocked_reason"]
+    # Слот зафенчен: бесполезная попытка больше не повторяется каждый час,
+    # а причина и команда отката видны прямо в ответе тика.
+    before = len(attempts)
+    result = orch.tick(db=db_session, now=moment)
+    assert len(attempts) == before
+    assert "physical-refresh/discard" in result["physical_refresh_blocked_reason"]
+
+
+def test_a_different_error_starts_the_count_over(tmp_state, db_session, monkeypatch):
+    """Сторож срабатывает на повторе одной ошибки, а не на череде разных."""
+    _accepted_parent_fixture(db_session)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 3, "error_retryable": 0, "error_exhausted": 0, "ready": 3},
+    )
+    attempts: list[datetime] = []
+    messages = ["1c timeout", "1c timeout", "balance mismatch"]
+
+    def _job(db, cutoff, key):
+        attempts.append(cutoff)
+        raise RuntimeError(messages[min(len(attempts), len(messages)) - 1])
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _job)
+
+    _tick_until_attempts(
+        db_session, attempts, 3, datetime(2026, 8, 24, 9, 0, tzinfo=timezone.utc)
+    )
+
+    state = orch.status(db_session)["physical_refresh"]
+    assert state["repeat_count"] == 1
+    assert state["active_generation_key"] is not None
+    assert state["last_release_at"] is None
