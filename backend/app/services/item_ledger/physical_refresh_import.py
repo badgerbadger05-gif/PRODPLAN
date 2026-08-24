@@ -649,13 +649,20 @@ def run_physical_recorder_audit(
                 )
             except HistoricalPullBeyondCutoffError:
                 identity = (recorder_type, recorder_ref)
-                if identity not in pull_state_drift_set:
-                    raise
-                # The pull journal describes the latest 1C state, which may
-                # have been observed after this candidate's immutable cutoff.
-                # Leave the accepted prefix unchanged and keep the count drift
-                # so the next candidate retries the recorder at a later cutoff.
-                deferred_pull_state_drift.append(identity)
+                # The document was posted after this candidate froze its
+                # cutoff, so at that cutoff it did not exist in this state.  It
+                # belongs to the next generation, whose cutoff is later, and
+                # discovery finds it again there.
+                #
+                # Failing the whole audit instead froze the Ledger for three
+                # days: a candidate holds an immutable cutoff while 1C keeps
+                # posting, so the very next document written during the pull
+                # made every retry fail the same way — 27 attempts, one error.
+                # Deferring is safe in both directions: the accepted prefix
+                # keeps exactly the facts that existed at its cutoff.
+                if identity in pull_state_drift_set:
+                    # Keep the count drift so the retry is not lost.
+                    deferred_pull_state_drift.append(identity)
                 run_rows.append({
                     "recorder_type": recorder_type,
                     "recorder_ref": recorder_ref,

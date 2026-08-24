@@ -1235,3 +1235,59 @@ def test_old_recorder_deletion_creates_tombstone_inside_refresh(db_session):
     assert visible_sles_for_generation(db_session, target.id) == []
     edge = db_session.query(models.StockLedgerFactSupersession).one()
     assert edge.new_sle_id is None
+
+
+def test_incremental_audit_defers_a_document_posted_after_the_cutoff(
+    db_session, monkeypatch
+):
+    """Документ, проведённый после cutoff кандидата, откладывается, а не валит аудит.
+
+    Кандидат держит неизменный cutoff, а 1С продолжает проводить документы:
+    любой, попавший в окно между выбором cutoff и вытягиванием, оказывается
+    «за» ним. Раньше такой документ ронял весь аудит, если он не числился в
+    дрейфе, — на стенде это заморозило Ledger на трое суток и 27 одинаковых
+    попыток подряд. На его cutoff документа в этом состоянии не существовало:
+    он принадлежит следующему поколению, где cutoff позже.
+    """
+    parent, _parent_batch = _accepted_parent(db_session, "late-posted")
+    target = _building_target(db_session, parent, "late-posted")
+    db_session.commit()
+
+    # Документ найден откатом назад по своей старой записи в регистре, но его
+    # текущее состояние в 1С уже за cutoff кандидата: его перепровели.
+    register_rows = [
+        _register_row(
+            "Document_СборкаЗапасов",
+            "late-doc",
+            (parent.cutoff - timedelta(days=1)).replace(tzinfo=None).isoformat(),
+        )
+    ]
+
+    def _pull(*args, **kwargs):
+        raise HistoricalPullBeyondCutoffError(
+            "recorder movement 2026-07-24T12:00:31 exceeds historical cutoff "
+            "2026-07-24T12:00:00+00:00 in Document_СборкаЗапасов late-doc"
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=_RegisterClient(register_rows),
+        discovery_lookback=timedelta(days=7),
+        audit_all_known_recorders=False,
+    )
+
+    checkpoint = db_session.get(models.LedgerBuildBatch, result.checkpoint_id)
+    deferred = [
+        row for row in checkpoint.metrics["audit_rows"]
+        if row["status"] == "deferred_beyond_cutoff"
+    ]
+    assert [row["recorder_ref"] for row in deferred] == ["late-doc"]
+    # Дрейфа у него не было — и выдумывать его не надо.
+    assert checkpoint.metrics["deferred_pull_state_drift"] == []
