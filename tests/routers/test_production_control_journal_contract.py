@@ -73,7 +73,15 @@ def test_orders_journal_exposes_strict_typed_canonical_envelope():
     assert close_payload["type"] == "object"
     assert "dry_run" in close_payload["properties"]
     assert "close_datetime" not in close_payload["properties"]
-    assert "/api/v1/production-control/orders/{product_id}/quantity" not in paths
+    # Правка количества к запуску разрешена, но только как явное действие
+    # оператора над ещё не открытым в 1С заказом: контракт обязан нести строгий
+    # payload, а не принимать произвольное тело.
+    quantity_payload = paths["/api/v1/production-control/orders/{product_id}/quantity"]["patch"]["requestBody"]["content"]["application/json"]["schema"]
+    if "$ref" in quantity_payload:
+        quantity_payload = schema["components"]["schemas"][quantity_payload["$ref"].split("/")[-1]]
+    assert quantity_payload["type"] == "object"
+    assert "quantity" in quantity_payload["properties"]
+    assert quantity_payload["properties"]["quantity"]["exclusiveMinimum"] == 0
     assert "/api/v1/production-control/orders/dedupe-mrp" not in paths
     assert "/api/v1/production-control/orders/{product_id}/materials/refresh" not in paths
 

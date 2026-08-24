@@ -30,8 +30,19 @@ def _read_owner_document(name: str) -> str:
     return _read(path)
 
 
+# Рабочий каталог держит внутри репозитория посторонние чекауты: worktree фоновых
+# задач и распакованные копии для деплоя. Это не исходники проекта, и канон по
+# ним не проверяется — иначе сторож ловит копию самого себя.
+_SCRATCH_DIRS = {".tmp", ".claude", ".git", "node_modules", "__pycache__", ".venv"}
+
+
 def _python_sources(root: Path):
-    return sorted(path for path in root.rglob("*.py") if path.is_file())
+    return sorted(
+        path
+        for path in root.rglob("*.py")
+        if path.is_file()
+        and not _SCRATCH_DIRS.intersection(path.relative_to(root).parts)
+    )
 
 
 def _enclosing_call_sites(
@@ -330,7 +341,6 @@ def test_local_production_flow_endpoints_are_canonical() -> None:
     )
 
     forbidden_mutation_routes = (
-        '/orders/{product_id}/quantity',
         '/orders/dedupe-mrp',
         'update_product_quantity',
         'dedupe_mrp_production_orders',
@@ -341,6 +351,31 @@ def test_local_production_flow_endpoints_are_canonical() -> None:
     assert not returned, (
         f"non-canonical quantity mutation returned to production router: {returned}"
     )
+
+    # Правка количества к запуску запрещена не как таковая, а как бесконтрольная.
+    # Выведенный `update_product_quantity` переписывал количество любой строки в
+    # любой момент — включая уже открытую в 1С и уже выпущенную. Сторож поэтому
+    # проверяет не имя маршрута, а то, что у правки есть все ограничения: пока
+    # заказ не стал фактом снаружи и не выше незакрытой потребности.
+    journal_service = _read(REPO / "backend/app/services/production_control_journal.py")
+    if '/orders/{product_id}/quantity' in production_router:
+        assert 'def update_local_order_quantity(' in journal_service, (
+            "маршрут правки количества есть, а канонической службы под ним нет"
+        )
+        required_guards = (
+            '_production_order_has_1c_link(db, order)',
+            'accepted_product_output(product)',
+            'PaintWeldChainLink',
+            '_material_issue_has_1c_link(db, issue)',
+            'launch_allowance_for_product(',
+            'require_accepted_truth(',
+        )
+        unguarded = [
+            token for token in required_guards if token not in journal_service
+        ]
+        assert not unguarded, (
+            f"правка количества к запуску вернулась без ограничений: {unguarded}"
+        )
 
     # Frontend may be in transition across releases; enforce canonical backend
     # contract at minimum.

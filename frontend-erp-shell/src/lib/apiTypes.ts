@@ -2018,6 +2018,30 @@ export interface paths {
         patch: operations["patch_order_line_state_api_v1_production_control_orders__product_id__state_patch"];
         trace?: never;
     };
+    "/api/v1/production-control/orders/{product_id}/quantity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Patch Order Line Quantity
+         * @description Изменить количество к запуску у локального заказа, ещё не открытого в 1С.
+         *
+         *     Пересчитывает потребность компонентов: уже созданные локальные заявки на
+         *     перемещение приводятся к новому количеству, выгруженные в 1С — возвращаются
+         *     как заблокированные, их правит отдельная корректировка.
+         */
+        patch: operations["patch_order_line_quantity_api_v1_production_control_orders__product_id__quantity_patch"];
+        trace?: never;
+    };
     "/api/v1/production-control/orders/{product_id}": {
         parameters: {
             query?: never;
@@ -3112,6 +3136,40 @@ export interface paths {
         head?: never;
         /** Patch Planning Resource */
         patch: operations["patch_planning_resource_api_v1_planning_rates_resources__resource_id__patch"];
+        trace?: never;
+    };
+    "/api/v1/release-feasibility/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search Items */
+        get: operations["search_items_api_v1_release_feasibility_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/release-feasibility/analyze": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Analyze */
+        get: operations["analyze_api_v1_release_feasibility_analyze_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/": {
@@ -4498,6 +4556,13 @@ export interface components {
         OpenPaintWeldChainsPayload: {
             /** Product Ids */
             product_ids: number[];
+            /** Initiated By */
+            initiated_by?: string | null;
+        };
+        /** OrderLineQuantityPayload */
+        OrderLineQuantityPayload: {
+            /** Quantity */
+            quantity: number;
             /** Initiated By */
             initiated_by?: string | null;
         };
@@ -9722,6 +9787,43 @@ export interface operations {
             };
         };
     };
+    patch_order_line_quantity_api_v1_production_control_orders__product_id__quantity_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OrderLineQuantityPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     delete_local_order_api_v1_production_control_orders__product_id__delete: {
         parameters: {
             query?: never;
@@ -11871,6 +11973,83 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProductionResourceRow"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_items_api_v1_release_feasibility_search_get: {
+        parameters: {
+            query?: {
+                /** @description Артикул, код, название или GUID изделия */
+                q?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    analyze_api_v1_release_feasibility_analyze_get: {
+        parameters: {
+            query: {
+                /** @description ID изделия (приоритетнее артикула) */
+                item_id?: number | null;
+                /** @description Артикул изделия */
+                article?: string | null;
+                /** @description Количество к выпуску */
+                qty: number;
+                /** @description Максимальная глубина разворота */
+                max_depth?: number;
+                /** @description Вернуть полный BOM (по кнопке «Развернуть») */
+                include_tree?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */
