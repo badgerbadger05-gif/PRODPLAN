@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Mapping, MutableMapping, Sequence
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app import models
 
@@ -106,6 +106,13 @@ def overlay_launch_facts(
         requirement_id = row.get("source_mrp_requirement_id")
         if requirement_id is None:
             continue
+        # Строка, у которой уже зачтены живые заказы, — это ОСТАТОК к запуску, а
+        # не предложение, факт запуска которого потерялся. Накладывать на неё
+        # личность созданного заказа нельзя: оператор запустил часть
+        # потребности, а остаток показывался с номером и пометкой «Открыт в 1С»
+        # того заказа, будто в 1С ушло именно это количество.
+        if _to_float(row.get("materialized_order_qty")) > 1e-9:
+            continue
         pending.setdefault(int(requirement_id), row)
     if not pending:
         return
@@ -184,6 +191,46 @@ def overlay_execution_state(
         row["route_sheet_printed_at"] = _datetime_iso(
             state.route_sheet_printed_at
         )
+
+    # Количество исполнительного заказа — команда оператора, и канон относит
+    # состояние исполнительных заказов к подвижному («Неподвижное и подвижное»).
+    # Оператор правит его у ещё не выгруженного заказа, и ждать следующего
+    # поколения незачем: заказ расчётный, число ничего не удостоверяет кроме
+    # самого себя.
+    #
+    # А вот принятый выпуск отсюда НЕ берётся: produced_qty принадлежит Ledger,
+    # остаётся снимочным, и остаток считается от него. Иначе публичное чтение
+    # поколения перестаёт быть байтово стабильным — ровно это и ломалось, когда
+    # накладка тянула из живой строки всё подряд.
+    products = (
+        db.query(models.ProductionProduct)
+        .options(joinedload(models.ProductionProduct.order))
+        .filter(models.ProductionProduct.product_id.in_(sorted(by_product_id)))
+        .all()
+    )
+    for product in products:
+        row = by_product_id.get(int(product.product_id))
+        if row is None:
+            continue
+        # Строка-предложение с наложенным фактом запуска количество документа не
+        # перенимает: её «количество» — остаток к запуску по расчёту.
+        if row.get("work_item_id") is None:
+            planned_qty = max(_to_float(product.quantity), 0.0)
+            produced_qty = _to_float(row.get("produced_qty"))
+            row["quantity"] = planned_qty
+            row["remaining_qty"] = max(planned_qty - produced_qty, 0.0)
+        order = getattr(product, "order", None)
+        locked = (
+            bool(order is not None and order.order_ref1c)
+            or _to_float(row.get("produced_qty")) > 1e-9
+            or str(row.get("issue_status") or "") in {"exported", "posted"}
+        )
+        if locked and "edit_quantity" in (row.get("available_actions") or []):
+            row["available_actions"] = [
+                action
+                for action in row["available_actions"]
+                if action != "edit_quantity"
+            ]
 
 
 def route_sheets_after_cutoff(

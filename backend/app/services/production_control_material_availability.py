@@ -523,6 +523,14 @@ def preview_materials(
             accepted_product_output(product).remaining_qty,
             field="production_output.remaining_qty",
         ),
+        # Количество, скомандованное оператором по этой строке. Оно подвижно —
+        # заказ исполнительный, — и по нему видно, что комплектацию посчитали на
+        # прежнее количество и её пора пересобрать. `qty` для этого не годится:
+        # он уже уменьшен на принятый выпуск и меняется вместе с Ledger.
+        "line_quantity": _to_float_strict(
+            accepted_product_output(product).planned_qty,
+            field="production_output.planned_qty",
+        ),
         "spec_id": spec_id,
         "components": components,
         "coverage": order_coverage,
@@ -720,6 +728,27 @@ def preview_make_work_items_coverage(
     return result
 
 
+def _snapshot_matches_line_command(
+    db: Session,
+    product_id: int,
+    material: Dict[str, Any],
+) -> bool:
+    """Комплектацию считали на то же количество, что скомандовано сейчас?
+
+    Сравнивается только количество заказа — команда оператора. Принятый выпуск
+    сюда не входит: он принадлежит Ledger, меняется своим чередом, и
+    пересобирать снимок из-за него нельзя.
+    """
+    stored = material.get("line_quantity")
+    if stored is None:
+        # Снимок прежнего формата: сравнивать не с чем, отдаём как есть.
+        return True
+    product = db.get(ProductionProduct, int(product_id))
+    if product is None:
+        return True
+    return abs(_to_float(product.quantity) - _to_float(stored)) <= 1e-6
+
+
 def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
     """Read coverage only from the accepted production-journal snapshot."""
     from .. import models
@@ -750,7 +779,21 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         )
     material = row.payload.get("material_coverage_snapshot") if row and isinstance(row.payload, dict) else None
     if isinstance(material, dict) and int(material.get("ledger_generation_id") or -1) == generation_id:
-        public = dict(material)
+        # Оператор мог изменить количество исполнительного заказа после cutoff.
+        # Комплектация снимка посчитана на прежнее количество: отдать её значило
+        # бы показать компоненты не на то, что запускается. Пересобираем тем же
+        # генерационно-закреплённым сборщиком, что и публикация снимка, — второй
+        # формулы потребности компонентов не появляется.
+        if _snapshot_matches_line_command(db, int(product_id), material):
+            public = dict(material)
+            public["truth_status"] = str(snapshot.truth_status)
+            public["cutoff"] = snapshot.cutoff.isoformat()
+            return public
+        public = preview_materials(
+            db,
+            int(product_id),
+            ledger_generation_id=generation_id,
+        )
         public["truth_status"] = str(snapshot.truth_status)
         public["cutoff"] = snapshot.cutoff.isoformat()
         return public
