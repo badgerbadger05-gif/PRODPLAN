@@ -49,6 +49,9 @@ def _mk_manufacture(
     qty: float = 5.0,
     exported_ref1c: str | None = "manuf-basis-ref",
     status: str = "exported",
+    executor_ref1c: str = "employee-ivanov-ref",
+    executor_type: str = "employee",
+    executor_code: str | None = None,
 ) -> ProductionManufacture:
     order = ProductionOrder(
         order_number=f"PO-{item.item_id}",
@@ -74,6 +77,17 @@ def _mk_manufacture(
         status="produced",
         issue_status="not_requested",
     ))
+    # Исполнитель наряда обязан резолвиться в сотрудника: 1С не проводит наряд,
+    # у которого в строке регистра «Сдельные наряды» пустой исполнитель.
+    if db.query(Employee).filter(Employee.employee_name == "Иванов").one_or_none() is None:
+        db.add(Employee(
+            employee_ref1c=executor_ref1c,
+            employee_name="Иванов",
+            employee_type=executor_type,
+            employee_code=executor_code,
+            deletion_mark=False,
+        ))
+        db.flush()
     manufacture = ProductionManufacture(
         product_id=product.product_id,
         order_id=order.order_id,
@@ -372,15 +386,14 @@ def test_live_export_fills_piecework_rate_from_1c_price_register(db_session, mon
 def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PW-BRIGADE", ref1c="item-ref-brigade")
-    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-brigade")
-    db.add(
-        Employee(
-            employee_ref1c="brigade-ref",
-            employee_type="brigade",
-            employee_code="000000022",
-            employee_name="Иванов",
-            deletion_mark=False,
-        )
+    m = _mk_manufacture(
+        db,
+        item,
+        qty=4.0,
+        exported_ref1c="basis-ref-brigade",
+        executor_ref1c="brigade-ref",
+        executor_type="brigade",
+        executor_code="000000022",
     )
     db.commit()
 
@@ -425,15 +438,12 @@ def test_optional_org_and_unit_in_payload(db_session):
 def test_single_executor_is_written_to_operation_rows(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PW-HEADER-EXEC", ref1c="item-ref-header-exec")
-    m = _mk_manufacture(db, item, exported_ref1c="ref-header-exec")
-    db.add(
-        Employee(
-            employee_ref1c="employee-ref",
-            employee_type="employee",
-            employee_code="000000023",
-            employee_name="Иванов",
-            deletion_mark=False,
-        )
+    m = _mk_manufacture(
+        db,
+        item,
+        exported_ref1c="ref-header-exec",
+        executor_ref1c="employee-ref",
+        executor_code="000000023",
     )
     db.commit()
 

@@ -1405,6 +1405,15 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
     product = _mk_product(db, item, qty=7)
     _attach_current_mrp_lineage(db, product)
 
+    # Исполнитель обязан резолвиться в сотрудника: 1С не проводит сдельный
+    # наряд с пустой строкой регистра «Сдельные наряды».
+    db.add(Employee(
+        employee_ref1c="employee-e2e-ref",
+        employee_name="operator",
+        employee_type="employee",
+        deletion_mark=False,
+    ))
+    db.flush()
     command = produce_line(db, product.product_id, qty=7, executor="operator")
     manufacture_id = int(command["manufacture_id"])
     db.refresh(product)

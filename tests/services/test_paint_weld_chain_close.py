@@ -11,6 +11,7 @@ from datetime import datetime
 
 import pytest
 
+from app import models
 from app.models import (
     DefaultSpecification,
     Item,
@@ -168,10 +169,21 @@ def _mk_side(db, *, code: str, op_ref: str, op_name: str, qty: float, sborka_ref
             product_id=product.product_id, status="produced", issue_status="not_requested"
         )
     )
+    # Исполнитель обязателен: 1С не проводит сдельный наряд с пустой строкой
+    # регистра «Сдельные наряды».
+    if db.query(models.Employee).filter(models.Employee.employee_name == "Иванов").one_or_none() is None:
+        db.add(models.Employee(
+            employee_ref1c="employee-chain-ref",
+            employee_name="Иванов",
+            employee_type="employee",
+            deletion_mark=False,
+        ))
+        db.flush()
     manufacture = ProductionManufacture(
         product_id=product.product_id,
         order_id=order.order_id,
         qty=qty,
+        executor="Иванов",
         status="exported",
         exported_ref1c=sborka_ref,
     )

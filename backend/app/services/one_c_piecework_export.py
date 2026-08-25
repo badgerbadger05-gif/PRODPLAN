@@ -452,7 +452,10 @@ def _collect_export_entries(
                     employee_type=str(getattr(employee_row, "employee_type", None) or "employee") if employee_row else "employee",
                 ))
             operation_lines = enriched_lines
-            employee_ref = None
+            # Исполнитель наряда НЕ обнуляется: оператор мог назначить его не на
+            # каждую операцию, и незакрытые строки должны взять его как запасной.
+            # Обнуление здесь оставляло строку регистра «Сдельные наряды» пустой,
+            # и 1С отказывалась проводить уже созданный документ.
         elif employee_ref and operation_lines:
             operation_lines = [
                 PieceworkOperationLine(
@@ -594,6 +597,34 @@ def _build_header_payload(
             f"manufacture_id={entry.manufacture_id}: не найдена операция спецификации для сдельного наряда"
         )
     has_row_executor = any(_clean_ref1c(line.employee_ref1c) for line in operation_lines)
+    fallback_executor = _clean_ref1c(entry.employee_ref1c)
+    if has_row_executor and fallback_executor:
+        for row in operation_rows:
+            if not _clean_ref1c(row.get("Исполнитель")):
+                row["Исполнитель"] = fallback_executor
+                row["Исполнитель_Type"] = header_executor_type
+
+    # 1С не проводит наряд, у которого хоть в одной строке регистра «Сдельные
+    # наряды» пустой исполнитель, и отвечает на Post пятисоткой. Раньше документ
+    # к этому моменту был уже создан: в 1С оставался непроведённый сирота, а
+    # оператор видел сырой HTTP 500 с закодированным URL. Проверяем до записи.
+    if has_row_executor:
+        missing_rows = [
+            int(row.get("LineNumber") or 0)
+            for row in operation_rows
+            if not _clean_ref1c(row.get("Исполнитель"))
+        ]
+        if missing_rows:
+            raise ValueError(
+                f"manufacture_id={entry.manufacture_id}: не указан исполнитель по "
+                f"операциям {', '.join(str(number) for number in missing_rows)}; "
+                "1С не проведёт сдельный наряд с пустой строкой исполнителя"
+            )
+    elif not fallback_executor:
+        raise ValueError(
+            f"manufacture_id={entry.manufacture_id}: не указан исполнитель; "
+            "1С не проведёт сдельный наряд с пустым исполнителем"
+        )
 
     payload: Dict[str, Any] = {
         "Number": entry.number,
