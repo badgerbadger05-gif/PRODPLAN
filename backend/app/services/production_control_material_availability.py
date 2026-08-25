@@ -798,17 +798,23 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         public["cutoff"] = snapshot.cutoff.isoformat()
         return public
 
-    # An executor created after the accepted cutoff cannot be a member of the
-    # immutable journal snapshot.  It is nevertheless owned by that exact
-    # generation and must be launchable immediately.  Reuse the same
-    # generation-pinned builder as snapshot publication; do not read newer
-    # stock or current specifications.
+    # Заказ, созданный после cutoff принятого снимка, попасть в него не мог.
+    # Комплектация всё равно считается — тем же генерационно-закреплённым
+    # сборщиком, что и публикация снимка: ни более свежий склад, ни текущие
+    # спецификации не читаются.
+    #
+    # Поколение строки заказа здесь НЕ сверяется с принятым. Раньше сверялось, и
+    # заказ, выписанный за минуты до смены поколения, проваливался между двумя
+    # путями: в снимок он не попал, потому что создан после cutoff, а живой путь
+    # его отвергал, потому что клеймо поколения уже устарело. Оператор получал
+    # material_coverage_snapshot_unavailable и не видел комплектующих, пока не
+    # опубликуется следующее поколение. Клеймо — это то, при каком поколении
+    # заказ выписан, а не разрешение считать по нему покрытие.
     live_product = (
         db.query(ProductionProduct)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .filter(
             ProductionProduct.product_id == int(product_id),
-            ProductionProduct.ledger_generation_id == generation_id,
             ProductionOrder.deletion_mark.is_(False),
             ProductionOrder.created_at > snapshot.cutoff,
         )

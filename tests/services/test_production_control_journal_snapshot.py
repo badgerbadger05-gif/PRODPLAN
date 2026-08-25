@@ -1033,6 +1033,40 @@ def test_materials_are_available_for_order_opened_after_cutoff(db_session):
     assert len(materials["components"]) == 1
 
 
+def test_materials_survive_a_generation_flip_right_after_launch(db_session):
+    """Заказ, выписанный за минуты до смены поколения, не должен пропадать.
+
+    В снимок он не попал — создан после cutoff. Клеймо поколения на строке при
+    этом осталось прежним: это отметка о том, при каком поколении заказ выписан,
+    а не разрешение считать по нему покрытие. Раньше живой путь сверял клеймо с
+    принятым поколением, заказ проваливался между двумя путями, и оператор
+    получал material_coverage_snapshot_unavailable вместо комплектующих.
+    """
+    generation = _building_generation(db_session, "production-journal-gen-flip")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+    _order, product = _launch_after_cutoff(
+        db_session,
+        generation,
+        work,
+        created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=13),
+    )
+    # Поколение сменилось уже после того, как заказ был выписан.
+    product.ledger_generation_id = int(generation.id) - 1
+    db_session.commit()
+
+    materials = get_materials_snapshot(db_session, product.product_id)
+
+    assert materials["product_id"] == product.product_id
+    assert materials["ledger_generation_id"] == generation.id
+    assert len(materials["components"]) == 1
+
+
 def test_route_sheet_prints_for_order_opened_after_cutoff(db_session):
     """Маршрутный лист — документ по физическому заказу, а не плановая
     гипотеза: он обязан печататься сразу после запуска."""
