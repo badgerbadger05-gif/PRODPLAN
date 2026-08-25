@@ -602,6 +602,150 @@ def test_journal_rows_carry_chain_info(db_session):
     )
 
 
+def test_close_chain_routes_each_side_executors_to_its_own_produce(db_session, monkeypatch):
+    """Исполнители цепочки приходят построчно и раздаются по своей стороне.
+
+    Комбинированный наряд несёт строки сварки И окраски, поэтому окно журнала
+    выбирает исполнителей обеим сторонам, а закрытие раздаёт их каждой стороне
+    отдельно; исполнитель шапки остаётся общим запасным.
+    """
+    ctx = _setup_chain(db_session)
+    for side in ("weld", "paint"):
+        ctx[side]["product"].produced_qty = 0
+        ctx[side]["product"].remaining_qty = ctx[side]["product"].quantity
+    db_session.commit()
+
+    def _side_executor_rows(side: str):
+        spec = (
+            db_session.query(Specification)
+            .filter(Specification.spec_name == f"Спека {'WELD' if side == 'weld' else 'PAINT'}")
+            .one()
+        )
+        spec_operation = (
+            db_session.query(SpecOperation)
+            .filter(SpecOperation.spec_id == spec.spec_id)
+            .order_by(SpecOperation.spec_operation_id.asc())
+            .first()
+        )
+        return [
+            {
+                "spec_operation_id": int(spec_operation.spec_operation_id),
+                "operation_id": int(spec_operation.operation_id),
+                "line_number": 1,
+                "employee_ref1c": "employee-chain-ref",
+            }
+        ]
+
+    weld_rows = _side_executor_rows("weld")
+    paint_rows = _side_executor_rows("paint")
+
+    captured: dict = {}
+    from app.services import production_control_production_flow as flow
+
+    def _fake_produce(db, product_id, **kwargs):
+        captured[int(product_id)] = kwargs
+        manufacture = (
+            db.query(ProductionManufacture)
+            .filter(ProductionManufacture.product_id == int(product_id))
+            .one()
+        )
+        return {"manufacture_id": int(manufacture.manufacture_id), "resumed": True}
+
+    monkeypatch.setattr(flow, "produce_line", _fake_produce)
+    fake = _FakeClient(ref_key="pw-executors-ref")
+    _stub_live(monkeypatch, fake)
+    _stub_manufactures_export(monkeypatch, failing_ids=set())
+
+    result = close_paint_chain(
+        db_session,
+        product_id=ctx["paint"]["product"].product_id,
+        executor="Иванов",
+        weld_operation_executors=weld_rows,
+        paint_operation_executors=paint_rows,
+        dry_run=False,
+    )
+
+    assert result["status"] == "ok"
+    weld_product_id = int(ctx["weld"]["product"].product_id)
+    paint_product_id = int(ctx["paint"]["product"].product_id)
+    assert captured[weld_product_id]["operation_executors"] == weld_rows
+    assert captured[paint_product_id]["operation_executors"] == paint_rows
+    # исполнитель шапки — общий запасной для строк без своего исполнителя
+    assert captured[weld_product_id]["executor"] == "Иванов"
+    assert captured[paint_product_id]["executor"] == "Иванов"
+    # сварная деталь выпускается только внутри цепочки
+    assert captured[weld_product_id]["allow_paint_weld_chain"] is True
+    assert not captured[paint_product_id].get("allow_paint_weld_chain")
+
+
+def test_combined_piecework_refuses_row_without_executor_before_writing_to_1c(
+    db_session, monkeypatch
+):
+    """Пустой исполнитель в строке — отказ ДО записи, а не 500 из 1С.
+
+    1С не проводит `Document_СдельныйНаряд`, если хоть в одной строке регистра
+    «Сдельные наряды» пуст Исполнитель. Раньше документ к этому моменту был уже
+    создан. Правило одно для обоих путей: без исполнителя в 1С не уходит ничего.
+    """
+    ctx = _setup_chain(db_session)
+    paint_spec = (
+        db_session.query(Specification).filter(Specification.spec_name == "Спека PAINT").one()
+    )
+    second_operation = Operation(
+        operation_ref1c="op-paint-2", operation_name="Сушка", time_norm=0.2, operation_price=5
+    )
+    db_session.add(second_operation)
+    db_session.flush()
+    db_session.add(
+        SpecOperation(
+            spec_id=paint_spec.spec_id, operation_id=second_operation.operation_id, time_norm=0.2
+        )
+    )
+    first_spec_operation = (
+        db_session.query(SpecOperation)
+        .filter(SpecOperation.spec_id == paint_spec.spec_id)
+        .order_by(SpecOperation.spec_operation_id.asc())
+        .first()
+    )
+    # Исполнитель назначен только на первую операцию окраски, шапка пуста.
+    paint_manufacture = ctx["paint"]["m"]
+    paint_manufacture.executor = None
+    db_session.add(
+        models.ProductionManufactureOperation(
+            manufacture_id=paint_manufacture.manufacture_id,
+            spec_operation_id=int(first_spec_operation.spec_operation_id),
+            operation_id=int(first_spec_operation.operation_id),
+            line_number=1,
+            employee_ref1c="employee-chain-ref",
+            employee_name="Иванов",
+            employee_type="employee",
+        )
+    )
+    db_session.commit()
+
+    fake = _FakeClient(ref_key="pw-no-executor-ref")
+    _stub_live(monkeypatch, fake)
+
+    result = exporter.export_chain_piecework_to_1c(
+        db_session,
+        weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
+        paint_manufacture_id=ctx["paint"]["m"].manufacture_id,
+        dry_run=False,
+    )
+
+    assert result["status"] == "error"
+    assert "не указан исполнитель по операциям 2" in result["error"]
+    # в 1С не ушло ничего: ни документа, ни проведения
+    assert fake.posts == []
+    assert fake.operations == []
+    assert (
+        db_session.query(SyncLink)
+        .filter(SyncLink.source_doctype == "piecework", SyncLink.status == "success")
+        .count()
+        == 0
+    )
+
+
 def test_close_chain_without_link_raises(db_session):
     ctx = _setup_chain(db_session)
     solo_item = Item(

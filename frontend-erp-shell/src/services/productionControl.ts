@@ -5,6 +5,7 @@ import type {
   MaterialIssueCreateResponse,
   MaterialIssueCreatePayload,
   MaterialsResponse,
+  PaintWeldChainClosePayload,
   ProductionOperationsResponse,
   ProduceLinePayload,
   ProduceLineResult,
@@ -215,14 +216,17 @@ export type ClosePaintWeldChainResult = {
   welded?: Record<string, unknown>
 }
 
-export function closePaintWeldChain(productId: number) {
+// Исполнители обеих сторон цепочки выбираются оператором до записи в 1С:
+// 1С не проводит сдельный наряд с пустой строкой регистра «Сдельные наряды»,
+// а комбинированный наряд цепочки несёт строки сварки и окраски сразу.
+export function closePaintWeldChain(productId: number, payload: PaintWeldChainClosePayload = {}) {
   return api<ClosePaintWeldChainResult>('/v1/paint-weld/chain/close', {
     method: 'POST',
     body: JSON.stringify({
       product_id: productId,
       dry_run: false,
-      executor: 'erp-shell',
       initiated_by: 'erp-shell',
+      ...payload,
     }),
   })
 }

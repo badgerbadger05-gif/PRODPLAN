@@ -876,7 +876,11 @@ describe('ProductionControlPage — characterization', () => {
     expect(within(tableRow).getByRole('checkbox')).not.toBeChecked()
   })
 
-  it('closes a paint-weld pair through the combined chain action', async () => {
+  it('asks for an executor on every operation of both chain sides before closing the chain', async () => {
+    // Комбинированный сдельный наряд цепочки несёт строки сварки И окраски.
+    // 1С не проводит наряд с пустой строкой регистра «Сдельные наряды», значит
+    // правило то же, что и у обычной строки: пока хоть одна операция любой из
+    // сторон без исполнителя — в 1С не уходит ничего.
     const [painted] = fakeRows()
     const paint = {
       ...painted,
@@ -892,6 +896,24 @@ describe('ProductionControlPage — characterization', () => {
       rows: [paint], total: 1, limit: 100, offset: 0, latest_run_id: 77,
       truth_meta: fakeTruthMeta,
     })
+    vi.mocked(listProductionOperations).mockImplementation((async (productId: number) => (
+      productId === 101
+        ? {
+          rows: [{
+            line_number: 1, spec_id: 5, spec_operation_id: 51, operation_id: 61,
+            operation_ref1c: 'op-paint', operation_name: 'Покраска', stage_name: 'Окраска', time_norm: 1,
+          }],
+          total: 1,
+        }
+        : {
+          rows: [{
+            line_number: 1, spec_id: 6, spec_operation_id: 71, operation_id: 81,
+            operation_ref1c: 'op-weld', operation_name: 'Сварка каркаса', stage_name: 'Сварка', time_norm: 2,
+          }],
+          total: 1,
+        }
+    )) as never)
+
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Сварная деталь: Кронштейн после сварки')
@@ -899,7 +921,35 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(within(rowFor('Кронштейн после окраски')).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: 'Произвести' }))
 
-    await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101))
+    const dialog = await screen.findByRole('dialog')
+    // Операции запрошены по обеим сторонам цепочки.
+    await waitFor(() => expect(listProductionOperations).toHaveBeenCalledWith(101))
+    expect(listProductionOperations).toHaveBeenCalledWith(102)
+    expect(dialog.textContent).toContain('Сварка — Кронштейн после сварки')
+    expect(dialog.textContent).toContain('Окраска — Кронштейн после окраски')
+
+    const submit = within(dialog).getByRole('button', { name: 'Создать в 1С' })
+    await waitFor(() => expect(submit).toBeDisabled())
+    expect(closePaintWeldChain).not.toHaveBeenCalled()
+
+    // Первый блок — сварка (цепочка идёт сварка → окраска), второй — окраска.
+    const selects = within(dialog).getAllByRole('combobox')
+    expect(selects).toHaveLength(2)
+    await user.selectOptions(selects[0], 'E1')
+    expect(submit).toBeDisabled()
+    expect(closePaintWeldChain).not.toHaveBeenCalled()
+    await user.selectOptions(selects[1], 'E1')
+    expect(submit).toBeEnabled()
+
+    await user.click(submit)
+    await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101, {
+      weld_operation_executors: [
+        { spec_operation_id: 71, operation_id: 81, line_number: 1, employee_ref1c: 'E1' },
+      ],
+      paint_operation_executors: [
+        { spec_operation_id: 51, operation_id: 61, line_number: 1, employee_ref1c: 'E1' },
+      ],
+    }))
     expect(produceOrderLine).not.toHaveBeenCalled()
   })
 

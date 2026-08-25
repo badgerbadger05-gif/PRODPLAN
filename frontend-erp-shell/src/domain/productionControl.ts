@@ -180,17 +180,29 @@ export type MaterialIssueCreatePayload = {
   source_warehouse_ref1c?: string | null
 }
 
+// Исполнитель одной операции спецификации. Бэкенд ищет его по ссылке
+// (employee_ref1c), исполнителя шапки — по имени сотрудника.
+export type OperationExecutorSelection = {
+  line_number?: number
+  spec_operation_id?: number
+  operation_id?: number
+  employee_ref1c?: string
+  employee_name?: string
+}
+
 export type ProduceLinePayload = {
   qty?: number
   executor?: string | null
-  operation_executors?: Array<{
-    line_number?: number
-    spec_operation_id?: number
-    operation_id?: number
-    employee_ref1c?: string
-    employee_name?: string
-  }>
+  operation_executors?: OperationExecutorSelection[]
   comment?: string | null
+}
+
+// Закрытие цепочки «сварка → окраска»: исполнители обеих сторон уходят одним
+// действием, тем же правилом, что и у обычной строки.
+export type PaintWeldChainClosePayload = {
+  executor?: string | null
+  weld_operation_executors?: OperationExecutorSelection[]
+  paint_operation_executors?: OperationExecutorSelection[]
 }
 
 export type ProduceLineResult = {

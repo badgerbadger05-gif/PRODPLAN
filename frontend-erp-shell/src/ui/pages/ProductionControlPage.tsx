@@ -55,7 +55,7 @@ import { ProductionOrdersTable } from './production-control/ProductionOrdersTabl
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
 import { ProductionViewBar } from './production-control/ProductionViewBar'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
-import { ProduceDialog } from './production-control/ProduceDialog'
+import { ProduceDialog, type ProduceChainSide } from './production-control/ProduceDialog'
 import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
 import { firstExportProblem, issueIdsFromCreateResult, limit } from './production-control/helpers'
 import {
@@ -115,6 +115,9 @@ export function ProductionControlPage() {
   const [produceOperationsLoading, setProduceOperationsLoading] = useState(false)
   const [produceOperationEmployees, setProduceOperationEmployees] = useState<Record<number, string>>({})
   const [produceEmployeeRef, setProduceEmployeeRef] = useState('')
+  // Цепочка «сварка → окраска» закрывается одним комбинированным нарядом,
+  // поэтому исполнителей выбирают сразу на обе стороны в том же диалоге.
+  const [produceChainSides, setProduceChainSides] = useState<ProduceChainSide[] | null>(null)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [warehouses, setWarehouses] = useState<ControlWarehouse[]>([])
   const [workshopRows, setWorkshopRows] = useState<WorkshopWarehouse[]>([])
@@ -554,21 +557,51 @@ export function ProductionControlPage() {
     if (!productId) return
     const row = rows.find((item) => item.product_id === productId)
     if (!row) return
+    const chain = row.paint_weld_chain
+    const counterpartProductId = chain?.counterpart_product_id ?? null
     setProduceError('')
     setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
     setProduceOperationEmployees({})
     setProduceEmployeeRef('')
     setProduceOperations([])
+    setProduceChainSides(null)
     setProduceOpen(true)
     setEmployeesLoading(true)
     setProduceOperationsLoading(true)
     try {
-      const [employeeList, operationList] = await Promise.all([
+      const [employeeList, operationList, counterpartOperations] = await Promise.all([
         listProductionEmployees(),
         listProductionOperations(productId),
+        counterpartProductId ? listProductionOperations(counterpartProductId) : Promise.resolve(null),
       ])
       setEmployees(employeeList.rows ?? [])
-      setProduceOperations(operationList.rows ?? [])
+      const ownOperations = operationList.rows ?? []
+      if (chain && counterpartProductId) {
+        const own: ProduceChainSide = {
+          key: chain.role === 'welded' ? 'weld' : 'paint',
+          title: chain.role === 'welded' ? 'Сварка' : 'Окраска',
+          productId,
+          itemName: row.item_name,
+          qty: row.remaining_qty ?? row.quantity ?? 0,
+          unit: row.unit,
+          operations: ownOperations,
+        }
+        const counterpart: ProduceChainSide = {
+          key: chain.role === 'welded' ? 'paint' : 'weld',
+          title: chain.role === 'welded' ? 'Окраска' : 'Сварка',
+          productId: counterpartProductId,
+          itemName: chain.counterpart_item_name,
+          qty: chain.counterpart_remaining_qty ?? chain.counterpart_quantity ?? 0,
+          unit: chain.counterpart_unit,
+          operations: counterpartOperations?.rows ?? [],
+        }
+        // Порядок блоков — порядок цепочки: сварка сначала, окраска следом.
+        const sides = own.key === 'weld' ? [own, counterpart] : [counterpart, own]
+        setProduceChainSides(sides)
+        setProduceOperations(sides.flatMap((side) => side.operations))
+      } else {
+        setProduceOperations(ownOperations)
+      }
     } catch (e) {
       setProduceError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -577,9 +610,58 @@ export function ProductionControlPage() {
     }
   }
 
+  function operationExecutorsOf(operations: ProductionOperationOption[]) {
+    return operations
+      .filter((operation) => produceOperationEmployees[operation.spec_operation_id])
+      .map((operation) => ({
+        spec_operation_id: operation.spec_operation_id,
+        operation_id: operation.operation_id,
+        line_number: operation.line_number,
+        employee_ref1c: produceOperationEmployees[operation.spec_operation_id],
+      }))
+  }
+
   async function submitProduce() {
     const productId = activeRow?.product_id
     if (!productId) return
+    // Бэкенд ищет исполнителя шапки по имени сотрудника, а список отдаёт
+    // ссылки: имя берём из того же списка, чтобы поиск сошёлся.
+    const headerExecutor = produceEmployeeRef
+      ? employees.find((employee) => employee.employee_ref1c === produceEmployeeRef)?.employee_name
+      : undefined
+    if (produceChainSides) {
+      // Цепочка: количества сторон считает бэкенд по остатку каждой из них,
+      // отсюда уходят только исполнители обеих сторон.
+      setProduceError('')
+      setProduceSaving(true)
+      try {
+        const weldExecutors = operationExecutorsOf(
+          produceChainSides.find((side) => side.key === 'weld')?.operations ?? [],
+        )
+        const paintExecutors = operationExecutorsOf(
+          produceChainSides.find((side) => side.key === 'paint')?.operations ?? [],
+        )
+        const result = await closePaintWeldChain(productId, {
+          ...(headerExecutor ? { executor: headerExecutor } : {}),
+          ...(weldExecutors.length ? { weld_operation_executors: weldExecutors } : {}),
+          ...(paintExecutors.length ? { paint_operation_executors: paintExecutors } : {}),
+        })
+        setProduceOpen(false)
+        setMessage(
+          result.message
+            || (result.resume_required
+              ? 'Цепочка сварка–окраска закрыта частично. Повторите действие для завершения.'
+              : 'Сварка и окраска закрыты совместно; создан один комбинированный сдельный наряд.'),
+        )
+        await loadMaterials(productId)
+        await load(offsetRef.current)
+      } catch (e) {
+        setProduceError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setProduceSaving(false)
+      }
+      return
+    }
     const qty = Number(produceQty)
     if (!Number.isFinite(qty) || qty <= 0) {
       setProduceError('Количество должно быть больше нуля')
@@ -588,19 +670,7 @@ export function ProductionControlPage() {
     setProduceError('')
     setProduceSaving(true)
     try {
-      const operationExecutors = produceOperations
-        .filter((operation) => produceOperationEmployees[operation.spec_operation_id])
-        .map((operation) => ({
-          spec_operation_id: operation.spec_operation_id,
-          operation_id: operation.operation_id,
-          line_number: operation.line_number,
-          employee_ref1c: produceOperationEmployees[operation.spec_operation_id],
-        }))
-      // Бэкенд ищет исполнителя шапки по имени сотрудника, а список отдаёт
-      // ссылки: имя берём из того же списка, чтобы поиск сошёлся.
-      const headerExecutor = produceEmployeeRef
-        ? employees.find((employee) => employee.employee_ref1c === produceEmployeeRef)?.employee_name
-        : undefined
+      const operationExecutors = operationExecutorsOf(produceOperations)
       const result = await produceOrderLine(productId, {
         qty,
         ...(headerExecutor ? { executor: headerExecutor } : {}),
@@ -627,21 +697,8 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      const row = rows.find((item) => item.product_id === productId)
-      if (row?.paint_weld_chain) {
-        const result = await closePaintWeldChain(productId)
-        setMessage(
-          result.message
-            || (result.resume_required
-              ? 'Цепочка сварка–окраска закрыта частично. Повторите действие для завершения.'
-              : 'Сварка и окраска закрыты совместно; создан один комбинированный сдельный наряд.'),
-        )
-        await loadMaterials(productId)
-        await load(offsetRef.current)
-        return
-      }
-      // Обычная строка: исполнителей по операциям выбирают в диалоге, отсюда
-      // ничего в 1С не уходит.
+      // Оба пути — строка и цепочка «сварка → окраска» — проходят через один
+      // диалог: пока хоть одна операция без исполнителя, в 1С ничего не уходит.
       await openProduceDialog(productId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -920,12 +977,16 @@ export function ProductionControlPage() {
         <ProduceDialog
           produceRow={activeRow}
           produceError={produceError}
-          canProduceRow={(activeRow.remaining_qty ?? 0) > 0}
+          // Закрытие цепочки возобновляемо: обе стороны могут быть уже
+          // произведены, а комбинированный наряд — ещё нет. Что закрывать,
+          // решает бэкенд по остатку каждой стороны.
+          canProduceRow={activeRow.paint_weld_chain ? true : (activeRow.remaining_qty ?? 0) > 0}
           produceQty={produceQty}
           setProduceQty={setProduceQty}
           produceSaving={produceSaving}
           produceOverageQty={Math.max(0, Number(produceQty) - (activeRow.remaining_qty ?? 0))}
           produceOperations={produceOperations}
+          produceChainSides={produceChainSides}
           produceOperationEmployees={produceOperationEmployees}
           setProduceOperationEmployees={setProduceOperationEmployees}
           employees={employees}
