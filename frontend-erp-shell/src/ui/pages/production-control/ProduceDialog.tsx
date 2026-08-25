@@ -17,10 +17,6 @@ type Props = {
   produceOperationsLoading: boolean
   produceEmployeeRef: string
   setProduceEmployeeRef: Dispatch<SetStateAction<string>>
-  produceDryRun: boolean
-  setProduceDryRun: Dispatch<SetStateAction<boolean>>
-  setProduceDryRunPayload: Dispatch<SetStateAction<string | null>>
-  produceDryRunPayload: string | null
   allOperationExecutorsSelected: boolean
   setProduceOpen: Dispatch<SetStateAction<boolean>>
   submitProduce: () => void | Promise<void>
@@ -42,10 +38,6 @@ export function ProduceDialog({
   produceOperationsLoading,
   produceEmployeeRef,
   setProduceEmployeeRef,
-  produceDryRun,
-  setProduceDryRun,
-  setProduceDryRunPayload,
-  produceDryRunPayload,
   allOperationExecutorsSelected,
   setProduceOpen,
   submitProduce,
@@ -128,17 +120,6 @@ export function ProduceDialog({
               )}
             </div>
           )}
-          <div className="dialogCheckRow">
-            <input
-              type="checkbox"
-              id="produceDryRun"
-              checked={produceDryRun}
-              onChange={(e) => { setProduceDryRun(e.target.checked); setProduceDryRunPayload(null) }}
-              disabled={produceSaving}
-            />
-            <label htmlFor="produceDryRun">dry_run - показать payload, не отправлять в 1С</label>
-          </div>
-          {produceDryRunPayload && <div className="dialogPreview">{produceDryRunPayload}</div>}
         </div>
         <div className="dialogFooter">
           <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
@@ -147,7 +128,7 @@ export function ProduceDialog({
             onClick={() => void submitProduce()}
             disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || (employees.length > 0 && (produceOperations.length ? !allOperationExecutorsSelected : !produceEmployeeRef))}
           >
-            {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
+            {produceSaving ? 'Создаём...' : 'Создать в 1С'}
           </button>
         </div>
       </div>

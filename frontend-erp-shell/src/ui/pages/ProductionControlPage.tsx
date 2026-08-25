@@ -3,10 +3,12 @@ import { useSearchParams } from 'react-router-dom'
 import {
   coverageLabels,
   type ControlWarehouse,
+  type EmployeeOption,
   type MaterialIssueCreateResponse,
   type MaterialsResponse,
   type OrderRow,
   type ProductionFilters,
+  type ProductionOperationOption,
   type WarehouseCandidate,
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
@@ -20,6 +22,8 @@ import {
   getWorkItemMaterials,
   getProductionControlSettings,
   listRootProductOptions,
+  listProductionEmployees,
+  listProductionOperations,
   listProductionOrders,
   materializeMakeWorkItems,
   updateOrderQuantity,
@@ -51,6 +55,7 @@ import { ProductionOrdersTable } from './production-control/ProductionOrdersTabl
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
 import { ProductionViewBar } from './production-control/ProductionViewBar'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
+import { ProduceDialog } from './production-control/ProduceDialog'
 import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
 import { firstExportProblem, issueIdsFromCreateResult, limit } from './production-control/helpers'
 import {
@@ -98,6 +103,18 @@ export function ProductionControlPage() {
   const [message, setMessage] = useState('')
   const [resources, setResources] = useState<ProductionResource[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // Диалог «Произвести»: 1С не проведёт сдельный наряд без исполнителя, поэтому
+  // операции выбираются поимённо до отправки, а не подставляются заглушкой.
+  const [produceOpen, setProduceOpen] = useState(false)
+  const [produceQty, setProduceQty] = useState('')
+  const [produceSaving, setProduceSaving] = useState(false)
+  const [produceError, setProduceError] = useState('')
+  const [employees, setEmployees] = useState<EmployeeOption[]>([])
+  const [employeesLoading, setEmployeesLoading] = useState(false)
+  const [produceOperations, setProduceOperations] = useState<ProductionOperationOption[]>([])
+  const [produceOperationsLoading, setProduceOperationsLoading] = useState(false)
+  const [produceOperationEmployees, setProduceOperationEmployees] = useState<Record<number, string>>({})
+  const [produceEmployeeRef, setProduceEmployeeRef] = useState('')
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [warehouses, setWarehouses] = useState<ControlWarehouse[]>([])
   const [workshopRows, setWorkshopRows] = useState<WorkshopWarehouse[]>([])
@@ -531,6 +548,78 @@ export function ProductionControlPage() {
     setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: value } : row))
   }
 
+  // Исполнителей выбирают до записи в 1С: наряд с пустой строкой регистра
+  // «Сдельные наряды» 1С не проводит, а документ к тому моменту уже создан.
+  async function openProduceDialog(productId: number | null | undefined) {
+    if (!productId) return
+    const row = rows.find((item) => item.product_id === productId)
+    if (!row) return
+    setProduceError('')
+    setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
+    setProduceOperationEmployees({})
+    setProduceEmployeeRef('')
+    setProduceOperations([])
+    setProduceOpen(true)
+    setEmployeesLoading(true)
+    setProduceOperationsLoading(true)
+    try {
+      const [employeeList, operationList] = await Promise.all([
+        listProductionEmployees(),
+        listProductionOperations(productId),
+      ])
+      setEmployees(employeeList.rows ?? [])
+      setProduceOperations(operationList.rows ?? [])
+    } catch (e) {
+      setProduceError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setEmployeesLoading(false)
+      setProduceOperationsLoading(false)
+    }
+  }
+
+  async function submitProduce() {
+    const productId = activeRow?.product_id
+    if (!productId) return
+    const qty = Number(produceQty)
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setProduceError('Количество должно быть больше нуля')
+      return
+    }
+    setProduceError('')
+    setProduceSaving(true)
+    try {
+      const operationExecutors = produceOperations
+        .filter((operation) => produceOperationEmployees[operation.spec_operation_id])
+        .map((operation) => ({
+          spec_operation_id: operation.spec_operation_id,
+          operation_id: operation.operation_id,
+          line_number: operation.line_number,
+          employee_ref1c: produceOperationEmployees[operation.spec_operation_id],
+        }))
+      // Бэкенд ищет исполнителя шапки по имени сотрудника, а список отдаёт
+      // ссылки: имя берём из того же списка, чтобы поиск сошёлся.
+      const headerExecutor = produceEmployeeRef
+        ? employees.find((employee) => employee.employee_ref1c === produceEmployeeRef)?.employee_name
+        : undefined
+      const result = await produceOrderLine(productId, {
+        qty,
+        ...(headerExecutor ? { executor: headerExecutor } : {}),
+        ...(operationExecutors.length ? { operation_executors: operationExecutors } : {}),
+      })
+      setProduceOpen(false)
+      setMessage(
+        `Сборка запасов и сдельный наряд созданы в 1С на ${result.qty} ед. ` +
+        'Факт ожидает считывания проведения в Item Ledger.',
+      )
+      await loadMaterials(productId)
+      await load(offsetRef.current)
+    } catch (e) {
+      setProduceError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProduceSaving(false)
+    }
+  }
+
   async function produceActiveLine(productId: number | null | undefined) {
     if (!productId) return
     if (!beginDangerousMutation()) return
@@ -551,15 +640,9 @@ export function ProductionControlPage() {
         await load(offsetRef.current)
         return
       }
-      const result = await produceOrderLine(productId, {
-        executor: 'erp-shell',
-      })
-      setMessage(
-        `Сборка запасов и сдельный наряд созданы в 1С на ${result.qty} ед. ` +
-        'Факт ожидает считывания проведения в Item Ledger.',
-      )
-      await loadMaterials(productId)
-      await load(offsetRef.current)
+      // Обычная строка: исполнителей по операциям выбирают в диалоге, отсюда
+      // ничего в 1С не уходит.
+      await openProduceDialog(productId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -833,6 +916,30 @@ export function ProductionControlPage() {
         }}
         onClose={() => setRootDialogOpen(false)}
       />
+      {produceOpen && activeRow && (
+        <ProduceDialog
+          produceRow={activeRow}
+          produceError={produceError}
+          canProduceRow={(activeRow.remaining_qty ?? 0) > 0}
+          produceQty={produceQty}
+          setProduceQty={setProduceQty}
+          produceSaving={produceSaving}
+          produceOverageQty={Math.max(0, Number(produceQty) - (activeRow.remaining_qty ?? 0))}
+          produceOperations={produceOperations}
+          produceOperationEmployees={produceOperationEmployees}
+          setProduceOperationEmployees={setProduceOperationEmployees}
+          employees={employees}
+          employeesLoading={employeesLoading}
+          produceOperationsLoading={produceOperationsLoading}
+          produceEmployeeRef={produceEmployeeRef}
+          setProduceEmployeeRef={setProduceEmployeeRef}
+          allOperationExecutorsSelected={produceOperations.length > 0 && produceOperations.every(
+            (operation) => Boolean(produceOperationEmployees[operation.spec_operation_id]),
+          )}
+          setProduceOpen={setProduceOpen}
+          submitProduce={submitProduce}
+        />
+      )}
       {warehousePickerOpen && warehousePickerCandidates.length > 0 && (
         <WarehousePickerDialog
           warehousePickerCandidates={warehousePickerCandidates}

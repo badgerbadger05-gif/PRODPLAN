@@ -740,7 +740,23 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByRole('spinbutton', { name: 'Количество запуска' })).toBeNull()
   })
 
-  it('runs the canonical produce action for one assembled row', async () => {
+  it('asks for an executor on every operation before producing a row', async () => {
+    // 1С не проводит сдельный наряд с пустой строкой регистра «Сдельные наряды»,
+    // поэтому исполнители выбираются до записи, а не подставляются заглушкой.
+    vi.mocked(listProductionOperations).mockResolvedValue({
+      rows: [
+        {
+          line_number: 1, spec_id: 5, spec_operation_id: 51, operation_id: 61,
+          operation_ref1c: 'op-ref-1', operation_name: 'Сборка', stage_name: 'Сборка', time_norm: 2,
+        },
+        {
+          line_number: 2, spec_id: 5, spec_operation_id: 52, operation_id: 62,
+          operation_ref1c: 'op-ref-2', operation_name: 'Контроль', stage_name: 'ОТК', time_norm: 1,
+        },
+      ],
+      total: 2,
+    } as never)
+
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
@@ -752,10 +768,28 @@ describe('ProductionControlPage — characterization', () => {
     expect(produceBtn).toBeEnabled()
 
     await user.click(produceBtn)
-    await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(
-      101,
-      { executor: 'erp-shell' },
-    ))
+
+    const dialog = await screen.findByRole('dialog')
+    const submit = within(dialog).getByRole('button', { name: 'Создать в 1С' })
+    // Пока хоть одна операция без исполнителя — в 1С ничего не уходит.
+    await waitFor(() => expect(submit).toBeDisabled())
+    expect(produceOrderLine).not.toHaveBeenCalled()
+
+    const selects = within(dialog).getAllByRole('combobox')
+    expect(selects).toHaveLength(2)
+    await user.selectOptions(selects[0], 'E1')
+    expect(submit).toBeDisabled()
+    await user.selectOptions(selects[1], 'E1')
+    expect(submit).toBeEnabled()
+
+    await user.click(submit)
+    await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(101, {
+      qty: 10,
+      operation_executors: [
+        { spec_operation_id: 51, operation_id: 61, line_number: 1, employee_ref1c: 'E1' },
+        { spec_operation_id: 52, operation_id: 62, line_number: 2, employee_ref1c: 'E1' },
+      ],
+    }))
   })
 
   it('shows a paint-weld pair as one row and launches both sides together', async () => {
