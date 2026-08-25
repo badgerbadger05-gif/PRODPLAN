@@ -1033,6 +1033,79 @@ def test_materials_are_available_for_order_opened_after_cutoff(db_session):
     assert len(materials["components"]) == 1
 
 
+def test_materials_endpoint_answers_through_its_strict_response_model(db_session):
+    """Комплектация обязана проходить контракт ответа, а не только сборщик.
+
+    `ProductionMaterialsResponse` запрещает лишние поля. Служебные ключи снимка
+    наружу не выходят, и проверять это надо через саму ручку: тест, зовущий
+    сборщик напрямую, проходит мимо модели ответа и такой отказ не ловит.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.database import get_db
+    from app.routers.production_control import router as production_router
+
+    generation = _building_generation(db_session, "production-journal-materials-api")
+    _item, _order, product = _journal_line(db_session)
+    snapshot = build_candidate_snapshot(
+        db_session, generation.id, accepted_run_ids=[],
+    )
+    _accept(db_session, generation, snapshot)
+
+    app = FastAPI()
+    app.include_router(production_router, prefix="/api")
+
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/production-control/orders/{product.product_id}/materials"
+        )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["product_id"] == product.product_id
+    assert "line_quantity" not in payload
+
+
+def test_work_item_materials_answer_through_their_strict_response_model(db_session):
+    """Та же проверка для строки-предложения: контракт ответа у ручек общий."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.database import get_db
+    from app.routers.production_control import router as production_router
+
+    generation = _building_generation(db_session, "production-journal-wi-materials-api")
+    run, work = _make_proposal(db_session, generation)
+    snapshot = build_candidate_snapshot(
+        db_session, generation.id, accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, generation, snapshot)
+
+    app = FastAPI()
+    app.include_router(production_router, prefix="/api")
+
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/production-control/work-items/{work.id}/materials"
+        )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["work_item_id"] == work.id
+    assert "line_quantity" not in payload
+
+
 def test_materials_survive_a_generation_flip_right_after_launch(db_session):
     """Заказ, выписанный за минуты до смены поколения, не должен пропадать.
 

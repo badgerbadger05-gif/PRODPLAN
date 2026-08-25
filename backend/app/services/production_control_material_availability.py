@@ -576,7 +576,7 @@ def preview_make_work_item_materials(
     )
     payload["work_item_id"] = int(work_item_id)
     payload["product_id"] = None
-    return payload
+    return public_materials_payload(payload)
 
 
 def preview_make_work_items_coverage(
@@ -728,6 +728,20 @@ def preview_make_work_items_coverage(
     return result
 
 
+# Внутреннее поле снимка комплектации: количество, скомандованное оператором по
+# строке. По нему видно, что комплектацию считали на прежнее количество и её пора
+# пересобрать. В публичный контракт `ProductionMaterialsResponse` оно не входит —
+# тот запрещает лишние поля, — поэтому снимается на выходе к читателю.
+_INTERNAL_MATERIAL_KEYS = ("line_quantity",)
+
+
+def public_materials_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    public = dict(payload)
+    for key in _INTERNAL_MATERIAL_KEYS:
+        public.pop(key, None)
+    return public
+
+
 def _snapshot_matches_line_command(
     db: Session,
     product_id: int,
@@ -785,14 +799,16 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         # генерационно-закреплённым сборщиком, что и публикация снимка, — второй
         # формулы потребности компонентов не появляется.
         if _snapshot_matches_line_command(db, int(product_id), material):
-            public = dict(material)
+            public = public_materials_payload(material)
             public["truth_status"] = str(snapshot.truth_status)
             public["cutoff"] = snapshot.cutoff.isoformat()
             return public
-        public = preview_materials(
-            db,
-            int(product_id),
-            ledger_generation_id=generation_id,
+        public = public_materials_payload(
+            preview_materials(
+                db,
+                int(product_id),
+                ledger_generation_id=generation_id,
+            )
         )
         public["truth_status"] = str(snapshot.truth_status)
         public["cutoff"] = snapshot.cutoff.isoformat()
@@ -823,11 +839,13 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         else None
     )
     if live_product is not None:
-        public = preview_materials(
-            db,
-            int(product_id),
-            ledger_generation_id=generation_id,
-            _product_override=live_product,
+        public = public_materials_payload(
+            preview_materials(
+                db,
+                int(product_id),
+                ledger_generation_id=generation_id,
+                _product_override=live_product,
+            )
         )
         public["truth_status"] = str(snapshot.truth_status)
         public["cutoff"] = snapshot.cutoff.isoformat()
