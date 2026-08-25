@@ -2691,7 +2691,7 @@ export interface paths {
         put?: never;
         /**
          * Chain Preview
-         * @description Предпросмотр цепочки «сварка → окраска» (dry-run, ничего не пишет).
+         * @description Предпросмотр цепочки «окраска ↔ сварка» (dry-run, ничего не пишет).
          */
         post: operations["chain_preview_api_v1_paint_weld_chain_preview_post"];
         delete?: never;
@@ -2712,7 +2712,7 @@ export interface paths {
         /**
          * Chain Open
          * @description Открыть цепочку. dry_run=true (по умолчанию) — предпросмотр; dry_run=false —
-         *     реальное создание в 1С (сварка, затем окраска на основании сварочного заказа).
+         *     реальное создание в 1С (окраска, затем сварка на основании окрасочного заказа).
          */
         post: operations["chain_open_api_v1_paint_weld_chain_open_post"];
         delete?: never;

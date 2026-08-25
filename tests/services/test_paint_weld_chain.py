@@ -1,11 +1,17 @@
-"""Цепочка открытия «сварка → окраска» (этап 2).
+"""Цепочка открытия пары «окраска ↔ сварка» (этап 2).
+
+Документное направление: сварная деталь входит в состав окрашенной, значит
+основанием в 1С является ОКРАСОЧНЫЙ заказ, а сварочный вводится на его
+основании и как подчинённый закрывается раньше. Производственная
+последовательность обратная и не меняется: сварка финиширует к старту окраски.
 
 Проверяем:
 - вердикт stock_covers → сварка не создаётся (окраска — штатно);
 - частичное покрытие → qty сварки уменьшено на эффективный остаток сварной;
-- need_weld → пара заказов в правильном порядке (сварка раньше окраски), с
-  датами (финиш сварки = старт окраски, старт = финиш − buffer_days участка) и
-  «основанием» в комментарии сварочного 1С-документа + локальной связью;
+- need_weld → пара заказов в правильном порядке выгрузки (окраска раньше
+  сварки), с датами (финиш сварки = старт окраски, старт = финиш − buffer_days
+  участка) и «основанием» в полях и комментарии сварочного 1С-документа +
+  локальной связью;
 - идемпотентность повтора (нет дублей заказа/связи, нет повторного POST);
 - dry-run ничего не пишет.
 
@@ -281,7 +287,7 @@ class _RefusingClient(_FakeClient):
 
 
 class _FailingClient(_FakeClient):
-    """1С отклонила создание окрасочного заказа."""
+    """1С отклонила создание первого (окрасочного) заказа цепочки."""
 
     def post(self, entity, payload, **_kwargs):
         self.posts.append((entity, payload))
@@ -289,14 +295,14 @@ class _FailingClient(_FakeClient):
 
 
 class _FailSecondClient(_FakeClient):
-    """Сварка создана, но 1С отклонила следующий окрасочный заказ."""
+    """Окраска создана, но 1С отклонила следующий сварочный заказ."""
 
     def post(self, entity, payload, **_kwargs):
         self._n += 1
         self.posts.append((entity, payload))
         if self._n == 2:
-            raise RuntimeError("1С: ошибка окраски")
-        return {"Ref_Key": "ref-weld-success"}
+            raise RuntimeError("1С: ошибка сварки")
+        return {"Ref_Key": "ref-paint-success"}
 
 
 def _stub_demo(monkeypatch):
@@ -365,11 +371,12 @@ def test_preview_need_weld_builds_pair_with_dates_and_basis(db_session, monkeypa
     # финиш сварки = старт окраски; старт = финиш − buffer_days
     assert welded_out["planned_finish_date"] == "2026-08-10"
     assert welded_out["planned_start_date"] == (date(2026, 8, 10) - __import__("datetime").timedelta(days=WELD_BUFFER_DAYS)).isoformat()
-    # Сварка — первый этап без основания; окраска ссылается на сварку.
-    assert "ДокументОснование" not in welded_out["payload"]
-    assert "основание: сварочный заказ" in res["painted"]["payload"]["Комментарий"]
-    assert res["painted"]["basis_pending_1c_ref"] is True
+    # Окраска — первичный документ без основания; сварка ссылается на окраску.
     assert "ДокументОснование" not in res["painted"]["payload"]
+    assert "ЗаказНаПроизводствоОснование_Key" not in res["painted"]["payload"]
+    assert "основание: окрасочный заказ" in welded_out["payload"]["Комментарий"]
+    assert welded_out["basis_pending_1c_ref"] is True
+    assert "ДокументОснование" not in welded_out["payload"]
     assert welded_out["payload"]["Продукция"][0]["Номенклатура_Key"] == "ref-welded"
     # dry-run ничего не пишет
     assert db.query(ProductionOrder).count() == 1
@@ -412,16 +419,16 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
     )
 
     assert res["verdict"] == "need_weld"
-    # сварка выгружена первой, окраска — второй
+    # окраска выгружена первой (родитель), сварка — второй (на её основании)
     assert len(fake.posts) == 2
-    assert res["welded"]["order_ref1c"] == "ref-1c-1"
-    assert res["painted"]["order_ref1c"] == "ref-1c-2"
+    assert res["painted"]["order_ref1c"] == "ref-1c-1"
+    assert res["welded"]["order_ref1c"] == "ref-1c-2"
 
     # заказы существуют локально
     paint_order = db.query(ProductionOrder).filter(ProductionOrder.order_id == res["painted"]["order_id"]).one()
     weld_order = db.query(ProductionOrder).filter(ProductionOrder.order_id == res["welded"]["order_id"]).one()
-    assert weld_order.order_ref1c == "ref-1c-1"
-    assert paint_order.order_ref1c == "ref-1c-2"
+    assert paint_order.order_ref1c == "ref-1c-1"
+    assert weld_order.order_ref1c == "ref-1c-2"
     weld_product = (
         db.query(ProductionProduct)
         .filter(ProductionProduct.order_id == weld_order.order_id)
@@ -441,17 +448,18 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
     assert link.welded_order_id == weld_order.order_id
 
     # «основание» проброшено штатными полями 1С + продублировано в комментарии
-    paint_payload = fake.posts[1][1]
-    assert paint_payload["ЗаказНаПроизводствоОснование_Key"] == weld_order.order_ref1c
-    assert paint_payload["ДокументОснование"] == weld_order.order_ref1c
-    assert paint_payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
-    assert "основание: сварочный заказ" in paint_payload["Комментарий"]
-    assert weld_order.order_ref1c in paint_payload["Комментарий"]
+    weld_payload = fake.posts[1][1]
+    assert weld_payload["ЗаказНаПроизводствоОснование_Key"] == paint_order.order_ref1c
+    assert weld_payload["ДокументОснование"] == paint_order.order_ref1c
+    assert weld_payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
+    assert "основание: окрасочный заказ" in weld_payload["Комментарий"]
+    assert paint_order.order_ref1c in weld_payload["Комментарий"]
 
-    # у сварочного (первичного) заказа полей основания нет
-    weld_payload = fake.posts[0][1]
-    assert "ЗаказНаПроизводствоОснование_Key" not in weld_payload
-    assert "ДокументОснование" not in weld_payload
+    # у окрасочного (первичного) заказа полей основания нет
+    paint_payload = fake.posts[0][1]
+    assert "ЗаказНаПроизводствоОснование_Key" not in paint_payload
+    assert "ДокументОснование" not in paint_payload
+    assert "ДокументОснование_Type" not in paint_payload
 
     # sync_link на оба заказа
     assert (
@@ -473,15 +481,125 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
     )
 
 
-def test_paint_order_is_not_exported_when_weld_order_has_no_ref(db_session, monkeypatch):
-    """Без подтверждённой сварки окрасочный документ не отправляется."""
+def test_weld_document_is_entered_on_basis_of_paint_document(db_session, monkeypatch):
+    """Направление основания в 1С: сварной заказ — подчинённый окрасочного.
+
+    Сваренная деталь входит в состав окрашенной, поэтому родителем цепочки в 1С
+    является окрасочный заказ: он выгружается ПЕРВЫМ и без основания, а
+    сварочный вводится ВТОРЫМ на его основании и как подчинённый закрывается
+    раньше. Плановые даты остаются производственными: сварка финиширует к
+    старту окраски.
+    """
+    db = db_session
+    _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
+    _stub_demo(monkeypatch)
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    res = open_paint_chain(
+        db,
+        painted_product_id=painted_product.product_id,
+        planned_start="2026-08-10",
+        dry_run=False,
+    )
+
+    assert res["status"] == "ok"
+    paint_number = res["painted"]["order_number"]
+    weld_number = res["welded"]["order_number"]
+
+    # 1. Порядок выгрузки: окраска первой, сварка второй.
+    posted_numbers = [payload.get("Number") for _entity, payload in fake.posts]
+    paint_ref = res["painted"]["order_ref1c"]
+    weld_ref = res["welded"]["order_ref1c"]
+    assert len(fake.posts) == 2
+    assert posted_numbers[0] != posted_numbers[1]
+    paint_payload, weld_payload = fake.posts[0][1], fake.posts[1][1]
+    assert paint_payload["Продукция"][0]["Номенклатура_Key"] == "ref-painted"
+    assert weld_payload["Продукция"][0]["Номенклатура_Key"] == "ref-welded"
+
+    # 2. У окрасочного (родительского) документа основания нет.
+    for field in (
+        "ЗаказНаПроизводствоОснование_Key",
+        "ДокументОснование",
+        "ДокументОснование_Type",
+    ):
+        assert field not in paint_payload
+
+    # 3. Сварочный документ введён на основании окрасочного.
+    assert weld_payload["ЗаказНаПроизводствоОснование_Key"] == paint_ref
+    assert weld_payload["ДокументОснование"] == paint_ref
+    assert (
+        weld_payload["ДокументОснование_Type"]
+        == "StandardODATA.Document_ЗаказНаПроизводство"
+    )
+    assert "основание: окрасочный заказ" in weld_payload["Комментарий"]
+    assert paint_ref in weld_payload["Комментарий"]
+    assert weld_ref != paint_ref
+    assert res["welded"]["basis"] is not None
+    assert "basis" not in res["painted"]
+
+    # 4. Производственная последовательность не перевёрнута: сварка финиширует
+    #    к старту окраски.
+    assert res["welded"]["planned_finish_date"] == "2026-08-10"
+
+    # 5. Локальная связь цепочки не меняет ролей колонок.
+    link = db.query(PaintWeldChainLink).one()
+    assert link.painted_order_id == res["painted"]["order_id"]
+    assert link.welded_order_id == res["welded"]["order_id"]
+    assert paint_number and weld_number
+
+
+def test_chain_opens_on_top_of_an_already_exported_paint_order(db_session, monkeypatch):
+    """Окрасочный заказ уже в 1С — цепочка достраивает сварочный на его основании.
+
+    В новом направлении окрасочный документ первичен и не требует основания,
+    поэтому его наличие в 1С не блокирует открытие цепочки: повторно он не
+    отправляется, а сварочный уходит вторым с его Ref_Key в основании.
+    """
+    db = db_session
+    _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=0)
+    _stub_demo(monkeypatch)
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    covered = open_paint_chain(
+        db, painted_product_id=painted_product.product_id, dry_run=False
+    )
+    assert covered["verdict"] == "stock_covers"
+    assert covered["welded"] is None
+    assert len(fake.posts) == 1
+    paint_ref = covered["painted"]["order_ref1c"]
+    assert paint_ref
+
+    reservation = db.query(models.ReservationEntry).one()
+    reservation.reserved_qty = 10
+    reservation.replenishment_required_qty = 10
+    db.commit()
+
+    opened = open_paint_chain(
+        db, painted_product_id=painted_product.product_id, dry_run=False
+    )
+
+    assert opened["status"] == "ok"
+    assert opened["verdict"] == "need_weld"
+    # окрасочный документ не отправлен повторно; в 1С ушёл только сварочный
+    assert len(fake.posts) == 2
+    assert opened["painted"]["order_ref1c"] == paint_ref
+    weld_payload = fake.posts[1][1]
+    assert weld_payload["Продукция"][0]["Номенклатура_Key"] == "ref-welded"
+    assert weld_payload["ЗаказНаПроизводствоОснование_Key"] == paint_ref
+    assert weld_payload["ДокументОснование"] == paint_ref
+
+
+def test_weld_order_is_not_exported_when_paint_order_has_no_ref(db_session, monkeypatch):
+    """Без подтверждённой окраски сварочный документ не отправляется."""
     db = db_session
     _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
     _stub_demo(monkeypatch)
     fake = _RefusingClient()
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    with pytest.raises(ValueError, match="без подтверждённого сварочного основания"):
+    with pytest.raises(ValueError, match="без подтверждённого окрасочного основания"):
         open_paint_chain(
             db,
             painted_product_id=painted_product.product_id,
@@ -489,15 +607,15 @@ def test_paint_order_is_not_exported_when_weld_order_has_no_ref(db_session, monk
             dry_run=False,
         )
 
-    # Ровно одна попытка POST — сварочная; окраски в 1С нет.
+    # Ровно одна попытка POST — окрасочная; сварки в 1С нет.
     assert len(fake.posts) == 1
     assert db.query(ProductionOrder).count() == 2
     assert db.query(PaintWeldChainLink).count() == 1
     assert all(not (order.order_ref1c or "") for order in db.query(ProductionOrder).all())
 
 
-def test_paint_order_is_not_exported_when_weld_export_errors(db_session, monkeypatch):
-    """Ошибка первого сварочного этапа не допускает POST окраски."""
+def test_weld_order_is_not_exported_when_paint_export_errors(db_session, monkeypatch):
+    """Ошибка первого окрасочного этапа не допускает POST сварки."""
     db = db_session
     _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
     _stub_demo(monkeypatch)
@@ -542,7 +660,7 @@ def test_open_fails_closed_when_frozen_weld_bom_is_missing(db_session, monkeypat
     assert db.query(PaintWeldChainLink).count() == 0
 
 
-def test_paint_failure_keeps_weld_success_and_retry_posts_only_paint(db_session, monkeypatch):
+def test_weld_failure_keeps_paint_success_and_retry_posts_only_weld(db_session, monkeypatch):
     db = db_session
     _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
     _stub_demo(monkeypatch)
@@ -556,8 +674,8 @@ def test_paint_failure_keeps_weld_success_and_retry_posts_only_paint(db_session,
         dry_run=False,
     )
     assert first["status"] == "partial_error"
-    assert first["welded"]["order_ref1c"] == "ref-weld-success"
-    assert first["painted"]["order_ref1c"] is None
+    assert first["painted"]["order_ref1c"] == "ref-paint-success"
+    assert first["welded"]["order_ref1c"] is None
     assert len(first_client.posts) == 2
 
     retry_client = _FakeClient()
@@ -570,7 +688,7 @@ def test_paint_failure_keeps_weld_success_and_retry_posts_only_paint(db_session,
     )
     assert second["status"] == "ok"
     assert len(retry_client.posts) == 1
-    assert retry_client.posts[0][1]["ЗаказНаПроизводствоОснование_Key"] == "ref-weld-success"
+    assert retry_client.posts[0][1]["ЗаказНаПроизводствоОснование_Key"] == "ref-paint-success"
 
 
 def test_open_is_idempotent_on_repeat(db_session, monkeypatch):

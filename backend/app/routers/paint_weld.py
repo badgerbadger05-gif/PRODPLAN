@@ -106,7 +106,7 @@ async def guard(
 
 @router.post("/chain/preview", response_model=dict)
 async def chain_preview(payload: ChainPreviewPayload, db: Session = Depends(get_db)):
-    """Предпросмотр цепочки «сварка → окраска» (dry-run, ничего не пишет)."""
+    """Предпросмотр цепочки «окраска ↔ сварка» (dry-run, ничего не пишет)."""
     try:
         return open_paint_chain(
             db,
@@ -124,7 +124,7 @@ async def chain_preview(payload: ChainPreviewPayload, db: Session = Depends(get_
 @router.post("/chain/open", response_model=dict)
 async def chain_open(payload: ChainOpenPayload, db: Session = Depends(get_db)):
     """Открыть цепочку. dry_run=true (по умолчанию) — предпросмотр; dry_run=false —
-    реальное создание в 1С (сварка, затем окраска на основании сварочного заказа)."""
+    реальное создание в 1С (окраска, затем сварка на основании окрасочного заказа)."""
     try:
         return open_paint_chain(
             db,
