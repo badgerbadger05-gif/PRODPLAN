@@ -1,3 +1,5 @@
+import type { components } from '../lib/apiTypes'
+
 export type PurchaseLineStatus =
   | 'to_order'
   | 'overdue'
@@ -103,6 +105,9 @@ export type PurchaseJournalSummary = {
   in_transit_amount: number
   fact_status: PurchaseFactStatus
 }
+
+export type PurchaseSelectionSummaryRequest = components['schemas']['PurchaseControlSelectionSummaryRequest']
+export type PurchaseSelectionSummary = components['schemas']['PurchaseControlSelectionSummaryResponse']
 
 export type PurchaseSnapshotMeta = {
   snapshot_id?: number

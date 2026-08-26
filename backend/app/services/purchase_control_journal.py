@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -109,6 +110,11 @@ def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[st
             "quantity": required,
             "remaining_qty": to_order,
             "received_qty": realized,
+            "amount": (
+                round(to_order * _to_float(row.get("price")), 2)
+                if row.get("price") is not None
+                else None
+            ),
             "line_status": (
                 "to_order"
                 if to_order > _EPS
@@ -119,6 +125,64 @@ def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[st
         }
     )
     return projected
+
+
+def get_selection_summary(
+    db: Session,
+    *,
+    snapshot_id: int,
+    row_keys: List[str],
+    horizon_period_to: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Aggregate a selected set using only the immutable purchase snapshot."""
+    snapshot = read_snapshot(db)
+    meta = dict(snapshot.get("meta") or {})
+    if int(meta.get("snapshot_id") or 0) != int(snapshot_id):
+        raise ValueError("Снимок журнала изменился; обновите страницу и повторите выбор")
+
+    unique_keys = list(dict.fromkeys(str(key or "").strip() for key in row_keys))
+    if not unique_keys or any(not key for key in unique_keys):
+        raise ValueError("Не выбраны строки журнала закупок")
+
+    rows_by_key = {
+        str(row.get("row_key")): dict(row)
+        for row in snapshot.get("rows") or []
+        if row.get("row_key") is not None
+    }
+    unknown = [key for key in unique_keys if key not in rows_by_key]
+    if unknown:
+        raise ValueError("Выбранные строки отсутствуют в текущем снимке")
+
+    horizon_iso = horizon_period_to.isoformat() if horizon_period_to else None
+    rows: List[Dict[str, Any]] = []
+    for key in unique_keys:
+        projected = _reconcile_buy_row_for_horizon(rows_by_key[key], horizon_iso)
+        if projected is None or not _materialization_action(projected)[0]:
+            raise ValueError("Выбор содержит строку, недоступную для формирования заказа")
+        rows.append(projected)
+
+    priced_rows = [row for row in rows if row.get("price") is not None]
+    known_amount = sum(
+        (Decimal(str(row.get("amount") or 0)) for row in priced_rows),
+        start=Decimal("0"),
+    )
+    unpriced_rows = len(rows) - len(priced_rows)
+    amount_status = (
+        "complete"
+        if unpriced_rows == 0
+        else "unavailable"
+        if not priced_rows
+        else "partial"
+    )
+    return {
+        "snapshot_id": int(snapshot_id),
+        "selected_rows": len(rows),
+        "priced_rows": len(priced_rows),
+        "unpriced_rows": unpriced_rows,
+        "known_amount": round(float(known_amount), 2),
+        "total_amount": round(float(known_amount), 2) if amount_status == "complete" else None,
+        "amount_status": amount_status,
+    }
 
 
 def _sum_to_order_by_period(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

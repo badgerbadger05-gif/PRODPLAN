@@ -13,6 +13,13 @@ def test_sync_nomenclature_persists_item_category_link(db_session, monkeypatch):
         def get_count(self, entity_name, filter_query):
             return 1
 
+        def get_all(self, entity_name, **kwargs):
+            if entity_name == "Catalog_ВидыЦен":
+                return [{"Ref_Key": "accounting-price-ref", "Description": "Учётная цена"}]
+            if entity_name.startswith("InformationRegister_ЦеныНоменклатуры/SliceLast"):
+                return []
+            raise AssertionError(f"Unexpected OData entity: {entity_name}")
+
         def iter_pages(self, entity_name, filter_query=None, select_fields=None, top=1000, max_pages=1000, order_by=None):
             yield [
                 {

@@ -2540,6 +2540,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/purchase-control/selection-summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Summarize Purchase Control Selection
+         * @description Backend-owned totals for the selected immutable purchase rows.
+         */
+        post: operations["summarize_purchase_control_selection_api_v1_purchase_control_selection_summary_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/purchase-control/materialize": {
         parameters: {
             query?: never;
@@ -5385,6 +5405,35 @@ export interface components {
              * @default true
              */
             dry_run: boolean;
+        };
+        /** PurchaseControlSelectionSummaryRequest */
+        PurchaseControlSelectionSummaryRequest: {
+            /** Snapshot Id */
+            snapshot_id: number;
+            /** Row Keys */
+            row_keys: string[];
+            /** Horizon Period To */
+            horizon_period_to?: string | null;
+        };
+        /** PurchaseControlSelectionSummaryResponse */
+        PurchaseControlSelectionSummaryResponse: {
+            /** Snapshot Id */
+            snapshot_id: number;
+            /** Selected Rows */
+            selected_rows: number;
+            /** Priced Rows */
+            priced_rows: number;
+            /** Unpriced Rows */
+            unpriced_rows: number;
+            /** Known Amount */
+            known_amount: number;
+            /** Total Amount */
+            total_amount?: number | null;
+            /**
+             * Amount Status
+             * @enum {string}
+             */
+            amount_status: "complete" | "partial" | "unavailable";
         };
         /** PurchaseOrder1CExportRequest */
         PurchaseOrder1CExportRequest: {
@@ -10842,6 +10891,39 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+        };
+    };
+    summarize_purchase_control_selection_api_v1_purchase_control_selection_summary_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PurchaseControlSelectionSummaryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PurchaseControlSelectionSummaryResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

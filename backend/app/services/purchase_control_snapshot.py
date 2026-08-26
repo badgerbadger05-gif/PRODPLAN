@@ -118,6 +118,22 @@ def validate_purchase_control_journal_buy_row(row: Any) -> None:
         abs_tol=_EPS_FLOAT,
     ):
         raise ValueError("purchase control buy row quantity is inconsistent")
+    price = row.get("price")
+    amount = row.get("amount")
+    if price is None:
+        if amount is not None:
+            raise ValueError("purchase control buy row amount requires price")
+    else:
+        numeric_price = _to_float(price)
+        numeric_amount = _to_float(amount)
+        if numeric_price < 0 or numeric_amount < 0:
+            raise ValueError("purchase control buy row has invalid accounting price")
+        if not math.isclose(
+            numeric_amount,
+            round(to_order_qty * numeric_price, 2),
+            abs_tol=0.005,
+        ):
+            raise ValueError("purchase control buy row amount is inconsistent")
     reservation_ids = row.get("reservation_ids")
     requirement_ids = row.get("requirement_ids")
     if (
@@ -646,6 +662,11 @@ def _build_buyer_rows(
                 "unit": item.unit,
                 "planning_stock_pool": pool,
                 "item_ref1c": _clean_ref(item.item_ref1c),
+                "accounting_price": (
+                    float(item.accounting_price)
+                    if item.accounting_price is not None
+                    else None
+                ),
                 "supplier_ref1c": _clean_ref(item.supplier_ref1c).lower(),
                 "requirement_ids": set(),
                 "reservation_ids": set(),
@@ -802,8 +823,12 @@ def _build_buyer_rows(
                 if open_order_covered_qty > _EPS_FLOAT
                 else "received"
             ),
-            "price": 0.0,
-            "amount": 0.0,
+            "price": payload["accounting_price"],
+            "amount": (
+                round(to_order_qty * float(payload["accounting_price"]), 2)
+                if payload["accounting_price"] is not None
+                else None
+            ),
             "run_id": sorted_runs[0] if len(sorted_runs) == 1 else None,
             "run_ids": sorted_runs,
             "requirement_ids": sorted(payload["requirement_ids"]),

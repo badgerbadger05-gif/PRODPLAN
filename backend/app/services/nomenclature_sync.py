@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional, List
 from datetime import datetime
 
@@ -8,6 +9,63 @@ from sqlalchemy.orm import Session
 
 from ..models import Item, ItemCategory, Supplier
 from ..schemas import ODataSyncRequest
+
+
+ACCOUNTING_PRICE_REGISTER = "InformationRegister_ЦеныНоменклатуры"
+ACCOUNTING_PRICE_TYPE_CATALOG = "Catalog_ВидыЦен"
+DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C = "81c4a02c-991b-11eb-e39a-fa163e61326a"
+
+
+def _clean_ref1c(value: object) -> str:
+    return str(value or "").strip().strip("{}").lower()
+
+
+def _accounting_price_type_ref(client) -> str:
+    """Resolve the 1C price type by name, keeping the known deployment ref as fallback."""
+    try:
+        rows = client.get_all(
+            ACCOUNTING_PRICE_TYPE_CATALOG,
+            select_fields=["Ref_Key", "Description"],
+            top=1000,
+            max_pages=10,
+            order_by="Ref_Key",
+        )
+    except Exception:
+        return DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C
+    for row in rows:
+        name = str(row.get("Description") or "").strip().casefold().replace("ё", "е")
+        if name == "учетная цена":
+            return _clean_ref1c(row.get("Ref_Key")) or DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C
+    return DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C
+
+
+def _load_accounting_prices(client, *, at_datetime: datetime) -> Dict[str, Decimal]:
+    price_type_ref = _accounting_price_type_ref(client)
+    period = at_datetime.replace(microsecond=0).isoformat()
+    rows = client.get_all(
+        f"{ACCOUNTING_PRICE_REGISTER}/SliceLast(Period=datetime'{period}')",
+        filter_query=f"ВидЦен_Key eq guid'{price_type_ref}'",
+        select_fields=["Номенклатура_Key", "Цена", "Актуальность"],
+        top=5000,
+        max_pages=1000,
+        order_by=None,
+    )
+    prices: Dict[str, Decimal] = {}
+    for row in rows:
+        if row.get("Актуальность") is False:
+            continue
+        item_ref = _clean_ref1c(row.get("Номенклатура_Key"))
+        raw_price = row.get("Цена")
+        if not item_ref or raw_price is None or raw_price == "":
+            continue
+        try:
+            price = Decimal(str(raw_price))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"Некорректная учётная цена для {item_ref}: {raw_price!r}") from exc
+        if price < 0:
+            raise ValueError(f"Отрицательная учётная цена для {item_ref}: {raw_price!r}")
+        prices[item_ref] = price
+    return prices
 
 
 def _is_folder(record: Dict) -> bool:
@@ -30,6 +88,9 @@ class NomenclatureSyncStats:
     items_unchanged: int = 0
     categories_created: int = 0
     categories_updated: int = 0
+    accounting_prices_found: int = 0
+    accounting_prices_missing: int = 0
+    accounting_prices_updated: int = 0
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
@@ -96,12 +157,19 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         existing_suppliers = {sup.supplier_ref1c: sup for sup in db.query(Supplier).all() if sup.supplier_ref1c}
         existing_codes_count = len(existing_items_by_code)
 
+        # Цена читается отдельным запросом к виртуальной таблице SliceLast.
+        # Ошибка здесь должна откатить всю синхронизацию: пустой ответ после
+        # сетевой ошибки нельзя трактовать как отсутствие цен у всех позиций.
+        accounting_prices = _load_accounting_prices(client, at_datetime=datetime.now())
+
         created_count = 0
         updated_count = 0
         updated_by_code_count = 0
         unchanged_count = 0
         categories_created = 0
         categories_updated = 0
+        accounting_prices_updated = 0
+        processed_item_refs: set[str] = set()
 
         # Обрабатываем записи постранично
         processed_count = 0
@@ -261,6 +329,13 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     if target_item is not None and item_type:
                         target_item.item_type = item_type
 
+                    if target_item is not None:
+                        processed_item_refs.add(_clean_ref1c(ref_key))
+                        accounting_price = accounting_prices.get(_clean_ref1c(ref_key))
+                        if target_item.accounting_price != accounting_price:
+                            target_item.accounting_price = accounting_price
+                            accounting_prices_updated += 1
+
                     resolved_category = None
 
                     # Обрабатываем категорию номенклатуры
@@ -356,6 +431,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             supplier_ref1c=supplier_ref1c,
                             replenishment_method=replenishment_method or None,
                             replenishment_time=replenishment_time,
+                            accounting_price=accounting_prices.get(_clean_ref1c(ref_key)),
                             item_type=(record.get('ТипНоменклатуры') or '').strip() or None,
                             unit=unit_key or None,
                             status='active'
@@ -365,6 +441,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         existing_items_by_code[code] = new_item  # обновим локальный кэш
                         if ref_key:
                             existing_items_by_ref[ref_key] = new_item
+                            processed_item_refs.add(_clean_ref1c(ref_key))
 
                         category_key = (record.get('КатегорияНоменклатуры_Key') or '').strip()
                         if category_key:
@@ -390,6 +467,9 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.items_unchanged = unchanged_count
         stats.categories_created = categories_created
         stats.categories_updated = categories_updated
+        stats.accounting_prices_found = len(processed_item_refs & set(accounting_prices))
+        stats.accounting_prices_missing = len(processed_item_refs - set(accounting_prices))
+        stats.accounting_prices_updated = accounting_prices_updated
 
         if req.dry_run:
             db.rollback()

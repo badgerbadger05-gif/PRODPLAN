@@ -22,6 +22,7 @@ export const purchaseOrderColumns = [
   { key: 'delivery_date', title: 'Поставка', className: 'dateCell', minWidth: 110, autoWidth: true, grow: false, align: 'left', sortable: true },
   { key: 'state', title: 'Статус 1С', className: undefined, minWidth: 130, autoWidth: true, grow: false, align: 'left', sortable: false },
   { key: 'line_status', title: 'Статус', className: undefined, minWidth: 116, autoWidth: true, grow: false, align: 'left', sortable: false },
+  { key: 'price', title: 'Учётная цена', className: 'numCell', minWidth: 104, autoWidth: true, grow: false, align: 'right', sortable: false },
   { key: 'amount', title: 'Сумма', className: 'numCell', minWidth: 90, autoWidth: true, grow: false, align: 'right', sortable: false },
 ] as const satisfies TableColumnDoctype[]
 
@@ -91,6 +92,7 @@ export function createPurchaseOrdersDoctype(
             permissionField: 'state',
           },
           { key: 'line_status', title: 'Статус', value: (row) => purchaseLineStatusLabel(row.line_status) },
+          { key: 'price', title: 'Учётная цена', value: (row) => row.price ?? '' },
           { key: 'amount', title: 'Сумма', value: (row) => row.amount || '' },
         ],
       },

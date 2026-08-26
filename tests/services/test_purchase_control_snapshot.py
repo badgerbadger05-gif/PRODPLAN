@@ -10,6 +10,7 @@ from app import models
 from app.routers.purchase_control import get_filters, get_order
 from app.services.planning_truth import publish_generation
 from app.services.purchase_control_journal import (
+    get_selection_summary,
     get_order_card,
     _materialization_action,
     _reconcile_buy_row_for_horizon,
@@ -229,7 +230,11 @@ def _add_buy_plan_run(
     return planning_run
 
 
-def _build_buy_horizon_generation(db):
+def _build_buy_horizon_generation(
+    db,
+    *,
+    accounting_price: Decimal | None = Decimal("12.50"),
+):
     cutoff = datetime(2026, 7, 24, 12, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key="purchase-snapshot-buy-horizon",
@@ -250,6 +255,7 @@ def _build_buy_horizon_generation(db):
         item_code="RAW-HRZ",
         item_name="Материал HORZ",
         item_article="ARTICLE-HRZ",
+        accounting_price=accounting_price,
         unit="шт",
         supplier_ref1c="SUP-HRZ",
     )
@@ -477,6 +483,65 @@ def test_list_journal_searches_buy_rows_by_item_article(db_session):
     assert result["total"] == 1
     assert result["rows"][0]["item_id"] == item.item_id
     assert result["rows"][0]["item_article"] == "ARTICLE-HRZ"
+    assert result["rows"][0]["price"] == 12.5
+    assert result["rows"][0]["amount"] == 187.5
+
+    selection = get_selection_summary(
+        db_session,
+        snapshot_id=int(result["meta"]["snapshot_id"]),
+        row_keys=[result["rows"][0]["row_key"]],
+    )
+    assert selection == {
+        "snapshot_id": int(result["meta"]["snapshot_id"]),
+        "selected_rows": 1,
+        "priced_rows": 1,
+        "unpriced_rows": 0,
+        "known_amount": 187.5,
+        "total_amount": 187.5,
+        "amount_status": "complete",
+    }
+    august_selection = get_selection_summary(
+        db_session,
+        snapshot_id=int(result["meta"]["snapshot_id"]),
+        row_keys=[result["rows"][0]["row_key"]],
+        horizon_period_to=date(2026, 8, 31),
+    )
+    assert august_selection["total_amount"] == 87.5
+
+
+def test_selection_summary_rejects_stale_snapshot(db_session):
+    _generation, _item, _aug, _sep, _snapshot = _build_buy_horizon_generation(
+        db_session
+    )
+
+    with pytest.raises(ValueError, match="Снимок журнала изменился"):
+        get_selection_summary(
+            db_session,
+            snapshot_id=999999,
+            row_keys=["buy:missing:main"],
+        )
+
+
+def test_buy_row_keeps_missing_accounting_price_nullable(db_session):
+    _generation, _item, _aug, _sep, _snapshot = _build_buy_horizon_generation(
+        db_session,
+        accounting_price=None,
+    )
+
+    result = list_journal(db_session)
+    row = result["rows"][0]
+    assert row["price"] is None
+    assert row["amount"] is None
+
+    selection = get_selection_summary(
+        db_session,
+        snapshot_id=int(result["meta"]["snapshot_id"]),
+        row_keys=[row["row_key"]],
+    )
+    assert selection["amount_status"] == "unavailable"
+    assert selection["known_amount"] == 0.0
+    assert selection["total_amount"] is None
+    assert selection["unpriced_rows"] == 1
 
 
 def test_missing_or_stale_snapshot_fails_closed(db_session):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -14,7 +14,12 @@ from ..services.purchase_control_materialization import (
     PurchaseControlSnapshotUnavailable,
     materialize_rows,
 )
-from ..services.purchase_control_journal import get_order_card, list_filters, list_journal
+from ..services.purchase_control_journal import (
+    get_order_card,
+    get_selection_summary,
+    list_filters,
+    list_journal,
+)
 from ..services.purchase_control_snapshot import PurchaseJournalSnapshotUnavailable
 
 router = APIRouter(prefix="/v1/purchase-control", tags=["purchase-control"])
@@ -24,6 +29,22 @@ class PurchaseControlMaterializeRequest(BaseModel):
     snapshot_id: int = Field(..., ge=1)
     row_keys: list[str] = Field(default_factory=list)
     dry_run: bool = True
+
+
+class PurchaseControlSelectionSummaryRequest(BaseModel):
+    snapshot_id: int = Field(..., ge=1)
+    row_keys: list[str] = Field(..., min_length=1, max_length=500)
+    horizon_period_to: Optional[date] = None
+
+
+class PurchaseControlSelectionSummaryResponse(BaseModel):
+    snapshot_id: int
+    selected_rows: int
+    priced_rows: int
+    unpriced_rows: int
+    known_amount: float
+    total_amount: Optional[float] = None
+    amount_status: Literal["complete", "partial", "unavailable"]
 
 
 @router.get("/orders", response_model=dict)
@@ -101,6 +122,30 @@ def get_filters(db: Session = Depends(get_db)):
         return list_filters(db)
     except PurchaseJournalSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/selection-summary",
+    response_model=PurchaseControlSelectionSummaryResponse,
+)
+def summarize_purchase_control_selection(
+    payload: PurchaseControlSelectionSummaryRequest,
+    db: Session = Depends(get_db),
+):
+    """Backend-owned totals for the selected immutable purchase rows."""
+    try:
+        return get_selection_summary(
+            db,
+            snapshot_id=payload.snapshot_id,
+            row_keys=payload.row_keys,
+            horizon_period_to=payload.horizon_period_to,
+        )
+    except PurchaseJournalSnapshotUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.as_dict())
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

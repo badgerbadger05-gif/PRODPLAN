@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PurchaseRow } from '../../domain/purchaseControl'
 import {
   materializePurchaseControlRows,
+  getPurchaseSelectionSummary,
   getPurchaseFilters,
   getPurchaseOrderCard,
   listPurchaseJournal,
@@ -18,6 +19,7 @@ import { PurchaseControlPage } from './PurchaseControlPage'
 
 vi.mock('../../services/purchaseControl', () => ({
   materializePurchaseControlRows: vi.fn(),
+  getPurchaseSelectionSummary: vi.fn(),
   getPurchaseFilters: vi.fn(),
   getPurchaseOrderCard: vi.fn(),
   listPurchaseJournal: vi.fn(),
@@ -256,6 +258,15 @@ describe('PurchaseControlPage Doctype migration', () => {
       dry_run: false,
       status: 'completed',
     })
+    vi.mocked(getPurchaseSelectionSummary).mockResolvedValue({
+      snapshot_id: 51,
+      selected_rows: 1,
+      priced_rows: 1,
+      unpriced_rows: 0,
+      known_amount: 1200,
+      total_amount: 1200,
+      amount_status: 'complete',
+    })
   })
 
   it('preserves dense journal rows, summary controls and explicit search', async () => {
@@ -287,6 +298,12 @@ describe('PurchaseControlPage Doctype migration', () => {
     await screen.findAllByText('Под заказ (MRP)')
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Выбрать строку buy:9:default' }))
+    await waitFor(() => expect(getPurchaseSelectionSummary).toHaveBeenCalledWith({
+      snapshot_id: 51,
+      row_keys: ['buy:9:default'],
+      horizon_period_to: null,
+    }, expect.any(AbortSignal)))
+    expect(await screen.findByText('Сумма: 1 200')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Сформировать заказы (1)' }))
 
     await waitFor(() => expect(materializePurchaseControlRows).toHaveBeenCalledWith({ snapshot_id: 51, row_keys: ['buy:9:default'], dry_run: false }))

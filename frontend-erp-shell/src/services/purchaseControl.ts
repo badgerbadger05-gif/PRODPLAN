@@ -1,4 +1,10 @@
-import type { PurchaseFiltersResponse, PurchaseOrderCard, PurchaseOrdersResponse } from '../domain/purchaseControl'
+import type {
+  PurchaseFiltersResponse,
+  PurchaseOrderCard,
+  PurchaseOrdersResponse,
+  PurchaseSelectionSummary,
+  PurchaseSelectionSummaryRequest,
+} from '../domain/purchaseControl'
 import { syncActions } from '../domain/sync'
 import { api } from '../lib/api'
 import { getODataConfig } from './sync'
@@ -13,6 +19,16 @@ export function getPurchaseOrderCard(orderId: number) {
 
 export function getPurchaseFilters() {
   return api<PurchaseFiltersResponse>('/v1/purchase-control/filters')
+}
+
+export function getPurchaseSelectionSummary(
+  payload: PurchaseSelectionSummaryRequest,
+  signal?: AbortSignal,
+) {
+  return api<PurchaseSelectionSummary>('/v1/purchase-control/selection-summary', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }, signal)
 }
 
 export function materializePurchaseControlRows(payload: {

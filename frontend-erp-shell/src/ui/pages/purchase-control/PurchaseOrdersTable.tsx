@@ -142,6 +142,9 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                 )}
             </td>
             <td className="numCell">
+              {row.price !== null ? qty(row.price) : <span className="muted">—</span>}
+            </td>
+            <td className="numCell">
               {row.amount !== null && row.amount > 0 ? qty(row.amount) : <span className="muted">—</span>}
             </td>
           </tr>

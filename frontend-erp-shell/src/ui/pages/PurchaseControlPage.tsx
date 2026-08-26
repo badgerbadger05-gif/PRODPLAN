@@ -13,6 +13,7 @@ import { useOptionalSession } from '../session'
 import { PurchaseDetailPane } from './purchase-control/PurchaseDetailPane'
 import { PurchaseFilterBar } from './purchase-control/PurchaseFilterBar'
 import { PurchaseOrdersTable } from './purchase-control/PurchaseOrdersTable'
+import { PurchaseSelectionSummary } from './purchase-control/PurchaseSelectionSummary'
 import {
   createPurchaseOrdersDoctype,
   type PurchaseOrderSortKey,
@@ -134,6 +135,8 @@ export function PurchaseControlPage() {
       renderToolbarAfter={(state) => {
         const summary = state.listMeta.summary as PurchaseJournalSummary | undefined
         const eligibleCount = state.rows.filter((row) => doctype.selectable?.(row) !== false).length
+        const snapshotId = Number((state.listMeta.meta as { snapshot_id?: number } | undefined)?.snapshot_id ?? 0)
+        const selectionKey = state.selection.map((row) => row.row_key).sort().join('\u001f')
         return (
           <div className="commandBar purchaseSummaryBar">
             <button onClick={() => state.setVisibleSelection(true)} disabled={!eligibleCount}>
@@ -142,6 +145,11 @@ export function PurchaseControlPage() {
             <button onClick={() => state.setVisibleSelection(false)} disabled={!state.selection.length}>
               Снять выбор
             </button>
+            <PurchaseSelectionSummary
+              snapshotId={snapshotId}
+              selectionKey={selectionKey}
+              horizonPeriodTo={state.filters.horizon_period_to}
+            />
             {summary && (
               <>
                 <div className="barSeparator" />

@@ -450,6 +450,9 @@ class Item(Base):
     supplier_ref1c = Column(String(36), nullable=True, index=True)
     replenishment_method = Column(String(50))
     replenishment_time = Column(Integer)
+    # Последняя учётная цена из регистра 1С. NULL означает, что для позиции
+    # цена в регистре отсутствует; это не эквивалентно нулевой цене.
+    accounting_price = Column(DECIMAL(15, 2), nullable=True)
     #: ``ТипНоменклатуры`` из 1С: «Запас», «Услуга», «Работа».  Услуга не бывает
     #: на складе, и требовать её остаток бессмысленно.
     item_type = Column(String(50), nullable=True, index=True)

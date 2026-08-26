@@ -38,14 +38,14 @@ const row: PurchaseRow = {
   supply_phase: 'no_goods',
   counts_in_mrp: true,
   price: 50,
-  amount: 0,
+  amount: 5000,
   run_id: 3,
   fact_status: 'available',
   fact_source: 'mrp',
 }
 
 describe('purchase journal CSV schema', () => {
-  it('keeps the established 14 columns, semicolon format, and value mapping', () => {
+  it('exports accounting price and backend-computed amount', () => {
     const doctype = createPurchaseOrdersDoctype()
     const csv = buildDoctypeCsv({
       doctype,
@@ -56,8 +56,8 @@ describe('purchase journal CSV schema', () => {
     })
 
     expect(csv).toBe(
-      '"Заказ";"Дата заказа";"Поставщик";"Артикул";"Номенклатура";"Заказано";"Поступило";"Осталось";"Дата поставки";"Просрочка, дн";"Статус 1С";"Фаза";"Статус";"Сумма"\n'
-      + '"Под заказ (MRP)";"2026-07-20";"ООО Металл";"ART-42";"Лист стальной";"100";"0";"100";"2026-07-25";"";"";"Нет товара";"К заказу";""\n',
+      '"Заказ";"Дата заказа";"Поставщик";"Артикул";"Номенклатура";"Заказано";"Поступило";"Осталось";"Дата поставки";"Просрочка, дн";"Статус 1С";"Фаза";"Статус";"Учётная цена";"Сумма"\n'
+      + '"Под заказ (MRP)";"2026-07-20";"ООО Металл";"ART-42";"Лист стальной";"100";"0";"100";"2026-07-25";"";"";"Нет товара";"К заказу";"50";"5000"\n',
     )
   })
 

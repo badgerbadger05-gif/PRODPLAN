@@ -259,6 +259,30 @@ def test_materialize_endpoint_dry_run_preview(client, db_session):
     assert db_session.query(models.PurchaseExportObligationAllocation).count() == 0
 
 
+def test_selection_summary_endpoint_reports_missing_accounting_price(client, db_session):
+    _generation, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+
+    response = client.post(
+        "/api/v1/purchase-control/selection-summary",
+        json={
+            "snapshot_id": snapshot.id,
+            "row_keys": [row["row_key"]],
+        },
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json() == {
+        "snapshot_id": snapshot.id,
+        "selected_rows": 1,
+        "priced_rows": 0,
+        "unpriced_rows": 1,
+        "known_amount": 0.0,
+        "total_amount": None,
+        "amount_status": "unavailable",
+    }
+
+
 def test_materialize_endpoint_returns_not_configured_when_materializer_missing(
     client,
     db_session,
