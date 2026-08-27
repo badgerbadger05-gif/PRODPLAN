@@ -299,11 +299,12 @@ def test_candidate_is_idempotent_and_groups_multiple_lines(db_session):
 
     assert second.id == first.id
     assert second.payload == first.payload
-    assert first.payload["rows"] == []
+    assert [row["item_code"] for row in first.payload["rows"]] == ["MAT-A", "MAT-B"]
     assert [line["item_code"] for line in first.payload["cards"][str(order.order_id)]["lines"]] == [
         "MAT-A", "MAT-B",
     ]
-    assert all(row["row_generator"] == "mrp_reservation" for row in first.payload["rows"])
+    assert all(row["row_generator"] == "ledger_future_supply" for row in first.payload["rows"])
+    assert all(row["supply_phase"] == "no_goods" for row in first.payload["rows"])
 
 
 @pytest.mark.parametrize(
@@ -456,11 +457,11 @@ def test_filters_sort_pagination_and_summary_use_only_snapshot(db_session):
         sort_dir="desc", limit=1, offset=1, active_only=True,
     )
 
-    assert result["total"] == 0
+    assert result["total"] == 2
     assert result["summary"] == {
-        "total_rows": 0,
-        "by_status": {},
-        "by_phase": {},
+        "total_rows": 2,
+        "by_status": {"partial": 2},
+        "by_phase": {"no_goods": 2},
         "to_order": 0,
         "overdue": 0,
         "expected_7d": 0,

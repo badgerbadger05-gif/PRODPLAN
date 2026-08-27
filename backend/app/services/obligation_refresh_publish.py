@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.purchase_control_snapshot import validate_purchase_control_journal_buy_row
+from app.services.purchase_control_snapshot import validate_purchase_control_journal_row
 from app.services.production_control_journal_snapshot import (
     CONSUMER as _PRODUCTION_JOURNAL_CONSUMER,
     SNAPSHOT_KEY as _PRODUCTION_JOURNAL_SNAPSHOT_KEY,
@@ -691,7 +691,7 @@ def _exact_retry(
     seen_journal_rows: set[str] = set()
     for row in journal_rows:
         try:
-            validate_purchase_control_journal_buy_row(row)
+            validate_purchase_control_journal_row(row)
             key = str(row["row_key"])
         except (KeyError, TypeError, ValueError, InvalidOperation):
             return None
@@ -894,7 +894,7 @@ def publish_obligation_refresh_batch(
     seen_supply_rows: set[str] = set()
     for row in journal_rows:
         try:
-            validate_purchase_control_journal_buy_row(row)
+            validate_purchase_control_journal_row(row)
             key = str(row["row_key"])
         except (KeyError, TypeError, InvalidOperation) as exc:
             raise ObligationRefreshPublishError("purchase control journal row is malformed") from exc

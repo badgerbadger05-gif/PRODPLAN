@@ -75,6 +75,42 @@ const purchaseRow: PurchaseRow = {
   planning_stock_pool: 'default',
   open_order_covered_pct: 0,
   to_order_pct: 100,
+  slices: [
+    {
+      reservation_id: 201,
+      work_item_id: 301,
+      requirement_id: 101,
+      run_id: 17,
+      plan_period_from: '2026-08-01',
+      plan_period_to: '2026-08-31',
+      need_date: '2026-08-01',
+      need_period_to: '2026-08-31',
+      period_label: 'Август 2026',
+      required_qty: 5,
+      realized_qty: 0,
+      open_order_covered_qty: 0,
+      to_order_qty: 5,
+      to_order_pct: 100,
+      coverage_slices: [],
+    },
+    {
+      reservation_id: 202,
+      work_item_id: 302,
+      requirement_id: 102,
+      run_id: 18,
+      plan_period_from: '2026-09-01',
+      plan_period_to: '2026-09-30',
+      need_date: '2026-09-01',
+      need_period_to: '2026-09-30',
+      period_label: 'Сентябрь 2026',
+      required_qty: 7,
+      realized_qty: 0,
+      open_order_covered_qty: 0,
+      to_order_qty: 7,
+      to_order_pct: 100,
+      coverage_slices: [],
+    },
+  ],
   fact_status: 'available',
   fact_source: 'mrp',
 }
@@ -278,6 +314,10 @@ describe('PurchaseControlPage Doctype migration', () => {
     // Справочник поставщиков грузится отдельным запросом от журнала — ждём его.
     expect(await screen.findByRole('option', { name: 'Промснаб' })).toBeInTheDocument()
     expect(screen.getByText(/в живых заказах 0 шт \(0%\) · к заказу 12 шт \(100%\)/)).toBeInTheDocument()
+    expect(screen.getByText('потребность − поступило − покрыто живыми заказами')).toBeVisible()
+    expect(screen.getByText('Август 2026')).toBeVisible()
+    expect(screen.getByText('Сентябрь 2026')).toBeVisible()
+    expect(screen.getByText(/Нужно 5 · поступило 0 · в заказах 0 · к заказу 5/)).toBeVisible()
     // Заголовок Ledger-блока рендерится ещё до ответа сервисов, ждать надо сами данные.
     expect(await screen.findByText('Основной склад')).toBeInTheDocument()
     expect(screen.getByText('Ledger по номенклатуре')).toBeInTheDocument()

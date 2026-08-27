@@ -24,6 +24,7 @@ from app.services.planning_truth import (
 )
 from app.services.odata_config import load_odata_config as _load_odata_config
 from app.services.production_control_common import to_float_strict as _to_float
+from app.services.supplier_order_status import phase_value, state_counts_in_mrp
 
 
 CONSUMER = "purchase_control_journal"
@@ -157,6 +158,33 @@ def validate_purchase_control_journal_buy_row(row: Any) -> None:
             raise ValueError("purchase control buy row lineage is malformed")
 
 
+def validate_purchase_control_journal_supply_row(row: Any) -> None:
+    if not isinstance(row, dict):
+        raise ValueError("purchase control supplier row is malformed")
+    if str(row.get("row_generator") or "") != "ledger_future_supply":
+        raise ValueError("purchase control supplier row has unsupported generator")
+    if not str(row.get("row_key") or "").startswith("ledger-supply:"):
+        raise ValueError("purchase control supplier row key is malformed")
+    if row.get("fact_source") != "ledger" or row.get("fact_status") != "available":
+        raise ValueError("purchase control supplier row violates the Ledger fact contract")
+    ordered = _to_float(row.get("quantity"))
+    realized = _to_float(row.get("received_qty"))
+    open_qty = _to_float(row.get("remaining_qty"))
+    if ordered < 0 or realized < 0 or open_qty < 0 or open_qty > ordered + _EPS_FLOAT:
+        raise ValueError("purchase control supplier row has invalid quantities")
+    if not str(row.get("order_ref1c") or "").strip():
+        raise ValueError("purchase control supplier row identity is malformed")
+    if not str(row.get("item_code") or "").strip():
+        raise ValueError("purchase control supplier row item is malformed")
+
+
+def validate_purchase_control_journal_row(row: Any) -> None:
+    if isinstance(row, dict) and row.get("row_generator") == _BUY_ROW_GENERATOR:
+        validate_purchase_control_journal_buy_row(row)
+        return
+    validate_purchase_control_journal_supply_row(row)
+
+
 def _period_label(period_to: Any) -> str | None:
     if period_to is None:
         return None
@@ -183,6 +211,28 @@ def _overdue_days(need_date_iso: Any, cutoff_date: date | None) -> int:
     except ValueError:
         return 0
     return max((cutoff_date - need).days, 0)
+
+
+def _supplier_line_status(
+    *,
+    open_qty: float,
+    realized_qty: float,
+    eta_date: date | None,
+    cutoff_date: date,
+    supply_phase: str,
+) -> str:
+    """Project a display status from generation-pinned supplier evidence."""
+    if supply_phase == "terminal":
+        return "closed"
+    if open_qty <= _EPS_FLOAT:
+        return "received"
+    if eta_date is not None and eta_date < cutoff_date:
+        return "overdue"
+    if realized_qty > _EPS_FLOAT:
+        return "partial"
+    if eta_date is None:
+        return "no_date"
+    return "expected"
 
 
 def order_block_reason(
@@ -488,6 +538,13 @@ def _build_supplier_card_rows(
             else None
         )
 
+        order_state_name = str(supply.source_state_key or "")
+        supply_phase = phase_value(order_state_name)
+        overdue_days = (
+            max((generation.cutoff.date() - supply.eta_date).days, 0)
+            if supply.eta_date is not None
+            else 0
+        )
         row = {
             "row_key": f"ledger-supply:{int(supply.id)}",
             "line_id": None,
@@ -497,9 +554,9 @@ def _build_supplier_card_rows(
             "order_number": str(order.order_number or "") if order else source_ref,
             "order_date": order.order_date.isoformat() if order and order.order_date else None,
             "order_ref1c": supply.source_ref,
-            "order_state_name": supply.source_state_key,
-            "supply_phase": None,
-            "counts_in_mrp": None,
+            "order_state_name": order_state_name,
+            "supply_phase": supply_phase,
+            "counts_in_mrp": state_counts_in_mrp(order_state_name),
             "source": "ledger",
             "supplier_id": int(order.supplier_id) if order and order.supplier_id is not None else None,
             "supplier_name": str(supplier.supplier_name or "") if supplier else "",
@@ -513,8 +570,14 @@ def _build_supplier_card_rows(
             "remaining_qty": open_qty,
             "delivery_date": supply.eta_date.isoformat() if supply.eta_date else None,
             "need_date": None,
-            "overdue_days": None,
-            "line_status": "unavailable",
+            "overdue_days": overdue_days,
+            "line_status": _supplier_line_status(
+                open_qty=open_qty,
+                realized_qty=realized,
+                eta_date=supply.eta_date,
+                cutoff_date=generation.cutoff.date(),
+                supply_phase=supply_phase,
+            ),
             "price": None,
             "amount": None,
             "run_id": None,
@@ -534,10 +597,21 @@ def _build_supplier_card_rows(
                     "order_date",
                     "order_ref1c",
                     "order_state_name",
+                    "supply_phase",
+                    "counts_in_mrp",
                     "supplier_id",
                     "supplier_name",
                 )
             }
+            header.update(
+                {
+                    "deletion_mark": bool(order.deletion_mark),
+                    "is_posted": bool(order.is_posted),
+                    "document_amount": float(order.document_amount or 0),
+                    "active": not bool(order.deletion_mark),
+                    "source": "1c",
+                }
+            )
             card = cards.setdefault(str(int(order.order_id)), {"order": header, "lines": []})
             if card["order"] != header:
                 raise ValueError("conflicting frozen supplier-order header")
@@ -894,8 +968,8 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
         raise ValueError("purchase journal candidate requires BUILDING Ledger generation")
 
     to_order_buckets: list[dict[str, Any]] = []
-    _, cards = _build_supplier_card_rows(db, generation)
-    merged_rows = [
+    supplier_rows, cards = _build_supplier_card_rows(db, generation)
+    buyer_rows = [
         dict(row)
         for row in _build_buyer_rows(
             db,
@@ -905,6 +979,7 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
         )
         if float(row.get("remaining_qty") or 0) >= 0
     ]
+    merged_rows = [*supplier_rows, *buyer_rows]
 
     by_bucket: dict[str, dict[str, Any]] = {}
     for bucket in to_order_buckets:
@@ -1054,7 +1129,7 @@ def promote_candidate_snapshot(
     seen: set[str] = set()
     for row in rows:
         try:
-            validate_purchase_control_journal_buy_row(row)
+            validate_purchase_control_journal_row(row)
             key = str(row["row_key"])
         except (KeyError, TypeError) as exc:
             raise PurchaseJournalPromotionError(

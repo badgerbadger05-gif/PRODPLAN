@@ -70,6 +70,8 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
             <strong>{activeRow.open_order_covered_qty == null ? '—' : `${qty(activeRow.open_order_covered_qty)} (${formatCoveragePercent(activeRow.open_order_covered_pct)})`}</strong>
             <span>К заказу</span>
             <strong>{activeRow.to_order_qty == null ? '—' : `${qty(activeRow.to_order_qty)} (${formatCoveragePercent(activeRow.to_order_pct)})`}</strong>
+            <span>Формула</span>
+            <strong>потребность − поступило − покрыто живыми заказами</strong>
           </>
         ) : (
           <>
@@ -117,6 +119,29 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
             )}
         </strong>
       </div>
+
+      {activeRow.row_generator === 'mrp_reservation' && Boolean(activeRow.slices?.length) && (
+        <>
+          <h2 style={{ marginTop: 16 }}>Потребность по планам</h2>
+          <div className="detailList">
+            {activeRow.slices?.map((slice) => (
+              <div key={`${slice.reservation_id}:${slice.work_item_id}`} className="detailListRow">
+                <span className="detailListName">
+                  <strong>{slice.period_label || dateRu(slice.plan_period_to) || '—'}</strong>
+                  <small>
+                    Нужно {qty(slice.required_qty)} · поступило {qty(slice.realized_qty)} · в заказах {qty(slice.open_order_covered_qty)} · к заказу {qty(slice.to_order_qty)}
+                  </small>
+                  {slice.coverage_slices.length > 0 && (
+                    <small>
+                      {slice.coverage_slices.map((coverage) => `Заказ ${coverage.source_ref}, строка ${coverage.source_line_ref}: ${qty(coverage.covered_qty)}`).join(' · ')}
+                    </small>
+                  )}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <ItemLedgerSummaryBlock itemId={activeRow.item_id} unit={activeRow.unit} />
 

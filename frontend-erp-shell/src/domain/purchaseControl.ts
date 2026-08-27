@@ -16,15 +16,26 @@ export type PurchaseFactStatus = 'available' | 'unavailable'
 export type SupplyPhase = 'no_goods' | 'in_transit' | 'in_stock' | 'terminal' | 'unknown'
 
 export type PurchaseCoverageSlice = {
+  reservation_id: number
+  work_item_id: number
+  requirement_id: number
+  run_id: number
   plan_period_from: string | null
   plan_period_to: string | null
+  need_date: string | null
+  need_period_to: string | null
   period_label: string | null
   required_qty: number
   realized_qty: number
   open_order_covered_qty: number
   to_order_qty: number
   to_order_pct: number
-  coverage_slices: unknown[]
+  coverage_slices: Array<{
+    source_type: 'supplier_order'
+    source_ref: string
+    source_line_ref: string
+    covered_qty: number
+  }>
 }
 
 export type PurchaseHorizonBucket = {

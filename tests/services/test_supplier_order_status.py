@@ -21,6 +21,7 @@ from app.services.supplier_order_status import (
         ("Оплачен полностью", SupplyPhase.IN_TRANSIT),
         ("Оплаченый полностью", SupplyPhase.IN_TRANSIT),  # опечатка в 1С
         ("Заказан (товар в пути)", SupplyPhase.IN_TRANSIT),
+        ("Товар в пути", SupplyPhase.IN_TRANSIT),
         ("В пути", SupplyPhase.IN_TRANSIT),
         ("Получен Агентом", SupplyPhase.IN_TRANSIT),
         ("Отправлен по России", SupplyPhase.IN_TRANSIT),
@@ -45,6 +46,7 @@ def test_normalize_state_casefold_and_yo():
     [
         ("В пути", True),
         ("Заказан (товар в пути)", True),
+        ("Товар в пути", True),
         ("Принят на склад", True),
         ("Оплаченый полностью", True),
         ("В закупку", False),

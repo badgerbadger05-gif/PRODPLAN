@@ -50,6 +50,7 @@ STATE_TO_PHASE = {
     "оплачен полностью": SupplyPhase.IN_TRANSIT,
     "оплаченый полностью": SupplyPhase.IN_TRANSIT,  # опечатка в справочнике 1С
     "заказан (товар в пути)": SupplyPhase.IN_TRANSIT,
+    "товар в пути": SupplyPhase.IN_TRANSIT,
     "в пути": SupplyPhase.IN_TRANSIT,
     "получен агентом": SupplyPhase.IN_TRANSIT,
     "отправлен по россии": SupplyPhase.IN_TRANSIT,
