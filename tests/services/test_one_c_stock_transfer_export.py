@@ -1104,3 +1104,15 @@ def test_number_probing_escapes_a_band_owned_by_another_contour(db_session, monk
     assert issue.document_number not in occupied
     assert issue.document_number.startswith("MT")
     assert issue.document_number[2:].isdigit()
+
+
+def test_shadow_number_offset_moves_transfer_into_dedicated_band(
+    db_session, monkeypatch
+):
+    db = db_session
+    parent = _mk_item(db, code="TRP-OFFSET", ref1c="parent-offset-ref")
+    comp = _mk_item(db, code="TRC-OFFSET", ref1c="comp-offset-ref")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-offset")
+    monkeypatch.setenv("PRODPLAN_MATERIAL_ISSUE_NUMBER_OFFSET", "100000000")
+
+    assert material_issue_number(db, issue) == f"MT{100000000 + issue.issue_id:09d}"

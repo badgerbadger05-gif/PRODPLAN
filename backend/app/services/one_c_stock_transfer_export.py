@@ -53,7 +53,7 @@ from .one_c_export_common import (
 from .mrp_mutation_guard import require_materialized_orders
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
-from .one_c_document_numbers import material_issue_number
+from .one_c_document_numbers import material_issue_number, material_issue_number_value
 from .one_c_production_order_export import export_production_orders_to_1c
 from .planning_truth import require_accepted_truth
 
@@ -320,16 +320,17 @@ def _transfer_number_offset(attempt: int) -> int:
 def _origin_transfer_number(entry: StockTransferExportEntry, *, attempt: int = 0) -> str:
     if not entry.origin_token:
         raise ValueError("material issue export has no durable origin token")
-    prefix = "RT" if str(entry.direction or "issue") == "return" else "MT"
     # 2 + 9 = the 11-character limit of Document_ПеремещениеЗапасов.Number.
-    # Keep the familiar stable-contour format (MT000002982) for operators.
+    # Keep the familiar numeric format for operators while allowing parallel
+    # contours to reserve disjoint configured ranges.
     # Probing is used only when that human-facing number is already owned by
     # another local or 1C document; durable ownership and retry recovery
     # continue to rely on prodplan-origin, not on the display number.
-    number_part = (
-        int(entry.issue_id) + _transfer_number_offset(attempt)
-    ) % 1_000_000_000
-    return f"{prefix}{number_part:09d}"
+    return material_issue_number_value(
+        int(entry.issue_id),
+        direction=str(entry.direction or "issue"),
+        probe_offset=_transfer_number_offset(attempt),
+    )
 
 
 def _document_by_number(client: Any, number: str) -> Optional[Dict[str, Any]]:
