@@ -66,6 +66,7 @@ export type PurchaseOrdersResponse = {
   limit: number
   offset: number
   run_id: number | null
+  run_ids?: number[]
   summary: PurchaseJournalSummary
 }
 

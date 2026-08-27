@@ -31,7 +31,7 @@ def get_orders(
 ):
     """
     Журнал закупок: строки заказов поставщику (1С) + незаказанные MRP-потребности
-    (`line_status = to_order`) последнего FIXED_SNAPSHOT-прогона.
+    (`line_status = to_order`) всех активных FIXED_SNAPSHOT-прогонов.
     """
     try:
         return list_journal(

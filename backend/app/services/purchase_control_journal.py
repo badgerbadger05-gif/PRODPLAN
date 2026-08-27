@@ -2,8 +2,8 @@
 Purchase control journal ("Журнал закупок").
 
 Read model over supplier orders synced from 1C (Document_ЗаказПоставщику)
-plus not-yet-ordered MRP purchase needs (planned_purchase rows of the latest
-FIXED_SNAPSHOT run without a successful SyncLink). Ordering itself reuses
+plus not-yet-ordered MRP purchase needs (planned_purchase rows of all active
+FIXED_SNAPSHOT runs without a successful SyncLink). Ordering itself reuses
 POST /v1/plan/results/{run_id}/purchases/export-to-1c; receipts come from 1C
 via supplier order sync. See .docs/purchase_journal_plan.md.
 """
@@ -20,6 +20,7 @@ from ..models import (
     Item,
     PlannedPurchase,
     PlanningRun,
+    ProductionPlanHeader,
     Supplier,
     SupplierOrder,
     SupplierOrderItem,
@@ -109,13 +110,25 @@ def _line_status(
 
 
 def latest_fixed_run_id(db: Session) -> Optional[int]:
-    row = (
+    run_ids = active_fixed_run_ids(db)
+    return run_ids[-1] if run_ids else None
+
+
+def active_fixed_run_ids(db: Session) -> List[int]:
+    rows = (
         db.query(PlanningRun.run_id)
+        .outerjoin(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
         .filter(PlanningRun.status == "FIXED_SNAPSHOT")
-        .order_by(PlanningRun.run_id.desc())
-        .first()
+        .filter(
+            or_(
+                PlanningRun.source_plan_id.is_(None),
+                ProductionPlanHeader.status == "fixed",
+            )
+        )
+        .order_by(PlanningRun.run_id.asc())
+        .all()
     )
-    return int(row[0]) if row else None
+    return [int(row[0]) for row in rows]
 
 
 def _exported_purchase_ids(db: Session) -> set:
@@ -435,7 +448,8 @@ def list_journal(
     today: Optional[date] = None,
 ) -> Dict[str, Any]:
     today = today or date.today()
-    run_id = latest_fixed_run_id(db)
+    run_ids = active_fixed_run_ids(db)
+    run_id = run_ids[-1] if run_ids else None
 
     rows = _supplier_order_rows(
         db,
@@ -446,9 +460,16 @@ def list_journal(
         today=today,
     )
     if include_to_order and order_id is None:
-        rows.extend(
-            _to_order_rows(db, run_id=run_id, supplier_id=supplier_id, search=search, today=today)
-        )
+        for fixed_run_id in run_ids:
+            rows.extend(
+                _to_order_rows(
+                    db,
+                    run_id=fixed_run_id,
+                    supplier_id=supplier_id,
+                    search=search,
+                    today=today,
+                )
+            )
 
     if state:
         state_norm = _normalize_state(state)
@@ -495,6 +516,7 @@ def list_journal(
         "limit": effective_limit,
         "offset": effective_offset,
         "run_id": run_id,
+        "run_ids": run_ids,
         "summary": summary,
     }
 

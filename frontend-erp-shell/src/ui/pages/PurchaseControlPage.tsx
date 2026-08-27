@@ -57,6 +57,7 @@ export function PurchaseControlPage() {
   const [message, setMessage] = useState('')
   const [total, setTotal] = useState(0)
   const [runId, setRunId] = useState<number | null>(null)
+  const [runIds, setRunIds] = useState<number[]>([])
   const [offset, setOffset] = useState(0)
   const [suppliers, setSuppliers] = useState<PurchaseSupplierOption[]>([])
   const [states, setStates] = useState<string[]>([])
@@ -114,6 +115,7 @@ export function PurchaseControlPage() {
       })
       setTotal(data.total ?? 0)
       setRunId(data.run_id ?? null)
+      setRunIds(data.run_ids ?? (data.run_id ? [data.run_id] : []))
       setSummary(data.summary ?? null)
       setOffset(data.offset ?? nextOffset)
       setActiveKey((currentKey) => {
@@ -172,22 +174,28 @@ export function PurchaseControlPage() {
   }
 
   async function orderTo1C() {
-    if (!runId) {
-      setError('Нет зафиксированного MRP-прогона: нечего заказывать')
+    const selectedRows = toOrderRows.filter((row) => selectedPurchaseRowKeys.has(row.row_key))
+    const idsByRun = new Map<number, Set<number>>()
+    selectedRows.forEach((row) => {
+      if (!row.run_id) return
+      const ids = idsByRun.get(row.run_id) ?? new Set<number>()
+      purchaseIdsForRow(row).forEach((id) => ids.add(id))
+      idsByRun.set(row.run_id, ids)
+    })
+    if (!idsByRun.size) {
+      setError('У выбранных строк не указан зафиксированный MRP-прогон')
       return
     }
-    const ids = [...new Set(
-      toOrderRows
-        .filter((row) => selectedPurchaseRowKeys.has(row.row_key))
-        .flatMap(purchaseIdsForRow),
-    )]
-    if (!ids.length) return
     setLoading(true)
     setError('')
     try {
-      const result = await exportPurchasesTo1C(runId, ids)
-      const created = Number(result.orders_created ?? 0)
-      const existing = Number(result.orders_existing ?? 0)
+      let created = 0
+      let existing = 0
+      for (const [selectedRunId, ids] of idsByRun) {
+        const result = await exportPurchasesTo1C(selectedRunId, [...ids])
+        created += Number(result.orders_created ?? 0)
+        existing += Number(result.orders_existing ?? 0)
+      }
       setMessage(`Заказы поставщику: создано ${created}, уже было ${existing}`)
       setSelectedPurchaseRowKeys(new Set())
       await syncSupplierOrdersFrom1C().catch(() => undefined)
@@ -235,7 +243,9 @@ export function PurchaseControlPage() {
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">Закупки / Журнал закупок</div>
-        <div className="runBadge">MRP run: {runId ?? '—'}</div>
+        <div className="runBadge">
+          {runIds.length ? `MRP: ${runIds.length} фикс. прогон${runIds.length === 1 ? '' : 'а'}` : `MRP run: ${runId ?? '—'}`}
+        </div>
       </div>
 
       <DocumentWindow

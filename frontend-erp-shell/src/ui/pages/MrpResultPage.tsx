@@ -23,7 +23,7 @@ import { StatusBar } from '../layout/StatusBar'
 
 type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
 
-const limit = 200
+const limit = 30
 
 function emptyTabFlags(): Record<Tab, boolean> {
   return { production: false, purchases: false, rework: false, capacity: false }

@@ -434,14 +434,14 @@ def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
 
 def _active_plan_snapshot_run_ids_for_root(db: Session, root_item_id: int) -> set[int]:
     rows = (
-        db.query(PlanningRun.source_plan_id, func.max(PlanningRun.run_id).label("run_id"))
+        db.query(PlanningRun.run_id)
         .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
         .join(ProductionPlanLine, ProductionPlanLine.plan_id == ProductionPlanHeader.id)
         .filter(ProductionPlanHeader.status == "fixed")
         .filter(ProductionPlanLine.item_id == int(root_item_id))
         .filter(PlanningRun.status == "FIXED_SNAPSHOT")
         .filter(PlanningRun.source_plan_id.isnot(None))
-        .group_by(PlanningRun.source_plan_id)
+        .distinct()
         .all()
     )
     return {int(row.run_id) for row in rows if row.run_id is not None}
