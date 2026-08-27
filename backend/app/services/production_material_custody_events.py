@@ -318,13 +318,26 @@ def project_transfer_custody_events_for_recorder(
         return 0
 
     lines: dict[int, ProductionMaterialIssueLine] = {}
-    for line in issue.lines or []:
+    for line in sorted(issue.lines or [], key=lambda row: int(row.line_id or 0)):
         component_id = int(line.component_item_id)
-        if component_id in lines:
+        existing = lines.get(component_id)
+        if existing is not None and (
+            str(existing.unit or "").strip() != str(line.unit or "").strip()
+            or int(existing.source_spec_id or 0) != int(line.source_spec_id or 0)
+            or str(existing.line_status or "").strip()
+            != str(line.line_status or "").strip()
+        ):
             raise RuntimeError(
-                "material issue has duplicate component rows; custody allocation is ambiguous"
+                "material issue has conflicting duplicate component rows; "
+                "custody allocation is ambiguous"
             )
-        lines[component_id] = line
+        # Older issue writers preserved repeated specification rows verbatim.
+        # Custody is component-scoped and the physical transfer is already
+        # aggregated by item, so equivalent rows share one deterministic event
+        # coordinate.  Their reservation openings are still summed by
+        # ``_custody_balance`` through issue_id + component_item_id.
+        if existing is None:
+            lines[component_id] = line
     appended = 0
     # Two passes.  A transfer may consume only what was reserved for it, and the
     # outbound and inbound rows of one component have to agree on that number

@@ -358,6 +358,94 @@ def test_ledger_projector_posts_transfer_custody_events(db_session, monkeypatch)
     assert len(events_after) == 3
 
 
+def test_ledger_projector_collapses_equivalent_duplicate_component_rows(db_session):
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-duplicate-equivalent",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    first = issue.lines[0]
+    first.required_qty = 11.0
+    first.issued_qty = 11.0
+    first.unit = "шт"
+    first.line_status = "issued"
+    db.add(
+        ProductionMaterialIssueLine(
+            issue_id=int(issue.issue_id),
+            component_item_id=int(first.component_item_id),
+            required_qty=11.0,
+            issued_qty=11.0,
+            unit="шт",
+            line_status="issued",
+        )
+    )
+    batch = _mk_transfer_batch(db, batch_key="batch-duplicate-equivalent")
+    posting_at = datetime(2026, 6, 23, 12, 0, 0)
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-duplicate-equivalent",
+        item_id=int(first.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-22.0, posting_at=posting_at, line_no=1,
+    )
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-duplicate-equivalent",
+        item_id=int(first.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=22.0, posting_at=posting_at, line_no=2,
+    )
+    db.commit()
+
+    rows = db.query(StockLedgerEntry).filter_by(
+        recorder_ref="ref-duplicate-equivalent"
+    ).all()
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-duplicate-equivalent",
+        stock_ledger_entries=rows,
+    ) == 3
+    db.flush()
+    events = db.query(ProductionMaterialCustodyEvent).filter_by(
+        issue_id=int(issue.issue_id)
+    ).all()
+    assert len(events) == 3
+    assert {event.document_line_no for event in events} == {str(first.line_id)}
+
+
+def test_ledger_projector_rejects_conflicting_duplicate_component_rows(db_session):
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        target_ref_key="ref-duplicate-conflict",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    first = issue.lines[0]
+    db.add(
+        ProductionMaterialIssueLine(
+            issue_id=int(issue.issue_id),
+            component_item_id=int(first.component_item_id),
+            required_qty=1.0,
+            issued_qty=0.0,
+            unit="кг",
+            line_status="planned",
+        )
+    )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="conflicting duplicate component rows"):
+        project_transfer_custody_events_for_recorder(
+            db,
+            recorder_type=STOCK_TRANSFER_ENTITY,
+            recorder_ref="ref-duplicate-conflict",
+            stock_ledger_entries=[],
+        )
+
+
 def test_ledger_projector_holds_only_what_was_reserved(db_session):
     """Shipping more than was reserved is ordinary, and the surplus is not ours.
 
