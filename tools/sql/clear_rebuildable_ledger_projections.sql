@@ -236,6 +236,35 @@ TRUNCATE
     purchase_export_batch
 RESTART IDENTITY;
 
+-- ``sync_link`` deliberately survives the rebuild because it is the durable
+-- idempotency record for documents already sent to 1C.  Its polymorphic
+-- ``source_id`` cannot own a foreign key to the rebuilt projection tables, so
+-- RESTART IDENTITY must not make new planned rows reuse one of those external
+-- identities.  Advance only the affected sequences; an empty link set keeps
+-- the normal first value of 1.
+SELECT setval(
+    pg_get_serial_sequence('planned_purchase', 'purchase_id'),
+    COALESCE((
+        SELECT max(source_id)
+        FROM sync_link
+        WHERE source_doctype = 'planned_purchase'
+    ), 1),
+    EXISTS (
+        SELECT 1 FROM sync_link WHERE source_doctype = 'planned_purchase'
+    )
+);
+SELECT setval(
+    pg_get_serial_sequence('planned_order', 'order_id'),
+    COALESCE((
+        SELECT max(source_id)
+        FROM sync_link
+        WHERE source_doctype = 'planned_order'
+    ), 1),
+    EXISTS (
+        SELECT 1 FROM sync_link WHERE source_doctype = 'planned_order'
+    )
+);
+
 ALTER TABLE planning_truth_state
     ADD CONSTRAINT planning_truth_state_current_generation_id_fkey
     FOREIGN KEY (current_generation_id)

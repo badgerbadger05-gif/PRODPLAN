@@ -144,6 +144,10 @@ def test_clear_script_is_guarded_and_preserves_non_rebuildable_inputs():
         "shelf_policy",
         "dbr_assembly_rate",
     }.isdisjoint(targets)
+    assert "pg_get_serial_sequence('planned_purchase', 'purchase_id')" in source
+    assert "source_doctype = 'planned_purchase'" in source
+    assert "pg_get_serial_sequence('planned_order', 'order_id')" in source
+    assert "source_doctype = 'planned_order'" in source
 
 
 def test_initial_legacy_clear_delegates_to_canonical_clear_fail_closed():
