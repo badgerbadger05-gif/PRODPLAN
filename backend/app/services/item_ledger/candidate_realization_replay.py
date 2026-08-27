@@ -85,7 +85,7 @@ def _manifest_replay_runs(
             retired_ids.add(retired_id)
             plan_ids.add(plan_id)
             continue
-        if action != "add":
+        if action not in {"add", "replace"}:
             raise CandidateRealizationReplayError(
                 "obligation_refresh_manifest contains unsupported action"
             )
@@ -118,6 +118,19 @@ def _manifest_replay_runs(
             or run.period_to is None
         ):
             raise CandidateRealizationReplayError("manifest candidate lineage or period conflicts")
+        if entry.get("action") == "add" and entry.get("parent_run_id") is not None:
+            raise CandidateRealizationReplayError("added candidate must not have a parent run")
+        if entry.get("action") == "replace":
+            try:
+                parent_run_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise CandidateRealizationReplayError(
+                    "replacement candidate lacks parent run lineage"
+                ) from exc
+            if int(run.prior_run_id or -1) != parent_run_id:
+                raise CandidateRealizationReplayError(
+                    "replacement candidate parent run lineage conflicts"
+                )
 
     # The target must have no unsealed candidate and no ReservationEntry that
     # could make an unlisted plan consume the shared physical prefix.

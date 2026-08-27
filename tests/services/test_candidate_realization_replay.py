@@ -231,6 +231,40 @@ def test_candidate_replay_retry_is_idempotent(db_session):
     assert after == before
 
 
+def test_candidate_replay_realizes_replacement_before_publication(db_session):
+    parent, target, candidates, parent_reservations = _world(
+        db_session,
+        candidate_periods=(date(2026, 7, 10),),
+        fact_rows=((datetime(2026, 7, 12), "5"),),
+    )
+    candidate, plan, old_run = candidates[0]
+    candidate.prior_run_id = int(old_run.run_id)
+    _seal(
+        target,
+        [
+            {
+                "action": "replace",
+                "plan_id": int(plan.id),
+                "parent_run_id": int(old_run.run_id),
+                "candidate_run_id": int(candidate.run_id),
+            }
+        ],
+        parent_id=int(parent.id),
+    )
+
+    result = replay_candidate_realizations(db_session, int(target.id))
+    db_session.flush()
+
+    replacement = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=int(target.id),
+        run_id=int(candidate.run_id),
+    ).one()
+    assert Decimal(result["allocated_qty"]) == Decimal("5")
+    assert replacement.realized_qty == Decimal("5")
+    assert replacement.replenishment_received_qty == Decimal("5")
+    assert [row.realized_qty for row in parent_reservations] == [Decimal("0")]
+
+
 def test_retained_and_candidate_replay_partition_one_sle_and_keep_open_output(
     db_session,
 ):

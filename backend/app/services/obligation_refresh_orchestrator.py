@@ -491,36 +491,22 @@ def run_obligation_refresh(
         "input_checksum": sha256(_canonical({"candidate_run_ids": candidate_ids, "freeze": freeze}).encode()).hexdigest(),
     }
     _complete(reservation_batch, reservation_metrics)
-    if incremental_rebase:
-        # Same physical cutoff: retained folds are copied as persisted state,
-        # while replacement reservations intentionally start empty. Replaying
-        # the historical prefix would assign old facts to the new MRP and was
-        # the multi-hour source of the previous implementation.
-        replay = {"status": "skipped_same_cutoff_rebase", "facts": 0}
-        supplier_summary = {
-            "provenance_count": 0,
-            "exact_fact_count": 0,
-            "allocation_count": 0,
-            "surplus_qty": "0",
-        }
-        replay_batch = _single_stage(db, target_id, "reservation_replay", key)
-        _complete(replay_batch, {
-            "replay_summary": _json_value(replay),
-            "supplier_receipt_summary": _json_value(supplier_summary),
-        })
-    else:
-        replay = replay_candidate_realizations(db, target_id)
-        supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
-            db,
-            ledger_generation_id=target_id,
-            cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
-        )
-        supplier_summary = {
-            "provenance_count": supplier.provenance_count,
-            "exact_fact_count": supplier.exact_fact_count,
-            "allocation_count": supplier.allocation_count,
-            "surplus_qty": supplier.surplus_qty,
-        }
+    # Replacement reservations are new live obligations and must see the same
+    # accepted physical prefix as every other candidate before publication.
+    # Skipping this replay temporarily resurrected already fulfilled purchase
+    # needs until the next physical refresh rebuilt the assignments.
+    replay = replay_candidate_realizations(db, target_id)
+    supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db,
+        ledger_generation_id=target_id,
+        cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
+    )
+    supplier_summary = {
+        "provenance_count": supplier.provenance_count,
+        "exact_fact_count": supplier.exact_fact_count,
+        "allocation_count": supplier.allocation_count,
+        "surplus_qty": supplier.surplus_qty,
+    }
     # Work items are a persisted projection of the reservation fold.  Both
     # make and supplier realizations must therefore be applied first; building
     # this projection earlier freezes stale ``fulfilled_qty``/``remaining_qty``

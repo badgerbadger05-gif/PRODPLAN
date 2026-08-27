@@ -90,7 +90,7 @@ def _run(db, parent, key, *, add=(), replace=(), config=None, pool_mapping=None)
     )
 
 
-def test_replacement_is_end_to_end_same_plan_saved_remainder_without_history_replay(db_session):
+def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay(db_session):
     accepted, plan, line, _item, parent, _cutoff = _world(
         db_session,
         qty=12,
@@ -142,7 +142,9 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_without_history_rep
     assert line.accepted_output_qty == Decimal("10")
     assert line.remaining_output_qty == Decimal("2")
     assert line.locked_by_run_id == candidate.run_id
-    assert replay_batch.metrics["replay_summary"]["status"] == "skipped_same_cutoff_rebase"
+    assert replay_batch.status == "completed"
+    assert replay_batch.metrics["facts"] == 0
+    assert "replay_summary" not in replay_batch.metrics
     assert execution_snapshot.payload["rows"] == []
     assert execution_snapshot.payload["summary"]["execution_completed_qty"] == 0
     assert execution_snapshot.payload["summary"]["execution_base_qty"] == 2
