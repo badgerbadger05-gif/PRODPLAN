@@ -839,10 +839,27 @@ class DatabaseRuntime:
     def fixed_snapshot_exists(self, generation_id: int, plan_id: int) -> bool:
         from app import models
 
+        generation = self.db.get(models.LedgerGeneration, int(generation_id))
+        if generation is None:
+            return False
+        manifest = dict(generation.source_watermarks or {}).get(
+            "obligation_refresh_manifest", {}
+        )
+        entries = list(dict(manifest or {}).get("entries") or [])
+        matching = [
+            entry
+            for entry in entries
+            if int(entry.get("plan_id") or 0) == int(plan_id)
+            and str(entry.get("action") or "") in {"add", "refresh"}
+            and entry.get("candidate_run_id") is not None
+        ]
+        if len(matching) != 1:
+            return False
+        expected_run_id = int(matching[0]["candidate_run_id"])
         rows = (
             self.db.query(models.PlanningRun)
             .filter(
-                models.PlanningRun.ledger_generation_id == generation_id,
+                models.PlanningRun.run_id == expected_run_id,
                 models.PlanningRun.source_plan_id == plan_id,
                 models.PlanningRun.status == "FIXED_SNAPSHOT",
             )
