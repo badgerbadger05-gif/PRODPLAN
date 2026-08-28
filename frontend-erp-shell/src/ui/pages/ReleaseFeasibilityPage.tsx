@@ -17,6 +17,7 @@ const STATUS_TITLE: Record<FeasibilityStatus, string> = {
   shortage: 'нет материала',
   blocked: 'нельзя изготовить',
   non_stock: 'не запас',
+  not_required: 'не требуется',
 }
 
 const STATUS_HINT: Record<FeasibilityStatus, string> = {
@@ -25,6 +26,7 @@ const STATUS_HINT: Record<FeasibilityStatus, string> = {
   make: 'Самого узла на складе нет, но всех его компонентов хватает — узел надо изготовить',
   shortage: 'Материал/покупное нечем закрыть — это и есть блокировка выпуска',
   blocked: 'Узел изготовить нельзя: внутри него не хватает компонентов',
+  not_required: 'Ветка закрыта остатком родителя и не создаёт потребность в компоненте',
 }
 
 function statusPill(status: FeasibilityStatus) {

@@ -191,11 +191,10 @@ def test_node_stock_stops_the_explosion(db_session):
 
     payload = analyze_release(db_session, product, 10.0)
 
-    # Выпуску ветка не мешает: узел берётся со склада, требуется 0.
-    [row] = payload["blocking"]
-    assert row["item_article"] == "ART-M1"
-    assert row["required_qty"] == 0.0
-    assert row["needed_now"] is False
+    # Выпуску ветка не мешает: узел берётся со склада, компонент не нужен.
+    assert payload["blocking"] == []
+    assert payload["summary"]["shortage_count"] == 0
+    assert payload["summary"]["blocked_count"] == 0
     assert payload["summary"]["producible_qty"] == 10.0
 
 
@@ -397,7 +396,7 @@ def test_find_items_marks_specification_presence(db_session):
 
 
 # ---------------------------------------------------------------------------
-# Раскраска полного состава: цвет позиции, а не «нужна ли ветка»
+# Полный состав: дефицит только в текущей чистой потребности
 # ---------------------------------------------------------------------------
 
 
@@ -411,13 +410,8 @@ def _find_node(node: dict, article: str) -> dict:
     return None
 
 
-def test_covered_branch_still_shows_a_position_that_cannot_be_closed(db_session):
-    """Родитель закрыт складом — но позиции нет вовсе и делать её не из чего.
-
-    Ветка в текущем выпуске не участвует, её потребность обнуляется. Красить по
-    ней нельзя: в полном составе такая позиция показывалась зелёным «хватает»,
-    и оператор видел состав, в котором ничего не мешает, хотя мешало.
-    """
+def test_covered_branch_does_not_create_component_need(db_session):
+    """Родителя хватает — ни потребности, ни дефицита компонента нет."""
     product = _mk_item(db_session, "P1")
     node = _mk_item(db_session, "N1", stock=100.0)          # закрыт складом
     coating = _mk_item(db_session, "C1")                     # 0, спеки нет
@@ -428,21 +422,16 @@ def test_covered_branch_still_shows_a_position_that_cannot_be_closed(db_session)
 
     row = _find_node(payload["tree"], "ART-C1")
     assert row["branch_required_qty"] == 0.0
-    assert row["status"] == "shortage"
-    assert row["stock_short"] is True
-    # И то же самое видно сразу в списке — оператор не обязан разворачивать
-    # состав, чтобы узнать, что позицию нечем закрыть.
-    [listed] = payload["blocking"]
-    assert listed["item_article"] == "ART-C1"
-    assert listed["status"] == "shortage"
-    assert listed["needed_now"] is False
-    assert listed["required_qty"] == 0.0
-    # На возможность выпустить это не влияет: узел берётся со склада.
+    assert row["branch_shortage_qty"] == 0.0
+    assert row["status"] == "not_required"
+    assert row["reason"] == "Не требуется: родитель закрыт остатком"
+    assert row["stock_short"] is False
+    assert payload["blocking"] == []
     assert payload["summary"]["producible_qty"] == 10.0
 
 
-def test_covered_branch_shows_a_position_that_can_still_be_made(db_session):
-    """Позиции нет, но есть из чего делать — жёлтая, даже если ветка не нужна."""
+def test_covered_branch_does_not_mark_make_need(db_session):
+    """Ненужную ветку нельзя красить как потребность в изготовлении."""
     product = _mk_item(db_session, "P1")
     node = _mk_item(db_session, "N1", stock=100.0)
     painted = _mk_item(db_session, "PT1")                    # 0 на складе
@@ -454,8 +443,11 @@ def test_covered_branch_shows_a_position_that_can_still_be_made(db_session):
     payload = analyze_release(db_session, product, 10.0, include_tree=True)
 
     row = _find_node(payload["tree"], "ART-PT1")
-    assert row["status"] == "make"
-    assert _find_node(payload["tree"], "ART-BL1")["status"] == "ok"
+    assert row["branch_required_qty"] == 0.0
+    assert row["status"] == "not_required"
+    assert row["reason"] == "Не требуется: родитель закрыт остатком"
+    assert _find_node(payload["tree"], "ART-BL1")["status"] == "not_required"
+    assert payload["blocking"] == []
 
 
 def test_partial_stock_keeps_the_row_yellow_and_marks_the_stock_cell(db_session):

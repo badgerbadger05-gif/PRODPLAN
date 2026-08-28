@@ -59,6 +59,9 @@ STATUS_OK = "ok"
 STATUS_MAKE = "make"
 STATUS_SHORTAGE = "shortage"
 STATUS_BLOCKED = "blocked"
+#: Позиция видна только в полном BOM, но её ветка закрыта остатком
+#: родителя и не создаёт ни потребность, ни дефицит.
+STATUS_NOT_REQUIRED = "not_required"
 #: Позиция, которой не бывает на складе: услуга/работа из 1С (травление, гибка
 #: на стороне, пошив) или маршрут «Переработка» (CANON §18).  Требовать с неё
 #: остаток бессмысленно, и выпуск она не блокирует.
@@ -457,43 +460,6 @@ def _classify(
     return status
 
 
-def _classify_structural(
-    order: List[int],
-    edges: Dict[int, Dict[int, float]],
-    stock: Dict[int, float],
-    non_stock: Set[int],
-) -> Dict[int, str]:
-    """Цвет позиции по её собственному состоянию, без оглядки на ветку.
-
-    Ветка, чей родитель закрыт складом, не участвует в текущем выпуске, и её
-    потребность обнуляется. Красить по ней нельзя: позиция, которой нет вовсе и
-    делать которую не из чего, показывалась зелёным «хватает» — оператор видел
-    полный состав, в котором ничего не мешает, хотя мешало.
-
-    Здесь вопрос другой и не зависит от количества: чем эту позицию вообще
-    закрыть. Есть остаток — зелёная; нет, но все компоненты доступны — жёлтая
-    (надо изготовить); нет и делать не из чего — красная.
-    """
-    status: Dict[int, str] = {}
-    for item_id in reversed(order):
-        comps = edges.get(item_id) or {}
-        if item_id in non_stock:
-            status[item_id] = STATUS_NON_STOCK
-            continue
-        if _to_float(stock.get(item_id, 0.0)) > EPS:
-            status[item_id] = STATUS_OK
-            continue
-        if not comps:
-            status[item_id] = STATUS_SHORTAGE
-            continue
-        blocked = any(
-            status.get(comp_id) in (STATUS_SHORTAGE, STATUS_BLOCKED)
-            for comp_id in comps
-        )
-        status[item_id] = STATUS_BLOCKED if blocked else STATUS_MAKE
-    return status
-
-
 def _has_hard_shortage(
     root_item_id: int,
     order: List[int],
@@ -688,7 +654,6 @@ def analyze_release(
         )
     }
     status_map = _classify(root_item_id, order, edges, exploded, non_stock)
-    structural_map = _classify_structural(order, edges, stock, non_stock)
 
     warnings: List[str] = []
     if cycles:
@@ -763,56 +728,6 @@ def analyze_release(
             }
         )
 
-    # Позиция, которую нечем закрыть, попадает в список даже когда её ветка
-    # закрыта остатком родителя и в этом количестве не нужна.  Иначе оператор
-    # открывает проверку, видит «блокирующих нет» и не знает, что деталь не из
-    # чего сделать: она всплывёт при первом же выпуске, который эту ветку
-    # затронет.  Потребность у такой строки нулевая — это видно в колонке.
-    listed = {int(row["item_id"]) for row in blocking}
-    for item_id in order:
-        if item_id == root_item_id or int(item_id) in listed:
-            continue
-        structural = structural_map.get(item_id, STATUS_OK)
-        if structural not in (STATUS_SHORTAGE, STATUS_BLOCKED):
-            continue
-        values = exploded.get(item_id) or {}
-        info = meta.get(item_id, {})
-        blocking.append(
-            {
-                "item_id": item_id,
-                "item_code": info.get("item_code", ""),
-                "item_article": info.get("item_article", ""),
-                "item_name": info.get("item_name", ""),
-                "unit": info.get("unit", ""),
-                "replenishment_method": info.get("replenishment_method", ""),
-                "level": int(llc.get(item_id, 0)),
-                "kind": "node" if edges.get(item_id) else "material",
-                "status": structural,
-                "reason": _status_reason(
-                    structural,
-                    str(info.get("replenishment_method", "")),
-                    bool(edges.get(item_id)),
-                    str(info.get("item_type", "")),
-                ),
-                "replenishment_time": info.get("replenishment_time"),
-                "needed_now": False,
-                "is_blocking": True,
-                "required_qty": 0.0,
-                "stock_on_hand": _round_qty(values.get("stock", 0.0)),
-                "allocated_qty": 0.0,
-                "shortage_qty": 0.0,
-                "used_in": [
-                    {
-                        "item_id": parent_id,
-                        "item_article": (meta.get(parent_id) or {}).get("item_article", ""),
-                        "item_name": (meta.get(parent_id) or {}).get("item_name", ""),
-                    }
-                    for parent_id in sorted(parents_by_item.get(item_id, []))[:8]
-                ],
-                "warehouses": [],
-            }
-        )
-
     breakdown = _warehouse_breakdown(db, [row["item_id"] for row in blocking])
     for row in blocking:
         row["warehouses"] = breakdown.get(int(row["item_id"]), [])
@@ -829,15 +744,9 @@ def analyze_release(
     shortage_rows = [row for row in blocking if row["status"] == STATUS_SHORTAGE]
     blocked_rows = [row for row in blocking if row["status"] == STATUS_BLOCKED]
     make_rows = [row for row in blocking if row["status"] == STATUS_MAKE]
-    # Итог по выпуску считают только позиции, которые это количество реально
-    # требует.  Красная строка из ветки, закрытой остатком выше, показывается
-    # оператору, но заявленный выпуск она не отменяет — иначе «можно выпустить
-    # 15» и «выпуск заблокирован» стояли бы рядом и противоречили друг другу.
-    blocking_now = [row for row in blocking if row.get("needed_now")]
-
-    if any(row["status"] == STATUS_SHORTAGE for row in blocking_now):
+    if shortage_rows:
         overall = STATUS_BLOCKED
-    elif any(row["status"] == STATUS_MAKE for row in blocking_now):
+    elif make_rows:
         overall = STATUS_MAKE
     else:
         overall = STATUS_OK
@@ -860,11 +769,7 @@ def analyze_release(
             "shortage_count": len(shortage_rows),
             "blocked_count": len(blocked_rows),
             "make_count": len(make_rows),
-            # Красные, которые это количество не требует: видны в списке, но
-            # выпуску не мешают.
-            "idle_blocker_count": len(
-                [row for row in blocking if not row.get("needed_now") and row["is_blocking"]]
-            ),
+            "idle_blocker_count": 0,
             "items_checked": len(reachable),
             "max_level": max(llc.values()) if llc else 0,
             "producible_qty": _round_qty(producible),
@@ -885,7 +790,6 @@ def analyze_release(
             edges=edges,
             exploded=exploded,
             status_map=status_map,
-            structural_status=structural_map,
             meta=meta,
             llc=llc,
             depth_limit=depth_limit,
@@ -903,7 +807,6 @@ def _build_tree(
     edges: Dict[int, Dict[int, float]],
     exploded: Dict[int, Dict[str, float]],
     status_map: Dict[int, str],
-    structural_status: Dict[int, str],
     meta: Dict[int, Dict[str, Any]],
     llc: Dict[int, int],
     depth_limit: int,
@@ -933,18 +836,17 @@ def _build_tree(
         own_net = branch_net(item_id, branch_required)
         comps = edges.get(item_id) or {}
         branch_stock = _to_float(values.get("stock", 0.0))
-        # Нужна ветка — красим по расчёту выпуска; не нужна — по самой позиции.
         row_status = (
             status_map.get(item_id, STATUS_OK)
             if branch_required > EPS
-            else structural_status.get(item_id, STATUS_OK)
+            else STATUS_NOT_REQUIRED
         )
         # Остатка не хватает на потребность ветки: строка может быть жёлтой
         # («собрать можно»), но цифру остатка надо показать красной.
         stock_short = (
             branch_stock + EPS < branch_required
             if branch_required > EPS
-            else branch_stock <= EPS
+            else False
         )
         payload: Dict[str, Any] = {
             "key": f"{item_id}:{depth}:{budget['nodes']}",
@@ -957,11 +859,15 @@ def _build_tree(
             "level": depth,
             "kind": "node" if comps else "material",
             "status": row_status,
-            "reason": _status_reason(
-                row_status,
-                str(info.get("replenishment_method", "")),
-                bool(comps),
-                str(info.get("item_type", "")),
+            "reason": (
+                _status_reason(
+                    row_status,
+                    str(info.get("replenishment_method", "")),
+                    bool(comps),
+                    str(info.get("item_type", "")),
+                )
+                if branch_required > EPS
+                else "Не требуется: родитель закрыт остатком"
             ),
             "replenishment_time": info.get("replenishment_time"),
             "stock_short": bool(stock_short),
