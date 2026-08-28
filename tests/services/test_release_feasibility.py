@@ -13,6 +13,7 @@ from app.models import (
     LedgerGeneration,
     PhysicalImportBatch,
     PlanningTruthState,
+    ProductionMaterialCustodyProjectionManifest,
     SpecComponent,
     Specification,
     StockBin,
@@ -45,6 +46,17 @@ def accepted_generation(db_session):
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
     db_session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=CUTOFF,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=CUTOFF,
+            built_at=CUTOFF,
+        )
+    )
+    db_session.add(
         StockWarehouse(
             warehouse_ref1c=MAIN_WAREHOUSE,
             warehouse_name="Основной склад",
@@ -52,6 +64,7 @@ def accepted_generation(db_session):
         )
     )
     db_session.flush()
+    db_session.expire_all()
     return generation
 
 
@@ -308,6 +321,40 @@ def test_ignored_warehouse_stock_does_not_cover_demand(db_session):
     assert warehouses["Склад №2"]["counted"] is True
     assert warehouses["Изолятор брака"]["counted"] is False
     assert warehouses["Изолятор брака"]["qty"] == 96.0
+
+
+def test_material_custody_is_not_free_for_a_new_release(db_session, monkeypatch):
+    """Детали, уже закреплённые за другим заказом, нельзя считать свободными."""
+    from app.services.production_material_custody import MaterialCustodyState
+
+    product = _mk_item(db_session, "P1")
+    material = _mk_item(db_session, "M1", stock=30.0)
+    _mk_spec(db_session, product, {material: 1.0})
+
+    custody = MaterialCustodyState(
+        by_warehouse_item={(MAIN_WAREHOUSE, int(material.item_id)): 20.0}
+    )
+    monkeypatch.setattr(
+        "app.services.production_material_custody_projection.load_material_custody_projection",
+        lambda _db, *, ledger_generation_id: custody,
+    )
+
+    payload = analyze_release(db_session, product, 25.0)
+
+    material_row = _by_article(payload, "ART-M1")
+    assert material_row["stock_on_hand"] == 10.0
+    assert material_row["shortage_qty"] == 15.0
+    assert material_row["status"] == "shortage"
+    assert payload["summary"]["producible_qty"] == 10.0
+    assert material_row["warehouses"] == [
+        {
+            "warehouse_name": "Основной склад",
+            "qty": 10.0,
+            "physical_qty": 30.0,
+            "reserved_qty": 20.0,
+            "counted": True,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -134,6 +134,41 @@ def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
     return planning_stock_by_item(db, int(truth.generation_id))
 
 
+def effective_free_stock_by_item_all(db: Session) -> Dict[int, float]:
+    """Accepted planning stock minus material custody held for other orders.
+
+    The physical Ledger includes kits that are still on a source warehouse and
+    kits already issued to a workshop.  Both remain physical stock, but neither
+    is free for a new release-feasibility check.  Custody is filtered through
+    the same planning warehouse scope as the physical balance so excluded
+    warehouses cannot reduce stock counted elsewhere.
+    """
+    from .planning_truth import require_accepted
+    from .production_material_custody_projection import load_material_custody_projection
+
+    truth = require_accepted(db)
+    physical = planning_stock_by_item(db, int(truth.generation_id))
+    custody = load_material_custody_projection(
+        db,
+        ledger_generation_id=int(truth.generation_id),
+    )
+    scope = planning_warehouse_scope(db)
+    reserved: Dict[int, float] = {}
+    for (warehouse_ref, item_id), quantity in custody.by_warehouse_item.items():
+        ref = str(warehouse_ref or "")
+        if scope.has_warehouse_rows and ref not in scope.selected_refs:
+            continue
+        if ref in scope.ignored_refs or ref in scope.finished_refs:
+            continue
+        iid = int(item_id)
+        reserved[iid] = reserved.get(iid, 0.0) + max(float(quantity or 0.0), 0.0)
+
+    return {
+        item_id: max(float(quantity or 0.0) - reserved.get(item_id, 0.0), 0.0)
+        for item_id, quantity in physical.items()
+    }
+
+
 def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], float]]]:
     """
     Return `{item_id: [(eta_date, remaining_qty), ...]}` for every active

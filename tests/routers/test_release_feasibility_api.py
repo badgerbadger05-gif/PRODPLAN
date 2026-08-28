@@ -17,6 +17,7 @@ from app.models import (
     LedgerGeneration,
     PhysicalImportBatch,
     PlanningTruthState,
+    ProductionMaterialCustodyProjectionManifest,
     SpecComponent,
     Specification,
     StockBin,
@@ -53,6 +54,17 @@ def db_session():
     session.flush()
     session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
     session.add(
+        ProductionMaterialCustodyProjectionManifest(
+            ledger_generation_id=int(generation.id),
+            cutoff=CUTOFF,
+            status="complete",
+            is_baseline=True,
+            source_event_high_watermark_id=0,
+            observed_at=CUTOFF,
+            built_at=CUTOFF,
+        )
+    )
+    session.add(
         StockWarehouse(
             warehouse_ref1c=MAIN_WAREHOUSE,
             warehouse_name="Основной склад",
@@ -60,6 +72,7 @@ def db_session():
         )
     )
     session.flush()
+    session.expire_all()
     try:
         yield session
     finally:

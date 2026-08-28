@@ -13,8 +13,9 @@
                  (травление, гибка на стороне, пошив) либо маршрут
                  «Переработка». Складом не закрывается и выпуск не блокирует.
 
-Расчёт чисто аналитический: ничего не пишет в БД и не учитывает открытые заказы,
-резервы и поставки в пути — только текущий свободный остаток. Это ответ на вопрос
+Расчёт чисто аналитический: ничего не пишет в БД и не учитывает открытые заказы
+и поставки в пути. Из физического остатка вычитается материальная опека уже
+запущенных заказов — это текущий свободный остаток. Это ответ на вопрос
 «что мешает прямо сейчас», а не MRP-прогон.
 
 Особенности разворота:
@@ -46,7 +47,7 @@ from ..models import (
     StockWarehouse,
     Unit,
 )
-from .mrp_stock_helpers import effective_stock_by_item_all
+from .mrp_stock_helpers import effective_free_stock_by_item_all
 from .planning_truth import require_accepted
 
 logger = logging.getLogger(__name__)
@@ -208,14 +209,18 @@ def _warehouse_breakdown(db: Session, item_ids: Sequence[int]) -> Dict[int, List
         StockWarehouse.warehouse_ref1c,
         StockWarehouse.warehouse_name,
         StockWarehouse.is_selected,
+        StockWarehouse.is_finished_goods,
     ).all()
     names: Dict[str, str] = {}
     selected_refs: Set[str] = set()
-    for ref, name, is_selected in warehouse_rows:
+    finished_refs: Set[str] = set()
+    for ref, name, is_selected, is_finished in warehouse_rows:
         if not ref:
             continue
         names[str(ref)] = str(name or "")
-        if bool(is_selected):
+        if bool(is_finished):
+            finished_refs.add(str(ref))
+        if bool(is_selected) and not bool(is_finished):
             selected_refs.add(str(ref))
     has_warehouse_settings = bool(warehouse_rows)
 
@@ -224,6 +229,12 @@ def _warehouse_breakdown(db: Session, item_ids: Sequence[int]) -> Dict[int, List
     # Legacy-таблица остатков как запасной источник запрещена: разошедшиеся
     # цифры в шапке и в разбивке по складам объяснить будет нечем.
     truth = require_accepted(db)
+    from .production_material_custody_projection import load_material_custody_projection
+
+    custody = load_material_custody_projection(
+        db,
+        ledger_generation_id=int(truth.generation_id),
+    )
     result: Dict[int, List[Dict[str, Any]]] = {}
     rows = (
         db.query(
@@ -243,11 +254,22 @@ def _warehouse_breakdown(db: Session, item_ids: Sequence[int]) -> Dict[int, List
         if abs(qty_value) <= EPS:
             continue
         ref_str = str(ref or "")
-        counted = ref_str not in ignored_refs and (not has_warehouse_settings or ref_str in selected_refs)
+        counted = (
+            ref_str not in ignored_refs
+            and ref_str not in finished_refs
+            and (not has_warehouse_settings or ref_str in selected_refs)
+        )
+        reserved_qty = max(
+            _to_float(custody.by_warehouse_item.get((ref_str, int(item_id)), 0.0)),
+            0.0,
+        )
+        free_qty = max(qty_value - reserved_qty, 0.0) if counted else qty_value
         result.setdefault(int(item_id), []).append(
             {
                 "warehouse_name": names.get(ref_str) or ref_str,
-                "qty": _round_qty(qty_value),
+                "qty": _round_qty(free_qty),
+                "physical_qty": _round_qty(qty_value),
+                "reserved_qty": _round_qty(reserved_qty),
                 "counted": bool(counted),
             }
         )
@@ -519,7 +541,7 @@ def find_items(db: Session, term: str, limit: int = 50) -> List[Dict[str, Any]]:
         .all()
         if row and row[0] is not None
     }
-    stock = effective_stock_by_item_all(db)
+    stock = effective_free_stock_by_item_all(db)
     rows: List[Dict[str, Any]] = []
     for item in items:
         item_id = int(item.item_id)
@@ -613,7 +635,7 @@ def analyze_release(
     llc = _low_level_codes(root_item_id, reachable, edges)
     order = sorted(reachable, key=lambda iid: (llc.get(iid, 0), iid))
 
-    stock_all = effective_stock_by_item_all(db)
+    stock_all = effective_free_stock_by_item_all(db)
     stock = {int(iid): _to_float(stock_all.get(int(iid), 0.0)) for iid in reachable}
 
     exploded = _explode(root_item_id, root_qty, order, edges, stock)
