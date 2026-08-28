@@ -363,15 +363,29 @@ BEGIN
        AND NOT EXISTS (
            SELECT 1
              FROM planning_read_snapshot AS snapshot
+             JOIN ledger_generation AS snapshot_generation
+               ON snapshot_generation.id = snapshot.ledger_generation_id
             WHERE snapshot.consumer = 'mrp_result'
               AND snapshot.snapshot_key = 'run:' || run.run_id::text
-              AND snapshot.ledger_generation_id = v_generation_id
-              AND snapshot.cutoff = v_generation_cutoff
+              AND snapshot.ledger_generation_id IN (
+                  WITH RECURSIVE accepted_lineage(id) AS (
+                      SELECT v_generation_id
+                      UNION
+                      SELECT (generation.source_watermarks->>'parent_generation_id')::bigint
+                        FROM ledger_generation AS generation
+                        JOIN accepted_lineage AS lineage
+                          ON generation.id = lineage.id
+                       WHERE generation.source_watermarks->>'parent_generation_id' IS NOT NULL
+                  )
+                  SELECT id FROM accepted_lineage
+              )
+              AND snapshot_generation.status = 'accepted'
+              AND snapshot.cutoff = snapshot_generation.cutoff
               AND snapshot.truth_status = 'accepted'
        );
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            '% fixed runs have no accepted MRP result snapshot',
+            '% fixed runs have no accepted MRP result snapshot in sealed lineage',
             v_count;
     END IF;
 
@@ -447,9 +461,12 @@ BEGIN
            OR (snapshot.payload::jsonb -> 'meta' ->> 'row_count')::bigint
               <> (
                   SELECT count(*)
-                    FROM planning_read_row AS row
+                   FROM planning_read_row AS row
                    WHERE row.snapshot_id = snapshot.id
-                     AND row.row_kind = 'production_order'
+                     AND row.row_kind IN (
+                         'production_order',
+                         'production_proposal'
+                     )
               )
        );
     IF v_count <> 0 THEN
@@ -596,9 +613,21 @@ BEGIN
       JOIN drum_schedule AS schedule
         ON schedule.id = slot.drum_schedule_id
      WHERE schedule.ledger_generation_id = v_generation_id;
-    IF v_count = 0 THEN
+    IF v_count = 0 AND NOT EXISTS (
+        SELECT 1
+          FROM drum_schedule AS schedule
+         WHERE schedule.ledger_generation_id = v_generation_id
+           AND coalesce(
+               (schedule.metrics::jsonb ->> 'excluded_lines')::bigint,
+               0
+           ) > 0
+           AND coalesce(
+               (schedule.metrics::jsonb ->> 'excluded_open_qty')::numeric,
+               0
+           ) > 0
+    ) THEN
         RAISE EXCEPTION
-            'current drum has no slots';
+            'current drum has neither slots nor declared exclusions';
     END IF;
 
     SELECT count(*)

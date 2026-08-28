@@ -249,6 +249,9 @@ def test_verifier_is_read_only_fail_closed_and_covers_publication_invariants():
         "assembly_queue",
     ):
         assert evidence in source
+    assert "WITH RECURSIVE accepted_lineage" in source
+    assert "snapshot_generation.status = 'accepted'" in source
+    assert "'production_proposal'" in source
 
 
 def test_verifier_accepts_fifo_split_but_rejects_overallocation_and_duplicate_pair():
@@ -330,4 +333,6 @@ def test_verifier_requires_exactly_all_five_planning_snapshot_consumers():
     assert "'plan=' || run.source_plan_id::text" in source
     assert "snapshot_key = 'current:v1'" in source
     assert "snapshot.consumer = 'production_control_journal'" in source
-    assert "row.row_kind = 'production_order'" in source
+    assert "'production_order'" in source
+    assert "'production_proposal'" in source
+    assert "current drum has neither slots nor declared exclusions" in source
