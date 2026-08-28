@@ -148,7 +148,8 @@ def test_node_without_stock_but_with_components_is_yellow(db_session):
     assert payload["summary"]["status"] == "make"
     assert payload["summary"]["make_count"] == 1
     assert payload["summary"]["shortage_count"] == 0
-    assert payload["summary"]["fully_producible"] is True
+    assert payload["summary"]["producible_qty"] == 0.0
+    assert payload["summary"]["fully_producible"] is False
 
 
 def test_missing_component_is_red_and_blocks_the_node_above(db_session):
@@ -176,8 +177,8 @@ def test_missing_component_is_red_and_blocks_the_node_above(db_session):
     assert payload["summary"]["status"] == "blocked"
     assert payload["summary"]["shortage_count"] == 1
     assert payload["summary"]["blocked_count"] == 1
-    # 5 единиц материала хватает ровно на 1 узел и, значит, на 1 изделие.
-    assert payload["summary"]["producible_qty"] == pytest.approx(1.666, abs=0.01)
+    # Материал позволяет изготовить часть узлов, но готовых узлов на складе нет.
+    assert payload["summary"]["producible_qty"] == 0.0
     assert payload["summary"]["fully_producible"] is False
 
 
@@ -217,6 +218,25 @@ def test_partial_node_stock_explodes_only_the_remainder(db_session):
     # Изготовить надо 6 узлов, а не 10.
     assert material_row["required_qty"] == 18.0
     assert material_row["shortage_qty"] == 18.0
+    assert payload["summary"]["producible_qty"] == 4.0
+
+
+def test_immediate_release_is_limited_by_ready_direct_nodes(db_session):
+    """Материалов может хватать на все 15, но «можно сейчас» ограничено готовыми узлами."""
+    product = _mk_item(db_session, "P1")
+    plentiful_node = _mk_item(db_session, "N1", stock=13.0)
+    scarce_node = _mk_item(db_session, "N2", stock=1.0)
+    material = _mk_item(db_session, "M1", stock=1000.0)
+    _mk_spec(db_session, product, {plentiful_node: 1.0, scarce_node: 1.0})
+    _mk_spec(db_session, plentiful_node, {material: 1.0})
+    _mk_spec(db_session, scarce_node, {material: 1.0})
+
+    payload = analyze_release(db_session, product, 15.0)
+
+    assert payload["summary"]["shortage_count"] == 0
+    assert payload["summary"]["make_count"] == 2
+    assert payload["summary"]["producible_qty"] == 1.0
+    assert payload["summary"]["fully_producible"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +561,7 @@ def test_rework_operation_is_not_a_blocker(db_session):
     # Деталь под покрытием изготавливается, а не блокируется.
     assert _find_node(payload["tree"], "ART-PL1")["status"] == "make"
     assert [row["item_article"] for row in payload["blocking"]] == ["ART-PL1"]
-    assert payload["summary"]["producible_qty"] == 10.0
+    assert payload["summary"]["producible_qty"] == 0.0
     assert payload["summary"]["shortage_count"] == 0
 
 
@@ -591,7 +611,7 @@ def test_service_from_1c_is_not_a_supply_position(db_session):
     assert row["reason"] == "Услуга: на складе не бывает"
     assert _find_node(payload["tree"], "ART-PL1")["status"] == "make"
     assert [r["item_article"] for r in payload["blocking"]] == ["ART-PL1"]
-    assert payload["summary"]["producible_qty"] == 10.0
+    assert payload["summary"]["producible_qty"] == 0.0
 
 
 def test_stocked_material_stays_a_blocker_even_if_it_looks_like_an_operation(db_session):
@@ -630,4 +650,4 @@ def test_technological_operation_is_not_a_supply_position(db_session):
     row = _find_node(payload["tree"], "ART-OP1")
     assert row["status"] == "non_stock"
     assert row["reason"] == "Операция: на складе не бывает"
-    assert payload["summary"]["producible_qty"] == 5.0
+    assert payload["summary"]["producible_qty"] == 0.0

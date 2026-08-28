@@ -460,56 +460,29 @@ def _classify(
     return status
 
 
-def _has_hard_shortage(
-    root_item_id: int,
-    order: List[int],
-    edges: Dict[int, Dict[int, float]],
-    exploded: Dict[int, Dict[str, float]],
-    non_stock: Set[int],
-) -> bool:
-    for item_id in order:
-        if item_id == root_item_id:
-            continue
-        values = exploded.get(item_id) or {}
-        if _to_float(values.get("net")) <= EPS:
-            continue
-        if item_id in non_stock:
-            continue
-        if not edges.get(item_id):
-            return True
-    return False
-
-
-def _max_producible_qty(
+def _immediate_release_qty(
     root_item_id: int,
     requested_qty: float,
-    order: List[int],
     edges: Dict[int, Dict[int, float]],
     stock: Dict[int, float],
     non_stock: Set[int],
 ) -> float:
-    """
-    Максимальное количество корня, которое сейчас нечем заблокировать.
+    """Сколько корней можно собрать прямо сейчас.
 
-    Потребность монотонна по количеству корня, поэтому ищем границу делением
-    отрезка: разворот здесь чисто арифметический (все справочники уже в памяти).
+    Готовность финальной сборки ограничивают физические остатки её
+    непосредственных компонентов. Жёлтый узел, который можно изготовить из
+    имеющихся деталей, ещё не является готовым узлом на складе.
+    Его состав нужен для списка «надо изготовить / нечем изготовить», но не
+    увеличивает «можно сейчас».
     """
-    def feasible(qty: float) -> bool:
-        exploded = _explode(root_item_id, qty, order, edges, stock)
-        return not _has_hard_shortage(root_item_id, order, edges, exploded, non_stock)
-
-    if feasible(requested_qty):
-        return requested_qty
-    low, high = 0.0, float(requested_qty)
-    if not feasible(min(1e-6, high)):
-        return 0.0
-    for _ in range(40):
-        mid = (low + high) / 2.0
-        if feasible(mid):
-            low = mid
-        else:
-            high = mid
-    return low
+    available = max(0.0, float(requested_qty))
+    for component_id, qty_per_root in edges.get(int(root_item_id), {}).items():
+        per = _to_float(qty_per_root)
+        if per <= EPS or int(component_id) in non_stock:
+            continue
+        component_stock = max(0.0, _to_float(stock.get(int(component_id), 0.0)))
+        available = min(available, component_stock / per)
+    return max(0.0, available)
 
 
 # --------------------------------------------------------------------------
@@ -752,7 +725,7 @@ def analyze_release(
         overall = STATUS_OK
 
     producible = (
-        _max_producible_qty(root_item_id, root_qty, order, edges, stock, non_stock)
+        _immediate_release_qty(root_item_id, root_qty, edges, stock, non_stock)
         if root_qty > 0
         else 0.0
     )
