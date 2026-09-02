@@ -645,6 +645,88 @@ def test_successful_export_records_where_the_output_lands(db_session, monkeypatc
     assert product.destination_warehouse_ref1c == "production-warehouse-ref"
 
 
+def test_recalculated_existing_order_is_reused_patched_and_reposted(
+    db_session, monkeypatch
+):
+    db = db_session
+    item = _mk_item(db, code="P-RECALC", ref1c="56565656-5656-5656-5656-565656565656")
+    resource = ProductionResource(resource_name="Workshop recalculated")
+    db.add(resource)
+    db.flush()
+    binding = WorkshopWarehouseBinding(
+        workshop_id=resource.resource_id,
+        warehouse_ref1c="workshop-recalc-ref",
+        production_warehouse_ref1c="old-output-ref",
+    )
+    db.add(binding)
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=4)
+    product = db.query(ProductionProduct).filter_by(order_id=order.order_id).one()
+    db.add(
+        ProductionOrderLineState(
+            product_id=product.product_id,
+            status="ready",
+            issue_status="not_requested",
+            workshop_id=resource.resource_id,
+        )
+    )
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata")
+    fake = _FakeClient(ref_key="recalculated-existing-ref")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    first = exporter.export_production_orders_to_1c(
+        db, [order.order_id], dry_run=False
+    )
+    assert first["orders_created"] == 1
+    db.refresh(product)
+    assert product.destination_warehouse_ref1c == "old-output-ref"
+
+    accepted_generation = db.get(models.LedgerGeneration, run.ledger_generation_id)
+    previous_generation = models.LedgerGeneration(
+        generation_key=f"previous-production-export-{id(db)}",
+        status="stale",
+        cutoff=accepted_generation.cutoff,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch_id=accepted_generation.physical_import_batch_id,
+        algorithm_version="test/previous",
+        replay_version="test/previous",
+    )
+    db.add(previous_generation)
+    db.flush()
+    link = db.query(SyncLink).filter_by(
+        source_doctype="production_order", source_id=order.order_id
+    ).one()
+    link.ledger_generation_id = previous_generation.id
+    binding.production_warehouse_ref1c = "new-output-ref"
+    db.commit()
+
+    second = exporter.export_production_orders_to_1c(
+        db, [order.order_id], dry_run=False
+    )
+
+    assert second["orders_created"] == 1
+    assert second["orders_already_linked"] == 0
+    assert len(fake.posts) == 1
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0].endswith("(guid'recalculated-existing-ref')")
+    assert (
+        fake.patches[0][1]["СтруктурнаяЕдиницаПродукции_Key"]
+        == "new-output-ref"
+    )
+    assert fake.operations[-2:] == [
+        "Document_ЗаказНаПроизводство(guid'recalculated-existing-ref')/Unpost",
+        "Document_ЗаказНаПроизводство(guid'recalculated-existing-ref')/Post?PostingModeOperational=true",
+    ]
+    db.refresh(product)
+    db.refresh(link)
+    assert product.destination_warehouse_ref1c == "new-output-ref"
+    assert link.ledger_generation_id == run.ledger_generation_id
+    assert link.status == "success"
+
+
 def test_second_export_is_noop_due_to_existing_link(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="P4", ref1c="44444444-4444-4444-4444-444444444444")

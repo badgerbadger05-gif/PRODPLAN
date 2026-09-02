@@ -137,6 +137,7 @@ class ProductionOrderExportEntry:
     error: Optional[str] = None
     reason: Optional[str] = None  # human-readable explanation for skipped/error
     origin_token: Optional[str] = None
+    unpost_before_patch: bool = False
 
 
 @dataclass
@@ -681,8 +682,13 @@ def _persist_line_destinations(
             )
             .one_or_none()
         )
-        if product is None or _clean_ref1c(product.destination_warehouse_ref1c):
+        if product is None:
             continue
+        # This value is owned by the sanctioned 1C export.  A route can change
+        # when an existing executor order is recalculated (for example, weld
+        # output must move from assembly to the following paint workshop), so
+        # preserving a non-empty historical destination would keep future
+        # supply attached to the wrong warehouse.
         product.destination_warehouse_ref1c = destination
 
 
@@ -1020,6 +1026,21 @@ def _upsert_link(
     status: str,
     last_error: Optional[str],
 ) -> None:
+    existing_before = _existing_link(db, int(entry.order_id))
+    if (
+        existing_before is not None
+        and existing_before.ledger_generation_id is not None
+        and entry.ledger_generation_id is not None
+        and int(existing_before.ledger_generation_id) != int(entry.ledger_generation_id)
+    ):
+        verified_reuse = (
+            bool(entry.unpost_before_patch)
+            and str(existing_before.status or "") == "success"
+            and _clean_ref1c(existing_before.target_ref_key)
+            == _clean_ref1c(target_ref_key)
+        )
+        if not verified_reuse:
+            raise RuntimeError("production SyncLink belongs to another Ledger generation")
     _upsert_sync_link(
         db,
         SyncLink,
@@ -1038,8 +1059,6 @@ def _upsert_link(
         raise RuntimeError("production SyncLink upsert was not persisted")
     if entry.ledger_generation_id is None:
         raise MrpMutationLineageError("production SyncLink has no accepted Ledger generation")
-    if link.ledger_generation_id is not None and int(link.ledger_generation_id) != int(entry.ledger_generation_id):
-        raise RuntimeError("production SyncLink belongs to another Ledger generation")
     link.ledger_generation_id = int(entry.ledger_generation_id)
 
 
@@ -1078,7 +1097,7 @@ def _validate_existing_retry_link(
     if link.ledger_generation_id is None:
         # Canonical rebuilds preserve successful external identity while
         # clearing rebuildable Ledger lineage.  The agreeing source Ref_Key is
-        # sufficient for the creation command to remain an idempotent no-op.
+        # sufficient for the creation command to reuse that exact document.
         if durable_success:
             return link_ref
         raise MrpMutationLineageError("production SyncLink has no accepted Ledger generation")
@@ -1087,8 +1106,9 @@ def _validate_existing_retry_link(
         raise MrpMutationLineageError("production SyncLink belongs to another Ledger generation")
     # A successfully created 1C order is a durable executor document.  A later
     # accepted physical Ledger generation may materialize the same live MRP
-    # obligation with a different current payload, but that must not create or
-    # patch a second 1C order.  Inside the same immutable generation, however,
+    # obligation with a different current payload, but that must not create a
+    # second 1C order.  The verified document itself may be unposted, patched
+    # and reposted by an explicit retry. Inside the same immutable generation,
     # a payload mismatch still means local lineage corruption and fails closed.
     if same_generation and (
         not link.payload_hash or str(link.payload_hash) != expected_payload_hash
@@ -1187,7 +1207,12 @@ def export_production_orders_to_1c(
             expected_payload_hash=expected_hash,
             order_ref1c=_clean_ref1c(order_row.order_ref1c),
         )
-        if link and link.status == "success" and verified_ref:
+        same_link_generation = (
+            link is not None
+            and link.ledger_generation_id is not None
+            and int(link.ledger_generation_id) == int(entry.ledger_generation_id)
+        )
+        if link and link.status == "success" and verified_ref and same_link_generation:
             entry.status = "existing"
             entry.target_ref_key = verified_ref
             entry.reason = "уже выгружен в 1С (проверенный sync_link)"
@@ -1195,7 +1220,11 @@ def export_production_orders_to_1c(
             continue
         if verified_ref:
             entry.target_ref_key = verified_ref
-            entry.reason = "повторная отправка: проверенный 1С-документ будет обновлён и проведён"
+            entry.unpost_before_patch = True
+            entry.reason = (
+                "повторная отправка: проверенный 1С-документ будет снят с "
+                "проведения, обновлён и проведён повторно"
+            )
         eligible.append(entry)
 
     payloads = [payloads_by_order[int(entry.order_id)] for entry in eligible]
