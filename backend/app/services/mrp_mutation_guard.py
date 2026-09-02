@@ -8,12 +8,14 @@ gate as live writes: an unsafe preview is still an unsafe promise.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
 from app import models
 from app.services.item_ledger.live_plan_scope import (
     RunAnchorError,
+    live_plan_run_ids,
     sealed_generation_lineage_ids,
     sealed_run_anchor,
 )
@@ -23,6 +25,7 @@ from app.services.planning_truth import (
     CAPABILITY_RESERVATION_REPLAY,
     require_accepted_truth,
 )
+from app.services.production_output_truth import accepted_product_output
 
 
 REQUIRED_MUTATION_CAPABILITIES = (
@@ -148,6 +151,125 @@ def require_selected_requirements(
             )
 
 
+def _current_make_work_for_historical_product(
+    db: Session,
+    *,
+    source_run: models.PlanningRun,
+    product: models.ProductionProduct,
+    generation_id: int,
+) -> models.ReplenishmentWorkItem:
+    """Resolve the live MAKE obligation that already nets this old order.
+
+    Materialized orders keep their original run/requirement as immutable
+    provenance.  An obligation refresh closes that run, but the unified
+    production journal deliberately nets every still-open order by the stable
+    ``plan + item`` boundary before offering the new MRP delta.  Export must
+    use the same boundary: requiring the historical run itself to remain
+    ``FIXED_SNAPSHOT`` made accounted orders visible but impossible to launch.
+
+    This is fail-closed.  A historical order is executable only while exactly
+    one live run of the same plan contains an active current-generation MAKE
+    work item for the same item, and the total open materialized quantity does
+    not exceed that current work remainder.
+    """
+    if source_run.source_plan_id is None:
+        raise MrpMutationLineageError(
+            f"historical planning run {source_run.run_id} has no source plan"
+        )
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise MrpMutationLineageError(
+            f"accepted Ledger generation {generation_id} not found"
+        )
+    live_ids = live_plan_run_ids(db, generation)
+    live_runs = (
+        db.query(models.PlanningRun)
+        .filter(
+            models.PlanningRun.run_id.in_(live_ids or [-1]),
+            models.PlanningRun.source_plan_id == int(source_run.source_plan_id),
+            models.PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .all()
+    )
+    if len(live_runs) != 1:
+        raise MrpMutationLineageError(
+            f"historical production order has no unique live run for plan "
+            f"{int(source_run.source_plan_id)}"
+        )
+    live_run = live_runs[0]
+    if live_run.active_freeze_version is None:
+        raise MrpMutationLineageError(
+            f"planning run {live_run.run_id} has no active freeze"
+        )
+
+    work = (
+        db.query(models.ReplenishmentWorkItem)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReplenishmentWorkItem.reservation_id,
+        )
+        .join(
+            models.MrpRequirement,
+            models.MrpRequirement.id
+            == models.ReplenishmentWorkItem.requirement_id,
+        )
+        .filter(
+            models.ReplenishmentWorkItem.ledger_generation_id
+            == int(generation_id),
+            models.ReplenishmentWorkItem.plan_id
+            == int(source_run.source_plan_id),
+            models.ReplenishmentWorkItem.run_id == int(live_run.run_id),
+            models.ReplenishmentWorkItem.item_id == int(product.item_id),
+            models.ReplenishmentWorkItem.replenishment_method == "make",
+            models.ReservationEntry.ledger_generation_id == int(generation_id),
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.realization_mode == "make",
+            models.MrpRequirement.run_id == int(live_run.run_id),
+            models.MrpRequirement.item_id == int(product.item_id),
+            models.MrpRequirement.freeze_version
+            == int(live_run.active_freeze_version),
+        )
+        .one_or_none()
+    )
+    if work is None:
+        raise MrpMutationLineageError(
+            f"historical production product {product.product_id} has no current "
+            "MAKE obligation for the same plan and item"
+        )
+
+    open_products = (
+        db.query(models.ProductionProduct)
+        .join(
+            models.ProductionOrder,
+            models.ProductionOrder.order_id == models.ProductionProduct.order_id,
+        )
+        .join(
+            models.PlanningRun,
+            models.PlanningRun.run_id == models.ProductionOrder.source_run_id,
+        )
+        .filter(
+            models.ProductionOrder.source == "mrp",
+            models.ProductionOrder.deletion_mark.is_(False),
+            models.PlanningRun.source_plan_id == int(source_run.source_plan_id),
+            models.ProductionProduct.item_id == int(product.item_id),
+        )
+        .all()
+    )
+    open_qty = sum(
+        (accepted_product_output(row).remaining_qty for row in open_products),
+        start=Decimal("0"),
+    )
+    current_remaining = Decimal(str(work.replenishment_remaining_qty or 0))
+    if open_qty - current_remaining > Decimal("0.000001"):
+        raise MrpMutationLineageError(
+            f"historical open production quantity {open_qty} exceeds current "
+            f"MAKE remainder {current_remaining} for plan "
+            f"{int(source_run.source_plan_id)} item {int(product.item_id)}"
+        )
+    return work
+
+
 def require_materialized_orders(
     db: Session,
     orders: Sequence[models.ProductionOrder],
@@ -164,7 +286,10 @@ def require_materialized_orders(
     )
     generation_id = int(truth.generation_id)
     run = db.get(models.PlanningRun, run_ids.pop())
-    if run is None or str(run.status or "").upper() != "FIXED_SNAPSHOT":
+    if run is None or str(run.status or "").upper() not in {
+        "FIXED_SNAPSHOT",
+        "CLOSED",
+    }:
         raise MrpMutationLineageError("selected orders do not belong to a fixed MRP run")
     if run.active_freeze_version is None:
         raise MrpMutationLineageError(f"planning run {run.run_id} has no active freeze")
@@ -173,6 +298,13 @@ def require_materialized_orders(
     # stamp without touching the obligation, so provenance is proved against
     # the accepted generation's sealed lineage.
     allowed_generation_ids = set(_accepted_lineage(db, generation_id))
+    historical_run = str(run.status or "").upper() == "CLOSED"
+    if historical_run:
+        generation = db.get(models.LedgerGeneration, generation_id)
+        try:
+            sealed_run_anchor(db, run, generation)
+        except (RunAnchorError, ValueError) as exc:
+            raise MrpMutationLineageError(str(exc)) from exc
     for order in orders:
         products = list(order.products)
         if not products:
@@ -192,6 +324,13 @@ def require_materialized_orders(
                 require_selected_proposals(
                     db, [proposal], run=run, generation_id=generation_id, consumer=consumer
                 )
+                if historical_run:
+                    _current_make_work_for_historical_product(
+                        db,
+                        source_run=run,
+                        product=product,
+                        generation_id=generation_id,
+                    )
             elif product.source_mrp_requirement_id is not None:
                 requirement = db.get(
                     models.MrpRequirement, int(product.source_mrp_requirement_id)
@@ -199,6 +338,23 @@ def require_materialized_orders(
                 if requirement is None:
                     raise MrpMutationLineageError("source MRP requirement is missing")
                 require_selected_requirements([requirement], run=run)
+                if historical_run:
+                    if (
+                        product.ledger_generation_id is None
+                        or int(product.ledger_generation_id)
+                        not in allowed_generation_ids
+                    ):
+                        raise MrpMutationLineageError(
+                            f"production product {product.product_id} is null, "
+                            "mixed or stale Ledger lineage"
+                        )
+                    _current_make_work_for_historical_product(
+                        db,
+                        source_run=run,
+                        product=product,
+                        generation_id=generation_id,
+                    )
+                    continue
                 if (
                     product.ledger_generation_id is None
                     or int(product.ledger_generation_id) != generation_id

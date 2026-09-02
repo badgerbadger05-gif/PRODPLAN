@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -22,15 +23,19 @@ from app.models import (
     DefaultSpecification,
     Item,
     Operation,
+    MrpRequirement,
     PlannedOrder,
     PlanningRun,
     ProductionOrderLineState,
     ProductionOrder,
+    ProductionPlanHeader,
     ProductionMaterialIssue,
     ProductionProduct,
     ProductionResource,
     ProductionStage,
     ResourceStage,
+    ReplenishmentWorkItem,
+    ReservationEntry,
     SpecComponent,
     Specification,
     SpecOperation,
@@ -262,6 +267,98 @@ def test_dry_run_returns_payload_without_touching_network(db_session, monkeypatc
 
     # No sync_link writes on dry-run.
     assert db.query(SyncLink).count() == 0
+
+
+def test_dry_run_exports_closed_run_order_netted_by_current_mrp(
+    db_session, monkeypatch
+):
+    """A recalculated plan keeps old order identity but may still execute it."""
+    db = db_session
+    item = _mk_item(
+        db,
+        code="P-HIST",
+        ref1c="11111111-1111-1111-1111-111111111199",
+    )
+    plan = ProductionPlanHeader(
+        name="Historical production export",
+        period_from=_dt.date(2026, 10, 1),
+        period_to=_dt.date(2026, 10, 31),
+        status="fixed",
+    )
+    db.add(plan)
+    db.flush()
+    old_run = _mk_run(db)
+    old_run.source_plan_id = int(plan.id)
+    old_run.period_from = plan.period_from
+    old_run.period_to = plan.period_to
+    order = _mk_mrp_order(db, item, run_id=old_run.run_id, qty=6)
+    old_run.status = "CLOSED"
+    current_run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        active_freeze_version=1,
+        ledger_generation_id=int(old_run.ledger_generation_id),
+        ledger_cutoff=old_run.ledger_cutoff,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db.add(current_run)
+    db.flush()
+    requirement = MrpRequirement(
+        run_id=int(current_run.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=Decimal("100"),
+        net_required_qty=Decimal("100"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    reservation = ReservationEntry(
+        ledger_generation_id=int(old_run.ledger_generation_id),
+        item_id=int(item.item_id),
+        run_id=int(current_run.run_id),
+        freeze_version=1,
+        requirement_id=int(requirement.id),
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("100"),
+        replenishment_required_qty=Decimal("100"),
+        lifecycle_status="active",
+    )
+    db.add(reservation)
+    db.flush()
+    db.add(ReplenishmentWorkItem(
+        ledger_generation_id=int(old_run.ledger_generation_id),
+        reservation_id=int(reservation.id),
+        plan_id=int(plan.id),
+        run_id=int(current_run.run_id),
+        requirement_id=int(requirement.id),
+        item_id=int(item.item_id),
+        replenishment_method="make",
+        replenishment_required_qty=Decimal("100"),
+        replenishment_fulfilled_qty=Decimal("0"),
+        replenishment_remaining_qty=Decimal("100"),
+    ))
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("Network client must not be instantiated in dry-run"),
+    )
+
+    result = exporter.export_production_orders_to_1c(
+        db, [order.order_id], dry_run=True
+    )
+
+    assert result["status"] == "ok"
+    assert result["orders_eligible"] == 1
+    assert result["payloads"][0]["order_id"] == int(order.order_id)
 
 
 def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_session, monkeypatch):

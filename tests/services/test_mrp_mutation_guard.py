@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -7,6 +8,7 @@ from app.services import one_c_purchase_order_export as purchase_exporter
 from app.services.mrp_mutation_guard import (
     MrpMutationLineageError,
     require_current_run,
+    require_materialized_orders,
     require_selected_proposals,
 )
 from app.services.planning_truth import PlanningTruthUnavailable
@@ -85,6 +87,118 @@ def _frozen_purchase_run(db, generation, *, code):
     db.add(purchase)
     db.flush()
     return run, purchase
+
+
+def _historical_materialized_order(
+    db,
+    generation,
+    *,
+    order_qty: Decimal = Decimal("6"),
+    current_remaining: Decimal = Decimal("100"),
+):
+    plan = models.ProductionPlanHeader(
+        name="Historical execution plan",
+        period_from=date(2026, 10, 1),
+        period_to=date(2026, 10, 31),
+        status="fixed",
+    )
+    item = models.Item(
+        item_code="guard-historical-order",
+        item_name="Historical order item",
+    )
+    db.add_all([plan, item])
+    db.flush()
+    source_run = models.PlanningRun(
+        status="CLOSED",
+        config_snapshot={},
+        ledger_generation_id=int(generation.id),
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    live_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=int(generation.id),
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db.add_all([source_run, live_run])
+    db.flush()
+    old_requirement = models.MrpRequirement(
+        run_id=int(source_run.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=order_qty,
+        net_required_qty=order_qty,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        freeze_version=1,
+    )
+    current_requirement = models.MrpRequirement(
+        run_id=int(live_run.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=current_remaining,
+        net_required_qty=current_remaining,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        freeze_version=1,
+    )
+    db.add_all([old_requirement, current_requirement])
+    db.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=int(generation.id),
+        item_id=int(item.item_id),
+        run_id=int(live_run.run_id),
+        freeze_version=1,
+        requirement_id=int(current_requirement.id),
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="make",
+        reserved_qty=current_remaining,
+        replenishment_required_qty=current_remaining,
+        lifecycle_status="active",
+    )
+    db.add(reservation)
+    db.flush()
+    db.add(models.ReplenishmentWorkItem(
+        ledger_generation_id=int(generation.id),
+        reservation_id=int(reservation.id),
+        plan_id=int(plan.id),
+        run_id=int(live_run.run_id),
+        requirement_id=int(current_requirement.id),
+        item_id=int(item.item_id),
+        replenishment_method="make",
+        replenishment_required_qty=current_remaining,
+        replenishment_fulfilled_qty=Decimal("0"),
+        replenishment_remaining_qty=current_remaining,
+    ))
+    order = models.ProductionOrder(
+        order_number="MRP-HISTORICAL-1",
+        order_date=datetime(2026, 8, 25, tzinfo=timezone.utc),
+        source="mrp",
+        source_run_id=int(source_run.run_id),
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    product = models.ProductionProduct(
+        order_id=int(order.order_id),
+        item_id=int(item.item_id),
+        line_number=1,
+        quantity=order_qty,
+        produced_qty=Decimal("0"),
+        remaining_qty=order_qty,
+        source_mrp_requirement_id=int(old_requirement.id),
+        ledger_generation_id=int(generation.id),
+    )
+    db.add(product)
+    db.flush()
+    return order, product, live_run
 
 
 def test_guard_accepts_the_obligation_a_physical_refresh_inherited(db_session):
@@ -172,6 +286,40 @@ def test_guard_rejects_a_proposal_stamped_outside_the_sealed_lineage(db_session)
             generation_id=int(child.id),
             consumer="test",
         )
+
+
+def test_guard_accepts_closed_run_order_netted_by_current_make_work(db_session):
+    generation = _generation(
+        db_session,
+        key="guard-historical-order",
+        cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    order, _product, _live_run = _historical_materialized_order(
+        db_session, generation
+    )
+
+    generation_id = require_materialized_orders(
+        db_session, [order], consumer="test"
+    )
+
+    assert generation_id == int(generation.id)
+
+
+def test_guard_rejects_closed_run_order_above_current_make_remainder(db_session):
+    generation = _generation(
+        db_session,
+        key="guard-historical-overcommit",
+        cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    order, _product, _live_run = _historical_materialized_order(
+        db_session,
+        generation,
+        order_qty=Decimal("6"),
+        current_remaining=Decimal("5"),
+    )
+
+    with pytest.raises(MrpMutationLineageError, match="exceeds current MAKE remainder"):
+        require_materialized_orders(db_session, [order], consumer="test")
 
 
 def test_dry_run_is_blocked_before_network_when_truth_unavailable(
