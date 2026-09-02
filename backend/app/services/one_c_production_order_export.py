@@ -1257,6 +1257,14 @@ def export_production_orders_to_1c(
     pending_payloads: List[Dict[str, Any]] = []
     pending_entries: List[ProductionOrderExportEntry] = []
     for entry, envelope in zip(eligible, payloads):
+        # A locally verified Ref_Key means this is an explicit update of that
+        # exact executor document. Origin recovery is only for the crash gap
+        # where no Ref_Key was persisted; letting it intercept a verified
+        # retry would silently skip the required PATCH.
+        if _clean_ref1c(entry.target_ref_key):
+            pending_entries.append(entry)
+            pending_payloads.append(envelope)
+            continue
         doc = _find_document_by_origin(
             client,
             entity=PRODUCTION_ORDER_ENTITY,

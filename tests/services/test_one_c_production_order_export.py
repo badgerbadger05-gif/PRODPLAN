@@ -702,6 +702,14 @@ def test_recalculated_existing_order_is_reused_patched_and_reposted(
     link.ledger_generation_id = previous_generation.id
     binding.production_warehouse_ref1c = "new-output-ref"
     db.commit()
+    fake.existing_docs = [
+        {
+            "Ref_Key": "recalculated-existing-ref",
+            "Комментарий": "same prodplan-origin marker",
+            "Posted": True,
+        }
+    ]
+    fake.get_calls.clear()
 
     second = exporter.export_production_orders_to_1c(
         db, [order.order_id], dry_run=False
@@ -711,6 +719,7 @@ def test_recalculated_existing_order_is_reused_patched_and_reposted(
     assert second["orders_already_linked"] == 0
     assert len(fake.posts) == 1
     assert len(fake.patches) == 1
+    assert fake.get_calls == []
     assert fake.patches[0][0].endswith("(guid'recalculated-existing-ref')")
     assert (
         fake.patches[0][1]["СтруктурнаяЕдиницаПродукции_Key"]
