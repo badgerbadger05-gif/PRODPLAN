@@ -26,11 +26,11 @@ app = FastAPI(title="PRODPLAN API", version="1.0.0")
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("specification").setLevel(logging.INFO)
 
-# CORS: фронтенд поднимается на разных портах в зависимости от контура —
-# 9000 (легаси/локальный), 9010 (prod), 9020 (shadow), 9300 (dev).
+# CORS: действующий серверный frontend — 9020; 9000 и 9300 используются
+# локальной разработкой. Выведенный из эксплуатации порт 9010 не разрешён.
 # FRONTEND_ORIGIN переопределяет список целиком; допускается перечисление
 # через запятую.
-_DEFAULT_FRONTEND_PORTS = (9000, 9010, 9020, 9300)
+_DEFAULT_FRONTEND_PORTS = (9000, 9020, 9300)
 _DEFAULT_FRONTEND_ORIGINS = [
     f"http://{host}:{port}"
     for port in _DEFAULT_FRONTEND_PORTS

@@ -1,6 +1,7 @@
 ﻿# Local developer stack only.
 #
-# Production on mtzdock.lan uses docker-compose.test.yml on ports 8010/9010/55433.
+# The only live server stack uses docker-compose.shadow.yml on 8020/9020/55434.
+# The former 8010/9010 compose is retired and intentionally empty.
 # This file is intentionally behind the "local-dev" profile so a bare
 # `docker compose up -d` cannot accidentally start a second stack on prod.
 #

@@ -1,7 +1,7 @@
 name: prodplan-shadow
 
-# Parallel evaluation stack. It is deliberately independent from the stable
-# `prodplan` compose project: its own database volume, ports, config and output.
+# Sole live PRODPLAN stack. The former 8010/9010 contour was retired on
+# 2026-09-02. Keep this stack on its own database volume, ports, config/output.
 # Use scripts/shadow-stack.sh instead of invoking this file by hand.
 
 services:
@@ -40,11 +40,9 @@ services:
       DATABASE_URL: postgresql://${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow}:${PRODPLAN_SHADOW_POSTGRES_PASSWORD:?Set PRODPLAN_SHADOW_POSTGRES_PASSWORD in .env.shadow}@db:5432/${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}
       PLANNING_TRUTH_MAX_AGE_SECONDS: "${PRODPLAN_TRUTH_MAX_AGE_SECONDS:-86400}"
       TZ: Europe/Moscow
-      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
-      # Keep shadow-created stock transfers outside the stable MT000... range.
+      PRODPLAN_DEPLOYMENT_CONTOUR: production
+      # Preserve the existing live document-number band.
       PRODPLAN_MATERIAL_ISSUE_NUMBER_OFFSET: ${PRODPLAN_MATERIAL_ISSUE_NUMBER_OFFSET:-100000000}
-      PRODPLAN_STABLE_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
-      STABLE_PRODPLAN_API_URL: ${PRODPLAN_STABLE_API_URL:-http://mtzdock.lan:8010}
       ITEM_LEDGER_ADMIN_TOKEN: ${ITEM_LEDGER_ADMIN_TOKEN:?Set ITEM_LEDGER_ADMIN_TOKEN in .env.shadow}
     depends_on:
       db:
@@ -76,13 +74,11 @@ services:
       # being assembled. Point this at that exact reviewed source tree.
       context: ${PRODPLAN_FRONTEND_BUILD_CONTEXT:-./frontend-erp-shell}
       args:
-        VITE_DEPLOYMENT_CONTOUR: parallel
-        VITE_STABLE_PRODPLAN_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
+        VITE_DEPLOYMENT_CONTOUR: production
     restart: unless-stopped
     environment:
       TZ: Europe/Moscow
-      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
-      PRODPLAN_STABLE_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
+      PRODPLAN_DEPLOYMENT_CONTOUR: production
     depends_on:
       backend:
         condition: service_healthy
@@ -96,7 +92,7 @@ services:
       start_period: 20s
 
   # Workers are intentionally OFF during bootstrap. Start them after checking
-  # the OData load and selecting a cadence that does not collide with stable.
+  # the OData load and selecting the required cadence.
   sync-worker:
     profiles: ["automation"]
     build:
@@ -114,7 +110,7 @@ services:
       # the single worker request attached until the backend returns its
       # checked result; the cluster lock still prevents overlap.
       SYNC_TICK_TIMEOUT_SECONDS: ${PRODPLAN_SHADOW_SYNC_TICK_TIMEOUT_SECONDS:-3600}
-      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
+      PRODPLAN_DEPLOYMENT_CONTOUR: production
     depends_on:
       backend:
         condition: service_healthy

@@ -26,11 +26,12 @@ npm run lint     # ESLint
 npm run smoke    # Playwright smoke tests
 ```
 
-Local container stack:
+Live server stack (the former 8010/9010 stack is retired and must not be
+started):
 
 ```powershell
-docker compose -f docker-compose.test.yml up -d --build
-docker compose -f docker-compose.test.yml exec -T backend alembic upgrade head
+scripts/shadow-stack.sh start
+scripts/shadow-stack.sh verify
 ```
 
 ## Coding Style & Naming Conventions

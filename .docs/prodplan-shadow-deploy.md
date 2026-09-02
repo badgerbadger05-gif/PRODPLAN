@@ -1,104 +1,53 @@
-# Параллельный PRODPLAN: безопасная эксплуатация
+# PRODPLAN 9020: эксплуатация и развёртывание
 
-Цель — неделями сравнивать новую версию с работающей PRODPLAN на реальных
-данных и полноценно работать в обеих программах, не заменяя и не изменяя
-стабильный контур.
+С 2026-09-02 это единственный действующий серверный контур PRODPLAN. Названия
+`shadow` в каталоге, compose project и runtime-каталогах сохранены как
+идентичность существующей базы и инфраструктуры; они не означают параллельный
+или тестовый режим.
 
-## Изоляция
+## Единственный источник развёртывания
 
-| Ресурс | Стабильный контур | Shadow-контур |
-|---|---|---|
-| Каталог | `/home/barsukov/prodplan` | `/home/barsukov/prodplan-shadow` |
-| Compose project | `prodplan` | `prodplan-shadow` |
-| Frontend | `:9010` | `:9020` |
-| Backend | `:8010` | `:8020` |
-| PostgreSQL | `127.0.0.1:55433` | `127.0.0.1:55434` |
-| Config | `config-test/` | `config-shadow/` |
-| Output | `output-test/` | `output-shadow/` |
-| PostgreSQL volume | существующий | отдельный shadow volume |
+| Ресурс | Значение |
+|---|---|
+| Каталог | `/home/barsukov/prodplan-shadow` |
+| Compose project | `prodplan-shadow` |
+| Compose file | `docker-compose.shadow.yml` |
+| Frontend | `http://mtzdock.lan:9020` |
+| Backend | `http://mtzdock.lan:8020` |
+| PostgreSQL | `127.0.0.1:55434` |
+| Config / output | `config-shadow/` / `output-shadow/` |
+| PostgreSQL volume | `prodplan-shadow_prodplan_shadow_postgres_data` |
 
-Нельзя подключать новую программу к старой базе или монтировать старые
-каталоги config/output. Общая точка интеграции — 1С: обе программы читают её,
-а созданный новой программой документ после синхронизации появляется и в
-стабильном журнале. Новая программа не блокируется от записи в 1С, поэтому
-операции создания документов доступны в штатном режиме.
+Порты 8010 и 9010 выведены из эксплуатации и должны быть закрыты. Старый
+checkout `/home/barsukov/prodplan` не является источником запуска. Его
+`docker-compose.test.yml` — пустая заглушка.
 
-`config-shadow/` монтируется с возможностью записи только внутрь shadow-backend:
-помимо защищённого `odata_config.json` там хранится собственный
-`sync_schedule.json`. Стабильный и параллельный контуры никогда не используют
-один файл расписания.
+## Подготовка
 
-## 1. Отдельный checkout
-
-Не обновляйте каталог стабильной программы. Создайте второй checkout на
-проверенном commit:
-
-```bash
-cd /home/barsukov
-git clone <URL_РЕПОЗИТОРИЯ> prodplan-shadow
-cd /home/barsukov/prodplan-shadow
-git checkout <ПРОВЕРЕННЫЙ_COMMIT>
-git status --short
-git rev-parse --short HEAD
-```
-
-`git status --short` должен быть пустым. Никогда не применяйте `git reset
---hard` в стабильном каталоге.
-
-Backend и готовый frontend сейчас могут находиться в разных рабочих checkout.
-Перед серверной сборкой их нужно свести в один проверенный release commit либо
-явно указать точный каталог frontend в `.env.shadow`:
+В `.env.shadow` должны быть уникальные секреты, права `600` и точный полный
+commit frontend:
 
 ```text
-PRODPLAN_FRONTEND_BUILD_CONTEXT=/home/barsukov/prodplan-shadow-ui/frontend-erp-shell
+PRODPLAN_FRONTEND_BUILD_CONTEXT=./frontend-erp-shell
 PRODPLAN_FRONTEND_EXPECTED_COMMIT=<ПОЛНЫЙ_40_СИМВОЛЬНЫЙ_COMMIT>
 ```
 
-UI и backend могут находиться в разных checkout. Нельзя молча собирать
-`frontend-erp-shell` из backend-checkout: явно задайте абсолютный build context
-конкретного окружения в `.env.shadow`. Скрипт проверяет наличие `Dockerfile` и
-`package.json`, точное совпадение commit и отказывается собирать frontend с
-незакоммиченными изменениями.
+`config-shadow/odata_config.json` содержит рабочую конфигурацию 1С и также
+должен иметь права `600`. Секреты нельзя коммитить или печатать в лог.
 
-## 2. Секреты и каталоги
-
-Первая команда создаёт отдельные runtime-каталоги и `.env.shadow`:
+## Развёртывание
 
 ```bash
 cd /home/barsukov/prodplan-shadow
-scripts/shadow-stack.sh bootstrap
-```
-
-Откройте `.env.shadow`, замените шаблон на уникальный URL-безопасный пароль
-длиной не менее 24 символов и защитите файл:
-
-```bash
-chmod 600 .env.shadow
-```
-
-`chmod 600` разрешает читать секрет только владельцу. Пароль и 1С credentials
-нельзя добавлять в Git или вставлять в логи.
-
-В `config-shadow/odata_config.json` поместите отдельную конфигурацию 1С. Она
-должна обеспечивать те же разрешённые рабочие операции, что и стабильный
-контур:
-
-```bash
-chmod 600 config-shadow/odata_config.json
-```
-
-## 3. Первичный запуск
-
-Команда выполняет строгую последовательность: сборка образов, запуск отдельной
-БД, ожидание её готовности, Alembic migration, затем backend и frontend.
-
-```bash
-cd /home/barsukov/prodplan-shadow
+git status --short
+git pull --ff-only
 scripts/shadow-stack.sh start
 ```
 
-Фоновый `sync-worker` не запускается. Он находится в отдельном compose-профиле
-`automation`.
+`start` проверяет, что 8010/9010 закрыты, собирает образы, запускает БД,
+применяет Alembic, затем запускает backend/frontend и выполняет проверку.
+Нельзя применять `git reset --hard`, `docker compose down -v` или подключать
+другой PostgreSQL volume.
 
 Проверка:
 
@@ -106,135 +55,28 @@ scripts/shadow-stack.sh start
 scripts/shadow-stack.sh verify
 curl -fsS http://127.0.0.1:8020/health
 curl -I http://127.0.0.1:9020
-docker compose --project-name prodplan -f /home/barsukov/prodplan/docker-compose.test.yml ps
+if curl -fsS http://127.0.0.1:8010/health; then exit 1; fi
+if curl -fsS http://127.0.0.1:9010; then exit 1; fi
 ```
 
-Последняя команда подтверждает, что стабильный контур продолжает работать.
-Новая программа доступна по `http://mtzdock.lan:9020`, старая — по
-`http://mtzdock.lan:9010`.
-
-Backend сравнения читает стабильный контур по
-`PRODPLAN_STABLE_API_URL` (по умолчанию `http://mtzdock.lan:8010`), только
-GET-запросами. Пользовательская ссылка возврата берётся из
-`PRODPLAN_STABLE_URL`.
-
-## 4. Начальное наполнение и одинаковый срез
-
-Для честного сравнения новой программе нужен тот же завершённый срез входных
-данных, но отдельная база. Не копируйте PostgreSQL volume на работающем сервере.
-Используйте согласованный dump:
-
-```bash
-cd /home/barsukov/prodplan
-docker compose -f docker-compose.test.yml exec -T db pg_dump \
-  -U prodplan -d prodplan --format=custom --no-owner --no-acl \
-  > /home/barsukov/prodplan-shadow/backups-shadow/stable-seed.dump
-chmod 600 /home/barsukov/prodplan-shadow/backups-shadow/stable-seed.dump
-```
-
-Перед restore отдельно убедитесь, что путь начинается с
-`/home/barsukov/prodplan-shadow/backups-shadow/`. Restore уничтожает только
-shadow-базу, поэтому требует явного подтверждения:
-
-```bash
-cd /home/barsukov/prodplan-shadow
-CONFIRM_RESTORE=prodplan-shadow \
-  scripts/shadow-stack.sh restore backups-shadow/stable-seed.dump
-scripts/shadow-stack.sh migrate
-scripts/shadow-stack.sh start
-```
-
-Стабильную БД эти команды не открывают и не изменяют.
-
-## 5. Параллельное наблюдение
-
-До включения воркеров:
-
-1. Проверить логи backend на ошибки чтения.
-2. Вручную выполнить синхронизацию.
-3. Сравнить количество заказов, остатки, MRP и DBR с одинаковым timestamp.
-4. Проверить ссылку возврата на стабильную программу.
-5. Создать контролируемый рабочий документ из новой программы и убедиться, что
-   после синхронизации он виден в старой без повторного создания.
-
-Только после этого включить замедленные воркеры:
+## Воркеры, backup и остановка
 
 ```bash
 scripts/shadow-stack.sh start-workers
-```
-
-`sync-worker` ждёт 180 секунд и выполняет не более одного due-job каждые 300
-секунд. Его расписание отделено от стабильного контура.
-
-Для ежедневного согласованного backup:
-
-```bash
 scripts/shadow-stack.sh backup
-```
-
-Сравнение должно собирать минимум: commit, migration head, timestamp входного
-среза, planning-run ID, количества рекомендаций и расхождения по
-номенклатуре/сроку/количеству.
-
-## 6. Расширение реальной работы
-
-Новая программа технически полноценна с первого запуска. Реальную нагрузку
-расширяйте после нескольких полных циклов и анализа расхождений:
-
-1. Перед расширением сделайте backup shadow-базы.
-2. Первые операции выполняйте вручную из журнала и проверяйте созданный
-   документ в 1С.
-3. Дождитесь, когда стабильная программа прочитает этот документ обратно.
-4. Убедитесь, что повторная команда не создаёт дубликат.
-5. Затем последовательно подключайте больше участков и фоновые регламенты.
-
-Стабильная программа всё время остаётся рабочим интерфейсом и продолжает
-синхронизацию с 1С.
-
-### Правило единственного оператора записи
-
-Обе программы технически умеют записывать документы, но одну и ту же команду
-нельзя одновременно запускать в двух интерфейсах. Метка `prodplan-origin`
-позволяет новой версии восстановить документ, уже созданный другим экземпляром
-нового кода, однако старая версия этой метки ещё не знает, а операция
-`GET → POST` в OData не атомарна.
-
-- В штатной работе новые документы создают из параллельной программы.
-- Стабильная программа читает их обратно из 1С и остаётся доступной для
-  просмотра и продолжения исполнения.
-- При отказе сначала выполняют `scripts/shadow-stack.sh stop` и убеждаются, что
-  backend `:8020` недоступен; только затем создание новых документов продолжают
-  в стабильной программе.
-- После возврата параллельного контура сначала запускают синхронизацию из 1С,
-  проверяют уже созданные документы и только потом возобновляют запись.
-
-Это переключение роли оператора, а не технический запрет: обе программы
-сохраняют полную функциональность записи.
-
-## 7. Остановка и откат
-
-Остановка новой программы не затрагивает старую:
-
-```bash
-cd /home/barsukov/prodplan-shadow
 scripts/shadow-stack.sh stop
 ```
 
-Команда использует `docker compose stop`. Она не выполняет `down -v`, поэтому
-контейнерный volume и данные сохраняются. После остановки:
+`sync-worker` находится в compose-профиле `automation`. `backup` создаёт
+согласованный custom-format dump действующей базы. `stop` сохраняет volume и
+данные. Restore допустим только из проверенного файла в `backups-shadow/` и с
+явным `CONFIRM_RESTORE=prodplan-shadow` согласно подсказке скрипта.
 
-```bash
-curl -fsS http://127.0.0.1:8010/health
-curl -I http://127.0.0.1:9010
-```
+## Запрещено
 
-Если новая программа ошибается, пользователи сразу возвращаются на `:9010`.
-Никакого rollback стабильного кода или стабильной базы не требуется.
-
-## Запрещённые действия
-
-- Не запускать `docker compose down -v`.
-- Не использовать один compose project name для двух программ.
-- Не подключать backend shadow к стабильной PostgreSQL.
-- Не копировать живой PostgreSQL volume средствами `cp`/`rsync`.
-- Не выполнять restore без свежего backup и проверки полного пути.
+- запускать или восстанавливать контур 8010/9010;
+- использовать 9010 как fallback при ошибке 9020;
+- подключать backend к иной или старой PostgreSQL;
+- копировать живой PostgreSQL volume через `cp`/`rsync`;
+- выполнять `docker compose down -v`;
+- создавать второй PRODPLAN-писатель документов 1С.

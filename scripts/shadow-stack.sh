@@ -87,6 +87,16 @@ wait_for_db() {
   done
 }
 
+require_retired_ports_closed() {
+  local port
+  for port in 8010 9010; do
+    if curl --silent --show-error --max-time 2 \
+      "http://127.0.0.1:${port}/" >/dev/null 2>&1; then
+      die "выведенный из эксплуатации порт ${port} отвечает; остановите старый контур"
+    fi
+  done
+}
+
 bootstrap() {
   mkdir -p -- config-shadow output-shadow backups-shadow
   chmod 700 -- config-shadow output-shadow backups-shadow
@@ -118,6 +128,7 @@ migrate() {
 }
 
 start_stack() {
+  require_retired_ports_closed
   require_env
   compose config --quiet
   compose build backend frontend
@@ -130,6 +141,7 @@ start_stack() {
 }
 
 verify_stack() {
+  require_retired_ports_closed
   require_env
   compose ps
   local backend_port frontend_port
@@ -142,7 +154,7 @@ verify_stack() {
   curl --fail --silent --show-error --max-time 10 \
     "http://127.0.0.1:${frontend_port}/" >/dev/null
   compose exec -T backend alembic current
-  info "backend и frontend отвечают; версия миграции показана выше"
+  info "backend и frontend отвечают; 8010/9010 закрыты; версия миграции показана выше"
 }
 
 backup_db() {

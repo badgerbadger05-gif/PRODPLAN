@@ -4,7 +4,9 @@
 
 Задача: предложить набор складов под текущие участки PRODPLAN и склады хранения, а не просто переименовать существующие строки 1С.
 
-Источник факта: живой `prodplan` на `mtzdock.lan`, путь `/home/barsukov/prodplan`, compose `docker-compose.test.yml`.
+Исторический источник факта на момент составления документа: ныне выведенный
+из эксплуатации `prodplan` на `mtzdock.lan`, путь `/home/barsukov/prodplan`,
+compose `docker-compose.test.yml`. Это архив, а не инструкция по запуску.
 
 ## Исходные факты
 
