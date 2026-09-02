@@ -91,12 +91,36 @@ def _setup_pair(
         stock=legacy_welded_stock,
     )
 
-    # painted default spec = 1 component (welded)
-    paint_spec = Specification(spec_name="Окраска кронштейна", spec_ref1c="spec-paint")
+    # painted default spec = 1 component (welded), routed to the explicit
+    # next-stage recipient used by the welded production order.
+    paint_kind = ProductionKind(ref_1c="kind-paint", name="Порошковая окраска")
+    db.add(paint_kind)
+    db.flush()
+    paint_spec = Specification(
+        spec_name="Окраска кронштейна",
+        spec_ref1c="spec-paint",
+        production_kind_id=paint_kind.id,
+    )
     db.add(paint_spec)
     db.flush()
     db.add(DefaultSpecification(item_id=painted.item_id, spec_id=paint_spec.spec_id))
     db.add(SpecComponent(spec_id=paint_spec.spec_id, item_id=welded.item_id, quantity=1, component_type="Сборка"))
+    paint_resource = ProductionResource(resource_name="Участок порошковой окраски")
+    db.add(paint_resource)
+    db.flush()
+    db.add(
+        ResourceProductionKind(
+            resource_id=paint_resource.resource_id,
+            production_kind_id=paint_kind.id,
+        )
+    )
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=paint_resource.resource_id,
+            warehouse_ref1c="warehouse-paint-workshop",
+            production_warehouse_ref1c="warehouse-painted-output",
+        )
+    )
 
     # welded default spec + weld workshop bound via production kind (buffer_days)
     kind = ProductionKind(ref_1c="kind-weld", name="Сварка")

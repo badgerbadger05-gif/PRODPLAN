@@ -53,6 +53,16 @@ def _accepted(db, key="assemble"):
 
 
 def _issue(db, generation, *, ref1c: str = "transfer-ref-1"):
+    order = db.get(models.ProductionOrder, 1)
+    if order is None:
+        order = models.ProductionOrder(
+            order_id=1,
+            order_number="MRP-ASSEMBLE",
+            order_date=datetime(2026, 7, 23, tzinfo=timezone.utc),
+            source="mrp",
+        )
+        db.add(order)
+        db.flush()
     issue = models.ProductionMaterialIssue(
         document_number="MI-ASSEMBLE",
         product_id=1,
@@ -133,6 +143,56 @@ def test_assemble_repull_resets_an_exhausted_pull_row(db_session, monkeypatch):
     )
     assert len(rows) == 1  # без дублей: get-or-create по (type, ref)
     assert rows[0].status == "pending"
+
+
+def test_assemble_accepts_stale_executor_when_parent_order_is_current(
+    db_session, monkeypatch
+):
+    creation_generation = _accepted(db_session, key="stale-creation")
+    issue = _issue(db_session, creation_generation)
+    current_generation = _accepted(db_session, key="stale-current")
+    fake = _FakeClient()
+    _stub_1c(monkeypatch, fake)
+    checked: list[tuple[list[int], str]] = []
+
+    def _require_current_parent(db, orders, *, consumer):
+        checked.append(([int(order.order_id) for order in orders], consumer))
+        return int(current_generation.id)
+
+    monkeypatch.setattr(
+        issues, "require_materialized_orders", _require_current_parent
+    )
+
+    result = issues.assemble_material_issue(db_session, issue.issue_id)
+
+    assert result["status"] == "ok"
+    assert checked == [
+        ([1], "production_material_issue_assemble_stale_executor")
+    ]
+    assert fake.operations[-1].endswith("/Post?PostingModeOperational=true")
+
+
+def test_assemble_rejects_stale_executor_when_parent_order_is_not_current(
+    db_session, monkeypatch
+):
+    creation_generation = _accepted(db_session, key="retired-creation")
+    issue = _issue(db_session, creation_generation)
+    _accepted(db_session, key="retired-current")
+    fake = _FakeClient()
+    _stub_1c(monkeypatch, fake)
+
+    def _reject_parent(*_args, **_kwargs):
+        raise ValueError("parent MRP obligation is retired")
+
+    monkeypatch.setattr(issues, "require_materialized_orders", _reject_parent)
+
+    try:
+        issues.assemble_material_issue(db_session, issue.issue_id)
+        assert False, "ожидали ValueError"
+    except ValueError as exc:
+        assert "retired" in str(exc)
+
+    assert fake.operations == []
 
 
 def test_assemble_failure_does_not_enqueue_pull(db_session, monkeypatch):

@@ -23,6 +23,8 @@ from app.models import (
     DefaultSpecification,
     Item,
     Operation,
+    PaintWeldChainLink,
+    PaintWeldPair,
     MrpRequirement,
     PlannedOrder,
     PlanningRun,
@@ -447,6 +449,93 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     assert operation_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
     assert operation_row["КлючСвязиПродукция"] == prod_row["КлючСвязи"]
     assert payload["ЗапланированыОперации"] is True
+
+
+def test_welded_chain_order_delivers_output_to_painted_workshop(
+    db_session, monkeypatch
+):
+    db = db_session
+    painted_item = _mk_item(db, code="P-PAINT", ref1c="painted-item-ref")
+    welded_item = _mk_item(db, code="P-WELD", ref1c="welded-item-ref")
+    painted_resource = ProductionResource(resource_name="Powder coating")
+    welded_resource = ProductionResource(resource_name="Welding")
+    db.add_all([painted_resource, welded_resource])
+    db.flush()
+    db.add_all(
+        [
+            WorkshopWarehouseBinding(
+                workshop_id=painted_resource.resource_id,
+                warehouse_ref1c="paint-workshop-ref",
+                production_warehouse_ref1c="painted-output-ref",
+            ),
+            WorkshopWarehouseBinding(
+                workshop_id=welded_resource.resource_id,
+                warehouse_ref1c="weld-workshop-ref",
+                production_warehouse_ref1c="assembly-output-ref",
+            ),
+        ]
+    )
+    run = _mk_run(db)
+    painted_order = _mk_mrp_order(db, painted_item, run_id=run.run_id, qty=3)
+    welded_order = _mk_mrp_order(db, welded_item, run_id=run.run_id, qty=3)
+    painted_product = (
+        db.query(ProductionProduct)
+        .filter_by(order_id=painted_order.order_id)
+        .one()
+    )
+    welded_product = (
+        db.query(ProductionProduct)
+        .filter_by(order_id=welded_order.order_id)
+        .one()
+    )
+    db.add_all(
+        [
+            ProductionOrderLineState(
+                product_id=painted_product.product_id,
+                status="ready",
+                issue_status="not_requested",
+                workshop_id=painted_resource.resource_id,
+            ),
+            ProductionOrderLineState(
+                product_id=welded_product.product_id,
+                status="ready",
+                issue_status="not_requested",
+                workshop_id=welded_resource.resource_id,
+            ),
+        ]
+    )
+    pair = PaintWeldPair(
+        painted_item_id=painted_item.item_id,
+        welded_item_id=welded_item.item_id,
+        source="manual",
+        is_active=True,
+    )
+    db.add(pair)
+    db.flush()
+    db.add(
+        PaintWeldChainLink(
+            painted_order_id=painted_order.order_id,
+            welded_order_id=welded_order.order_id,
+            pair_id=pair.id,
+        )
+    )
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("Network client must not be instantiated in dry-run"),
+    )
+
+    result = exporter.export_production_orders_to_1c(
+        db, [welded_order.order_id], dry_run=True
+    )
+    payload = result["payloads"][0]["payload"]
+
+    assert payload["СтруктурнаяЕдиницаРезерв_Key"] == "weld-workshop-ref"
+    assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "paint-workshop-ref"
+    assert payload["Продукция"][0]["СтруктурнаяЕдиница_Key"] == "paint-workshop-ref"
 
 
 def test_export_writes_into_configured_production_base(db_session, monkeypatch):

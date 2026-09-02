@@ -49,6 +49,7 @@ from .production_material_custody_projection import (
     load_current_accepted_material_custody,
 )
 from .planning_truth import require_accepted_truth
+from .mrp_mutation_guard import require_materialized_orders
 from .production_output_truth import accepted_product_output
 from .workshop_resolution import (
     diagnose_product,
@@ -1487,8 +1488,21 @@ def assemble_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     )
     if issue is None:
         raise ValueError("Заявка на перемещение не найдена")
-    if issue.ledger_generation_id is None or int(issue.ledger_generation_id) != int(truth.generation_id):
+    if issue.ledger_generation_id is None:
         raise ValueError("material issue is not bound to current accepted Ledger generation")
+    if int(issue.ledger_generation_id) != int(truth.generation_id):
+        # The transfer is an executor document: a fact-only Ledger refresh
+        # must not invalidate an already exported 1C document.  Reuse the
+        # canonical MRP executor guard used by transfer export, which proves
+        # that the immutable parent order still belongs to current accepted
+        # work and fails closed when its obligation has been retired.
+        if issue.order is None:
+            raise ValueError("material issue parent production order is missing")
+        require_materialized_orders(
+            db,
+            [issue.order],
+            consumer="production_material_issue_assemble_stale_executor",
+        )
     ref_key = _clean_ref1c(issue.exported_ref1c)
     if not ref_key:
         raise ValueError("Перемещение ещё не выгружено в 1С")

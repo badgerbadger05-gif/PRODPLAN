@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, joinedload
 from ..models import (
     Item,
     Operation,
+    PaintWeldChainLink,
     ProductionMaterialIssue,
     ProductionOrder,
     PlanningRun,
@@ -232,6 +233,49 @@ def _active_issue_for_product(db: Session, product_id: int) -> Optional[Producti
     )
 
 
+def _paint_weld_next_stage_destination_ref(
+    db: Session, order_id: int
+) -> Optional[str]:
+    """Return the painted workshop warehouse for a welded chain order.
+
+    A welded product is consumed by the painted order, so its physical output
+    must land at the next executor (powder coating), not at the welded
+    workshop's generic finished-goods warehouse.  The chain link is the
+    canonical sequence owner; the painted product's workshop binding owns the
+    concrete 1C structural-unit reference.
+    """
+    link = (
+        db.query(PaintWeldChainLink)
+        .filter(PaintWeldChainLink.welded_order_id == int(order_id))
+        .one_or_none()
+    )
+    if link is None:
+        return None
+    painted_products = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.order_id == int(link.painted_order_id))
+        .all()
+    )
+    if len(painted_products) != 1:
+        raise ValueError(
+            f"paint/weld chain painted order {int(link.painted_order_id)} "
+            "does not have exactly one product"
+        )
+    painted_product = painted_products[0]
+    painted_spec_id = spec_id_for_product(db, painted_product)
+    painted_workshop_id = resolve_workshop_for_product(
+        db, painted_product, spec_id=painted_spec_id
+    )
+    binding = warehouse_binding_for_workshop(db, painted_workshop_id)
+    destination_ref = _clean_ref1c(binding.warehouse_ref1c) if binding else ""
+    if not destination_ref:
+        raise ValueError(
+            f"paint/weld chain painted order {int(link.painted_order_id)} "
+            "has no recipient workshop warehouse"
+        )
+    return destination_ref
+
+
 def _materials_for_spec(
     db: Session,
     *,
@@ -390,6 +434,9 @@ def _collect_export_entries(
         product_structural_unit_ref: Optional[str] = None
         start_dates: List[Any] = []
         finish_dates: List[Any] = []
+        chain_destination_ref = _paint_weld_next_stage_destination_ref(
+            db, int(order.order_id)
+        )
         for product in order.products or []:
             item = product.item
             ref1c = _clean_ref1c(item.item_ref1c) if item else ""
@@ -422,7 +469,11 @@ def _collect_export_entries(
             material_destination_ref = (
                 _clean_ref1c(issue.warehouse_ref1c) if issue else None
             ) or workshop_warehouse_ref
-            product_destination_ref = production_warehouse_ref or material_destination_ref
+            product_destination_ref = (
+                chain_destination_ref
+                or production_warehouse_ref
+                or material_destination_ref
+            )
             product_reserve_ref = material_destination_ref
             if product_reserve_ref and not reserve_ref:
                 reserve_ref = product_reserve_ref
