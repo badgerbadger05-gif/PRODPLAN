@@ -67,6 +67,7 @@ from .one_c_export_common import (
 )
 from .one_c_document_numbers import production_order_number
 from .mrp_mutation_guard import MrpMutationLineageError, require_materialized_orders
+from .production_control_common import DONE_STATE_KEY
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .bom_specification_resolver import BomSpecificationResolver
@@ -75,6 +76,7 @@ from .bom_specification_resolver import BomSpecificationResolver
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 PRODUCTION_ORDER_PRODUCTS_ENTITY = "Document_ЗаказНаПроизводство_Продукция"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
+DONE_VARIANT_VALUE = "Успешно"
 
 
 @dataclass
@@ -196,8 +198,16 @@ def _export_defaults(config: Dict[str, Any]) -> ProductionOrderExportDefaults:
 
 def _close_defaults(config: Dict[str, Any]) -> ProductionOrderCloseDefaults:
     return ProductionOrderCloseDefaults(
-        close_state_ref1c=_config_ref1c(config, "default_production_order_done_state_ref1c"),
-        close_variant_ref1c=_config_ref1c(config, "default_production_order_done_variant_ref1c"),
+        close_state_ref1c=_config_ref1c(
+            config,
+            "default_production_order_done_state_ref1c",
+            DONE_STATE_KEY,
+        ),
+        close_variant_ref1c=_config_ref1c(
+            config,
+            "default_production_order_done_variant_ref1c",
+            DONE_VARIANT_VALUE,
+        ),
     )
 
 
@@ -633,15 +643,6 @@ def _collect_close_entries(
                 }
             )
             continue
-        if link.ledger_generation_id is not None and int(link.ledger_generation_id) != int(generation_id):
-            skipped.append(
-                {
-                    "order_id": int(order.order_id),
-                    "reason": "SyncLink принадлежит другой Ledger-цепи",
-                }
-            )
-            continue
-
         entries.append(
             ProductionOrderCloseEntry(
                 order_id=int(order.order_id),

@@ -33,7 +33,7 @@ import {
   produceOrderLine,
   returnLeftoverComponents,
   saveProductionControlSettings,
-  syncPostedTransfers,
+  syncExecutionFrom1C,
   updateItem,
   updateOrderStatus,
 } from '../../services/productionControl'
@@ -507,16 +507,18 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      // Pulls Posted=true flag from 1C for previously exported transfers and
-      // advances local status: К перемещению → Собран.
-      const result = await syncPostedTransfers()
-      const candidates = Number(result.candidates ?? 0)
-      const advanced = Number(result.advanced ?? 0)
-      const errors = Array.isArray(result.errors) ? result.errors.length : 0
-      setMessage(`Синхронизация: проверено ${candidates}, переведено в «Собран» ${advanced}${errors ? `, ошибок ${errors}` : ''}`)
-      if (advanced > 0) {
-        await load(offsetRef.current)
-      }
+      const result = await syncExecutionFrom1C()
+      const ordersUpdated = Number(result.orders.orders_updated ?? 0)
+      const candidates = Number(result.transfers.candidates ?? 0)
+      const advanced = Number(result.transfers.advanced ?? 0)
+      const orderErrors = Array.isArray(result.orders.errors) ? result.orders.errors.length : 0
+      const transferErrors = Array.isArray(result.transfers.errors) ? result.transfers.errors.length : 0
+      const errors = orderErrors + transferErrors
+      await load(offsetRef.current)
+      setMessage(
+        `Синхронизация: заказов обновлено ${ordersUpdated}, перемещений проверено ${candidates}, переведено в «Собран» ${advanced}`
+        + (errors ? `, ошибок ${errors}` : ''),
+      )
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {

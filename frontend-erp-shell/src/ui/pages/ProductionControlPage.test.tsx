@@ -30,7 +30,7 @@ vi.mock('../../services/productionControl', () => ({
   closeProductionOrder: vi.fn(),
   exportMaterialIssuesTo1C: vi.fn(),
   markMaterialIssueAssembled: vi.fn(),
-  syncPostedTransfers: vi.fn(),
+  syncExecutionFrom1C: vi.fn(),
   produceOrderLine: vi.fn(),
   getItem: vi.fn(),
   updateItem: vi.fn(),
@@ -57,7 +57,7 @@ import {
   updateOrderStatus,
   postMaterialIssues,
   exportMaterialIssuesTo1C,
-  syncPostedTransfers,
+  syncExecutionFrom1C,
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
   produceOrderLine,
@@ -337,7 +337,10 @@ beforeEach(() => {
     status: 'ok', dry_run: false, orders_requested: 1, orders_eligible: 1,
     orders_closed: 1, orders_error: 0,
   })
-  vi.mocked(syncPostedTransfers).mockResolvedValue({ candidates: 2, advanced: 0, errors: [] } as never)
+  vi.mocked(syncExecutionFrom1C).mockResolvedValue({
+    orders: { orders_updated: 1, errors: [] },
+    transfers: { candidates: 2, advanced: 0, errors: [] },
+  } as never)
 })
 
 describe('ProductionControlPage — characterization', () => {
@@ -988,15 +991,15 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByText(/Заказ закрыт в 1С по кнопке/)).not.toBeInTheDocument()
   })
 
-  it('"Синхронизировать" calls syncPostedTransfers and shows a summary message', async () => {
+  it('"Синхронизировать" reads order completion and transfer state from 1C', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
 
     await user.click(screen.getByRole('button', { name: 'Синхронизировать' }))
 
-    await waitFor(() => expect(syncPostedTransfers).toHaveBeenCalledTimes(1))
-    expect(await screen.findByText(/Синхронизация: проверено 2/)).toBeInTheDocument()
+    await waitFor(() => expect(syncExecutionFrom1C).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText(/заказов обновлено 1, перемещений проверено 2/)).toBeInTheDocument()
   })
 
   it('exposes sortable state and supports keyboard activation and selection of order rows', async () => {

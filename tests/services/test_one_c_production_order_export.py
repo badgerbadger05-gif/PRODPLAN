@@ -1109,6 +1109,41 @@ def test_close_dry_run_without_network(db_session, monkeypatch):
     assert "Комментарий" not in payload
 
 
+def test_close_reuses_successful_link_from_older_accepted_generation(db_session):
+    db = db_session
+    item = _mk_item(db, code="PCG", ref1c="cccccccc-cccc-cccc-cccc-ccccccccccc1")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=1)
+    order.order_ref1c = "e2d7f3f0-0000-0000-0000-000000000124"
+    link = _mk_sync_link_for_order(db, order, target_ref_key=order.order_ref1c)
+    link.ledger_generation_id = int(run.ledger_generation_id) - 1
+    db.commit()
+
+    entries, skipped = exporter._collect_close_entries(
+        db,
+        generation_id=int(run.ledger_generation_id),
+        order_ids=[order.order_id],
+    )
+
+    assert [entry.order_id for entry in entries] == [order.order_id]
+    assert skipped == []
+
+
+def test_close_uses_canonical_done_defaults_when_optional_config_is_absent():
+    defaults = exporter._close_defaults({})
+    entry = exporter.ProductionOrderCloseEntry(
+        order_id=1,
+        number="PP000000001",
+        order_ref1c="11111111-1111-1111-1111-111111111111",
+        source_run_id=1,
+    )
+
+    assert exporter._build_close_payload(entry, defaults) == {
+        "СостояниеЗаказа_Key": exporter.DONE_STATE_KEY,
+        "ВариантЗавершения": exporter.DONE_VARIANT_VALUE,
+    }
+
+
 def test_close_live_writes_patch_to_1c_without_mutating_local_order(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PXC", ref1c="dddddddd-dddd-dddd-dddd-dddddddddddd")
@@ -1171,7 +1206,7 @@ def test_close_fails_closed_when_link_missing_or_ineligible(db_session, monkeypa
     assert "SyncLink не найден" in result["skipped_rows"][0]["reason"]
 
 
-def test_close_requires_done_variant_in_config(db_session, monkeypatch):
+def test_close_uses_done_variant_fallback_when_config_value_is_empty(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PXA", ref1c="ffffffff-ffff-ffff-ffff-ffffffffffff")
     run = _mk_run(db)
@@ -1181,11 +1216,7 @@ def test_close_requires_done_variant_in_config(db_session, monkeypatch):
     db.commit()
 
     _stub_close_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo", done_variant_ref="")
-    monkeypatch.setattr(
-        exporter,
-        "OData1CClient",
-        lambda **_: pytest.fail("close should fail before network when variant is not configured"),
-    )
+    result = exporter.close_production_orders_to_1c(db, [order.order_id], dry_run=True)
 
-    with pytest.raises(exporter.MrpMutationLineageError, match="done_variant_ref1c"):
-        exporter.close_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    assert result["orders_eligible"] == 1
+    assert result["payloads"][0]["payload"]["ВариантЗавершения"] == exporter.DONE_VARIANT_VALUE

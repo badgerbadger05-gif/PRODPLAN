@@ -181,8 +181,13 @@ export function deleteMaterialIssue(issueId: number) {
   return api(`/v1/production-control/material-issues/${issueId}`, { method: 'DELETE' })
 }
 
-export function syncPostedTransfers() {
-  return api<Record<string, unknown>>('/v1/production-control/sync-posted-transfers', {
+export type ExecutionSyncResult = {
+  orders: Record<string, unknown>
+  transfers: Record<string, unknown>
+}
+
+export function syncExecutionFrom1C() {
+  return api<ExecutionSyncResult>('/v1/production-control/sync-execution-from-1c', {
     method: 'POST',
   })
 }

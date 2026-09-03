@@ -56,6 +56,10 @@ from ..services.production_control_production_flow import (
     return_leftover_components,
     rollback_local_manufacture,
 )
+from ..services.production_order_sync import (
+    configured_production_order_sync_request,
+    sync_production_orders_from_odata,
+)
 from .production_control_settings import router as settings_router
 
 
@@ -1408,6 +1412,25 @@ def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_
     """
     try:
         return sync_posted_transfers(db, dry_run=bool(dry_run))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/sync-execution-from-1c", response_model=dict)
+def post_sync_execution_from_1c(dry_run: bool = False, db: Session = Depends(get_db)):
+    """Read mutable execution state from 1C without deriving completion locally.
+
+    Production-order completion comes exclusively from
+    ``СостояниеЗаказа_Key`` in 1C.  Accepted output remains a Ledger fact; it is
+    refreshed by the production-order sync's canonical fact-cache step.
+    """
+    try:
+        request = configured_production_order_sync_request(dry_run=bool(dry_run))
+        orders = sync_production_orders_from_odata(db, request)
+        transfers = sync_posted_transfers(db, dry_run=bool(dry_run))
+        return {"orders": orders, "transfers": transfers}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

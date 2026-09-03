@@ -27,6 +27,7 @@ from app.services.item_ledger.future_supply_capture import (
     FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
     replace_future_supply_capture,
 )
+from app.services.production_control_common import DONE_STATE_KEY
 
 
 CAPABILITIES = {
@@ -811,6 +812,29 @@ def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session
     assert after["rows"][0]["quantity"] == 4, "команда оператора обязана быть видна сразу"
     assert after["rows"][0]["produced_qty"] == 3, "принятый выпуск остаётся снимочным"
     assert after["rows"][0]["remaining_qty"] == 1, "остаток считается от снимочного выпуска"
+
+
+def test_completed_1c_order_is_hidden_immediately_from_accepted_snapshot(db_session):
+    generation = _building_generation(db_session, "production-journal-live-completion")
+    _item, order, _product = _journal_line(db_session)
+    snapshot = build_candidate_snapshot(
+        db_session, generation.id, accepted_run_ids=[],
+    )
+    _accept(db_session, generation, snapshot)
+
+    before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    assert before["total"] == 1
+
+    # The order was completed in 1C and its state was read back. Completion is
+    # mutable execution state, so the immutable planning row is hidden rather
+    # than rewritten while waiting for the next accepted generation.
+    order.order_state_key = DONE_STATE_KEY
+    db_session.commit()
+
+    after = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    assert after["rows"] == []
+    assert after["total"] == 0
+    assert after["offset"] == 0
 
 
 def test_missing_snapshot_fails_closed_and_router_maps_it_to_503(db_session):

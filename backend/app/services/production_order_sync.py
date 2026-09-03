@@ -22,10 +22,29 @@ from ..schemas import ODataSyncRequest
 from .item_ledger.production_output_cache import (
     update_accepted_product_output_cache,
 )
+from .odata_config import load_odata_config, sanitize_base_url
 
 
 PRODUCTION_ORDER_SYNC_FROM = datetime(2026, 5, 1)
 PRODUCTION_ORDER_SYNC_FROM_1C = "2026-05-01T00:00:00"
+PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
+
+
+def configured_production_order_sync_request(*, dry_run: bool = False) -> ODataSyncRequest:
+    """Build the operator-triggered order readback from the stored 1C config."""
+    config = load_odata_config()
+    base_url = sanitize_base_url(str(config.get("base_url") or ""))
+    if not base_url:
+        raise ValueError("OData base_url is not configured")
+    return ODataSyncRequest(
+        base_url=base_url,
+        entity_name=PRODUCTION_ORDER_ENTITY,
+        username=config.get("username") or None,
+        password=config.get("password") or None,
+        token=config.get("token") or None,
+        dry_run=bool(dry_run),
+        zero_missing=False,
+    )
 
 
 @dataclass

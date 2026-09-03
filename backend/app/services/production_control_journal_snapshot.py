@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import models
@@ -45,6 +45,7 @@ from app.services.production_control_journal import (
     list_journal,
     list_make_proposals,
 )
+from app.services.production_control_common import DONE_STATE_KEY
 
 
 CONSUMER = "production_control_journal"
@@ -930,6 +931,21 @@ def read_snapshot(
         models.PlanningReadRow.row_kind.in_(ROW_KINDS),
     )
     row_payload = models.PlanningReadRow.payload
+    # Completion is mutable execution state read back from 1C.  The accepted
+    # planning row remains immutable, but a completed live order must disappear
+    # immediately and must not distort pagination while the next generation is
+    # being built.
+    completed_order_ids = select(models.ProductionOrder.order_id).where(
+        func.lower(func.coalesce(models.ProductionOrder.order_state_key, ""))
+        == DONE_STATE_KEY
+    )
+    order_id_expr = row_payload["order_id"].as_integer()
+    query = query.filter(
+        or_(
+            order_id_expr.is_(None),
+            order_id_expr.notin_(completed_order_ids),
+        )
+    )
     if product_id is not None:
         query = query.filter(row_payload["product_id"].as_integer() == int(product_id))
     if order_id is not None:
