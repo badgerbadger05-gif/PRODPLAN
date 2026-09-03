@@ -6,6 +6,8 @@ import { ItemLedgerSummaryBlock } from '../../item-ledger/ItemLedgerSummaryBlock
 type Props = {
   activeRow: OrderRow | null
   materials: MaterialsResponse | null
+  materialsLoading: boolean
+  materialsError: string
   coverageLabels: Record<string, string>
   onLoadMaterials: () => void
   onPrint: () => void
@@ -20,6 +22,8 @@ type Props = {
 export function ProductionDetailPane({
   activeRow,
   materials,
+  materialsLoading,
+  materialsError,
   coverageLabels,
   onLoadMaterials,
   onPrint,
@@ -342,7 +346,9 @@ export function ProductionDetailPane({
             </div>
           )}
           <div className="detailActions">
-            <button onClick={onLoadMaterials}>Повторить загрузку</button>
+            <button onClick={onLoadMaterials} disabled={materialsLoading}>
+              {materialsLoading ? 'Загрузка…' : 'Повторить загрузку'}
+            </button>
             <button onClick={onPrint} disabled={!activeRow?.product_id}>Печать листа</button>
             {activeRow?.product_id && (
               <button
@@ -400,7 +406,13 @@ export function ProductionDetailPane({
                 </span>
               </div>
             ))}
-            {!materials?.components?.length && <div className="emptyDetail">Материалы не загружены</div>}
+            {materialsLoading && <div className="emptyDetail" role="status">Загрузка комплектующих…</div>}
+            {!materialsLoading && materialsError && (
+              <div className="emptyDetail" role="alert">Не удалось загрузить комплектующие: {materialsError}</div>
+            )}
+            {!materialsLoading && !materialsError && materials != null && !materials.components.length && (
+              <div className="emptyDetail">Комплектующие отсутствуют</div>
+            )}
           </div>
         </>
       ) : (

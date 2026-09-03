@@ -1130,6 +1130,57 @@ def test_work_item_materials_answer_through_their_strict_response_model(db_sessi
     assert "line_quantity" not in payload
 
 
+def test_work_item_materials_remain_readable_from_the_published_row_generation(db_session):
+    """Смена истины между списком и карточкой не обнуляет комплектующие."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.database import get_db
+    from app.routers.production_control import router as production_router
+
+    row_generation = _building_generation(db_session, "production-journal-wi-pinned")
+    run, work = _make_proposal(db_session, row_generation)
+    row_snapshot = build_candidate_snapshot(
+        db_session, row_generation.id, accepted_run_ids=[run.run_id],
+    )
+    _accept(db_session, row_generation, row_snapshot)
+
+    current_generation = _building_generation(db_session, "production-journal-wi-current")
+    current_snapshot = build_candidate_snapshot(
+        db_session, current_generation.id, accepted_run_ids=[],
+    )
+    _accept(db_session, current_generation, current_snapshot)
+
+    app = FastAPI()
+    app.include_router(production_router, prefix="/api")
+
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        stale_unpinned = client.get(
+            f"/api/v1/production-control/work-items/{work.id}/materials"
+        )
+        pinned = client.get(
+            f"/api/v1/production-control/work-items/{work.id}/materials",
+            params={"ledger_generation_id": row_generation.id},
+        )
+        wrong_generation = client.get(
+            f"/api/v1/production-control/work-items/{work.id}/materials",
+            params={"ledger_generation_id": current_generation.id},
+        )
+    app.dependency_overrides.clear()
+
+    assert stale_unpinned.status_code == 404
+    assert wrong_generation.status_code == 404
+    assert pinned.status_code == 200, pinned.text
+    payload = pinned.json()
+    assert payload["ledger_generation_id"] == row_generation.id
+    assert payload["cutoff"] == row_snapshot.cutoff.isoformat()
+    assert len(payload["components"]) == 1
+
+
 def test_materials_survive_a_generation_flip_right_after_launch(db_session):
     """Заказ, выписанный за минуты до смены поколения, не должен пропадать.
 

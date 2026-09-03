@@ -86,6 +86,9 @@ export function ProductionControlPage() {
     initialUrlState.current.activeProductId,
   )
   const [materials, setMaterials] = useState<MaterialsResponse | null>(null)
+  const [materialsLoading, setMaterialsLoading] = useState(false)
+  const [materialsError, setMaterialsError] = useState('')
+  const [materialsRefreshToken, setMaterialsRefreshToken] = useState(0)
   const [launchQtyByWorkItem, setLaunchQtyByWorkItem] = useState<Record<number, number>>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -253,6 +256,8 @@ export function ProductionControlPage() {
     const requestSeq = ++materialsRequestSeq.current
     setActiveId(productId)
     setMaterials(null)
+    setMaterialsLoading(true)
+    setMaterialsError('')
     try {
       const data = await request(productId)
       if (requestSeq !== materialsRequestSeq.current) return
@@ -266,7 +271,9 @@ export function ProductionControlPage() {
       } : row))
     } catch (e) {
       if (requestSeq !== materialsRequestSeq.current) return
-      setError(e instanceof Error ? e.message : String(e))
+      setMaterialsError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (requestSeq === materialsRequestSeq.current) setMaterialsLoading(false)
     }
   }, [])
 
@@ -276,9 +283,9 @@ export function ProductionControlPage() {
   )
 
   const loadWorkItemMaterials = useCallback(
-    (workItemId: number, quantity: number) => requestMaterials(
+    (workItemId: number, quantity: number, ledgerGenerationId: number) => requestMaterials(
       -workItemId,
-      () => getWorkItemMaterials(workItemId, quantity),
+      () => getWorkItemMaterials(workItemId, quantity, ledgerGenerationId),
     ),
     [requestMaterials],
   )
@@ -811,6 +818,7 @@ export function ProductionControlPage() {
 
   useEffect(() => {
     setMaterials(null)
+    setMaterialsError('')
   }, [activeRow?.journal_row_key])
 
   useEffect(() => {
@@ -818,15 +826,24 @@ export function ProductionControlPage() {
     const workItemId = activeRow?.work_item_id
     if (productId) {
       void loadMaterials(productId)
-    } else if (workItemId) {
+    } else if (workItemId && truthMeta?.ledger_generation) {
       const launchQty = launchQtyByWorkItem[workItemId]
         ?? activeRow.launchable_qty
         ?? activeRow.quantity
-      const timer = window.setTimeout(() => void loadWorkItemMaterials(workItemId, launchQty), 250)
+      const timer = window.setTimeout(() => void loadWorkItemMaterials(
+        workItemId,
+        launchQty,
+        truthMeta.ledger_generation as number,
+      ), 250)
       return () => window.clearTimeout(timer)
     }
     return undefined
-  }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials])
+  }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials, materialsRefreshToken, truthMeta?.ledger_generation])
+
+  async function refreshJournal() {
+    await load(offsetRef.current)
+    setMaterialsRefreshToken((current) => current + 1)
+  }
 
   const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
 
@@ -870,7 +887,7 @@ export function ProductionControlPage() {
           onPrintSelected={() => openRouteSheets(selectedRows.flatMap(productionRowProductIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
-          onRefresh={() => void load(offset)}
+          onRefresh={() => void refreshJournal()}
           onSelectAll={() => setSelectedIds(new Set(rows
             .filter((row) => !row.selection_disabled_reason)
             .map(productionRowId)))}
@@ -935,13 +952,16 @@ export function ProductionControlPage() {
             <ProductionDetailPane
               activeRow={activeRow}
               materials={materials}
+              materialsLoading={materialsLoading}
+              materialsError={materialsError}
               coverageLabels={coverageLabels}
               onLoadMaterials={() => {
                 if (activeRow?.product_id != null) void loadMaterials(activeRow.product_id)
-                else if (activeRow?.work_item_id != null) {
+                else if (activeRow?.work_item_id != null && truthMeta?.ledger_generation != null) {
                   void loadWorkItemMaterials(
                     activeRow.work_item_id,
                     launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty ?? activeRow.quantity,
+                    truthMeta.ledger_generation,
                   )
                 }
               }}

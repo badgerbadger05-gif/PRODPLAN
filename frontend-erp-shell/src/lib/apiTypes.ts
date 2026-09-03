@@ -2086,6 +2086,11 @@ export interface paths {
         /**
          * Get Work Item Materials
          * @description Preview BOM coverage for a saved MRP row without creating an order.
+         *
+         *     The journal row and its detail request must use the same immutable Ledger
+         *     generation.  A newer accepted generation may be published between the two
+         *     requests, so an explicitly pinned, previously published journal snapshot
+         *     remains readable.
          */
         get: operations["get_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_get"];
         put?: never;
@@ -9965,6 +9970,7 @@ export interface operations {
         parameters: {
             query?: {
                 qty?: number | null;
+                ledger_generation_id?: number | null;
             };
             header?: never;
             path: {

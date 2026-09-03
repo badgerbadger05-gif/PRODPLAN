@@ -35,6 +35,9 @@ from ..services.production_control_journal import (
     update_local_order_quantity,
 )
 from ..services.production_control_journal_snapshot import (
+    CONSUMER as PRODUCTION_JOURNAL_CONSUMER,
+    PROPOSAL_ROW_KIND as PRODUCTION_JOURNAL_PROPOSAL_ROW_KIND,
+    SNAPSHOT_KEY as PRODUCTION_JOURNAL_SNAPSHOT_KEY,
     RouteSheetSnapshotUnavailable,
     ProductionControlJournalSnapshotUnavailable,
     list_root_product_options,
@@ -978,16 +981,52 @@ def get_order_line_materials(
 def get_work_item_materials(
     work_item_id: int,
     qty: Optional[float] = None,
+    ledger_generation_id: Optional[int] = Query(default=None, gt=0),
     db: Session = Depends(get_db),
 ):
-    """Preview BOM coverage for a saved MRP row without creating an order."""
+    """Preview BOM coverage for a saved MRP row without creating an order.
+
+    The journal row and its detail request must use the same immutable Ledger
+    generation.  A newer accepted generation may be published between the two
+    requests, so an explicitly pinned, previously published journal snapshot
+    remains readable.
+    """
     try:
         truth = planning_truth.require_accepted_truth(
             db, "production_control.work_item_materials"
         )
         work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
-        if work is None or int(work.ledger_generation_id) != int(truth.generation_id):
+        requested_generation_id = int(
+            ledger_generation_id
+            if ledger_generation_id is not None
+            else truth.generation_id
+        )
+        if work is None or int(work.ledger_generation_id) != requested_generation_id:
             raise HTTPException(status_code=404, detail="Актуальная расчётная строка не найдена")
+        journal_snapshot = (
+            db.query(models.PlanningReadSnapshot)
+            .filter(
+                models.PlanningReadSnapshot.consumer == PRODUCTION_JOURNAL_CONSUMER,
+                models.PlanningReadSnapshot.snapshot_key == PRODUCTION_JOURNAL_SNAPSHOT_KEY,
+                models.PlanningReadSnapshot.ledger_generation_id == requested_generation_id,
+                models.PlanningReadSnapshot.truth_status == "accepted",
+            )
+            .one_or_none()
+        )
+        published_row = None if journal_snapshot is None else (
+            db.query(models.PlanningReadRow)
+            .filter(
+                models.PlanningReadRow.snapshot_id == int(journal_snapshot.id),
+                models.PlanningReadRow.row_kind == PRODUCTION_JOURNAL_PROPOSAL_ROW_KIND,
+                models.PlanningReadRow.row_key == f"work-item:{int(work.id)}",
+            )
+            .one_or_none()
+        )
+        if journal_snapshot is None or published_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Опубликованный снимок строки расчёта не найден",
+            )
         launch_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
         if launch_qty <= 0 or launch_qty > float(work.replenishment_remaining_qty) + 1e-6:
             raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
@@ -997,12 +1036,12 @@ def get_work_item_materials(
             item_id=int(work.item_id),
             quantity=launch_qty,
             spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
-            ledger_generation_id=int(truth.generation_id),
+            ledger_generation_id=requested_generation_id,
             order_number=f"MRP-R-{int(work.requirement_id)}",
             run_id=int(work.run_id),
         )
         payload["truth_status"] = "accepted"
-        payload["cutoff"] = truth.cutoff.isoformat()
+        payload["cutoff"] = journal_snapshot.cutoff.isoformat()
         return payload
     except HTTPException:
         raise

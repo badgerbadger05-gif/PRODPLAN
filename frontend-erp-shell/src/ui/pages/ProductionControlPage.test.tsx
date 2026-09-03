@@ -664,13 +664,13 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
     await screen.findByText('Расчёт MRP · заказ ещё не создан')
     expect(within(rowFor('Кронштейн')).getByText('Не создан')).toBeInTheDocument()
-    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 10))
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 10, 77))
 
     const launchInput = screen.getByRole('spinbutton', { name: 'Количество запуска' })
     await user.clear(launchInput)
     await user.type(launchInput, '6')
     await user.tab()
-    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6))
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6, 77))
     await waitFor(() => expect(within(rowFor('Кронштейн')).getByText('6')).toBeInTheDocument())
     expect(await screen.findByRole('heading', { name: 'Комплектующие на 6 шт' })).toBeInTheDocument()
     expect(screen.getByText('нужно 24')).toBeInTheDocument()
@@ -685,6 +685,41 @@ describe('ProductionControlPage — characterization', () => {
     }]))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([901], 'erp-shell', undefined))
     expect(getOrderMaterials).not.toHaveBeenCalled()
+  })
+
+  it('retries proposal materials with the journal generation after refresh', async () => {
+    const proposal = {
+      ...fakeRows()[0],
+      journal_row_key: 'work-item:701',
+      work_item_id: 701,
+      product_id: null,
+      order_id: null,
+      order_number: 'MRP-R-701',
+      order_prodplan_number: 'MRP-R-701',
+      status: 'not_created',
+      available_actions: ['materialize'],
+      materialized_order_qty: 0,
+      launchable_qty: 10,
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(getWorkItemMaterials)
+      .mockRejectedValueOnce(new Error('generation changed'))
+      .mockResolvedValue({ ...fakeMaterials(), product_id: null, work_item_id: 701 })
+
+    const user = userEvent.setup()
+    renderPage()
+
+    expect(await screen.findByText(/Не удалось загрузить комплектующие: generation changed/)).toHaveAttribute('role', 'alert')
+    expect(screen.queryByText('Материалы не загружены')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Обновить' }))
+
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledTimes(2))
+    expect(getWorkItemMaterials).toHaveBeenLastCalledWith(701, 10, 77)
+    expect(await screen.findByText('Болт М8')).toBeInTheDocument()
   })
 
   it('re-quantifies a created local order and reloads its components', async () => {

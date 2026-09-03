@@ -119,8 +119,11 @@ export function getOrderMaterials(productId: number) {
   return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
 }
 
-export function getWorkItemMaterials(workItemId: number, quantity: number) {
-  const params = new URLSearchParams({ qty: String(quantity) })
+export function getWorkItemMaterials(workItemId: number, quantity: number, ledgerGenerationId: number) {
+  const params = new URLSearchParams({
+    qty: String(quantity),
+    ledger_generation_id: String(ledgerGenerationId),
+  })
   return api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
 }
 
