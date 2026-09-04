@@ -555,8 +555,28 @@ input:focus, select:focus {
 .drumTileBlockers { color: #8f1e1e; font-size: 10px; font-weight: 700; }
 .drumTileManual { display: block; margin-top: 3px; color: #314d76; font-size: 9px; font-weight: 800; }
 
-.drumGaps { margin: 0 8px 8px; }
-.drumGaps h2 { margin: 8px 0 5px; font-size: 14px; }
+.drumGaps {
+  max-height: 280px;
+  margin: 0 8px 8px;
+  border: 1px solid var(--line);
+  background: #fff;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+.drumGaps > summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 9px;
+  background: #f6f7f9;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+.drumGaps > summary::before { content: '▶'; color: var(--muted); font-size: 9px; }
+.drumGaps[open] > summary::before { content: '▼'; }
+.drumGapsSummary { color: var(--muted); font-weight: 400; }
+.drumGapsTableWrap { max-height: 240px; overflow: auto; border-top: 1px solid var(--line); }
 .drumGapRow > td { background: #fdf3f3; }
 .drumTileDetails { display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
 .drumActionGroups { display: grid; gap: 8px; margin-top: 12px; }

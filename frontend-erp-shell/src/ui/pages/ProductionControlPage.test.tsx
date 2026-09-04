@@ -546,6 +546,41 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.getByRole('heading', { name: 'Барабан сборки' })).toBeInTheDocument()
   })
 
+  it('keeps capacity gaps collapsed so the calendar remains the primary drum view', async () => {
+    vi.mocked(listDrumSchedule).mockResolvedValueOnce({
+      ...await vi.mocked(listDrumSchedule).getMockImplementation()!(new AbortController().signal),
+      gaps: [{
+        gap_id: 601,
+        queue_line_id: 902,
+        plan_id: 1,
+        plan_line_id: 12,
+        item_id: 202,
+        item_code: 'ART-2',
+        item_name: 'Рама',
+        resource_id: 1,
+        gap_date: '2026-10-02',
+        required_qty: 6,
+        available_capacity: 0,
+        gap_qty: 6,
+        readiness_phase: 'blocked',
+        original_priority: ['2026-08-01', 12],
+      }],
+      total_gaps: 1,
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+
+    expect(await screen.findByRole('table', { name: 'Календарный барабан сборки' })).toBeInTheDocument()
+    const summary = screen.getByText('Разрывы мощности')
+    const details = summary.closest('details')
+    expect(details).not.toHaveAttribute('open')
+    await user.click(summary)
+    expect(details).toHaveAttribute('open')
+    expect(screen.getByRole('table', { name: 'Разрывы мощности барабана' })).toBeInTheDocument()
+  })
+
   it('moves a drum tile by mouse drag to another workday of the same resource', async () => {
     const user = userEvent.setup()
     renderPage()

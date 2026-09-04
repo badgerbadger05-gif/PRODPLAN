@@ -233,24 +233,29 @@ export function DrumSchedulePanel() {
       </AsyncState>
 
       {!!response?.gaps.length && (
-        <section className="drumGaps">
-          <h2>Разрывы мощности</h2>
-          <table className="journalTable" aria-label="Разрывы мощности барабана">
-            <thead><tr><th>Дата</th><th>Участок</th><th>Изделие</th><th className="numCell">Требуется</th><th className="numCell">Доступно</th><th className="numCell">Дефицит</th></tr></thead>
-            <tbody>
-              {response.gaps.map((gap) => (
-                <tr key={gap.gap_id} className="drumGapRow">
-                  <td>{gap.gap_date}</td>
-                  <td>{response.resources.find((resource) => resource.resource_id === gap.resource_id)?.resource_name ?? `#${gap.resource_id}`}</td>
-                  <td>{gap.item_name || gap.item_code || `Изделие #${gap.item_id}`}</td>
-                  <td className="numCell">{gap.required_qty}</td>
-                  <td className="numCell">{gap.available_capacity}</td>
-                  <td className="numCell"><strong>{gap.gap_qty}</strong></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
+        <details className="drumGaps">
+          <summary>
+            <span>Разрывы мощности</span>
+            <span className="drumGapsSummary">{response.total_gaps} строк · {response.total_gap_qty} шт. за горизонтом</span>
+          </summary>
+          <div className="drumGapsTableWrap">
+            <table className="journalTable" aria-label="Разрывы мощности барабана">
+              <thead><tr><th>Дата</th><th>Участок</th><th>Изделие</th><th className="numCell">Требуется</th><th className="numCell">Остаток мощности</th><th className="numCell">За горизонтом</th></tr></thead>
+              <tbody>
+                {response.gaps.map((gap) => (
+                  <tr key={gap.gap_id} className="drumGapRow">
+                    <td>{gap.gap_date}</td>
+                    <td>{response.resources.find((resource) => resource.resource_id === gap.resource_id)?.resource_name ?? `#${gap.resource_id}`}</td>
+                    <td>{gap.item_name || gap.item_code || `Изделие #${gap.item_id}`}</td>
+                    <td className="numCell">{gap.required_qty}</td>
+                    <td className="numCell">{gap.available_capacity}</td>
+                    <td className="numCell"><strong>{gap.gap_qty}</strong></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
       )}
 
       {activeSlot && (
