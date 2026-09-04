@@ -417,10 +417,16 @@ def test_close_chain_live_exports_combined_without_closing_orders(db_session, mo
     # ничего не должен пересоздавать; стаббим его, чтобы не ходить в конфиг.
     from app.services import one_c_manufacture_export
 
+    export_calls = []
+
+    def _export_in_order(db, ids, **kw):
+        export_calls.append(list(ids))
+        return {"status": "ok", "manufacture_ids": list(ids)}
+
     monkeypatch.setattr(
         one_c_manufacture_export,
         "export_manufactures_to_1c",
-        lambda db, ids, **kw: {"status": "ok", "manufacture_ids": list(ids)},
+        _export_in_order,
     )
 
     result = close_paint_chain(
@@ -431,6 +437,10 @@ def test_close_chain_live_exports_combined_without_closing_orders(db_session, mo
 
     assert result["status"] == "ok"
     assert result["manufactures_export"]["status"] == "ok"
+    assert export_calls == [
+        [int(ctx["weld"]["m"].manufacture_id)],
+        [int(ctx["paint"]["m"].manufacture_id)],
+    ]
     assert result["piecework_export"]["status"] == "ok"
     assert len(fake.posts) == 1
 
@@ -517,6 +527,53 @@ def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, mo
         int(ctx["paint"]["m"].manufacture_id),
     }
     assert {link.target_ref_key for link in links} == {"pw-resume-ref"}
+
+
+def test_close_chain_does_not_export_paint_when_weld_was_not_posted(
+    db_session, monkeypatch
+):
+    """Баланс-гард окраски не запускается до успешного выпуска сварки."""
+    ctx = _setup_chain(db_session)
+    for side in ("weld", "paint"):
+        db_session.delete(ctx[side]["m"])
+        ctx[side]["product"].produced_qty = 0
+        ctx[side]["product"].remaining_qty = ctx[side]["product"].quantity
+    db_session.commit()
+
+    from app.services import one_c_manufacture_export
+
+    export_calls = []
+
+    def _fail_first_export(db, ids, **_kwargs):
+        export_calls.append(list(ids))
+        manufacture_id = int(ids[0])
+        return {
+            "status": "partial_error",
+            "entries": [
+                {
+                    "manufacture_id": manufacture_id,
+                    "status": "error",
+                    "error": "сварочная сборка не проведена",
+                }
+            ],
+            "manufactures_error": 1,
+        }
+
+    monkeypatch.setattr(
+        one_c_manufacture_export,
+        "export_manufactures_to_1c",
+        _fail_first_export,
+    )
+
+    with pytest.raises(ValueError, match="сварочная сборка не проведена"):
+        close_paint_chain(
+            db_session,
+            product_id=ctx["paint"]["product"].product_id,
+            dry_run=False,
+        )
+
+    assert len(export_calls) == 1
+    assert db_session.query(ProductionManufacture).count() == 0
 
 
 def test_close_chain_rolls_back_first_command_when_second_side_fails_before_export(
@@ -725,6 +782,9 @@ def test_close_chain_routes_each_side_executors_to_its_own_produce(db_session, m
     # сварная деталь выпускается только внутри цепочки
     assert captured[weld_product_id]["allow_paint_weld_chain"] is True
     assert not captured[paint_product_id].get("allow_paint_weld_chain")
+    assert captured[paint_product_id]["anticipated_material_receipts"] == {
+        int(ctx["weld"]["item"].item_id): float(ctx["weld"]["m"].qty)
+    }
 
 
 def test_combined_piecework_refuses_row_without_executor_before_writing_to_1c(

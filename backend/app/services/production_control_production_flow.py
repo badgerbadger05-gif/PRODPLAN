@@ -111,10 +111,16 @@ def _ensure_workshop_reservation_covers(
     db: Session,
     product: ProductionProduct,
     qty: Optional[float] = None,
+    anticipated_material_receipts: Optional[Dict[int, float]] = None,
 ) -> None:
     """
     Block a production event that would consume more material than is
     currently held at the target workshop for this line.
+
+    ``anticipated_material_receipts`` is reserved for one atomic production
+    chain whose preceding command is exported before this one. It credits only
+    the explicitly named component and quantity during command preparation;
+    it does not create a stock fact or alter the accepted Ledger projection.
     """
     from .production_control_domain import default_spec_id as _spec_for
     from .production_material_custody_projection import load_current_accepted_material_custody
@@ -149,6 +155,10 @@ def _ensure_workshop_reservation_covers(
         consumer="production_output_material_guard",
     )
     reservation = state.for_product(int(product.product_id))
+    anticipated = {
+        int(item_id): max(_to_float(receipt_qty), 0.0)
+        for item_id, receipt_qty in (anticipated_material_receipts or {}).items()
+    }
 
     shortfall_by_item: Dict[int, tuple] = {}
     for cid, per in per_unit.items():
@@ -156,16 +166,17 @@ def _ensure_workshop_reservation_covers(
         if needed <= 1e-9:
             continue
         held = reservation.at_workshop.get(cid, 0.0)
-        if held + 1e-6 < needed:
-            shortfall_by_item[cid] = (needed, held)
+        available_for_command = held + anticipated.get(cid, 0.0)
+        if available_for_command + 1e-6 < needed:
+            shortfall_by_item[cid] = (needed, available_for_command)
     if shortfall_by_item:
         names = {
             int(item.item_id): str(item.item_name or item.item_code or item.item_id)
             for item in db.query(Item).filter(Item.item_id.in_(shortfall_by_item.keys())).all()
         }
         shortfalls = [
-            f"{names.get(cid, cid)}: нужно {needed:g}, удержано на участке {held:g}"
-            for cid, (needed, held) in sorted(shortfall_by_item.items())
+            f"{names.get(cid, cid)}: нужно {needed:g}, доступно для команды {available:g}"
+            for cid, (needed, available) in sorted(shortfall_by_item.items())
         ]
         raise ValueError(
             "Недостаточно компонентов, удержанных на участке для этой строки: "
@@ -235,6 +246,7 @@ def produce_line(
     operation_executors: Optional[List[Dict[str, Any]]] = None,
     comment: Optional[str] = None,
     allow_paint_weld_chain: bool = False,
+    anticipated_material_receipts: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
     Record an operator command to create production documents in 1C.
@@ -331,7 +343,12 @@ def produce_line(
     # проведённое в 1С перемещение может не иметь ProductionMaterialIssue, а
     # экспортированная заявка, наоборот, ещё не гарантирует физику. Единственный
     # guard — сохранённая проекция custody принятого Ledger ниже.
-    _ensure_workshop_reservation_covers(db, product, qty_f)
+    _ensure_workshop_reservation_covers(
+        db,
+        product,
+        qty_f,
+        anticipated_material_receipts=anticipated_material_receipts,
+    )
 
     manufacture = ProductionManufacture(
         product_id=int(product.product_id),

@@ -629,6 +629,47 @@ def test_produce_blocks_without_sufficient_workshop_held_material(db_session):
         produce_line(db, product.product_id, qty=1)
 
 
+def test_produce_credits_only_explicit_same_chain_receipt(db_session):
+    """Окраску можно подготовить под точный выход сварки той же цепочки."""
+    db = db_session
+    item = _mk_item(db, code="PRD-CHAIN-PAINT", ref1c="ref-prd-chain-paint")
+    component = _mk_item(db, code="COMP-CHAIN-WELD", ref1c="ref-comp-chain-weld")
+    product = _mk_product(db, item, qty=2.0)
+
+    spec = Specification(spec_name="Paint chain spec", spec_ref1c="spec-paint-chain-ref")
+    db.add(spec)
+    db.flush()
+    product.spec_id = spec.spec_id
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=1,
+            component_type="Материал",
+        )
+    )
+    db.commit()
+    _stock_kit_on_workshop(db, product, component, qty=0)
+
+    with pytest.raises(ValueError, match="Недостаточно компонентов"):
+        produce_line(
+            db,
+            product.product_id,
+            qty=2,
+            anticipated_material_receipts={int(component.item_id): 1},
+        )
+
+    result = produce_line(
+        db,
+        product.product_id,
+        qty=2,
+        anticipated_material_receipts={int(component.item_id): 2},
+    )
+
+    assert result["status"] == "pending_1c_fact"
+    assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 1
+
+
 # ---------------------------------------------------------------------------
 # one_c_manufacture_export
 # ---------------------------------------------------------------------------

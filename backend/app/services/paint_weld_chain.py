@@ -1060,8 +1060,9 @@ def close_paint_chain(
     существуют, payload комбинированного сдельного.
 
     Закрытие возобновляемо (см. produce_line после доработки «докат цепочки»).
-    Обе СборкиЗапасов уходят одним вызовом экспортёра, но их результаты
-    разбираются построчно: проведённая в 1С сборка НИКОГДА не откатывается
+    СборкиЗапасов уходят последовательно: сначала сварка, затем окраска.
+    Так проверка остатков 1С для окраски видит уже выпущенный сварной
+    полуфабрикат. При этом проведённая в 1С сборка НИКОГДА не откатывается
     из-за того, что вторая не прошла. При частичном успехе ответ несёт
     ``status='partial'`` / ``chain_state='partially_posted'`` /
     ``resume_required=True``, а повторный вызов докатывает недостающую сборку
@@ -1144,7 +1145,10 @@ def close_paint_chain(
     created_manufacture_ids: List[int] = []
 
     def _ensure_manufacture(
-        plan: Dict[str, Any], operation_executors: Any, allow_paint_weld_chain: bool = False
+        plan: Dict[str, Any],
+        operation_executors: Any,
+        allow_paint_weld_chain: bool = False,
+        anticipated_material_receipts: Optional[Dict[int, float]] = None,
     ) -> int:
         if plan["qty_to_produce"] > 0:
             produced = produce_line(
@@ -1155,6 +1159,7 @@ def close_paint_chain(
                 operation_executors=operation_executors,
                 comment=comment,
                 allow_paint_weld_chain=allow_paint_weld_chain,
+                anticipated_material_receipts=anticipated_material_receipts,
             )
             plan["produce"] = produced
             manufacture_id = int(produced["manufacture_id"])
@@ -1181,9 +1186,17 @@ def close_paint_chain(
             weld_operation_executors,
             allow_paint_weld_chain=True,
         )
+        weld_manufacture = db.get(ProductionManufacture, weld_manufacture_id)
+        if weld_manufacture is None:
+            raise ValueError(
+                f"manufacture_id={weld_manufacture_id}: сварочный выпуск не найден"
+            )
         paint_manufacture_id = _ensure_manufacture(
             paint_plan,
             paint_operation_executors,
+            anticipated_material_receipts={
+                int(weld_product.item_id): _to_float(weld_manufacture.qty)
+            },
         )
     except Exception:
         for manufacture_id in reversed(created_manufacture_ids):
@@ -1194,17 +1207,90 @@ def close_paint_chain(
     weld_plan["manufacture_id"] = weld_manufacture_id
     paint_plan["manufacture_id"] = paint_manufacture_id
 
-    manufactures_export = export_manufactures_to_1c(
-        db,
-        [weld_manufacture_id, paint_manufacture_id],
-        dry_run=False,
-    )
-    result["manufactures_export"] = manufactures_export
-    export_entries = {
-        int(entry.get("manufacture_id")): entry
-        for entry in (manufactures_export.get("entries") or [])
-        if entry.get("manufacture_id") is not None
+    # Экспортёр проверяет живые остатки 1С до записи документа. Поэтому
+    # окрасочную СборкуЗапасов можно проверять и писать только после того,
+    # как сварочная уже проведена и её выход появился на участке окраски.
+    manufacture_exports: Dict[str, Dict[str, Any]] = {}
+    export_entries: Dict[int, Dict[str, Any]] = {}
+    side_exported: Dict[str, bool] = {}
+
+    def _export_side(side: str, manufacture_id: int) -> bool:
+        side_export = export_manufactures_to_1c(db, [manufacture_id], dry_run=False)
+        manufacture_exports[side] = side_export
+        for entry in side_export.get("entries") or []:
+            if entry.get("manufacture_id") is not None:
+                export_entries[int(entry["manufacture_id"])] = entry
+        entry = export_entries.get(int(manufacture_id), {})
+        persisted = db.get(ProductionManufacture, int(manufacture_id))
+        exported_ref = str(
+            entry.get("target_ref_key")
+            or (persisted.exported_ref1c if persisted is not None else "")
+            or ""
+        ).strip()
+        side_exported[side] = bool(
+            exported_ref and str(entry.get("status") or "") != "error"
+        )
+        return side_exported[side]
+
+    weld_exported = _export_side("weld", weld_manufacture_id)
+    if weld_exported:
+        _export_side("paint", paint_manufacture_id)
+
+    merged_entries = [
+        entry
+        for side in ("weld", "paint")
+        for entry in (manufacture_exports.get(side, {}).get("entries") or [])
+    ]
+    manufactures_export = {
+        "status": "ok" if all(side_exported.get(side) for side in ("weld", "paint"))
+        else "partial_error",
+        "dry_run": False,
+        "entity": next(
+            (
+                payload.get("entity")
+                for payload in manufacture_exports.values()
+                if payload.get("entity")
+            ),
+            None,
+        ),
+        "manufactures_requested": sum(
+            int(payload.get("manufactures_requested") or 0)
+            for payload in manufacture_exports.values()
+        ),
+        "manufactures_eligible": sum(
+            int(payload.get("manufactures_eligible") or 0)
+            for payload in manufacture_exports.values()
+        ),
+        "manufactures_already_linked": sum(
+            int(payload.get("manufactures_already_linked") or 0)
+            for payload in manufacture_exports.values()
+        ),
+        "manufactures_created": sum(
+            int(payload.get("manufactures_created") or 0)
+            for payload in manufacture_exports.values()
+        ),
+        "manufactures_blocked": sum(
+            int(payload.get("manufactures_blocked") or 0)
+            for payload in manufacture_exports.values()
+        ),
+        "entries": merged_entries,
+        "manufactures_error": sum(
+            int(payload.get("manufactures_error") or 0)
+            for payload in manufacture_exports.values()
+        ),
+        "skipped_rows": [
+            row
+            for payload in manufacture_exports.values()
+            for row in (payload.get("skipped_rows") or [])
+        ],
+        "warnings": [
+            warning
+            for payload in manufacture_exports.values()
+            for warning in (payload.get("warnings") or [])
+        ],
+        "steps": manufacture_exports,
     }
+    result["manufactures_export"] = manufactures_export
     posted_sides: List[str] = []
     pending_sides: List[str] = []
     failures: List[str] = []
