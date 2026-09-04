@@ -244,3 +244,60 @@ def test_preserves_order_after_even_a_failed_1c_export_attempt(db_session):
     assert Decimal(product.quantity) == Decimal("40")
     assert summary["resized"] == 0
     assert summary["locked"] == 1
+
+
+def test_local_draft_material_issue_does_not_lock_quantity(db_session):
+    generation, live_run, order, product = _scenario(
+        db_session,
+        order_qty=Decimal("40"),
+        target_qty=Decimal("30"),
+    )
+    db_session.add(
+        models.ProductionMaterialIssue(
+            document_number="LOCAL-DRAFT-ISSUE",
+            product_id=int(product.product_id),
+            order_id=int(order.order_id),
+            status="draft",
+            direction="issue",
+        )
+    )
+    db_session.flush()
+
+    summary = reconcile_local_mrp_orders(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        live_run_ids=[int(live_run.run_id)],
+    )
+
+    assert Decimal(product.quantity) == Decimal("30")
+    assert summary["resized"] == 1
+    assert summary["locked"] == 0
+
+
+def test_exported_material_issue_locks_quantity(db_session):
+    generation, live_run, order, product = _scenario(
+        db_session,
+        order_qty=Decimal("40"),
+        target_qty=Decimal("30"),
+    )
+    db_session.add(
+        models.ProductionMaterialIssue(
+            document_number="EXPORTED-ISSUE",
+            product_id=int(product.product_id),
+            order_id=int(order.order_id),
+            status="requested",
+            direction="issue",
+            exported_ref1c="22222222-2222-2222-2222-222222222222",
+        )
+    )
+    db_session.flush()
+
+    summary = reconcile_local_mrp_orders(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        live_run_ids=[int(live_run.run_id)],
+    )
+
+    assert Decimal(product.quantity) == Decimal("40")
+    assert summary["resized"] == 0
+    assert summary["locked"] == 1

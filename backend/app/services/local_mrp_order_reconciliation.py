@@ -158,12 +158,29 @@ def reconcile_local_mrp_orders(
         )
         .all()
     }
+    issue_rows = db.query(
+        models.ProductionMaterialIssue.issue_id,
+        models.ProductionMaterialIssue.product_id,
+        models.ProductionMaterialIssue.exported_ref1c,
+    ).filter(
+        models.ProductionMaterialIssue.product_id.in_(sorted(product_ids))
+    ).all()
+    issue_ids = {int(issue_id) for issue_id, _product_id, _ref in issue_rows}
+    linked_issue_ids = {
+        int(source_id)
+        for (source_id,) in db.query(models.SyncLink.source_id)
+        .filter(
+            models.SyncLink.source_system == "PRODPLAN",
+            models.SyncLink.source_doctype == "material_issue",
+            models.SyncLink.target_entity == "Document_ПеремещениеЗапасов",
+            models.SyncLink.source_id.in_(sorted(issue_ids)),
+        )
+        .all()
+    }
     issue_product_ids = {
         int(product_id)
-        for (product_id,) in db.query(models.ProductionMaterialIssue.product_id)
-        .filter(models.ProductionMaterialIssue.product_id.in_(sorted(product_ids)))
-        .distinct()
-        .all()
+        for issue_id, product_id, exported_ref1c in issue_rows
+        if str(exported_ref1c or "").strip() or int(issue_id) in linked_issue_ids
     }
     manufacture_product_ids = {
         int(product_id)
