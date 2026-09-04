@@ -75,9 +75,10 @@ from app.services.item_ledger.future_supply_capture import (
 from app.services.item_ledger.shelf_projection_persistence import (
     materialize_shelf_projections,
 )
+from app.services.local_mrp_order_reconciliation import reconcile_local_mrp_orders
 
 
-_VERSION = "obligation-refresh-orchestrator/2"
+_VERSION = "obligation-refresh-orchestrator/3"
 _CORE_CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
@@ -518,6 +519,11 @@ def run_obligation_refresh(
         int(replenishment_batch.id),
     )
     _complete(replenishment_batch, replenishment_summary)
+    local_order_reconciliation = reconcile_local_mrp_orders(
+        db,
+        ledger_generation_id=target_id,
+        live_run_ids=(*candidate_ids, *retained_run_ids),
+    )
     assembly_outputs = materialize_assembly_output_allocations(db, target_id)
     custody_projection = build_material_custody_projection(
         db, ledger_generation_id=target_id
@@ -557,6 +563,7 @@ def run_obligation_refresh(
         "drum_schedule_summary": _json_value(drum_schedule),
         "shelf_projection_summary": _json_value(shelf_projection),
         "supplier_receipt_summary": _json_value(supplier_summary),
+        "local_order_reconciliation": _json_value(local_order_reconciliation),
         "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
         "production_control_journal_snapshot_id": int(production_journal_snapshot.id),
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
