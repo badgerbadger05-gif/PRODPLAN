@@ -3,15 +3,22 @@ import { expect, test, type Page } from '@playwright/test'
 const draftPlan = {
   id: 123,
   name: 'МАЙ 2026',
-  status: 'draft',
+  status: 'fixed',
   period_from: '2026-05-01',
   period_to: '2026-05-29',
   comment: 'Основной производственный план',
   created_by: 'Иван',
   created_at: '2026-04-01T10:00:00',
-  fixed_at: null,
-  fixed_by: null,
+  fixed_at: '2026-05-01T08:00:00+03:00',
+  fixed_by: 'Иван',
   line_count: 1,
+  planned_output_qty: 24,
+  accepted_plan_output_qty: 6,
+  assembly_remaining_qty: 18,
+  plan_output_truth_status: 'accepted',
+  plan_output_truth_reason: null,
+  plan_output_generation_id: 77,
+  plan_output_cutoff: '2026-07-20T12:00:00Z',
 }
 
 const closedPlan = {
@@ -37,6 +44,13 @@ async function mockPeriodPlanApi(page: Page) {
       await route.fulfill({
         json: {
           plan: draftPlan,
+          planned_output_qty: 24,
+          accepted_plan_output_qty: 6,
+          assembly_remaining_qty: 18,
+          plan_output_truth_status: 'accepted',
+          plan_output_truth_reason: null,
+          plan_output_generation_id: 77,
+          plan_output_cutoff: '2026-07-20T12:00:00Z',
           buckets: ['2026-05-01', '2026-05-08', '2026-05-15', '2026-05-22'],
           bucket_totals: {
             '2026-05-01': 4,
@@ -50,6 +64,15 @@ async function mockPeriodPlanApi(page: Page) {
             item_name: 'Насос ГА-1',
             item_article: 'ART-501',
             total_qty: 24,
+            planned_output_qty: 24,
+            accepted_plan_output_qty: 6,
+            assembly_remaining_qty: 18,
+            output_by_bucket: {
+              '2026-05-01': { planned_output_qty: 4, accepted_plan_output_qty: 4, assembly_remaining_qty: 0 },
+              '2026-05-08': { planned_output_qty: 6, accepted_plan_output_qty: 2, assembly_remaining_qty: 4 },
+              '2026-05-15': { planned_output_qty: 8, accepted_plan_output_qty: 0, assembly_remaining_qty: 8 },
+              '2026-05-22': { planned_output_qty: 6, accepted_plan_output_qty: 0, assembly_remaining_qty: 6 },
+            },
             buckets: {
               '2026-05-01': 4,
               '2026-05-08': 6,
@@ -105,6 +128,7 @@ test('period plan list visual contract', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Планирование выпуска' })).toBeVisible()
   await expect(page.getByText('МАЙ 2026', { exact: true })).toBeVisible()
   await expect(page.getByText('АПРЕЛЬ 2026', { exact: true })).toBeVisible()
+  await expect(page.getByRole('row', { name: /МАЙ 2026/ }).getByLabel('Факт выпуска плана')).toContainText('Принято Ledger 6')
   await expect(page.locator('.statusBar')).toContainText('Строки 1-2 из 2')
 
   await expect(page.locator('.app')).toHaveScreenshot('period-plan-list.png', {
@@ -120,7 +144,10 @@ test('period plan detail visual contract', async ({ page }) => {
 
   await expect(page.getByRole('heading', { name: 'МАЙ 2026' })).toBeVisible()
   await expect(page.getByText('Насос ГА-1', { exact: true })).toBeVisible()
-  await expect(page.getByRole('columnheader', { name: 'Итого' })).toBeVisible()
+  await expect(page.getByRole('columnheader', { name: 'Итого выпуска' })).toBeVisible()
+  await expect(page.locator('.periodPlanOutputFacts').getByLabel('Факт выпуска плана')).toContainText('Исходный план 24')
+  await expect(page.locator('.periodPlanOutputFacts').getByLabel('Факт выпуска плана')).toContainText('Принято Ledger 6')
+  await expect(page.locator('.periodPlanOutputFacts').getByLabel('Факт выпуска плана')).toContainText('Осталось выпустить 18')
   await expect(page.locator('.statusBar')).not.toContainText('Загрузка')
 
   await expect(page.locator('.app')).toHaveScreenshot('period-plan-detail.png', {

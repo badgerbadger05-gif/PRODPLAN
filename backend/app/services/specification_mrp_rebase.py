@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.planning_run_candidate import _resolve_parent_generation_id
+from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 
 
 ZERO = Decimal("0")
@@ -61,11 +61,20 @@ def _remaining_root_rows(
     if not lines:
         raise ValueError("source production plan has no root lines")
     for line in lines:
-        planned = max(_dec(line.qty), ZERO)
         if line.remaining_output_qty is None:
             raise ValueError("plan line has no persisted execution remainder")
-        accepted = max(_dec(line.accepted_output_qty), ZERO)
-        remaining = max(_dec(line.remaining_output_qty), ZERO)
+        planned = _dec(line.qty)
+        accepted = _dec(line.accepted_output_qty)
+        remaining = _dec(line.remaining_output_qty)
+        if (
+            planned < ZERO
+            or accepted < ZERO
+            or remaining < ZERO
+            or planned != accepted + remaining
+        ):
+            raise ValueError(
+                f"plan line {int(line.id)} violates output conservation"
+            )
         bucket_date = max(line.bucket_date, successor_period_from)
         audit.append(
             {
@@ -164,12 +173,11 @@ def rebase_fixed_plan_remaining_roots(
         or generation.cutoff is None
     ):
         raise ValueError("current accepted planning truth is unavailable")
-    if (
-        _resolve_parent_generation_id(
-            db, predecessor, current_generation_id=parent_generation_id
-        )
-        != parent_generation_id
-    ):
+    try:
+        current_live_run_ids = live_plan_run_ids(db, generation)
+    except ValueError as exc:
+        raise ValueError("current accepted planning truth is unavailable") from exc
+    if int(predecessor.run_id) not in current_live_run_ids:
         raise ValueError("planning run is not part of current accepted truth")
 
     # Facts at/before the accepted cutoff have already reduced the predecessor

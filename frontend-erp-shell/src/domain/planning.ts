@@ -165,7 +165,23 @@ export function planningStatusLabel(status: string) {
 
 // ── Period Plans ──────────────────────────────────────────────────────────────
 
-export type PeriodPlan = {
+type ApiPlanOutputContext = components['schemas']['PeriodPlanOutputFields']
+export type PlanOutputFacts = Pick<
+  ApiPlanOutputContext,
+  'planned_output_qty' | 'accepted_plan_output_qty' | 'assembly_remaining_qty'
+>
+export type PlanOutputContext = Partial<Pick<
+  ApiPlanOutputContext,
+  | 'planned_output_qty'
+  | 'accepted_plan_output_qty'
+  | 'assembly_remaining_qty'
+  | 'plan_output_truth_status'
+  | 'plan_output_truth_reason'
+  | 'plan_output_generation_id'
+  | 'plan_output_cutoff'
+>>
+
+export type PeriodPlan = PlanOutputContext & {
   id: number
   name: string
   status: 'draft' | 'fixed' | 'closed'
@@ -218,7 +234,7 @@ export type PeriodPlanRunsResponse = {
   total: number
 }
 
-export type PeriodPlanMatrixRow = {
+export type PeriodPlanMatrixRow = PlanOutputFacts & {
   item_id: number
   item_code: string
   item_name: string
@@ -226,6 +242,7 @@ export type PeriodPlanMatrixRow = {
   total_qty: number
   buckets: Record<string, number>
   locked_buckets: Record<string, number>
+  output_by_bucket?: components['schemas']['PeriodPlanMatrixRow']['output_by_bucket']
   bucket_forecasts?: Record<string, {
     forecast_date?: string | null
     forecast_shift_days?: number | null
@@ -234,7 +251,7 @@ export type PeriodPlanMatrixRow = {
   }>
 }
 
-export type PeriodPlanMatrix = {
+export type PeriodPlanMatrix = PlanOutputContext & {
   plan: PeriodPlan
   buckets: string[]
   rows: PeriodPlanMatrixRow[]

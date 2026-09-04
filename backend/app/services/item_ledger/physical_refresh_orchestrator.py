@@ -49,6 +49,8 @@ from .physical_refresh_import import (
     run_physical_recorder_audit,
 )
 from .physical_refresh_generation import fork_physical_refresh_generation
+from .output_repair_gate import assert_output_repair_allows
+from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
 
 
 PHYSICAL_REFRESH_LOCK_KEY = PHYSICAL_SEQUENCE_LOCK_KEY
@@ -552,6 +554,19 @@ def run_physical_refresh(
     try:
         lock_context = physical_sequence_lock_context()
         lock_context.__enter__()
+        # Serialise the durable repair gate check with repair-job creation.
+        # Once the fork is flushed, its BUILDING physical candidate prevents a
+        # repair from starting until this lifecycle finishes or is discarded.
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": MRP_LEDGER_LOCK_KEY},
+            )
+        assert_output_repair_allows(
+            db,
+            operation="physical refresh",
+            actor=started_by,
+        )
         parent = _current_parent(db)
         pool_mapping = effective_planning_pool_by_warehouse(
             db,

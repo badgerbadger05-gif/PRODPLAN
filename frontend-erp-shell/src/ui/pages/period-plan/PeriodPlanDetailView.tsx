@@ -39,6 +39,7 @@ import { KeyboardShortcutShell, type KeyboardShortcut } from '../../platform'
 import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../../tableDoctype'
 import { bucketLabel, type SortDir } from './helpers'
 import { ForecastShift } from './ForecastShift'
+import { OutputFactSummary } from '../production-control/OutputFactSummary'
 
 type Tab = 'matrix' | 'journal'
 
@@ -70,11 +71,11 @@ const periodPlanJournalColumns = [
   { key: 'bom_level', title: 'Ур.', width: 68, minWidth: 68, grow: false, align: 'center', sortable: true, tooltip: 'Уровень в дереве спецификации (0 — изделие плана)' },
   { key: 'net_qty', title: 'Потребность', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Чистая потребность = потребность с припусками − остаток склада. Брутто и склад — в подсказке ячейки' },
   { key: 'ordered_qty', title: 'Оформлено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Оформлено в заказы (1С). Красным — есть неоформленный остаток, см. подсказку ячейки' },
-  { key: 'completed_qty', title: 'Выполнено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Выпущено производством / принято на склад' },
-  { key: 'remaining_qty', title: 'Осталось', width: 110, minWidth: 110, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Осталось выполнить до закрытия потребности' },
+  { key: 'completed_qty', title: 'Исполнено MRP', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Исполненная часть потребности этого потока MRP; это не факт выпуска готового изделия плана' },
+  { key: 'remaining_qty', title: 'Остаток MRP', width: 110, minWidth: 110, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Незакрытая часть потребности этого потока MRP; это не остаток выпуска готового изделия плана' },
   { key: 'need_date', title: 'Срок', width: 118, minWidth: 118, grow: false, align: 'center', sortable: true, tooltip: 'Дата потребности; рядом — прогнозный сдвиг (+N дн = опоздание)' },
   { key: 'status', title: 'Статус', width: 128, minWidth: 128, grow: false, align: 'center', sortable: true, tooltip: 'Закрыто — выполнено полностью; Частично — есть выполнение; Оформлено — заказы созданы, выполнения нет; Не оформлено — требуются заказы; Покрыто складом — потребность закрыта остатком' },
-  { key: 'coverage_pct', title: 'Выполнение', width: 104, minWidth: 104, grow: false, align: 'center', sortable: true, tooltip: '% выполнения от чистой потребности' },
+  { key: 'coverage_pct', title: 'Исполнение MRP', width: 112, minWidth: 112, grow: false, align: 'center', sortable: true, tooltip: '% исполнения от чистой потребности MRP; это не процент выпуска плана' },
   { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false, tooltip: 'Число заказов/заданий по строке; клик по строке раскрывает список' },
 ] as const satisfies TableColumnDoctype[]
 
@@ -603,7 +604,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   function downloadJournalCsv() {
     if (!journal) return
-    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность (брутто)', 'Чистая потребность', 'Оформлено', 'Не оформлено', 'Выполнено', 'Осталось выполнить', 'Срок', 'Статус', 'Выполнение %', 'Заданий']
+    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность (брутто)', 'Чистая потребность', 'Оформлено', 'Не оформлено', 'Исполнено MRP', 'Остаток MRP', 'Срок', 'Статус', 'Исполнение MRP %', 'Заданий']
     const esc = (v: unknown) => {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
@@ -779,6 +780,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         {message && <div className="successLine">{message}</div>}
 
         {plan && !editingHeader && (
+          <>
           <div className="mrpSummaryStrip" style={{ gridTemplateColumns: 'repeat(6, minmax(100px,1fr))' }}>
             <div className="metricCell">
               <span>Название</span>
@@ -807,6 +809,24 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               <strong style={{ fontSize: 12 }}>{plan.comment ?? '—'}</strong>
             </div>
           </div>
+          <div className="periodPlanOutputFacts" title={plan.plan_output_truth_reason ?? undefined}>
+            <OutputFactSummary
+              scope="plan"
+              planned={plan.planned_output_qty}
+              accepted={plan.accepted_plan_output_qty}
+              remaining={plan.assembly_remaining_qty}
+              available={plan.plan_output_truth_status === 'accepted'}
+            />
+            {plan.plan_output_truth_status !== 'accepted' && (
+              <span className="muted">{plan.plan_output_truth_reason || 'Факт выпуска плана недоступен'}</span>
+            )}
+            {plan.plan_output_truth_status === 'accepted' && (
+              <span className="muted">
+                Ledger {plan.plan_output_generation_id ?? '—'}{plan.plan_output_cutoff ? ` · срез ${dateTimeRu(plan.plan_output_cutoff)}` : ''}
+              </span>
+            )}
+          </div>
+          </>
         )}
 
         {plan && editingHeader && (
@@ -938,7 +958,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   <tr>
                     <th style={{ width: 74 }}>Код</th>
                     <th style={{ width: 320 }}>Номенклатура</th>
-                    <th style={{ width: 96, textAlign: 'right' }}>Итого</th>
+                    <th style={{ width: isDraft ? 96 : 220, textAlign: 'right' }}>Итого выпуска</th>
                     {matrix.buckets.map((b) => (
                       <th key={b} style={{ width: 90, textAlign: 'right' }}>{bucketLabel(b)}</th>
                     ))}
@@ -956,7 +976,18 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           {row.item_article && <span className="muted">{row.item_article}</span>}
                         </td>
                         <td className="numCell">
-                          <strong>{qty(row.total_qty ?? 0)}</strong>
+                          {isDraft ? (
+                            <strong>{qty(row.total_qty ?? 0)}</strong>
+                          ) : (
+                            <OutputFactSummary
+                              scope="plan"
+                              planned={row.planned_output_qty}
+                              accepted={row.accepted_plan_output_qty}
+                              remaining={row.assembly_remaining_qty}
+                              available={matrix.plan_output_truth_status === 'accepted'}
+                              compact
+                            />
+                          )}
                         </td>
                         {matrix.buckets.map((b) => {
                           const locked = row.locked_buckets[b] !== undefined
@@ -985,6 +1016,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               </td>
                             )
                           }
+                          const bucketOutput = row.output_by_bucket?.[b]
                           return (
                             <td
                               key={b}
@@ -992,9 +1024,14 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               style={locked ? { background: 'repeating-linear-gradient(135deg,#eef1f5 0 4px,#e3e8ee 4px 8px)' } : undefined}
                               title={locked ? 'Зафиксировано MRP-прогоном' : undefined}
                             >
-                              <span style={{ display: 'block', textAlign: 'right', paddingRight: 4, color: locked ? 'var(--muted)' : undefined }}>
-                                {val ? qty(val) : (isDraft ? '' : <span className="muted">—</span>)}
-                              </span>
+                              <OutputFactSummary
+                                scope="plan"
+                                planned={bucketOutput?.planned_output_qty}
+                                accepted={bucketOutput?.accepted_plan_output_qty}
+                                remaining={bucketOutput?.assembly_remaining_qty}
+                                available={matrix.plan_output_truth_status === 'accepted'}
+                                compact
+                              />
                               <ForecastShift forecast={forecast} />
                             </td>
                           )
@@ -1027,7 +1064,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   <tfoot>
                     <tr style={{ position: 'sticky', bottom: 0, background: 'linear-gradient(#eef1f5,#dfe4ea)', fontWeight: 700 }}>
                       <td colSpan={2} style={{ textAlign: 'right', paddingRight: 6 }}>
-                        Итого по неделям
+                        Исходный план по неделям
                         <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 6 }}>
                           (серверно)
                         </span>
@@ -1059,7 +1096,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 <>
                   <div className="barSeparator" />
                   {journalExecutionPct !== null && (
-                    <span className="toolbarText" title="Выполнено / чистая потребность по всем строкам">Общее выполнение: {journalExecutionPct}%</span>
+                    <span className="toolbarText" title="Исполнено / чистая потребность MRP по всем строкам; не факт выпуска готовых изделий">Исполнение потребностей MRP: {journalExecutionPct}%</span>
                   )}
                   {journalExecutionByFlow.map((row) => (
                     <span key={row.flow} className="toolbarText">
@@ -1132,6 +1169,22 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 </>
               )}
             </div>
+
+            {journal && (
+              <div className="periodPlanOutputFacts">
+                <OutputFactSummary
+                  scope="plan"
+                  planned={journal.summary.planned_output_qty}
+                  accepted={journal.summary.accepted_plan_output_qty}
+                  remaining={journal.summary.assembly_remaining_qty}
+                />
+                {(journal.summary.planned_output_qty == null
+                  || journal.summary.accepted_plan_output_qty == null
+                  || journal.summary.assembly_remaining_qty == null) && (
+                  <span className="muted">Факт выпуска плана недоступен в этом сохранённом снимке</span>
+                )}
+              </div>
+            )}
 
             {journal && !journalTruthAccepted && (
               <div

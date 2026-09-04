@@ -44,11 +44,52 @@ from app.services import obligation_refresh_orchestrator
 from app.services.period_plan_service import (
     _build_execution_snapshot_rows,
     build_period_plan_execution_snapshot,
+    build_period_plan_execution_snapshots_for_generation,
     create_mrp_snapshot_from_period_plan,
     get_period_plan_matrix,
     get_period_plan_execution_journal,
     list_period_plans,
 )
+
+
+def test_generation_snapshot_build_skips_legacy_run_without_persisted_roots(
+    db_session,
+):
+    item = _make_purchased_item(db_session, "LEGACY-NO-ROOTS")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
+    generation_id = int(
+        db_session.query(PlanningTruthState.current_generation_id).scalar()
+    )
+    run = PlanningRun(
+        source_plan_id=int(plan.id),
+        ledger_generation_id=generation_id,
+        status="FIXED_SNAPSHOT",
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    result = build_period_plan_execution_snapshots_for_generation(
+        db_session, generation_id
+    )
+
+    assert result["snapshots"] == 0
+    assert result["plan_runs"] == []
+    assert result["unavailable"] == 1
+    assert result["unavailable_plan_runs"] == [{
+        "plan_id": int(plan.id),
+        "run_id": int(run.run_id),
+        "reason": "missing_mrp_roots",
+    }]
+    assert db_session.query(PlanningReadSnapshot).filter_by(
+        consumer="period_plan_execution",
+        ledger_generation_id=generation_id,
+    ).count() == 0
+
+    detail = period_plan_service.get_period_plan(db_session, int(plan.id))
+    assert detail["plan_output_truth_status"] == "unavailable"
+    assert detail["planned_output_qty"] is None
 
 
 def test_period_plan_percent_adapter_uses_canonical_clamp_and_zero_base():
@@ -222,7 +263,20 @@ def test_execution_journal_repeated_get_reads_snapshot_without_computation_or_wr
         "ledger_generation": 7,
         "cutoff": "2026-07-23T12:00:00",
         "rows": [{"req_id": 11, "completed_qty": 2.0}],
-        "summary": {"execution_pct": 66.7},
+        "plan_output_rows": [{
+            "plan_line_id": 1,
+            "item_id": item.item_id,
+            "bucket_date": "2026-07-01",
+            "planned_output_qty": 3.0,
+            "accepted_plan_output_qty": 0.0,
+            "assembly_remaining_qty": 3.0,
+        }],
+        "summary": {
+            "execution_pct": 66.7,
+            "planned_output_qty": 3.0,
+            "accepted_plan_output_qty": 0.0,
+            "assembly_remaining_qty": 3.0,
+        },
     }
     monkeypatch.setattr(
         planning_truth,
@@ -277,7 +331,19 @@ def test_execution_journal_filters_sorts_and_pages_on_backend(
             "ledger_generation": 7,
             "cutoff": "2026-07-23T12:00:00",
             "rows": rows,
-            "summary": {},
+            "plan_output_rows": [{
+                "plan_line_id": 1,
+                "item_id": item.item_id,
+                "bucket_date": "2026-07-01",
+                "planned_output_qty": 3.0,
+                "accepted_plan_output_qty": 0.0,
+                "assembly_remaining_qty": 3.0,
+            }],
+            "summary": {
+                "planned_output_qty": 3.0,
+                "accepted_plan_output_qty": 0.0,
+                "assembly_remaining_qty": 3.0,
+            },
         }),
     )
 
@@ -300,6 +366,46 @@ def test_execution_journal_filters_sorts_and_pages_on_backend(
     assert result["rows"][0]["status_label"] == "Оформлено"
     assert result["summary"]["total_items"] == 3
     assert result["facets"]["bom_levels"] == [0, 1, 2]
+
+
+def test_execution_journal_rejects_accepted_snapshot_without_plan_output(
+    db_session, monkeypatch
+):
+    from app.services import planning_truth
+
+    item = _make_purchased_item(db_session, "SNAPSHOT-NO-PLAN-OUTPUT")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=3.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.commit()
+    monkeypatch.setattr(
+        planning_truth,
+        "get_latest_read_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(payload={
+            "plan": {"id": plan.id},
+            "run_id": run.run_id,
+            "truth_status": "accepted",
+            "ledger_generation": 7,
+            "cutoff": "2026-07-23T12:00:00",
+            "rows": [],
+            "summary": {"execution_completed_qty": 0, "execution_base_qty": 3},
+        }),
+    )
+
+    result = get_period_plan_execution_journal(
+        db_session, int(plan.id), run_id=int(run.run_id)
+    )
+
+    assert result["truth_status"] == "unavailable"
+    assert result["summary"]["planned_output_qty"] is None
+    assert result["summary"]["accepted_plan_output_qty"] is None
+    assert result["summary"]["assembly_remaining_qty"] is None
+    assert result["truth_reason"] == "Saved plan-output read model is missing or invalid"
 
 
 def test_execution_journal_missing_current_snapshot_is_unavailable(
@@ -358,6 +464,7 @@ def test_execution_journal_reads_closed_plan_snapshot_without_current_truth(db_s
         period_to=plan.period_to,
         bom_level=0,
     ))
+    _add_root_for_plan(db_session, run, plan)
     db_session.flush()
 
     payload = build_period_plan_execution_snapshot(
@@ -423,6 +530,7 @@ def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session)
         produced_qty=999,
         remaining_qty=0,
     ))
+    _add_root_for_plan(db_session, run, plan)
     db_session.commit()
 
     result = build_period_plan_execution_snapshot(db_session, plan.id, run_id=run.run_id)
@@ -449,6 +557,7 @@ def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
     )
     db_session.add(run)
     db_session.flush()
+    _add_root_for_plan(db_session, run, plan)
 
     payload = build_period_plan_execution_snapshot(
         db_session,
@@ -466,6 +575,10 @@ def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
     assert snapshot.cutoff == generation.cutoff
     assert snapshot.truth_status == "accepted"
     assert snapshot.payload == payload
+    assert payload["summary"]["planned_output_qty"] == 5.0
+    assert payload["summary"]["accepted_plan_output_qty"] == 0.0
+    assert payload["summary"]["assembly_remaining_qty"] == 5.0
+    assert payload["plan_output_rows"][0]["planned_output_qty"] == 5.0
 
 
 def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db_session):
@@ -491,6 +604,9 @@ def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db
                 "execution_pct": 62.5,
                 "execution_completed_qty": 5,
                 "execution_base_qty": 8,
+                "planned_output_qty": 5,
+                "accepted_plan_output_qty": 3,
+                "assembly_remaining_qty": 2,
             },
         },
         published_at=datetime.datetime(2026, 7, 24),
@@ -503,6 +619,9 @@ def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db
     assert row["execution_pct"] == 60.0
     assert row["execution_completed_qty"] == 3
     assert row["execution_base_qty"] == 5
+    assert row["planned_output_qty"] == 5
+    assert row["accepted_plan_output_qty"] == 3
+    assert row["assembly_remaining_qty"] == 2
     assert row["execution_status"] == "accepted"
     assert row["execution_reason"] is None
     assert row["execution_generation_id"] == generation_id
@@ -554,9 +673,112 @@ def test_replacement_mrp_starts_at_zero_of_saved_remainder_with_empty_journal(db
     assert payload["summary"]["execution_completed_qty"] == 0
     assert payload["summary"]["execution_base_qty"] == 2
     assert payload["summary"]["execution_pct"] == 0
+    assert payload["summary"]["planned_output_qty"] == 12
+    assert payload["summary"]["accepted_plan_output_qty"] == 10
+    assert payload["summary"]["assembly_remaining_qty"] == 2
     assert line.qty == Decimal("12")
     assert line.accepted_output_qty == Decimal("10")
     assert line.remaining_output_qty == Decimal("2")
+
+
+def test_period_plan_detail_and_matrix_read_saved_plan_output_projection(db_session):
+    item = _make_purchased_item(db_session, "MATRIX-SAVED-OUTPUT")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
+    generation_id = int(db_session.query(PlanningTruthState.current_generation_id).scalar())
+    generation = db_session.get(LedgerGeneration, generation_id)
+    line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    db_session.add(PlanningReadSnapshot(
+        consumer="period_plan_execution",
+        snapshot_key=f"plan={plan.id};run=101",
+        ledger_generation_id=generation_id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload={
+            "plan": {"id": plan.id},
+            "truth_status": "accepted",
+            "plan_output_rows": [{
+                "plan_line_id": int(line.id),
+                "item_id": int(item.item_id),
+                "bucket_date": line.bucket_date.isoformat(),
+                "planned_output_qty": 5.0,
+                "accepted_plan_output_qty": 3.0,
+                "assembly_remaining_qty": 2.0,
+            }],
+            "summary": {
+                "planned_output_qty": 5.0,
+                "accepted_plan_output_qty": 3.0,
+                "assembly_remaining_qty": 2.0,
+            },
+        },
+        published_at=datetime.datetime(2026, 7, 24),
+    ))
+    # Mutable table state after publication must not change the GET projection.
+    line.accepted_output_qty = Decimal("0")
+    line.remaining_output_qty = Decimal("5")
+    db_session.commit()
+
+    detail = period_plan_service.get_period_plan(db_session, int(plan.id))
+    matrix = get_period_plan_matrix(db_session, int(plan.id))
+
+    assert detail["planned_output_qty"] == 5.0
+    assert detail["accepted_plan_output_qty"] == 3.0
+    assert detail["assembly_remaining_qty"] == 2.0
+    assert detail["plan_output_truth_status"] == "accepted"
+    assert detail["plan_output_cutoff"] == generation.cutoff.isoformat()
+    assert matrix["planned_output_qty"] == 5.0
+    assert matrix["accepted_plan_output_qty"] == 3.0
+    assert matrix["assembly_remaining_qty"] == 2.0
+    assert matrix["plan_output_cutoff"] == generation.cutoff.isoformat()
+    assert matrix["rows"][0]["output_by_bucket"][line.bucket_date.isoformat()] == {
+        "planned_output_qty": 5.0,
+        "accepted_plan_output_qty": 3.0,
+        "assembly_remaining_qty": 2.0,
+    }
+
+
+def test_period_plan_detail_rejects_nonconserving_saved_output_projection(db_session):
+    item = _make_purchased_item(db_session, "MATRIX-BROKEN-OUTPUT")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
+    generation_id = int(
+        db_session.query(PlanningTruthState.current_generation_id).scalar()
+    )
+    generation = db_session.get(LedgerGeneration, generation_id)
+    line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    db_session.add(PlanningReadSnapshot(
+        consumer="period_plan_execution",
+        snapshot_key=f"plan={plan.id};run=broken",
+        ledger_generation_id=generation_id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload={
+            "plan": {"id": plan.id},
+            "plan_output_rows": [{
+                "plan_line_id": int(line.id),
+                "item_id": int(item.item_id),
+                "bucket_date": line.bucket_date.isoformat(),
+                "planned_output_qty": 5.0,
+                "accepted_plan_output_qty": 4.0,
+                "assembly_remaining_qty": 2.0,
+            }],
+            "summary": {
+                "planned_output_qty": 5.0,
+                "accepted_plan_output_qty": 4.0,
+                "assembly_remaining_qty": 1.0,
+            },
+        },
+        published_at=datetime.datetime(2026, 7, 24),
+    ))
+    db_session.commit()
+
+    detail = period_plan_service.get_period_plan(db_session, int(plan.id))
+
+    assert detail["planned_output_qty"] is None
+    assert detail["accepted_plan_output_qty"] is None
+    assert detail["assembly_remaining_qty"] is None
+    assert detail["plan_output_truth_status"] == "unavailable"
+    assert detail["plan_output_truth_reason"] == (
+        "Saved plan-output read model is missing or invalid"
+    )
 
 
 @pytest.mark.parametrize("match_status", ["exact", "unmatched"])
@@ -715,10 +937,24 @@ def _make_fixed_plan(
             item_id=item.item_id,
             bucket_date=bucket_date,
             qty=qty,
+            accepted_output_qty=0,
+            remaining_output_qty=qty,
         )
     )
     db.flush()
     return plan
+
+
+def _add_root_for_plan(db, run: PlanningRun, plan: ProductionPlanHeader) -> None:
+    for line in db.query(ProductionPlanLine).filter_by(plan_id=int(plan.id)).all():
+        db.add(models.MrpRunRoot(
+            run_id=int(run.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal(str(line.remaining_output_qty)),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal(str(line.remaining_output_qty)),
+        ))
+    db.flush()
 
 
 def _make_supplier_order(

@@ -33,6 +33,7 @@ from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
 from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
     MANIFEST_KEY,
+    ObligationRefreshManifestError,
     _current_parents,
 )
 from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
@@ -838,9 +839,13 @@ def publish_obligation_refresh_batch(
     pointer, parent, target = _require_refresh_lineage(
         db, int(parent_generation_id), int(target_generation_id)
     )
+    try:
+        current_parents = _current_parents(db, int(parent.id))
+    except ObligationRefreshManifestError as exc:
+        raise ObligationRefreshPublishError(str(exc)) from exc
     parents = [
         _lock(db.query(models.PlanningRun)).filter_by(run_id=int(row.run_id)).one()
-        for row in _current_parents(db, int(parent.id))
+        for row in current_parents
     ]
     if any(row.source_plan_id is None for row in parents):
         raise ObligationRefreshPublishError("active parent snapshot lacks source plan lineage")
@@ -1009,6 +1014,13 @@ def publish_obligation_refresh_batch(
             )
         retired_run.status = "CLOSED"
         retired_run.finished_at = accepted_at
+        db.query(models.MrpRequirement).filter(
+            models.MrpRequirement.run_id == int(retired_run.run_id),
+            models.MrpRequirement.status == "open",
+        ).update(
+            {"status": "closed", "closed_at": accepted_at},
+            synchronize_session=False,
+        )
         plan.status = "closed"
         if plan.closed_at is None:
             plan.closed_at = accepted_at

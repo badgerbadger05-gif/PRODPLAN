@@ -253,8 +253,11 @@ beforeEach(() => {
     slots: [{
       slot_id: 501,
       queue_line_id: 901,
+      run_id: 77,
       plan_id: 1,
       plan_line_id: 11,
+      period_from: '2026-09-01',
+      period_to: '2026-09-30',
       item_id: 201,
       item_code: 'ART-1',
       item_name: 'Кронштейн',
@@ -278,11 +281,14 @@ beforeEach(() => {
       original_priority: ['2026-08-01', 11],
     }],
     gaps: [],
+    excluded: [],
     total_open_qty: 10,
     total_slot_qty: 4,
     total_gap_qty: 6,
     total_slots: 1,
     total_gaps: 0,
+    total_excluded: 0,
+    total_excluded_open_qty: 0,
     limit: 10000,
     offset: 0,
     truth_meta: fakeTruthMeta,
@@ -443,9 +449,48 @@ describe('ProductionControlPage — characterization', () => {
       .getAllByRole('columnheader')
       .map((h) => h.textContent ?? '')
       .join('|')
-    for (const col of ['Заказ', 'Деталь', 'Кол-во', 'План', 'Участок', 'Статус', 'Обеспечение']) {
+    for (const col of ['Заказ', 'Деталь', 'Выпуск заказа', 'План', 'Участок', 'Статус', 'Обеспечение']) {
       expect(headerText).toContain(col)
     }
+  })
+
+  it('shows saved order output facts in the journal and selected card without deriving the remainder', async () => {
+    const rows = fakeRows()
+    rows[0] = { ...rows[0], quantity: 10, produced_qty: 4, remaining_qty: 6 }
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows,
+      total: 2,
+      limit: 100,
+      offset: 0,
+      latest_run_id: 77,
+      truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
+    })
+
+    renderPage()
+    await screen.findByText('Вал')
+
+    const journalFacts = within(rowFor('Кронштейн')).getByLabelText('Факт выпуска заказа')
+    expect(journalFacts).toHaveTextContent('Заказано 10')
+    expect(journalFacts).toHaveTextContent('Принято Ledger 4')
+    expect(journalFacts).toHaveTextContent('Осталось по заказу 6')
+
+    fireEvent.click(rowFor('Кронштейн'))
+    const detailPane = document.querySelector('.detailPane') as HTMLElement
+    const cardFacts = within(detailPane).getByLabelText('Факт выпуска заказа')
+    expect(cardFacts).toHaveTextContent('Заказано 10')
+    expect(cardFacts).toHaveTextContent('Принято Ledger 4')
+    expect(cardFacts).toHaveTextContent('Осталось по заказу 6')
+  })
+
+  it('does not present order output numbers as facts when Ledger truth is unavailable', async () => {
+    renderPage()
+    await screen.findByText('Вал')
+
+    const facts = within(rowFor('Кронштейн')).getByLabelText('Факт выпуска заказа')
+    expect(facts).toHaveTextContent('Заказано 10')
+    expect(facts).toHaveTextContent('Принято Ledger Недоступно')
+    expect(facts).toHaveTextContent('Осталось по заказу Недоступно')
+    expect(facts).not.toHaveTextContent('Принято Ledger 0')
   })
 
   it('loads orders from the service and renders them as rows', async () => {
@@ -544,16 +589,130 @@ describe('ProductionControlPage — characterization', () => {
     expect(listDrumSchedule).toHaveBeenCalledWith(expect.any(AbortSignal))
     expect(screen.getByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Барабан сборки' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })).toHaveTextContent('Исходный план Недоступно')
+    expect(screen.getByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })).toHaveTextContent('Принято Ledger Недоступно')
+    expect(screen.getByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })).toHaveTextContent('Осталось выпустить Недоступно')
   })
 
-  it('keeps capacity gaps collapsed so the calendar remains the primary drum view', async () => {
+  it('shows canonical plan output facts supplied by the drum read model without client arithmetic', async () => {
+    const response = await vi.mocked(listDrumSchedule).getMockImplementation()!(new AbortController().signal)
+    vi.mocked(listDrumSchedule).mockResolvedValueOnce({
+      ...response,
+      truth_meta: { ...response.truth_meta, truth_status: 'accepted' },
+      slots: response.slots.map((slot) => ({
+        ...slot,
+        planned_output_qty: 12,
+        accepted_plan_output_qty: 5,
+        assembly_remaining_qty: 7,
+      })),
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+
+    const tile = await screen.findByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })
+    expect(tile).toHaveTextContent('Исходный план 12')
+    expect(tile).toHaveTextContent('Принято Ledger 5')
+    expect(tile).toHaveTextContent('Осталось выпустить 7')
+    await user.click(tile)
+    const dialog = screen.getByRole('dialog', { name: /Плитка: Кронштейн/ })
+    expect(dialog).toHaveTextContent('Принято Ledger 5')
+    expect(dialog).toHaveTextContent('MRP: 77')
+    expect(dialog).toHaveTextContent('Период: 2026-09-01 — 2026-09-30')
+  })
+
+  it('shows the saved deficit evidence without recalculating coverage in the browser', async () => {
+    const response = await vi.mocked(listDrumSchedule).getMockImplementation()!(new AbortController().signal)
+    vi.mocked(listDrumSchedule).mockResolvedValueOnce({
+      ...response,
+      slots: response.slots.map((slot) => ({
+        ...slot,
+        readiness_phase: 'blocked' as const,
+        blocking_manifest: [{
+          item_id: 940,
+          item_code: 'CA-004940-SP',
+          item_article: 'CA-004940-SP',
+          item_name: 'Конёк для лыжи, чёрный',
+          required_qty: '10',
+          available_qty: '3',
+          shortage_qty: '7',
+          reason: 'SHORTAGE',
+          destination_warehouse_ref1c: 'WH-ASSEMBLY',
+          destination_warehouse_name: 'Склад сборки',
+          path: [201, 940],
+          point_of_use_qty: '1',
+          custody_qty: '2',
+          transit_qty: '3',
+          wip_qty: '4',
+          supplier_qty: '5',
+          other_stock_qty: '6',
+          coverage_sources: [{
+            coverage_kind: 'wip_order' as const,
+            qty: '4',
+            source_key: 'wip:ZP-42',
+            warehouse_ref1c: 'WH-WIP',
+            warehouse_name: 'Склад производства',
+            destination_warehouse_ref1c: 'WH-ASSEMBLY',
+            destination_warehouse_name: 'Склад сборки',
+            available_date: '2026-09-08',
+            confidence: 'committed',
+            source_kind: 'wip_order',
+            source_ref: 'ЗП-000042',
+          }],
+        }],
+      })),
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+
+    await user.click(await screen.findByRole('button', { name: /Кронштейн: 4 шт., Пока не собирается/ }))
+    const table = screen.getByRole('table', { name: 'Дефициты по источникам обеспечения' })
+    const rows = within(table).getAllByRole('row')
+    const cells = within(rows[1]).getAllByRole('cell').map((cell) => (cell.textContent ?? '').trim())
+    expect(cells.slice(1, 9)).toEqual(['10', '1', '2', '3', '4', '5', '6', '7'])
+    expect(cells[0]).toContain('CA-004940-SP')
+    expect(cells[9]).toBe('Не хватает остатка')
+    const sources = screen.getByLabelText('Источники покрытия: CA-004940-SP')
+    expect(sources).toHaveTextContent('В производстве · 4 шт. · Склад производства → Склад сборки · ЗП-000042 · к 2026-09-08 · подтверждено документом')
+    expect(screen.getByRole('link', { name: 'Журнал' })).toHaveAttribute('href', '#/production-control?search=CA-004940-SP')
+    expect(screen.getByRole('link', { name: 'Очередь мехцеха' })).toHaveAttribute('href', '#/production-control?view=mechshop&search=CA-004940-SP')
+  })
+
+  it('keeps unscheduled residue collapsed and explains that it is not always a capacity gap', async () => {
+    const blocker = {
+      item_id: 941,
+      item_code: 'FRAME-RAW',
+      item_article: 'FRAME-RAW',
+      item_name: 'Заготовка рамы',
+      required_qty: '6',
+      available_qty: '0',
+      shortage_qty: '6',
+      reason: 'LEAD_TIME_MISSING',
+      destination_warehouse_ref1c: 'WH-ASSEMBLY',
+      destination_warehouse_name: 'Склад сборки',
+      path: [202, 941],
+      point_of_use_qty: '0',
+      custody_qty: '0',
+      transit_qty: '0',
+      wip_qty: '0',
+      supplier_qty: '0',
+      other_stock_qty: '0',
+      coverage_sources: [],
+    }
     vi.mocked(listDrumSchedule).mockResolvedValueOnce({
       ...await vi.mocked(listDrumSchedule).getMockImplementation()!(new AbortController().signal),
+      truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
       gaps: [{
         gap_id: 601,
         queue_line_id: 902,
+        run_id: 78,
         plan_id: 1,
         plan_line_id: 12,
+        period_from: '2026-09-01',
+        period_to: '2026-09-30',
         item_id: 202,
         item_code: 'ART-2',
         item_name: 'Рама',
@@ -564,6 +723,20 @@ describe('ProductionControlPage — characterization', () => {
         gap_qty: 6,
         readiness_phase: 'blocked',
         original_priority: ['2026-08-01', 12],
+        planned_output_qty: 9,
+        accepted_plan_output_qty: 3,
+        assembly_remaining_qty: 6,
+        readiness_curve: [{
+          horizon: 'now',
+          cumulative_qty: '0',
+          available_date: null,
+          actions: [],
+          required_actions: [],
+          blockers: [blocker],
+        }],
+        action_manifest: [],
+        unavailable_reasons: [],
+        blocking_manifest: [blocker],
       }],
       total_gaps: 1,
     })
@@ -573,12 +746,59 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
 
     expect(await screen.findByRole('table', { name: 'Календарный барабан сборки' })).toBeInTheDocument()
-    const summary = screen.getByText('Разрывы мощности')
+    const summary = screen.getByText('Вне календаря')
     const details = summary.closest('details')
     expect(details).not.toHaveAttribute('open')
     await user.click(summary)
     expect(details).toHaveAttribute('open')
-    expect(screen.getByRole('table', { name: 'Разрывы мощности барабана' })).toBeInTheDocument()
+    expect(screen.getByRole('table', { name: 'Строки барабана вне календаря' })).toBeInTheDocument()
+    expect(screen.getByText('Не задан срок обеспечения')).toBeInTheDocument()
+    const gapRow = screen.getByRole('table', { name: 'Строки барабана вне календаря' }).querySelector('.drumGapRow')
+    expect(gapRow).toHaveTextContent('Исходный план 9')
+    expect(gapRow).toHaveTextContent('Принято Ledger 3')
+    expect(gapRow).toHaveTextContent('Осталось выпустить 6')
+    await user.click(within(gapRow as HTMLElement).getByRole('button', { name: 'Подробнее' }))
+    const dialog = screen.getByRole('dialog', { name: 'Вне календаря: Рама' })
+    expect(dialog).toHaveTextContent('Сегодня можно собрать 0 из 6')
+    expect(dialog).toHaveTextContent('Заготовка рамы')
+    expect(dialog).toHaveTextContent('Не задан срок обеспечения')
+  })
+
+  it('shows saved queue rows without takt instead of hiding them in a metric', async () => {
+    vi.mocked(listDrumSchedule).mockResolvedValueOnce({
+      ...await vi.mocked(listDrumSchedule).getMockImplementation()!(new AbortController().signal),
+      excluded: [{
+        queue_line_id: 903,
+        plan_id: 1,
+        plan_line_id: 13,
+        run_id: 77,
+        item_id: 203,
+        period_from: '2026-09-01',
+        period_to: '2026-09-30',
+        item_code: 'NO-TAKT',
+        item_name: 'Изделие без такта',
+        planned_output_qty: 12,
+        accepted_plan_output_qty: 2,
+        assembly_remaining_qty: 10,
+        reason: 'ASSEMBLY_RATE_MISSING',
+        readiness_status: 'blocked',
+        readiness_curve: [],
+        action_manifest: [],
+        unavailable_reasons: [],
+        blocking_manifest: [],
+        original_priority: ['2026-08-01', 13],
+      }],
+      total_excluded: 1,
+      total_excluded_open_qty: 10,
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+
+    expect(await screen.findByRole('table', { name: 'Строки очереди без такта сборки' })).toBeInTheDocument()
+    expect(screen.getByText('Изделие без такта')).toBeInTheDocument()
+    expect(screen.getByText('Не настроен такт финишной сборки')).toBeInTheDocument()
   })
 
   it('moves a drum tile by mouse drag to another workday of the same resource', async () => {
@@ -684,7 +904,7 @@ describe('ProductionControlPage — characterization', () => {
     })
     renderPage()
 
-    expect(await screen.findByText('Недоступно')).toBeInTheDocument()
+    expect(await screen.findByText('Недоступно', { selector: '.materialEta' })).toBeInTheDocument()
     expect(screen.queryByText('На складе')).not.toBeInTheDocument()
   })
 
@@ -819,7 +1039,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.type(launchInput, '6')
     await user.tab()
     await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6, 77))
-    await waitFor(() => expect(within(rowFor('Кронштейн')).getByText('6')).toBeInTheDocument())
+    await waitFor(() => expect(within(rowFor('Кронштейн')).getByText(/К запуску: 6 шт/)).toBeInTheDocument())
     expect(await screen.findByRole('heading', { name: 'Комплектующие на 6 шт' })).toBeInTheDocument()
     expect(screen.getByText('нужно 24')).toBeInTheDocument()
 

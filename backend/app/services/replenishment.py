@@ -8,8 +8,15 @@ REPLENISHMENT_FLOW_PURCHASE = "purchase"
 REPLENISHMENT_FLOW_REWORK = "rework"
 REPLENISHMENT_FLOW_UNAVAILABLE = "unavailable"
 
-PURCHASE_MARKERS = ("покуп", "закуп", "purchase", "buy")
-REWORK_MARKERS = ("переработ", "rework")
+# Closed vocabulary.  Substring matching is unsafe here: for example the 1C
+# value "Не производится" contains "производ" and used to create a phantom
+# make route in MRP/readiness.
+PURCHASE_METHODS = frozenset(
+    {"покупка", "закупка", "покупное изделие", "purchase", "buy"}
+)
+PRODUCTION_METHODS = frozenset({"производство", "make"})
+REWORK_METHODS = frozenset({"переработка", "rework"})
+NON_STOCK_ITEM_TYPES = frozenset({"услуга", "работа", "операция"})
 
 
 def normalize_replenishment_method(method_raw: Optional[str]) -> str:
@@ -31,14 +38,20 @@ def classify_replenishment_flow(method_raw: Optional[str]) -> str:
     method = normalize_replenishment_method(method_raw)
     if not method:
         return REPLENISHMENT_FLOW_UNAVAILABLE
-    if any(marker in method for marker in PURCHASE_MARKERS):
+    if method in PURCHASE_METHODS:
         return REPLENISHMENT_FLOW_PURCHASE
-    if any(marker in method for marker in REWORK_MARKERS):
+    if method in REWORK_METHODS:
         return REPLENISHMENT_FLOW_REWORK
-    if "производ" in method or "make" in method:
+    if method in PRODUCTION_METHODS:
         return REPLENISHMENT_FLOW_PRODUCTION
     return REPLENISHMENT_FLOW_UNAVAILABLE
 
 
 def is_purchase_replenishment(method_raw: Optional[str]) -> bool:
     return classify_replenishment_flow(method_raw) == REPLENISHMENT_FLOW_PURCHASE
+
+
+def is_non_stock_item_type(item_type_raw: Optional[str]) -> bool:
+    """Return whether the exact 1C item type is intentionally non-stock."""
+
+    return str(item_type_raw or "").strip().casefold() in NON_STOCK_ITEM_TYPES

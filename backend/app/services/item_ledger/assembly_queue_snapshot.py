@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import and_, asc, func
+from sqlalchemy import and_, asc
 from sqlalchemy.orm import Session
 
 from app import models
@@ -120,29 +120,12 @@ def _build_rows_by_scope(
     if generation is None:
         raise ValueError("assembly queue snapshot generation not found")
     run_ids = live_plan_run_ids(db, generation)
-    legacy_accepted_by_line = {
-        int(line_id): _dec(qty)
-        for line_id, qty in db.query(
-            models.AssemblyOutputAllocation.plan_line_id,
-            func.coalesce(
-                func.sum(models.AssemblyOutputAllocation.allocated_qty),
-                Decimal("0"),
-            ),
-        )
-        .filter(
-            models.AssemblyOutputAllocation.ledger_generation_id
-            == int(generation_id)
-        )
-        .group_by(models.AssemblyOutputAllocation.plan_line_id)
-        .all()
-    }
     rows = (
         db.query(
             models.ProductionPlanLine,
             models.PlanningRun,
             models.ProductionPlanHeader,
             models.Item,
-            models.MrpRunRoot,
         )
         .join(
             models.ProductionPlanHeader,
@@ -156,13 +139,6 @@ def _build_rows_by_scope(
             ),
         )
         .join(models.Item, models.Item.item_id == models.ProductionPlanLine.item_id)
-        .outerjoin(
-            models.MrpRunRoot,
-            and_(
-                models.MrpRunRoot.run_id == models.PlanningRun.run_id,
-                models.MrpRunRoot.plan_line_id == models.ProductionPlanLine.id,
-            ),
-        )
         .filter(
             models.ProductionPlanHeader.status == "fixed",
             models.ProductionPlanLine.qty > 0,
@@ -177,35 +153,38 @@ def _build_rows_by_scope(
     )
 
     lines: list[dict[str, Any]] = []
-    for line, run, plan, item, root in rows:
-        # Legacy rows without run roots remain readable during migration only.
-        # Every newly frozen run owns an explicit MrpRunRoot.
-        planned_output_qty = _dec(root.planned_qty if root is not None else line.qty)
-        accepted_output_qty = _dec(
-            root.accepted_qty
-            if root is not None
-            else legacy_accepted_by_line.get(int(line.id), line.accepted_output_qty)
-        )
-        assembly_remaining_qty = _dec(
-            root.remaining_qty
-            if root is not None
-            else (
-                line.remaining_output_qty
-                if line.remaining_output_qty is not None
-                else max(_dec(line.qty) - accepted_output_qty, Decimal("0"))
+    for line, run, plan, item in rows:
+        # A successor MrpRunRoot owns only this run's remainder and execution
+        # journal.  The assembly queue is a plan read-model, so its immutable
+        # denominator and accumulated accepted output always come from the
+        # original ProductionPlanLine across every specification rebase.
+        if line.remaining_output_qty is None:
+            raise ValueError(
+                f"assembly queue plan line {int(line.id)} lacks saved output remainder"
             )
-        )
+        planned_output_qty = _dec(line.qty)
+        accepted_output_qty = _dec(line.accepted_output_qty)
+        assembly_remaining_qty = _dec(line.remaining_output_qty)
+        if (
+            planned_output_qty < Decimal("0")
+            or accepted_output_qty < Decimal("0")
+            or assembly_remaining_qty < Decimal("0")
+            or planned_output_qty
+            != accepted_output_qty + assembly_remaining_qty
+        ):
+            raise ValueError(
+                f"assembly queue plan line {int(line.id)} violates output conservation"
+            )
         if not include_zero and assembly_remaining_qty <= Decimal("0"):
             continue
 
         plan_id = int(plan.id)
         line_id = int(line.id)
         run_id = int(run.run_id)
-        eligible_from = (
-            run.started_at
-            if run.prior_run_id is not None
-            else (plan.fixed_at or run.fixed_at)
-        )
+        # Rebase must not make a backdated, late-imported physical output
+        # ineligible merely because the successor run started later.  The
+        # historical boundary belongs to the immutable fixed plan.
+        eligible_from = plan.fixed_at
         period_from, period_to = _frozen_run_period(run, plan)
         priority = _priority_key(period_from, period_to, plan_id, line_id)
         sort_key = _sort_key(period_from, period_to, plan_id, line_id)

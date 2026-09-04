@@ -6,7 +6,6 @@ from typing import Annotated, List, Literal, Optional, Union
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import case
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -66,7 +65,13 @@ from ..services.production_order_sync import (
     sync_production_orders_from_odata,
 )
 from ..services.item_ledger.drum_manual_move import move_drum_slot
-from ..services.work_calendar_service import is_workday
+from ..services.item_ledger.drum_saved_calendar import (
+    DrumSavedCalendarError,
+    saved_working_days,
+)
+from ..services.item_ledger.drum_schedule_persistence import (
+    ALGORITHM_VERSION as DRUM_SCHEDULE_ALGORITHM_VERSION,
+)
 from .production_control_settings import router as settings_router
 
 
@@ -139,18 +144,35 @@ class ReadinessActionResponse(BaseModel):
     confidence: str
     source_key: str
     source_warehouse_ref1c: str
+    source_warehouse_name: str = ""
     destination_warehouse_ref1c: str
+    destination_warehouse_name: str = ""
     resource_id: int | None = None
+    resource_name: str = ""
     path: list[int]
 
 
-class ReadinessCurvePointResponse(BaseModel):
+class ReadinessCoverageSourceResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    horizon: Literal["now", "transfer", "kitting", "committed", "launch"]
-    cumulative_qty: str
+    coverage_kind: Literal[
+        "point_of_use",
+        "custody",
+        "transit",
+        "wip_order",
+        "supplier_order",
+        "other_stock",
+    ]
+    qty: str
+    source_key: str
+    warehouse_ref1c: str = ""
+    warehouse_name: str = ""
+    destination_warehouse_ref1c: str = ""
+    destination_warehouse_name: str = ""
     available_date: str | None = None
-    actions: list[ReadinessActionResponse] = Field(default_factory=list)
+    confidence: str = "physical"
+    source_kind: str = ""
+    source_ref: str = ""
 
 
 class ReadinessBlockerResponse(BaseModel):
@@ -165,7 +187,28 @@ class ReadinessBlockerResponse(BaseModel):
     shortage_qty: str | None = None
     reason: str = "SHORTAGE"
     destination_warehouse_ref1c: str = ""
+    destination_warehouse_name: str = ""
     path: list[int] = Field(default_factory=list)
+    point_of_use_qty: str = "0"
+    custody_qty: str = "0"
+    transit_qty: str = "0"
+    wip_qty: str = "0"
+    supplier_qty: str = "0"
+    other_stock_qty: str = "0"
+    coverage_sources: list[ReadinessCoverageSourceResponse] = Field(
+        default_factory=list
+    )
+
+
+class ReadinessCurvePointResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    horizon: Literal["now", "transfer", "kitting", "committed", "launch"]
+    cumulative_qty: str
+    available_date: str | None = None
+    actions: list[ReadinessActionResponse] = Field(default_factory=list)
+    required_actions: list[ReadinessActionResponse] = Field(default_factory=list)
+    blockers: list[ReadinessBlockerResponse] = Field(default_factory=list)
 
 
 class AssemblyReadinessRowResponse(BaseModel):
@@ -233,8 +276,11 @@ class DrumSlotRow(BaseModel):
 
     slot_id: int
     queue_line_id: int
+    run_id: int | None = None
     plan_id: int
     plan_line_id: int
+    period_from: str | None = None
+    period_to: str | None = None
     item_id: int
     # Additive: the drum board used to render bare item ids. Nullable because a
     # slot is keyed by the persisted generation, not by the live item table.
@@ -244,6 +290,9 @@ class DrumSlotRow(BaseModel):
     slot_date: str
     auto_slot_date: str | None = None
     slot_qty: float
+    planned_output_qty: float | None = None
+    accepted_plan_output_qty: float | None = None
+    assembly_remaining_qty: float | None = None
     slot_ordinal: int
     readiness_phase: Literal["now", "transfer", "kitting", "committed", "launch", "blocked", "unavailable"]
     readiness_date: str | None = None
@@ -283,8 +332,11 @@ class DrumGapRow(BaseModel):
 
     gap_id: int
     queue_line_id: int
+    run_id: int | None = None
     plan_id: int
     plan_line_id: int
+    period_from: str | None = None
+    period_to: str | None = None
     item_id: int
     item_code: str | None = None
     item_name: str | None = None
@@ -293,7 +345,15 @@ class DrumGapRow(BaseModel):
     required_qty: float
     available_capacity: float
     gap_qty: float
+    planned_output_qty: float | None = None
+    accepted_plan_output_qty: float | None = None
+    assembly_remaining_qty: float | None = None
     readiness_phase: Literal["now", "transfer", "kitting", "committed", "launch", "blocked", "unavailable", "mixed"]
+    readiness_date: str | None = None
+    readiness_curve: list[ReadinessCurvePointResponse] = Field(default_factory=list)
+    action_manifest: list[ReadinessActionResponse] = Field(default_factory=list)
+    unavailable_reasons: list[str] = Field(default_factory=list)
+    blocking_manifest: list[ReadinessBlockerResponse] = Field(default_factory=list)
     original_priority: list[Union[str, int]]
 
 
@@ -302,6 +362,33 @@ class DrumResourceRow(BaseModel):
 
     resource_id: int
     resource_name: str
+
+
+class DrumExcludedRow(BaseModel):
+    """Saved open queue row that cannot enter the calendar without one takt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    queue_line_id: int
+    plan_id: int
+    plan_line_id: int
+    run_id: int
+    item_id: int
+    period_from: str
+    period_to: str
+    item_code: str | None = None
+    item_name: str | None = None
+    planned_output_qty: float
+    accepted_plan_output_qty: float
+    assembly_remaining_qty: float
+    reason: Literal["ASSEMBLY_RATE_MISSING"] = "ASSEMBLY_RATE_MISSING"
+    readiness_status: Literal["ready", "recoverable", "partial", "blocked", "unavailable"]
+    readiness_date: str | None = None
+    readiness_curve: list[ReadinessCurvePointResponse] = Field(default_factory=list)
+    action_manifest: list[ReadinessActionResponse] = Field(default_factory=list)
+    unavailable_reasons: list[str] = Field(default_factory=list)
+    blocking_manifest: list[ReadinessBlockerResponse] = Field(default_factory=list)
+    original_priority: list[Union[str, int]] = Field(default_factory=list)
 
 
 class DrumScheduleResponse(BaseModel):
@@ -313,11 +400,14 @@ class DrumScheduleResponse(BaseModel):
     resources: list[DrumResourceRow]
     slots: list[DrumSlotRow]
     gaps: list[DrumGapRow]
+    excluded: list[DrumExcludedRow]
     total_open_qty: float
     total_slot_qty: float
     total_gap_qty: float
     total_slots: int
     total_gaps: int
+    total_excluded: int
+    total_excluded_open_qty: float
     limit: int
     offset: int
     truth_meta: TruthMeta
@@ -469,16 +559,8 @@ def get_assembly_readiness(
     if resource_id is not None:
         query = query.filter(models.AssemblyRate.resource_id == int(resource_id))
     total = int(query.count() or 0)
-    status_rank = case(
-        (models.AssemblyReadiness.status == "ready", 0),
-        (models.AssemblyReadiness.status == "recoverable", 1),
-        (models.AssemblyReadiness.status == "partial", 2),
-        (models.AssemblyReadiness.status == "blocked", 3),
-        else_=3,
-    )
     records = (
         query.order_by(
-            status_rank,
             models.AssemblyQueueLine.sort_key,
             models.AssemblyQueueLine.id,
         )
@@ -559,6 +641,20 @@ def get_drum_schedule(
                 "reason": "drum schedule is missing for accepted generation",
             },
         )
+    if str(schedule.algorithm_version) != DRUM_SCHEDULE_ALGORITHM_VERSION:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                **truth.as_dict(),
+                "code": "drum_schedule_version_unavailable",
+                "reason": (
+                    "accepted generation contains a legacy drum schedule; "
+                    "publish a new accepted generation before reading the drum"
+                ),
+                "expected_algorithm_version": DRUM_SCHEDULE_ALGORITHM_VERSION,
+                "actual_algorithm_version": str(schedule.algorithm_version or ""),
+            },
+        )
     slot_query = db.query(models.DrumSlot).filter(
         models.DrumSlot.drum_schedule_id == schedule.id
     )
@@ -590,10 +686,74 @@ def get_drum_schedule(
         .limit(limit)
         .all()
     )
+    queue_context_ids = {
+        int(row.assembly_queue_line_id) for row in (*slots, *gaps)
+    }
+    queue_context = {
+        int(row.id): row
+        for row in db.query(models.AssemblyQueueLine)
+        .filter(
+            models.AssemblyQueueLine.ledger_generation_id == truth.generation_id,
+            models.AssemblyQueueLine.id.in_(queue_context_ids or {0}),
+        )
+        .all()
+    }
+
+    def queue_context_payload(queue_line_id: int) -> dict[str, object]:
+        row = queue_context.get(int(queue_line_id))
+        return {
+            "run_id": int(row.planning_run_id) if row is not None else None,
+            "period_from": row.period_from.isoformat() if row is not None else None,
+            "period_to": row.period_to.isoformat() if row is not None else None,
+        }
+
+    excluded_item_ids = [
+        int(item_id) for item_id in list((schedule.metrics or {}).get("excluded_item_ids") or [])
+    ]
+    excluded_query = db.query(models.AssemblyQueueLine).filter(
+        models.AssemblyQueueLine.ledger_generation_id == truth.generation_id,
+        models.AssemblyQueueLine.line_status == "open",
+        models.AssemblyQueueLine.assembly_remaining_qty > 0,
+        models.AssemblyQueueLine.item_id.in_(excluded_item_ids),
+    )
+    excluded_rows = (
+        excluded_query.order_by(
+            models.AssemblyQueueLine.sort_key,
+            models.AssemblyQueueLine.id,
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+        if excluded_item_ids
+        else []
+    )
+    excluded_readiness = {
+        int(row.assembly_queue_line_id): row
+        for row in db.query(models.AssemblyReadiness)
+        .filter(
+            models.AssemblyReadiness.ledger_generation_id == truth.generation_id,
+            models.AssemblyReadiness.assembly_queue_line_id.in_(
+                [int(row.id) for row in excluded_rows]
+            ),
+        )
+        .all()
+    }
+    if len(excluded_readiness) != len(excluded_rows):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                **truth.as_dict(),
+                "code": "drum_excluded_readiness_unavailable",
+                "reason": "excluded drum rows are missing saved readiness",
+            },
+        )
     # Item labels for this page only, in one query — the drum board needs a name
     # next to every slot, not the raw item id.
     slot_items = _items_by_id(
-        db, {int(row.item_id) for row in slots} | {int(row.item_id) for row in gaps}
+        db,
+        {int(row.item_id) for row in slots}
+        | {int(row.item_id) for row in gaps}
+        | {int(row.item_id) for row in excluded_rows},
     )
     resource_ids = {int(row.resource_id) for row in slots} | {
         int(row.resource_id) for row in gaps
@@ -606,12 +766,17 @@ def get_drum_schedule(
         if resource_ids
         else []
     )
-    days = []
-    day = schedule.schedule_from
-    while day <= schedule.schedule_to:
-        if is_workday(db, day):
-            days.append(day.isoformat())
-        day += timedelta(days=1)
+    try:
+        days = [value.isoformat() for value in saved_working_days(schedule)]
+    except DrumSavedCalendarError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                **truth.as_dict(),
+                "code": "drum_schedule_calendar_unavailable",
+                "reason": str(exc),
+            },
+        ) from exc
     return DrumScheduleResponse.model_validate(
         {
             "schedule_from": schedule.schedule_from.isoformat(),
@@ -628,6 +793,7 @@ def get_drum_schedule(
                 {
                     "slot_id": int(row.id),
                     "queue_line_id": int(row.assembly_queue_line_id),
+                    **queue_context_payload(int(row.assembly_queue_line_id)),
                     "plan_id": row.plan_id,
                     "plan_line_id": row.plan_line_id,
                     "item_id": row.item_id,
@@ -645,6 +811,18 @@ def get_drum_schedule(
                     "slot_date": row.slot_date.isoformat(),
                     "auto_slot_date": row.auto_slot_date.isoformat() if row.auto_slot_date else None,
                     "slot_qty": float(row.slot_qty),
+                    "planned_output_qty": (
+                        float(row.planned_output_qty)
+                        if row.planned_output_qty is not None else None
+                    ),
+                    "accepted_plan_output_qty": (
+                        float(row.accepted_plan_output_qty)
+                        if row.accepted_plan_output_qty is not None else None
+                    ),
+                    "assembly_remaining_qty": (
+                        float(row.assembly_remaining_qty)
+                        if row.assembly_remaining_qty is not None else None
+                    ),
                     "slot_ordinal": row.slot_ordinal,
                     "readiness_phase": row.readiness_phase,
                     "readiness_date": row.readiness_date.isoformat() if row.readiness_date else None,
@@ -665,6 +843,7 @@ def get_drum_schedule(
                 {
                     "gap_id": int(row.id),
                     "queue_line_id": int(row.assembly_queue_line_id),
+                    **queue_context_payload(int(row.assembly_queue_line_id)),
                     "plan_id": row.plan_id,
                     "plan_line_id": row.plan_line_id,
                     "item_id": row.item_id,
@@ -683,16 +862,85 @@ def get_drum_schedule(
                     "required_qty": float(row.required_qty),
                     "available_capacity": float(row.available_capacity),
                     "gap_qty": float(row.gap_qty),
+                    "planned_output_qty": (
+                        float(row.planned_output_qty)
+                        if row.planned_output_qty is not None else None
+                    ),
+                    "accepted_plan_output_qty": (
+                        float(row.accepted_plan_output_qty)
+                        if row.accepted_plan_output_qty is not None else None
+                    ),
+                    "assembly_remaining_qty": (
+                        float(row.assembly_remaining_qty)
+                        if row.assembly_remaining_qty is not None else None
+                    ),
                     "readiness_phase": row.readiness_phase,
+                    "readiness_date": (
+                        row.readiness_date.isoformat() if row.readiness_date else None
+                    ),
+                    "readiness_curve": list(row.readiness_curve or []),
+                    "action_manifest": list(row.action_manifest or []),
+                    "unavailable_reasons": list(row.unavailable_reasons or []),
+                    "blocking_manifest": list(row.blocking_manifest or []),
                     "original_priority": list(row.original_priority or []),
                 }
                 for row in gaps
+            ],
+            "excluded": [
+                {
+                    "queue_line_id": int(row.id),
+                    "plan_id": int(row.plan_id),
+                    "plan_line_id": int(row.plan_line_id),
+                    "run_id": int(row.planning_run_id),
+                    "item_id": int(row.item_id),
+                    "period_from": row.period_from.isoformat(),
+                    "period_to": row.period_to.isoformat(),
+                    "item_code": (
+                        slot_items[int(row.item_id)].item_code
+                        if int(row.item_id) in slot_items
+                        else None
+                    ),
+                    "item_name": (
+                        slot_items[int(row.item_id)].item_name
+                        if int(row.item_id) in slot_items
+                        else None
+                    ),
+                    "planned_output_qty": float(row.planned_output_qty),
+                    "accepted_plan_output_qty": float(row.accepted_plan_output_qty),
+                    "assembly_remaining_qty": float(row.assembly_remaining_qty),
+                    "reason": "ASSEMBLY_RATE_MISSING",
+                    "readiness_status": str(excluded_readiness[int(row.id)].status),
+                    "readiness_date": (
+                        excluded_readiness[int(row.id)].readiness_date.isoformat()
+                        if excluded_readiness[int(row.id)].readiness_date
+                        else None
+                    ),
+                    "readiness_curve": list(
+                        excluded_readiness[int(row.id)].readiness_curve or []
+                    ),
+                    "action_manifest": list(
+                        excluded_readiness[int(row.id)].action_manifest or []
+                    ),
+                    "unavailable_reasons": list(
+                        excluded_readiness[int(row.id)].unavailable_reasons or []
+                    ),
+                    "blocking_manifest": list(
+                        excluded_readiness[int(row.id)].blocking_manifest or []
+                    ),
+                    "original_priority": list(row.original_priority or []),
+                }
+                for row in excluded_rows
+                if int(row.id) in excluded_readiness
             ],
             "total_open_qty": float(schedule.total_open_qty),
             "total_slot_qty": float(schedule.total_slot_qty),
             "total_gap_qty": float(schedule.total_gap_qty),
             "total_slots": total_slots,
             "total_gaps": total_gaps,
+            "total_excluded": int((schedule.metrics or {}).get("excluded_lines") or 0),
+            "total_excluded_open_qty": float(
+                (schedule.metrics or {}).get("excluded_open_qty") or 0
+            ),
             "limit": limit,
             "offset": offset,
             "truth_meta": build_truth_meta(truth),

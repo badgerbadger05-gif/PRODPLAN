@@ -313,6 +313,23 @@ def test_retained_and_candidate_replay_partition_one_sle_and_keep_open_output(
     )
     db_session.add_all([retained_line, candidate_line, retained_run])
     db_session.flush()
+    db_session.add_all([
+        models.MrpRunRoot(
+            run_id=retained_run.run_id,
+            plan_line_id=retained_line.id,
+            planned_qty=Decimal("10"),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal("10"),
+        ),
+        models.MrpRunRoot(
+            run_id=candidate.run_id,
+            plan_line_id=candidate_line.id,
+            planned_qty=Decimal("10"),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal("10"),
+        ),
+    ])
+    db_session.flush()
     retained_requirement = models.MrpRequirement(
         run_id=retained_run.run_id,
         item_id=item.item_id,

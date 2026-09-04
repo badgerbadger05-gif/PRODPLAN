@@ -45,19 +45,23 @@ from ..models import (
     LedgerFutureSupply,
     MrpFreezeAllocation,
     MrpFreezeBaseline,
+    MrpFreezeBomNode,
     MrpFreezeComponent,
     MrpFreezeComponentCumulative,
     MrpRequirement,
+    Item,
     PlanningRun,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
+    ProductionResource,
     ReservationConsumptionAllocation,
     ReservationEntry,
     SpecComponent,
     Specification,
     StockBin,
     StockLedgerEntry,
+    WorkshopWarehouseBinding,
 )
 from .mrp_stock_helpers import (
     WipSupplyLine,
@@ -191,8 +195,14 @@ class FreezeTrace:
         default_factory=lambda: defaultdict(ItemFreezeTrace)
     )
     root_item_ids: Set[int] = field(default_factory=set)
-    # (parent_item_id, component_item_id, spec_id, norm_per_unit)
-    component_norms: List[Tuple[int, int, int, float]] = field(default_factory=list)
+    # Exact selected edge:
+    # (root_item_id, parent_item_id, component_item_id, parent_spec_id,
+    #  child_spec_id | None, norm_per_unit).
+    component_norms: List[Tuple[int, int, int, int, int | None, float]] = field(
+        default_factory=list
+    )
+    # (root_item_id, item_id, selected_spec_id | None)
+    bom_nodes: Set[Tuple[int, int, int | None]] = field(default_factory=set)
 
 
 def _raise_unavailable_if_characteristics_present(
@@ -641,19 +651,27 @@ def _write_freeze_component(
     trace: FreezeTrace,
     now: datetime,
 ) -> int:
-    """Frozen BOM norms from the trace, aggregated per (parent, component, spec).
+    """Write the exact root-scoped BOM branch selected during the freeze.
 
     Coverage: every parent with gross > 0 and a default spec (including
     stock-covered parents whose explosion was skipped).
     """
     if not trace.component_norms:
         return 0
-    agg: Dict[Tuple[int, int, int], float] = {}
+    agg: Dict[Tuple[int, int, int, int, int | None], float] = {}
     spec_ids: Set[int] = set()
-    for parent, component, spec_id, norm in trace.component_norms:
-        key = (int(parent), int(component), int(spec_id))
+    for root, parent, component, spec_id, child_spec_id, norm in trace.component_norms:
+        key = (
+            int(root),
+            int(parent),
+            int(component),
+            int(spec_id),
+            int(child_spec_id) if child_spec_id is not None else None,
+        )
         agg[key] = agg.get(key, 0.0) + float(norm)
         spec_ids.add(int(spec_id))
+        if child_spec_id is not None:
+            spec_ids.add(int(child_spec_id))
 
     spec_by_id = {
         int(sid): (
@@ -671,15 +689,26 @@ def _write_freeze_component(
         )
     }
     count = 0
-    for (parent, component, spec_id), norm in sorted(agg.items()):
+    for (root, parent, component, spec_id, child_spec_id), norm in sorted(
+        agg.items(),
+        key=lambda row: tuple(-1 if value is None else value for value in row[0]),
+    ):
         ppk = pool_key_for(parent)
         cpk = pool_key_for(component)
         spec_ref, spec_version = spec_by_id.get(int(spec_id), (None, None))
         spec_ref = spec_ref or str(spec_id)
+        child_spec_ref, child_spec_version = (
+            spec_by_id.get(int(child_spec_id), (None, None))
+            if child_spec_id is not None
+            else (None, None)
+        )
+        if child_spec_id is not None:
+            child_spec_ref = child_spec_ref or str(child_spec_id)
         db.add(
             MrpFreezeComponent(
                 run_id=int(run.run_id),
                 freeze_version=int(new_version),
+                root_item_id=int(root),
                 parent_item_id=int(parent),
                 parent_characteristic_ref=ppk.characteristic_ref,
                 parent_organization_ref=ppk.organization_ref,
@@ -690,8 +719,155 @@ def _write_freeze_component(
                 component_planning_stock_pool=cpk.planning_stock_pool,
                 spec_ref=str(spec_ref),
                 spec_version=spec_version,
+                child_spec_ref=str(child_spec_ref or ""),
+                child_spec_version=child_spec_version,
                 norm_qty_per_unit=float(norm),
                 unit_coef=1.0,
+                created_at=now,
+            )
+        )
+        count += 1
+    return count
+
+
+def _write_freeze_bom_nodes(
+    db: Session,
+    run: PlanningRun,
+    new_version: int,
+    trace: FreezeTrace,
+    now: datetime,
+) -> int:
+    """Freeze replenishment and canonical workshop routing for every BOM node."""
+
+    if not trace.bom_nodes:
+        return 0
+
+    from .replenishment import (
+        REPLENISHMENT_FLOW_PRODUCTION,
+        REPLENISHMENT_FLOW_PURCHASE,
+        REPLENISHMENT_FLOW_REWORK,
+        classify_replenishment_flow,
+        is_non_stock_item_type,
+    )
+    from .workshop_resolution import (
+        REASON_NO_SPEC,
+        REASON_NO_WAREHOUSE_BINDING,
+        REASON_OK,
+        diagnose_specs,
+    )
+
+    item_ids = sorted({int(item_id) for _root, item_id, _spec in trace.bom_nodes})
+    spec_ids = sorted(
+        {int(spec_id) for _root, _item, spec_id in trace.bom_nodes if spec_id is not None}
+    )
+    items = {
+        int(row.item_id): row
+        for row in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
+    }
+    specs = {
+        int(row.spec_id): row
+        for row in db.query(Specification).filter(Specification.spec_id.in_(spec_ids)).all()
+    }
+    diagnoses = diagnose_specs(db, spec_ids)
+    resource_ids = sorted(
+        {
+            int(row.workshop_id)
+            for row in diagnoses.values()
+            if row.workshop_id is not None
+        }
+    )
+    resources = {
+        int(row.resource_id): row
+        for row in db.query(ProductionResource)
+        .filter(ProductionResource.resource_id.in_(resource_ids))
+        .all()
+    }
+    bindings = {
+        int(row.workshop_id): row
+        for row in db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id.in_(resource_ids))
+        .all()
+    }
+
+    count = 0
+    for root_item_id, item_id, spec_id in sorted(
+        trace.bom_nodes,
+        key=lambda row: (row[0], row[1], -1 if row[2] is None else row[2]),
+    ):
+        item = items.get(int(item_id))
+        flow = classify_replenishment_flow(
+            item.replenishment_method if item is not None else None
+        )
+        mode = {
+            REPLENISHMENT_FLOW_PRODUCTION: "make",
+            REPLENISHMENT_FLOW_PURCHASE: "buy",
+            REPLENISHMENT_FLOW_REWORK: "rework",
+        }.get(flow, "unavailable")
+        lead_days = (
+            int(item.replenishment_time)
+            if item is not None and item.replenishment_time is not None
+            else None
+        )
+        spec = specs.get(int(spec_id)) if spec_id is not None else None
+        diagnosis = diagnoses.get(int(spec_id)) if spec_id is not None else None
+        resource_id: int | None = None
+        material_warehouse = ""
+        output_warehouse = ""
+        is_kitting = False
+        route_reason = ""
+        is_stock_item = not is_non_stock_item_type(
+            item.item_type if item is not None else None
+        )
+
+        if not is_stock_item:
+            route_reason = "NON_STOCK_ITEM"
+        elif mode == "make":
+            if spec is None:
+                route_reason = REASON_NO_SPEC
+            elif diagnosis is None:
+                route_reason = REASON_NO_SPEC
+            else:
+                route_reason = str(diagnosis.reason_code or "")
+                resource_id = (
+                    int(diagnosis.workshop_id)
+                    if diagnosis.workshop_id is not None
+                    else None
+                )
+                binding = bindings.get(resource_id) if resource_id is not None else None
+                resource = resources.get(resource_id) if resource_id is not None else None
+                if route_reason == REASON_OK and binding is not None:
+                    material_warehouse = str(binding.warehouse_ref1c or "")
+                    output_warehouse = str(binding.production_warehouse_ref1c or "")
+                    is_kitting = bool(resource.is_kitting) if resource is not None else False
+                    if not material_warehouse or not output_warehouse:
+                        route_reason = REASON_NO_WAREHOUSE_BINDING
+                elif route_reason == REASON_OK:
+                    route_reason = REASON_NO_WAREHOUSE_BINDING
+        elif mode == "rework":
+            # Rework is a valid frozen reservation route, but it has no canonical
+            # launch/workshop promise yet and therefore cannot forecast readiness.
+            route_reason = "REWORK_ROUTE_UNAVAILABLE"
+        elif mode == "unavailable":
+            route_reason = "REPLENISHMENT_MODE_UNAVAILABLE"
+
+        db.add(
+            MrpFreezeBomNode(
+                run_id=int(run.run_id),
+                freeze_version=int(new_version),
+                root_item_id=int(root_item_id),
+                item_id=int(item_id),
+                spec_ref=str(
+                    (spec.spec_ref1c or spec.spec_id) if spec is not None else ""
+                ),
+                spec_version=(str(spec.content_hash) if spec and spec.content_hash else None),
+                replenishment_mode=mode,
+                replenishment_time_days=lead_days,
+                resource_id=resource_id,
+                material_warehouse_ref1c=material_warehouse,
+                output_warehouse_ref1c=output_warehouse,
+                is_stock_item=is_stock_item,
+                is_kitting=is_kitting,
+                route_reason=("" if route_reason == REASON_OK else route_reason),
                 created_at=now,
             )
         )
@@ -709,37 +885,67 @@ def _write_freeze_component_cumulative(
     if not trace.component_norms or not trace.root_item_ids:
         return 0
 
-    # Trace data is immediate parent->child norms from the BOM explosion.
-    # Build it into an adjacency list before propagating to cumulative values.
+    # The trace already contains the selected specification on both sides of
+    # every root-scoped edge.  Traverse that frozen branch directly; never join
+    # equal item ids from another root or another pinned specification.
     zero = Decimal("0")
-    immediate_norm_by_edge: Dict[Tuple[int, int], Decimal] = {}
-    graph: Dict[int, list[tuple[int, Decimal]]] = defaultdict(list)
-    for parent, component, _spec_id, norm in trace.component_norms:
+    immediate_norm_by_edge: Dict[
+        Tuple[int, int, int, int, int | None], Decimal
+    ] = {}
+    graph: Dict[
+        Tuple[int, int, int], list[tuple[int, int | None, Decimal]]
+    ] = defaultdict(list)
+    for root, parent, component, spec_id, child_spec_id, norm in trace.component_norms:
         decimal_norm = Decimal(str(norm))
         if decimal_norm <= zero:
             continue
+        root_id = int(root)
         parent_id = int(parent)
         child_id = int(component)
-        key = (parent_id, child_id)
+        parent_spec_id = int(spec_id)
+        child_spec_key = int(child_spec_id) if child_spec_id is not None else None
+        key = (root_id, parent_id, parent_spec_id, child_id, child_spec_key)
         immediate_norm_by_edge[key] = immediate_norm_by_edge.get(key, zero) + decimal_norm
 
-    for (parent_id, component_id), norm in sorted(immediate_norm_by_edge.items()):
-        graph[parent_id].append((component_id, norm))
+    for (
+        root_id,
+        parent_id,
+        parent_spec_id,
+        component_id,
+        child_spec_id,
+    ), norm in sorted(
+        immediate_norm_by_edge.items(),
+        key=lambda row: tuple(-1 if value is None else value for value in row[0]),
+    ):
+        graph[(root_id, parent_id, parent_spec_id)].append(
+            (component_id, child_spec_id, norm)
+        )
 
-    for parent_id, edges in graph.items():
-        graph[parent_id] = sorted(edges, key=lambda item: item[0])
+    for scope, edges in graph.items():
+        graph[scope] = sorted(
+            edges,
+            key=lambda item: (item[0], -1 if item[1] is None else item[1]),
+        )
 
     cumulative_norm_by_root_component: Dict[Tuple[int, int], Decimal] = {}
 
     for root_id in sorted(trace.root_item_ids):
-        stack: list[tuple[int, Decimal, set[int]]] = [
-            (int(root_id), Decimal("1"), {int(root_id)})
+        root_specs = sorted(
+            {
+                spec_id
+                for candidate_root, parent_id, spec_id in graph
+                if candidate_root == int(root_id) and parent_id == int(root_id)
+            }
+        )
+        stack: list[tuple[int, int, Decimal, set[tuple[int, int]]]] = [
+            (int(root_id), int(spec_id), Decimal("1"), {(int(root_id), int(spec_id))})
+            for spec_id in reversed(root_specs)
         ]
         while stack:
-            parent_id, path_factor, ancestors = stack.pop()
-            for component_id, parent_norm in graph.get(parent_id, []):
-                if component_id in ancestors:
-                    continue
+            parent_id, parent_spec_id, path_factor, ancestors = stack.pop()
+            for component_id, child_spec_id, parent_norm in graph.get(
+                (int(root_id), parent_id, parent_spec_id), []
+            ):
                 cumulative_norm = path_factor * parent_norm
                 if cumulative_norm <= zero:
                     continue
@@ -747,9 +953,16 @@ def _write_freeze_component_cumulative(
                 cumulative_norm_by_root_component[key] = (
                     cumulative_norm_by_root_component.get(key, zero) + cumulative_norm
                 )
+                if child_spec_id is None:
+                    continue
+                child_scope = (int(component_id), int(child_spec_id))
+                if child_scope in ancestors:
+                    continue
                 next_ancestors = set(ancestors)
-                next_ancestors.add(int(component_id))
-                stack.append((int(component_id), cumulative_norm, next_ancestors))
+                next_ancestors.add(child_scope)
+                stack.append(
+                    (int(component_id), int(child_spec_id), cumulative_norm, next_ancestors)
+                )
 
     if not cumulative_norm_by_root_component:
         return 0

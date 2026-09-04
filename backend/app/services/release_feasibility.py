@@ -71,7 +71,6 @@ REWORK_METHOD = "Переработка"
 #: ``ТипНоменклатуры`` из 1С у позиций, которые запасом не являются: услуга на
 #: стороне, работа и технологическая операция.  Их не бывает на остатке, и
 #: требовать его с них нельзя — на стенде таких 484 услуги и 1542 операции.
-SERVICE_ITEM_TYPES = ("Услуга", "Работа", "Операция")
 
 _STATUS_RANK = {
     STATUS_NON_STOCK: 4,
@@ -408,8 +407,9 @@ def _explode(
 
 
 def _is_service(item_type: object) -> bool:
-    value = str(item_type or "").strip().casefold()
-    return any(value == kind.casefold() for kind in SERVICE_ITEM_TYPES)
+    from .replenishment import is_non_stock_item_type
+
+    return is_non_stock_item_type(str(item_type or ""))
 
 
 def _is_rework(method: object) -> bool:

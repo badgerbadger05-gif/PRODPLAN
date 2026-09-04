@@ -351,15 +351,19 @@ def create_replacement_candidate_run(
     lines = db.query(models.ProductionPlanLine).filter(
         models.ProductionPlanLine.plan_id == int(plan.id)
     ).order_by(models.ProductionPlanLine.id).all()
+    persisted_root_count = 0
     for line in lines:
-        remaining = (
-            line.remaining_output_qty
-            if line.remaining_output_qty is not None
-            else max(
-                (line.qty or 0) - (line.accepted_output_qty or 0),
-                0,
+        if line.remaining_output_qty is None:
+            raise PlanningRunCandidateError(
+                f"plan line {int(line.id)} has no persisted execution remainder"
             )
-        )
+        planned = line.qty or 0
+        accepted = line.accepted_output_qty or 0
+        remaining = line.remaining_output_qty
+        if planned < 0 or accepted < 0 or remaining < 0 or planned != accepted + remaining:
+            raise PlanningRunCandidateError(
+                f"plan line {int(line.id)} violates output conservation"
+            )
         if remaining <= 0:
             continue
         db.add(models.MrpRunRoot(
@@ -369,5 +373,10 @@ def create_replacement_candidate_run(
             accepted_qty=0,
             remaining_qty=remaining,
         ))
+        persisted_root_count += 1
+    if persisted_root_count == 0:
+        raise PlanningRunCandidateError(
+            "replacement source plan has no persisted positive execution remainder"
+        )
     db.flush()
     return candidate

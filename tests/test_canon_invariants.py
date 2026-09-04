@@ -828,6 +828,100 @@ def test_queue_period_and_shelf_transfer_decisions_have_single_saved_inputs() ->
     assert "transfer = min(addressed_transfer, other)" in shelf
 
 
+def test_readiness_and_drum_get_have_no_second_planning_engine() -> None:
+    readiness = _read(
+        REPO / "backend/app/services/item_ledger/assembly_readiness_persistence.py"
+    )
+    router = _read(REPO / "backend/app/routers/production_control.py")
+    manual_move = _read(
+        REPO / "backend/app/services/item_ledger/drum_manual_move.py"
+    )
+
+    for live_bom_model in (
+        "models.Specification",
+        "models.SpecComponent",
+        "models.DefaultSpecification",
+    ):
+        assert live_bom_model not in readiness
+    assert "status_rank = case(" not in router
+    assert "is_workday(db, day)" not in router
+    assert "is_workday(" not in manual_move
+    assert "saved_working_days(schedule)" in router
+    assert "saved_working_days(schedule)" in manual_move
+    assert "saved_resource_horizon_ends(schedule)" in manual_move
+    assert "saved_resource_daily_capacities(schedule)" in manual_move
+    assert "models.AssemblyRate" not in manual_move
+    assert "models.ProductionResource" not in manual_move
+    assert "slot.slot_qty) /" not in manual_move
+
+    replacement = _read(REPO / "backend/app/services/planning_run_candidate.py")
+    output = _read(
+        REPO / "backend/app/services/item_ledger/assembly_output_persistence.py"
+    )
+    assert "else max(\n                (line.qty or 0)" not in replacement
+    assert "else max(planned - accepted" not in output
+
+
+def test_assembly_output_read_model_uses_accumulated_plan_truth() -> None:
+    queue = _read(
+        REPO / "backend/app/services/item_ledger/assembly_queue_snapshot.py"
+    )
+    output = _read(
+        REPO / "backend/app/services/item_ledger/assembly_output_persistence.py"
+    )
+    rebase = _read(REPO / "backend/app/services/specification_mrp_rebase.py")
+    router = _read(REPO / "backend/app/routers/production_control.py")
+    period_plan = _read(REPO / "backend/app/services/period_plan_service.py")
+    plan_router = _read(REPO / "backend/app/routers/plan.py")
+
+    for required in (
+        "planned_output_qty = _dec(line.qty)",
+        "accepted_output_qty = _dec(line.accepted_output_qty)",
+        "assembly_remaining_qty = _dec(line.remaining_output_qty)",
+        "eligible_from = plan.fixed_at",
+        '"planned_output_qty": float(planned_output_qty)',
+        '"accepted_plan_output_qty": float(accepted_output_qty)',
+        '"assembly_remaining_qty": float(assembly_remaining_qty)',
+    ):
+        assert required in queue
+    for forbidden in (
+        "root.planned_qty",
+        "root.accepted_qty",
+        "root.remaining_qty",
+        "legacy_accepted_by_line",
+        "run.started_at",
+    ):
+        assert forbidden not in queue
+
+    assert 'raise ValueError("assembly allocation references missing fixed MRP root")' in output
+    assert "root = models.MrpRunRoot(" not in output
+    assert "new_accepted = max(" not in output
+    assert "line.remaining_output_qty = max(" not in output
+    assert "planned != accepted + remaining" in output
+    assert "planned != accepted + remaining" in rebase
+    assert "planned = max(_dec(line.qty)" not in rebase
+    assert "accepted = max(_dec(line.accepted_output_qty)" not in rebase
+    assert "remaining = max(_dec(line.remaining_output_qty)" not in rebase
+
+    for field in (
+        "planned_output_qty: float",
+        "accepted_plan_output_qty: float",
+        "assembly_remaining_qty: float",
+    ):
+        assert field in router
+    assert 'consumer="assembly_queue"' in router
+    assert "get_latest_read_snapshot(" in router
+    assert period_plan.count("_attach_run_output_summary(db, {") == 1
+    assert 'result["plan_output_rows"] = plan_output_rows' in period_plan
+    assert '"planned_output_qty": float(plan_planned)' in period_plan
+    assert '"accepted_plan_output_qty": float(plan_accepted)' in period_plan
+    assert '"assembly_remaining_qty": float(plan_remaining)' in period_plan
+    assert "def _saved_plan_output_validation_error(" in period_plan
+    assert 'reason=validation_error' in period_plan
+    assert 'return "Saved plan-output read model is missing or invalid"' in period_plan
+    assert "class PlanOutputRow(BaseModel):" in plan_router
+
+
 def test_mrp_stock_contour_has_one_owner() -> None:
     owner = _read(REPO / "backend/app/services/mrp_stock_helpers.py")
     freeze = _read(REPO / "backend/app/services/mrp_freeze.py")

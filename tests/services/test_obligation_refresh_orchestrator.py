@@ -11,6 +11,7 @@ from app.services.mrp_result_snapshot import read_mrp_result_manifest
 from app.services.item_ledger.generation_lifecycle import (
     RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
 )
+from app.services.item_ledger.obligation_generation import ObligationGenerationError
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
 from app.services.planning_pool_resolver import PlanningPoolConfigurationError
@@ -73,15 +74,36 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
         parent = models.PlanningRun(status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
             source_plan_id=plan.id, period_from=plan.period_from, period_to=plan.period_to,
             config_snapshot={}, started_at=cutoff, fixed_at=cutoff, finished_at=cutoff,
-            pinned=True, active_freeze_version=1)
+            pinned=True, active_freeze_version=1, ledger_cutoff=cutoff)
         db.add(parent); db.flush()
+        line.accepted_output_qty = Decimal("0")
+        line.remaining_output_qty = Decimal(str(qty))
+        line.locked_by_run_id = int(parent.run_id)
+        db.add(models.MrpRunRoot(
+            run_id=int(parent.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal(str(qty)),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal(str(qty)),
+        ))
     db.commit()
     return accepted, plan, line, item, parent, cutoff
 
 
-def _run(db, parent, key, *, add=(), replace=(), config=None, pool_mapping=None):
+def _run(
+    db,
+    parent,
+    key,
+    *,
+    add=(),
+    retire=(),
+    replace=(),
+    config=None,
+    pool_mapping=None,
+):
     return workflow.run_obligation_refresh(
         db, parent_generation_id=parent.id, generation_key=key, add_plan_ids=add,
+        retire_plan_ids=retire,
         replace_plan_ids=replace,
         started_by="test", horizon_days=30, config_version_id=None,
         config_snapshot=config or {},
@@ -90,7 +112,39 @@ def _run(db, parent, key, *, add=(), replace=(), config=None, pool_mapping=None)
     )
 
 
-def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay(db_session):
+def _accepted_physical_fork(db, parent, *, key):
+    physical = models.PhysicalImportBatch(
+        batch_key=f"{key}-physical",
+        status="completed",
+        cutoff=parent.cutoff,
+        source_watermarks={},
+        completed_at=parent.cutoff,
+    )
+    child = models.LedgerGeneration(
+        generation_key=key,
+        status="accepted",
+        cutoff=parent.cutoff,
+        accepted_at=parent.cutoff,
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": int(parent.id),
+            "replay_from": (parent.source_watermarks or {})["replay_from"],
+        },
+        capabilities=dict(parent.capabilities or {}),
+        physical_import_batch=physical,
+        algorithm_version="test",
+    )
+    db.add(child)
+    db.flush()
+    db.get(models.PlanningTruthState, 1).current_generation_id = int(child.id)
+    db.flush()
+    return child
+
+
+def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay(
+    db_session,
+    monkeypatch,
+):
     accepted, plan, line, _item, parent, _cutoff = _world(
         db_session,
         qty=12,
@@ -98,14 +152,24 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
     line.accepted_output_qty = Decimal("10")
     line.remaining_output_qty = Decimal("2")
     line.locked_by_run_id = parent.run_id
-    db_session.add(models.MrpRunRoot(
-        run_id=parent.run_id,
-        plan_line_id=line.id,
-        planned_qty=Decimal("12"),
-        accepted_qty=Decimal("10"),
-        remaining_qty=Decimal("2"),
-    ))
+    parent_root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(parent.run_id), plan_line_id=int(line.id)
+    ).one()
+    parent_root.accepted_qty = Decimal("10")
+    parent_root.remaining_qty = Decimal("2")
     db_session.commit()
+    preserve_flags = []
+    real_carry = workflow.carry_forward_retained_reservations
+
+    def capture_carry(*args, **kwargs):
+        preserve_flags.append(kwargs.get("preserve_realization"))
+        return real_carry(*args, **kwargs)
+
+    monkeypatch.setattr(
+        workflow,
+        "carry_forward_retained_reservations",
+        capture_carry,
+    )
 
     result = _run(
         db_session,
@@ -129,6 +193,18 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
         consumer="period_plan_execution",
         snapshot_key=f"plan={plan.id};run={candidate.run_id}",
     ).one()
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id,
+    ).one()
+    queue_line = db_session.query(models.AssemblyQueueLine).filter_by(
+        ledger_generation_id=result.target_generation_id,
+        planning_run_id=candidate.run_id,
+        plan_line_id=line.id,
+    ).one()
+    readiness = db_session.query(models.AssemblyReadiness).filter_by(
+        ledger_generation_id=result.target_generation_id,
+        assembly_queue_line_id=queue_line.id,
+    ).one()
 
     assert result.published is True
     assert db_session.query(models.ProductionPlanHeader).count() == 1
@@ -138,6 +214,8 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
     assert root.planned_qty == Decimal("2")
     assert root.accepted_qty == Decimal("0")
     assert root.remaining_qty == Decimal("2")
+    assert requirement.total_required_qty == Decimal("2")
+    assert requirement.net_required_qty == Decimal("2")
     assert line.qty == Decimal("12")
     assert line.accepted_output_qty == Decimal("10")
     assert line.remaining_output_qty == Decimal("2")
@@ -148,6 +226,184 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
     assert execution_snapshot.payload["rows"] == []
     assert execution_snapshot.payload["summary"]["execution_completed_qty"] == 0
     assert execution_snapshot.payload["summary"]["execution_base_qty"] == 2
+    assert queue_line.assembly_remaining_qty == Decimal("2")
+    assert readiness.open_qty == Decimal("2")
+    assert preserve_flags == [False]
+
+
+def test_replacement_uses_saved_remainder_through_multiple_accepted_fact_forks(db_session):
+    accepted, plan, line, _item, parent, cutoff = _world(
+        db_session,
+        qty=12,
+    )
+    parent.ledger_cutoff = cutoff
+    line.accepted_output_qty = Decimal("7")
+    line.remaining_output_qty = Decimal("5")
+    line.locked_by_run_id = int(parent.run_id)
+    parent_root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(parent.run_id), plan_line_id=int(line.id)
+    ).one()
+    parent_root.accepted_qty = Decimal("7")
+    parent_root.remaining_qty = Decimal("5")
+    first_fact_fork = _accepted_physical_fork(
+        db_session, accepted, key="orch-fact-fork-1"
+    )
+    second_fact_fork = _accepted_physical_fork(
+        db_session, first_fact_fork, key="orch-fact-fork-2"
+    )
+    db_session.commit()
+
+    result = _run(
+        db_session,
+        second_fact_fork,
+        "orch-replace-after-two-fact-forks",
+        replace=[plan.id],
+    )
+
+    candidate = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=int(parent.run_id)
+    ).one()
+    root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(candidate.run_id)
+    ).one()
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=int(candidate.run_id)
+    ).one()
+    queue_line = db_session.query(models.AssemblyQueueLine).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        planning_run_id=int(candidate.run_id),
+        plan_line_id=int(line.id),
+    ).one()
+    readiness = db_session.query(models.AssemblyReadiness).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        assembly_queue_line_id=int(queue_line.id),
+    ).one()
+
+    assert parent.status == "CLOSED"
+    assert candidate.status == "FIXED_SNAPSHOT"
+    assert root.planned_qty == Decimal("5")
+    assert root.accepted_qty == Decimal("0")
+    assert root.remaining_qty == Decimal("5")
+    assert requirement.total_required_qty == Decimal("5")
+    assert requirement.net_required_qty == Decimal("5")
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("7")
+    assert line.remaining_output_qty == Decimal("5")
+    assert queue_line.assembly_remaining_qty == Decimal("5")
+    assert readiness.open_qty == Decimal("5")
+
+
+@pytest.mark.parametrize("truth_state", ["missing", "unaccepted", "incomplete"])
+def test_replacement_fails_closed_without_complete_accepted_ledger(
+    db_session,
+    truth_state,
+):
+    accepted, plan, line, _item, parent, _cutoff = _world(
+        db_session,
+        qty=12,
+    )
+    line.accepted_output_qty = Decimal("7")
+    line.remaining_output_qty = Decimal("5")
+    parent_root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(parent.run_id), plan_line_id=int(line.id)
+    ).one()
+    parent_root.accepted_qty = Decimal("7")
+    parent_root.remaining_qty = Decimal("5")
+    if truth_state == "missing":
+        db_session.delete(db_session.get(models.PlanningTruthState, 1))
+    elif truth_state == "unaccepted":
+        accepted.status = "building"
+        accepted.accepted_at = None
+    else:
+        accepted.physical_import_batch.status = "building"
+    db_session.flush()
+
+    with pytest.raises(
+        (workflow.ObligationRefreshOrchestratorError, ObligationGenerationError)
+    ) as exc_info:
+        _run(
+            db_session,
+            accepted,
+            f"orch-replacement-{truth_state}-ledger",
+            replace=[plan.id],
+        )
+
+    assert "accepted" in str(exc_info.value).lower() or "truth" in str(
+        exc_info.value
+    ).lower() or "physical" in str(exc_info.value).lower()
+    assert db_session.query(models.PlanningRun).filter(
+        models.PlanningRun.prior_run_id == int(parent.run_id)
+    ).count() == 0
+
+
+def test_zero_remainder_retires_mrp_without_recreating_demand(db_session):
+    accepted, plan, line, item, parent, _cutoff = _world(
+        db_session,
+        qty=12,
+    )
+    line.accepted_output_qty = Decimal("12")
+    line.remaining_output_qty = Decimal("0")
+    parent_root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(parent.run_id), plan_line_id=int(line.id)
+    ).one()
+    parent_root.accepted_qty = Decimal("12")
+    parent_root.remaining_qty = Decimal("0")
+    requirement = models.MrpRequirement(
+        run_id=int(parent.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=Decimal("12"),
+        net_required_qty=Decimal("12"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+        status="open",
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=int(accepted.id),
+        item_id=int(item.item_id),
+        run_id=int(parent.run_id),
+        requirement_id=int(requirement.id),
+        freeze_version=1,
+        reserved_qty=Decimal("12"),
+        replenishment_required_qty=Decimal("12"),
+        replenishment_received_qty=Decimal("12"),
+        lifecycle_status="active",
+        realization_mode="buy",
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+    ))
+    db_session.commit()
+
+    result = _run(
+        db_session,
+        accepted,
+        "orch-retire-zero-remainder",
+        retire=[plan.id],
+    )
+
+    db_session.refresh(requirement)
+    assert result.published is True
+    assert parent.status == "CLOSED"
+    assert plan.status == "closed"
+    assert requirement.status == "closed"
+    assert requirement.closed_at is not None
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("12")
+    assert line.remaining_output_qty == Decimal("0")
+    assert db_session.query(models.PlanningRun).filter(
+        models.PlanningRun.prior_run_id == int(parent.run_id)
+    ).count() == 0
+    assert db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        run_id=int(parent.run_id),
+        lifecycle_status="active",
+    ).count() == 0
+    assert db_session.query(models.AssemblyQueueLine).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        plan_line_id=int(line.id),
+    ).count() == 0
 
 
 def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(db_session):
@@ -546,7 +802,7 @@ def test_failure_after_freeze_is_reversible_by_outer_transaction(db_session, mon
     outer.rollback()
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
     assert old.status == "FIXED_SNAPSHOT"
-    assert line.locked_by_run_id is None
+    assert line.locked_by_run_id == int(old.run_id)
     assert db_session.query(models.LedgerGeneration).filter_by(generation_key="orch-rollback").count() == 0
 
 

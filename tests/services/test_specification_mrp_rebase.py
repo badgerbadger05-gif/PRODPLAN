@@ -2,6 +2,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from app import models
 from app.services.specification_mrp_rebase import (
     REBASE_REASON,
@@ -214,6 +216,17 @@ def test_rebase_creates_successor_only_for_unproduced_roots(db_session, monkeypa
     assert retry["successor_plan_id"] == result["successor_plan_id"]
 
 
+def test_rebase_rejects_corrupt_saved_plan_output_instead_of_clamping(db_session):
+    _, _plan, run, line = _world(db_session, accepted_qty=Decimal("8"))
+    line.remaining_output_qty = Decimal("3")
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="violates output conservation"):
+        rebase_fixed_plan_remaining_roots(db_session, int(run.run_id))
+
+    assert db_session.get(models.PlanningRun, int(run.run_id)).status == "FIXED_SNAPSHOT"
+
+
 def test_rebase_closes_fully_produced_plan_without_empty_successor(
     db_session, monkeypatch
 ):
@@ -309,3 +322,50 @@ def test_rebase_tolerates_closed_snapshot_from_earlier_generation(
     assert db_session.query(models.ClosedPlanSnapshot).filter_by(
         plan_id=int(plan.id), run_id=int(run.run_id)
     ).count() == 1
+
+
+def test_rebase_finds_live_run_through_multiple_accepted_fact_forks(
+    db_session,
+    monkeypatch,
+):
+    generation, _plan, run, _line = _world(
+        db_session,
+        accepted_qty=Decimal("8"),
+    )
+    current = generation
+    for ordinal in (1, 2):
+        physical = models.PhysicalImportBatch(
+            batch_key=f"spec-rebase-fact-fork-{ordinal}-physical",
+            status="completed",
+            cutoff=CUTOFF,
+            source_watermarks={},
+            completed_at=CUTOFF,
+        )
+        current = models.LedgerGeneration(
+            generation_key=f"spec-rebase-fact-fork-{ordinal}",
+            status="accepted",
+            cutoff=CUTOFF,
+            source_watermarks={
+                "generation_kind": "physical_refresh",
+                "parent_generation_id": int(current.id),
+            },
+            capabilities={},
+            physical_import_batch=physical,
+            algorithm_version="test",
+            accepted_at=CUTOFF,
+        )
+        db_session.add_all([physical, current])
+        db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(current.id)
+    db_session.commit()
+    _stub_publication(monkeypatch, db_session)
+
+    result = rebase_fixed_plan_remaining_roots(
+        db_session,
+        int(run.run_id),
+        changed_spec_refs=("spec-after-fact-forks",),
+        started_by="test",
+    )
+
+    assert result["status"] == "rebased"
+    assert result["remaining_root_lines"][0]["qty"] == "2.000"

@@ -4,6 +4,7 @@ import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from 
 import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
 import { ForecastShift } from '../period-plan/ForecastShift'
 import { productionRowId } from './model'
+import { OutputFactSummary } from './OutputFactSummary'
 
 type Props = {
   rows: OrderRow[]
@@ -11,6 +12,7 @@ type Props = {
   selectedIds: Set<number>
   launchQtyByWorkItem: Readonly<Record<number, number>>
   sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
+  outputFactsAvailable: boolean
   onSelectIds: (ids: Set<number>) => void
   onActivate: (id: number) => void
   onOpenMaterials: (row: OrderRow) => void
@@ -32,7 +34,7 @@ function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
 }
 
-export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyByWorkItem, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
+export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyByWorkItem, sort, outputFactsAvailable, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
       <colgroup>
@@ -149,10 +151,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
               )}
             </td>
             <td className="numCell">
-              <strong>{qty(launchQuantity)}</strong>
-              <span>/ {qty(row.quantity)} {row.unit || ''}</span>
-              {isProposal && launchQuantity !== row.remaining_qty && (
-                <span className="muted">запуск / остаток {qty(row.remaining_qty)}</span>
+              <OutputFactSummary scope={isProposal ? 'proposal' : 'order'} planned={row.quantity} accepted={row.produced_qty} remaining={row.remaining_qty} available={outputFactsAvailable} compact />
+              {isProposal && (
+                <span className="muted">К запуску: {qty(launchQuantity)} {row.unit || ''}</span>
               )}
               {chain?.counterpart_product_id && (
                 <span className="muted">

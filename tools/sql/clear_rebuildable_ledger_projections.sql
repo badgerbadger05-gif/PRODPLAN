@@ -205,6 +205,7 @@ TRUNCATE
     reservation_entry,
     pegging_link,
     mrp_freeze_allocation,
+    mrp_freeze_bom_node,
     mrp_freeze_component,
     mrp_freeze_component_cumulative,
     mrp_freeze_baseline,

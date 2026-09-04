@@ -36,6 +36,7 @@ class QueueLine:
     planned_output_qty: Decimal
     accepted_plan_output_qty: Decimal
     original_priority: tuple[Any, ...]
+    assembly_remaining_qty: Decimal | None = None
     ready_qty: Decimal | None = None
     readiness_status: str = "unavailable"
     readiness_curve: tuple[tuple[str, Decimal, date | None], ...] = ()
@@ -56,7 +57,10 @@ class PlannedSlot:
     resource_id: int
     slot_date: date
     slot_qty: Decimal
+    capacity_load: Decimal
     planned_output_qty: Decimal
+    accepted_plan_output_qty: Decimal
+    assembly_remaining_qty: Decimal
     slot_ordinal: int
     original_priority: tuple[Any, ...]
     readiness_phase: str
@@ -73,6 +77,9 @@ class CapacityGap:
     required_qty: Decimal
     available_capacity: Decimal
     gap_qty: Decimal
+    planned_output_qty: Decimal
+    accepted_plan_output_qty: Decimal
+    assembly_remaining_qty: Decimal
     original_priority: tuple[Any, ...]
     readiness_phase: str
 
@@ -81,6 +88,9 @@ class CapacityGap:
 class DrumSchedulePlan:
     schedule_from: date
     schedule_to: date
+    working_days: tuple[date, ...]
+    resource_horizon_ends: tuple[tuple[int, date], ...]
+    resource_daily_capacities: tuple[tuple[int, Decimal], ...]
     slots: tuple[PlannedSlot, ...]
     gaps: tuple[CapacityGap, ...]
     queue_signature: str
@@ -90,9 +100,13 @@ class DrumSchedulePlan:
 
 
 def _workday_flag(calendar_by_date: dict[date, bool], candidate: date) -> bool:
+    # The owner contract is a strict five-day week.  A bad override must not
+    # turn Saturday/Sunday into production days inside the pure scheduler.
+    if candidate.weekday() >= 5:
+        return False
     if candidate in calendar_by_date:
         return bool(calendar_by_date[candidate])
-    return candidate.weekday() < 5
+    return True
 
 
 def _signature(rows: list[dict[str, Any]]) -> str:
@@ -132,16 +146,57 @@ def _normalize_queue_signature(lines: list[QueueLine]) -> str:
 
 
 def _open_qty(line: QueueLine) -> Decimal:
-    quantity = max(
-        _dec(line.planned_output_qty) - _dec(line.accepted_plan_output_qty),
-        Decimal("0"),
-    )
+    if line.assembly_remaining_qty is None:
+        raise ValueError(
+            f"assembly queue line {int(line.queue_line_id)} has no saved remaining quantity"
+        )
+    quantity = _dec(line.assembly_remaining_qty)
+    if not quantity.is_finite() or quantity < 0:
+        raise ValueError(
+            f"assembly queue line {int(line.queue_line_id)} has invalid saved remaining quantity"
+        )
     whole = quantity.quantize(_QTY_QUANTUM, rounding=ROUND_DOWN)
     if quantity != whole:
         raise ValueError(
             f"assembly queue line {int(line.queue_line_id)} has fractional root quantity {quantity}"
         )
     return whole
+
+
+def _whole_saved_qty(
+    value: Decimal | int | float | str | None,
+    *,
+    queue_line_id: int,
+    field: str,
+) -> Decimal:
+    quantity = _dec(value)
+    if not quantity.is_finite() or quantity < 0:
+        raise ValueError(
+            f"assembly queue line {int(queue_line_id)} has invalid saved {field}"
+        )
+    whole = quantity.quantize(_QTY_QUANTUM, rounding=ROUND_DOWN)
+    if quantity != whole:
+        raise ValueError(
+            f"assembly queue line {int(queue_line_id)} has fractional saved {field} "
+            f"{quantity}"
+        )
+    return whole
+
+
+def _last_workday(
+    calendar_by_date: dict[date, bool],
+    start: date,
+    end: date,
+) -> date:
+    candidate = end
+    while candidate >= start:
+        if _workday_flag(calendar_by_date, candidate):
+            return candidate
+        candidate -= timedelta(days=1)
+    raise ValueError(
+        f"drum resource horizon {start.isoformat()}—{end.isoformat()} "
+        "contains no working day"
+    )
 
 
 def build_drum_plan(
@@ -159,6 +214,34 @@ def build_drum_plan(
 
     calendar = calendar_by_date or {}
     horizon_end = dict(resource_horizon_end_by_id or {})
+    working_days = tuple(
+        candidate
+        for offset in range((schedule_to - schedule_from).days + 1)
+        if _workday_flag(
+            calendar,
+            candidate := schedule_from + timedelta(days=offset),
+        )
+    )
+    resource_horizon_ends = tuple(
+        sorted(
+            (
+                int(resource_id),
+                min(end_date, schedule_to),
+            )
+            for resource_id, end_date in horizon_end.items()
+        )
+    )
+    resource_daily_capacities = tuple(
+        sorted(
+            (int(resource_id), _dec(capacity))
+            for resource_id, capacity in resource_capacity_by_id.items()
+        )
+    )
+    if any(
+        resource_id <= 0 or not capacity.is_finite() or capacity <= 0
+        for resource_id, capacity in resource_daily_capacities
+    ):
+        raise ValueError("resource capacities must be positive finite values")
     ordered = sorted(
         tuple(queue_lines),
         key=lambda row: (str(row.sort_key), int(row.queue_line_id)),
@@ -168,6 +251,9 @@ def build_drum_plan(
         return DrumSchedulePlan(
             schedule_from=schedule_from,
             schedule_to=schedule_to,
+            working_days=working_days,
+            resource_horizon_ends=resource_horizon_ends,
+            resource_daily_capacities=resource_daily_capacities,
             slots=(),
             gaps=(),
             queue_signature="",
@@ -201,7 +287,19 @@ def build_drum_plan(
         if curve:
             previous = Decimal("0")
             for horizon, raw_cumulative, raw_date in curve:
-                cumulative = min(max(_dec(raw_cumulative), previous), open_qty)
+                cumulative = _whole_saved_qty(
+                    raw_cumulative,
+                    queue_line_id=int(queue_line.queue_line_id),
+                    field=f"readiness cumulative quantity for horizon {horizon}",
+                )
+                if cumulative < previous:
+                    raise ValueError(
+                        f"readiness curve decreases for queue line {int(queue_line.queue_line_id)}"
+                    )
+                if cumulative > open_qty:
+                    raise ValueError(
+                        f"readiness curve exceeds saved remainder for queue line {int(queue_line.queue_line_id)}"
+                    )
                 increment = cumulative - previous
                 if increment > 0:
                     eligible = max(raw_date or schedule_from, schedule_from)
@@ -209,11 +307,15 @@ def build_drum_plan(
                 previous = cumulative
             allocated_qty = previous
         else:
-            ready_qty = (
-                Decimal("0")
-                if queue_line.ready_qty is None
-                else min(max(_dec(queue_line.ready_qty), Decimal("0")), open_qty)
+            ready_qty = _whole_saved_qty(
+                Decimal("0") if queue_line.ready_qty is None else queue_line.ready_qty,
+                queue_line_id=int(queue_line.queue_line_id),
+                field="ready quantity",
             )
+            if ready_qty > open_qty:
+                raise ValueError(
+                    f"invalid saved ready quantity for queue line {int(queue_line.queue_line_id)}"
+                )
             if ready_qty > 0:
                 phased.append((0, schedule_from, 0, queue_line, ready_qty, "now"))
             allocated_qty = ready_qty
@@ -226,7 +328,13 @@ def build_drum_plan(
     gap_by_line: dict[int, CapacityGap] = {}
     for _phase, eligible_date, _horizon_rank, queue_line, phase_qty, readiness_phase in sorted(
         phased,
-        key=lambda row: (row[0], row[1], row[2], str(row[3].sort_key), int(row[3].queue_line_id)),
+        key=lambda row: (
+            row[0],
+            row[1],
+            str(row[3].sort_key),
+            int(row[3].queue_line_id),
+            row[2],
+        ),
     ):
 
         profiles = rates_by_item.get(int(queue_line.item_id))
@@ -247,6 +355,40 @@ def build_drum_plan(
         resource_last_day = min(horizon_end.get(resource_id, schedule_to), schedule_to)
         if resource_last_day < schedule_from:
             resource_last_day = schedule_from
+
+        gap_date = _last_workday(calendar, schedule_from, resource_last_day)
+        if readiness_phase in {"blocked", "unavailable"}:
+            existing_gap = gap_by_line.get(int(queue_line.queue_line_id))
+            gap_by_line[int(queue_line.queue_line_id)] = CapacityGap(
+                queue_line_id=int(queue_line.queue_line_id),
+                plan_id=int(queue_line.plan_id),
+                plan_line_id=int(queue_line.plan_line_id),
+                item_id=int(queue_line.item_id),
+                resource_id=resource_id,
+                gap_date=gap_date,
+                required_qty=(
+                    phase_qty
+                    if existing_gap is None
+                    else existing_gap.required_qty + phase_qty
+                ),
+                available_capacity=Decimal("0"),
+                gap_qty=(
+                    phase_qty
+                    if existing_gap is None
+                    else existing_gap.gap_qty + phase_qty
+                ),
+                planned_output_qty=_dec(queue_line.planned_output_qty),
+                accepted_plan_output_qty=_dec(queue_line.accepted_plan_output_qty),
+                assembly_remaining_qty=_dec(queue_line.assembly_remaining_qty),
+                original_priority=tuple(queue_line.original_priority),
+                readiness_phase=(
+                    readiness_phase
+                    if existing_gap is None
+                    or existing_gap.readiness_phase == readiness_phase
+                    else "mixed"
+                ),
+            )
+            continue
 
         remaining = phase_qty
         current = max(schedule_from, eligible_date)
@@ -276,7 +418,14 @@ def build_drum_plan(
                                 resource_id=resource_id,
                                 slot_date=current,
                                 slot_qty=take,
+                                capacity_load=take / rate,
                                 planned_output_qty=_dec(queue_line.planned_output_qty),
+                                accepted_plan_output_qty=_dec(
+                                    queue_line.accepted_plan_output_qty
+                                ),
+                                assembly_remaining_qty=_dec(
+                                    queue_line.assembly_remaining_qty
+                                ),
                                 slot_ordinal=slot_ordinal,
                                 original_priority=tuple(queue_line.original_priority),
                                 readiness_phase=readiness_phase,
@@ -296,9 +445,9 @@ def build_drum_plan(
 
         if remaining > 0:
             available_last = Decimal("0")
-            if _workday_flag(calendar, resource_last_day):
+            if _workday_flag(calendar, gap_date):
                 used = _dec(
-                    used_capacity.get((resource_id, resource_last_day), Decimal("0"))
+                    used_capacity.get((resource_id, gap_date), Decimal("0"))
                 )
                 available_last = max(resource_capacity - used, Decimal("0")) * rate
 
@@ -310,7 +459,7 @@ def build_drum_plan(
                     plan_line_id=int(queue_line.plan_line_id),
                     item_id=int(queue_line.item_id),
                     resource_id=resource_id,
-                    gap_date=resource_last_day,
+                    gap_date=gap_date,
                     required_qty=(
                         remaining
                         if existing_gap is None
@@ -320,6 +469,9 @@ def build_drum_plan(
                     gap_qty=(
                         remaining if existing_gap is None else existing_gap.gap_qty + remaining
                     ),
+                    planned_output_qty=_dec(queue_line.planned_output_qty),
+                    accepted_plan_output_qty=_dec(queue_line.accepted_plan_output_qty),
+                    assembly_remaining_qty=_dec(queue_line.assembly_remaining_qty),
                     original_priority=tuple(queue_line.original_priority),
                     readiness_phase=(
                         readiness_phase
@@ -373,6 +525,7 @@ def build_drum_plan(
                 "date": slot.slot_date.isoformat(),
                 "resource": int(slot.resource_id),
                 "qty": str(_dec(slot.slot_qty).normalize()),
+                "capacity_load": str(_dec(slot.capacity_load).normalize()),
                 "readiness_phase": slot.readiness_phase,
             }
             for slot in output_slots
@@ -396,6 +549,9 @@ def build_drum_plan(
     return DrumSchedulePlan(
         schedule_from=schedule_from,
         schedule_to=schedule_to,
+        working_days=working_days,
+        resource_horizon_ends=resource_horizon_ends,
+        resource_daily_capacities=resource_daily_capacities,
         slots=tuple(output_slots),
         gaps=tuple(output_gaps),
         queue_signature=_signature(queue_signature_payload),

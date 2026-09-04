@@ -32,6 +32,9 @@ from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
     fork_obligation_generation,
 )
+from app.services.item_ledger.output_repair_gate import (
+    assert_output_repair_allows,
+)
 from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
 )
@@ -327,6 +330,13 @@ def run_obligation_refresh(
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
+    assert_output_repair_allows(
+        db,
+        operation="obligation refresh",
+        actor=started_by,
+    )
     pool_mapping = effective_planning_pool_by_warehouse(
         db,
         planning_pool_by_warehouse,
@@ -335,7 +345,6 @@ def run_obligation_refresh(
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
     retire_ids = tuple(sorted(int(v) for v in retire_plan_ids))
     replace_ids = tuple(sorted(int(v) for v in replace_plan_ids))
-    incremental_rebase = bool(replace_ids) and not add_ids and not retire_ids
     if len(add_ids) != len(set(add_ids)) or any(v <= 0 for v in add_ids):
         raise ValueError("add_plan_ids must be unique positive ids")
     if len(retire_ids) != len(set(retire_ids)) or any(v <= 0 for v in retire_ids):
@@ -362,9 +371,6 @@ def run_obligation_refresh(
             raise ObligationRefreshOrchestratorError(
                 "add plans with different period_from must be refreshed separately"
             )
-    if db.get_bind().dialect.name == "postgresql":
-        db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
-
     existing = db.query(models.LedgerGeneration).filter_by(generation_key=key).one_or_none()
     if existing is not None and str(existing.status) == "accepted":
         # A service-level retry normally resolves ``parent_generation_id`` from
@@ -437,7 +443,10 @@ def run_obligation_refresh(
         parent_generation_id=int(parent_generation_id),
         target_generation_id=target_id,
         retained_run_ids=retained_run_ids,
-        preserve_realization=incremental_rebase,
+        # Every obligation refresh below executes the canonical physical replay
+        # for both candidates and retained runs.  Pre-copying realization here
+        # would assign the same SLE to the same retained reservation twice.
+        preserve_realization=False,
     )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)

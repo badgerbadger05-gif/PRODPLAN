@@ -18,6 +18,7 @@ from hashlib import sha256
 import json
 from typing import Any
 
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -34,9 +35,10 @@ from app.services.item_ledger.document_net_output import (
 from app.services.item_ledger.physical_visibility import visible_sle_query
 from app.services.item_ledger.recorder_identity import build_recorder_identity_index
 from app.services.item_ledger.assembly_queue_snapshot import materialize_assembly_queue_lines
+from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 
 _STAGE = "assembly_output_allocation"
-_ALGORITHM_VERSION = "assembly-output-allocation/3"
+_ALGORITHM_VERSION = "assembly-output-allocation/4"
 _BATCH_INTERNAL_KEYS = {"batch_version", "fact_signature", "allocation_signature"}
 
 
@@ -61,6 +63,61 @@ def _qty_text(value: Any) -> str:
 def _checksum(rows: list[dict[str, Any]]) -> str:
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ensure_plan_execution_baseline(
+    db: Session,
+    generation: models.LedgerGeneration,
+) -> None:
+    """Persist the initial plan remainder before any queue projection is built.
+
+    Historical fixed plans can predate the persisted execution columns.  This
+    is the only sanctioned bootstrap: it runs inside the BUILDING generation,
+    locks the live plan rows, and stores ``qty - accepted`` once.  Public read
+    models still fail closed instead of reconstructing the remainder.
+    """
+
+    run_ids = live_plan_run_ids(db, generation)
+    if not run_ids:
+        return
+    lines = (
+        db.query(models.ProductionPlanLine)
+        .join(
+            models.ProductionPlanHeader,
+            models.ProductionPlanHeader.id == models.ProductionPlanLine.plan_id,
+        )
+        .join(
+            models.PlanningRun,
+            and_(
+                models.PlanningRun.source_plan_id == models.ProductionPlanHeader.id,
+                models.PlanningRun.run_id.in_(run_ids),
+            ),
+        )
+        .filter(
+            models.ProductionPlanHeader.status == "fixed",
+            models.ProductionPlanLine.qty >= 0,
+        )
+        .with_for_update()
+        .all()
+    )
+    for line in lines:
+        planned = _dec(line.qty)
+        accepted = _dec(line.accepted_output_qty or 0)
+        if planned < 0 or accepted < 0 or accepted > planned:
+            raise ValueError(
+                f"plan line {int(line.id)} has invalid persisted output quantities"
+            )
+        if line.remaining_output_qty is None:
+            line.accepted_output_qty = accepted
+            line.remaining_output_qty = planned - accepted
+            continue
+        remaining = _dec(line.remaining_output_qty)
+        if remaining < 0 or planned != accepted + remaining:
+            raise ValueError(
+                f"plan line {int(line.id)} violates output conservation"
+            )
+    if lines:
+        db.flush()
 
 
 def _canonical(value: Any) -> Any:
@@ -733,7 +790,12 @@ def _persist_rows(
             )
         )
 
-        line = db.get(models.ProductionPlanLine, int(alloc["plan_line_id"]))
+        line = (
+            db.query(models.ProductionPlanLine)
+            .filter(models.ProductionPlanLine.id == int(alloc["plan_line_id"]))
+            .with_for_update()
+            .one_or_none()
+        )
         root = (
             db.query(models.MrpRunRoot)
             .filter(
@@ -746,25 +808,14 @@ def _persist_rows(
         if line is None:
             raise ValueError("assembly allocation references missing plan line")
         if root is None:
-            planned = max(_dec(line.qty), Decimal("0"))
-            accepted = max(_dec(line.accepted_output_qty), Decimal("0"))
-            remaining = (
-                _dec(line.remaining_output_qty)
-                if line.remaining_output_qty is not None
-                else max(planned - accepted, Decimal("0"))
+            raise ValueError("assembly allocation references missing fixed MRP root")
+        if line.remaining_output_qty is None:
+            raise ValueError(
+                "assembly allocation references plan line without persisted remainder"
             )
-            root = models.MrpRunRoot(
-                run_id=int(alloc["run_id"]),
-                plan_line_id=int(alloc["plan_line_id"]),
-                planned_qty=remaining,
-                accepted_qty=Decimal("0"),
-                remaining_qty=remaining,
-            )
-            db.add(root)
-            line.accepted_output_qty = accepted
-            line.remaining_output_qty = remaining
-            db.flush()
         qty = _dec(alloc["allocated_qty"])
+        if qty <= Decimal("0"):
+            raise ValueError("assembly allocation quantity must be positive")
         if qty > _dec(root.remaining_qty) or qty > _dec(line.remaining_output_qty):
             raise ValueError("assembly allocation exceeds persisted execution remainder")
         db.add(models.ProductionPlanExecutionFact(
@@ -777,9 +828,17 @@ def _persist_rows(
             accepted_at=generation.cutoff or datetime.now(timezone.utc),
         ))
         line.accepted_output_qty = _dec(line.accepted_output_qty) + qty
-        line.remaining_output_qty = max(_dec(line.remaining_output_qty) - qty, Decimal("0"))
+        line.remaining_output_qty = _dec(line.remaining_output_qty) - qty
         root.accepted_qty = _dec(root.accepted_qty) + qty
-        root.remaining_qty = max(_dec(root.remaining_qty) - qty, Decimal("0"))
+        root.remaining_qty = _dec(root.remaining_qty) - qty
+        if _dec(line.qty) != (
+            _dec(line.accepted_output_qty) + _dec(line.remaining_output_qty)
+        ):
+            raise ValueError("assembly allocation violates plan output conservation")
+        if _dec(root.planned_qty) != (
+            _dec(root.accepted_qty) + _dec(root.remaining_qty)
+        ):
+            raise ValueError("assembly allocation violates run-root output conservation")
 
     db.flush()
 
@@ -816,12 +875,21 @@ def _apply_allocations_to_assembly_queue(
             )
 
         row = by_line[line_id]
-        new_accepted = max(_dec(row.accepted_plan_output_qty), _dec(allocated_qty))
-        row.accepted_plan_output_qty = new_accepted
-        row.assembly_remaining_qty = max(
-            _dec(row.planned_output_qty) - new_accepted,
-            Decimal("0"),
-        )
+        line = db.get(models.ProductionPlanLine, int(line_id))
+        if line is None or line.remaining_output_qty is None:
+            raise ValueError("assembly allocation references incomplete plan execution")
+
+        # _persist_rows has already advanced the canonical accumulated plan
+        # execution.  Project that saved state verbatim; the queue must never
+        # merge a predecessor tile and the current generation batch with max().
+        planned = _dec(line.qty)
+        accepted = _dec(line.accepted_output_qty)
+        remaining = _dec(line.remaining_output_qty)
+        if planned != accepted + remaining:
+            raise ValueError("assembly allocation violates plan output conservation")
+        row.planned_output_qty = planned
+        row.accepted_plan_output_qty = accepted
+        row.assembly_remaining_qty = remaining
         row.line_status = (
             "fulfilled"
             if _dec(row.assembly_remaining_qty) == Decimal("0")
@@ -847,6 +915,7 @@ def materialize_assembly_output_allocations(
         raise ValueError("assembly output allocation requires physical import batch")
     if str(generation.physical_import_batch.status) != "completed":
         raise ValueError("assembly output allocation requires completed physical import batch")
+    _ensure_plan_execution_baseline(db, generation)
     materialize_assembly_queue_lines(db, int(generation.id))
 
     facts = _load_visible_facts(db, generation)
@@ -894,9 +963,18 @@ def materialize_assembly_output_allocations(
             .all()
         )
         for row in rows:
-            row.accepted_plan_output_qty = Decimal("0")
-            row.assembly_remaining_qty = _dec(row.planned_output_qty)
-            row.line_status = "open"
+            line = db.get(models.ProductionPlanLine, int(row.plan_line_id))
+            if line is None or line.remaining_output_qty is None:
+                raise ValueError("assembly queue references incomplete plan execution")
+            planned = _dec(line.qty)
+            accepted = _dec(line.accepted_output_qty)
+            remaining = _dec(line.remaining_output_qty)
+            if planned != accepted + remaining:
+                raise ValueError("assembly queue violates plan output conservation")
+            row.planned_output_qty = planned
+            row.accepted_plan_output_qty = accepted
+            row.assembly_remaining_qty = remaining
+            row.line_status = "fulfilled" if remaining == Decimal("0") else "open"
         if rows:
             db.flush()
 

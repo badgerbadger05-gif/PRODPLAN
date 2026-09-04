@@ -18,11 +18,11 @@ from typing import Any, Iterable, Mapping
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 from app.services.planning_run_candidate import (
     PlanningRunCandidateError,
     create_added_candidate_run,
     create_replacement_candidate_run,
-    _resolve_parent_generation_id,
 )
 
 
@@ -100,18 +100,38 @@ def _require_target(
 
 
 def _current_parents(db: Session, parent_generation_id: int) -> list[models.PlanningRun]:
-    parent_generation_id = int(parent_generation_id)
-    rows = db.query(models.PlanningRun).filter(
+    generation = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if generation is None or str(generation.status) != "accepted":
+        raise ObligationRefreshManifestError(
+            "parent generation must be the current ACCEPTED planning truth"
+        )
+    try:
+        live_run_ids = live_plan_run_ids(db, generation)
+    except ValueError as exc:
+        raise ObligationRefreshManifestError(str(exc)) from exc
+    unanchored = db.query(models.PlanningRun.run_id).filter(
         models.PlanningRun.status == "FIXED_SNAPSHOT",
         models.PlanningRun.source_plan_id.isnot(None),
-    ).order_by(models.PlanningRun.source_plan_id, models.PlanningRun.run_id).all()
+        models.PlanningRun.ledger_generation_id.is_(None),
+    ).first()
+    if unanchored is not None:
+        raise ObligationRefreshManifestError(
+            f"live fixed run {int(unanchored[0])} has no Ledger generation anchor"
+        )
+    rows = (
+        db.query(models.PlanningRun)
+        .filter(models.PlanningRun.run_id.in_(live_run_ids or (0,)))
+        .order_by(models.PlanningRun.source_plan_id, models.PlanningRun.run_id)
+        .all()
+    )
     seen: set[int] = set()
     selected: list[models.PlanningRun] = []
     for row in rows:
+        if str(row.status) != "FIXED_SNAPSHOT" or row.source_plan_id is None:
+            raise ObligationRefreshManifestError(
+                f"live-plan scope contains invalid run {int(row.run_id)}"
+            )
         plan_id = int(row.source_plan_id)
-        resolved_generation = _resolve_parent_generation_id(db, row)
-        if resolved_generation != parent_generation_id:
-            continue
         if plan_id in seen:
             raise ObligationRefreshManifestError(
                 f"current generation has multiple FIXED_SNAPSHOT runs for plan {plan_id}"

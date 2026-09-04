@@ -83,6 +83,100 @@ const materials = {
   }],
 }
 
+const drumBlocker = {
+  item_id: 940,
+  item_code: 'CA-004940-SP',
+  item_article: 'CA-004940-SP',
+  item_name: 'Конёк для лыжи, чёрный',
+  required_qty: '10',
+  available_qty: '6',
+  shortage_qty: '4',
+  reason: 'SHORTAGE',
+  destination_warehouse_ref1c: 'Склад участка модулей',
+  path: [201, 940],
+  point_of_use_qty: '1',
+  custody_qty: '1',
+  transit_qty: '1',
+  wip_qty: '2',
+  supplier_qty: '1',
+  other_stock_qty: '3',
+  coverage_sources: [
+    { coverage_kind: 'point_of_use', qty: '1', source_key: 'stock:assembly:940', warehouse_ref1c: 'Склад участка модулей', destination_warehouse_ref1c: 'Склад участка модулей', available_date: null, confidence: 'physical', source_kind: 'physical_stock', source_ref: 'Склад участка модулей' },
+    { coverage_kind: 'custody', qty: '1', source_key: 'custody:91', warehouse_ref1c: 'Участок сборки модулей', destination_warehouse_ref1c: 'Склад участка модулей', available_date: null, confidence: 'custody', source_kind: 'custody_workshop', source_ref: 'Заказ ЗСНФ-002926' },
+    { coverage_kind: 'transit', qty: '1', source_key: 'custody:92', warehouse_ref1c: 'Склад №3', destination_warehouse_ref1c: 'Склад участка модулей', available_date: '2026-09-07', confidence: 'custody', source_kind: 'custody_transit', source_ref: 'Перемещение ПМ-000118' },
+    { coverage_kind: 'wip_order', qty: '2', source_key: 'future:31', warehouse_ref1c: 'Склад участка модулей', destination_warehouse_ref1c: 'Склад участка модулей', available_date: '2026-09-08', confidence: 'committed', source_kind: 'wip_order', source_ref: 'ЗСНФ-002944' },
+    { coverage_kind: 'supplier_order', qty: '1', source_key: 'future:32', warehouse_ref1c: 'Склад участка модулей', destination_warehouse_ref1c: 'Склад участка модулей', available_date: '2026-09-09', confidence: 'committed', source_kind: 'supplier_order', source_ref: 'ЗП-000042' },
+    { coverage_kind: 'other_stock', qty: '3', source_key: 'stock:store-4:940', warehouse_ref1c: 'Склад №4', destination_warehouse_ref1c: 'Склад участка модулей', available_date: null, confidence: 'physical', source_kind: 'physical_stock', source_ref: 'Склад №4' },
+  ],
+}
+
+const drumSchedule = {
+  schedule_from: '2026-09-04',
+  schedule_to: '2026-09-10',
+  days: ['2026-09-04', '2026-09-07', '2026-09-08', '2026-09-09', '2026-09-10'],
+  resources: [
+    { resource_id: 17, resource_name: 'Участок сборки модулей' },
+    { resource_id: 18, resource_name: 'Участок сборки мотобуксировщиков' },
+    { resource_id: 19, resource_name: 'Участок сборки снегоходов' },
+  ],
+  slots: [{
+    slot_id: 501,
+    queue_line_id: 901,
+    run_id: 77,
+    plan_id: 7,
+    plan_line_id: 71,
+    period_from: '2026-07-01',
+    period_to: '2026-07-31',
+    item_id: 201,
+    item_code: 'MODULE-FISHRIDE',
+    item_name: 'Лыжный модуль Fishride NEW',
+    resource_id: 17,
+    slot_date: '2026-09-04',
+    auto_slot_date: '2026-09-07',
+    slot_qty: 3,
+    planned_output_qty: 10,
+    accepted_plan_output_qty: 0,
+    assembly_remaining_qty: 10,
+    slot_ordinal: 0,
+    readiness_phase: 'transfer',
+    readiness_date: '2026-09-07',
+    readiness_curve: [
+      { horizon: 'now', cumulative_qty: '1', available_date: '2026-09-04', actions: [], required_actions: [], blockers: [drumBlocker] },
+      { horizon: 'transfer', cumulative_qty: '3', available_date: '2026-09-07', actions: [{ action_kind: 'transfer', item_id: 940, item_code: 'CA-004940-SP', item_article: 'CA-004940-SP', item_name: 'Конёк для лыжи, чёрный', qty: '2', available_date: '2026-09-07', confidence: 'physical', source_key: 'stock:store-3:940', source_warehouse_ref1c: 'Склад №3', destination_warehouse_ref1c: 'Склад участка модулей', resource_id: 17, path: [201] }], required_actions: [], blockers: [drumBlocker] },
+      { horizon: 'kitting', cumulative_qty: '3', available_date: '2026-09-07', actions: [], required_actions: [], blockers: [drumBlocker] },
+      { horizon: 'committed', cumulative_qty: '3', available_date: '2026-09-08', actions: [], required_actions: [], blockers: [drumBlocker] },
+      { horizon: 'launch', cumulative_qty: '3', available_date: '2026-09-08', actions: [], required_actions: [{ action_kind: 'make', item_id: 940, item_code: 'CA-004940-SP', item_article: 'CA-004940-SP', item_name: 'Конёк для лыжи, чёрный', qty: '4', available_date: '2026-09-11', confidence: 'forecast', source_key: '', source_warehouse_ref1c: '', destination_warehouse_ref1c: 'Склад участка модулей', resource_id: 17, path: [201] }], blockers: [drumBlocker] },
+    ],
+    action_manifest: [
+      { action_kind: 'transfer', item_id: 940, item_code: 'CA-004940-SP', item_article: 'CA-004940-SP', item_name: 'Конёк для лыжи, чёрный', qty: '2', available_date: '2026-09-07', confidence: 'physical', source_key: 'stock:store-3:940', source_warehouse_ref1c: 'Склад №3', destination_warehouse_ref1c: 'Склад участка модулей', resource_id: 17, path: [201] },
+      { action_kind: 'make', item_id: 940, item_code: 'CA-004940-SP', item_article: 'CA-004940-SP', item_name: 'Конёк для лыжи, чёрный', qty: '4', available_date: '2026-09-11', confidence: 'forecast', source_key: '', source_warehouse_ref1c: '', destination_warehouse_ref1c: 'Склад участка модулей', resource_id: 17, path: [201] },
+    ],
+    unavailable_reasons: [],
+    blocking_manifest: [drumBlocker],
+    manual_override: true,
+    manual_moved_at: '2026-09-04T11:25:00+03:00',
+    manual_moved_by: 'Мастер сборки',
+    original_priority: ['2026-07-01', 71],
+  }],
+  gaps: [],
+  excluded: [],
+  total_open_qty: 10,
+  total_slot_qty: 3,
+  total_gap_qty: 7,
+  total_slots: 1,
+  total_gaps: 0,
+  total_excluded: 0,
+  total_excluded_open_qty: 0,
+  limit: 10000,
+  offset: 0,
+  truth_meta: {
+    ledger_generation: 890,
+    cutoff: '2026-09-04T09:30:00+03:00',
+    truth_status: 'accepted',
+    truth_reason: null,
+  },
+}
+
 test.use({
   viewport: { width: 1440, height: 900 },
   deviceScaleFactor: 1,
@@ -150,10 +244,81 @@ test('production control visual contract', async ({ page }) => {
   await expect(page.getByText('Болт М8')).toBeVisible()
   await expect(page.locator('.runBadge')).toHaveText('MRP run: 77')
   await expect(page.locator('.statusBar')).not.toContainText('Загрузка')
+  const firstOrderRow = page.getByRole('row').filter({ hasText: 'Кронштейн опорный' }).first()
+  await expect(firstOrderRow.getByLabel('Факт выпуска заказа')).toContainText('Заказано 10')
+  await expect(firstOrderRow.getByLabel('Факт выпуска заказа')).toContainText('Принято Ledger 0')
+  await expect(firstOrderRow.getByLabel('Факт выпуска заказа')).toContainText('Осталось по заказу 10')
+  const selectedCardFacts = page.locator('.detailPane').getByLabel('Факт выпуска заказа')
+  await expect(selectedCardFacts).toContainText('Принято Ledger 0')
 
   await expect(page.locator('.app')).toHaveScreenshot('production-control.png', {
     animations: 'disabled',
     caret: 'hide',
     scale: 'css',
   })
+})
+
+test('drum master card renders saved readiness evidence and scrolls', async ({ page }, testInfo) => {
+  await page.clock.setFixedTime(new Date('2026-09-04T09:30:00+03:00'))
+  await page.route('**/api/**', async (route) => {
+    const { pathname } = new URL(route.request().url())
+    if (pathname === '/api/v1/production-control/drum') {
+      await route.fulfill({ json: drumSchedule })
+      return
+    }
+    if (pathname === '/api/v1/production-control/orders') {
+      await route.fulfill({ json: { rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null, truth_meta: drumSchedule.truth_meta } })
+      return
+    }
+    if (pathname === '/api/v1/production-control/orders/root-products') {
+      await route.fulfill({ json: { rows: [], total: 0 } })
+      return
+    }
+    if (pathname === '/api/v1/resources/') {
+      await route.fulfill({ json: drumSchedule.resources })
+      return
+    }
+    await route.fulfill({ status: 404, json: { detail: `Not mocked: ${pathname}` } })
+  })
+
+  await page.goto('/#/production-control?view=drum')
+  await page.addStyleTag({
+    content: `
+      *, *::before, *::after {
+        animation: none !important;
+        caret-color: transparent !important;
+        transition: none !important;
+      }
+    `,
+  })
+
+  const tile = page.getByRole('button', { name: /Лыжный модуль Fishride NEW: 3 шт., После перемещения/ })
+  await expect(tile).toBeVisible()
+  await expect(tile).toContainText('Исходный план 10')
+  await expect(tile).toContainText('Принято Ledger 0')
+  await expect(tile).toContainText('Осталось выпустить 10')
+  await expect(tile).toContainText('Сегодня можно 1 из 3')
+  await expect(tile).toContainText('Нет: CA-004940-SP, −4')
+  await tile.click()
+
+  const dialog = page.getByRole('dialog', { name: /Плитка: Лыжный модуль Fishride NEW/ })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByLabel('Факт выпуска плана')).toContainText('Исходный план 10')
+  await expect(dialog.getByLabel('Факт выпуска плана')).toContainText('Принято Ledger 0')
+  await expect(dialog.getByLabel('Факт выпуска плана')).toContainText('Осталось выпустить 10')
+  await expect(dialog.getByRole('table', { name: 'Дефициты по источникам обеспечения' })).toBeVisible()
+  await expect(dialog.getByText('Сегодня можно собрать 1 из 3')).toBeVisible()
+  await expect(dialog.getByText('MRP: 77')).toBeVisible()
+  await expect(dialog.getByText('Период: 2026-07-01 — 2026-07-31')).toBeVisible()
+  await expect(dialog.getByText('Перемещение ПМ-000118')).toBeVisible()
+  await expect(dialog.getByText('ЗСНФ-002944')).toBeVisible()
+  await expect(dialog.getByText('ЗП-000042')).toBeVisible()
+  await expect(dialog.getByRole('link', { name: 'Журнал' })).toBeVisible()
+  await expect(dialog.getByRole('link', { name: 'Очередь мехцеха' })).toBeVisible()
+
+  const body = dialog.locator('.dialogBody')
+  await expect.poll(async () => body.evaluate((node) => node.scrollHeight > node.clientHeight)).toBe(true)
+  await body.evaluate((node) => { node.scrollTop = node.scrollHeight })
+  await expect.poll(async () => body.evaluate((node) => node.scrollTop > 0)).toBe(true)
+  await page.screenshot({ path: testInfo.outputPath('drum-deficit-card.png'), fullPage: true })
 })

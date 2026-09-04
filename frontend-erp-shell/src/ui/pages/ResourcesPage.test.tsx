@@ -96,6 +96,7 @@ describe('ResourcesPage characterization', () => {
       buffer_days: 0,
       shift_offset: 0,
       planning_range: 30,
+      is_kitting: false,
     })
     vi.mocked(updateResource).mockImplementation(async (resourceId, payload) => ({
       resource_id: resourceId,
@@ -233,6 +234,7 @@ describe('ResourcesPage characterization', () => {
       work_schedule: '5/2',
       daily_work_hours: 8,
       buffer_days: 0,
+      is_kitting: false,
     }))
     expect(await screen.findByText('Участок создан')).toBeVisible()
     expect(listResources).toHaveBeenCalledTimes(2)
@@ -258,6 +260,7 @@ describe('ResourcesPage characterization', () => {
       work_schedule: '2/2',
       daily_work_hours: 12,
       buffer_days: 1,
+      is_kitting: false,
     }))
     expect(await screen.findByText('Участок сохранен')).toBeVisible()
   })

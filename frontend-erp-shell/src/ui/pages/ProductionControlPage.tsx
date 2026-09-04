@@ -950,6 +950,7 @@ export function ProductionControlPage() {
               <ProductionOrdersTable
                 rows={rows}
                 activeRow={activeRow}
+                outputFactsAvailable={truthMeta?.truth_status === 'accepted'}
                 selectedIds={selectedIds}
                 launchQtyByWorkItem={launchQtyByWorkItem}
                 sort={{
@@ -980,6 +981,7 @@ export function ProductionControlPage() {
           ) : (
             <ProductionDetailPane
               activeRow={activeRow}
+              outputFactsAvailable={truthMeta?.truth_status === 'accepted'}
               materials={materials}
               materialsLoading={materialsLoading}
               materialsError={materialsError}

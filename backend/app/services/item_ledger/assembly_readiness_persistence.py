@@ -8,7 +8,7 @@ from hashlib import sha256
 import json
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -18,12 +18,6 @@ from app.services.mrp_stock_helpers import (
 )
 from app.services.production_material_custody_projection import (
     load_material_custody_projection,
-)
-from app.services.replenishment import (
-    REPLENISHMENT_FLOW_PRODUCTION,
-    REPLENISHMENT_FLOW_PURCHASE,
-    REPLENISHMENT_FLOW_REWORK,
-    classify_replenishment_flow,
 )
 
 from .assembly_queue_snapshot import materialize_assembly_queue_lines
@@ -37,8 +31,7 @@ from .assembly_readiness_core import (
 
 
 STAGE = "assembly_readiness"
-ALGORITHM_VERSION = "assembly-readiness/4-root-scoped-specification"
-_NON_STOCK_TYPES = {"услуга", "работа", "операция"}
+ALGORITHM_VERSION = "assembly-readiness/9-master-card-labels"
 
 
 def _d(value: Any) -> Decimal:
@@ -53,6 +46,7 @@ def _signature(value: Any) -> str:
 def _physical_supplies(
     db: Session,
     generation_id: int,
+    queue_rows: list[models.AssemblyQueueLine],
 ) -> tuple[ReadinessSupply, ...] | None:
     if db.get(models.ProductionMaterialCustodyProjectionManifest, int(generation_id)) is None:
         return None
@@ -89,6 +83,126 @@ def _physical_supplies(
                 layer="now",
                 warehouse_ref1c=warehouse,
                 confidence="physical",
+                source_kind="physical_stock",
+                source_ref=warehouse,
+            )
+        )
+
+    queue_by_run_root: dict[tuple[int, int], list[int]] = {}
+    for queue_row in queue_rows:
+        queue_by_run_root.setdefault(
+            (int(queue_row.planning_run_id), int(queue_row.item_id)), []
+        ).append(int(queue_row.id))
+    run_ids = sorted({int(row.planning_run_id) for row in queue_rows})
+    active_version_by_run = {
+        int(run.run_id): int(run.active_freeze_version or 0)
+        for run in db.query(models.PlanningRun)
+        .filter(models.PlanningRun.run_id.in_(run_ids or [0]))
+        .all()
+    }
+    roots_by_run_item: dict[tuple[int, int], set[int]] = {}
+    nodes_by_run_item: dict[
+        tuple[int, int], list[models.MrpFreezeBomNode]
+    ] = {}
+    for node in (
+        db.query(models.MrpFreezeBomNode)
+        .filter(models.MrpFreezeBomNode.run_id.in_(run_ids or [0]))
+        .all()
+    ):
+        if int(node.freeze_version) != active_version_by_run.get(
+            int(node.run_id), -1
+        ):
+            continue
+        roots_by_run_item.setdefault(
+            (int(node.run_id), int(node.item_id)), set()
+        ).add(int(node.root_item_id))
+        nodes_by_run_item.setdefault(
+            (int(node.run_id), int(node.item_id)), []
+        ).append(node)
+    custody_rows = (
+        db.query(
+            models.ProductionMaterialCustodyProjection,
+            models.ProductionProduct.item_id.label("product_item_id"),
+            models.MrpRequirement.run_id.label("run_id"),
+            models.ProductionOrder.order_number.label("source_number"),
+        )
+        .join(
+            models.ProductionProduct,
+            models.ProductionMaterialCustodyProjection.product_id
+            == models.ProductionProduct.product_id,
+        )
+        .outerjoin(
+            models.MrpRequirement,
+            models.ProductionProduct.source_mrp_requirement_id
+            == models.MrpRequirement.id,
+        )
+        .join(
+            models.ProductionOrder,
+            models.ProductionProduct.order_id == models.ProductionOrder.order_id,
+        )
+        .filter(
+            models.ProductionMaterialCustodyProjection.ledger_generation_id
+            == int(generation_id),
+            models.ProductionMaterialCustodyProjection.location_kind.in_(
+                ("workshop", "transit")
+            ),
+            models.ProductionMaterialCustodyProjection.reserved_qty > 0,
+        )
+        .order_by(models.ProductionMaterialCustodyProjection.id)
+        .all()
+    )
+    for custody_row, product_item_id, run_id, source_number in custody_rows:
+        if run_id is None:
+            continue
+        root_item_ids = tuple(
+            sorted(
+                roots_by_run_item.get(
+                    (int(run_id), int(product_item_id)), set()
+                )
+            )
+        )
+        if not root_item_ids:
+            continue
+        route_destinations = {
+            str(node.material_warehouse_ref1c or "").strip()
+            for node in nodes_by_run_item.get(
+                (int(run_id), int(product_item_id)), []
+            )
+            if str(node.material_warehouse_ref1c or "").strip()
+        }
+        is_transit = str(custody_row.location_kind) == "transit"
+        if is_transit and len(route_destinations) != 1:
+            # A transit reservation is a promise only when the frozen route
+            # names one exact point of use.  The live issue document is not an
+            # allowed candidate input and cannot resolve an ambiguous freeze.
+            continue
+        transfer_destination = (
+            next(iter(route_destinations)) if is_transit else ""
+        )
+        candidates = [
+            queue_line_id
+            for root_item_id in root_item_ids
+            for queue_line_id in queue_by_run_root.get(
+                (int(run_id), int(root_item_id)), []
+            )
+        ]
+        result.append(
+            ReadinessSupply(
+                source_key=f"custody:{int(custody_row.id)}",
+                item_id=int(custody_row.component_item_id),
+                qty=_d(custody_row.reserved_qty),
+                layer="transfer" if is_transit else "now",
+                warehouse_ref1c=str(custody_row.warehouse_ref1c or ""),
+                confidence="custody",
+                bom_key=int(run_id),
+                queue_line_id=(int(candidates[0]) if len(candidates) == 1 else None),
+                root_item_ids=root_item_ids,
+                custody_owner_item_id=int(product_item_id),
+                transfer_destination_warehouse_ref1c=transfer_destination,
+                source_kind=(
+                    "custody_transit" if is_transit else "custody_workshop"
+                ),
+                source_ref=str(source_number or int(custody_row.product_id)),
             )
         )
     return tuple(result)
@@ -124,6 +238,10 @@ def _future_supplies(db: Session, generation_id: int) -> tuple[ReadinessSupply, 
             bom_key=requirement_run.get(int(row.source_requirement_id))
             if row.source_requirement_id is not None
             else None,
+            source_kind=str(row.supply_kind or ""),
+            source_ref=str(
+                row.source_ref or row.source_local_id or row.id
+            ),
         )
         for row in rows
     )
@@ -151,297 +269,119 @@ def _curve_inputs(
         if run_ids
         else []
     )
-    item_ids = {
-        int(value)
-        for row in component_rows
-        for value in (row.parent_item_id, row.component_item_id)
-    }
-    item_ids.update(int(row.item_id) for row in queue_rows)
-    item_meta = {
-        int(row.item_id): row
-        for row in db.query(models.Item).filter(models.Item.item_id.in_(item_ids)).all()
+    node_rows = (
+        db.query(models.MrpFreezeBomNode)
+        .filter(models.MrpFreezeBomNode.run_id.in_(run_ids))
+        .all()
+        if run_ids
+        else []
+    )
+    active_version_by_run = {
+        run_id: int(run.active_freeze_version or 0) for run_id, run in runs.items()
     }
     frozen_rows: list[models.MrpFreezeComponent] = []
     for component in component_rows:
-        run = runs.get(int(component.run_id))
-        if run is None or int(component.freeze_version) != int(run.active_freeze_version or 0):
-            continue
-        item = item_meta.get(int(component.component_item_id))
-        if item is not None and (
-            str(item.item_type or "").strip().lower() in _NON_STOCK_TYPES
+        if int(component.freeze_version) != active_version_by_run.get(
+            int(component.run_id), -1
         ):
             continue
         frozen_rows.append(component)
+    frozen_nodes = [
+        row
+        for row in node_rows
+        if int(row.freeze_version)
+        == active_version_by_run.get(int(row.run_id), -1)
+    ]
 
-    root_item_ids = sorted({int(row.item_id) for row in queue_rows})
-    rate_rows = (
-        db.query(models.AssemblyRate)
-        .filter(models.AssemblyRate.item_id.in_(root_item_ids))
-        .order_by(models.AssemblyRate.item_id, models.AssemblyRate.resource_id)
-        .all()
-        if root_item_ids else []
+    issues_by_scope: dict[tuple[int, int], set[str]] = {}
+    legacy_runs: set[int] = set()
+    edges_list: list[FrozenBomEdge] = []
+    for row in frozen_rows:
+        if row.root_item_id is None:
+            legacy_runs.add(int(row.run_id))
+            continue
+        scope = (int(row.run_id), int(row.root_item_id))
+        norm = _d(row.norm_qty_per_unit) * _d(row.unit_coef or 1)
+        if norm <= 0:
+            issues_by_scope.setdefault(scope, set()).add("INVALID_COMPONENT_NORM")
+            continue
+        edges_list.append(
+            FrozenBomEdge(
+                bom_key=int(row.run_id),
+                root_item_id=int(row.root_item_id),
+                parent_item_id=int(row.parent_item_id),
+                component_item_id=int(row.component_item_id),
+                parent_spec_ref=str(row.spec_ref or ""),
+                child_spec_ref=str(row.child_spec_ref or ""),
+                norm_qty=norm,
+            )
+        )
+
+    policies = tuple(
+        ReplenishmentPolicy(
+            bom_key=int(row.run_id),
+            root_item_id=int(row.root_item_id),
+            item_id=int(row.item_id),
+            spec_ref=str(row.spec_ref or ""),
+            mode=str(row.replenishment_mode or "unavailable"),
+            lead_days=(
+                int(row.replenishment_time_days)
+                if row.replenishment_time_days is not None
+                else None
+            ),
+            route_kind="kitting" if bool(row.is_kitting) else "production",
+            resource_id=int(row.resource_id) if row.resource_id is not None else None,
+            material_warehouse_ref1c=str(row.material_warehouse_ref1c or ""),
+            output_warehouse_ref1c=str(row.output_warehouse_ref1c or ""),
+            unavailable_reason=(
+                "NON_STOCK_ITEM"
+                if not bool(row.is_stock_item)
+                else str(row.route_reason or "")
+            ),
+        )
+        for row in frozen_nodes
     )
-    rates_by_item: dict[int, list[models.AssemblyRate]] = {}
-    for rate in rate_rows:
-        rates_by_item.setdefault(int(rate.item_id), []).append(rate)
-    resource_ids = {int(rate.resource_id) for rate in rate_rows}
-    bindings = {
-        int(row.workshop_id): str(row.warehouse_ref1c or "")
-        for row in db.query(models.WorkshopWarehouseBinding)
-        .filter(models.WorkshopWarehouseBinding.workshop_id.in_(resource_ids))
-        .all()
-    } if resource_ids else {}
+
+    root_nodes: dict[tuple[int, int], list[models.MrpFreezeBomNode]] = {}
+    for row in frozen_nodes:
+        if int(row.item_id) == int(row.root_item_id):
+            root_nodes.setdefault((int(row.run_id), int(row.root_item_id)), []).append(row)
 
     lines_list: list[ReadinessCurveLine] = []
     for row in queue_rows:
-        rates = rates_by_item.get(int(row.item_id), [])
-        target = bindings.get(int(rates[0].resource_id), "") if len(rates) == 1 else ""
+        scope = (int(row.planning_run_id), int(row.item_id))
+        issues = set(issues_by_scope.get(scope, set()))
+        if int(row.planning_run_id) in legacy_runs:
+            issues.add("FROZEN_BOM_SCHEMA_OUTDATED")
+        candidates = root_nodes.get(scope, [])
+        if not candidates:
+            issues.add("FROZEN_BOM_NODE_MISSING")
+            root_spec_ref = ""
+            target = ""
+        elif len(candidates) > 1:
+            issues.add("FROZEN_ROOT_SPEC_AMBIGUOUS")
+            root_spec_ref = ""
+            target = ""
+        else:
+            root = candidates[0]
+            root_spec_ref = str(root.spec_ref or "")
+            target = str(root.material_warehouse_ref1c or "")
+            if str(root.route_reason or ""):
+                issues.add(str(root.route_reason))
         lines_list.append(
             ReadinessCurveLine(
                 queue_line_id=int(row.id),
                 sort_key=str(row.sort_key),
                 bom_key=int(row.planning_run_id),
                 root_item_id=int(row.item_id),
+                root_spec_ref=root_spec_ref,
                 open_qty=_d(row.assembly_remaining_qty),
                 target_warehouse_ref1c=target,
+                unavailable_reasons=tuple(sorted(issues)),
             )
         )
 
-    spec_refs = {str(row.spec_ref or "") for row in frozen_rows if str(row.spec_ref or "")}
-    numeric_spec_ids = {int(value) for value in spec_refs if value.isdigit()}
-    specs = (
-        db.query(models.Specification)
-        .filter(or_(
-            models.Specification.spec_ref1c.in_(spec_refs),
-            models.Specification.spec_id.in_(numeric_spec_ids),
-        ))
-        .all()
-        if spec_refs else []
-    )
-    spec_by_ref = {}
-    for row in specs:
-        if row.spec_ref1c:
-            spec_by_ref[str(row.spec_ref1c)] = row
-        spec_by_ref[str(row.spec_id)] = row
-    kind_ids = {int(row.production_kind_id) for row in specs if row.production_kind_id is not None}
-    route_rows = (
-        db.query(models.ResourceProductionKind)
-        .filter(models.ResourceProductionKind.production_kind_id.in_(kind_ids))
-        .all()
-        if kind_ids else []
-    )
-    resources_by_kind: dict[int, list[int]] = {}
-    for row in route_rows:
-        resources_by_kind.setdefault(int(row.production_kind_id), []).append(int(row.resource_id))
-    route_resource_ids = {resource_id for values in resources_by_kind.values() for resource_id in values}
-    resources = {
-        int(row.resource_id): row
-        for row in db.query(models.ProductionResource)
-        .filter(models.ProductionResource.resource_id.in_(route_resource_ids))
-        .all()
-    } if route_resource_ids else {}
-    route_bindings = {
-        int(row.workshop_id): str(row.warehouse_ref1c or "")
-        for row in db.query(models.WorkshopWarehouseBinding)
-        .filter(models.WorkshopWarehouseBinding.workshop_id.in_(route_resource_ids))
-        .all()
-    } if route_resource_ids else {}
-    kinds = {
-        int(row.id): str(row.name or "")
-        for row in db.query(models.ProductionKind).filter(models.ProductionKind.id.in_(kind_ids)).all()
-    } if kind_ids else {}
-
-    # One MRP run may legitimately use different pinned specifications for the
-    # same child under different roots.  The frozen rows carry the exact parent
-    # spec ref/hash; while that hash still matches the local immutable spec
-    # content, its component pins let us reconstruct the selected graph for
-    # each queue root.  Never collapse this to (run, item): doing so made an old
-    # pin from an unrelated snowmobile block the Fishride module whose branch
-    # explicitly pins the current default specification.
-    rows_by_scope: dict[tuple[int, int, str], list[models.MrpFreezeComponent]] = {}
-    candidate_specs: dict[tuple[int, int], set[str]] = {}
-    for row in frozen_rows:
-        run_id = int(row.run_id)
-        parent_id = int(row.parent_item_id)
-        spec_ref = str(row.spec_ref or "")
-        rows_by_scope.setdefault((run_id, parent_id, spec_ref), []).append(row)
-        candidate_specs.setdefault((run_id, parent_id), set()).add(spec_ref)
-
-    default_ref_by_item: dict[int, str] = {}
-    default_candidates: dict[int, set[str]] = {}
-    for item_id, spec_id in (
-        db.query(models.DefaultSpecification.item_id, models.DefaultSpecification.spec_id)
-        .filter(models.DefaultSpecification.item_id.in_(item_ids))
-        .all()
-        if item_ids else []
-    ):
-        spec = next((row for row in specs if int(row.spec_id) == int(spec_id)), None)
-        if spec is not None:
-            default_candidates.setdefault(int(item_id), set()).add(
-                str(spec.spec_ref1c or spec.spec_id)
-            )
-    for item_id, refs in default_candidates.items():
-        if len(refs) == 1:
-            default_ref_by_item[item_id] = next(iter(refs))
-
-    component_pins: dict[tuple[str, int], set[str]] = {}
-    if specs:
-        spec_id_to_ref = {
-            int(spec.spec_id): str(spec.spec_ref1c or spec.spec_id)
-            for spec in specs
-        }
-        for component in (
-            db.query(models.SpecComponent)
-            .filter(models.SpecComponent.spec_id.in_(list(spec_id_to_ref)))
-            .all()
-        ):
-            parent_ref = spec_id_to_ref.get(int(component.spec_id))
-            if parent_ref is None:
-                continue
-            pin = str(component.component_spec_ref1c or "").strip()
-            component_pins.setdefault((parent_ref, int(component.item_id)), set()).add(pin)
-
-    selected_spec: dict[tuple[int, int, int], tuple[str, str | None]] = {}
-    ambiguous_spec: set[tuple[int, int, int]] = set()
-    edges_list: list[FrozenBomEdge] = []
-    roots_by_run: dict[int, set[int]] = {run_id: set() for run_id in run_ids}
-    for line in queue_rows:
-        roots_by_run.setdefault(int(line.planning_run_id), set()).add(int(line.item_id))
-
-    def choose_spec(run_id: int, root_id: int, item_id: int, pinned_ref: str = ""):
-        key = (run_id, root_id, item_id)
-        candidates = candidate_specs.get((run_id, item_id), set())
-        wanted = str(pinned_ref or "").strip()
-        if wanted:
-            if wanted in candidates:
-                return wanted
-            ambiguous_spec.add(key)
-            return None
-        if len(candidates) == 1:
-            return next(iter(candidates))
-        default_ref = default_ref_by_item.get(item_id, "")
-        if default_ref and default_ref in candidates:
-            return default_ref
-        if len(candidates) > 1:
-            ambiguous_spec.add(key)
-        return None
-
-    for run_id, roots in roots_by_run.items():
-        for root_id in sorted(roots):
-            root_ref = choose_spec(run_id, root_id, root_id)
-            stack: list[tuple[int, str]] = [(root_id, root_ref)] if root_ref else []
-            visited: set[tuple[int, str]] = set()
-            while stack:
-                parent_id, spec_ref = stack.pop()
-                scope = (parent_id, spec_ref)
-                if scope in visited:
-                    continue
-                visited.add(scope)
-                scoped_rows = rows_by_scope.get((run_id, parent_id, spec_ref), ())
-                if not scoped_rows:
-                    continue
-                versions = {
-                    str(row.spec_version) if row.spec_version else None
-                    for row in scoped_rows
-                }
-                if len(versions) != 1:
-                    ambiguous_spec.add((run_id, root_id, parent_id))
-                    continue
-                frozen_version = next(iter(versions))
-                current_spec = spec_by_ref.get(spec_ref)
-                if current_spec is None or (
-                    frozen_version
-                    and str(current_spec.content_hash or "") != frozen_version
-                ):
-                    ambiguous_spec.add((run_id, root_id, parent_id))
-                    continue
-                selected_spec[(run_id, root_id, parent_id)] = (
-                    spec_ref,
-                    frozen_version,
-                )
-                for row in scoped_rows:
-                    component_id = int(row.component_item_id)
-                    norm = _d(row.norm_qty_per_unit) * _d(row.unit_coef or 1)
-                    component_item = item_meta.get(component_id)
-                    if norm > 0 and not (
-                        component_item is not None
-                        and str(component_item.item_type or "").strip().lower()
-                        in _NON_STOCK_TYPES
-                    ):
-                        edges_list.append(FrozenBomEdge(
-                            bom_key=run_id,
-                            root_item_id=root_id,
-                            parent_item_id=parent_id,
-                            component_item_id=component_id,
-                            norm_qty=norm,
-                        ))
-                    pins = component_pins.get((spec_ref, component_id), {""})
-                    non_empty_pins = {value for value in pins if value}
-                    if len(non_empty_pins) > 1 or (non_empty_pins and "" in pins):
-                        ambiguous_spec.add((run_id, root_id, component_id))
-                        continue
-                    pinned = next(iter(non_empty_pins), "")
-                    child_ref = choose_spec(run_id, root_id, component_id, pinned)
-                    if child_ref:
-                        stack.append((component_id, child_ref))
-
-    edges = tuple(edges_list)
-    policies: list[ReplenishmentPolicy] = []
-    items_by_root: dict[tuple[int, int], set[int]] = {}
-    for edge in edges:
-        scope = (int(edge.bom_key), int(edge.root_item_id or 0))
-        items_by_root.setdefault(scope, set()).update(
-            (int(edge.parent_item_id), int(edge.component_item_id))
-        )
-    for (run_id, root_id), root_items in items_by_root.items():
-        for item_id in sorted(root_items):
-            item = item_meta.get(item_id)
-            flow = classify_replenishment_flow(item.replenishment_method if item is not None else None)
-            mode = {
-                REPLENISHMENT_FLOW_PRODUCTION: "make",
-                REPLENISHMENT_FLOW_PURCHASE: "buy",
-                REPLENISHMENT_FLOW_REWORK: "rework",
-            }.get(flow, "unavailable")
-            lead_days = int(item.replenishment_time) if item is not None and item.replenishment_time is not None else None
-            resource_id = None
-            output_warehouse = ""
-            route_kind = ""
-            unavailable_reason = ""
-            if mode in {"make", "rework"}:
-                frozen_spec = selected_spec.get((run_id, root_id, item_id))
-                if (run_id, root_id, item_id) in ambiguous_spec:
-                    unavailable_reason = "FROZEN_SPEC_AMBIGUOUS"
-                spec = spec_by_ref.get(frozen_spec[0]) if frozen_spec else None
-                spec_is_current = bool(
-                    spec is not None
-                    and (not frozen_spec[1] or str(spec.content_hash or "") == frozen_spec[1])
-                )
-                routed = resources_by_kind.get(int(spec.production_kind_id), []) if spec_is_current and spec.production_kind_id is not None else []
-                if len(routed) == 1:
-                    resource_id = int(routed[0])
-                    resource = resources.get(resource_id)
-                    output_warehouse = route_bindings.get(resource_id, "")
-                    lead_days = (
-                        int(resource.buffer_days)
-                        if resource is not None and resource.buffer_days is not None
-                        else None
-                    )
-                    route_label = f"{resource.resource_name if resource is not None else ''} {kinds.get(int(spec.production_kind_id), '')}".lower()
-                    route_kind = "kitting" if "комплект" in route_label or "склад сборки" in route_label else "production"
-            policies.append(
-                ReplenishmentPolicy(
-                    bom_key=run_id,
-                    root_item_id=root_id,
-                    item_id=item_id,
-                    mode=mode,
-                    lead_days=lead_days,
-                    route_kind=route_kind,
-                    resource_id=resource_id,
-                    output_warehouse_ref1c=output_warehouse,
-                    unavailable_reason=unavailable_reason,
-                )
-            )
-    return tuple(lines_list), edges, tuple(policies)
+    return tuple(lines_list), tuple(edges_list), policies
 
 
 def materialize_assembly_readiness(
@@ -485,7 +425,7 @@ def materialize_assembly_readiness(
         if _d(row.assembly_remaining_qty) > 0
     ]
     lines, edges, policies = _curve_inputs(db, queue_rows)
-    physical = _physical_supplies(db, int(generation.id))
+    physical = _physical_supplies(db, int(generation.id), queue_rows)
     results = allocate_readiness_curves(
         lines,
         edges,
@@ -498,15 +438,63 @@ def materialize_assembly_readiness(
         int(action.item_id)
         for result in results
         for point in result.points
-        for action in point.actions
+        for action in (*point.actions, *point.required_actions)
     } | {
         int(blocker.item_id)
         for result in results
-        for blocker in result.blockers
+        for point in result.points
+        for blocker in point.blockers
     }
     labels = {
         int(row.item_id): row
         for row in db.query(models.Item).filter(models.Item.item_id.in_(item_ids)).all()
+    }
+    warehouse_refs = {
+        str(value).strip()
+        for result in results
+        for point in result.points
+        for action in (*point.actions, *point.required_actions)
+        for value in (
+            action.source_warehouse_ref1c,
+            action.destination_warehouse_ref1c,
+        )
+        if str(value or "").strip()
+    } | {
+        str(value).strip()
+        for result in results
+        for point in result.points
+        for blocker in point.blockers
+        for value in (
+            blocker.destination_warehouse_ref1c,
+            *(
+                ref
+                for source in blocker.coverage_sources
+                for ref in (
+                    source.warehouse_ref1c,
+                    source.destination_warehouse_ref1c,
+                )
+            ),
+        )
+        if str(value or "").strip()
+    }
+    warehouse_names = {
+        str(row.warehouse_ref1c): str(row.warehouse_name or "")
+        for row in db.query(models.StockWarehouse)
+        .filter(models.StockWarehouse.warehouse_ref1c.in_(warehouse_refs or {""}))
+        .all()
+    }
+    resource_ids = {
+        int(action.resource_id)
+        for result in results
+        for point in result.points
+        for action in (*point.actions, *point.required_actions)
+        if action.resource_id is not None
+    }
+    resource_names = {
+        int(row.resource_id): str(row.resource_name or "")
+        for row in db.query(models.ProductionResource)
+        .filter(models.ProductionResource.resource_id.in_(resource_ids or {0}))
+        .all()
     }
     status_counts: dict[str, int] = {}
     for result in results:
@@ -523,24 +511,25 @@ def materialize_assembly_readiness(
                 "confidence": action.confidence,
                 "source_key": action.source_key,
                 "source_warehouse_ref1c": action.source_warehouse_ref1c,
+                "source_warehouse_name": warehouse_names.get(
+                    str(action.source_warehouse_ref1c or ""), ""
+                ),
                 "destination_warehouse_ref1c": action.destination_warehouse_ref1c,
+                "destination_warehouse_name": warehouse_names.get(
+                    str(action.destination_warehouse_ref1c or ""), ""
+                ),
                 "resource_id": action.resource_id,
+                "resource_name": (
+                    resource_names.get(int(action.resource_id), "")
+                    if action.resource_id is not None
+                    else ""
+                ),
                 "path": list(action.path),
             }
-        curve = []
-        for point in result.points:
-            curve.append({
-                "horizon": point.horizon,
-                "cumulative_qty": str(point.cumulative_qty),
-                "available_date": point.available_date.isoformat() if point.available_date else None,
-                "actions": [action_payload(action) for action in point.actions],
-            })
-        launch_point = result.points[-1]
-        manifest = [action_payload(action) for action in launch_point.actions]
-        blocker_manifest = []
-        for blocker in result.blockers:
+
+        def blocker_payload(blocker):
             item = labels.get(int(blocker.item_id))
-            blocker_manifest.append({
+            return {
                 "item_id": int(blocker.item_id),
                 "item_code": str(item.item_code or "") if item is not None else "",
                 "item_article": str(item.item_article or "") if item is not None else "",
@@ -550,8 +539,66 @@ def materialize_assembly_readiness(
                 "shortage_qty": str(blocker.shortage_qty),
                 "reason": blocker.reason,
                 "destination_warehouse_ref1c": blocker.destination_warehouse_ref1c,
+                "destination_warehouse_name": warehouse_names.get(
+                    str(blocker.destination_warehouse_ref1c or ""), ""
+                ),
                 "path": list(blocker.path),
+                "point_of_use_qty": str(blocker.point_of_use_qty),
+                "custody_qty": str(blocker.custody_qty),
+                "transit_qty": str(blocker.transit_qty),
+                "wip_qty": str(blocker.wip_qty),
+                "supplier_qty": str(blocker.supplier_qty),
+                "other_stock_qty": str(blocker.other_stock_qty),
+                "coverage_sources": [
+                    {
+                        "coverage_kind": source.coverage_kind,
+                        "qty": str(source.qty),
+                        "source_key": source.source_key,
+                        "warehouse_ref1c": source.warehouse_ref1c,
+                        "warehouse_name": warehouse_names.get(
+                            str(source.warehouse_ref1c or ""), ""
+                        ),
+                        "destination_warehouse_ref1c": (
+                            source.destination_warehouse_ref1c
+                        ),
+                        "destination_warehouse_name": warehouse_names.get(
+                            str(source.destination_warehouse_ref1c or ""), ""
+                        ),
+                        "available_date": (
+                            source.available_date.isoformat()
+                            if source.available_date
+                            else None
+                        ),
+                        "confidence": source.confidence,
+                        "source_kind": source.source_kind,
+                        "source_ref": source.source_ref,
+                    }
+                    for source in blocker.coverage_sources
+                ],
+            }
+
+        curve = []
+        for point in result.points:
+            curve.append({
+                "horizon": point.horizon,
+                "cumulative_qty": str(point.cumulative_qty),
+                "available_date": point.available_date.isoformat() if point.available_date else None,
+                "actions": [action_payload(action) for action in point.actions],
+                "required_actions": [
+                    action_payload(action) for action in point.required_actions
+                ],
+                "blockers": [
+                    blocker_payload(blocker) for blocker in point.blockers
+                ],
             })
+        launch_point = result.points[-1]
+        manifest = [
+            action_payload(action)
+            for action in (*launch_point.actions, *launch_point.required_actions)
+        ]
+        blocker_manifest = [
+            blocker_payload(blocker) for blocker in launch_point.blockers
+        ]
         blocker_manifest.extend(
             {"reason": reason}
             for reason in result.unavailable_reasons

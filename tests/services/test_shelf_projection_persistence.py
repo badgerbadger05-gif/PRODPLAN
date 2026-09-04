@@ -15,6 +15,12 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from app import models
+from app.services.item_ledger.assembly_queue_snapshot import (
+    materialize_assembly_queue_lines,
+)
+from app.services.item_ledger.assembly_readiness_persistence import (
+    ALGORITHM_VERSION as READINESS_ALGORITHM_VERSION,
+)
 from app.services.item_ledger.drum_schedule_persistence import (
     materialize_drum_schedule,
 )
@@ -62,6 +68,7 @@ def _contour(db, *, key: str, active_freeze_version: int):
         period_from=date(2026, 8, 1),
         period_to=date(2026, 8, 31),
         status="fixed",
+        fixed_at=CUTOFF,
     )
     db.add_all([generation, item, component, resource, plan])
     db.flush()
@@ -85,6 +92,8 @@ def _contour(db, *, key: str, active_freeze_version: int):
             item_id=item.item_id,
             bucket_date=date(2026, 8, 3),
             qty=Decimal("12"),
+            accepted_output_qty=Decimal("0"),
+            remaining_output_qty=Decimal("12"),
         )
     )
     db.add(
@@ -125,6 +134,52 @@ def _contour(db, *, key: str, active_freeze_version: int):
                 review_cycle_days=3,
                 safety_days=2,
                 batch_multiple=Decimal("1"),
+            ),
+        ]
+    )
+    db.flush()
+
+    # These tests isolate the shelf projection.  Freeze an explicitly ready
+    # assembly gate so the drum can provide dated demand without re-running the
+    # separate readiness engine against this intentionally minimal fixture.
+    [queue_line] = materialize_assembly_queue_lines(db, int(generation.id))
+    readiness_curve = [
+        {
+            "horizon": "now",
+            "cumulative_qty": "12",
+            "available_date": CUTOFF.date().isoformat(),
+            "actions": [],
+            "required_actions": [],
+            "blockers": [],
+        }
+    ]
+    db.add_all(
+        [
+            models.AssemblyReadiness(
+                ledger_generation_id=int(generation.id),
+                assembly_queue_line_id=int(queue_line.id),
+                status="ready",
+                open_qty=Decimal("12"),
+                ready_qty=Decimal("12"),
+                readiness_date=CUTOFF.date(),
+                readiness_curve=readiness_curve,
+                action_manifest=[],
+                unavailable_reasons=[],
+                blocker_count=0,
+                blocking_manifest=[],
+                evidence_signature=f"shelf-ready-{key}",
+            ),
+            models.LedgerBuildBatch(
+                ledger_generation_id=int(generation.id),
+                stage="assembly_readiness",
+                batch_key=(
+                    f"g{int(generation.id)}:assembly_readiness:"
+                    f"{READINESS_ALGORITHM_VERSION}"
+                ),
+                status="completed",
+                algorithm_version=READINESS_ALGORITHM_VERSION,
+                metrics={"rows": 1},
+                completed_at=CUTOFF,
             ),
         ]
     )

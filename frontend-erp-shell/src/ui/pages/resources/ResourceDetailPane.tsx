@@ -152,6 +152,10 @@ export function ResourceForm({
         <span>Диапазон, дней</span>
         <input type="number" value={form.planning_range ?? 30} onChange={(event) => onChange({ ...form, planning_range: Number(event.target.value) })} />
       </label>
+      <label className="resourceBooleanField">
+        <input type="checkbox" checked={Boolean(form.is_kitting)} onChange={(event) => onChange({ ...form, is_kitting: event.target.checked })} />
+        <span>Комплектовочный участок</span>
+      </label>
       <div className="detailActions">
         <button className="primary" onClick={onSave} disabled={saving}>{creating ? 'Создать' : 'Сохранить'}</button>
       </div>

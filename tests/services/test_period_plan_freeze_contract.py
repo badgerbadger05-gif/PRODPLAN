@@ -21,7 +21,10 @@ from app.models import (
     DefaultSpecification,
     Item,
     LedgerGeneration,
+    MrpFreezeBomNode,
+    MrpFreezeComponent,
     MrpRequirement,
+    MrpRunRoot,
     ProductionMaterialCustodyProjectionManifest,
     PhysicalImportBatch,
     PlannedOrder,
@@ -35,6 +38,7 @@ from app.models import (
     StockWarehouse,
 )
 from app.services import period_plan_service
+from app.services.mrp_freeze import LedgerPoolUnavailable
 from app.services.period_plan_service import (
     _build_execution_snapshot_rows,
     _execution_row_summary,
@@ -46,6 +50,70 @@ from app.services.period_plan_service import (
 
 CUTOFF = datetime(2026, 7, 23)
 FLOOR = date(2026, 7, 23)
+
+
+def test_empty_replacement_cannot_rehydrate_full_original_plan(db_session):
+    item = Item(
+        item_code="EMPTY-REPLACEMENT-ROOT",
+        item_name="Empty replacement root",
+        unit="шт",
+        replenishment_method="Производство",
+        status="active",
+    )
+    plan = ProductionPlanHeader(
+        name="Fully completed immutable plan",
+        period_from=FLOOR,
+        period_to=date(2026, 7, 31),
+        status="fixed",
+    )
+    db_session.add_all([item, plan])
+    db_session.flush()
+    line = ProductionPlanLine(
+        plan_id=int(plan.id),
+        item_id=int(item.item_id),
+        bucket_date=FLOOR,
+        qty=Decimal("10"),
+        accepted_output_qty=Decimal("10"),
+        remaining_output_qty=Decimal("0"),
+    )
+    parent = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        config_snapshot={},
+    )
+    db_session.add_all([line, parent])
+    db_session.flush()
+    candidate = PlanningRun(
+        status="BUILDING_SNAPSHOT",
+        prior_run_id=int(parent.run_id),
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        config_snapshot={},
+    )
+    db_session.add(candidate)
+    db_session.flush()
+
+    with pytest.raises(
+        LedgerPoolUnavailable,
+        match="replacement candidate has no persisted remaining roots",
+    ):
+        period_plan_service._freeze_one_run(
+            db_session,
+            candidate,
+            plan,
+            shared_pools=None,
+            trace=None,
+            now=CUTOFF,
+            new_version=1,
+            cutoff_date=FLOOR,
+        )
+
+    assert db_session.query(MrpRunRoot).filter(
+        MrpRunRoot.run_id == int(candidate.run_id)
+    ).count() == 0
 
 
 @pytest.fixture(autouse=True)
@@ -270,7 +338,8 @@ def test_planned_production_orders_are_linked_back_to_their_requirement(db_sessi
     """`ordered_qty`/`unassigned_qty` were dead: the reader searched `req:<id>`
     while the writer stamped `mrp_requirement:<id>`."""
     item = _item(db_session, "DEMAND-REF")
-    _bom(db_session, item, {_item(db_session, "DEMAND-REF-C", method="Покупка"): 1.0})
+    child = _item(db_session, "DEMAND-REF-C", method="Покупка")
+    _bom(db_session, item, {child: 1.0})
     plan = ProductionPlanHeader(
         name="август", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
         status="draft", created_by="test",
@@ -293,6 +362,20 @@ def test_planned_production_orders_are_linked_back_to_their_requirement(db_sessi
         run_id=run.run_id, item_id=item.item_id,
     ).one()
     assert order.demand_ref == f"mrp_requirement:{int(requirement.id)}"
+
+    [edge] = db_session.query(MrpFreezeComponent).filter_by(
+        run_id=int(run.run_id), parent_item_id=int(item.item_id)
+    ).all()
+    assert edge.root_item_id == item.item_id
+    assert edge.spec_ref
+    assert edge.child_spec_ref == ""
+    frozen_nodes = db_session.query(MrpFreezeBomNode).filter_by(
+        run_id=int(run.run_id), root_item_id=int(item.item_id)
+    ).all()
+    assert {(row.item_id, row.replenishment_mode) for row in frozen_nodes} == {
+        (item.item_id, "make"),
+        (child.item_id, "buy"),
+    }
 
     payload = build_period_plan_execution_snapshot(
         db_session, plan.id, run_id=int(run.run_id),

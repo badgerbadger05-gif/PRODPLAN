@@ -387,6 +387,7 @@ class ProductionResourceBase(BaseModel):
     work_schedule: Optional[str] = '5/2'
     daily_work_hours: float = 8.0
     buffer_days: int = 0
+    is_kitting: bool = False
 
 
 class ProductionResourceCreate(ProductionResourceBase):

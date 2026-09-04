@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +8,13 @@ from app.services.item_ledger.drum_scheduler import (
     AssemblyRateProfile,
     QueueLine,
     build_drum_plan,
+)
+from app.services.item_ledger.drum_schedule_persistence import (
+    _slot_readiness_payload,
+)
+from app.services.item_ledger.drum_saved_calendar import (
+    DrumSavedCalendarError,
+    saved_working_days,
 )
 
 
@@ -20,6 +28,7 @@ def test_readiness_gate_allows_ready_younger_line_to_pass_blocked_old_line():
         planned_output_qty=Decimal("1"),
         accepted_plan_output_qty=Decimal("0"),
         original_priority=("old",),
+        assembly_remaining_qty=Decimal("1"),
         ready_qty=Decimal("0"),
         readiness_status="blocked",
     )
@@ -32,6 +41,7 @@ def test_readiness_gate_allows_ready_younger_line_to_pass_blocked_old_line():
         planned_output_qty=Decimal("1"),
         accepted_plan_output_qty=Decimal("0"),
         original_priority=("young",),
+        assembly_remaining_qty=Decimal("1"),
         ready_qty=Decimal("1"),
         readiness_status="ready",
     )
@@ -50,11 +60,14 @@ def test_readiness_gate_allows_ready_younger_line_to_pass_blocked_old_line():
 
     assert [(slot.queue_line_id, slot.slot_date) for slot in plan.slots] == [
         (2, date(2026, 9, 3)),
-        (1, date(2026, 9, 4)),
     ]
-    assert [slot.readiness_phase for slot in plan.slots] == ["now", "blocked"]
+    assert [slot.readiness_phase for slot in plan.slots] == ["now"]
+    assert [(gap.queue_line_id, gap.readiness_phase) for gap in plan.gaps] == [
+        (1, "blocked")
+    ]
     assert plan.metrics["total_open_qty"] == "2"
-    assert plan.metrics["total_slot_qty"] == "2"
+    assert plan.metrics["total_slot_qty"] == "1"
+    assert plan.metrics["total_gap_qty"] == "1"
 
 
 def test_readiness_curve_delays_each_increment_until_its_available_date():
@@ -67,6 +80,7 @@ def test_readiness_curve_delays_each_increment_until_its_available_date():
         planned_output_qty=Decimal("3"),
         accepted_plan_output_qty=Decimal("0"),
         original_priority=("old",),
+        assembly_remaining_qty=Decimal("3"),
         readiness_status="recoverable",
         readiness_curve=(
             ("now", Decimal("1"), date(2026, 9, 3)),
@@ -93,6 +107,55 @@ def test_readiness_curve_delays_each_increment_until_its_available_date():
     ]
 
 
+def test_readiness_source_does_not_override_oldest_first_on_same_date():
+    day = date(2026, 9, 3)
+    older = QueueLine(
+        queue_line_id=1,
+        plan_id=1,
+        plan_line_id=1,
+        item_id=10,
+        sort_key="001",
+        planned_output_qty=Decimal("1"),
+        accepted_plan_output_qty=Decimal("0"),
+        original_priority=("old",),
+        assembly_remaining_qty=Decimal("1"),
+        readiness_status="recoverable",
+        readiness_curve=(("transfer", Decimal("1"), day),),
+    )
+    younger = QueueLine(
+        queue_line_id=2,
+        plan_id=2,
+        plan_line_id=2,
+        item_id=20,
+        sort_key="002",
+        planned_output_qty=Decimal("1"),
+        accepted_plan_output_qty=Decimal("0"),
+        original_priority=("young",),
+        assembly_remaining_qty=Decimal("1"),
+        readiness_status="ready",
+        readiness_curve=(("now", Decimal("1"), day),),
+    )
+
+    plan = build_drum_plan(
+        (younger, older),
+        {
+            10: (AssemblyRateProfile(1, Decimal("1")),),
+            20: (AssemblyRateProfile(1, Decimal("1")),),
+        },
+        {day: True},
+        schedule_from=day,
+        schedule_to=day,
+        resource_capacity_by_id={1: Decimal("1")},
+    )
+
+    assert [(slot.queue_line_id, slot.readiness_phase) for slot in plan.slots] == [
+        (1, "transfer")
+    ]
+    assert [(gap.queue_line_id, gap.gap_qty) for gap in plan.gaps] == [
+        (2, Decimal("1"))
+    ]
+
+
 def _line(line_id: int, qty: str, *, sort_key: str, item_id: int = 1) -> QueueLine:
     return QueueLine(
         queue_line_id=line_id,
@@ -103,6 +166,9 @@ def _line(line_id: int, qty: str, *, sort_key: str, item_id: int = 1) -> QueueLi
         planned_output_qty=Decimal(qty),
         accepted_plan_output_qty=Decimal("0"),
         original_priority=(sort_key,),
+        assembly_remaining_qty=Decimal(qty),
+        ready_qty=Decimal(qty),
+        readiness_status="ready",
     )
 
 
@@ -124,7 +190,7 @@ def test_drum_splits_fifo_and_exposes_horizon_gap() -> None:
     assert [(row.queue_line_id, row.gap_qty) for row in result.gaps] == [
         (2, Decimal("3"))
     ]
-    assert result.gaps[0].readiness_phase == "unavailable"
+    assert result.gaps[0].readiness_phase == "now"
     assert Decimal(result.metrics["total_open_qty"]) == Decimal("13")
     assert Decimal(result.metrics["total_slot_qty"]) == Decimal("10")
     assert Decimal(result.metrics["total_gap_qty"]) == Decimal("3")
@@ -172,8 +238,73 @@ def test_drum_is_deterministic_and_respects_non_workday() -> None:
     second = build_drum_plan(**kwargs)
 
     assert first == second
+    assert first.working_days == (date(2026, 7, 28),)
+    assert first.resource_horizon_ends == ()
+    assert first.resource_daily_capacities == ((10, Decimal("4")),)
     assert [row.queue_line_id for row in first.slots] == [1, 2]
     assert {row.slot_date for row in first.slots} == {date(2026, 7, 28)}
+
+
+def test_weekend_cannot_be_overridden_to_working_day() -> None:
+    saturday = date(2026, 9, 5)
+    monday = date(2026, 9, 7)
+    result = build_drum_plan(
+        (_line(1, "1", sort_key="a"),),
+        {1: (AssemblyRateProfile(10, Decimal("1")),)},
+        {saturday: True, monday: True},
+        schedule_from=saturday,
+        schedule_to=monday,
+        resource_capacity_by_id={10: Decimal("1")},
+    )
+
+    assert result.working_days == (monday,)
+    assert result.slots[0].slot_date == monday
+
+
+def test_saved_drum_calendar_rejects_weekend_as_working_day() -> None:
+    schedule = SimpleNamespace(
+        schedule_from=date(2026, 9, 4),
+        schedule_to=date(2026, 9, 7),
+        working_days=["2026-09-05"],
+    )
+
+    with pytest.raises(DrumSavedCalendarError, match="Saturday or Sunday"):
+        saved_working_days(schedule)
+
+
+def test_drum_rejects_resource_horizon_without_a_working_day() -> None:
+    saturday = date(2026, 9, 5)
+    sunday = date(2026, 9, 6)
+
+    with pytest.raises(ValueError, match="contains no working day"):
+        build_drum_plan(
+            (_line(1, "1", sort_key="a"),),
+            {1: (AssemblyRateProfile(10, Decimal("1")),)},
+            {saturday: True, sunday: True},
+            schedule_from=saturday,
+            schedule_to=sunday,
+            resource_capacity_by_id={10: Decimal("1")},
+        )
+
+
+@pytest.mark.parametrize("remaining", ["-1", "NaN"])
+def test_drum_rejects_invalid_saved_remaining(remaining: str) -> None:
+    line = _line(1, "1", sort_key="a")
+    line = QueueLine(
+        **{
+            **line.__dict__,
+            "assembly_remaining_qty": Decimal(remaining),
+        }
+    )
+    with pytest.raises(ValueError, match="invalid saved remaining quantity"):
+        build_drum_plan(
+            (line,),
+            {1: (AssemblyRateProfile(10, Decimal("1")),)},
+            {date(2026, 9, 7): True},
+            schedule_from=date(2026, 9, 7),
+            schedule_to=date(2026, 9, 7),
+            resource_capacity_by_id={10: Decimal("1")},
+        )
 
 
 def test_shared_resource_books_capacity_units_not_sku_units() -> None:
@@ -202,9 +333,8 @@ def test_shared_resource_books_capacity_units_not_sku_units() -> None:
         (2, Decimal("70"))
     ]
 
-    rates = {1: Decimal("1"), 2: Decimal("5")}
     consumed = sum(
-        (slot.slot_qty / rates[slot.item_id] for slot in result.slots),
+        (slot.capacity_load for slot in result.slots),
         Decimal("0"),
     )
     assert consumed == Decimal("10")
@@ -236,9 +366,8 @@ def test_shared_resource_is_not_starved_by_foreign_sku_units() -> None:
         (2, Decimal("13"))
     ]
 
-    rates = {1: Decimal("10"), 2: Decimal("1")}
     consumed = sum(
-        (slot.slot_qty / rates[slot.item_id] for slot in result.slots),
+        (slot.capacity_load for slot in result.slots),
         Decimal("0"),
     )
     assert consumed == Decimal("10")
@@ -264,6 +393,11 @@ def test_per_resource_horizon_stops_short_of_the_global_window() -> None:
     )
 
     slots = {(row.queue_line_id, row.slot_date): row.slot_qty for row in result.slots}
+    assert result.resource_horizon_ends == ((10, first),)
+    assert result.resource_daily_capacities == (
+        (10, Decimal("5")),
+        (11, Decimal("5")),
+    )
     # Resource 10 closes after day one; resource 11 keeps the full window.
     assert slots == {
         (1, first): Decimal("5"),
@@ -312,3 +446,149 @@ def test_drum_rejects_fractional_finished_assembly_quantity() -> None:
             schedule_to=date(2026, 7, 27),
             resource_capacity_by_id={10: Decimal("1")},
         )
+
+
+def test_drum_reads_saved_remaining_instead_of_recomputing_plan_delta() -> None:
+    line = _line(1, "10", sort_key="a")
+    line = QueueLine(
+        **{
+            **line.__dict__,
+            "accepted_plan_output_qty": Decimal("2"),
+            "assembly_remaining_qty": Decimal("3"),
+            "ready_qty": Decimal("3"),
+        }
+    )
+    result = build_drum_plan(
+        (line,),
+        {1: (AssemblyRateProfile(10, Decimal("1")),)},
+        {date(2026, 7, 27): True},
+        schedule_from=date(2026, 7, 27),
+        schedule_to=date(2026, 7, 27),
+        resource_capacity_by_id={10: Decimal("10")},
+    )
+
+    assert result.metrics["total_open_qty"] == "3"
+    assert result.slots[0].slot_qty == Decimal("3")
+
+
+def test_drum_rejects_a_decreasing_readiness_curve_instead_of_clamping_it() -> None:
+    line = _line(1, "2", sort_key="a")
+    line = QueueLine(
+        **{
+            **line.__dict__,
+            "readiness_curve": (
+                ("now", Decimal("2"), date(2026, 7, 27)),
+                ("transfer", Decimal("1"), date(2026, 7, 28)),
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="readiness curve decreases"):
+        build_drum_plan(
+            (line,),
+            {1: (AssemblyRateProfile(10, Decimal("1")),)},
+            {},
+            schedule_from=date(2026, 7, 27),
+            schedule_to=date(2026, 7, 28),
+            resource_capacity_by_id={10: Decimal("10")},
+        )
+
+
+@pytest.mark.parametrize("cumulative", ["0.5", "NaN", "-1"])
+def test_drum_rejects_non_whole_saved_readiness_curve(cumulative: str) -> None:
+    line = _line(1, "2", sort_key="a")
+    line = QueueLine(
+        **{
+            **line.__dict__,
+            "readiness_curve": (
+                ("now", Decimal(cumulative), date(2026, 7, 27)),
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="saved readiness cumulative quantity"):
+        build_drum_plan(
+            (line,),
+            {1: (AssemblyRateProfile(10, Decimal("1")),)},
+            {},
+            schedule_from=date(2026, 7, 27),
+            schedule_to=date(2026, 7, 27),
+            resource_capacity_by_id={10: Decimal("10")},
+        )
+
+
+@pytest.mark.parametrize("ready_qty", ["0.5", "NaN", "-1"])
+def test_drum_rejects_non_whole_saved_ready_quantity(ready_qty: str) -> None:
+    line = _line(1, "2", sort_key="a")
+    line = QueueLine(
+        **{
+            **line.__dict__,
+            "ready_qty": Decimal(ready_qty),
+            "readiness_curve": (),
+        }
+    )
+
+    with pytest.raises(ValueError, match="saved ready quantity"):
+        build_drum_plan(
+            (line,),
+            {1: (AssemblyRateProfile(10, Decimal("1")),)},
+            {},
+            schedule_from=date(2026, 7, 27),
+            schedule_to=date(2026, 7, 27),
+            resource_capacity_by_id={10: Decimal("10")},
+        )
+
+
+def test_blocked_gap_is_dated_on_the_last_workday_not_the_weekend() -> None:
+    line = _line(1, "2", sort_key="a")
+    line = QueueLine(
+        **{
+            **line.__dict__,
+            "ready_qty": Decimal("0"),
+            "readiness_status": "blocked",
+        }
+    )
+    result = build_drum_plan(
+        (line,),
+        {1: (AssemblyRateProfile(10, Decimal("1")),)},
+        {},
+        schedule_from=date(2026, 9, 4),  # Friday
+        schedule_to=date(2026, 9, 6),  # Sunday
+        resource_capacity_by_id={10: Decimal("10")},
+    )
+
+    assert result.slots == ()
+    assert result.gaps[0].gap_date == date(2026, 9, 4)
+    assert result.gaps[0].readiness_phase == "blocked"
+
+
+def test_tile_curve_keeps_saved_explanations_for_every_horizon() -> None:
+    readiness = SimpleNamespace(
+        readiness_curve=[
+            {
+                "horizon": "now",
+                "cumulative_qty": "0",
+                "available_date": None,
+                "actions": [],
+                "required_actions": [],
+                "blockers": [{"reason": "HORIZON_DOES_NOT_ALLOW_REPLENISHMENT"}],
+            },
+            {
+                "horizon": "launch",
+                "cumulative_qty": "1",
+                "available_date": "2026-09-08",
+                "actions": [{"action_kind": "make", "item_id": 20, "qty": "1"}],
+                "required_actions": [{"action_kind": "buy", "item_id": 30, "qty": "2"}],
+                "blockers": [{"reason": "LEAD_TIME_MISSING"}],
+            },
+        ]
+    )
+
+    ready_date, curve, _actions = _slot_readiness_payload(
+        readiness,
+        "launch",
+        Decimal("1"),
+    )
+
+    assert ready_date == date(2026, 9, 8)
+    assert curve[0]["blockers"][0]["reason"] == "HORIZON_DOES_NOT_ALLOW_REPLENISHMENT"
+    assert curve[1]["required_actions"][0]["action_kind"] == "buy"

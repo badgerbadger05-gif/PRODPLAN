@@ -1543,7 +1543,7 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
         )
         db.add(plan)
         db.flush()
-        db.add(models.PlanningRun(
+        run = models.PlanningRun(
             status="FIXED_SNAPSHOT",
             config_snapshot={},
             ledger_generation_id=int(generation.id),
@@ -1553,7 +1553,8 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
             period_from=start,
             period_to=date(2026, 12, 31),
             fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
-        ))
+        )
+        db.add(run)
         line = models.ProductionPlanLine(
             plan_id=int(plan.id),
             item_id=int(item.item_id),
@@ -1561,6 +1562,14 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
             qty=qty,
         )
         db.add(line)
+        db.flush()
+        db.add(models.MrpRunRoot(
+            run_id=int(run.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=qty,
+            accepted_qty=Decimal("0"),
+            remaining_qty=qty,
+        ))
         db.flush()
         lines.append(line)
 

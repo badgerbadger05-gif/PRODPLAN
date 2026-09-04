@@ -98,9 +98,11 @@ def test_pinned_non_default_child_spec_drives_mrp_walkers_and_exports(db_session
     assert gross[pinned_leaf.item_id][date(2026, 7, 30)] == 30.0
     assert default_leaf.item_id not in gross
     assert (
+        root.item_id,
         child.item_id,
         pinned_leaf.item_id,
         pinned_spec.spec_id,
+        None,
         5.0,
     ) in trace.component_norms
 

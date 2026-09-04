@@ -121,8 +121,20 @@ def _plan_with_run(
         item_id=int(item.item_id),
         bucket_date=plan_period_from,
         qty=Decimal(str(qty)),
+        accepted_output_qty=Decimal("0"),
+        remaining_output_qty=Decimal(str(qty)),
     )
     db.add(line)
+    db.flush()
+    db.add(
+        models.MrpRunRoot(
+            run_id=int(run.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal(str(qty)),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal(str(qty)),
+        )
+    )
     db.flush()
     return plan, run, line
 
@@ -330,8 +342,20 @@ def test_exact_manufacture_provenance_allocates_oldest_first_inside_plan(db_sess
         item_id=int(item.item_id),
         bucket_date=date(2026, 7, 2),
         qty=Decimal("2"),
+        accepted_output_qty=Decimal("0"),
+        remaining_output_qty=Decimal("2"),
     )
     db_session.add(second_exact_line)
+    db_session.flush()
+    db_session.add(
+        models.MrpRunRoot(
+            run_id=int(exact_run.run_id),
+            plan_line_id=int(second_exact_line.id),
+            planned_qty=Decimal("2"),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal("2"),
+        )
+    )
     db_session.flush()
     requirement = models.MrpRequirement(
         run_id=int(exact_run.run_id),
@@ -785,6 +809,113 @@ def test_live_plan_allocation_appends_only_new_facts_in_next_generation(
     assert root.remaining_qty == Decimal("3")
 
 
+def test_rebase_accepts_late_backdated_output_and_preserves_plan_conservation(
+    db_session,
+):
+    generation_a = _building_generation(
+        db_session,
+        key="rebase-late-a",
+        cutoff=datetime(2026, 7, 10, tzinfo=timezone.utc),
+    )
+    generation_b = _building_generation(
+        db_session,
+        key="rebase-late-b",
+        cutoff=datetime(2026, 8, 20, tzinfo=timezone.utc),
+    )
+    item = _item(db_session, "ASM-REBASE-LATE")
+    plan, old_run, line = _plan_with_run(
+        db_session,
+        generation=generation_a,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("12"),
+        period_from=date(2026, 7, 1),
+        fixed_at=datetime(2026, 6, 30, tzinfo=timezone.utc),
+    )
+    _sline(
+        db_session,
+        batch=generation_a.physical_import_batch,
+        item=item,
+        qty="4",
+        at=datetime(2026, 7, 5, tzinfo=timezone.utc),
+        recorder="rebase-old-output",
+        content_hash="a" * 64,
+    )
+    materialize_assembly_output_allocations(db_session, int(generation_a.id))
+
+    old_run.status = "REBASED"
+    generation_a.status = "accepted"
+    db_session.flush()
+    successor = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=int(generation_b.id),
+        ledger_cutoff=generation_b.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+        started_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+        prior_run_id=int(old_run.run_id),
+    )
+    db_session.add(successor)
+    db_session.flush()
+    db_session.add(
+        models.MrpRunRoot(
+            run_id=int(successor.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal("8"),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal("8"),
+        )
+    )
+    # Imported only after rebase, but historically posted after the original
+    # plan fixation and before the successor run existed.
+    _sline(
+        db_session,
+        batch=generation_b.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 7, 8, tzinfo=timezone.utc),
+        recorder="rebase-late-output",
+        content_hash="b" * 64,
+    )
+
+    result = materialize_assembly_output_allocations(db_session, int(generation_b.id))
+
+    assert result["allocations"] == 1
+    assert Decimal(result["allocated_qty"]) == Decimal("3")
+    db_session.refresh(line)
+    assert line.qty == Decimal("12")
+    assert line.accepted_output_qty == Decimal("7")
+    assert line.remaining_output_qty == Decimal("5")
+    assert line.qty == line.accepted_output_qty + line.remaining_output_qty
+
+    roots = {
+        int(root.run_id): root
+        for root in db_session.query(models.MrpRunRoot)
+        .filter_by(plan_line_id=int(line.id))
+        .all()
+    }
+    assert roots[int(old_run.run_id)].planned_qty == Decimal("12")
+    assert roots[int(old_run.run_id)].accepted_qty == Decimal("4")
+    assert roots[int(old_run.run_id)].remaining_qty == Decimal("8")
+    assert roots[int(successor.run_id)].planned_qty == Decimal("8")
+    assert roots[int(successor.run_id)].accepted_qty == Decimal("3")
+    assert roots[int(successor.run_id)].remaining_qty == Decimal("5")
+
+    queue = db_session.query(models.AssemblyQueueLine).filter_by(
+        ledger_generation_id=int(generation_b.id),
+        plan_line_id=int(line.id),
+    ).one()
+    assert queue.planning_run_id == int(successor.run_id)
+    assert queue.planned_output_qty == Decimal("12")
+    assert queue.accepted_plan_output_qty == Decimal("7")
+    assert queue.assembly_remaining_qty == Decimal("5")
+    assert queue.eligible_from.replace(tzinfo=timezone.utc) == plan.fixed_at
+
+
 def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
     cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="drum-from-queue", cutoff=cutoff)
@@ -805,7 +936,7 @@ def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
     )
     db_session.flush()
 
-    _, _, line = _plan_with_run(
+    _, run, line = _plan_with_run(
         db_session,
         generation=generation,
         plan_status="fixed",
@@ -813,6 +944,62 @@ def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
         qty=Decimal("10"),
         period_from=date(2026, 8, 1),
     )
+
+    component = _item(db_session, "ASM-DRUM-COMP")
+    # SQLite drops timezone metadata on reload; construct both sides of the
+    # custody checkpoint from the same persisted cutoff representation.
+    db_session.refresh(generation)
+    db_session.add_all(
+        [
+            models.ProductionMaterialCustodyProjectionManifest(
+                ledger_generation_id=generation.id,
+                cutoff=generation.cutoff,
+                status="complete",
+                is_baseline=True,
+                source_event_high_watermark_id=0,
+            ),
+            models.MrpFreezeComponent(
+                run_id=run.run_id,
+                freeze_version=1,
+                root_item_id=item.item_id,
+                parent_item_id=item.item_id,
+                component_item_id=component.item_id,
+                spec_ref="root-spec",
+                child_spec_ref="",
+                norm_qty_per_unit=Decimal("1"),
+            ),
+            models.MrpFreezeBomNode(
+                run_id=run.run_id,
+                freeze_version=1,
+                root_item_id=item.item_id,
+                item_id=item.item_id,
+                spec_ref="root-spec",
+                replenishment_mode="make",
+                replenishment_time_days=0,
+                resource_id=resource.resource_id,
+                material_warehouse_ref1c="ASSEMBLY",
+                output_warehouse_ref1c="ASSEMBLY",
+            ),
+            models.MrpFreezeBomNode(
+                run_id=run.run_id,
+                freeze_version=1,
+                root_item_id=item.item_id,
+                item_id=component.item_id,
+                spec_ref="",
+                replenishment_mode="buy",
+                replenishment_time_days=0,
+                material_warehouse_ref1c="ASSEMBLY",
+                output_warehouse_ref1c="ASSEMBLY",
+            ),
+            models.StockBin(
+                ledger_generation_id=generation.id,
+                item_id=component.item_id,
+                warehouse_ref1c="ASSEMBLY",
+                on_hand=Decimal("7"),
+            ),
+        ]
+    )
+    db_session.flush()
 
     _sline(
         db_session,
@@ -837,6 +1024,34 @@ def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
     assert Decimal(schedule["total_slot_qty"]) == Decimal("7")
     assert db_session.query(models.DrumSlot).count() == 1
     assert db_session.query(models.DrumSlot).one().slot_qty == Decimal("7")
+
+
+def test_output_allocation_fails_closed_when_fixed_run_root_is_missing(db_session):
+    cutoff = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="missing-root", cutoff=cutoff)
+    item = _item(db_session, "ASM-MISSING-ROOT")
+    _, run, _line = _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+        period_from=date(2026, 8, 1),
+    )
+    db_session.query(models.MrpRunRoot).filter_by(run_id=int(run.run_id)).delete()
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        recorder="missing-root-output",
+    )
+
+    with pytest.raises(ValueError, match="missing fixed MRP root"):
+        materialize_assembly_output_allocations(db_session, int(generation.id))
+
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 0
 
 
 def test_fully_allocated_queue_line_is_fulfilled_and_excluded_from_snapshot(

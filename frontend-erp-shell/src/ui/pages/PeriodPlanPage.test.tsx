@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { PeriodPlanPage } from './PeriodPlanPage'
@@ -49,6 +49,12 @@ const fixedPlan: PeriodPlan = {
   status: 'fixed',
   fixed_at: '2026-04-05T12:00:00',
   fixed_by: 'ivan',
+  planned_output_qty: 10,
+  accepted_plan_output_qty: 2,
+  assembly_remaining_qty: 8,
+  plan_output_truth_status: 'accepted',
+  plan_output_truth_reason: null,
+  plan_output_generation_id: 7,
 }
 
 const closedPlan: PeriodPlan = {
@@ -59,6 +65,7 @@ const closedPlan: PeriodPlan = {
 }
 
 function makeMatrix(plan: PeriodPlan): PeriodPlanMatrix {
+  const outputAvailable = plan.plan_output_truth_status === 'accepted'
   return {
     plan,
     buckets: ['2026-05-01', '2026-05-08'],
@@ -70,10 +77,23 @@ function makeMatrix(plan: PeriodPlan): PeriodPlanMatrix {
         item_name: 'Насос ГА-1',
         item_article: 'ART-501',
         total_qty: 10,
+        planned_output_qty: outputAvailable ? 10 : null,
+        accepted_plan_output_qty: outputAvailable ? 2 : null,
+        assembly_remaining_qty: outputAvailable ? 8 : null,
         buckets: { '2026-05-01': 4, '2026-05-08': 6 },
         locked_buckets: {},
+        output_by_bucket: outputAvailable ? {
+          '2026-05-01': { planned_output_qty: 4, accepted_plan_output_qty: 2, assembly_remaining_qty: 2 },
+          '2026-05-08': { planned_output_qty: 6, accepted_plan_output_qty: 0, assembly_remaining_qty: 6 },
+        } : {},
       },
     ],
+    planned_output_qty: outputAvailable ? 10 : null,
+    accepted_plan_output_qty: outputAvailable ? 2 : null,
+    assembly_remaining_qty: outputAvailable ? 8 : null,
+    plan_output_truth_status: outputAvailable ? 'accepted' : 'not_applicable',
+    plan_output_truth_reason: outputAvailable ? null : 'План ещё не зафиксирован',
+    plan_output_generation_id: outputAvailable ? 7 : null,
     total_qty: 10,
     grand_total: 10,
     total: 10,
@@ -112,7 +132,11 @@ const journalResponse: ExecutionJournalResponse = {
     },
   ],
   summary: {
+    truth_status: 'accepted',
     total_items: 1,
+    planned_output_qty: 10,
+    accepted_plan_output_qty: 2,
+    assembly_remaining_qty: 8,
     fully_covered: 0,
     partially_covered: 1,
     not_covered: 0,
@@ -343,7 +367,7 @@ describe('PeriodPlanPage — list view', () => {
     expect(screen.getByRole('button', { name: 'Новый план' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Название/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^Статус/ })).toBeInTheDocument()
-    expect(screen.getByText('Выполнение')).toBeInTheDocument()
+    expect(screen.getByText('Исполнение потребностей MRP')).toBeInTheDocument()
     expect(screen.getByText('62,9%')).toBeInTheDocument()
     expect(screen.getByText('Недоступно: Нет данных')).toBeInTheDocument()
   })
@@ -506,6 +530,17 @@ describe('PeriodPlanPage — list view', () => {
     expect(refresh.defaultPrevented).toBe(true)
     expect(screen.getByText('Планирование / Планирование выпуска')).toBeInTheDocument()
   })
+
+  it('shows exact saved plan output facts in the plan list without using MRP execution as a surrogate', async () => {
+    vi.mocked(periodPlanSvc.listPeriodPlans).mockResolvedValue({ rows: [fixedPlan], total: 1 })
+    renderAt('/period-plan')
+
+    const row = await screen.findByRole('row', { name: /МАЙ 2026/ })
+    const facts = within(row).getByLabelText('Факт выпуска плана')
+    expect(facts).toHaveTextContent('Исходный план 10')
+    expect(facts).toHaveTextContent('Принято Ledger 2')
+    expect(facts).toHaveTextContent('Осталось выпустить 8')
+  })
 })
 
 // ── Detail view ───────────────────────────────────────────────────────────────
@@ -520,9 +555,35 @@ describe('PeriodPlanPage — detail view', () => {
     expect(await screen.findByText('Насос ГА-1')).toBeInTheDocument()
     expect(screen.getByText('Код')).toBeInTheDocument()
     expect(screen.getByText('Номенклатура')).toBeInTheDocument()
-    expect(screen.getByText('Итого')).toBeInTheDocument()
+    expect(screen.getByText('Итого выпуска')).toBeInTheDocument()
     // Plan name surfaces in the document window title.
     expect(screen.getAllByText('МАЙ 2026').length).toBeGreaterThan(0)
+  })
+
+  it('shows saved plan-output totals and per-bucket facts on a fixed plan without client arithmetic', async () => {
+    vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockResolvedValue(makeMatrix(fixedPlan))
+    renderAt('/period-plan/123')
+
+    await screen.findByText('Насос ГА-1')
+    const summary = document.querySelector('.periodPlanOutputFacts') as HTMLElement
+    expect(within(summary).getByLabelText('Факт выпуска плана')).toHaveTextContent('Исходный план 10')
+    expect(within(summary).getByLabelText('Факт выпуска плана')).toHaveTextContent('Принято Ledger 2')
+    expect(within(summary).getByLabelText('Факт выпуска плана')).toHaveTextContent('Осталось выпустить 8')
+
+    const facts = screen.getAllByLabelText('Факт выпуска плана')
+    expect(facts.some((element) => element.textContent?.includes('Исходный план 6Принято Ledger 0Осталось выпустить 6'))).toBe(true)
+  })
+
+  it('fails the plan-output card closed when the persisted context is unavailable', async () => {
+    renderAt('/period-plan/123')
+
+    await screen.findByText('Насос ГА-1')
+    const summary = document.querySelector('.periodPlanOutputFacts') as HTMLElement
+    const facts = within(summary).getByLabelText('Факт выпуска плана')
+    expect(facts).toHaveTextContent('Исходный план Недоступно')
+    expect(facts).toHaveTextContent('Принято Ledger Недоступно')
+    expect(facts).toHaveTextContent('Осталось выпустить Недоступно')
+    expect(within(summary).getByText('Факт выпуска плана недоступен')).toBeInTheDocument()
   })
 
   it('runs nomenclature search while typing in the draft search box', async () => {
@@ -560,6 +621,10 @@ describe('PeriodPlanPage — detail view', () => {
     expect(vi.mocked(periodPlanSvc.getExecutionJournal).mock.calls[0][0]).toBe(123)
     // Journal-specific column header appears.
     expect(await screen.findByText('Тип')).toBeInTheDocument()
+    const journalFacts = screen.getAllByLabelText('Факт выпуска плана').at(-1)
+    expect(journalFacts).toHaveTextContent('Исходный план 10')
+    expect(journalFacts).toHaveTextContent('Принято Ledger 2')
+    expect(journalFacts).toHaveTextContent('Осталось выпустить 8')
   })
 
   it('loads the accepted execution snapshot when the plan has no linked MRP runs', async () => {

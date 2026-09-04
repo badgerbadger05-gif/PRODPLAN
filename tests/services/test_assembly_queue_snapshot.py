@@ -66,11 +66,14 @@ def _run(db, *, generation, plan, status: str = "FIXED_SNAPSHOT"):
 
 
 def _plan_line(db, *, plan, item, bucket_date: date, qty):
+    planned = Decimal(str(qty))
     row = models.ProductionPlanLine(
         plan_id=plan.id,
         item_id=item.item_id,
         bucket_date=bucket_date,
-        qty=Decimal(str(qty)),
+        qty=planned,
+        accepted_output_qty=Decimal("0"),
+        remaining_output_qty=planned,
     )
     db.add(row)
     db.flush()
@@ -116,6 +119,53 @@ def test_assembly_queue_rejects_divergent_run_and_plan_periods(db_session):
         assembly_queue_snapshot._build_rows(db_session, int(generation.id))
 
 
+def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session):
+    cutoff = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="rebase-plan-truth", cutoff=cutoff)
+    item = models.Item(item_code="FG-REBASE", item_name="Rebased plan truth")
+    plan = _production_plan(
+        db_session,
+        start=date(2026, 8, 1),
+        end=date(2026, 8, 31),
+    )
+    db_session.add_all((item, plan))
+    db_session.flush()
+    old_run = _run(db_session, generation=generation, plan=plan)
+    old_run.status = "REBASED"
+    db_session.flush()
+    successor = _run(db_session, generation=generation, plan=plan)
+    successor.prior_run_id = int(old_run.run_id)
+    successor.started_at = datetime(2026, 8, 15, tzinfo=timezone.utc)
+    line = _plan_line(
+        db_session,
+        plan=plan,
+        item=item,
+        bucket_date=date(2026, 8, 3),
+        qty="12",
+    )
+    line.accepted_output_qty = Decimal("10")
+    line.remaining_output_qty = Decimal("2")
+    db_session.add(
+        models.MrpRunRoot(
+            run_id=int(successor.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal("2"),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal("2"),
+        )
+    )
+    db_session.flush()
+
+    [row] = assembly_queue_snapshot._build_rows(db_session, int(generation.id))
+    payload = row["payload"]
+
+    assert payload["run_id"] == int(successor.run_id)
+    assert payload["planned_output_qty"] == 12.0
+    assert payload["accepted_plan_output_qty"] == 10.0
+    assert payload["assembly_remaining_qty"] == 2.0
+    assert payload["eligible_from"] == plan.fixed_at
+
+
 def _allocation(
     db,
     *,
@@ -137,6 +187,12 @@ def _allocation(
         match_rule=match_rule,
     )
     db.add(row)
+    accepted = min(
+        Decimal(str(line.qty)),
+        Decimal(str(line.accepted_output_qty or 0)) + Decimal(str(qty)),
+    )
+    line.accepted_output_qty = accepted
+    line.remaining_output_qty = Decimal(str(line.qty)) - accepted
     db.flush()
     return row
 
@@ -356,8 +412,18 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monk
     )
     db_session.add(requirement)
     db_session.flush()
+    # SQLite drops timezone metadata on reload; construct both sides of the
+    # custody checkpoint from the same persisted cutoff representation.
+    db_session.refresh(generation)
     db_session.add_all(
         [
+            models.ProductionMaterialCustodyProjectionManifest(
+                ledger_generation_id=generation.id,
+                cutoff=generation.cutoff,
+                status="complete",
+                is_baseline=True,
+                source_event_high_watermark_id=0,
+            ),
             models.ReservationEntry(
                 ledger_generation_id=generation.id,
                 item_id=component.item_id,
@@ -369,21 +435,46 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monk
                 reserved_qty=Decimal("12"),
                 replenishment_required_qty=Decimal("12"),
             ),
-                models.MrpFreezeComponent(
+            models.MrpFreezeComponent(
                 run_id=run.run_id,
                 freeze_version=1,
+                root_item_id=item.item_id,
                 parent_item_id=item.item_id,
                 component_item_id=component.item_id,
-                spec_ref="test",
-                    norm_qty_per_unit=Decimal("2"),
-                ),
-                models.MrpFreezeComponentCumulative(
-                    run_id=run.run_id,
-                    freeze_version=1,
-                    root_item_id=item.item_id,
-                    component_item_id=component.item_id,
-                    cumulative_norm_qty_per_root_unit=Decimal("2"),
-                ),
+                spec_ref="root-spec",
+                child_spec_ref="",
+                norm_qty_per_unit=Decimal("2"),
+            ),
+            models.MrpFreezeBomNode(
+                run_id=run.run_id,
+                freeze_version=1,
+                root_item_id=item.item_id,
+                item_id=item.item_id,
+                spec_ref="root-spec",
+                replenishment_mode="make",
+                replenishment_time_days=0,
+                resource_id=resource.resource_id,
+                material_warehouse_ref1c="SHELF",
+                output_warehouse_ref1c="SHELF",
+            ),
+            models.MrpFreezeBomNode(
+                run_id=run.run_id,
+                freeze_version=1,
+                root_item_id=item.item_id,
+                item_id=component.item_id,
+                spec_ref="",
+                replenishment_mode="buy",
+                replenishment_time_days=0,
+                material_warehouse_ref1c="SHELF",
+                output_warehouse_ref1c="SHELF",
+            ),
+            models.MrpFreezeComponentCumulative(
+                run_id=run.run_id,
+                freeze_version=1,
+                root_item_id=item.item_id,
+                component_item_id=component.item_id,
+                cumulative_norm_qty_per_root_unit=Decimal("2"),
+            ),
             models.ShelfPolicy(
                 item_id=component.item_id,
                 warehouse_ref1c="SHELF",

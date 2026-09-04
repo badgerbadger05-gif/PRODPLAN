@@ -10,11 +10,32 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services import planning_truth
-from app.services.work_calendar_service import is_workday
+from app.services.item_ledger.drum_saved_calendar import (
+    DrumSavedCalendarError,
+    saved_resource_daily_capacities,
+    saved_resource_horizon_ends,
+    saved_working_days,
+)
 
 
 def _d(value: Any) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value or 0))
+
+
+_CAPACITY_EPSILON = Decimal("0.000000001")
+
+
+def _saved_slot_load(slot: models.DrumSlot) -> Decimal:
+    if slot.capacity_load is None:
+        raise ValueError(
+            f"для плитки #{int(slot.id)} не сохранена нагрузка принятого барабана"
+        )
+    load = _d(slot.capacity_load)
+    if not load.is_finite() or load <= 0:
+        raise ValueError(
+            f"для плитки #{int(slot.id)} сохранена некорректная нагрузка"
+        )
+    return load
 
 
 def move_drum_slot(
@@ -48,6 +69,17 @@ def move_drum_slot(
     schedule = db.get(models.DrumSchedule, int(slot.drum_schedule_id))
     if schedule is None or int(schedule.ledger_generation_id) != int(truth.generation_id):
         raise ValueError("перемещать можно только плитки текущего принятого барабана")
+    try:
+        working_days = set(saved_working_days(schedule))
+        resource_horizon_ends = saved_resource_horizon_ends(schedule)
+        resource_daily_capacities = saved_resource_daily_capacities(schedule)
+    except DrumSavedCalendarError as exc:
+        raise ValueError(f"сохранённый календарь барабана недоступен: {exc}") from exc
+    if str(slot.readiness_phase) in {"blocked", "unavailable"}:
+        raise ValueError(
+            "заблокированный остаток не является календарной плиткой; "
+            "сначала устраните блокеры readiness"
+        )
 
     target_resource = int(new_resource_id or slot.resource_id)
     if target_resource != int(slot.resource_id):
@@ -62,8 +94,16 @@ def move_drum_slot(
         )
     if new_date < (today or date.today()):
         raise ValueError("переносить плитку в прошлое нельзя")
-    if not is_workday(db, new_date):
+    if new_date not in working_days:
         raise ValueError(f"{new_date.isoformat()} — нерабочий день")
+    resource_horizon_end = resource_horizon_ends.get(target_resource)
+    if resource_horizon_end is None:
+        raise ValueError("для участка не сохранён горизонт барабана")
+    if new_date > resource_horizon_end:
+        raise ValueError(
+            f"дата {new_date.isoformat()} вне горизонта участка до "
+            f"{resource_horizon_end.isoformat()}"
+        )
     if slot.readiness_date is not None and new_date < slot.readiness_date:
         raise ValueError(
             "плитка ещё не обеспечена: ближайшая дата готовности "
@@ -81,20 +121,9 @@ def move_drum_slot(
             "resource_id": target_resource,
         }
 
-    rate = (
-        db.query(models.AssemblyRate)
-        .filter(
-            models.AssemblyRate.item_id == int(slot.item_id),
-            models.AssemblyRate.resource_id == target_resource,
-        )
-        .one_or_none()
-    )
-    resource = db.get(models.ProductionResource, target_resource)
-    if rate is None or resource is None or _d(rate.qty_per_capacity) <= 0:
-        raise ValueError("для плитки не настроен однозначный положительный такт участка")
-    capacity = _d(resource.capacity)
-    if capacity <= 0:
-        raise ValueError("для участка не настроена положительная мощность")
+    capacity = resource_daily_capacities.get(target_resource)
+    if capacity is None:
+        raise ValueError("для участка не сохранена мощность принятого барабана")
 
     resource_slots = (
         db.query(models.DrumSlot)
@@ -109,18 +138,6 @@ def move_drum_slot(
         )
         .all()
     )
-    item_ids = {int(row.item_id) for row in resource_slots}
-    rate_rows = (
-        db.query(models.AssemblyRate)
-        .filter(
-            models.AssemblyRate.resource_id == target_resource,
-            models.AssemblyRate.item_id.in_(sorted(item_ids)),
-        )
-        .all()
-    )
-    rate_by_item = {int(row.item_id): _d(row.qty_per_capacity) for row in rate_rows}
-    if any(rate_by_item.get(item_id, Decimal("0")) <= 0 for item_id in item_ids):
-        raise ValueError("не удалось проверить загрузку участка: отсутствует такт изделия")
     # A drop means insertion into the resource timeline, not stacking the tile
     # on top of an already full day.  Repack the target day and its tail in the
     # existing order around the tile pinned to its requested date, carrying
@@ -137,21 +154,20 @@ def move_drum_slot(
 
     def next_workday(candidate: date) -> date:
         day = candidate
-        while day <= schedule.schedule_to and not is_workday(db, day):
+        while day <= resource_horizon_end and day not in working_days:
             day += timedelta(days=1)
         return day
 
-    slot_load = _d(slot.slot_qty) / rate_by_item[int(slot.item_id)]
-    if slot_load > capacity + Decimal("0.0000001"):
+    slot_load = _saved_slot_load(slot)
+    if slot_load > capacity + _CAPACITY_EPSILON:
         raise ValueError(
             f"плитка #{int(slot.id)} целиком не помещается в дневную мощность участка"
         )
     used_by_day: dict[date, Decimal] = {new_date: slot_load}
 
     for row in tail:
-        rate_value = rate_by_item[int(row.item_id)]
-        load = _d(row.slot_qty) / rate_value
-        if load > capacity + Decimal("0.0000001"):
+        load = _saved_slot_load(row)
+        if load > capacity + _CAPACITY_EPSILON:
             raise ValueError(
                 f"плитка #{int(row.id)} целиком не помещается в дневную мощность участка"
             )
@@ -160,12 +176,12 @@ def move_drum_slot(
             current = earliest
         current = next_workday(current)
         while (
-            current <= schedule.schedule_to
+            current <= resource_horizon_end
             and used_by_day.get(current, Decimal("0")) + load
-            > capacity + Decimal("0.0000001")
+            > capacity + _CAPACITY_EPSILON
         ):
             current = next_workday(current + timedelta(days=1))
-        if current > schedule.schedule_to:
+        if current > resource_horizon_end:
             raise ValueError("вставка сдвигает плитки за горизонт барабана")
         placements[int(row.id)] = current
         used_by_day[current] = used_by_day.get(current, Decimal("0")) + load
@@ -176,13 +192,21 @@ def move_drum_slot(
         placed = placements[int(row.id)]
         if row.slot_date == placed:
             continue
-        if row.auto_slot_date is None:
-            row.auto_slot_date = row.slot_date
-        if row.auto_resource_id is None:
+        direct_move = int(row.id) == int(slot.id)
+        if direct_move:
+            if row.auto_slot_date is None:
+                row.auto_slot_date = row.slot_date
+            if row.auto_resource_id is None:
+                row.auto_resource_id = int(row.resource_id)
+            row.manual_moved_at = stamp
+            row.manual_moved_by = actor
+        elif row.manual_moved_at is None:
+            # Cascading is a deterministic consequence of insertion, not a
+            # separate operator decision.  Keep it as the new automatic
+            # placement so the UI does not attribute it to the master.
+            row.auto_slot_date = placed
             row.auto_resource_id = int(row.resource_id)
         row.slot_date = placed
-        row.manual_moved_at = stamp
-        row.manual_moved_by = actor
     db.commit()
     return {
         "ok": True,

@@ -20,6 +20,7 @@ describe('resource form helpers', () => {
       work_schedule: '5/2',
       daily_work_hours: 8,
       buffer_days: 0,
+      is_kitting: false,
     })
     expect(first).not.toBe(second)
   })
@@ -42,6 +43,7 @@ describe('resource form helpers', () => {
       work_schedule: '5/2',
       daily_work_hours: 8,
       buffer_days: 0,
+      is_kitting: false,
     })
   })
 
@@ -62,6 +64,7 @@ describe('resource form helpers', () => {
       work_schedule: '5/2',
       daily_work_hours: 8,
       buffer_days: 0,
+      is_kitting: false,
     })
   })
 

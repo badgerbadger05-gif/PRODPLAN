@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { productionStatusLabel, type MaterialsResponse, type OrderRow } from '../../../domain/productionControl'
 import { dateRu, qty } from '../../../lib/format'
 import { ItemLedgerSummaryBlock } from '../../item-ledger/ItemLedgerSummaryBlock'
+import { OutputFactSummary } from './OutputFactSummary'
 
 type Props = {
   activeRow: OrderRow | null
@@ -17,6 +18,7 @@ type Props = {
   launchQuantity: number | null
   onLaunchQuantityChange: (value: number) => void
   onOrderQuantitySave: (productId: number, value: number) => Promise<void>
+  outputFactsAvailable: boolean
 }
 
 export function ProductionDetailPane({
@@ -33,6 +35,7 @@ export function ProductionDetailPane({
   launchQuantity,
   onLaunchQuantityChange,
   onOrderQuantitySave,
+  outputFactsAvailable,
 }: Props) {
   const [batchValue, setBatchValue] = useState('')
   const [batchSaving, setBatchSaving] = useState(false)
@@ -217,6 +220,7 @@ export function ProductionDetailPane({
         <>
           <div className="detailTitle">{activeRow.item_name}</div>
           <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
+          <OutputFactSummary scope={activeRow.product_id == null ? 'proposal' : 'order'} planned={activeRow.quantity} accepted={activeRow.produced_qty} remaining={activeRow.remaining_qty} available={outputFactsAvailable} />
           <div className="detailGrid">
             <span>Заказ</span><strong>{activeOrderNumber()}</strong>
             {activeRow.order_ref1c && (
@@ -225,7 +229,6 @@ export function ProductionDetailPane({
               </>
             )}
             <span>Источник</span><strong>{sourceDisplayLabel}</strong>
-            <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>
             {activeRow.work_item_id != null ? (
               <span className="batchEditCell">

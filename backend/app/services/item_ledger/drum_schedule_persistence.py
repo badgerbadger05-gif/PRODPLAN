@@ -14,11 +14,17 @@ from app.services.work_calendar_service import is_workday
 
 from .assembly_queue_snapshot import materialize_assembly_queue_lines
 from .assembly_readiness_persistence import materialize_assembly_readiness
+from .drum_saved_calendar import (
+    DrumSavedCalendarError,
+    saved_resource_daily_capacities,
+    saved_resource_horizon_ends,
+    saved_working_days,
+)
 from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
 STAGE = "drum_schedule"
-ALGORITHM_VERSION = "drum-schedule/6-root-scoped-readiness"
+ALGORITHM_VERSION = "drum-schedule/10-saved-capacity"
 
 
 def _d(value: Any) -> Decimal:
@@ -50,6 +56,12 @@ def _slot_readiness_payload(
             "horizon": str(point.get("horizon") or ""),
             "cumulative_qty": str(slot_qty if _READINESS_RANK.get(str(point.get("horizon")), 99) >= phase_rank else Decimal("0")),
             "available_date": point.get("available_date"),
+            # These are deliberately line-level explanations.  The tile owns
+            # a bucket quantity, while the master also needs to see what blocks
+            # the remaining saved queue line at every horizon.
+            "actions": list(point.get("actions") or []),
+            "required_actions": list(point.get("required_actions") or []),
+            "blockers": list(point.get("blockers") or []),
         }
         for point in curve
     ]
@@ -186,6 +198,7 @@ def _plan(
                 planned_output_qty=_d(row.planned_output_qty),
                 accepted_plan_output_qty=_d(row.accepted_plan_output_qty),
                 original_priority=tuple(row.original_priority or ()),
+                assembly_remaining_qty=_d(row.assembly_remaining_qty),
                 ready_qty=_d(readiness_by_line[int(row.id)].ready_qty),
                 readiness_status=str(readiness_by_line[int(row.id)].status),
                 readiness_curve=tuple(
@@ -213,6 +226,9 @@ def _plan(
     return type(plan)(
         schedule_from=plan.schedule_from,
         schedule_to=plan.schedule_to,
+        working_days=plan.working_days,
+        resource_horizon_ends=plan.resource_horizon_ends,
+        resource_daily_capacities=plan.resource_daily_capacities,
         slots=plan.slots,
         gaps=plan.gaps,
         queue_signature=plan.queue_signature,
@@ -233,12 +249,28 @@ def _validate_persisted_checkpoint(
     schedule: models.DrumSchedule,
     batch: models.LedgerBuildBatch,
 ) -> None:
-    slot_count = db.query(models.DrumSlot).filter(
+    slots = db.query(models.DrumSlot).filter(
         models.DrumSlot.drum_schedule_id == int(schedule.id)
-    ).count()
+    ).all()
+    slot_count = len(slots)
     gap_count = db.query(models.DrumCapacityGap).filter(
         models.DrumCapacityGap.drum_schedule_id == int(schedule.id)
     ).count()
+    try:
+        saved_working_days(schedule)
+        resource_horizons = saved_resource_horizon_ends(schedule)
+        resource_capacities = saved_resource_daily_capacities(schedule)
+    except DrumSavedCalendarError as exc:
+        raise ValueError(
+            "persisted drum checkpoint has invalid saved inputs"
+        ) from exc
+    invalid_saved_slot = any(
+        row.capacity_load is None
+        or _d(row.capacity_load) <= 0
+        or int(row.resource_id) not in resource_horizons
+        or int(row.resource_id) not in resource_capacities
+        for row in slots
+    )
     if (
         schedule.status != "completed"
         or batch.status != "completed"
@@ -246,6 +278,7 @@ def _validate_persisted_checkpoint(
         or batch.algorithm_version != ALGORITHM_VERSION
         or slot_count != int(schedule.slot_row_count)
         or gap_count != int(schedule.gap_row_count)
+        or invalid_saved_slot
         or dict(batch.metrics or {}) != dict(schedule.metrics or {})
         or _d(schedule.total_open_qty)
         != _d(schedule.total_slot_qty) + _d(schedule.total_gap_qty)
@@ -304,6 +337,15 @@ def materialize_drum_schedule(
         algorithm_version=ALGORITHM_VERSION,
         schedule_from=plan.schedule_from,
         schedule_to=plan.schedule_to,
+        working_days=[value.isoformat() for value in plan.working_days],
+        resource_horizon_ends={
+            str(resource_id): end_date.isoformat()
+            for resource_id, end_date in plan.resource_horizon_ends
+        },
+        resource_daily_capacities={
+            str(resource_id): str(capacity)
+            for resource_id, capacity in plan.resource_daily_capacities
+        },
         queue_signature=plan.queue_signature,
         slot_signature=plan.slot_signature,
         gap_signature=plan.gap_signature,
@@ -339,7 +381,10 @@ def materialize_drum_schedule(
                 auto_slot_date=slot.slot_date,
                 auto_resource_id=int(slot.resource_id),
                 slot_qty=slot.slot_qty,
+                capacity_load=slot.capacity_load,
                 planned_output_qty=slot.planned_output_qty,
+                accepted_plan_output_qty=slot.accepted_plan_output_qty,
+                assembly_remaining_qty=slot.assembly_remaining_qty,
                 slot_ordinal=int(slot.slot_ordinal),
                 original_priority=list(slot.original_priority),
                 readiness_phase=slot.readiness_phase,
@@ -355,6 +400,14 @@ def materialize_drum_schedule(
             )
         )
     for gap in plan.gaps:
+        readiness = readiness_by_line[int(gap.queue_line_id)]
+        readiness_date, gap_curve, gap_actions = _slot_readiness_payload(
+            readiness, gap.readiness_phase, gap.gap_qty
+        )
+        if gap.readiness_phase in {"blocked", "unavailable", "mixed"}:
+            readiness_date = readiness.readiness_date
+            gap_curve = list(readiness.readiness_curve or [])
+            gap_actions = list(readiness.action_manifest or [])
         db.add(
             models.DrumCapacityGap(
                 drum_schedule_id=int(schedule.id),
@@ -367,8 +420,16 @@ def materialize_drum_schedule(
                 required_qty=gap.required_qty,
                 available_capacity=gap.available_capacity,
                 gap_qty=gap.gap_qty,
+                planned_output_qty=gap.planned_output_qty,
+                accepted_plan_output_qty=gap.accepted_plan_output_qty,
+                assembly_remaining_qty=gap.assembly_remaining_qty,
                 original_priority=list(gap.original_priority),
                 readiness_phase=gap.readiness_phase,
+                readiness_date=readiness_date,
+                readiness_curve=gap_curve,
+                action_manifest=gap_actions,
+                unavailable_reasons=list(readiness.unavailable_reasons or []),
+                blocking_manifest=list(readiness.blocking_manifest or []),
             )
         )
     batch = models.LedgerBuildBatch(

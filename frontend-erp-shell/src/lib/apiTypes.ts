@@ -3660,16 +3660,75 @@ export interface components {
             /** Id */
             id: number;
         };
-        /** DrumGapRow */
-        DrumGapRow: {
-            /** Gap Id */
-            gap_id: number;
+        /**
+         * DrumExcludedRow
+         * @description Saved open queue row that cannot enter the calendar without one takt.
+         */
+        DrumExcludedRow: {
             /** Queue Line Id */
             queue_line_id: number;
             /** Plan Id */
             plan_id: number;
             /** Plan Line Id */
             plan_line_id: number;
+            /** Run Id */
+            run_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Period From */
+            period_from: string;
+            /** Period To */
+            period_to: string;
+            /** Item Code */
+            item_code?: string | null;
+            /** Item Name */
+            item_name?: string | null;
+            /** Planned Output Qty */
+            planned_output_qty: number;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty: number;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty: number;
+            /**
+             * Reason
+             * @default ASSEMBLY_RATE_MISSING
+             * @constant
+             */
+            reason: "ASSEMBLY_RATE_MISSING";
+            /**
+             * Readiness Status
+             * @enum {string}
+             */
+            readiness_status: "ready" | "recoverable" | "partial" | "blocked" | "unavailable";
+            /** Readiness Date */
+            readiness_date?: string | null;
+            /** Readiness Curve */
+            readiness_curve?: components["schemas"]["ReadinessCurvePointResponse"][];
+            /** Action Manifest */
+            action_manifest?: components["schemas"]["ReadinessActionResponse"][];
+            /** Unavailable Reasons */
+            unavailable_reasons?: string[];
+            /** Blocking Manifest */
+            blocking_manifest?: components["schemas"]["ReadinessBlockerResponse"][];
+            /** Original Priority */
+            original_priority?: (string | number)[];
+        };
+        /** DrumGapRow */
+        DrumGapRow: {
+            /** Gap Id */
+            gap_id: number;
+            /** Queue Line Id */
+            queue_line_id: number;
+            /** Run Id */
+            run_id?: number | null;
+            /** Plan Id */
+            plan_id: number;
+            /** Plan Line Id */
+            plan_line_id: number;
+            /** Period From */
+            period_from?: string | null;
+            /** Period To */
+            period_to?: string | null;
             /** Item Id */
             item_id: number;
             /** Item Code */
@@ -3686,11 +3745,27 @@ export interface components {
             available_capacity: number;
             /** Gap Qty */
             gap_qty: number;
+            /** Planned Output Qty */
+            planned_output_qty?: number | null;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty?: number | null;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty?: number | null;
             /**
              * Readiness Phase
              * @enum {string}
              */
             readiness_phase: "now" | "transfer" | "kitting" | "committed" | "launch" | "blocked" | "unavailable" | "mixed";
+            /** Readiness Date */
+            readiness_date?: string | null;
+            /** Readiness Curve */
+            readiness_curve?: components["schemas"]["ReadinessCurvePointResponse"][];
+            /** Action Manifest */
+            action_manifest?: components["schemas"]["ReadinessActionResponse"][];
+            /** Unavailable Reasons */
+            unavailable_reasons?: string[];
+            /** Blocking Manifest */
+            blocking_manifest?: components["schemas"]["ReadinessBlockerResponse"][];
             /** Original Priority */
             original_priority: (string | number)[];
         };
@@ -3715,6 +3790,8 @@ export interface components {
             slots: components["schemas"]["DrumSlotRow"][];
             /** Gaps */
             gaps: components["schemas"]["DrumGapRow"][];
+            /** Excluded */
+            excluded: components["schemas"]["DrumExcludedRow"][];
             /** Total Open Qty */
             total_open_qty: number;
             /** Total Slot Qty */
@@ -3725,6 +3802,10 @@ export interface components {
             total_slots: number;
             /** Total Gaps */
             total_gaps: number;
+            /** Total Excluded */
+            total_excluded: number;
+            /** Total Excluded Open Qty */
+            total_excluded_open_qty: number;
             /** Limit */
             limit: number;
             /** Offset */
@@ -3765,10 +3846,16 @@ export interface components {
             slot_id: number;
             /** Queue Line Id */
             queue_line_id: number;
+            /** Run Id */
+            run_id?: number | null;
             /** Plan Id */
             plan_id: number;
             /** Plan Line Id */
             plan_line_id: number;
+            /** Period From */
+            period_from?: string | null;
+            /** Period To */
+            period_to?: string | null;
             /** Item Id */
             item_id: number;
             /** Item Code */
@@ -3783,6 +3870,12 @@ export interface components {
             auto_slot_date?: string | null;
             /** Slot Qty */
             slot_qty: number;
+            /** Planned Output Qty */
+            planned_output_qty?: number | null;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty?: number | null;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty?: number | null;
             /** Slot Ordinal */
             slot_ordinal: number;
             /**
@@ -3867,6 +3960,8 @@ export interface components {
             run_id: number;
             /** Rows */
             rows: components["schemas"]["ExecutionJournalRow"][];
+            /** Plan Output Rows */
+            plan_output_rows?: components["schemas"]["PlanOutputRow"][];
             summary: components["schemas"]["ExecutionJournalSummary"];
             /** Total */
             total: number;
@@ -4010,6 +4105,12 @@ export interface components {
             execution_confirmed_pct?: number | null;
             /** Execution Partial */
             execution_partial?: boolean | null;
+            /** Planned Output Qty */
+            planned_output_qty?: number | null;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty?: number | null;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty?: number | null;
             /** Fully Covered */
             fully_covered?: number | null;
             /** Partially Covered */
@@ -4906,10 +5007,75 @@ export interface components {
             /** Qty */
             qty: number;
         };
+        /** PeriodPlanListResponse */
+        PeriodPlanListResponse: {
+            /** Rows */
+            rows: components["schemas"]["PeriodPlanOutputFields"][];
+            /** Total */
+            total: number;
+        };
+        /** PeriodPlanMatrixResponse */
+        PeriodPlanMatrixResponse: {
+            /** Planned Output Qty */
+            planned_output_qty?: number | null;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty?: number | null;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty?: number | null;
+            /** Plan Output Truth Status */
+            plan_output_truth_status: string;
+            /** Plan Output Truth Reason */
+            plan_output_truth_reason?: string | null;
+            /** Plan Output Generation Id */
+            plan_output_generation_id?: number | null;
+            /** Plan Output Cutoff */
+            plan_output_cutoff?: string | null;
+            /** Rows */
+            rows: components["schemas"]["PeriodPlanMatrixRow"][];
+        } & {
+            [key: string]: unknown;
+        };
+        /** PeriodPlanMatrixRow */
+        PeriodPlanMatrixRow: {
+            /** Planned Output Qty */
+            planned_output_qty?: number | null;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty?: number | null;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty?: number | null;
+            /** Output By Bucket */
+            output_by_bucket?: {
+                [key: string]: components["schemas"]["PlanOutputQtyCell"];
+            };
+        } & {
+            [key: string]: unknown;
+        };
         /** PeriodPlanMrpSnapshotRequest */
         PeriodPlanMrpSnapshotRequest: {
             /** Started By */
             started_by?: string | null;
+        };
+        /**
+         * PeriodPlanOutputFields
+         * @description Accepted, precomputed output of the immutable period-plan matrix.
+         */
+        PeriodPlanOutputFields: {
+            /** Planned Output Qty */
+            planned_output_qty?: number | null;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty?: number | null;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty?: number | null;
+            /** Plan Output Truth Status */
+            plan_output_truth_status: string;
+            /** Plan Output Truth Reason */
+            plan_output_truth_reason?: string | null;
+            /** Plan Output Generation Id */
+            plan_output_generation_id?: number | null;
+            /** Plan Output Cutoff */
+            plan_output_cutoff?: string | null;
+        } & {
+            [key: string]: unknown;
         };
         /** PeriodPlanRepairSnapshotsRequest */
         PeriodPlanRepairSnapshotsRequest: {
@@ -4933,6 +5099,30 @@ export interface components {
             ledger_generation_id: number;
             /** Reason */
             reason: string;
+        };
+        /** PlanOutputQtyCell */
+        PlanOutputQtyCell: {
+            /** Planned Output Qty */
+            planned_output_qty: number;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty: number;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty: number;
+        };
+        /** PlanOutputRow */
+        PlanOutputRow: {
+            /** Plan Line Id */
+            plan_line_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Bucket Date */
+            bucket_date: string;
+            /** Planned Output Qty */
+            planned_output_qty: number;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty: number;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty: number;
         };
         /** PlanningConfigCreate */
         PlanningConfigCreate: {
@@ -5394,6 +5584,11 @@ export interface components {
              * @default 0
              */
             buffer_days: number;
+            /**
+             * Is Kitting
+             * @default false
+             */
+            is_kitting: boolean;
             /** Resource Id */
             resource_id: number;
             /**
@@ -5441,6 +5636,11 @@ export interface components {
              * @default 0
              */
             buffer_days: number;
+            /**
+             * Is Kitting
+             * @default false
+             */
+            is_kitting: boolean;
         };
         /** ProductionResourceListResponse */
         ProductionResourceListResponse: {
@@ -5509,6 +5709,11 @@ export interface components {
              * @default 0
              */
             buffer_days: number;
+            /**
+             * Is Kitting
+             * @default false
+             */
+            is_kitting: boolean;
         };
         /** ProtectedDrumSlotResponse */
         ProtectedDrumSlotResponse: {
@@ -5716,10 +5921,25 @@ export interface components {
             source_key: string;
             /** Source Warehouse Ref1C */
             source_warehouse_ref1c: string;
+            /**
+             * Source Warehouse Name
+             * @default
+             */
+            source_warehouse_name: string;
             /** Destination Warehouse Ref1C */
             destination_warehouse_ref1c: string;
+            /**
+             * Destination Warehouse Name
+             * @default
+             */
+            destination_warehouse_name: string;
             /** Resource Id */
             resource_id?: number | null;
+            /**
+             * Resource Name
+             * @default
+             */
+            resource_name: string;
             /** Path */
             path: number[];
         };
@@ -5758,8 +5978,94 @@ export interface components {
              * @default
              */
             destination_warehouse_ref1c: string;
+            /**
+             * Destination Warehouse Name
+             * @default
+             */
+            destination_warehouse_name: string;
             /** Path */
             path?: number[];
+            /**
+             * Point Of Use Qty
+             * @default 0
+             */
+            point_of_use_qty: string;
+            /**
+             * Custody Qty
+             * @default 0
+             */
+            custody_qty: string;
+            /**
+             * Transit Qty
+             * @default 0
+             */
+            transit_qty: string;
+            /**
+             * Wip Qty
+             * @default 0
+             */
+            wip_qty: string;
+            /**
+             * Supplier Qty
+             * @default 0
+             */
+            supplier_qty: string;
+            /**
+             * Other Stock Qty
+             * @default 0
+             */
+            other_stock_qty: string;
+            /** Coverage Sources */
+            coverage_sources?: components["schemas"]["ReadinessCoverageSourceResponse"][];
+        };
+        /** ReadinessCoverageSourceResponse */
+        ReadinessCoverageSourceResponse: {
+            /**
+             * Coverage Kind
+             * @enum {string}
+             */
+            coverage_kind: "point_of_use" | "custody" | "transit" | "wip_order" | "supplier_order" | "other_stock";
+            /** Qty */
+            qty: string;
+            /** Source Key */
+            source_key: string;
+            /**
+             * Warehouse Ref1C
+             * @default
+             */
+            warehouse_ref1c: string;
+            /**
+             * Warehouse Name
+             * @default
+             */
+            warehouse_name: string;
+            /**
+             * Destination Warehouse Ref1C
+             * @default
+             */
+            destination_warehouse_ref1c: string;
+            /**
+             * Destination Warehouse Name
+             * @default
+             */
+            destination_warehouse_name: string;
+            /** Available Date */
+            available_date?: string | null;
+            /**
+             * Confidence
+             * @default physical
+             */
+            confidence: string;
+            /**
+             * Source Kind
+             * @default
+             */
+            source_kind: string;
+            /**
+             * Source Ref
+             * @default
+             */
+            source_ref: string;
         };
         /** ReadinessCurvePointResponse */
         ReadinessCurvePointResponse: {
@@ -5774,6 +6080,10 @@ export interface components {
             available_date?: string | null;
             /** Actions */
             actions?: components["schemas"]["ReadinessActionResponse"][];
+            /** Required Actions */
+            required_actions?: components["schemas"]["ReadinessActionResponse"][];
+            /** Blockers */
+            blockers?: components["schemas"]["ReadinessBlockerResponse"][];
         };
         /** ReconcileRequest */
         ReconcileRequest: {
@@ -7597,7 +7907,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PeriodPlanListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7661,7 +7971,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PeriodPlanOutputFields"];
                 };
             };
             /** @description Validation Error */
@@ -7758,7 +8068,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["PeriodPlanMatrixResponse"];
                 };
             };
             /** @description Validation Error */

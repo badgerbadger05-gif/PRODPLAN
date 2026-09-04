@@ -7,6 +7,7 @@ export type ProductionResource = {
   work_schedule?: string | null
   daily_work_hours?: number | null
   buffer_days?: number | null
+  is_kitting?: boolean
 }
 
 export type ProductionResourcePayload = {
@@ -17,6 +18,7 @@ export type ProductionResourcePayload = {
   work_schedule?: string
   daily_work_hours?: number
   buffer_days?: number
+  is_kitting?: boolean
 }
 
 export type ResourceProductionKind = {

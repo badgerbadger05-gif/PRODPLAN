@@ -67,6 +67,43 @@ def test_execution_journal_openapi_exposes_server_query_contract(client):
     assert params["offset"]["schema"]["default"] == 0
 
 
+def test_period_plan_openapi_types_exact_saved_output_projection(client):
+    schema = client.app.openapi()
+    paths = schema["paths"]
+    components = schema["components"]["schemas"]
+
+    assert paths["/api/v1/plan/period-plans"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/PeriodPlanListResponse"
+    }
+    assert paths["/api/v1/plan/period-plans/{plan_id}"]["get"]["responses"][
+        "200"
+    ]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/PeriodPlanOutputFields"
+    }
+    assert paths["/api/v1/plan/period-plans/{plan_id}/matrix"]["get"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/PeriodPlanMatrixResponse"
+    }
+    output_properties = components["PeriodPlanOutputFields"]["properties"]
+    assert {
+        "planned_output_qty",
+        "accepted_plan_output_qty",
+        "assembly_remaining_qty",
+        "plan_output_truth_status",
+        "plan_output_truth_reason",
+        "plan_output_generation_id",
+        "plan_output_cutoff",
+    }.issubset(output_properties)
+    assert {
+        "planned_output_qty",
+        "accepted_plan_output_qty",
+        "assembly_remaining_qty",
+    }.issubset(components["PlanOutputRow"]["properties"])
+
+
 def test_execution_journal_route_returns_typed_payload_after_fix(client, db_session, accepted_generation):
     plan = _plan_with_line(db_session)
 

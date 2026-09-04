@@ -52,6 +52,8 @@ class FrozenBomEdge:
     component_item_id: int
     norm_qty: Decimal
     root_item_id: int | None = None
+    parent_spec_ref: str = ""
+    child_spec_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,11 @@ class ReadinessSupply:
     confidence: str = "physical"
     bom_key: int | None = None
     queue_line_id: int | None = None
+    transfer_destination_warehouse_ref1c: str = ""
+    root_item_ids: tuple[int, ...] = ()
+    custody_owner_item_id: int | None = None
+    source_kind: str = ""
+    source_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +85,8 @@ class ReplenishmentPolicy:
     output_warehouse_ref1c: str = ""
     unavailable_reason: str = ""
     root_item_id: int | None = None
+    spec_ref: str = ""
+    material_warehouse_ref1c: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +97,8 @@ class ReadinessCurveLine:
     root_item_id: int
     open_qty: Decimal
     target_warehouse_ref1c: str
+    root_spec_ref: str = ""
+    unavailable_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,6 +121,26 @@ class ReadinessCurvePoint:
     cumulative_qty: Decimal
     available_date: date | None
     actions: tuple[ReadinessAction, ...]
+    # A point is a saved answer for this exact horizon, including why the
+    # still-open residue cannot advance and which successful prerequisite
+    # actions were discovered while evaluating that residue.  Keeping these
+    # beside the point prevents the UI from pretending the launch blocker also
+    # explains the earlier transfer/kitting horizons.
+    blockers: tuple[ReadinessBlocker, ...] = ()
+    required_actions: tuple[ReadinessAction, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReadinessCoverageSource:
+    coverage_kind: str
+    qty: Decimal
+    source_key: str
+    warehouse_ref1c: str = ""
+    destination_warehouse_ref1c: str = ""
+    available_date: date | None = None
+    confidence: str = "physical"
+    source_kind: str = ""
+    source_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,6 +152,13 @@ class ReadinessBlocker:
     reason: str
     destination_warehouse_ref1c: str = ""
     path: tuple[int, ...] = ()
+    point_of_use_qty: Decimal = Decimal("0")
+    custody_qty: Decimal = Decimal("0")
+    transit_qty: Decimal = Decimal("0")
+    wip_qty: Decimal = Decimal("0")
+    supplier_qty: Decimal = Decimal("0")
+    other_stock_qty: Decimal = Decimal("0")
+    coverage_sources: tuple[ReadinessCoverageSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -194,6 +232,41 @@ def _aggregate_actions(actions: list[ReadinessAction]) -> tuple[ReadinessAction,
     )
 
 
+def _aggregate_coverage_sources(
+    sources: list[ReadinessCoverageSource],
+) -> tuple[ReadinessCoverageSource, ...]:
+    grouped: dict[tuple[Any, ...], ReadinessCoverageSource] = {}
+    for row in sources:
+        key = (
+            row.coverage_kind,
+            row.source_key,
+            row.warehouse_ref1c,
+            row.destination_warehouse_ref1c,
+            row.available_date,
+            row.confidence,
+            row.source_kind,
+            row.source_ref,
+        )
+        current = grouped.get(key)
+        grouped[key] = (
+            row
+            if current is None
+            else replace(current, qty=_q(current.qty + row.qty))
+        )
+    return tuple(
+        sorted(
+            grouped.values(),
+            key=lambda row: (
+                row.coverage_kind,
+                row.available_date or date.min,
+                row.warehouse_ref1c,
+                row.source_ref,
+                row.source_key,
+            ),
+        )
+    )
+
+
 def allocate_readiness_curves(
     lines: tuple[ReadinessCurveLine, ...],
     edges: tuple[FrozenBomEdge, ...],
@@ -203,14 +276,15 @@ def allocate_readiness_curves(
     as_of: date,
     global_unavailable_reasons: tuple[str, ...] = (),
 ) -> tuple[ReadinessCurveResult, ...]:
-    """Build cumulative readiness scenarios with consume-once allocation.
+    """Build one cumulative consume-once readiness allocation.
 
-    Every horizon is an alternative cumulative scenario over the same frozen
-    facts.  Inside a scenario sources are shared by all queue rows and consumed
-    only after a producible root quantity is proven.  A blocked older row
-    therefore cannot hoard stock needed by a younger ready row.
+    Supply layers open successively across the five horizons, but a physical or
+    committed unit is consumed at most once across the entire curve.  A blocked
+    older row does not hoard a component: a younger row that can really assemble
+    may consume it, and the older row cannot claim the same unit again at a later
+    horizon.
     """
-    graph: dict[tuple[int, int, int], list[tuple[int, Decimal]]] = {}
+    graph: dict[tuple[int, int, int, str], list[tuple[int, str, Decimal]]] = {}
     for edge in edges:
         norm = _d(edge.norm_qty)
         if norm <= 0:
@@ -219,8 +293,9 @@ def allocate_readiness_curves(
             int(edge.bom_key),
             int(edge.root_item_id) if edge.root_item_id is not None else 0,
             int(edge.parent_item_id),
+            str(edge.parent_spec_ref or ""),
         ), []).append(
-            (int(edge.component_item_id), norm)
+            (int(edge.component_item_id), str(edge.child_spec_ref or ""), norm)
         )
     for parent_key in graph:
         graph[parent_key].sort(key=lambda row: row[0])
@@ -229,20 +304,51 @@ def allocate_readiness_curves(
             int(row.bom_key),
             int(row.root_item_id) if row.root_item_id is not None else 0,
             int(row.item_id),
+            str(row.spec_ref or ""),
         ): row
         for row in policies
     }
 
-    def graph_rows(bom_key: int, root_item_id: int, parent_item_id: int):
+    def graph_rows(
+        bom_key: int,
+        root_item_id: int,
+        parent_item_id: int,
+        parent_spec_ref: str,
+    ):
         return graph.get(
-            (int(bom_key), int(root_item_id), int(parent_item_id)),
-            graph.get((int(bom_key), 0, int(parent_item_id)), ()),
+            (
+                int(bom_key),
+                int(root_item_id),
+                int(parent_item_id),
+                str(parent_spec_ref or ""),
+            ),
+            graph.get(
+                (
+                    int(bom_key),
+                    0,
+                    int(parent_item_id),
+                    str(parent_spec_ref or ""),
+                ),
+                (),
+            ),
         )
 
-    def item_policy(bom_key: int, root_item_id: int, item_id: int):
+    def item_policy(
+        bom_key: int,
+        root_item_id: int,
+        item_id: int,
+        spec_ref: str,
+    ):
         return policy_by_item.get(
-            (int(bom_key), int(root_item_id), int(item_id)),
-            policy_by_item.get((int(bom_key), 0, int(item_id))),
+            (
+                int(bom_key),
+                int(root_item_id),
+                int(item_id),
+                str(spec_ref or ""),
+            ),
+            policy_by_item.get(
+                (int(bom_key), 0, int(item_id), str(spec_ref or ""))
+            ),
         )
     ordered_lines = tuple(sorted(lines, key=lambda row: (str(row.sort_key), int(row.queue_line_id))))
     open_qty_by_line = {
@@ -272,10 +378,19 @@ def allocate_readiness_curves(
     blockers_by_line: dict[int, tuple[ReadinessBlocker, ...]] = {
         int(row.queue_line_id): () for row in ordered_lines
     }
+    remaining = {row.source_key: _q(row.qty) for row in supplies}
+    secured_by_line = {
+        int(row.queue_line_id): Decimal("0") for row in ordered_lines
+    }
+    ready_date_by_line: dict[int, date | None] = {
+        int(row.queue_line_id): None for row in ordered_lines
+    }
+    actions_by_line: dict[int, list[ReadinessAction]] = {
+        int(row.queue_line_id): [] for row in ordered_lines
+    }
 
     for horizon in READINESS_HORIZONS:
         horizon_rank = _HORIZON_RANK[horizon]
-        remaining = {row.source_key: _q(row.qty) for row in supplies}
         supply_by_item: dict[int, list[ReadinessSupply]] = {}
         for row in supplies:
             if _SUPPLY_RANK.get(row.layer, 99) <= horizon_rank and _d(row.qty) > 0:
@@ -293,6 +408,8 @@ def allocate_readiness_curves(
         for line in ordered_lines:
             line_id = int(line.queue_line_id)
             open_qty = open_qty_by_line[line_id]
+            secured_qty = secured_by_line[line_id]
+            residual_qty = _root_q(max(open_qty - secured_qty, Decimal("0")))
             target = str(line.target_warehouse_ref1c or "").strip()
             if not target:
                 reasons_by_line[line_id].add("TARGET_WAREHOUSE_MISSING")
@@ -302,16 +419,82 @@ def allocate_readiness_curves(
                 continue
             bom_key = int(line.bom_key)
             root_item_id = int(line.root_item_id)
-            if not graph_rows(bom_key, root_item_id, root_item_id):
+            if line.unavailable_reasons:
+                reasons_by_line[line_id].update(line.unavailable_reasons)
+                points_by_line[line_id].append(
+                    ReadinessCurvePoint(horizon, Decimal("0"), None, ())
+                )
+                continue
+            if not graph_rows(
+                bom_key,
+                root_item_id,
+                root_item_id,
+                line.root_spec_ref,
+            ):
                 reasons_by_line[line_id].add("ROOT_FROZEN_BOM_MISSING")
                 points_by_line[line_id].append(
                     ReadinessCurvePoint(horizon, Decimal("0"), None, ())
                 )
                 continue
 
+            if residual_qty <= 0:
+                points_by_line[line_id].append(
+                    ReadinessCurvePoint(
+                        horizon,
+                        secured_qty,
+                        ready_date_by_line[line_id],
+                        _aggregate_actions(actions_by_line[line_id]),
+                    )
+                )
+                continue
+
             def attempt(root_qty: Decimal, pool: dict[str, Decimal]):
                 actions: list[ReadinessAction] = []
-                visiting: set[int] = set()
+                visiting: set[tuple[int, str]] = set()
+
+                def source_matches(
+                    source: ReadinessSupply,
+                    path: tuple[int, ...],
+                ) -> bool:
+                    if (
+                        source.queue_line_id is not None
+                        and int(source.queue_line_id) != line_id
+                    ):
+                        return False
+                    if (
+                        source.bom_key is not None
+                        and int(source.bom_key) != bom_key
+                    ):
+                        return False
+                    if (
+                        source.root_item_ids
+                        and int(root_item_id) not in source.root_item_ids
+                    ):
+                        return False
+                    if source.custody_owner_item_id is not None and (
+                        not path
+                        or int(path[-1]) != int(source.custody_owner_item_id)
+                    ):
+                        return False
+                    return True
+
+                def coverage_kind(
+                    source: ReadinessSupply,
+                    *,
+                    source_warehouse: str,
+                    destination: str,
+                ) -> str:
+                    if source.layer == "committed":
+                        return (
+                            "supplier_order"
+                            if source.source_kind == "supplier_order"
+                            else "wip_order"
+                        )
+                    if source.confidence == "custody":
+                        return "transit" if source.layer == "transfer" else "custody"
+                    if source_warehouse != destination:
+                        return "transit"
+                    return "point_of_use"
 
                 def blocked(
                     *,
@@ -321,9 +504,23 @@ def allocate_readiness_curves(
                     reason: str,
                     destination: str,
                     path: tuple[int, ...],
+                    coverage_sources: list[ReadinessCoverageSource],
+                    other_stock_sources: list[ReadinessCoverageSource],
                 ) -> tuple[bool, None, tuple[ReadinessBlocker, ...]]:
                     required = _q(required_qty)
                     available = _q(available_qty)
+                    coverage = _aggregate_coverage_sources(
+                        [*coverage_sources, *other_stock_sources]
+                    )
+
+                    def coverage_qty(kind: str) -> Decimal:
+                        return _q(
+                            sum(
+                                (row.qty for row in coverage if row.coverage_kind == kind),
+                                Decimal("0"),
+                            )
+                        )
+
                     return False, None, (
                         ReadinessBlocker(
                             item_id=int(item_id),
@@ -333,11 +530,19 @@ def allocate_readiness_curves(
                             reason=reason,
                             destination_warehouse_ref1c=destination,
                             path=path,
+                            point_of_use_qty=coverage_qty("point_of_use"),
+                            custody_qty=coverage_qty("custody"),
+                            transit_qty=coverage_qty("transit"),
+                            wip_qty=coverage_qty("wip_order"),
+                            supplier_qty=coverage_qty("supplier_order"),
+                            other_stock_qty=coverage_qty("other_stock"),
+                            coverage_sources=coverage,
                         ),
                     )
 
                 def fulfill(
                     item_id: int,
+                    spec_ref: str,
                     qty: Decimal,
                     path: tuple[int, ...],
                     destination: str,
@@ -345,15 +550,24 @@ def allocate_readiness_curves(
                     requested = _d(qty)
                     needed = requested
                     ready_date: date | None = as_of
+                    coverage_taken: list[ReadinessCoverageSource] = []
                     for source in supply_by_item.get(int(item_id), ()):
                         if needed <= 0:
                             break
-                        if source.queue_line_id is not None and int(source.queue_line_id) != line_id:
+                        if not source_matches(source, path):
                             continue
-                        if source.bom_key is not None and int(source.bom_key) != bom_key:
-                            continue
-                        if horizon == "now" and str(source.warehouse_ref1c or "") != destination:
-                            continue
+                        source_warehouse = str(source.warehouse_ref1c or "")
+                        if source_warehouse != destination:
+                            if horizon == "now":
+                                continue
+                            if (
+                                str(
+                                    source.transfer_destination_warehouse_ref1c
+                                    or ""
+                                )
+                                != destination
+                            ):
+                                continue
                         available = pool.get(source.source_key, Decimal("0"))
                         take = min(needed, available)
                         if take <= 0:
@@ -361,6 +575,23 @@ def allocate_readiness_curves(
                         pool[source.source_key] = available - take
                         needed -= take
                         ready_date = _max_date(ready_date, source.available_date)
+                        coverage_taken.append(
+                            ReadinessCoverageSource(
+                                coverage_kind=coverage_kind(
+                                    source,
+                                    source_warehouse=source_warehouse,
+                                    destination=destination,
+                                ),
+                                qty=_q(take),
+                                source_key=source.source_key,
+                                warehouse_ref1c=source_warehouse,
+                                destination_warehouse_ref1c=destination,
+                                available_date=source.available_date,
+                                confidence=source.confidence,
+                                source_kind=source.source_kind,
+                                source_ref=source.source_ref,
+                            )
+                        )
                         if source.layer == "committed":
                             actions.append(
                                 ReadinessAction(
@@ -374,7 +605,7 @@ def allocate_readiness_curves(
                                     path=path,
                                 )
                             )
-                        if str(source.warehouse_ref1c or "") != destination:
+                        if source_warehouse != destination:
                             actions.append(
                                 ReadinessAction(
                                     action_kind="transfer",
@@ -388,10 +619,59 @@ def allocate_readiness_curves(
                                     path=path,
                                 )
                             )
+
+                    def other_stock_sources() -> list[ReadinessCoverageSource]:
+                        rows: list[ReadinessCoverageSource] = []
+                        for source in supply_by_item.get(int(item_id), ()):
+                            if (
+                                source.layer != "now"
+                                or source.confidence != "physical"
+                                or not source_matches(source, path)
+                            ):
+                                continue
+                            source_warehouse = str(source.warehouse_ref1c or "")
+                            if not source_warehouse or source_warehouse == destination:
+                                continue
+                            available = _q(
+                                pool.get(source.source_key, Decimal("0"))
+                            )
+                            if available <= 0:
+                                continue
+                            rows.append(
+                                ReadinessCoverageSource(
+                                    coverage_kind="other_stock",
+                                    qty=available,
+                                    source_key=source.source_key,
+                                    warehouse_ref1c=source_warehouse,
+                                    destination_warehouse_ref1c=destination,
+                                    confidence=source.confidence,
+                                    source_kind=source.source_kind,
+                                    source_ref=source.source_ref,
+                                )
+                            )
+                        return rows
+
+                    def fail(reason: str):
+                        return blocked(
+                            item_id=item_id,
+                            required_qty=requested,
+                            available_qty=requested - needed,
+                            reason=reason,
+                            destination=destination,
+                            path=path,
+                            coverage_sources=coverage_taken,
+                            other_stock_sources=other_stock_sources(),
+                        )
+
                     if needed <= Decimal("0.0000001"):
                         return True, ready_date, ()
 
-                    policy = item_policy(bom_key, root_item_id, int(item_id))
+                    policy = item_policy(
+                        bom_key,
+                        root_item_id,
+                        int(item_id),
+                        spec_ref,
+                    )
                     can_kit = (
                         horizon_rank >= _HORIZON_RANK["kitting"]
                         and policy is not None
@@ -399,47 +679,22 @@ def allocate_readiness_curves(
                     )
                     can_launch = horizon_rank >= _HORIZON_RANK["launch"]
                     if policy is None or (not can_kit and not can_launch):
-                        return blocked(
-                            item_id=item_id,
-                            required_qty=requested,
-                            available_qty=requested - needed,
-                            reason=(
+                        return fail(
+                            (
                                 "REPLENISHMENT_POLICY_MISSING"
                                 if policy is None
                                 else "HORIZON_DOES_NOT_ALLOW_REPLENISHMENT"
-                            ),
-                            destination=destination,
-                            path=path,
+                            )
                         )
                     if policy.unavailable_reason:
-                        return blocked(
-                            item_id=item_id,
-                            required_qty=requested,
-                            available_qty=requested - needed,
-                            reason=policy.unavailable_reason,
-                            destination=destination,
-                            path=path,
-                        )
-                    if int(item_id) in visiting:
-                        return blocked(
-                            item_id=item_id,
-                            required_qty=requested,
-                            available_qty=requested - needed,
-                            reason="BOM_CYCLE",
-                            destination=destination,
-                            path=path,
-                        )
+                        return fail(policy.unavailable_reason)
+                    visit_scope = (int(item_id), str(spec_ref or ""))
+                    if visit_scope in visiting:
+                        return fail("BOM_CYCLE")
                     mode = str(policy.mode or "unavailable")
                     if mode == "buy":
                         if not can_launch or policy.lead_days is None:
-                            return blocked(
-                                item_id=item_id,
-                                required_qty=requested,
-                                available_qty=requested - needed,
-                                reason="LEAD_TIME_MISSING",
-                                destination=destination,
-                                path=path,
-                            )
+                            return fail("LEAD_TIME_MISSING")
                         finish = as_of + timedelta(days=max(int(policy.lead_days), 0))
                         actions.append(
                             ReadinessAction(
@@ -454,56 +709,54 @@ def allocate_readiness_curves(
                         )
                         return True, _max_date(ready_date, finish), ()
                     if mode not in {"make", "rework"} or not graph_rows(
-                        bom_key, root_item_id, int(item_id)
+                        bom_key,
+                        root_item_id,
+                        int(item_id),
+                        spec_ref,
                     ):
-                        return blocked(
-                            item_id=item_id,
-                            required_qty=requested,
-                            available_qty=requested - needed,
-                            reason=(
+                        return fail(
+                            (
                                 "FROZEN_BOM_MISSING"
                                 if mode in {"make", "rework"}
                                 else "REPLENISHMENT_MODE_UNAVAILABLE"
-                            ),
-                            destination=destination,
-                            path=path,
+                            )
                         )
                     if policy.lead_days is None:
-                        return blocked(
-                            item_id=item_id,
-                            required_qty=requested,
-                            available_qty=requested - needed,
-                            reason="LEAD_TIME_MISSING",
-                            destination=destination,
-                            path=path,
-                        )
-                    visiting.add(int(item_id))
+                        return fail("LEAD_TIME_MISSING")
+                    visiting.add(visit_scope)
                     child_date: date | None = as_of
-                    production_warehouse = str(policy.output_warehouse_ref1c or "").strip()
-                    if not production_warehouse:
-                        visiting.remove(int(item_id))
-                        return blocked(
-                            item_id=item_id,
-                            required_qty=requested,
-                            available_qty=requested - needed,
-                            reason="OUTPUT_WAREHOUSE_MISSING",
-                            destination=destination,
-                            path=path,
-                        )
-                    for component_id, norm in graph_rows(
-                        bom_key, root_item_id, int(item_id)
+                    nested_blockers: list[ReadinessBlocker] = []
+                    material_warehouse = str(
+                        policy.material_warehouse_ref1c
+                        or policy.output_warehouse_ref1c
+                        or ""
+                    ).strip()
+                    output_warehouse = str(
+                        policy.output_warehouse_ref1c or ""
+                    ).strip()
+                    if not material_warehouse or not output_warehouse:
+                        visiting.remove(visit_scope)
+                        return fail("NO_WAREHOUSE_BINDING")
+                    for component_id, child_spec_ref, norm in graph_rows(
+                        bom_key,
+                        root_item_id,
+                        int(item_id),
+                        spec_ref,
                     ):
                         ok, component_date, component_blockers = fulfill(
                             component_id,
+                            child_spec_ref,
                             needed * norm,
                             path + (int(item_id),),
-                            production_warehouse,
+                            material_warehouse,
                         )
                         if not ok:
-                            visiting.remove(int(item_id))
-                            return False, None, component_blockers
+                            nested_blockers.extend(component_blockers)
+                            continue
                         child_date = _max_date(child_date, component_date)
-                    visiting.remove(int(item_id))
+                    visiting.remove(visit_scope)
+                    if nested_blockers:
+                        return False, None, tuple(nested_blockers)
                     base = child_date or as_of
                     finish = base + timedelta(days=max(int(policy.lead_days), 0))
                     actions.append(
@@ -513,12 +766,12 @@ def allocate_readiness_curves(
                             qty=needed,
                             available_date=finish,
                             confidence="forecast",
-                            destination_warehouse_ref1c=production_warehouse,
+                            destination_warehouse_ref1c=output_warehouse,
                             resource_id=policy.resource_id,
                             path=path,
                         )
                     )
-                    if production_warehouse != destination:
+                    if output_warehouse != destination:
                         actions.append(
                             ReadinessAction(
                                 action_kind="transfer",
@@ -526,7 +779,7 @@ def allocate_readiness_curves(
                                 qty=needed,
                                 available_date=finish,
                                 confidence="forecast",
-                                source_warehouse_ref1c=production_warehouse,
+                                source_warehouse_ref1c=output_warehouse,
                                 destination_warehouse_ref1c=destination,
                                 path=path,
                             )
@@ -534,26 +787,41 @@ def allocate_readiness_curves(
                     return True, _max_date(ready_date, finish), ()
 
                 root_date: date | None = as_of
-                visiting.add(int(line.root_item_id))
-                for component_id, norm in graph_rows(
-                    bom_key, root_item_id, root_item_id
+                root_blockers: list[ReadinessBlocker] = []
+                visiting.add((int(line.root_item_id), str(line.root_spec_ref or "")))
+                for component_id, child_spec_ref, norm in graph_rows(
+                    bom_key,
+                    root_item_id,
+                    root_item_id,
+                    line.root_spec_ref,
                 ):
                     ok, component_date, component_blockers = fulfill(
                         component_id,
+                        child_spec_ref,
                         root_qty * norm,
                         (int(line.root_item_id),),
                         target,
                     )
                     if not ok:
-                        return False, None, (), component_blockers
+                        root_blockers.extend(component_blockers)
+                        continue
                     root_date = _max_date(root_date, component_date)
+                if root_blockers:
+                    return (
+                        False,
+                        None,
+                        _aggregate_actions(actions),
+                        tuple(root_blockers),
+                    )
                 return True, root_date, _aggregate_actions(actions), ()
 
             low = Decimal("0")
-            high = open_qty
+            high = residual_qty
             best_pool = dict(remaining)
             best_date: date | None = None
             best_actions: tuple[ReadinessAction, ...] = ()
+            horizon_blockers: tuple[ReadinessBlocker, ...] = ()
+            horizon_required_actions: tuple[ReadinessAction, ...] = ()
             # Finished assemblies are indivisible.  Component quantities keep
             # their normal precision inside ``attempt``; only the root search
             # advances in whole pieces.
@@ -570,19 +838,44 @@ def allocate_readiness_curves(
                     best_actions = actions
                 else:
                     high = mid - ROOT_QTY_QUANTUM
-            if low < open_qty:
-                trial_pool = dict(remaining)
-                ok, ready_date, actions, full_blockers = attempt(open_qty, trial_pool)
+            if low < residual_qty:
+                # Explain only the residue left after the largest feasible
+                # integer batch.  This makes blockers and required actions
+                # additive to the cumulative quantity already promised at the
+                # current horizon.
+                outstanding = _root_q(residual_qty - low)
+                trial_pool = dict(best_pool)
+                ok, ready_date, actions, full_blockers = attempt(
+                    outstanding, trial_pool
+                )
                 if ok:
-                    low = open_qty
+                    low = residual_qty
                     best_pool = trial_pool
-                    best_date = ready_date
-                    best_actions = actions
-                elif horizon == "launch":
-                    blockers_by_line[line_id] = full_blockers
+                    best_date = _max_date(best_date, ready_date)
+                    best_actions = _aggregate_actions(
+                        [*best_actions, *actions]
+                    )
+                else:
+                    horizon_blockers = full_blockers
+                    horizon_required_actions = actions
+                    if horizon == "launch":
+                        blockers_by_line[line_id] = full_blockers
             remaining = best_pool
+            if low > 0:
+                secured_by_line[line_id] = _root_q(secured_qty + low)
+                ready_date_by_line[line_id] = _max_date(
+                    ready_date_by_line[line_id], best_date
+                )
+                actions_by_line[line_id].extend(best_actions)
             points_by_line[line_id].append(
-                ReadinessCurvePoint(horizon, _root_q(low), best_date, best_actions)
+                ReadinessCurvePoint(
+                    horizon,
+                    secured_by_line[line_id],
+                    ready_date_by_line[line_id],
+                    _aggregate_actions(actions_by_line[line_id]),
+                    horizon_blockers,
+                    horizon_required_actions,
+                )
             )
 
     results: list[ReadinessCurveResult] = []

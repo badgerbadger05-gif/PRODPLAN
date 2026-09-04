@@ -8,6 +8,7 @@ import { StatusBar } from '../../layout/StatusBar'
 import { KeyboardShortcutShell, type KeyboardShortcut } from '../../platform'
 import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../../tableDoctype'
 import { nextFriday, type SortDir } from './helpers'
+import { OutputFactSummary } from '../production-control/OutputFactSummary'
 
 const PLAN_LIMIT = 50
 
@@ -25,7 +26,8 @@ const periodPlanListColumns = [
   { key: 'fixed_by', title: 'Кем', width: 110, minWidth: 110, grow: false, sortable: false },
   { key: 'created_at', title: 'Создан', width: 140, minWidth: 140, grow: false, sortable: true },
   { key: 'line_count', title: 'Строк', width: 64, minWidth: 64, grow: false, align: 'right', sortable: false },
-  { key: 'execution', title: 'Выполнение', minWidth: 140, grow: true, sortable: false },
+  { key: 'plan_output', title: 'Выпуск плана', minWidth: 180, grow: true, sortable: false },
+  { key: 'execution', title: 'Исполнение потребностей MRP', minWidth: 180, grow: true, sortable: false },
 ] as const satisfies TableColumnDoctype[]
 
 export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
@@ -354,7 +356,7 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                   </label>
                 </td>
                 <td></td>
-                <td>
+                <td colSpan={2}>
                   <button
                     className="columnFilterButton"
                     onClick={() => { setFilterStatus(''); setFilterFrom(''); setFilterTo(''); setFilterCreatedBy('') }}
@@ -400,11 +402,21 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                   <td><span className="muted">{plan.fixed_by ?? plan.created_by ?? '—'}</span></td>
                   <td><span className="muted">{plan.created_at ? dateTimeRu(plan.created_at) : '—'}</span></td>
                   <td style={{ textAlign: 'right' }}><strong>{plan.line_count ?? 0}</strong></td>
+                  <td title={plan.plan_output_truth_reason || (plan.plan_output_cutoff ? `Срез Ledger: ${dateTimeRu(plan.plan_output_cutoff)}` : undefined)}>
+                    <OutputFactSummary
+                      scope="plan"
+                      planned={plan.planned_output_qty}
+                      accepted={plan.accepted_plan_output_qty}
+                      remaining={plan.assembly_remaining_qty}
+                      available={plan.plan_output_truth_status === 'accepted'}
+                      compact
+                    />
+                  </td>
                   <td>{executionText(plan)}</td>
                 </tr>
               ))}
               {!loading && !plans.length && (
-                <tr><td colSpan={8}><div className="emptyDetail">Нет планов</div></td></tr>
+                <tr><td colSpan={9}><div className="emptyDetail">Нет планов</div></td></tr>
               )}
             </tbody>
           </table>

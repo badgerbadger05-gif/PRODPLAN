@@ -409,7 +409,7 @@ def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
         _publish(db_session, parent, target, cutoff)
 
 
-def test_legacy_parent_without_direct_generation_id_fails_closed_on_retry(db_session):
+def test_legacy_parent_without_direct_generation_id_fails_closed_before_publish(db_session):
     cutoff, parent, target, parents, candidates = _batch(db_session, count=1)
     legacy_parent = parents[0]
     legacy_parent.ledger_generation_id = None
@@ -437,13 +437,10 @@ def test_legacy_parent_without_direct_generation_id_fails_closed_on_retry(db_ses
     ))
     db_session.flush()
 
-    first = _publish(db_session, parent, target, cutoff)
-    assert first.published is True
-    assert first.parent_run_ids == (legacy_parent.run_id,)
-    assert first.candidate_run_ids == ()
-    db_session.commit()
-
-    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
+    with pytest.raises(
+        ObligationRefreshPublishError,
+        match="has no Ledger generation anchor",
+    ):
         _publish(db_session, parent, target, cutoff)
 
 

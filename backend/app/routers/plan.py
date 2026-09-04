@@ -450,11 +450,25 @@ class ExecutionJournalSummary(BaseModel):
     execution_pct: float | None = None
     execution_confirmed_pct: float | None = None
     execution_partial: bool | None = None
+    planned_output_qty: float | None = None
+    accepted_plan_output_qty: float | None = None
+    assembly_remaining_qty: float | None = None
     fully_covered: int | None = None
     partially_covered: int | None = None
     not_covered: int | None = None
     net_zero: int | None = None
     execution_by_flow: dict[str, ExecutionJournalSummaryByFlow] | None = None
+
+
+class PlanOutputRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_line_id: int
+    item_id: int
+    bucket_date: str
+    planned_output_qty: float
+    accepted_plan_output_qty: float
+    assembly_remaining_qty: float
 
 
 class ExecutionJournalResponse(BaseModel):
@@ -463,6 +477,7 @@ class ExecutionJournalResponse(BaseModel):
     plan: dict[str, object]
     run_id: int
     rows: list[ExecutionJournalRow]
+    plan_output_rows: list[PlanOutputRow] = Field(default_factory=list)
     summary: ExecutionJournalSummary
     total: int
     limit: int
@@ -478,6 +493,48 @@ class ExecutionJournalResponse(BaseModel):
     facets: dict[str, list[int]] | None = None
 
 
+class PeriodPlanOutputFields(BaseModel):
+    """Accepted, precomputed output of the immutable period-plan matrix."""
+
+    model_config = ConfigDict(extra="allow")
+
+    planned_output_qty: float | None = None
+    accepted_plan_output_qty: float | None = None
+    assembly_remaining_qty: float | None = None
+    plan_output_truth_status: str
+    plan_output_truth_reason: str | None = None
+    plan_output_generation_id: int | None = None
+    plan_output_cutoff: str | None = None
+
+
+class PeriodPlanListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[PeriodPlanOutputFields]
+    total: int
+
+
+class PlanOutputQtyCell(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    planned_output_qty: float
+    accepted_plan_output_qty: float
+    assembly_remaining_qty: float
+
+
+class PeriodPlanMatrixRow(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    planned_output_qty: float | None = None
+    accepted_plan_output_qty: float | None = None
+    assembly_remaining_qty: float | None = None
+    output_by_bucket: dict[str, PlanOutputQtyCell] = Field(default_factory=dict)
+
+
+class PeriodPlanMatrixResponse(PeriodPlanOutputFields):
+    rows: list[PeriodPlanMatrixRow]
+
+
 class PurchaseOrder1CExportRequest(BaseModel):
     date_from: Optional[str] = None
     date_to: Optional[str] = None
@@ -490,7 +547,7 @@ class PurchaseOrder1CExportRequest(BaseModel):
 
 # ===== Period plan routes =====
 
-@router.get("/period-plans")
+@router.get("/period-plans", response_model=PeriodPlanListResponse)
 async def period_plans_list(
     status: Optional[str] = None,
     period_from: Optional[str] = None,
@@ -541,7 +598,7 @@ async def period_plans_delete(plan_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/period-plans/{plan_id}")
+@router.get("/period-plans/{plan_id}", response_model=PeriodPlanOutputFields)
 async def period_plans_get(plan_id: int, db: Session = Depends(get_db)):
     try:
         return get_period_plan(db, plan_id)
@@ -549,7 +606,7 @@ async def period_plans_get(plan_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@router.get("/period-plans/{plan_id}/matrix")
+@router.get("/period-plans/{plan_id}/matrix", response_model=PeriodPlanMatrixResponse)
 async def period_plans_matrix(plan_id: int, db: Session = Depends(get_db)):
     try:
         return get_period_plan_matrix(db, plan_id)

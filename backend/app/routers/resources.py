@@ -58,6 +58,7 @@ def create_resource(resource: ProductionResourceCreate, db: Session = Depends(ge
             work_schedule=resource.work_schedule,
             daily_work_hours=resource.daily_work_hours,
             buffer_days=resource.buffer_days,
+            is_kitting=resource.is_kitting,
         )
         db.add(db_resource)
         db.commit()
@@ -87,6 +88,7 @@ def update_resource(
         db_resource.work_schedule = resource.work_schedule
         db_resource.daily_work_hours = resource.daily_work_hours
         db_resource.buffer_days = resource.buffer_days
+        db_resource.is_kitting = resource.is_kitting
         
         db.commit()
         db.refresh(db_resource)

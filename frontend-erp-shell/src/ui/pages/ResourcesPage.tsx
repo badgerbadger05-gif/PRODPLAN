@@ -129,7 +129,7 @@ export function ResourcesPage() {
                   >
                     <td className="itemCell">
                       <strong>{row.resource_name}</strong>
-                      <span>ID {row.resource_id}</span>
+                      <span>ID {row.resource_id}{row.is_kitting ? ' · комплектовка' : ''}</span>
                     </td>
                     <td className="numCell"><strong>{qty(row.capacity)}</strong></td>
                     <td className="numCell"><strong>{qty(row.daily_work_hours)}</strong></td>

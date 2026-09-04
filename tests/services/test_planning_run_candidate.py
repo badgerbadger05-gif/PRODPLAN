@@ -7,6 +7,7 @@ from app import models
 from app.services.planning_run_candidate import (
     PlanningRunCandidateError,
     create_added_candidate_run,
+    create_replacement_candidate_run,
 )
 
 
@@ -198,3 +199,92 @@ def test_create_added_candidate_rejects_duplicate_current_plan_and_outer_rollbac
     candidate_id = candidate.run_id
     db_session.rollback()
     assert db_session.get(models.PlanningRun, candidate_id) is None
+
+
+def _replacement_plan_line(db_session, parent, *, planned, accepted, remaining):
+    plan = db_session.get(models.ProductionPlanHeader, int(parent.source_plan_id))
+    plan.status = "fixed"
+    item = models.Item(
+        item_code=f"replacement-root-{planned}-{accepted}-{remaining}",
+        item_name="Replacement root",
+        unit="шт",
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    line = models.ProductionPlanLine(
+        plan_id=int(plan.id),
+        item_id=int(item.item_id),
+        bucket_date=plan.period_from,
+        qty=planned,
+        accepted_output_qty=accepted,
+        remaining_output_qty=remaining,
+    )
+    db_session.add(line)
+    db_session.flush()
+    return line
+
+
+def test_replacement_candidate_roots_use_only_persisted_plan_remainder(db_session):
+    parent, _accepted_generation, target = _parent_and_target(db_session)
+    line = _replacement_plan_line(
+        db_session, parent, planned=10, accepted=8, remaining=2
+    )
+
+    candidate = create_replacement_candidate_run(
+        db_session,
+        int(parent.run_id),
+        int(target.id),
+        "replacement-test",
+        horizon_days=parent.horizon_days,
+        config_version_id=parent.config_version_id,
+        config_snapshot=dict(parent.config_snapshot or {}),
+    )
+
+    root = db_session.query(models.MrpRunRoot).filter(
+        models.MrpRunRoot.run_id == int(candidate.run_id)
+    ).one()
+    assert int(root.plan_line_id) == int(line.id)
+    assert root.planned_qty == 2
+    assert root.accepted_qty == 0
+    assert root.remaining_qty == 2
+
+
+def test_replacement_candidate_rejects_zero_saved_remainder(db_session):
+    parent, _accepted_generation, target = _parent_and_target(db_session)
+    _replacement_plan_line(
+        db_session, parent, planned=10, accepted=10, remaining=0
+    )
+
+    with pytest.raises(
+        PlanningRunCandidateError,
+        match="no persisted positive execution remainder",
+    ):
+        create_replacement_candidate_run(
+            db_session,
+            int(parent.run_id),
+            int(target.id),
+            "replacement-test",
+            horizon_days=parent.horizon_days,
+            config_version_id=parent.config_version_id,
+            config_snapshot=dict(parent.config_snapshot or {}),
+        )
+
+
+def test_replacement_candidate_rejects_broken_plan_output_conservation(db_session):
+    parent, _accepted_generation, target = _parent_and_target(db_session)
+    _replacement_plan_line(
+        db_session, parent, planned=10, accepted=8, remaining=3
+    )
+
+    with pytest.raises(PlanningRunCandidateError, match="violates output conservation"):
+        create_replacement_candidate_run(
+            db_session,
+            int(parent.run_id),
+            int(target.id),
+            "replacement-test",
+            horizon_days=parent.horizon_days,
+            config_version_id=parent.config_version_id,
+            config_snapshot=dict(parent.config_snapshot or {}),
+        )

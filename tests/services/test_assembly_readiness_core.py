@@ -68,7 +68,14 @@ def test_curve_distinguishes_point_of_use_from_transferable_stock():
         (FrozenBomEdge(1, 100, 10, Decimal("1")),),
         (
             ReadinessSupply("at-line", 10, Decimal("1"), "now", "assembly"),
-            ReadinessSupply("at-store", 10, Decimal("1"), "transfer", "store-3"),
+            ReadinessSupply(
+                "at-store",
+                10,
+                Decimal("1"),
+                "transfer",
+                "store-3",
+                transfer_destination_warehouse_ref1c="assembly",
+            ),
         ),
         (),
         as_of=date(2026, 9, 3),
@@ -80,6 +87,18 @@ def test_curve_distinguishes_point_of_use_from_transferable_stock():
     ]
     assert row.points[1].actions[0].action_kind == "transfer"
     assert row.points[1].actions[0].source_warehouse_ref1c == "store-3"
+
+
+def test_curve_does_not_promise_unaddressed_stock_from_another_warehouse():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (FrozenBomEdge(1, 100, 10, Decimal("1")),),
+        (ReadinessSupply("candidate-only", 10, Decimal("1"), "now", "store-3"),),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert [point.cumulative_qty for point in row.points] == [Decimal("0.000")] * 5
 
 
 def test_curve_does_not_let_blocked_old_line_hoard_shared_supply():
@@ -110,7 +129,7 @@ def test_curve_explains_kitting_then_recursive_make_launch():
             FrozenBomEdge(1, 20, 30, Decimal("2")),
             FrozenBomEdge(1, 30, 40, Decimal("3")),
         ),
-        (ReadinessSupply("metal", 40, Decimal("6"), "now", "store"),),
+        (ReadinessSupply("metal", 40, Decimal("6"), "now", "wip"),),
         (
             ReplenishmentPolicy(1, 20, "make", 1, "kitting", 3, "store-3"),
             ReplenishmentPolicy(1, 30, "make", 2, "production", 7, "wip"),
@@ -283,3 +302,244 @@ def test_curve_keeps_pinned_specification_routes_scoped_to_their_roots():
     assert ready.points[-1].cumulative_qty == Decimal("1.000")
     assert blocked.points[-1].cumulative_qty == Decimal("0")
     assert blocked.blockers[0].reason == "FROZEN_SPEC_AMBIGUOUS"
+
+
+def test_curve_reports_every_blocking_component_not_only_the_first():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (
+            FrozenBomEdge(1, 100, 20, Decimal("1")),
+            FrozenBomEdge(1, 100, 30, Decimal("2")),
+        ),
+        (),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert [(blocker.item_id, blocker.shortage_qty) for blocker in row.blockers] == [
+        (20, Decimal("1.000")),
+        (30, Decimal("2.000")),
+    ]
+    assert all(len(point.blockers) == 2 for point in row.points)
+
+
+def test_curve_saves_required_actions_and_blockers_for_each_horizon():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (
+            FrozenBomEdge(1, 100, 20, Decimal("1")),
+            FrozenBomEdge(1, 100, 30, Decimal("1")),
+        ),
+        (),
+        (ReplenishmentPolicy(1, 20, "buy", lead_days=2),),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert [point.horizon for point in row.points] == [
+        "now",
+        "transfer",
+        "kitting",
+        "committed",
+        "launch",
+    ]
+    assert all(point.blockers for point in row.points)
+    assert row.points[0].required_actions == ()
+    assert [action.action_kind for action in row.points[-1].required_actions] == [
+        "buy"
+    ]
+    assert [blocker.item_id for blocker in row.points[-1].blockers] == [30]
+
+
+def test_curve_never_reuses_a_unit_when_a_later_supply_layer_opens():
+    older, younger = allocate_readiness_curves(
+        (
+            ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),
+            ReadinessCurveLine(2, "002", 1, 200, Decimal("1"), "assembly"),
+        ),
+        (
+            FrozenBomEdge(1, 100, 10, Decimal("1")),
+            FrozenBomEdge(1, 100, 20, Decimal("1")),
+            FrozenBomEdge(1, 200, 10, Decimal("1")),
+        ),
+        (
+            ReadinessSupply("shared-now", 10, Decimal("1"), "now", "assembly"),
+            ReadinessSupply(
+                "older-later",
+                20,
+                Decimal("1"),
+                "transfer",
+                "store",
+                transfer_destination_warehouse_ref1c="assembly",
+            ),
+        ),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    # The blocked older row cannot reserve component 10.  The ready younger row
+    # consumes it now, and opening component 20 later must not resurrect the
+    # already consumed unit for the older row.
+    assert [point.cumulative_qty for point in older.points] == [Decimal("0.000")] * 5
+    assert [point.cumulative_qty for point in younger.points] == [Decimal("1.000")] * 5
+
+
+def test_custody_supply_is_reserved_for_the_node_that_received_it():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (
+            FrozenBomEdge(1, 100, 30, Decimal("1")),
+            FrozenBomEdge(1, 100, 40, Decimal("1")),
+            FrozenBomEdge(1, 40, 30, Decimal("1")),
+        ),
+        (
+            ReadinessSupply(
+                "custody-for-node-40",
+                30,
+                Decimal("1"),
+                "now",
+                "assembly",
+                bom_key=1,
+                root_item_ids=(100,),
+                custody_owner_item_id=40,
+            ),
+        ),
+        (
+            ReplenishmentPolicy(
+                1,
+                40,
+                "make",
+                0,
+                "production",
+                9,
+                "assembly",
+                material_warehouse_ref1c="assembly",
+            ),
+        ),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert row.points[0].cumulative_qty == Decimal("0.000")
+    assert [(blocker.item_id, blocker.path) for blocker in row.points[-1].blockers] == [
+        (30, (100,))
+    ]
+
+
+def test_custody_supply_is_visible_only_to_its_frozen_root_scope():
+    first, second = allocate_readiness_curves(
+        (
+            ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),
+            ReadinessCurveLine(2, "002", 1, 200, Decimal("1"), "assembly"),
+        ),
+        (
+            FrozenBomEdge(1, 100, 10, Decimal("1")),
+            FrozenBomEdge(1, 200, 10, Decimal("1")),
+        ),
+        (
+            ReadinessSupply(
+                "custody-for-root-200",
+                10,
+                Decimal("1"),
+                "now",
+                "assembly",
+                bom_key=1,
+                root_item_ids=(200,),
+                custody_owner_item_id=200,
+            ),
+        ),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert first.points[0].cumulative_qty == Decimal("0.000")
+    assert second.points[0].cumulative_qty == Decimal("1.000")
+
+
+def test_blocker_preserves_full_generation_scoped_supply_evidence():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (FrozenBomEdge(1, 100, 10, Decimal("6")),),
+        (
+            ReadinessSupply(
+                "point",
+                10,
+                Decimal("1"),
+                "now",
+                "assembly",
+                source_kind="physical_stock",
+                source_ref="assembly",
+            ),
+            ReadinessSupply(
+                "custody",
+                10,
+                Decimal("1"),
+                "now",
+                "assembly",
+                confidence="custody",
+                source_kind="custody_workshop",
+                source_ref="product-1",
+            ),
+            ReadinessSupply(
+                "transit",
+                10,
+                Decimal("1"),
+                "transfer",
+                "store-3",
+                confidence="custody",
+                transfer_destination_warehouse_ref1c="assembly",
+                source_kind="custody_transit",
+                source_ref="product-1",
+            ),
+            ReadinessSupply(
+                "wip",
+                10,
+                Decimal("1"),
+                "committed",
+                "assembly",
+                available_date=date(2026, 9, 5),
+                confidence="committed",
+                source_kind="wip_order",
+                source_ref="wo-1",
+            ),
+            ReadinessSupply(
+                "supplier",
+                10,
+                Decimal("1"),
+                "committed",
+                "assembly",
+                available_date=date(2026, 9, 6),
+                confidence="committed",
+                source_kind="supplier_order",
+                source_ref="po-1",
+            ),
+            ReadinessSupply(
+                "candidate-only",
+                10,
+                Decimal("7"),
+                "now",
+                "unaddressed-store",
+                source_kind="physical_stock",
+                source_ref="unaddressed-store",
+            ),
+        ),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    blocker = row.points[-1].blockers[0]
+    assert blocker.required_qty == Decimal("6.000")
+    assert blocker.available_qty == Decimal("5.000")
+    assert blocker.shortage_qty == Decimal("1.000")
+    assert blocker.point_of_use_qty == Decimal("1.000")
+    assert blocker.custody_qty == Decimal("1.000")
+    assert blocker.transit_qty == Decimal("1.000")
+    assert blocker.wip_qty == Decimal("1.000")
+    assert blocker.supplier_qty == Decimal("1.000")
+    assert blocker.other_stock_qty == Decimal("7.000")
+    assert [source.coverage_kind for source in blocker.coverage_sources] == [
+        "custody",
+        "other_stock",
+        "point_of_use",
+        "supplier_order",
+        "transit",
+        "wip_order",
+    ]

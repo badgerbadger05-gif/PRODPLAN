@@ -151,7 +151,37 @@ def test_manifest_replaces_run_on_saved_remainder_of_same_plan(db_session):
     assert root.remaining_qty == Decimal("2")
 
 
-def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lineage(db_session):
+def test_manifest_replacement_fails_closed_without_saved_plan_remainder(db_session):
+    accepted, target, parents = _fixture(db_session, plans=1)
+    plan, parent = parents[0]
+    item = models.Item(item_code="ROOT-NO-REMAINDER", item_name="Root")
+    db_session.add(item)
+    db_session.flush()
+    line = models.ProductionPlanLine(
+        plan_id=int(plan.id),
+        item_id=int(item.item_id),
+        bucket_date=date(2026, 7, 1),
+        qty=Decimal("12"),
+        accepted_output_qty=Decimal("0"),
+        remaining_output_qty=None,
+        locked_by_run_id=int(parent.run_id),
+    )
+    db_session.add(line)
+    db_session.commit()
+
+    with pytest.raises(
+        ObligationRefreshManifestError,
+        match="has no persisted execution remainder",
+    ):
+        _create(
+            db_session,
+            accepted,
+            target,
+            replace_plan_ids=(int(plan.id),),
+        )
+
+
+def test_manifest_rejects_parent_with_null_ledger_generation_even_with_reservation_lineage(db_session):
     accepted, target, _parents = _fixture(db_session, plans=0)
     plan = models.ProductionPlanHeader(
         name="legacy parent", period_from=date(2026, 7, 1), period_to=date(2026, 7, 31),
@@ -184,10 +214,11 @@ def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lin
     ))
     db_session.flush()
 
-    result = _create(db_session, accepted, target)
-    assert [(row["action"], row["plan_id"], row["parent_run_id"]) for row in result.entries] == [
-        ("retain", plan.id, parent.run_id),
-    ]
+    with pytest.raises(
+        ObligationRefreshManifestError,
+        match="has no Ledger generation anchor",
+    ):
+        _create(db_session, accepted, target)
 
 def test_manifest_never_omits_current_plan_and_conflicting_retry_is_rejected(db_session):
     accepted, target, parents = _fixture(db_session)

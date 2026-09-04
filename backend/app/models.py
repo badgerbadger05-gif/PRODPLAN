@@ -1317,6 +1317,9 @@ class ProductionResource(Base):
     daily_work_hours = Column("work_hours_per_day", DECIMAL(4, 2), default=8.0)  # Рабочее время в часах в сутки
     # Буфер (дней) для расчёта базового количества запуска на участке
     buffer_days = Column(Integer, default=0, nullable=False)
+    # Explicit routing property for unified assembly specifications.  Names are
+    # presentation only: readiness must never infer kitting from a substring.
+    is_kitting = Column(Boolean, default=False, server_default="false", nullable=False)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
@@ -2305,6 +2308,24 @@ class DrumSchedule(Base):
     algorithm_version = Column(String(64), nullable=False)
     schedule_from = Column(Date, nullable=False)
     schedule_to = Column(Date, nullable=False)
+    working_days = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'"),
+    )
+    resource_horizon_ends = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
+    resource_daily_capacities = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
     queue_signature = Column(String(64), nullable=False)
     slot_signature = Column(String(64), nullable=False)
     gap_signature = Column(String(64), nullable=False)
@@ -2329,6 +2350,10 @@ class DrumSlot(Base):
             name="uq_drum_slot_schedule_line_ordinal",
         ),
         CheckConstraint("slot_qty > 0", name="ck_drum_slot_qty_positive"),
+        CheckConstraint(
+            "capacity_load IS NULL OR capacity_load > 0",
+            name="ck_drum_slot_capacity_load_positive",
+        ),
         CheckConstraint("slot_ordinal >= 0", name="ck_drum_slot_ordinal_nonnegative"),
         CheckConstraint(
             "readiness_phase IN ('now', 'transfer', 'kitting', 'committed', 'launch', 'blocked', 'unavailable')",
@@ -2380,7 +2405,10 @@ class DrumSlot(Base):
     slot_date = Column(Date, nullable=False)
     auto_slot_date = Column(Date, nullable=True)
     slot_qty = Column(DECIMAL(15, 3), nullable=False)
+    capacity_load = Column(DECIMAL(24, 12), nullable=True)
     planned_output_qty = Column(DECIMAL(15, 3), nullable=False)
+    accepted_plan_output_qty = Column(DECIMAL(15, 3), nullable=True)
+    assembly_remaining_qty = Column(DECIMAL(15, 3), nullable=True)
     slot_ordinal = Column(Integer, nullable=False, default=0, server_default="0")
     original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
     readiness_phase = Column(
@@ -2471,9 +2499,25 @@ class DrumCapacityGap(Base):
     required_qty = Column(DECIMAL(15, 3), nullable=False)
     available_capacity = Column(DECIMAL(15, 3), nullable=False)
     gap_qty = Column(DECIMAL(15, 3), nullable=False)
+    planned_output_qty = Column(DECIMAL(15, 3), nullable=True)
+    accepted_plan_output_qty = Column(DECIMAL(15, 3), nullable=True)
+    assembly_remaining_qty = Column(DECIMAL(15, 3), nullable=True)
     original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
     readiness_phase = Column(
         String(20), nullable=False, default="unavailable", server_default="unavailable"
+    )
+    readiness_date = Column(Date, nullable=True)
+    readiness_curve = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    action_manifest = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    unavailable_reasons = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    blocking_manifest = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
     )
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
@@ -2751,18 +2795,25 @@ class MrpFreezeAllocation(Base):
 
 
 class MrpFreezeComponent(Base):
-    """Frozen BOM / consumption norms (v2 ). Writer = freeze; reader = drift
-    only (a spec/norm change after freeze does NOT create drift)."""
+    """Frozen root-scoped BOM edge selected while the obligation is fixed.
+
+    ``root_item_id`` and ``child_spec_ref`` make the selected branch
+    reconstructable without consulting live specifications.  Legacy v2 rows
+    have a NULL root and are intentionally unavailable to branch readers until
+    the owning live MRP is rebased.
+    """
 
     __tablename__ = "mrp_freeze_component"
     __table_args__ = (
         UniqueConstraint(
             "run_id",
             "freeze_version",
+            "root_item_id",
             "parent_item_id",
             "component_item_id",
             "spec_ref",
-            name="ux_mrp_freeze_component_spec",
+            "child_spec_ref",
+            name="ux_mrp_freeze_component_root_branch",
         ),
         Index("ix_mrp_freeze_component_run_version", "run_id", "freeze_version"),
         Index("ix_mrp_freeze_component_parent", "parent_item_id"),
@@ -2772,6 +2823,7 @@ class MrpFreezeComponent(Base):
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False, index=True)
     freeze_version = Column(Integer, nullable=False)
+    root_item_id = Column(Integer, ForeignKey("items.item_id"), nullable=True, index=True)
     parent_item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     parent_characteristic_ref = Column(String(36), nullable=True)
     parent_organization_ref = Column(String(36), nullable=True)
@@ -2782,13 +2834,61 @@ class MrpFreezeComponent(Base):
     component_planning_stock_pool = Column(String(64), nullable=True)
     spec_ref = Column(String(36), nullable=False, server_default="")
     spec_version = Column(String(64), nullable=True)
+    child_spec_ref = Column(String(36), nullable=False, server_default="")
+    child_spec_version = Column(String(64), nullable=True)
     norm_qty_per_unit = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     unit_coef = Column(DECIMAL(15, 3), nullable=False, default=1.0, server_default="1")
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
     run = relationship("PlanningRun")
+    root_item = relationship("Item", foreign_keys=[root_item_id])
     parent_item = relationship("Item", foreign_keys=[parent_item_id])
     component_item = relationship("Item", foreign_keys=[component_item_id])
+
+
+class MrpFreezeBomNode(Base):
+    """Frozen routing policy for one selected item/spec inside one root BOM."""
+
+    __tablename__ = "mrp_freeze_bom_node"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "freeze_version",
+            "root_item_id",
+            "item_id",
+            "spec_ref",
+            name="ux_mrp_freeze_bom_node_scope",
+        ),
+        Index("ix_mrp_freeze_bom_node_run_version", "run_id", "freeze_version"),
+        Index("ix_mrp_freeze_bom_node_root", "root_item_id"),
+        Index("ix_mrp_freeze_bom_node_item", "item_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    freeze_version = Column(Integer, nullable=False)
+    root_item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
+    spec_ref = Column(String(36), nullable=False, server_default="")
+    spec_version = Column(String(64), nullable=True)
+    replenishment_mode = Column(String(20), nullable=False, server_default="unavailable")
+    replenishment_time_days = Column(Integer, nullable=True)
+    resource_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True)
+    material_warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    output_warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    is_stock_item = Column(Boolean, nullable=False, default=True, server_default="true")
+    is_kitting = Column(Boolean, nullable=False, server_default="false")
+    route_reason = Column(String(40), nullable=False, server_default="")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    run = relationship("PlanningRun")
+    root_item = relationship("Item", foreign_keys=[root_item_id])
+    item = relationship("Item", foreign_keys=[item_id])
+    resource = relationship("ProductionResource")
 
 
 class MrpFreezeComponentCumulative(Base):
@@ -3246,6 +3346,185 @@ class ProductionPlanExecutionFact(Base):
     plan = relationship("ProductionPlanHeader")
     plan_line = relationship("ProductionPlanLine")
     run = relationship("PlanningRun")
+
+
+class AssemblyOutputRepairJob(Base):
+    """Durable multi-generation repair of output missed by an old rebase boundary."""
+
+    __tablename__ = "assembly_output_repair_job"
+    __table_args__ = (
+        UniqueConstraint(
+            "audit_checksum", name="uq_assembly_output_repair_job_checksum"
+        ),
+        UniqueConstraint(
+            "phase1_generation_key",
+            name="uq_assembly_output_repair_job_phase1_key",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'phase1_published', 'rebasing', "
+            "'completed', 'blocked', 'failed')",
+            name="ck_assembly_output_repair_job_status",
+        ),
+        CheckConstraint(
+            "expected_fact_qty >= 0 AND expected_allocated_qty >= 0 "
+            "AND expected_surplus_qty >= 0",
+            name="ck_assembly_output_repair_job_qty",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    audit_checksum = Column(String(64), nullable=False, index=True)
+    audit_algorithm_version = Column(String(128), nullable=False)
+    source_generation_id = Column(BigInteger, nullable=False, index=True)
+    source_cutoff = Column(DateTime(timezone=True), nullable=False)
+    status = Column(String(32), nullable=False, default="pending", server_default="pending")
+    phase1_generation_key = Column(String(128), nullable=False)
+    phase1_generation_id = Column(BigInteger, nullable=True, index=True)
+    audit_payload = Column(CrossPlatformJSON, nullable=False)
+    expected_fact_qty = Column(DECIMAL(15, 3), nullable=False)
+    expected_allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    expected_surplus_qty = Column(DECIMAL(15, 3), nullable=False)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    approved_by = Column(String(255), nullable=False)
+    approved_at = Column(DateTime(timezone=True), nullable=False)
+    last_error = Column(TEXT, nullable=True)
+    result = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    facts = relationship(
+        "AssemblyOutputRepairFact",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="AssemblyOutputRepairFact.stock_ledger_entry_id",
+    )
+    allocations = relationship(
+        "AssemblyOutputRepairAllocation",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="AssemblyOutputRepairAllocation.id",
+    )
+    targets = relationship(
+        "AssemblyOutputRepairTarget",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="AssemblyOutputRepairTarget.sequence",
+    )
+
+
+class AssemblyOutputRepairFact(Base):
+    """Immutable source evidence approved for one output repair job."""
+
+    __tablename__ = "assembly_output_repair_fact"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "stock_ledger_entry_id", name="uq_output_repair_fact_job_sle"
+        ),
+        CheckConstraint(
+            "fact_qty > 0 AND expected_surplus_qty >= 0",
+            name="ck_output_repair_fact_qty",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    job_id = Column(
+        BigInteger,
+        ForeignKey("assembly_output_repair_job.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    stock_ledger_entry_id = Column(BigInteger, nullable=False, index=True)
+    source_content_hash = Column(String(64), nullable=False)
+    item_id = Column(Integer, nullable=False, index=True)
+    posting_at = Column(DateTime(timezone=True), nullable=False)
+    fact_qty = Column(DECIMAL(15, 3), nullable=False)
+    expected_surplus_qty = Column(DECIMAL(15, 3), nullable=False)
+    decision_status = Column(String(32), nullable=False)
+
+    job = relationship("AssemblyOutputRepairJob", back_populates="facts")
+
+
+class AssemblyOutputRepairAllocation(Base):
+    """Expected canonical fact-to-plan assignment saved before phase one."""
+
+    __tablename__ = "assembly_output_repair_allocation"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "stock_ledger_entry_id",
+            "plan_line_id",
+            name="uq_output_repair_allocation_job_sle_line",
+        ),
+        CheckConstraint(
+            "allocated_qty > 0", name="ck_output_repair_allocation_qty"
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    job_id = Column(
+        BigInteger,
+        ForeignKey("assembly_output_repair_job.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    stock_ledger_entry_id = Column(BigInteger, nullable=False, index=True)
+    allocation_ordinal = Column(Integer, nullable=False, default=0, server_default="0")
+    plan_id = Column(Integer, nullable=False, index=True)
+    plan_line_id = Column(Integer, nullable=False, index=True)
+    audited_run_id = Column(Integer, nullable=False, index=True)
+    item_id = Column(Integer, nullable=False, index=True)
+    allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    match_rule = Column(String(16), nullable=False)
+    requires_mrp_replacement = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+    job = relationship("AssemblyOutputRepairJob", back_populates="allocations")
+
+
+class AssemblyOutputRepairTarget(Base):
+    """One crash-resumable MRP replacement following repaired output facts."""
+
+    __tablename__ = "assembly_output_repair_target"
+    __table_args__ = (
+        UniqueConstraint("job_id", "plan_id", name="uq_output_repair_target_job_plan"),
+        UniqueConstraint(
+            "job_id",
+            "predecessor_run_id",
+            name="uq_output_repair_target_job_run",
+        ),
+        UniqueConstraint("job_id", "sequence", name="uq_output_repair_target_job_seq"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'blocked', 'failed')",
+            name="ck_output_repair_target_status",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    job_id = Column(
+        BigInteger,
+        ForeignKey("assembly_output_repair_job.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence = Column(Integer, nullable=False)
+    plan_id = Column(Integer, nullable=False, index=True)
+    predecessor_run_id = Column(Integer, nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="pending", server_default="pending")
+    expected_roots = Column(CrossPlatformJSON, nullable=False)
+    expected_roots_checksum = Column(String(64), nullable=False)
+    successor_run_id = Column(Integer, nullable=True, index=True)
+    published_generation_id = Column(BigInteger, nullable=True, index=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(TEXT, nullable=True)
+    result = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    job = relationship("AssemblyOutputRepairJob", back_populates="targets")
 
 
 class StockLedgerFactSupersession(Base):

@@ -273,7 +273,6 @@ def list_period_plans(
     )
     plan_ids = [int(plan.id) for plan in plans]
     line_stats: Dict[int, Dict[str, float]] = {}
-    persisted_output_by_plan: Dict[int, Dict[str, Any]] = {}
     execution_by_plan: Dict[int, Dict[str, Any]] = {}
     if plan_ids:
         stats_rows = (
@@ -281,10 +280,6 @@ def list_period_plans(
                 ProductionPlanLine.plan_id,
                 func.count(ProductionPlanLine.id).label("line_count"),
                 func.coalesce(func.sum(ProductionPlanLine.qty), 0.0).label("total_qty"),
-                func.count(ProductionPlanLine.remaining_output_qty).label("initialized_count"),
-                func.coalesce(func.sum(ProductionPlanLine.accepted_output_qty), 0.0).label(
-                    "accepted_output_qty"
-                ),
             )
             .filter(ProductionPlanLine.plan_id.in_(plan_ids))
             .group_by(ProductionPlanLine.plan_id)
@@ -294,29 +289,26 @@ def list_period_plans(
             int(row.plan_id): {"line_count": int(row.line_count or 0), "total_qty": _to_float(row.total_qty)}
             for row in stats_rows
         }
-        for row in stats_rows:
-            line_count = int(row.line_count or 0)
-            initialized = line_count > 0 and int(row.initialized_count or 0) == line_count
-            if not initialized:
-                continue
-            planned = _to_float(row.total_qty)
-            accepted = min(max(_to_float(row.accepted_output_qty), 0.0), planned)
-            execution_pct = _rounded_replenishment_pct(planned, accepted)
-            persisted_output_by_plan[int(row.plan_id)] = {
-                "execution_pct": execution_pct,
-                "execution_partial": False,
-                "execution_progress_status": replenishment_execution_status(
-                    planned,
-                    accepted,
-                    partial_truth=False,
-                ),
-                "execution_completed_qty": accepted,
-                "execution_base_qty": planned,
-            }
         truth_generation_id = (
             db.query(PlanningTruthState.current_generation_id)
             .filter(PlanningTruthState.id == 1)
             .scalar()
+        )
+        truth_generation = (
+            db.get(LedgerGeneration, int(truth_generation_id))
+            if truth_generation_id is not None
+            else None
+        )
+        if (
+            truth_generation is None
+            or str(truth_generation.status or "") != "accepted"
+            or truth_generation.cutoff is None
+        ):
+            truth_generation_id = None
+        truth_cutoff = (
+            truth_generation.cutoff
+            if truth_generation_id is not None
+            else None
         )
         if truth_generation_id is not None:
             snapshots = (
@@ -326,6 +318,7 @@ def list_period_plans(
                     PlanningReadSnapshot.ledger_generation_id
                     == int(truth_generation_id),
                     PlanningReadSnapshot.truth_status == "accepted",
+                    PlanningReadSnapshot.cutoff == truth_generation.cutoff,
                 )
                 .order_by(
                     PlanningReadSnapshot.published_at.desc(),
@@ -344,25 +337,53 @@ def list_period_plans(
                 if payload_plan_id not in wanted or payload_plan_id in execution_by_plan:
                     continue
                 summary = dict(payload.get("summary") or {})
+                planned_output = summary.get("planned_output_qty")
+                accepted_output = summary.get("accepted_plan_output_qty")
+                remaining_output = summary.get("assembly_remaining_qty")
+                plan_output_available = all(
+                    value is not None
+                    for value in (planned_output, accepted_output, remaining_output)
+                )
                 execution_by_plan[payload_plan_id] = {
                     "execution_pct": (
-                        summary.get("execution_pct")
-                        if summary.get("execution_pct") is not None
-                        else summary.get("execution_confirmed_pct")
+                        _rounded_replenishment_pct(planned_output, accepted_output)
+                        if plan_output_available
+                        else None
                     ),
-                    "execution_partial": bool(
-                        summary.get("execution_partial", False)
+                    "execution_partial": False,
+                    "execution_progress_status": (
+                        replenishment_execution_status(
+                            planned_output,
+                            accepted_output,
+                            partial_truth=False,
+                        )
+                        if plan_output_available
+                        else "unavailable"
                     ),
-                    "execution_progress_status": replenishment_execution_status(
-                        summary.get("execution_base_qty") or 0,
-                        summary.get("execution_completed_qty") or 0,
-                        partial_truth=bool(summary.get("execution_partial", False)),
+                    "execution_completed_qty": accepted_output,
+                    "execution_base_qty": planned_output,
+                    "planned_output_qty": planned_output,
+                    "accepted_plan_output_qty": accepted_output,
+                    "assembly_remaining_qty": remaining_output,
+                    "plan_output_truth_status": (
+                        "accepted" if plan_output_available else "unavailable"
                     ),
-                    "execution_completed_qty": summary.get("execution_completed_qty"),
-                    "execution_base_qty": summary.get("execution_base_qty"),
+                    "plan_output_truth_reason": (
+                        None if plan_output_available else "Saved plan-output summary is missing"
+                    ),
+                    "plan_output_generation_id": int(truth_generation_id),
+                    "plan_output_cutoff": snapshot.cutoff.isoformat(),
                     "execution_by_flow": summary.get("execution_by_flow") or {},
-                    "execution_status": str(payload.get("truth_status") or ""),
-                    "execution_reason": payload.get("truth_reason"),
+                    "execution_status": (
+                        str(payload.get("truth_status") or "")
+                        if plan_output_available
+                        else "unavailable"
+                    ),
+                    "execution_reason": (
+                        payload.get("truth_reason")
+                        if plan_output_available
+                        else "Saved plan-output summary is missing"
+                    ),
                     "execution_generation_id": int(truth_generation_id),
                 }
     return {
@@ -382,6 +403,33 @@ def list_period_plans(
                         "execution_progress_status": "unavailable",
                         "execution_completed_qty": None,
                         "execution_base_qty": None,
+                        "planned_output_qty": None,
+                        "accepted_plan_output_qty": None,
+                        "assembly_remaining_qty": None,
+                        "plan_output_truth_status": (
+                            "not_applicable"
+                            if str(plan.status or "") == "draft"
+                            else "unavailable"
+                        ),
+                        "plan_output_truth_reason": (
+                            None
+                            if str(plan.status or "") == "draft"
+                            else (
+                                "Execution snapshot is missing for the accepted Ledger generation"
+                                if truth_generation_id is not None
+                                else "Accepted Ledger generation is unavailable"
+                            )
+                        ),
+                        "plan_output_generation_id": (
+                            int(truth_generation_id)
+                            if truth_generation_id is not None
+                            else None
+                        ),
+                        "plan_output_cutoff": (
+                            truth_cutoff.isoformat()
+                            if truth_cutoff is not None
+                            else None
+                        ),
                         "execution_by_flow": {},
                         "execution_status": "unavailable",
                         "execution_reason": (
@@ -396,10 +444,6 @@ def list_period_plans(
                         ),
                         },
                     ),
-                    # Plan execution is the persisted root-output counter.  A
-                    # replacement MRP starts its own 0/N execution without
-                    # resetting the immutable plan's accumulated X/total.
-                    **persisted_output_by_plan.get(int(plan.id), {}),
                 },
             }
             for plan in plans
@@ -454,8 +498,144 @@ def create_period_plan(
     return _serialize_plan(plan)
 
 
+def _saved_plan_output_validation_error(payload: Dict[str, Any]) -> Optional[str]:
+    """Validate persisted exact output without consulting mutable plan facts."""
+    summary = dict(payload.get("summary") or {})
+    rows = payload.get("plan_output_rows")
+    try:
+        summary_planned = Decimal(str(summary["planned_output_qty"]))
+        summary_accepted = Decimal(str(summary["accepted_plan_output_qty"]))
+        summary_remaining = Decimal(str(summary["assembly_remaining_qty"]))
+        row_totals = [Decimal("0"), Decimal("0"), Decimal("0")]
+        seen_line_ids: set[int] = set()
+        if not isinstance(rows, list):
+            raise ValueError("plan_output_rows is not a list")
+        for row in rows:
+            line_id = int(row["plan_line_id"])
+            if line_id in seen_line_ids:
+                raise ValueError("duplicate plan output line")
+            seen_line_ids.add(line_id)
+            row_planned = Decimal(str(row["planned_output_qty"]))
+            row_accepted = Decimal(str(row["accepted_plan_output_qty"]))
+            row_remaining = Decimal(str(row["assembly_remaining_qty"]))
+            row_values = (row_planned, row_accepted, row_remaining)
+            if (
+                not all(value.is_finite() for value in row_values)
+                or min(row_values) < 0
+                or row_planned != row_accepted + row_remaining
+            ):
+                raise ValueError("plan output row violates conservation")
+            row_totals[0] += row_planned
+            row_totals[1] += row_accepted
+            row_totals[2] += row_remaining
+        summary_values = (summary_planned, summary_accepted, summary_remaining)
+        if (
+            not all(value.is_finite() for value in summary_values)
+            or min(summary_values) < 0
+            or summary_planned != summary_accepted + summary_remaining
+            or row_totals != list(summary_values)
+        ):
+            raise ValueError("plan output summary violates conservation")
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return "Saved plan-output read model is missing or invalid"
+    return None
+
+
+def _saved_plan_output_payload(
+    db: Session,
+    plan_id: int,
+) -> tuple[Optional[Dict[str, Any]], Optional[int], Optional[str], Optional[str]]:
+    """Read one accepted, precomputed plan-output projection without fallback."""
+    pointer = db.get(PlanningTruthState, 1)
+    if pointer is None or pointer.current_generation_id is None:
+        return None, None, None, "Accepted Ledger generation is unavailable"
+    generation = db.get(LedgerGeneration, int(pointer.current_generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        return None, None, None, "Accepted Ledger generation is unavailable"
+    if generation.cutoff is None:
+        return (
+            None,
+            int(generation.id),
+            None,
+            "Accepted Ledger generation cutoff is unavailable",
+        )
+    cutoff = generation.cutoff.isoformat()
+    snapshots = (
+        db.query(PlanningReadSnapshot)
+        .filter(
+            PlanningReadSnapshot.consumer == "period_plan_execution",
+            PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+            PlanningReadSnapshot.truth_status == "accepted",
+            PlanningReadSnapshot.cutoff == generation.cutoff,
+        )
+        .order_by(PlanningReadSnapshot.published_at.desc(), PlanningReadSnapshot.id.desc())
+        .all()
+    )
+    for snapshot in snapshots:
+        payload = dict(snapshot.payload or {})
+        payload_plan = dict(payload.get("plan") or {})
+        try:
+            payload_plan_id = int(payload_plan.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if payload_plan_id != int(plan_id):
+            continue
+        validation_error = _saved_plan_output_validation_error(payload)
+        if validation_error is not None:
+            return None, int(generation.id), cutoff, validation_error
+        return payload, int(generation.id), cutoff, None
+    return (
+        None,
+        int(generation.id),
+        cutoff,
+        "Saved plan-output read model is missing",
+    )
+
+
+def _plan_output_header_fields(
+    payload: Optional[Dict[str, Any]],
+    generation_id: Optional[int],
+    cutoff: Optional[str],
+    reason: Optional[str],
+) -> Dict[str, Any]:
+    summary = dict((payload or {}).get("summary") or {})
+    available = payload is not None and reason is None
+    return {
+        "planned_output_qty": summary.get("planned_output_qty") if available else None,
+        "accepted_plan_output_qty": (
+            summary.get("accepted_plan_output_qty") if available else None
+        ),
+        "assembly_remaining_qty": (
+            summary.get("assembly_remaining_qty") if available else None
+        ),
+        "plan_output_truth_status": "accepted" if available else "unavailable",
+        "plan_output_truth_reason": reason,
+        "plan_output_generation_id": generation_id,
+        "plan_output_cutoff": cutoff,
+    }
+
+
 def get_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
-    return _serialize_plan(_get_plan(db, plan_id))
+    plan = _get_plan(db, plan_id)
+    result = _serialize_plan(plan)
+    if str(plan.status or "") != "fixed":
+        return {
+            **result,
+            "planned_output_qty": None,
+            "accepted_plan_output_qty": None,
+            "assembly_remaining_qty": None,
+            "plan_output_truth_status": "not_applicable",
+            "plan_output_truth_reason": None,
+            "plan_output_generation_id": None,
+            "plan_output_cutoff": None,
+        }
+    payload, generation_id, cutoff, reason = _saved_plan_output_payload(
+        db, int(plan.id)
+    )
+    return {
+        **result,
+        **_plan_output_header_fields(payload, generation_id, cutoff, reason),
+    }
 
 
 def fix_period_plan(db: Session, plan_id: int, *, fixed_by: Optional[str] = None) -> Dict[str, Any]:
@@ -704,6 +884,77 @@ def _explode_bom_net_first(
     for comp in db.query(SpecComponent).all():
         components_by_spec.setdefault(int(comp.spec_id), []).append(comp)
 
+    if shared_pools is not None and trace is not None:
+        # Persist the exact branch chosen by the canonical resolver while the
+        # obligation is being frozen.  This traversal is deliberately separate
+        # from quantity netting: even a parent covered by stock must retain its
+        # selected BOM branch so downstream readiness never has to re-read live
+        # specifications.
+        for root_item_id in sorted(trace.root_item_ids):
+            selected_root_spec = default_spec_map.get(int(root_item_id))
+            trace.bom_nodes.add(
+                (
+                    int(root_item_id),
+                    int(root_item_id),
+                    int(selected_root_spec) if selected_root_spec is not None else None,
+                )
+            )
+
+        for root_item_id in sorted(trace.root_item_ids):
+            root_spec_id = default_spec_map.get(int(root_item_id))
+            if root_spec_id is None:
+                continue
+            visited_scopes: Set[Tuple[int, int]] = set()
+            stack: List[Tuple[int, int, frozenset[Tuple[int, int]]]] = [
+                (
+                    int(root_item_id),
+                    int(root_spec_id),
+                    frozenset({(int(root_item_id), int(root_spec_id))}),
+                )
+            ]
+            while stack:
+                parent_item_id, parent_spec_id, ancestors = stack.pop()
+                scope = (int(parent_item_id), int(parent_spec_id))
+                if scope in visited_scopes:
+                    continue
+                visited_scopes.add(scope)
+                trace.bom_nodes.add(
+                    (int(root_item_id), int(parent_item_id), int(parent_spec_id))
+                )
+                for component in components_by_spec.get(int(parent_spec_id), []):
+                    child_item_id = int(component.item_id)
+                    child_spec_id = spec_resolver.child_spec_id(component)
+                    norm = float(component.quantity) if component.quantity is not None else 0.0
+                    trace.component_norms.append(
+                        (
+                            int(root_item_id),
+                            int(parent_item_id),
+                            child_item_id,
+                            int(parent_spec_id),
+                            int(child_spec_id) if child_spec_id is not None else None,
+                            norm,
+                        )
+                    )
+                    trace.bom_nodes.add(
+                        (
+                            int(root_item_id),
+                            child_item_id,
+                            int(child_spec_id) if child_spec_id is not None else None,
+                        )
+                    )
+                    if child_spec_id is None:
+                        continue
+                    child_scope = (child_item_id, int(child_spec_id))
+                    if child_scope in ancestors:
+                        continue
+                    stack.append(
+                        (
+                            child_item_id,
+                            int(child_spec_id),
+                            ancestors | {child_scope},
+                        )
+                    )
+
     # --- WIP: remaining qty from active (non-done, non-deleted) production
     # orders, keyed by planned_finish_date so the netting respects when the
     # WIP is actually expected to be physically available. A WIP order that
@@ -806,8 +1057,6 @@ def _explode_bom_net_first(
         (int(iid), default_spec_map.get(int(iid)), frozenset()): dict(buckets)
         for iid, buckets in plan_demands.items()
     }
-    traced_spec_scopes: Set[Tuple[int, int]] = set()
-
     MAX_BOM_DEPTH = 20
     for depth in range(MAX_BOM_DEPTH):
         if not demand_map:
@@ -941,22 +1190,6 @@ def _explode_bom_net_first(
             comps = components_by_spec.get(int(spec_id), [])
             if not comps:
                 continue
-            if (
-                shared_pools is not None
-                and trace is not None
-                and (iid, int(spec_id)) not in traced_spec_scopes
-            ):
-                traced_spec_scopes.add((iid, int(spec_id)))
-                for component in comps:
-                    trace.component_norms.append(
-                        (
-                            int(iid),
-                            int(component.item_id),
-                            int(spec_id),
-                            float(component.quantity or 0.0),
-                        )
-                    )
-
             # Explode demand that on-hand stock does NOT cover (after-stock,
             # NOT after-stock-and-WIP): an open parent order still needs its
             # components produced, so WIP must not suppress the explosion or
@@ -1321,6 +1554,7 @@ def _freeze_one_run(
         pool_key_for,
         _write_freeze_baseline,
         _write_freeze_allocation,
+        _write_freeze_bom_nodes,
         _write_freeze_component,
         _write_freeze_component_cumulative,
     )
@@ -1340,6 +1574,13 @@ def _freeze_one_run(
         .all()
     }
     if not run_roots:
+        if run.prior_run_id is not None:
+            # A replacement is defined exclusively by its persisted remainder
+            # roots.  Treating an empty replacement like a first fixation would
+            # silently restore the immutable plan's full original demand.
+            raise LedgerPoolUnavailable(
+                "replacement candidate has no persisted remaining roots"
+            )
         # First fixation: the run receives the immutable plan matrix. A
         # specification rebase pre-creates roots from the saved plan remainder
         # and therefore never enters this branch.
@@ -1728,6 +1969,7 @@ def _freeze_one_run(
     )
     component_rows = _write_freeze_component(db, run, new_version, trace, now)
     component_rows += _write_freeze_component_cumulative(db, run, new_version, trace)
+    bom_node_rows = _write_freeze_bom_nodes(db, run, new_version, trace, now)
     run.active_freeze_version = int(new_version)
 
     # No commit here — the orchestrator owns the queue transaction.
@@ -1745,6 +1987,7 @@ def _freeze_one_run(
         "baseline_rows": int(baseline_rows),
         "allocation_rows": int(allocation_rows),
         "component_rows": int(component_rows),
+        "bom_node_rows": int(bom_node_rows),
         "schedule_warnings": 0,
     }
 
@@ -2180,6 +2423,62 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
     for bucket_key in bucket_keys:
         grand_total += bucket_totals[bucket_key]
 
+    output_payload: Optional[Dict[str, Any]] = None
+    output_generation_id: Optional[int] = None
+    output_cutoff: Optional[str] = None
+    output_reason: Optional[str] = None
+    if str(plan.status or "") == "fixed":
+        (
+            output_payload,
+            output_generation_id,
+            output_cutoff,
+            output_reason,
+        ) = _saved_plan_output_payload(db, int(plan.id))
+    output_rows = list((output_payload or {}).get("plan_output_rows") or [])
+    output_by_item_bucket = {
+        (int(row["item_id"]), str(row["bucket_date"])): row
+        for row in output_rows
+    }
+    for item_id, rec in by_item.items():
+        rec["planned_output_qty"] = 0.0 if output_payload is not None else None
+        rec["accepted_plan_output_qty"] = 0.0 if output_payload is not None else None
+        rec["assembly_remaining_qty"] = 0.0 if output_payload is not None else None
+        rec["output_by_bucket"] = {}
+        for bucket_key in bucket_keys:
+            output_row = output_by_item_bucket.get((int(item_id), bucket_key))
+            if output_row is None:
+                continue
+            cell = {
+                "planned_output_qty": float(output_row["planned_output_qty"]),
+                "accepted_plan_output_qty": float(
+                    output_row["accepted_plan_output_qty"]
+                ),
+                "assembly_remaining_qty": float(output_row["assembly_remaining_qty"]),
+            }
+            rec["output_by_bucket"][bucket_key] = cell
+            rec["planned_output_qty"] += cell["planned_output_qty"]
+            rec["accepted_plan_output_qty"] += cell["accepted_plan_output_qty"]
+            rec["assembly_remaining_qty"] += cell["assembly_remaining_qty"]
+
+    output_header = (
+        _plan_output_header_fields(
+            output_payload,
+            output_generation_id,
+            output_cutoff,
+            output_reason,
+        )
+        if str(plan.status or "") == "fixed"
+        else {
+            "planned_output_qty": None,
+            "accepted_plan_output_qty": None,
+            "assembly_remaining_qty": None,
+            "plan_output_truth_status": "not_applicable",
+            "plan_output_truth_reason": None,
+            "plan_output_generation_id": None,
+            "plan_output_cutoff": None,
+        }
+    )
+
     return {
         "plan": _serialize_plan(plan),
         "buckets": bucket_keys,
@@ -2188,6 +2487,7 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         "grand_total": grand_total,
         "total_qty": grand_total,
         "total": len(by_item),
+        **output_header,
     }
 
 
@@ -2233,17 +2533,78 @@ def _attach_run_output_summary(
     payload: Dict[str, Any],
     run: PlanningRun,
 ) -> Dict[str, Any]:
-    """Overlay the persisted root-output counter for exactly one MRP run."""
-    planned, accepted = (
-        db.query(
-            func.coalesce(func.sum(MrpRunRoot.planned_qty), 0),
-            func.coalesce(func.sum(MrpRunRoot.accepted_qty), 0),
-        )
+    """Save run-local execution and immutable-plan execution in one snapshot."""
+    roots = (
+        db.query(MrpRunRoot)
         .filter(MrpRunRoot.run_id == int(run.run_id))
-        .one()
+        .order_by(MrpRunRoot.plan_line_id)
+        .all()
     )
-    planned_qty = max(_to_float(planned), 0.0)
-    accepted_qty = min(max(_to_float(accepted), 0.0), planned_qty)
+    if not roots:
+        raise ValueError("execution snapshot requires persisted MRP roots")
+    run_planned = Decimal("0")
+    run_accepted = Decimal("0")
+    for root in roots:
+        planned = Decimal(str(root.planned_qty))
+        accepted = Decimal(str(root.accepted_qty))
+        remaining = Decimal(str(root.remaining_qty))
+        if (
+            planned < 0
+            or accepted < 0
+            or remaining < 0
+            or planned != accepted + remaining
+        ):
+            raise ValueError(
+                f"MRP root {int(root.id)} violates output conservation"
+            )
+        run_planned += planned
+        run_accepted += accepted
+
+    if run.source_plan_id is None:
+        raise ValueError("execution snapshot run is not bound to a plan")
+    plan_lines = (
+        db.query(ProductionPlanLine)
+        .filter(ProductionPlanLine.plan_id == int(run.source_plan_id))
+        .order_by(ProductionPlanLine.bucket_date, ProductionPlanLine.id)
+        .all()
+    )
+    if not plan_lines:
+        raise ValueError("execution snapshot plan has no output lines")
+    plan_output_rows: List[Dict[str, Any]] = []
+    plan_planned = Decimal("0")
+    plan_accepted = Decimal("0")
+    plan_remaining = Decimal("0")
+    for line in plan_lines:
+        if line.remaining_output_qty is None:
+            raise ValueError(
+                f"plan line {int(line.id)} has no persisted execution remainder"
+            )
+        planned = Decimal(str(line.qty))
+        accepted = Decimal(str(line.accepted_output_qty))
+        remaining = Decimal(str(line.remaining_output_qty))
+        if (
+            planned < 0
+            or accepted < 0
+            or remaining < 0
+            or planned != accepted + remaining
+        ):
+            raise ValueError(
+                f"plan line {int(line.id)} violates output conservation"
+            )
+        plan_output_rows.append({
+            "plan_line_id": int(line.id),
+            "item_id": int(line.item_id),
+            "bucket_date": line.bucket_date.isoformat(),
+            "planned_output_qty": float(planned),
+            "accepted_plan_output_qty": float(accepted),
+            "assembly_remaining_qty": float(remaining),
+        })
+        plan_planned += planned
+        plan_accepted += accepted
+        plan_remaining += remaining
+
+    planned_qty = float(run_planned)
+    accepted_qty = float(run_accepted)
     result = dict(payload)
     summary = dict(result.get("summary") or {})
     summary.update({
@@ -2254,7 +2615,11 @@ def _attach_run_output_summary(
         "execution_base_qty": planned_qty,
         "execution_pct": _rounded_replenishment_pct(planned_qty, accepted_qty),
         "execution_partial": False,
+        "planned_output_qty": float(plan_planned),
+        "accepted_plan_output_qty": float(plan_accepted),
+        "assembly_remaining_qty": float(plan_remaining),
     })
+    result["plan_output_rows"] = plan_output_rows
     result["summary"] = summary
     return result
 
@@ -2289,12 +2654,16 @@ def _execution_unavailable_payload(
         "cutoff": cutoff_value,
         "truth_reason": reason or state_value("reason") or "Execution snapshot is not published",
         "rows": rows,
+        "plan_output_rows": [],
         "summary": {
             "truth_status": truth_status,
             "total_items": 0,
             "execution_completed_qty": None,
             "execution_base_qty": None,
             "execution_pct": None,
+            "planned_output_qty": None,
+            "accepted_plan_output_qty": None,
+            "assembly_remaining_qty": None,
             "execution_by_flow": None,
         },
     }
@@ -3308,7 +3677,33 @@ def get_period_plan_execution_journal(
                 sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
         payload = dict(snapshot.payload)
 
-    payload = _attach_run_output_summary(db, payload, run)
+    validation_error = _saved_plan_output_validation_error(payload)
+    if (
+        str(payload.get("truth_status") or "") == "accepted"
+        and validation_error is not None
+    ):
+        return _finalize_execution_payload(
+            db,
+            _execution_unavailable_payload(
+                db,
+                plan=plan,
+                run=run,
+                root_item_id=None,
+                bom_level=None,
+                flow=None,
+                truth_state=get_truth_state(db),
+                reason=validation_error,
+            ),
+            root_item_id=root_item_id,
+            bom_level=bom_level,
+            flow=flow,
+            status=status,
+            include_net_zero=include_net_zero,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            limit=limit,
+            offset=offset,
+        )
 
     return _finalize_execution_payload(
         db,
@@ -3530,6 +3925,7 @@ def build_period_plan_execution_snapshots_for_generation(
     if len(runs) != len(run_ids):
         raise ValueError("execution snapshot run lineage is incomplete")
     snapshots: List[Dict[str, int]] = []
+    unavailable_plan_runs: List[Dict[str, Any]] = []
     for run in runs:
         if (
             str(run.status or "") != "FIXED_SNAPSHOT"
@@ -3538,6 +3934,24 @@ def build_period_plan_execution_snapshots_for_generation(
             raise ValueError(
                 f"execution snapshot run {run.run_id} lacks fixed period-plan lineage"
             )
+        has_persisted_roots = (
+            db.query(MrpRunRoot.id)
+            .filter(MrpRunRoot.run_id == int(run.run_id))
+            .first()
+            is not None
+        )
+        if not has_persisted_roots:
+            # Synthetic and pre-root-ledger runs cannot prove either run-local
+            # execution or exact plan-output lineage.  Their individual read
+            # model remains absent (and therefore fail-closed on GET), but an
+            # unrelated legacy run must not veto publication of the physical
+            # Ledger generation used by every other consumer.
+            unavailable_plan_runs.append({
+                "plan_id": int(run.source_plan_id),
+                "run_id": int(run.run_id),
+                "reason": "missing_mrp_roots",
+            })
+            continue
         build_period_plan_execution_snapshot(
             db,
             int(run.source_plan_id),
@@ -3553,4 +3967,6 @@ def build_period_plan_execution_snapshots_for_generation(
         "ledger_generation_id": int(generation_id),
         "snapshots": len(snapshots),
         "plan_runs": snapshots,
+        "unavailable": len(unavailable_plan_runs),
+        "unavailable_plan_runs": unavailable_plan_runs,
     }

@@ -20,6 +20,9 @@ from app.routers.production_control import (
     router as production_control_router,
 )
 from app.services import planning_truth
+from app.services.item_ledger.drum_schedule_persistence import (
+    ALGORITHM_VERSION as DRUM_SCHEDULE_ALGORITHM_VERSION,
+)
 
 
 @pytest.fixture()
@@ -174,7 +177,15 @@ def test_assembly_readiness_reads_only_the_accepted_generation(client, db_sessio
             "shortage_qty": "3",
             "reason": "SHORTAGE",
             "destination_warehouse_ref1c": "",
+            "destination_warehouse_name": "",
             "path": [],
+            "point_of_use_qty": "0",
+            "custody_qty": "0",
+            "transit_qty": "0",
+            "wip_qty": "0",
+            "supplier_qty": "0",
+            "other_stock_qty": "0",
+            "coverage_sources": [],
         }],
         "original_priority": ["2026-08-01", 501],
     }
@@ -186,6 +197,59 @@ def test_assembly_readiness_reads_only_the_accepted_generation(client, db_sessio
     assert empty_filter.status_code == 200
     assert empty_filter.json()["rows"] == []
     assert empty_filter.json()["total"] == 0
+
+
+def test_assembly_readiness_preserves_frozen_oldest_first_order(client, db_session):
+    generation, _ = _accepted_generation(db_session)
+    older_item = models.Item(item_code="OLD-BLOCKED", item_name="Older blocked")
+    newer_item = models.Item(item_code="NEW-READY", item_name="Newer ready")
+    db_session.add_all([older_item, newer_item])
+    db_session.flush()
+    rows = []
+    for ordinal, (item, status) in enumerate(
+        ((older_item, "blocked"), (newer_item, "ready")),
+        start=1,
+    ):
+        queue = models.AssemblyQueueLine(
+            ledger_generation_id=generation.id,
+            planning_run_id=300 + ordinal,
+            plan_id=400 + ordinal,
+            plan_line_id=500 + ordinal,
+            item_id=item.item_id,
+            bucket_date=date(2026, 8, ordinal),
+            period_from=date(2026, 8, ordinal),
+            period_to=date(2026, 8, 31),
+            planned_output_qty=1,
+            accepted_plan_output_qty=0,
+            assembly_remaining_qty=1,
+            original_priority=[f"2026-08-0{ordinal}", 500 + ordinal],
+            sort_key=f"2026-08-0{ordinal}|{500 + ordinal:010d}",
+            line_status="open",
+        )
+        db_session.add(queue)
+        db_session.flush()
+        db_session.add(
+            models.AssemblyReadiness(
+                ledger_generation_id=generation.id,
+                assembly_queue_line_id=queue.id,
+                status=status,
+                open_qty=1,
+                ready_qty=1 if status == "ready" else 0,
+                blocker_count=0 if status == "ready" else 1,
+                blocking_manifest=[] if status == "ready" else [{"reason": "SHORTAGE"}],
+                evidence_signature=str(ordinal) * 64,
+            )
+        )
+        rows.append(queue)
+    db_session.commit()
+
+    payload = client.get("/api/v1/production-control/assembly-readiness").json()
+
+    assert [row["queue_line_id"] for row in payload["rows"]] == [
+        int(rows[0].id),
+        int(rows[1].id),
+    ]
+    assert [row["status"] for row in payload["rows"]] == ["blocked", "ready"]
 
 
 def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_session):
@@ -357,7 +421,7 @@ def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
         models.DrumSchedule(
             ledger_generation_id=generation.id,
             status="completed",
-            algorithm_version="tests/1",
+            algorithm_version=DRUM_SCHEDULE_ALGORITHM_VERSION,
             schedule_from=cutoff.date(),
             schedule_to=cutoff.date(),
             queue_signature="q" * 64,
@@ -383,11 +447,14 @@ def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
         "resources": [],
         "slots": [],
         "gaps": [],
+        "excluded": [],
         "total_open_qty": 0.0,
         "total_slot_qty": 0.0,
         "total_gap_qty": 0.0,
         "total_slots": 0,
         "total_gaps": 0,
+        "total_excluded": 0,
+        "total_excluded_open_qty": 0.0,
         "limit": 1000,
         "offset": 0,
         "truth_meta": {
@@ -399,14 +466,52 @@ def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
     }
 
 
+def test_drum_router_rejects_legacy_schedule_until_new_generation_is_published(
+    db_session,
+):
+    generation, cutoff = _accepted_generation(db_session)
+    db_session.add(
+        models.DrumSchedule(
+            ledger_generation_id=generation.id,
+            status="completed",
+            algorithm_version="drum-schedule/legacy",
+            schedule_from=cutoff.date(),
+            schedule_to=cutoff.date(),
+            queue_signature="q" * 64,
+            slot_signature="s" * 64,
+            gap_signature="g" * 64,
+            slot_row_count=0,
+            gap_row_count=0,
+            total_open_qty=0,
+            total_slot_qty=0,
+            total_gap_qty=0,
+            metrics={},
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        get_drum_schedule(db=db_session)
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail["code"] == "drum_schedule_version_unavailable"
+    assert (
+        exc.value.detail["expected_algorithm_version"]
+        == DRUM_SCHEDULE_ALGORITHM_VERSION
+    )
+    assert exc.value.detail["actual_algorithm_version"] == "drum-schedule/legacy"
+
+
 def test_drum_router_omits_weekends_from_board_columns(client, db_session):
     generation, _ = _accepted_generation(db_session)
     db_session.add(models.DrumSchedule(
         ledger_generation_id=generation.id,
         status="completed",
-        algorithm_version="tests/1",
-        schedule_from=date(2026, 9, 4),  # Friday
-        schedule_to=date(2026, 9, 7),    # Monday
+        algorithm_version=DRUM_SCHEDULE_ALGORITHM_VERSION,
+            schedule_from=date(2026, 9, 4),  # Friday
+            schedule_to=date(2026, 9, 7),    # Monday
+            working_days=["2026-09-04", "2026-09-07"],
+            resource_horizon_ends={},
         queue_signature="q" * 64,
         slot_signature="s" * 64,
         gap_signature="g" * 64,
@@ -417,11 +522,102 @@ def test_drum_router_omits_weekends_from_board_columns(client, db_session):
         total_gap_qty=0,
         metrics={},
     ))
+    db_session.add(
+        models.WorkCalendarDay(
+            date=date(2026, 9, 7),
+            is_workday=False,
+            comment="changed after drum publication",
+        )
+    )
     db_session.commit()
 
     body = client.get("/api/v1/production-control/drum").json()
 
     assert body["days"] == ["2026-09-04", "2026-09-07"]
+
+
+def test_drum_router_exposes_saved_queue_rows_without_takt(client, db_session):
+    generation, cutoff = _accepted_generation(db_session)
+    item = models.Item(item_code="NO-TAKT", item_name="Outside drum")
+    db_session.add(item)
+    db_session.flush()
+    queue = models.AssemblyQueueLine(
+        ledger_generation_id=generation.id,
+        planning_run_id=301,
+        plan_id=401,
+        plan_line_id=501,
+        item_id=item.item_id,
+        bucket_date=cutoff.date(),
+        period_from=cutoff.date(),
+        period_to=cutoff.date(),
+        planned_output_qty=12,
+        accepted_plan_output_qty=2,
+        assembly_remaining_qty=10,
+        original_priority=[cutoff.date().isoformat(), 501],
+        sort_key=f"{cutoff.date().isoformat()}|0000000501",
+        line_status="open",
+    )
+    db_session.add(queue)
+    db_session.flush()
+    db_session.add(
+        models.AssemblyReadiness(
+            ledger_generation_id=generation.id,
+            assembly_queue_line_id=queue.id,
+            status="blocked",
+            open_qty=10,
+            ready_qty=0,
+            transferable_qty=0,
+            kitting_qty=0,
+            committed_qty=0,
+            launchable_qty=0,
+            readiness_curve=[],
+            action_manifest=[],
+            unavailable_reasons=[],
+            blocker_count=1,
+            blocking_manifest=[{"reason": "LEAD_TIME_MISSING"}],
+            evidence_signature="e" * 64,
+        )
+    )
+    db_session.add(
+        models.DrumSchedule(
+            ledger_generation_id=generation.id,
+            status="completed",
+            algorithm_version=DRUM_SCHEDULE_ALGORITHM_VERSION,
+            schedule_from=cutoff.date(),
+            schedule_to=cutoff.date(),
+            queue_signature="q" * 64,
+            slot_signature="s" * 64,
+            gap_signature="g" * 64,
+            slot_row_count=0,
+            gap_row_count=0,
+            total_open_qty=10,
+            total_slot_qty=0,
+            total_gap_qty=10,
+            metrics={
+                "excluded_lines": 1,
+                "excluded_open_qty": "10",
+                "excluded_item_ids": [item.item_id],
+            },
+        )
+    )
+    db_session.commit()
+
+    body = client.get("/api/v1/production-control/drum").json()
+
+    assert body["total_excluded"] == 1
+    assert body["total_excluded_open_qty"] == 10.0
+    [excluded] = body["excluded"]
+    assert excluded["queue_line_id"] == queue.id
+    assert excluded["item_id"] == item.item_id
+    assert excluded["item_code"] == "NO-TAKT"
+    assert excluded["planned_output_qty"] == 12.0
+    assert excluded["accepted_plan_output_qty"] == 2.0
+    assert excluded["assembly_remaining_qty"] == 10.0
+    assert excluded["period_from"] == cutoff.date().isoformat()
+    assert excluded["period_to"] == cutoff.date().isoformat()
+    assert excluded["reason"] == "ASSEMBLY_RATE_MISSING"
+    assert excluded["readiness_status"] == "blocked"
+    assert excluded["blocking_manifest"][0]["reason"] == "LEAD_TIME_MISSING"
 
 
 def test_drum_tile_move_is_persisted_and_audited(client, db_session):
@@ -438,11 +634,12 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
     item = models.Item(item_code="MOVE-1", item_name="Move tile")
     db_session.add_all([resource, item])
     db_session.flush()
-    db_session.add(models.AssemblyRate(
+    rate = models.AssemblyRate(
         resource_id=resource.resource_id,
         item_id=item.item_id,
         qty_per_capacity=1,
-    ))
+    )
+    db_session.add(rate)
     queue = models.AssemblyQueueLine(
         ledger_generation_id=generation.id,
         planning_run_id=301,
@@ -464,9 +661,18 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
     schedule = models.DrumSchedule(
         ledger_generation_id=generation.id,
         status="completed",
-        algorithm_version="tests/1",
+        algorithm_version=DRUM_SCHEDULE_ALGORITHM_VERSION,
         schedule_from=source,
         schedule_to=target + timedelta(days=3),
+        working_days=[
+            (source + timedelta(days=offset)).isoformat()
+            for offset in range((target + timedelta(days=3) - source).days + 1)
+            if (source + timedelta(days=offset)).weekday() < 5
+        ],
+        resource_horizon_ends={
+            str(resource.resource_id): (target + timedelta(days=3)).isoformat()
+        },
+        resource_daily_capacities={str(resource.resource_id): "1"},
         queue_signature="q" * 64,
         slot_signature="s" * 64,
         gap_signature="g" * 64,
@@ -490,6 +696,7 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
         auto_slot_date=source,
         auto_resource_id=resource.resource_id,
         slot_qty=1,
+        capacity_load=1,
         planned_output_qty=1,
         slot_ordinal=0,
         original_priority=[source.isoformat(), 501],
@@ -497,6 +704,12 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
         readiness_date=source,
     )
     db_session.add(slot)
+    db_session.commit()
+
+    # An accepted drum is immutable input for manual correction.  Later edits
+    # to the live rate/capacity master must not change how the saved tiles pack.
+    rate.qty_per_capacity = 0
+    resource.capacity = 0
     db_session.commit()
 
     response = client.post(
@@ -514,6 +727,54 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
     board = client.get("/api/v1/production-control/drum").json()
     assert board["slots"][0]["slot_date"] == target.isoformat()
     assert board["slots"][0]["manual_override"] is True
+    assert board["slots"][0]["run_id"] == 301
+    assert board["slots"][0]["period_from"] == source.isoformat()
+    assert board["slots"][0]["period_to"] == target.isoformat()
+
+    moved.capacity_load = None
+    db_session.commit()
+    missing_saved_load = client.post(
+        f"/api/v1/production-control/drum/slots/{slot.id}/move",
+        json={"new_date": source.isoformat(), "moved_by": "test-master"},
+    )
+    assert missing_saved_load.status_code == 409
+    assert "не сохранена нагрузка" in missing_saved_load.json()["detail"]
+    moved.capacity_load = 1
+    db_session.commit()
+
+    schedule.resource_daily_capacities = {}
+    db_session.commit()
+    missing_saved_capacity = client.post(
+        f"/api/v1/production-control/drum/slots/{slot.id}/move",
+        json={"new_date": source.isoformat(), "moved_by": "test-master"},
+    )
+    assert missing_saved_capacity.status_code == 409
+    assert "не сохранена мощность" in missing_saved_capacity.json()["detail"]
+    schedule.resource_daily_capacities = {str(resource.resource_id): "1"}
+    db_session.commit()
+
+    schedule.resource_horizon_ends = {
+        str(resource.resource_id): source.isoformat()
+    }
+    db_session.commit()
+    outside_resource_horizon = client.post(
+        f"/api/v1/production-control/drum/slots/{slot.id}/move",
+        json={"new_date": target.isoformat(), "moved_by": "test-master"},
+    )
+    assert outside_resource_horizon.status_code == 409
+    assert "вне горизонта участка" in outside_resource_horizon.json()["detail"]
+
+    schedule.resource_horizon_ends = {
+        str(resource.resource_id): (target + timedelta(days=3)).isoformat()
+    }
+    moved.readiness_phase = "blocked"
+    db_session.commit()
+    refused = client.post(
+        f"/api/v1/production-control/drum/slots/{slot.id}/move",
+        json={"new_date": source.isoformat(), "moved_by": "test-master"},
+    )
+    assert refused.status_code == 409
+    assert "заблокированный остаток" in refused.json()["detail"]
 
 
 def test_drum_tile_move_inserts_and_cascades_full_days(client, db_session):
@@ -540,9 +801,12 @@ def test_drum_tile_move_inserts_and_cascades_full_days(client, db_session):
     schedule = models.DrumSchedule(
         ledger_generation_id=generation.id,
         status="completed",
-        algorithm_version="tests/1",
+        algorithm_version=DRUM_SCHEDULE_ALGORITHM_VERSION,
         schedule_from=days[0],
         schedule_to=days[2],
+        working_days=[value.isoformat() for value in days],
+        resource_horizon_ends={str(resource.resource_id): days[2].isoformat()},
+        resource_daily_capacities={str(resource.resource_id): "1"},
         queue_signature="q" * 64,
         slot_signature="s" * 64,
         gap_signature="g" * 64,
@@ -586,6 +850,7 @@ def test_drum_tile_move_inserts_and_cascades_full_days(client, db_session):
             auto_slot_date=slot_date,
             auto_resource_id=resource.resource_id,
             slot_qty=1,
+            capacity_load=1,
             planned_output_qty=1,
             slot_ordinal=0,
             original_priority=list(queue.original_priority),
@@ -606,10 +871,13 @@ def test_drum_tile_move_inserts_and_cascades_full_days(client, db_session):
     assert db_session.get(models.DrumSlot, slots[2].id).slot_date == days[0]
     assert db_session.get(models.DrumSlot, slots[0].id).slot_date == days[1]
     assert db_session.get(models.DrumSlot, slots[1].id).slot_date == days[2]
-    assert all(
-        db_session.get(models.DrumSlot, row.id).manual_moved_by == "test-master"
-        for row in slots
-    )
+    directly_moved = db_session.get(models.DrumSlot, slots[2].id)
+    assert directly_moved.manual_moved_by == "test-master"
+    for cascaded in slots[:2]:
+        row = db_session.get(models.DrumSlot, cascaded.id)
+        assert row.manual_moved_by is None
+        assert row.manual_moved_at is None
+        assert row.auto_slot_date == row.slot_date
 
     # Moving the same tile later reuses the vacancy at its source instead of
     # trying to stack it on the full target day and rejecting the drop.
@@ -642,7 +910,7 @@ def _drum_schedule_with_slots(
     schedule = models.DrumSchedule(
         ledger_generation_id=generation.id,
         status="completed",
-        algorithm_version="tests/1",
+        algorithm_version=DRUM_SCHEDULE_ALGORITHM_VERSION,
         schedule_from=cutoff.date(),
         schedule_to=cutoff.date(),
         queue_signature="q" * 64,

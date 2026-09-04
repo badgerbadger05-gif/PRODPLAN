@@ -14,6 +14,7 @@ export function emptyResourceForm(): ProductionResourcePayload {
     work_schedule: '5/2',
     daily_work_hours: 8,
     buffer_days: 0,
+    is_kitting: false,
   }
 }
 
@@ -26,6 +27,7 @@ export function resourceToForm(resource: ProductionResource): ProductionResource
     work_schedule: resource.work_schedule || '5/2',
     daily_work_hours: Number(resource.daily_work_hours ?? 8),
     buffer_days: Number(resource.buffer_days ?? 0),
+    is_kitting: Boolean(resource.is_kitting),
   }
 }
 
@@ -40,6 +42,7 @@ export function normalizeResourcePayload(
     work_schedule: form.work_schedule || '5/2',
     daily_work_hours: Number(form.daily_work_hours ?? 8),
     buffer_days: Number(form.buffer_days ?? 0),
+    is_kitting: Boolean(form.is_kitting),
   }
 }
 
