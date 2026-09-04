@@ -78,7 +78,7 @@ from app.services.item_ledger.shelf_projection_persistence import (
 from app.services.local_mrp_order_reconciliation import reconcile_local_mrp_orders
 
 
-_VERSION = "obligation-refresh-orchestrator/3"
+_VERSION = "obligation-refresh-orchestrator/4"
 _CORE_CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
@@ -519,11 +519,6 @@ def run_obligation_refresh(
         int(replenishment_batch.id),
     )
     _complete(replenishment_batch, replenishment_summary)
-    local_order_reconciliation = reconcile_local_mrp_orders(
-        db,
-        ledger_generation_id=target_id,
-        live_run_ids=(*candidate_ids, *retained_run_ids),
-    )
     assembly_outputs = materialize_assembly_output_allocations(db, target_id)
     custody_projection = build_material_custody_projection(
         db, ledger_generation_id=target_id
@@ -532,6 +527,15 @@ def run_obligation_refresh(
     shelf_projection = materialize_shelf_projections(db, target_id)
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
+    # Reconciliation takes row locks on mutable executor orders.  Keep it next
+    # to the production snapshot which consumes those quantities, after every
+    # unrelated heavy projection, so operators are not blocked while assembly,
+    # drum, shelf and purchase views are being built.
+    local_order_reconciliation = reconcile_local_mrp_orders(
+        db,
+        ledger_generation_id=target_id,
+        live_run_ids=(*candidate_ids, *retained_run_ids),
+    )
     production_journal_snapshot = build_production_journal_candidate(
         db,
         target_id,
