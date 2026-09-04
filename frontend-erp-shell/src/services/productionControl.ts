@@ -29,6 +29,21 @@ export type ControlSettingsUpdate = {
 
 export type RootProductOption = ApiSchemas['ProductionControlRootProductOption']
 export type RootProductOptionsResponse = ApiSchemas['ProductionControlRootProductOptionsResponse']
+export type DrumScheduleResponse = ApiSchemas['DrumScheduleResponse']
+export type DrumSlotMoveResponse = ApiSchemas['DrumSlotMoveResponse']
+
+export function listDrumSchedule(signal?: AbortSignal) {
+  return api<DrumScheduleResponse>('/v1/production-control/drum?limit=10000&offset=0', {
+    signal,
+  })
+}
+
+export function moveDrumSlot(slotId: number, newDate: string, newResourceId: number) {
+  return api<DrumSlotMoveResponse>(`/v1/production-control/drum/slots/${slotId}/move`, {
+    method: 'POST',
+    body: JSON.stringify({ new_date: newDate, new_resource_id: newResourceId }),
+  })
+}
 
 // Loosely-typed side of the paint↔weld chain preview/close response. The
 // endpoint returns a heterogeneous document the page reads field-by-field.

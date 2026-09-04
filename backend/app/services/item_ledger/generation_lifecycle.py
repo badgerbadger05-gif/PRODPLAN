@@ -96,6 +96,7 @@ CAPABILITIES = {
     "planning_snapshots": True,
     "assembly_output_allocation": True,
     "assembly_queue": True,
+    "assembly_readiness": True,
     "drum_schedule": True,
     "shelf_projection": True,
     "replenishment_work_item": True,
@@ -1529,6 +1530,11 @@ def accept_generation_build(
         assembly_outputs = materialize_assembly_output_allocations(
             db, int(generation.id)
         )
+        # Readiness must net material already held for executable orders before
+        # it allocates the remaining free stock across assembly queue lines.
+        build_material_custody_projection(
+            db, ledger_generation_id=int(generation.id)
+        )
         try:
             drum_schedule = materialize_drum_schedule(db, int(generation.id))
             shelf_projection = materialize_shelf_projections(
@@ -1588,9 +1594,6 @@ def accept_generation_build(
                 .order_by(models.PlanningRun.run_id.asc())
                 .all()
             ]
-            build_material_custody_projection(
-                db, ledger_generation_id=int(generation.id)
-            )
             production_journal_snapshot = build_production_journal_candidate(
                 db,
                 int(generation.id),

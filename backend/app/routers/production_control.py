@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Annotated, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import case
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -63,6 +65,8 @@ from ..services.production_order_sync import (
     configured_production_order_sync_request,
     sync_production_orders_from_odata,
 )
+from ..services.item_ledger.drum_manual_move import move_drum_slot
+from ..services.work_calendar_service import is_workday
 from .production_control_settings import router as settings_router
 
 
@@ -122,6 +126,85 @@ class AssemblyQueueResponse(BaseModel):
     truth_meta: TruthMeta
 
 
+class ReadinessActionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_kind: str
+    item_id: int
+    item_code: str
+    item_article: str
+    item_name: str
+    qty: str
+    available_date: str | None = None
+    confidence: str
+    source_key: str
+    source_warehouse_ref1c: str
+    destination_warehouse_ref1c: str
+    resource_id: int | None = None
+    path: list[int]
+
+
+class ReadinessCurvePointResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    horizon: Literal["now", "transfer", "kitting", "committed", "launch"]
+    cumulative_qty: str
+    available_date: str | None = None
+    actions: list[ReadinessActionResponse] = Field(default_factory=list)
+
+
+class ReadinessBlockerResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int | None = None
+    item_code: str = ""
+    item_article: str = ""
+    item_name: str = ""
+    required_qty: str | None = None
+    available_qty: str | None = None
+    shortage_qty: str | None = None
+    reason: str = "SHORTAGE"
+    destination_warehouse_ref1c: str = ""
+    path: list[int] = Field(default_factory=list)
+
+
+class AssemblyReadinessRowResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    queue_line_id: int
+    plan_id: int
+    plan_line_id: int
+    run_id: int
+    item_id: int
+    item_code: str
+    item_name: str
+    resource_id: int | None
+    status: Literal["ready", "recoverable", "partial", "blocked", "unavailable"]
+    open_qty: float
+    ready_qty: float
+    transferable_qty: float
+    kitting_qty: float
+    committed_qty: float
+    launchable_qty: float
+    readiness_date: str | None = None
+    readiness_curve: list[ReadinessCurvePointResponse]
+    action_manifest: list[ReadinessActionResponse]
+    unavailable_reasons: list[str]
+    blocker_count: int
+    blockers: list[ReadinessBlockerResponse]
+    original_priority: list[Union[str, int]]
+
+
+class AssemblyReadinessListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[AssemblyReadinessRowResponse]
+    total: int
+    limit: int
+    offset: int
+    truth_meta: TruthMeta
+
+
 class ProductionMaterialsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -148,6 +231,8 @@ class ProductionMaterialsResponse(BaseModel):
 class DrumSlotRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    slot_id: int
+    queue_line_id: int
     plan_id: int
     plan_line_id: int
     item_id: int
@@ -157,21 +242,66 @@ class DrumSlotRow(BaseModel):
     item_name: str | None = None
     resource_id: int
     slot_date: str
+    auto_slot_date: str | None = None
     slot_qty: float
     slot_ordinal: int
+    readiness_phase: Literal["now", "transfer", "kitting", "committed", "launch", "blocked", "unavailable"]
+    readiness_date: str | None = None
+    readiness_curve: list[ReadinessCurvePointResponse]
+    action_manifest: list[ReadinessActionResponse]
+    unavailable_reasons: list[str]
+    blocking_manifest: list[ReadinessBlockerResponse]
+    manual_override: bool = False
+    manual_moved_at: str | None = None
+    manual_moved_by: str | None = None
     original_priority: list[Union[str, int]]
+
+
+class DrumSlotMoveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_date: str
+    new_resource_id: int | None = None
+    moved_by: str | None = None
+
+
+class DrumSlotMoveResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    moved: bool
+    slot_id: int
+    from_date: str
+    to_date: str
+    resource_id: int
+    manual_moved_at: str | None = None
+    manual_moved_by: str | None = None
 
 
 class DrumGapRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    gap_id: int
+    queue_line_id: int
     plan_id: int
     plan_line_id: int
     item_id: int
+    item_code: str | None = None
+    item_name: str | None = None
     resource_id: int
     gap_date: str
+    required_qty: float
+    available_capacity: float
     gap_qty: float
+    readiness_phase: Literal["now", "transfer", "kitting", "committed", "launch", "blocked", "unavailable", "mixed"]
     original_priority: list[Union[str, int]]
+
+
+class DrumResourceRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resource_id: int
+    resource_name: str
 
 
 class DrumScheduleResponse(BaseModel):
@@ -179,6 +309,8 @@ class DrumScheduleResponse(BaseModel):
 
     schedule_from: str
     schedule_to: str
+    days: list[str]
+    resources: list[DrumResourceRow]
     slots: list[DrumSlotRow]
     gaps: list[DrumGapRow]
     total_open_qty: float
@@ -292,6 +424,106 @@ def get_assembly_queue(
     return AssemblyQueueResponse.model_validate(response)
 
 
+@router.get("/assembly-readiness", response_model=AssemblyReadinessListResponse)
+def get_assembly_readiness(
+    resource_id: Optional[int] = None,
+    limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: Session = Depends(get_db),
+) -> AssemblyReadinessListResponse:
+    """Read the persisted release recommendation; never calculate readiness in GET."""
+    try:
+        truth = planning_truth.require_accepted_truth(
+            db,
+            "assembly_readiness",
+            required_capabilities=(
+                planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+                planning_truth.CAPABILITY_ASSEMBLY_READINESS,
+            ),
+        )
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+
+    query = (
+        db.query(models.AssemblyReadiness, models.AssemblyQueueLine, models.AssemblyRate)
+        .join(
+            models.AssemblyQueueLine,
+            models.AssemblyQueueLine.id == models.AssemblyReadiness.assembly_queue_line_id,
+        )
+        .outerjoin(
+            models.AssemblyRate,
+            models.AssemblyRate.item_id == models.AssemblyQueueLine.item_id,
+        )
+        .filter(models.AssemblyReadiness.ledger_generation_id == int(truth.generation_id))
+    )
+    if int(query.count() or 0) == 0:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                **truth.as_dict(),
+                "code": "assembly_readiness_unavailable",
+                "reason": "assembly readiness is missing for accepted generation",
+            },
+        )
+    if resource_id is not None:
+        query = query.filter(models.AssemblyRate.resource_id == int(resource_id))
+    total = int(query.count() or 0)
+    status_rank = case(
+        (models.AssemblyReadiness.status == "ready", 0),
+        (models.AssemblyReadiness.status == "recoverable", 1),
+        (models.AssemblyReadiness.status == "partial", 2),
+        (models.AssemblyReadiness.status == "blocked", 3),
+        else_=3,
+    )
+    records = (
+        query.order_by(
+            status_rank,
+            models.AssemblyQueueLine.sort_key,
+            models.AssemblyQueueLine.id,
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    items = _items_by_id(db, {int(line.item_id) for _ready, line, _rate in records})
+    return AssemblyReadinessListResponse.model_validate(
+        {
+            "rows": [
+                {
+                    "queue_line_id": int(ready.assembly_queue_line_id),
+                    "plan_id": int(line.plan_id),
+                    "plan_line_id": int(line.plan_line_id),
+                    "run_id": int(line.planning_run_id),
+                    "item_id": int(line.item_id),
+                    "item_code": str(items[int(line.item_id)].item_code or ""),
+                    "item_name": str(items[int(line.item_id)].item_name or ""),
+                    "resource_id": int(rate.resource_id) if rate is not None else None,
+                    "status": str(ready.status),
+                    "open_qty": float(ready.open_qty),
+                    "ready_qty": float(ready.ready_qty),
+                    "transferable_qty": float(ready.transferable_qty),
+                    "kitting_qty": float(ready.kitting_qty),
+                    "committed_qty": float(ready.committed_qty),
+                    "launchable_qty": float(ready.launchable_qty),
+                    "readiness_date": ready.readiness_date.isoformat() if ready.readiness_date else None,
+                    "readiness_curve": list(ready.readiness_curve or []),
+                    "action_manifest": list(ready.action_manifest or []),
+                    "unavailable_reasons": list(ready.unavailable_reasons or []),
+                    "blocker_count": int(ready.blocker_count),
+                    "blockers": list(ready.blocking_manifest or []),
+                    "original_priority": list(line.original_priority or []),
+                }
+                for ready, line, rate in records
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "truth_meta": build_truth_meta(truth),
+        }
+    )
+
+
 @router.get("/drum", response_model=DrumScheduleResponse)
 def get_drum_schedule(
     limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
@@ -360,13 +592,42 @@ def get_drum_schedule(
     )
     # Item labels for this page only, in one query — the drum board needs a name
     # next to every slot, not the raw item id.
-    slot_items = _items_by_id(db, {int(row.item_id) for row in slots})
+    slot_items = _items_by_id(
+        db, {int(row.item_id) for row in slots} | {int(row.item_id) for row in gaps}
+    )
+    resource_ids = {int(row.resource_id) for row in slots} | {
+        int(row.resource_id) for row in gaps
+    }
+    drum_resources = (
+        db.query(models.ProductionResource)
+        .filter(models.ProductionResource.resource_id.in_(sorted(resource_ids)))
+        .order_by(models.ProductionResource.resource_name, models.ProductionResource.resource_id)
+        .all()
+        if resource_ids
+        else []
+    )
+    days = []
+    day = schedule.schedule_from
+    while day <= schedule.schedule_to:
+        if is_workday(db, day):
+            days.append(day.isoformat())
+        day += timedelta(days=1)
     return DrumScheduleResponse.model_validate(
         {
             "schedule_from": schedule.schedule_from.isoformat(),
             "schedule_to": schedule.schedule_to.isoformat(),
+            "days": days,
+            "resources": [
+                {
+                    "resource_id": int(resource.resource_id),
+                    "resource_name": str(resource.resource_name or f"Участок #{resource.resource_id}"),
+                }
+                for resource in drum_resources
+            ],
             "slots": [
                 {
+                    "slot_id": int(row.id),
+                    "queue_line_id": int(row.assembly_queue_line_id),
                     "plan_id": row.plan_id,
                     "plan_line_id": row.plan_line_id,
                     "item_id": row.item_id,
@@ -382,20 +643,47 @@ def get_drum_schedule(
                     ),
                     "resource_id": row.resource_id,
                     "slot_date": row.slot_date.isoformat(),
+                    "auto_slot_date": row.auto_slot_date.isoformat() if row.auto_slot_date else None,
                     "slot_qty": float(row.slot_qty),
                     "slot_ordinal": row.slot_ordinal,
+                    "readiness_phase": row.readiness_phase,
+                    "readiness_date": row.readiness_date.isoformat() if row.readiness_date else None,
+                    "readiness_curve": list(row.readiness_curve or []),
+                    "action_manifest": list(row.action_manifest or []),
+                    "unavailable_reasons": list(row.unavailable_reasons or []),
+                    "blocking_manifest": list(row.blocking_manifest or []),
+                    "manual_override": bool(
+                        row.auto_slot_date is not None and row.auto_slot_date != row.slot_date
+                    ),
+                    "manual_moved_at": row.manual_moved_at.isoformat() if row.manual_moved_at else None,
+                    "manual_moved_by": row.manual_moved_by,
                     "original_priority": list(row.original_priority or []),
                 }
                 for row in slots
             ],
             "gaps": [
                 {
+                    "gap_id": int(row.id),
+                    "queue_line_id": int(row.assembly_queue_line_id),
                     "plan_id": row.plan_id,
                     "plan_line_id": row.plan_line_id,
                     "item_id": row.item_id,
+                    "item_code": (
+                        slot_items[int(row.item_id)].item_code
+                        if int(row.item_id) in slot_items
+                        else None
+                    ),
+                    "item_name": (
+                        slot_items[int(row.item_id)].item_name
+                        if int(row.item_id) in slot_items
+                        else None
+                    ),
                     "resource_id": row.resource_id,
                     "gap_date": row.gap_date.isoformat(),
+                    "required_qty": float(row.required_qty),
+                    "available_capacity": float(row.available_capacity),
                     "gap_qty": float(row.gap_qty),
+                    "readiness_phase": row.readiness_phase,
                     "original_priority": list(row.original_priority or []),
                 }
                 for row in gaps
@@ -410,6 +698,30 @@ def get_drum_schedule(
             "truth_meta": build_truth_meta(truth),
         }
     )
+
+
+@router.post("/drum/slots/{slot_id}/move", response_model=DrumSlotMoveResponse)
+def post_move_drum_slot(
+    slot_id: int,
+    payload: DrumSlotMoveRequest,
+    db: Session = Depends(get_db),
+) -> DrumSlotMoveResponse:
+    try:
+        target_date = date.fromisoformat(payload.new_date)
+        result = move_drum_slot(
+            db,
+            int(slot_id),
+            target_date,
+            new_resource_id=payload.new_resource_id,
+            moved_by=payload.moved_by,
+        )
+        return DrumSlotMoveResponse.model_validate(result)
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/shelves", response_model=ShelfProjectionResponse)
@@ -746,6 +1058,16 @@ class PaintWeldPairResponse(BaseModel):
     selection_disabled_reason: Optional[str] = None
 
 
+class ProtectedDrumSlotResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    drum_slot_id: int
+    root_item_id: int
+    slot_date: str
+    slot_qty: str
+    readiness_phase: Literal["now", "transfer", "kitting", "committed", "launch", "blocked", "unavailable"]
+
+
 class ProductionOrderJournalRowResponse(BaseModel):
     """One executor order or saved MRP proposal in the unified journal."""
 
@@ -814,6 +1136,11 @@ class ProductionOrderJournalRowResponse(BaseModel):
     shelf_pull_qty: Optional[float] = None
     shelf_materialized_qty: Optional[float] = None
     shelf_latest_start_date: Optional[str] = None
+    readiness_required_qty: Optional[float] = None
+    readiness_need_date: Optional[str] = None
+    readiness_action_date: Optional[str] = None
+    readiness_priority_key: Optional[str] = None
+    protected_drum_slots: list[ProtectedDrumSlotResponse] = Field(default_factory=list)
     materialized_order_qty: Optional[float] = None
     launchable_qty: Optional[float] = None
     paint_weld_chain: Optional[PaintWeldChainResponse] = None
@@ -875,6 +1202,10 @@ def get_orders_journal(
         None,
         description="Контур планирования: mrp или 1c для источника заказа.",
     ),
+    launch_source: Optional[str] = Query(
+        None,
+        description="Источник запуска: drum_readiness, shelf_pull или mrp_remaining.",
+    ),
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -895,6 +1226,7 @@ def get_orders_journal(
             status=status,
             coverage_status=coverage_status,
             planning_contour=planning_contour,
+            launch_source=launch_source,
             search=search,
             date_from=date_from,
             date_to=date_to,

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -17,6 +17,7 @@ from app.services.production_control_journal_snapshot import (
     RouteSheetSnapshotUnavailable,
     list_root_product_options,
     _public_journal_row,
+    _drum_readiness_pull_by_run_item,
     build_candidate_snapshot,
     read_route_sheet_snapshot_rows,
     promote_candidate_snapshot,
@@ -50,6 +51,77 @@ def test_public_journal_row_strips_internal_material_snapshot():
     assert _public_journal_row(source) == {"product_id": 7}
     assert "material_coverage_snapshot" in source
     assert "_route_sheet_snapshot" in source
+
+
+def test_drum_make_manifest_becomes_run_scoped_mechshop_pull(db_session):
+    generation = _building_generation(db_session, "journal-readiness-pull")
+    line = models.AssemblyQueueLine(
+        ledger_generation_id=generation.id,
+        planning_run_id=77,
+        plan_id=8,
+        plan_line_id=9,
+        item_id=100,
+        bucket_date=date(2026, 9, 8),
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        planned_output_qty=2,
+        accepted_plan_output_qty=0,
+        assembly_remaining_qty=2,
+        original_priority=["2026-09-01", 9],
+        sort_key="2026-09-01|0000000009",
+        line_status="open",
+    )
+    db_session.add(line)
+    db_session.flush()
+    db_session.add(models.AssemblyReadiness(
+        ledger_generation_id=generation.id,
+        assembly_queue_line_id=line.id,
+        status="recoverable",
+        open_qty=2,
+        ready_qty=0,
+        launchable_qty=2,
+        action_manifest=[{
+            "action_kind": "make", "item_id": 501, "qty": "4",
+            "available_date": "2026-09-06",
+        }],
+        evidence_signature="e" * 64,
+    ))
+    schedule = models.DrumSchedule(
+        ledger_generation_id=generation.id,
+        status="completed", algorithm_version="test",
+        schedule_from=date(2026, 9, 3), schedule_to=date(2026, 9, 30),
+        queue_signature="q", slot_signature="s", gap_signature="g",
+        slot_row_count=1, gap_row_count=0,
+        total_open_qty=2, total_slot_qty=2, total_gap_qty=0,
+    )
+    db_session.add(schedule)
+    db_session.flush()
+    slot = models.DrumSlot(
+        drum_schedule_id=schedule.id,
+        assembly_queue_line_id=line.id,
+        plan_id=8, plan_line_id=9, item_id=100, resource_id=3,
+        slot_date=date(2026, 9, 8), slot_qty=2, planned_output_qty=2,
+        slot_ordinal=0, original_priority=["2026-09-01", 9],
+        readiness_phase="launch",
+        action_manifest=[{
+            "action_kind": "make", "item_id": 501, "qty": "4",
+            "available_date": "2026-09-06",
+        }],
+    )
+    db_session.add(slot)
+    db_session.flush()
+
+    pull = _drum_readiness_pull_by_run_item(db_session, generation.id)
+
+    assert pull[(77, 501)]["readiness_required_qty"] == 4.0
+    assert pull[(77, 501)]["readiness_need_date"] == "2026-09-08"
+    assert pull[(77, 501)]["protected_drum_slots"] == [{
+        "drum_slot_id": slot.id,
+        "root_item_id": 100,
+        "slot_date": "2026-09-08",
+        "slot_qty": "2",
+        "readiness_phase": "launch",
+    }]
 
 
 def _building_generation(db, key: str):

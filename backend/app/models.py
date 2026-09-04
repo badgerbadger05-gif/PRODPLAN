@@ -100,7 +100,7 @@ class LedgerBuildBatch(Base):
             "'reservation_materialize', "
             "'execution_allocation', 'assembly_output_allocation', "
             "'replenishment_work_item', 'future_supply_capture', "
-            "'snapshot_build', 'drum_schedule', 'shelf_projection')",
+            "'snapshot_build', 'assembly_readiness', 'drum_schedule', 'shelf_projection')",
             name="ck_ledger_build_batch_stage",
         ),
         CheckConstraint(
@@ -2210,6 +2210,74 @@ class AssemblyQueueLine(Base):
     ledger_generation = relationship("LedgerGeneration")
 
 
+class AssemblyReadiness(Base):
+    """Generation-scoped readiness gate for one canonical assembly queue line."""
+
+    __tablename__ = "assembly_readiness"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "assembly_queue_line_id",
+            name="uq_assembly_readiness_generation_queue_line",
+        ),
+        CheckConstraint("open_qty >= 0", name="ck_assembly_readiness_open_qty_nonnegative"),
+        CheckConstraint("ready_qty >= 0", name="ck_assembly_readiness_ready_qty_nonnegative"),
+        CheckConstraint("ready_qty <= open_qty", name="ck_assembly_readiness_ready_not_above_open"),
+        CheckConstraint(
+            "status IN ('ready', 'recoverable', 'partial', 'blocked', 'unavailable')",
+            name="ck_assembly_readiness_status",
+        ),
+        Index(
+            "ix_assembly_readiness_generation_status",
+            "ledger_generation_id",
+            "status",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    assembly_queue_line_id = Column(
+        BigInteger,
+        ForeignKey("assembly_queue_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String(20), nullable=False)
+    open_qty = Column(DECIMAL(15, 3), nullable=False)
+    ready_qty = Column(DECIMAL(15, 3), nullable=False)
+    transferable_qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
+    kitting_qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
+    committed_qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
+    launchable_qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
+    readiness_date = Column(Date, nullable=True)
+    readiness_curve = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    action_manifest = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    unavailable_reasons = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    blocker_count = Column(Integer, nullable=False, default=0, server_default="0")
+    blocking_manifest = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'"),
+    )
+    evidence_signature = Column(String(64), nullable=False)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    ledger_generation = relationship("LedgerGeneration")
+    queue_line = relationship("AssemblyQueueLine")
+
+
 class DrumSchedule(Base):
     __tablename__ = "drum_schedule"
     __table_args__ = (
@@ -2262,6 +2330,10 @@ class DrumSlot(Base):
         ),
         CheckConstraint("slot_qty > 0", name="ck_drum_slot_qty_positive"),
         CheckConstraint("slot_ordinal >= 0", name="ck_drum_slot_ordinal_nonnegative"),
+        CheckConstraint(
+            "readiness_phase IN ('now', 'transfer', 'kitting', 'committed', 'launch', 'blocked', 'unavailable')",
+            name="ck_drum_slot_readiness_phase",
+        ),
         Index("ix_drum_slot_schedule_date", "drum_schedule_id", "slot_date"),
         Index("ix_drum_slot_resource_date", "resource_id", "slot_date"),
         Index("ix_drum_slot_item", "item_id"),
@@ -2306,10 +2378,30 @@ class DrumSlot(Base):
         index=True,
     )
     slot_date = Column(Date, nullable=False)
+    auto_slot_date = Column(Date, nullable=True)
     slot_qty = Column(DECIMAL(15, 3), nullable=False)
     planned_output_qty = Column(DECIMAL(15, 3), nullable=False)
     slot_ordinal = Column(Integer, nullable=False, default=0, server_default="0")
     original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    readiness_phase = Column(
+        String(20), nullable=False, default="unavailable", server_default="unavailable"
+    )
+    readiness_date = Column(Date, nullable=True)
+    readiness_curve = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    action_manifest = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    unavailable_reasons = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    blocking_manifest = Column(
+        CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    auto_resource_id = Column(Integer, nullable=True)
+    manual_moved_at = Column(TIMESTAMP, nullable=True)
+    manual_moved_by = Column(String(100), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
     drum_schedule = relationship("DrumSchedule")
@@ -2329,6 +2421,10 @@ class DrumCapacityGap(Base):
         CheckConstraint("required_qty >= 0", name="ck_drum_gap_required_qty_nonnegative"),
         CheckConstraint("available_capacity >= 0", name="ck_drum_gap_available_capacity_nonnegative"),
         CheckConstraint("gap_qty >= 0", name="ck_drum_gap_qty_nonnegative"),
+        CheckConstraint(
+            "readiness_phase IN ('now', 'transfer', 'kitting', 'committed', 'launch', 'blocked', 'unavailable', 'mixed')",
+            name="ck_drum_gap_readiness_phase",
+        ),
         Index("ix_drum_gap_schedule_resource_date", "drum_schedule_id", "resource_id", "gap_date"),
         Index("ix_drum_gap_schedule_item", "drum_schedule_id", "item_id"),
         Index("ix_drum_gap_item_resource", "item_id", "resource_id"),
@@ -2376,6 +2472,9 @@ class DrumCapacityGap(Base):
     available_capacity = Column(DECIMAL(15, 3), nullable=False)
     gap_qty = Column(DECIMAL(15, 3), nullable=False)
     original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    readiness_phase = Column(
+        String(20), nullable=False, default="unavailable", server_default="unavailable"
+    )
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
     drum_schedule = relationship("DrumSchedule")

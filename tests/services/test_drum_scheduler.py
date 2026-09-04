@@ -10,6 +10,89 @@ from app.services.item_ledger.drum_scheduler import (
 )
 
 
+def test_readiness_gate_allows_ready_younger_line_to_pass_blocked_old_line():
+    older = QueueLine(
+        queue_line_id=1,
+        plan_id=1,
+        plan_line_id=1,
+        item_id=10,
+        sort_key="001",
+        planned_output_qty=Decimal("1"),
+        accepted_plan_output_qty=Decimal("0"),
+        original_priority=("old",),
+        ready_qty=Decimal("0"),
+        readiness_status="blocked",
+    )
+    younger = QueueLine(
+        queue_line_id=2,
+        plan_id=2,
+        plan_line_id=2,
+        item_id=20,
+        sort_key="002",
+        planned_output_qty=Decimal("1"),
+        accepted_plan_output_qty=Decimal("0"),
+        original_priority=("young",),
+        ready_qty=Decimal("1"),
+        readiness_status="ready",
+    )
+
+    plan = build_drum_plan(
+        (older, younger),
+        {
+            10: (AssemblyRateProfile(resource_id=1, qty_per_capacity=Decimal("1")),),
+            20: (AssemblyRateProfile(resource_id=1, qty_per_capacity=Decimal("1")),),
+        },
+        {},
+        schedule_from=date(2026, 9, 3),
+        schedule_to=date(2026, 9, 4),
+        resource_capacity_by_id={1: Decimal("1")},
+    )
+
+    assert [(slot.queue_line_id, slot.slot_date) for slot in plan.slots] == [
+        (2, date(2026, 9, 3)),
+        (1, date(2026, 9, 4)),
+    ]
+    assert [slot.readiness_phase for slot in plan.slots] == ["now", "blocked"]
+    assert plan.metrics["total_open_qty"] == "2"
+    assert plan.metrics["total_slot_qty"] == "2.000"
+
+
+def test_readiness_curve_delays_each_increment_until_its_available_date():
+    line = QueueLine(
+        queue_line_id=1,
+        plan_id=1,
+        plan_line_id=1,
+        item_id=10,
+        sort_key="001",
+        planned_output_qty=Decimal("3"),
+        accepted_plan_output_qty=Decimal("0"),
+        original_priority=("old",),
+        readiness_status="recoverable",
+        readiness_curve=(
+            ("now", Decimal("1"), date(2026, 9, 3)),
+            ("transfer", Decimal("2"), date(2026, 9, 4)),
+            ("kitting", Decimal("2"), date(2026, 9, 4)),
+            ("committed", Decimal("2"), date(2026, 9, 4)),
+            ("launch", Decimal("3"), date(2026, 9, 7)),
+        ),
+    )
+
+    plan = build_drum_plan(
+        (line,),
+        {10: (AssemblyRateProfile(1, Decimal("1")),)},
+        {},
+        schedule_from=date(2026, 9, 3),
+        schedule_to=date(2026, 9, 8),
+        resource_capacity_by_id={1: Decimal("1")},
+    )
+
+    assert [(slot.readiness_phase, slot.slot_date, slot.slot_qty) for slot in plan.slots] == [
+        ("now", date(2026, 9, 3), Decimal("1.000")),
+        ("transfer", date(2026, 9, 4), Decimal("1.000")),
+        ("launch", date(2026, 9, 7), Decimal("1.000")),
+    ]
+
+
 def _line(line_id: int, qty: str, *, sort_key: str, item_id: int = 1) -> QueueLine:
     return QueueLine(
         queue_line_id=line_id,
@@ -41,6 +124,7 @@ def test_drum_splits_fifo_and_exposes_horizon_gap() -> None:
     assert [(row.queue_line_id, row.gap_qty) for row in result.gaps] == [
         (2, Decimal("3"))
     ]
+    assert result.gaps[0].readiness_phase == "unavailable"
     assert Decimal(result.metrics["total_open_qty"]) == Decimal("13")
     assert Decimal(result.metrics["total_slot_qty"]) == Decimal("10")
     assert Decimal(result.metrics["total_gap_qty"]) == Decimal("3")

@@ -20,7 +20,7 @@ import {
 
 const filters: ProductionFilters = {
   search: 'насос', status: 'ready', workshop_id: '', coverage_status: '', root_item_id: '', planning_contour: '',
-  sort_by: 'planned_start_date', sort_dir: 'asc',
+  launch_source: '', sort_by: 'planned_start_date', sort_dir: 'asc',
 }
 const rows = [
   { product_id: 1, order_id: 1, item_id: 11, order_number: 'LOCAL', status: 'ready', coverage_status: 'ready' },
@@ -55,6 +55,7 @@ describe('production control model', () => {
         planning_contour: 'mrp',
         sort_dir: 'desc',
       },
+      view: 'mechshop',
       offset: 100,
       activeProductId: 2,
     })
@@ -70,9 +71,11 @@ describe('production control model', () => {
         coverage_status: 'shortage',
         root_item_id: '44',
         planning_contour: 'mrp',
-        sort_by: 'planned_start_date',
+        launch_source: 'drum_readiness',
+        sort_by: 'readiness_priority_key',
         sort_dir: 'desc',
       },
+      view: 'mechshop',
       offset: 100,
       activeProductId: 2,
     })
@@ -84,6 +87,7 @@ describe('production control model', () => {
     ))
     expect(parsed).toEqual({
       filters: DEFAULT_PRODUCTION_FILTERS,
+      view: 'orders',
       offset: 0,
       activeProductId: null,
     })

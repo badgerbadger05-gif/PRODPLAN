@@ -8,6 +8,7 @@ import {
   type MaterialsResponse,
   type OrderRow,
   type ProductionFilters,
+  type ProductionControlView,
   type ProductionOperationOption,
   type WarehouseCandidate,
   type WorkshopWarehouse,
@@ -54,6 +55,7 @@ import { ProductionFilterBar } from './production-control/ProductionFilterBar'
 import { ProductionOrdersTable } from './production-control/ProductionOrdersTable'
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
 import { ProductionViewBar } from './production-control/ProductionViewBar'
+import { DrumSchedulePanel } from './production-control/DrumSchedulePanel'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
 import { ProduceDialog, type ProduceChainSide } from './production-control/ProduceDialog'
 import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
@@ -101,6 +103,7 @@ export function ProductionControlPage() {
   const [filters, setFilters] = useState<ProductionFilters>(
     initialUrlState.current.filters ?? DEFAULT_PRODUCTION_FILTERS,
   )
+  const [view, setView] = useState<ProductionControlView>(initialUrlState.current.view)
   const filtersRef = useRef(filters)
   const offsetRef = useRef(offset)
   const [message, setMessage] = useState('')
@@ -143,13 +146,14 @@ export function ProductionControlPage() {
   useEffect(() => {
     setSearchParams(writeProductionControlUrlState(searchParams, {
       filters,
+      view,
       offset,
       activeProductId: activeId,
     }), { replace: true })
     // URL params are cloned from the current render, but changes to external
     // product_id/order_id must not reset locally owned journal state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId, filters, offset, setSearchParams])
+  }, [activeId, filters, offset, setSearchParams, view])
 
   const activeRow = useMemo(() => activeProductionRow(rows, activeId), [rows, activeId])
   const selectedRows = useMemo(() => selectedProductionRows(rows, selectedIds), [rows, selectedIds])
@@ -845,6 +849,21 @@ export function ProductionControlPage() {
     setMaterialsRefreshToken((current) => current + 1)
   }
 
+  function changeView(nextView: ProductionControlView) {
+    const nextFilters: ProductionFilters = {
+      ...filtersRef.current,
+      planning_contour: nextView === 'mechshop' ? 'mrp' : '',
+      launch_source: nextView === 'mechshop' ? 'drum_readiness' : '',
+      sort_by: nextView === 'mechshop' ? 'readiness_priority_key' : 'planned_start_date',
+      sort_dir: 'asc',
+    }
+    filtersRef.current = nextFilters
+    setFilters(nextFilters)
+    setView(nextView)
+    setOffset(0)
+    if (nextView !== 'drum') void load(0)
+  }
+
   const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
 
   return (
@@ -858,10 +877,17 @@ export function ProductionControlPage() {
       </div>
 
       <DocumentWindow
-        title="Журнал заказов на производство"
-        subtitle="Рабочий список строк по деталям, цехам, обеспечению и запуску в 1С"
+        title={view === 'drum' ? 'Барабан сборки' : 'Журнал заказов на производство'}
+        subtitle={view === 'drum'
+          ? 'Календарная последовательность трёх финишных участков с readiness gate'
+          : 'Рабочий список строк по деталям, цехам, обеспечению и запуску в 1С'}
         hotkeys="F5 Обновить · Ctrl+P Печать · Enter Детали"
-        footer={(
+        footer={view === 'drum' ? (
+          <footer className="statusBar">
+            <span>Сохранённый барабан принятого Ledger</span>
+            <span>API: /api</span>
+          </footer>
+        ) : (
           <StatusBar
             loading={loading}
             visibleFrom={visibleFrom}
@@ -875,7 +901,7 @@ export function ProductionControlPage() {
           />
         )}
       >
-        <ProductionCommandBar
+        {view !== 'drum' && <ProductionCommandBar
           rows={rows}
           selectedIds={selectedIds}
           canClose={selectedRows.length === 1 && selectedRows[0].available_actions.includes('close_1c')}
@@ -894,13 +920,16 @@ export function ProductionControlPage() {
           onClearSelection={() => setSelectedIds(new Set())}
           rootProductLabel={rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}
           onOpenRootProductFilter={() => setRootDialogOpen(true)}
-        />
+        />}
 
         {error && rows.length > 0 && <div className="errorLine" role="alert">{error}</div>}
         {message && <div className="successLine" role="status">{message}</div>}
 
-        <ProductionViewBar filters={filters} onChange={changeFilters} />
+        <ProductionViewBar view={view} onChange={changeView} />
 
+        {view === 'drum' ? (
+          <DrumSchedulePanel />
+        ) : (
         <div className="split">
           <div className="tablePane">
             <ProductionFilterBar
@@ -980,6 +1009,7 @@ export function ProductionControlPage() {
             />
           )}
         </div>
+        )}
       </DocumentWindow>
 
       <RootProductFilterDialog

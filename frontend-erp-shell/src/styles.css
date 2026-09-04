@@ -424,6 +424,150 @@ input:focus, select:focus {
   grid-template-columns: minmax(760px, 1fr) 320px;
 }
 
+.drumBoard {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #f7f9fb;
+}
+
+.drumBoardBar { flex-wrap: wrap; }
+
+.drumKpis {
+  display: flex;
+  gap: 8px;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.drumKpi {
+  display: grid;
+  min-width: 120px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.drumKpi.alert { border-color: #d88888; background: #fdf2f2; }
+.drumKpi span { color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.drumKpi strong { margin-top: 2px; font-size: 17px; }
+
+.drumBoard > .asyncStateContent {
+  align-items: flex-start;
+  overflow: hidden;
+}
+
+.drumGridWrap {
+  width: calc(100% - 16px);
+  margin: 8px;
+  border: 1px solid var(--line);
+  overflow: auto;
+  background: #fff;
+}
+
+.drumGrid {
+  width: max-content;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+}
+
+.drumGrid th,
+.drumGrid td {
+  padding: 0;
+  border-right: 1px solid var(--line2);
+  border-bottom: 1px solid var(--line2);
+  vertical-align: top;
+}
+
+.drumGrid th {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  height: 34px;
+  background: #eef1f5;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.drumGrid .drumDayCol {
+  width: 190px;
+  min-width: 190px;
+  max-width: 190px;
+}
+
+.drumGrid .drumDayCol.weekend { background: #f2f2f4; color: #929ba5; }
+
+.drumGrid .drumResourceCol {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  width: 205px;
+  min-width: 205px;
+  background: #fff;
+}
+
+.drumGrid th.drumResourceCol { z-index: 5; background: #eef1f5; }
+.drumResourceName { padding: 8px 10px; font-size: 12px; font-weight: 700; }
+
+.drumCell {
+  display: flex;
+  min-height: 64px;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+}
+.drumDayCol.dropArmed { outline: 1px dashed #6b7f99; outline-offset: -2px; }
+.drumMoveMessage { margin: 4px 8px; border: 1px solid #7da48a; background: #edf8f0; padding: 5px 8px; color: #245f35; font-size: 11px; }
+
+.drumTile {
+  display: block;
+  width: 100%;
+  min-height: auto;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  text-align: left;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.25;
+}
+.drumTile[draggable="true"] { cursor: grab; }
+.drumTile[draggable="true"]:active { cursor: grabbing; opacity: .75; }
+
+.drumTile.gateReady { background: #d1fae5; color: #065f46; }
+.drumTile.gateTransfer { background: #fef3c7; color: #92400e; }
+.drumTile.gateKitting { background: #ffedd5; color: #9a3412; }
+.drumTile.gateCommitted { background: #dbeafe; color: #1e40af; }
+.drumTile.gateLaunch { background: #ede9fe; color: #5b21b6; }
+.drumTile.gateBlocked { background: #fee2e2; color: #991b1b; }
+.drumTile.gateUnavailable { background: #e5e7eb; color: #374151; }
+.drumTile:hover, .drumTile:focus-visible { border-color: #3b82f6; box-shadow: 0 0 0 1px #3b82f6; }
+.drumTileQty { margin-right: 4px; font-weight: 800; }
+.drumTileName { font-weight: 700; }
+.drumTileCode { display: block; margin-top: 2px; font-size: 10px; opacity: .75; }
+.drumTileReadiness { display: grid; gap: 1px; margin-top: 5px; padding-top: 4px; border-top: 1px solid rgb(0 0 0 / 12%); font-size: 9px; }
+.drumTileReadiness span { display: flex; justify-content: space-between; gap: 5px; }
+.drumTileDate { display: block; margin-top: 3px; font-size: 9px; font-weight: 700; }
+.drumTileBlockers { color: #8f1e1e; font-size: 10px; font-weight: 700; }
+.drumTileManual { display: block; margin-top: 3px; color: #314d76; font-size: 9px; font-weight: 800; }
+
+.drumGaps { margin: 0 8px 8px; }
+.drumGaps h2 { margin: 8px 0 5px; font-size: 14px; }
+.drumGapRow > td { background: #fdf3f3; }
+.drumTileDetails { display: flex; flex-direction: column; gap: 5px; font-size: 13px; }
+.drumActionGroups { display: grid; gap: 8px; margin-top: 12px; }
+.drumBlockers { margin-top: 12px; border-top: 1px solid #d6a5a5; padding-top: 8px; }
+.drumBlockers h3 { margin: 0 0 6px; color: #7c1717; font-size: 13px; }
+.drumBlockerRow { margin-bottom: 6px; border-left: 3px solid #b94444; background: #fff1f1; padding: 6px 8px; font-size: 12px; }
+.drumActionGroup { border: 1px solid var(--line); background: #f8fafc; }
+.drumActionGroup h3 { margin: 0; padding: 6px 8px; border-bottom: 1px solid var(--line); background: #eef2f7; font-size: 12px; }
+.drumActionRow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line2); font-size: 11px; }
+.drumActionRow:last-child { border-bottom: 0; }
+
 .tablePane {
   min-width: 0;
   overflow: auto;
@@ -897,6 +1041,7 @@ input:focus, select:focus {
 .planningBadge.red { border-color: #c97878; background: #fbe8e8; color: #982c2c; }
 .planningBadge.yellow { border-color: #c5a44a; background: #fff5d2; color: #765a00; }
 .planningBadge.green { border-color: #6ca47d; background: #e5f4e9; color: #28643a; }
+.planningBadge.drum_readiness { border-color: #8270ad; background: #eee9fa; color: #51378c; }
 
 .shelfLaunchBlock {
   margin: 10px;
@@ -914,6 +1059,8 @@ input:focus, select:focus {
 }
 
 .shelfLaunchTitle .planningBadge { margin-left: 8px; }
+
+.readinessProtectedSlots { display: grid; gap: 3px; padding: 6px 8px 8px; color: #51378c; font-size: 11px; }
 
 .runsTable td {
   height: 38px;

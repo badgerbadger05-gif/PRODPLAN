@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
-from backend.app.models import ProductionDayClose
-from backend.app.services.work_calendar_service import get_planning_anchor_date
+from backend.app.models import ProductionDayClose, WorkCalendarDay
+from backend.app.services.work_calendar_service import get_planning_anchor_date, is_workday
 
 
 def test_anchor_without_any_closed_days_falls_back_to_previous_workday(db_session):
@@ -37,4 +37,12 @@ def test_anchor_skips_weekend_when_last_closed_is_friday(db_session):
 
     res = get_planning_anchor_date(db=db, today_override=date(2026, 2, 10))
     assert res["anchor_date"] == date(2026, 2, 9).isoformat()
+
+
+def test_weekend_cannot_be_overridden_as_workday(db_session):
+    saturday = date(2026, 2, 7)
+    db_session.add(WorkCalendarDay(date=saturday, is_workday=True))
+    db_session.commit()
+
+    assert is_workday(db_session, saturday) is False
 

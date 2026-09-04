@@ -599,6 +599,20 @@ BEGIN
 
     SELECT count(*)
       INTO v_count
+      FROM assembly_queue_line AS queue
+      LEFT JOIN assembly_readiness AS readiness
+        ON readiness.assembly_queue_line_id = queue.id
+       AND readiness.ledger_generation_id = queue.ledger_generation_id
+     WHERE queue.ledger_generation_id = v_generation_id
+       AND queue.line_status = 'open'
+       AND readiness.id IS NULL;
+    IF v_count <> 0 THEN
+        RAISE EXCEPTION
+            '% current assembly queue rows have no readiness gate row', v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
       FROM drum_schedule
      WHERE ledger_generation_id = v_generation_id
        AND status = 'completed';

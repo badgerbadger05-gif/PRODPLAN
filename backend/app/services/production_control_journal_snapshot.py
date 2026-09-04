@@ -92,6 +92,61 @@ def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _drum_readiness_pull_by_run_item(
+    db: Session,
+    ledger_generation_id: int,
+) -> dict[tuple[int, int], dict[str, Any]]:
+    """Collapse per-tile make actions into journal-ready pull provenance."""
+    slot_rows = (
+        db.query(models.DrumSlot, models.AssemblyQueueLine)
+        .join(models.DrumSchedule, models.DrumSchedule.id == models.DrumSlot.drum_schedule_id)
+        .join(
+            models.AssemblyQueueLine,
+            models.AssemblyQueueLine.id == models.DrumSlot.assembly_queue_line_id,
+        )
+        .filter(models.DrumSchedule.ledger_generation_id == int(ledger_generation_id))
+        .order_by(models.DrumSlot.slot_date, models.DrumSlot.id)
+        .all()
+    )
+    result: dict[tuple[int, int], dict[str, Any]] = {}
+    for slot, line in slot_rows:
+        protected = {
+            "drum_slot_id": int(slot.id),
+            "root_item_id": int(slot.item_id),
+            "slot_date": slot.slot_date.isoformat(),
+            "slot_qty": str(slot.slot_qty),
+            "readiness_phase": str(slot.readiness_phase),
+        }
+        for action in list(slot.action_manifest or []):
+            if str(action.get("action_kind") or "") not in {"make", "rework"}:
+                continue
+            item_id = int(action["item_id"])
+            key = (int(line.planning_run_id), item_id)
+            entry = result.setdefault(key, {
+                "readiness_required_qty": 0.0,
+                "readiness_need_date": None,
+                "readiness_action_date": None,
+                "readiness_priority_key": str(line.sort_key),
+                "protected_drum_slots": [],
+            })
+            entry["readiness_required_qty"] += float(action.get("qty") or 0)
+            action_date = action.get("available_date")
+            if action_date and (
+                entry["readiness_action_date"] is None
+                or str(action_date) < str(entry["readiness_action_date"])
+            ):
+                entry["readiness_action_date"] = str(action_date)
+            if str(line.sort_key) < str(entry["readiness_priority_key"]):
+                entry["readiness_priority_key"] = str(line.sort_key)
+            known_ids = {row["drum_slot_id"] for row in entry["protected_drum_slots"]}
+            if protected["drum_slot_id"] not in known_ids:
+                entry["protected_drum_slots"].append(protected)
+            need_date = protected["slot_date"]
+            if entry["readiness_need_date"] is None or need_date < entry["readiness_need_date"]:
+                entry["readiness_need_date"] = need_date
+    return result
+
+
 def _route_sheet_payload_value(row: Mapping[str, Any], *, product_id: int) -> dict[str, Any]:
     route_payload = row.get("_route_sheet_snapshot")
     if not isinstance(route_payload, dict):
@@ -375,6 +430,7 @@ def _build_rows(
         proposal_rows,
         ledger_generation_id=int(generation.id),
     )
+    readiness_pull = _drum_readiness_pull_by_run_item(db, int(generation.id))
     for row in proposal_rows:
         coverage = proposal_coverage.get(int(row["work_item_id"]))
         if coverage is not None:
@@ -383,6 +439,14 @@ def _build_rows(
             row["material_coverage_status"] = coverage["coverage_status"]
             row["material_coverage_label"] = coverage["coverage_label"]
             row["material_coverage_calculated_at"] = generation.cutoff.isoformat()
+        source_run_id = row.get("source_run_id")
+        pull = (
+            readiness_pull.get((int(source_run_id), int(row["item_id"])))
+            if source_run_id is not None else None
+        )
+        if pull is not None:
+            row.update(deepcopy(pull))
+            row["launch_source"] = "drum_readiness"
     rows.extend(proposal_rows)
     product_ids = [
         int(row["product_id"])
@@ -891,6 +955,7 @@ def read_snapshot(
     status: str | None = None,
     coverage_status: str | None = None,
     planning_contour: str | None = None,
+    launch_source: str | None = None,
     search: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
@@ -974,6 +1039,10 @@ def read_snapshot(
         if contour not in {"mrp", "1c"}:
             raise ValueError("unknown planning_contour")
         query = query.filter(row_payload["order_source"].as_string() == contour)
+    if launch_source:
+        query = query.filter(
+            row_payload["launch_source"].as_string() == str(launch_source).strip()
+        )
     if search and search.strip():
         pattern = f"%{search.strip()}%"
         query = query.filter(
@@ -1000,7 +1069,10 @@ def read_snapshot(
     effective_offset = min(requested_offset, max_offset)
     sort_field = str(sort_by or "").strip().lower()
     descending = str(sort_dir or "").strip().lower() == "desc"
-    if sort_field in {"planned_start_date", "planned_finish_date"}:
+    if sort_field in {
+        "planned_start_date", "planned_finish_date", "readiness_need_date",
+        "readiness_action_date", "readiness_priority_key",
+    }:
         expression = row_payload[sort_field].as_string()
         ordering = expression.desc() if descending else expression.asc()
         query = query.order_by(

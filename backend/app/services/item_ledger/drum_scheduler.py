@@ -36,6 +36,9 @@ class QueueLine:
     planned_output_qty: Decimal
     accepted_plan_output_qty: Decimal
     original_priority: tuple[Any, ...]
+    ready_qty: Decimal | None = None
+    readiness_status: str = "unavailable"
+    readiness_curve: tuple[tuple[str, Decimal, date | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class PlannedSlot:
     planned_output_qty: Decimal
     slot_ordinal: int
     original_priority: tuple[Any, ...]
+    readiness_phase: str
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,7 @@ class CapacityGap:
     available_capacity: Decimal
     gap_qty: Decimal
     original_priority: tuple[Any, ...]
+    readiness_phase: str
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,14 @@ def _normalize_queue_signature(lines: list[QueueLine]) -> str:
                 "sort_key": str(line.sort_key),
                 "planned_output_qty": str(_dec(line.planned_output_qty).normalize()),
                 "accepted_plan_output_qty": str(_dec(line.accepted_plan_output_qty).normalize()),
+                "ready_qty": (
+                    None if line.ready_qty is None else str(_dec(line.ready_qty).normalize())
+                ),
+                "readiness_status": str(line.readiness_status),
+                "readiness_curve": tuple(
+                    (horizon, str(_dec(qty).normalize()), available_date)
+                    for horizon, qty, available_date in line.readiness_curve
+                ),
                 "original_priority": tuple(line.original_priority),
             }
         )
@@ -168,10 +181,44 @@ def build_drum_plan(
     output_slots: list[PlannedSlot] = []
     output_gaps: list[CapacityGap] = []
 
+    phased: list[tuple[int, date, int, QueueLine, Decimal, str]] = []
+    horizon_rank = {"now": 0, "transfer": 1, "kitting": 2, "committed": 3, "launch": 4}
     for queue_line in ordered:
         open_qty = _open_qty(queue_line)
         if open_qty <= 0:
             continue
+        allocated_qty = Decimal("0")
+        curve = tuple(queue_line.readiness_curve or ())
+        if curve:
+            previous = Decimal("0")
+            for horizon, raw_cumulative, raw_date in curve:
+                cumulative = min(max(_dec(raw_cumulative), previous), open_qty)
+                increment = cumulative - previous
+                if increment > 0:
+                    eligible = max(raw_date or schedule_from, schedule_from)
+                    phased.append((0, eligible, horizon_rank.get(horizon, 9), queue_line, increment, horizon))
+                previous = cumulative
+            allocated_qty = previous
+        else:
+            ready_qty = (
+                Decimal("0")
+                if queue_line.ready_qty is None
+                else min(max(_dec(queue_line.ready_qty), Decimal("0")), open_qty)
+            )
+            if ready_qty > 0:
+                phased.append((0, schedule_from, 0, queue_line, ready_qty, "now"))
+            allocated_qty = ready_qty
+        blocked_qty = open_qty - allocated_qty
+        if blocked_qty > 0:
+            phased.append((1, schedule_from, 99, queue_line, blocked_qty,
+                "unavailable" if queue_line.readiness_status == "unavailable" else "blocked"))
+
+    slot_ordinal_by_line: dict[int, int] = {}
+    gap_by_line: dict[int, CapacityGap] = {}
+    for _phase, eligible_date, _horizon_rank, queue_line, phase_qty, readiness_phase in sorted(
+        phased,
+        key=lambda row: (row[0], row[1], row[2], str(row[3].sort_key), int(row[3].queue_line_id)),
+    ):
 
         profiles = rates_by_item.get(int(queue_line.item_id))
         if not profiles:
@@ -192,9 +239,9 @@ def build_drum_plan(
         if resource_last_day < schedule_from:
             resource_last_day = schedule_from
 
-        remaining = open_qty
-        current = schedule_from
-        slot_ordinal = 0
+        remaining = phase_qty
+        current = max(schedule_from, eligible_date)
+        slot_ordinal = slot_ordinal_by_line.get(int(queue_line.queue_line_id), 0)
 
         while remaining > 0 and current <= resource_last_day:
             if _workday_flag(calendar, current):
@@ -226,6 +273,7 @@ def build_drum_plan(
                                 planned_output_qty=_dec(queue_line.planned_output_qty),
                                 slot_ordinal=slot_ordinal,
                                 original_priority=tuple(queue_line.original_priority),
+                                readiness_phase=readiness_phase,
                             )
                         )
                         # Exhausting the day is booked exactly, so repeated
@@ -237,6 +285,7 @@ def build_drum_plan(
                             used_capacity[(resource_id, current)] = used + (take / rate)
                         remaining -= take
                         slot_ordinal += 1
+                        slot_ordinal_by_line[int(queue_line.queue_line_id)] = slot_ordinal
             current += timedelta(days=1)
 
         if remaining > 0:
@@ -247,7 +296,8 @@ def build_drum_plan(
                 )
                 available_last = max(resource_capacity - used, Decimal("0")) * rate
 
-            output_gaps.append(
+            existing_gap = gap_by_line.get(int(queue_line.queue_line_id))
+            gap_by_line[int(queue_line.queue_line_id)] = (
                 CapacityGap(
                     queue_line_id=int(queue_line.queue_line_id),
                     plan_id=int(queue_line.plan_id),
@@ -255,12 +305,26 @@ def build_drum_plan(
                     item_id=int(queue_line.item_id),
                     resource_id=resource_id,
                     gap_date=resource_last_day,
-                    required_qty=remaining,
+                    required_qty=(
+                        remaining
+                        if existing_gap is None
+                        else existing_gap.required_qty + remaining
+                    ),
                     available_capacity=available_last,
-                    gap_qty=remaining,
+                    gap_qty=(
+                        remaining if existing_gap is None else existing_gap.gap_qty + remaining
+                    ),
                     original_priority=tuple(queue_line.original_priority),
+                    readiness_phase=(
+                        readiness_phase
+                        if existing_gap is None
+                        or existing_gap.readiness_phase == readiness_phase
+                        else "mixed"
+                    ),
                 )
             )
+
+    output_gaps.extend(gap_by_line.values())
 
     total_open = Decimal("0")
     total_slots = Decimal("0")
@@ -286,6 +350,10 @@ def build_drum_plan(
                 "line": int(row.queue_line_id),
                 "item_id": int(row.item_id),
                 "open_qty": str(_open_qty(row).normalize()),
+                "ready_qty": (
+                    None if row.ready_qty is None else str(_dec(row.ready_qty).normalize())
+                ),
+                "readiness_status": str(row.readiness_status),
             }
             for row in ordered
             if _open_qty(row) > 0
@@ -299,6 +367,7 @@ def build_drum_plan(
                 "date": slot.slot_date.isoformat(),
                 "resource": int(slot.resource_id),
                 "qty": str(_dec(slot.slot_qty).normalize()),
+                "readiness_phase": slot.readiness_phase,
             }
             for slot in output_slots
         ],
@@ -311,6 +380,7 @@ def build_drum_plan(
                 "date": gap.gap_date.isoformat(),
                 "resource": int(gap.resource_id),
                 "qty": str(_dec(gap.gap_qty).normalize()),
+                "readiness_phase": gap.readiness_phase,
             }
             for gap in output_gaps
         ],

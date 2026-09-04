@@ -88,6 +88,7 @@ _CORE_CAPABILITIES = {
     "planning_snapshots": True,
     "assembly_output_allocation": True,
     "assembly_queue": True,
+    "assembly_readiness": True,
     "drum_schedule": True,
     "shelf_projection": True,
     "purchase_control_journal": True,
@@ -518,13 +519,13 @@ def run_obligation_refresh(
     )
     _complete(replenishment_batch, replenishment_summary)
     assembly_outputs = materialize_assembly_output_allocations(db, target_id)
+    custody_projection = build_material_custody_projection(
+        db, ledger_generation_id=target_id
+    )
     drum_schedule = materialize_drum_schedule(db, target_id)
     shelf_projection = materialize_shelf_projections(db, target_id)
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
-    custody_projection = build_material_custody_projection(
-        db, ledger_generation_id=target_id
-    )
     production_journal_snapshot = build_production_journal_candidate(
         db,
         target_id,

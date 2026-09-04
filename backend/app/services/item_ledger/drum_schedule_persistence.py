@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -12,15 +13,78 @@ from app import models
 from app.services.work_calendar_service import is_workday
 
 from .assembly_queue_snapshot import materialize_assembly_queue_lines
+from .assembly_readiness_persistence import materialize_assembly_readiness
 from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
 STAGE = "drum_schedule"
-ALGORITHM_VERSION = "drum-schedule/1"
+ALGORITHM_VERSION = "drum-schedule/4-readiness-curve"
 
 
 def _d(value: Any) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value or 0))
+
+
+_READINESS_RANK = {"now": 0, "transfer": 1, "kitting": 2, "committed": 3, "launch": 4}
+
+
+def _action_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        json.dumps(row.get(name), sort_keys=True, default=str)
+        for name in (
+            "action_kind", "item_id", "available_date", "confidence", "source_key",
+            "source_warehouse_ref1c", "destination_warehouse_ref1c", "resource_id", "path",
+        )
+    )
+
+
+def _slot_readiness_payload(
+    readiness: models.AssemblyReadiness,
+    phase: str,
+    slot_qty: Decimal,
+) -> tuple[date | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    curve = list(readiness.readiness_curve or [])
+    phase_rank = _READINESS_RANK.get(str(phase), 99)
+    tile_curve = [
+        {
+            "horizon": str(point.get("horizon") or ""),
+            "cumulative_qty": str(slot_qty if _READINESS_RANK.get(str(point.get("horizon")), 99) >= phase_rank else Decimal("0")),
+            "available_date": point.get("available_date"),
+        }
+        for point in curve
+    ]
+    if phase_rank >= 99:
+        return None, tile_curve, []
+    current_index = next(
+        (index for index, point in enumerate(curve) if str(point.get("horizon")) == phase),
+        None,
+    )
+    if current_index is None:
+        return None, tile_curve, []
+    current = curve[current_index]
+    previous = curve[current_index - 1] if current_index > 0 else {"cumulative_qty": "0", "actions": []}
+    increment = max(_d(current.get("cumulative_qty")) - _d(previous.get("cumulative_qty")), Decimal("0"))
+    if increment <= 0:
+        return (
+            date.fromisoformat(str(current["available_date"])) if current.get("available_date") else None,
+            tile_curve,
+            [],
+        )
+    previous_qty = {_action_key(row): _d(row.get("qty")) for row in list(previous.get("actions") or [])}
+    ratio = slot_qty / increment
+    actions: list[dict[str, Any]] = []
+    for row in list(current.get("actions") or []):
+        delta = max(_d(row.get("qty")) - previous_qty.get(_action_key(row), Decimal("0")), Decimal("0"))
+        if delta <= 0:
+            continue
+        payload = dict(row)
+        payload["qty"] = str((delta * ratio).quantize(Decimal("0.001")))
+        actions.append(payload)
+    return (
+        date.fromisoformat(str(current["available_date"])) if current.get("available_date") else None,
+        tile_curve,
+        actions,
+    )
 
 
 def _rates_and_capacity(
@@ -88,6 +152,16 @@ def _plan(
     queue_rows: list[models.AssemblyQueueLine],
 ):
     rates, capacity, horizon, horizon_by_resource = _rates_and_capacity(db, queue_rows)
+    readiness_rows = (
+        db.query(models.AssemblyReadiness)
+        .filter(models.AssemblyReadiness.ledger_generation_id == int(generation.id))
+        .all()
+    )
+    readiness_by_line = {
+        int(row.assembly_queue_line_id): row for row in readiness_rows
+    }
+    if set(readiness_by_line) != {int(row.id) for row in queue_rows}:
+        raise ValueError("assembly readiness does not cover the open assembly queue")
     scheduled_rows = [row for row in queue_rows if int(row.item_id) in rates]
     excluded_rows = [row for row in queue_rows if int(row.item_id) not in rates]
     schedule_from = generation.cutoff.date()
@@ -112,6 +186,17 @@ def _plan(
                 planned_output_qty=_d(row.planned_output_qty),
                 accepted_plan_output_qty=_d(row.accepted_plan_output_qty),
                 original_priority=tuple(row.original_priority or ()),
+                ready_qty=_d(readiness_by_line[int(row.id)].ready_qty),
+                readiness_status=str(readiness_by_line[int(row.id)].status),
+                readiness_curve=tuple(
+                    (
+                        str(point.get("horizon") or ""),
+                        _d(point.get("cumulative_qty")),
+                        date.fromisoformat(str(point["available_date"]))
+                        if point.get("available_date") else None,
+                    )
+                    for point in list(readiness_by_line[int(row.id)].readiness_curve or [])
+                ),
             )
             for row in scheduled_rows
         ),
@@ -210,6 +295,7 @@ def materialize_drum_schedule(
         for row in materialize_assembly_queue_lines(db, int(generation.id))
         if _d(row.assembly_remaining_qty) > 0
     ]
+    materialize_assembly_readiness(db, int(generation.id))
     plan = _plan(db, generation, queue_rows)
 
     schedule = models.DrumSchedule(
@@ -230,7 +316,17 @@ def materialize_drum_schedule(
     )
     db.add(schedule)
     db.flush()
+    readiness_by_line = {
+        int(row.assembly_queue_line_id): row
+        for row in db.query(models.AssemblyReadiness)
+        .filter(models.AssemblyReadiness.ledger_generation_id == int(generation.id))
+        .all()
+    }
     for slot in plan.slots:
+        readiness = readiness_by_line[int(slot.queue_line_id)]
+        readiness_date, tile_curve, tile_actions = _slot_readiness_payload(
+            readiness, slot.readiness_phase, slot.slot_qty
+        )
         db.add(
             models.DrumSlot(
                 drum_schedule_id=int(schedule.id),
@@ -240,10 +336,22 @@ def materialize_drum_schedule(
                 item_id=int(slot.item_id),
                 resource_id=int(slot.resource_id),
                 slot_date=slot.slot_date,
+                auto_slot_date=slot.slot_date,
+                auto_resource_id=int(slot.resource_id),
                 slot_qty=slot.slot_qty,
                 planned_output_qty=slot.planned_output_qty,
                 slot_ordinal=int(slot.slot_ordinal),
                 original_priority=list(slot.original_priority),
+                readiness_phase=slot.readiness_phase,
+                readiness_date=readiness_date,
+                readiness_curve=tile_curve,
+                action_manifest=tile_actions,
+                unavailable_reasons=list(readiness.unavailable_reasons or []),
+                blocking_manifest=(
+                    list(readiness.blocking_manifest or [])
+                    if slot.readiness_phase in {"blocked", "unavailable"}
+                    else []
+                ),
             )
         )
     for gap in plan.gaps:
@@ -260,6 +368,7 @@ def materialize_drum_schedule(
                 available_capacity=gap.available_capacity,
                 gap_qty=gap.gap_qty,
                 original_priority=list(gap.original_priority),
+                readiness_phase=gap.readiness_phase,
             )
         )
     batch = models.LedgerBuildBatch(

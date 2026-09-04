@@ -43,7 +43,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Изменение спецификации живого плана | матрица и факт плана не меняются; старый MRP закрывается, все его живые резервы закрываются/освобождаются, а новый MRP того же плана получает сохранённый остаток корней и новую BOM (§3, §7) |
 | Коррекция после смены MRP | по каждой детали сравниваются сохранённый незакрытый спрос старого MRP и потребность нового MRP; разница добавляет либо снимает рабочее количество (§3, §7) |
 | Очередь сборки | остатки выпуска всех живых планов, oldest-first (§7) |
-| Календарная раскладка сборки | барабан поверх очереди сборки (§8) |
+| Календарная раскладка сборки | единственный барабан поверх очереди сборки с сохранённым readiness gate (§8, §29) |
 | Цель полки | расход барабана внутри защитного окна, ограниченный MRP (§10) |
 | Количество вытягивания мехцеха | незакрытая MRP-потребность, ограниченная дефицитом полки (§10) |
 | Исполнительный заказ | единый производственный или закупочный журнал (§1.6) |
@@ -78,7 +78,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Единая спецификация сборки: узлы и комплектовки со складов | контракт `unified-assembly-specification.md` (§26); развёртка — существующие `backend/app/services/mrp_freeze.py`, `planning_service.py`, `bom_specification_resolver.py`, без второго движка |
 | Живая область планов и привязка run к поколению | `backend/app/services/item_ledger/live_plan_scope.py`; обход sealed-цепочки существует только здесь |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
-| Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
+| Очередь сборки, комплектность и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/assembly_readiness_persistence.py`, `drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
 | Read-model | `PlanningReadSnapshot` и специализированные `*_snapshot.py`; публичный GET не пересчитывает и не обновляет снимок |
 | Frontend | OpenAPI + `src/services`; UI только отображает read-model |

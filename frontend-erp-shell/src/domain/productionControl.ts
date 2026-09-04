@@ -346,9 +346,12 @@ export type ProductionFilters = {
   coverage_status: string
   root_item_id: string
   planning_contour: '' | 'mrp'
-  sort_by: 'planned_start_date'
+  launch_source: '' | 'drum_readiness'
+  sort_by: 'planned_start_date' | 'readiness_priority_key'
   sort_dir: 'asc' | 'desc'
 }
+
+export type ProductionControlView = 'orders' | 'mechshop' | 'drum'
 
 export function productionStatusLabel(value: string) {
   return productionStatusLabels[value] ?? value

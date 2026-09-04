@@ -136,11 +136,16 @@ export function ProductionDetailPane({
     || (activeRow?.source_plan_id ? `План #${activeRow.source_plan_id}` : '')
   const sourceDisplayLabel = planSourceLabel || activeRow?.launch_source || rowSource || '1C'
   const hasShelfLaunchData = Boolean(
-    activeRow?.launch_source
-    || activeRow?.shelf_warehouse_ref1c
+    activeRow?.launch_source !== 'drum_readiness'
+    && (activeRow?.shelf_warehouse_ref1c
     || activeRow?.shelf_pull_qty != null
     || activeRow?.shelf_materialized_qty != null
-    || activeRow?.shelf_latest_start_date,
+    || activeRow?.shelf_latest_start_date),
+  )
+  const hasReadinessPullData = Boolean(
+    activeRow?.launch_source === 'drum_readiness'
+    || activeRow?.readiness_required_qty != null
+    || activeRow?.protected_drum_slots?.length,
   )
 
   function shelfQty(value?: number | null) {
@@ -327,6 +332,28 @@ export function ProductionDetailPane({
                 <span>Материализовано на полке</span><strong>{shelfQty(activeRow?.shelf_materialized_qty)}</strong>
                 <span>Дата запуска с полки</span><strong>{dateRu(activeRow?.shelf_latest_start_date) || '—'}</strong>
               </div>
+            </div>
+          )}
+          {hasReadinessPullData && (
+            <div className="shelfLaunchBlock">
+              <div className="shelfLaunchTitle">
+                <span>Вытягивание от барабана сборки</span>
+                <span className="planningBadge drum_readiness">readiness gate</span>
+              </div>
+              <div className="detailGrid">
+                <span>Требуется изготовить</span><strong>{shelfQty(activeRow?.readiness_required_qty)}</strong>
+                <span>Нужно плиткам к</span><strong>{dateRu(activeRow?.readiness_need_date) || '—'}</strong>
+                <span>Прогноз готовности</span><strong>{dateRu(activeRow?.readiness_action_date) || '—'}</strong>
+              </div>
+              {!!activeRow?.protected_drum_slots?.length && (
+                <div className="readinessProtectedSlots">
+                  {activeRow.protected_drum_slots.map((slot) => (
+                    <div key={slot.drum_slot_id}>
+                      Плитка #{slot.drum_slot_id}: изделие #{slot.root_item_id}, {slot.slot_qty} шт. к {dateRu(slot.slot_date)}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
           {hasMrpCoverage && (

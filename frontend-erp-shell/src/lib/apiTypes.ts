@@ -1893,6 +1893,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/assembly-readiness": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Assembly Readiness
+         * @description Read the persisted release recommendation; never calculate readiness in GET.
+         */
+        get: operations["get_assembly_readiness_api_v1_production_control_assembly_readiness_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/drum": {
         parameters: {
             query?: never;
@@ -1907,6 +1927,23 @@ export interface paths {
         get: operations["get_drum_schedule_api_v1_production_control_drum_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/production-control/drum/slots/{slot_id}/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post Move Drum Slot */
+        post: operations["post_move_drum_slot_api_v1_production_control_drum_slots__slot_id__move_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3388,6 +3425,68 @@ export interface components {
             /** Updated */
             updated: number;
         };
+        /** AssemblyReadinessListResponse */
+        AssemblyReadinessListResponse: {
+            /** Rows */
+            rows: components["schemas"]["AssemblyReadinessRowResponse"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+            truth_meta: components["schemas"]["TruthMeta"];
+        };
+        /** AssemblyReadinessRowResponse */
+        AssemblyReadinessRowResponse: {
+            /** Queue Line Id */
+            queue_line_id: number;
+            /** Plan Id */
+            plan_id: number;
+            /** Plan Line Id */
+            plan_line_id: number;
+            /** Run Id */
+            run_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code: string;
+            /** Item Name */
+            item_name: string;
+            /** Resource Id */
+            resource_id: number | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "recoverable" | "partial" | "blocked" | "unavailable";
+            /** Open Qty */
+            open_qty: number;
+            /** Ready Qty */
+            ready_qty: number;
+            /** Transferable Qty */
+            transferable_qty: number;
+            /** Kitting Qty */
+            kitting_qty: number;
+            /** Committed Qty */
+            committed_qty: number;
+            /** Launchable Qty */
+            launchable_qty: number;
+            /** Readiness Date */
+            readiness_date?: string | null;
+            /** Readiness Curve */
+            readiness_curve: components["schemas"]["ReadinessCurvePointResponse"][];
+            /** Action Manifest */
+            action_manifest: components["schemas"]["ReadinessActionResponse"][];
+            /** Unavailable Reasons */
+            unavailable_reasons: string[];
+            /** Blocker Count */
+            blocker_count: number;
+            /** Blockers */
+            blockers: components["schemas"]["ReadinessBlockerResponse"][];
+            /** Original Priority */
+            original_priority: (string | number)[];
+        };
         /** BindingReviewItemResponse */
         BindingReviewItemResponse: {
             /** Item Id */
@@ -3563,20 +3662,44 @@ export interface components {
         };
         /** DrumGapRow */
         DrumGapRow: {
+            /** Gap Id */
+            gap_id: number;
+            /** Queue Line Id */
+            queue_line_id: number;
             /** Plan Id */
             plan_id: number;
             /** Plan Line Id */
             plan_line_id: number;
             /** Item Id */
             item_id: number;
+            /** Item Code */
+            item_code?: string | null;
+            /** Item Name */
+            item_name?: string | null;
             /** Resource Id */
             resource_id: number;
             /** Gap Date */
             gap_date: string;
+            /** Required Qty */
+            required_qty: number;
+            /** Available Capacity */
+            available_capacity: number;
             /** Gap Qty */
             gap_qty: number;
+            /**
+             * Readiness Phase
+             * @enum {string}
+             */
+            readiness_phase: "now" | "transfer" | "kitting" | "committed" | "launch" | "blocked" | "unavailable" | "mixed";
             /** Original Priority */
             original_priority: (string | number)[];
+        };
+        /** DrumResourceRow */
+        DrumResourceRow: {
+            /** Resource Id */
+            resource_id: number;
+            /** Resource Name */
+            resource_name: string;
         };
         /** DrumScheduleResponse */
         DrumScheduleResponse: {
@@ -3584,6 +3707,10 @@ export interface components {
             schedule_from: string;
             /** Schedule To */
             schedule_to: string;
+            /** Days */
+            days: string[];
+            /** Resources */
+            resources: components["schemas"]["DrumResourceRow"][];
             /** Slots */
             slots: components["schemas"]["DrumSlotRow"][];
             /** Gaps */
@@ -3604,8 +3731,40 @@ export interface components {
             offset: number;
             truth_meta: components["schemas"]["TruthMeta"];
         };
+        /** DrumSlotMoveRequest */
+        DrumSlotMoveRequest: {
+            /** New Date */
+            new_date: string;
+            /** New Resource Id */
+            new_resource_id?: number | null;
+            /** Moved By */
+            moved_by?: string | null;
+        };
+        /** DrumSlotMoveResponse */
+        DrumSlotMoveResponse: {
+            /** Ok */
+            ok: boolean;
+            /** Moved */
+            moved: boolean;
+            /** Slot Id */
+            slot_id: number;
+            /** From Date */
+            from_date: string;
+            /** To Date */
+            to_date: string;
+            /** Resource Id */
+            resource_id: number;
+            /** Manual Moved At */
+            manual_moved_at?: string | null;
+            /** Manual Moved By */
+            manual_moved_by?: string | null;
+        };
         /** DrumSlotRow */
         DrumSlotRow: {
+            /** Slot Id */
+            slot_id: number;
+            /** Queue Line Id */
+            queue_line_id: number;
             /** Plan Id */
             plan_id: number;
             /** Plan Line Id */
@@ -3620,10 +3779,36 @@ export interface components {
             resource_id: number;
             /** Slot Date */
             slot_date: string;
+            /** Auto Slot Date */
+            auto_slot_date?: string | null;
             /** Slot Qty */
             slot_qty: number;
             /** Slot Ordinal */
             slot_ordinal: number;
+            /**
+             * Readiness Phase
+             * @enum {string}
+             */
+            readiness_phase: "now" | "transfer" | "kitting" | "committed" | "launch" | "blocked" | "unavailable";
+            /** Readiness Date */
+            readiness_date?: string | null;
+            /** Readiness Curve */
+            readiness_curve: components["schemas"]["ReadinessCurvePointResponse"][];
+            /** Action Manifest */
+            action_manifest: components["schemas"]["ReadinessActionResponse"][];
+            /** Unavailable Reasons */
+            unavailable_reasons: string[];
+            /** Blocking Manifest */
+            blocking_manifest: components["schemas"]["ReadinessBlockerResponse"][];
+            /**
+             * Manual Override
+             * @default false
+             */
+            manual_override: boolean;
+            /** Manual Moved At */
+            manual_moved_at?: string | null;
+            /** Manual Moved By */
+            manual_moved_by?: string | null;
             /** Original Priority */
             original_priority: (string | number)[];
         };
@@ -5158,6 +5343,16 @@ export interface components {
             shelf_materialized_qty?: number | null;
             /** Shelf Latest Start Date */
             shelf_latest_start_date?: string | null;
+            /** Readiness Required Qty */
+            readiness_required_qty?: number | null;
+            /** Readiness Need Date */
+            readiness_need_date?: string | null;
+            /** Readiness Action Date */
+            readiness_action_date?: string | null;
+            /** Readiness Priority Key */
+            readiness_priority_key?: string | null;
+            /** Protected Drum Slots */
+            protected_drum_slots?: components["schemas"]["ProtectedDrumSlotResponse"][];
             /** Materialized Order Qty */
             materialized_order_qty?: number | null;
             /** Launchable Qty */
@@ -5314,6 +5509,22 @@ export interface components {
              * @default 0
              */
             buffer_days: number;
+        };
+        /** ProtectedDrumSlotResponse */
+        ProtectedDrumSlotResponse: {
+            /** Drum Slot Id */
+            drum_slot_id: number;
+            /** Root Item Id */
+            root_item_id: number;
+            /** Slot Date */
+            slot_date: string;
+            /** Slot Qty */
+            slot_qty: string;
+            /**
+             * Readiness Phase
+             * @enum {string}
+             */
+            readiness_phase: "now" | "transfer" | "kitting" | "committed" | "launch" | "blocked" | "unavailable";
         };
         /** PurchaseCategoryGroup */
         PurchaseCategoryGroup: {
@@ -5482,6 +5693,87 @@ export interface components {
              * @default false
              */
             allow_production: boolean | null;
+        };
+        /** ReadinessActionResponse */
+        ReadinessActionResponse: {
+            /** Action Kind */
+            action_kind: string;
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code: string;
+            /** Item Article */
+            item_article: string;
+            /** Item Name */
+            item_name: string;
+            /** Qty */
+            qty: string;
+            /** Available Date */
+            available_date?: string | null;
+            /** Confidence */
+            confidence: string;
+            /** Source Key */
+            source_key: string;
+            /** Source Warehouse Ref1C */
+            source_warehouse_ref1c: string;
+            /** Destination Warehouse Ref1C */
+            destination_warehouse_ref1c: string;
+            /** Resource Id */
+            resource_id?: number | null;
+            /** Path */
+            path: number[];
+        };
+        /** ReadinessBlockerResponse */
+        ReadinessBlockerResponse: {
+            /** Item Id */
+            item_id?: number | null;
+            /**
+             * Item Code
+             * @default
+             */
+            item_code: string;
+            /**
+             * Item Article
+             * @default
+             */
+            item_article: string;
+            /**
+             * Item Name
+             * @default
+             */
+            item_name: string;
+            /** Required Qty */
+            required_qty?: string | null;
+            /** Available Qty */
+            available_qty?: string | null;
+            /** Shortage Qty */
+            shortage_qty?: string | null;
+            /**
+             * Reason
+             * @default SHORTAGE
+             */
+            reason: string;
+            /**
+             * Destination Warehouse Ref1C
+             * @default
+             */
+            destination_warehouse_ref1c: string;
+            /** Path */
+            path?: number[];
+        };
+        /** ReadinessCurvePointResponse */
+        ReadinessCurvePointResponse: {
+            /**
+             * Horizon
+             * @enum {string}
+             */
+            horizon: "now" | "transfer" | "kitting" | "committed" | "launch";
+            /** Cumulative Qty */
+            cumulative_qty: string;
+            /** Available Date */
+            available_date?: string | null;
+            /** Actions */
+            actions?: components["schemas"]["ReadinessActionResponse"][];
         };
         /** ReconcileRequest */
         ReconcileRequest: {
@@ -9636,6 +9928,39 @@ export interface operations {
             };
         };
     };
+    get_assembly_readiness_api_v1_production_control_assembly_readiness_get: {
+        parameters: {
+            query?: {
+                resource_id?: number | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssemblyReadinessListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_drum_schedule_api_v1_production_control_drum_get: {
         parameters: {
             query?: {
@@ -9655,6 +9980,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DrumScheduleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_move_drum_slot_api_v1_production_control_drum_slots__slot_id__move_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                slot_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DrumSlotMoveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DrumSlotMoveResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9794,6 +10154,8 @@ export interface operations {
                 coverage_status?: string | null;
                 /** @description Контур планирования: mrp или 1c для источника заказа. */
                 planning_contour?: string | null;
+                /** @description Источник запуска: drum_readiness, shelf_pull или mrp_remaining. */
+                launch_source?: string | null;
                 search?: string | null;
                 date_from?: string | null;
                 date_to?: string | null;

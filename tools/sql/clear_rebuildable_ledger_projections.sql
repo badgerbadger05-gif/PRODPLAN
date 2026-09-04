@@ -222,6 +222,7 @@ TRUNCATE
     planning_run,
     assembly_output_allocation,
     assembly_output_fact_decision,
+    assembly_readiness,
     assembly_queue_line,
     drum_capacity_gap,
     drum_slot,
@@ -345,6 +346,7 @@ BEGIN
       + (SELECT count(*) FROM reservation_entry)
       + (SELECT count(*) FROM reservation_event)
       + (SELECT count(*) FROM mrp_requirement)
+      + (SELECT count(*) FROM assembly_readiness)
       + (SELECT count(*) FROM planning_read_snapshot)
     INTO remaining_count;
 

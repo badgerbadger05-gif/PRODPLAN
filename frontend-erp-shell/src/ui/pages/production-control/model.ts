@@ -2,6 +2,7 @@ import {
   type EmployeeOption,
   type OrderRow,
   type ProductionFilters,
+  type ProductionControlView,
   type ProductionOperationOption,
   type WorkshopWarehouse,
 } from '../../../domain/productionControl'
@@ -14,12 +15,14 @@ export const DEFAULT_PRODUCTION_FILTERS: ProductionFilters = {
   coverage_status: '',
   root_item_id: '',
   planning_contour: '',
+  launch_source: '',
   sort_by: 'planned_start_date',
   sort_dir: 'asc',
 }
 
 export type ProductionControlUrlState = {
   filters: ProductionFilters
+  view: ProductionControlView
   offset: number
   activeProductId: number | null
 }
@@ -31,6 +34,7 @@ const URL_FILTER_KEYS = [
   'coverage_status',
   'root_item_id',
   'planning_contour',
+  'launch_source',
   'sort_by',
   'sort_dir',
 ] as const
@@ -49,6 +53,12 @@ function positiveInteger(value: string | null): number | null {
 export function parseProductionControlUrlState(
   params: URLSearchParams,
 ): ProductionControlUrlState {
+  const requestedView = params.get('view')
+  const view: ProductionControlView = requestedView === 'drum'
+    ? 'drum'
+    : requestedView === 'mechshop' || params.get('planning_contour') === 'mrp'
+      ? 'mechshop'
+      : 'orders'
   return {
     filters: {
       search: params.get('search') ?? '',
@@ -56,10 +66,12 @@ export function parseProductionControlUrlState(
       workshop_id: params.get('workshop_id') ?? '',
       coverage_status: params.get('coverage_status') ?? '',
       root_item_id: params.get('root_item_id') ?? '',
-      planning_contour: params.get('planning_contour') === 'mrp' ? 'mrp' : '',
-      sort_by: 'planned_start_date',
+      planning_contour: view === 'mechshop' ? 'mrp' : '',
+      launch_source: view === 'mechshop' ? 'drum_readiness' : '',
+      sort_by: view === 'mechshop' ? 'readiness_priority_key' : 'planned_start_date',
       sort_dir: params.get('sort_dir') === 'desc' ? 'desc' : 'asc',
     },
+    view,
     offset: nonNegativeInteger(params.get('offset')),
     activeProductId: positiveInteger(params.get('active_product_id')),
   }
@@ -73,6 +85,7 @@ export function writeProductionControlUrlState(
   for (const key of URL_FILTER_KEYS) next.delete(key)
   next.delete('offset')
   next.delete('active_product_id')
+  next.delete('view')
 
   for (const [key, value] of Object.entries(state.filters)) {
     if (!value) continue
@@ -84,6 +97,7 @@ export function writeProductionControlUrlState(
   if (state.activeProductId != null && state.activeProductId > 0) {
     next.set('active_product_id', String(state.activeProductId))
   }
+  if (state.view !== 'orders') next.set('view', state.view)
   return next
 }
 

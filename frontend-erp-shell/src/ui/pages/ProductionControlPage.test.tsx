@@ -14,6 +14,8 @@ import type { ProductionResource } from '../../domain/resources'
 // component's real rendering/wiring.
 vi.mock('../../services/productionControl', () => ({
   listProductionOrders: vi.fn(),
+  listDrumSchedule: vi.fn(),
+  moveDrumSlot: vi.fn(),
   listProductionEmployees: vi.fn(),
   listProductionOperations: vi.fn(),
   getProductionControlSettings: vi.fn(),
@@ -50,6 +52,8 @@ vi.mock('../../services/itemLedger', () => ({
 
 import {
   listProductionOrders,
+  listDrumSchedule,
+  moveDrumSlot,
   listProductionEmployees,
   listProductionOperations,
   getOrderMaterials,
@@ -240,6 +244,56 @@ beforeEach(() => {
     offset: 0,
     latest_run_id: 77,
     truth_meta: fakeTruthMeta,
+  })
+  vi.mocked(listDrumSchedule).mockResolvedValue({
+    schedule_from: '2026-09-03',
+    schedule_to: '2026-10-02',
+    days: ['2026-09-03', '2026-09-04'],
+    resources: [{ resource_id: 1, resource_name: 'Цех 1' }],
+    slots: [{
+      slot_id: 501,
+      queue_line_id: 901,
+      plan_id: 1,
+      plan_line_id: 11,
+      item_id: 201,
+      item_code: 'ART-1',
+      item_name: 'Кронштейн',
+      resource_id: 1,
+      slot_date: '2026-09-03',
+      slot_qty: 4,
+      slot_ordinal: 0,
+      readiness_phase: 'now',
+      readiness_date: '2026-09-03',
+      readiness_curve: [
+        { horizon: 'now', cumulative_qty: '4', available_date: '2026-09-03', actions: [] },
+        { horizon: 'transfer', cumulative_qty: '4', available_date: '2026-09-03', actions: [] },
+        { horizon: 'kitting', cumulative_qty: '4', available_date: '2026-09-03', actions: [] },
+        { horizon: 'committed', cumulative_qty: '4', available_date: '2026-09-03', actions: [] },
+        { horizon: 'launch', cumulative_qty: '4', available_date: '2026-09-03', actions: [] },
+      ],
+      action_manifest: [],
+      unavailable_reasons: [],
+      blocking_manifest: [],
+      manual_override: false,
+      original_priority: ['2026-08-01', 11],
+    }],
+    gaps: [],
+    total_open_qty: 10,
+    total_slot_qty: 4,
+    total_gap_qty: 6,
+    total_slots: 1,
+    total_gaps: 0,
+    limit: 10000,
+    offset: 0,
+    truth_meta: fakeTruthMeta,
+  })
+  vi.mocked(moveDrumSlot).mockResolvedValue({
+    ok: true,
+    moved: true,
+    slot_id: 501,
+    from_date: '2026-09-03',
+    to_date: '2026-09-04',
+    resource_id: 1,
   })
   vi.mocked(getOrderMaterials).mockResolvedValue(fakeMaterials())
   vi.mocked(getWorkItemMaterials).mockResolvedValue({ ...fakeMaterials(), product_id: null, work_item_id: 701 })
@@ -461,7 +515,7 @@ describe('ProductionControlPage — characterization', () => {
     expect(listRootProductOptions).toHaveBeenCalledTimes(1)
   })
 
-  it('uses the backend-supported journal endpoint for the mechshop view', async () => {
+  it('restores the mechshop queue without replacing the production journal', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
@@ -472,10 +526,46 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(2))
     const params = vi.mocked(listProductionOrders).mock.calls[1][0]
     expect(params.get('planning_contour')).toBe('mrp')
-    expect(params.get('sort_by')).toBe('planned_start_date')
+    expect(params.get('launch_source')).toBe('drum_readiness')
+    expect(params.get('sort_by')).toBe('readiness_priority_key')
     expect(params.get('sort_dir')).toBe('asc')
     expect(screen.getByRole('button', { name: 'Очередь мехцеха' })).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByText('Очередь мехцеха · единый журнал запуска')).toBeInTheDocument()
+    expect(screen.getByRole('table', { name: 'Заказы на производство' })).toBeInTheDocument()
+  })
+
+  it('opens the persisted calendar drum as a separate view', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+
+    expect(await screen.findByRole('table', { name: 'Календарный барабан сборки' })).toBeInTheDocument()
+    expect(listDrumSchedule).toHaveBeenCalledWith(expect.any(AbortSignal))
+    expect(screen.getByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Барабан сборки' })).toBeInTheDocument()
+  })
+
+  it('moves a drum tile by mouse drag to another workday of the same resource', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+    const tile = await screen.findByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })
+    const target = screen.getByLabelText('Цех 1, 2026-09-04')
+    const dataTransfer = {
+      effectAllowed: 'move',
+      dropEffect: 'move',
+      setData: vi.fn(),
+      getData: vi.fn(() => '501'),
+    }
+
+    fireEvent.dragStart(tile, { dataTransfer })
+    fireEvent.dragOver(target, { dataTransfer })
+    fireEvent.drop(target, { dataTransfer })
+
+    await waitFor(() => expect(moveDrumSlot).toHaveBeenCalledWith(501, '2026-09-04', 1))
+    expect(await screen.findByText('Плитка перенесена на 2026-09-04')).toBeInTheDocument()
   })
 
   it('shows shelf launch metadata in a journal row and its card', async () => {
