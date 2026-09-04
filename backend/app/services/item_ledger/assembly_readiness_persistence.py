@@ -37,7 +37,7 @@ from .assembly_readiness_core import (
 
 
 STAGE = "assembly_readiness"
-ALGORITHM_VERSION = "assembly-readiness/3-whole-piece-readiness-curve"
+ALGORITHM_VERSION = "assembly-readiness/4-root-scoped-specification"
 _NON_STOCK_TYPES = {"услуга", "работа", "операция"}
 
 
@@ -156,6 +156,7 @@ def _curve_inputs(
         for row in component_rows
         for value in (row.parent_item_id, row.component_item_id)
     }
+    item_ids.update(int(row.item_id) for row in queue_rows)
     item_meta = {
         int(row.item_id): row
         for row in db.query(models.Item).filter(models.Item.item_id.in_(item_ids)).all()
@@ -171,22 +172,6 @@ def _curve_inputs(
         ):
             continue
         frozen_rows.append(component)
-
-    edges = tuple(
-        FrozenBomEdge(
-            bom_key=int(row.run_id),
-            parent_item_id=int(row.parent_item_id),
-            component_item_id=int(row.component_item_id),
-            norm_qty=_d(row.norm_qty_per_unit) * _d(row.unit_coef or 1),
-        )
-        for row in frozen_rows
-        if _d(row.norm_qty_per_unit) * _d(row.unit_coef or 1) > 0
-        and not (
-            (item_meta.get(int(row.component_item_id)) is not None)
-            and str(item_meta[int(row.component_item_id)].item_type or "").strip().lower()
-            in _NON_STOCK_TYPES
-        )
-    )
 
     root_item_ids = sorted({int(row.item_id) for row in queue_rows})
     rate_rows = (
@@ -266,26 +251,150 @@ def _curve_inputs(
         for row in db.query(models.ProductionKind).filter(models.ProductionKind.id.in_(kind_ids)).all()
     } if kind_ids else {}
 
-    frozen_spec_by_parent: dict[tuple[int, int], tuple[str, str | None] | None] = {}
-    ambiguous_frozen_specs: set[tuple[int, int]] = set()
+    # One MRP run may legitimately use different pinned specifications for the
+    # same child under different roots.  The frozen rows carry the exact parent
+    # spec ref/hash; while that hash still matches the local immutable spec
+    # content, its component pins let us reconstruct the selected graph for
+    # each queue root.  Never collapse this to (run, item): doing so made an old
+    # pin from an unrelated snowmobile block the Fishride module whose branch
+    # explicitly pins the current default specification.
+    rows_by_scope: dict[tuple[int, int, str], list[models.MrpFreezeComponent]] = {}
+    candidate_specs: dict[tuple[int, int], set[str]] = {}
     for row in frozen_rows:
-        key = (int(row.run_id), int(row.parent_item_id))
-        value = (str(row.spec_ref or ""), str(row.spec_version) if row.spec_version else None)
-        if key in ambiguous_frozen_specs:
-            continue
-        previous = frozen_spec_by_parent.get(key)
-        if previous is not None and previous != value:
-            frozen_spec_by_parent[key] = None
-            ambiguous_frozen_specs.add(key)
-        else:
-            frozen_spec_by_parent[key] = value
+        run_id = int(row.run_id)
+        parent_id = int(row.parent_item_id)
+        spec_ref = str(row.spec_ref or "")
+        rows_by_scope.setdefault((run_id, parent_id, spec_ref), []).append(row)
+        candidate_specs.setdefault((run_id, parent_id), set()).add(spec_ref)
 
+    default_ref_by_item: dict[int, str] = {}
+    default_candidates: dict[int, set[str]] = {}
+    for item_id, spec_id in (
+        db.query(models.DefaultSpecification.item_id, models.DefaultSpecification.spec_id)
+        .filter(models.DefaultSpecification.item_id.in_(item_ids))
+        .all()
+        if item_ids else []
+    ):
+        spec = next((row for row in specs if int(row.spec_id) == int(spec_id)), None)
+        if spec is not None:
+            default_candidates.setdefault(int(item_id), set()).add(
+                str(spec.spec_ref1c or spec.spec_id)
+            )
+    for item_id, refs in default_candidates.items():
+        if len(refs) == 1:
+            default_ref_by_item[item_id] = next(iter(refs))
+
+    component_pins: dict[tuple[str, int], set[str]] = {}
+    if specs:
+        spec_id_to_ref = {
+            int(spec.spec_id): str(spec.spec_ref1c or spec.spec_id)
+            for spec in specs
+        }
+        for component in (
+            db.query(models.SpecComponent)
+            .filter(models.SpecComponent.spec_id.in_(list(spec_id_to_ref)))
+            .all()
+        ):
+            parent_ref = spec_id_to_ref.get(int(component.spec_id))
+            if parent_ref is None:
+                continue
+            pin = str(component.component_spec_ref1c or "").strip()
+            component_pins.setdefault((parent_ref, int(component.item_id)), set()).add(pin)
+
+    selected_spec: dict[tuple[int, int, int], tuple[str, str | None]] = {}
+    ambiguous_spec: set[tuple[int, int, int]] = set()
+    edges_list: list[FrozenBomEdge] = []
+    roots_by_run: dict[int, set[int]] = {run_id: set() for run_id in run_ids}
+    for line in queue_rows:
+        roots_by_run.setdefault(int(line.planning_run_id), set()).add(int(line.item_id))
+
+    def choose_spec(run_id: int, root_id: int, item_id: int, pinned_ref: str = ""):
+        key = (run_id, root_id, item_id)
+        candidates = candidate_specs.get((run_id, item_id), set())
+        wanted = str(pinned_ref or "").strip()
+        if wanted:
+            if wanted in candidates:
+                return wanted
+            ambiguous_spec.add(key)
+            return None
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        default_ref = default_ref_by_item.get(item_id, "")
+        if default_ref and default_ref in candidates:
+            return default_ref
+        if len(candidates) > 1:
+            ambiguous_spec.add(key)
+        return None
+
+    for run_id, roots in roots_by_run.items():
+        for root_id in sorted(roots):
+            root_ref = choose_spec(run_id, root_id, root_id)
+            stack: list[tuple[int, str]] = [(root_id, root_ref)] if root_ref else []
+            visited: set[tuple[int, str]] = set()
+            while stack:
+                parent_id, spec_ref = stack.pop()
+                scope = (parent_id, spec_ref)
+                if scope in visited:
+                    continue
+                visited.add(scope)
+                scoped_rows = rows_by_scope.get((run_id, parent_id, spec_ref), ())
+                if not scoped_rows:
+                    continue
+                versions = {
+                    str(row.spec_version) if row.spec_version else None
+                    for row in scoped_rows
+                }
+                if len(versions) != 1:
+                    ambiguous_spec.add((run_id, root_id, parent_id))
+                    continue
+                frozen_version = next(iter(versions))
+                current_spec = spec_by_ref.get(spec_ref)
+                if current_spec is None or (
+                    frozen_version
+                    and str(current_spec.content_hash or "") != frozen_version
+                ):
+                    ambiguous_spec.add((run_id, root_id, parent_id))
+                    continue
+                selected_spec[(run_id, root_id, parent_id)] = (
+                    spec_ref,
+                    frozen_version,
+                )
+                for row in scoped_rows:
+                    component_id = int(row.component_item_id)
+                    norm = _d(row.norm_qty_per_unit) * _d(row.unit_coef or 1)
+                    component_item = item_meta.get(component_id)
+                    if norm > 0 and not (
+                        component_item is not None
+                        and str(component_item.item_type or "").strip().lower()
+                        in _NON_STOCK_TYPES
+                    ):
+                        edges_list.append(FrozenBomEdge(
+                            bom_key=run_id,
+                            root_item_id=root_id,
+                            parent_item_id=parent_id,
+                            component_item_id=component_id,
+                            norm_qty=norm,
+                        ))
+                    pins = component_pins.get((spec_ref, component_id), {""})
+                    non_empty_pins = {value for value in pins if value}
+                    if len(non_empty_pins) > 1 or (non_empty_pins and "" in pins):
+                        ambiguous_spec.add((run_id, root_id, component_id))
+                        continue
+                    pinned = next(iter(non_empty_pins), "")
+                    child_ref = choose_spec(run_id, root_id, component_id, pinned)
+                    if child_ref:
+                        stack.append((component_id, child_ref))
+
+    edges = tuple(edges_list)
     policies: list[ReplenishmentPolicy] = []
-    items_by_run: dict[int, set[int]] = {run_id: set() for run_id in run_ids}
-    for row in frozen_rows:
-        items_by_run[int(row.run_id)].update((int(row.parent_item_id), int(row.component_item_id)))
-    for run_id, run_item_ids in items_by_run.items():
-        for item_id in sorted(run_item_ids):
+    items_by_root: dict[tuple[int, int], set[int]] = {}
+    for edge in edges:
+        scope = (int(edge.bom_key), int(edge.root_item_id or 0))
+        items_by_root.setdefault(scope, set()).update(
+            (int(edge.parent_item_id), int(edge.component_item_id))
+        )
+    for (run_id, root_id), root_items in items_by_root.items():
+        for item_id in sorted(root_items):
             item = item_meta.get(item_id)
             flow = classify_replenishment_flow(item.replenishment_method if item is not None else None)
             mode = {
@@ -299,8 +408,8 @@ def _curve_inputs(
             route_kind = ""
             unavailable_reason = ""
             if mode in {"make", "rework"}:
-                frozen_spec = frozen_spec_by_parent.get((run_id, item_id))
-                if (run_id, item_id) in ambiguous_frozen_specs:
+                frozen_spec = selected_spec.get((run_id, root_id, item_id))
+                if (run_id, root_id, item_id) in ambiguous_spec:
                     unavailable_reason = "FROZEN_SPEC_AMBIGUOUS"
                 spec = spec_by_ref.get(frozen_spec[0]) if frozen_spec else None
                 spec_is_current = bool(
@@ -322,6 +431,7 @@ def _curve_inputs(
             policies.append(
                 ReplenishmentPolicy(
                     bom_key=run_id,
+                    root_item_id=root_id,
                     item_id=item_id,
                     mode=mode,
                     lead_days=lead_days,

@@ -51,6 +51,7 @@ class FrozenBomEdge:
     parent_item_id: int
     component_item_id: int
     norm_qty: Decimal
+    root_item_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class ReplenishmentPolicy:
     resource_id: int | None = None
     output_warehouse_ref1c: str = ""
     unavailable_reason: str = ""
+    root_item_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -208,17 +210,40 @@ def allocate_readiness_curves(
     only after a producible root quantity is proven.  A blocked older row
     therefore cannot hoard stock needed by a younger ready row.
     """
-    graph: dict[tuple[int, int], list[tuple[int, Decimal]]] = {}
+    graph: dict[tuple[int, int, int], list[tuple[int, Decimal]]] = {}
     for edge in edges:
         norm = _d(edge.norm_qty)
         if norm <= 0:
             continue
-        graph.setdefault((int(edge.bom_key), int(edge.parent_item_id)), []).append(
+        graph.setdefault((
+            int(edge.bom_key),
+            int(edge.root_item_id) if edge.root_item_id is not None else 0,
+            int(edge.parent_item_id),
+        ), []).append(
             (int(edge.component_item_id), norm)
         )
     for parent_key in graph:
         graph[parent_key].sort(key=lambda row: row[0])
-    policy_by_item = {(int(row.bom_key), int(row.item_id)): row for row in policies}
+    policy_by_item = {
+        (
+            int(row.bom_key),
+            int(row.root_item_id) if row.root_item_id is not None else 0,
+            int(row.item_id),
+        ): row
+        for row in policies
+    }
+
+    def graph_rows(bom_key: int, root_item_id: int, parent_item_id: int):
+        return graph.get(
+            (int(bom_key), int(root_item_id), int(parent_item_id)),
+            graph.get((int(bom_key), 0, int(parent_item_id)), ()),
+        )
+
+    def item_policy(bom_key: int, root_item_id: int, item_id: int):
+        return policy_by_item.get(
+            (int(bom_key), int(root_item_id), int(item_id)),
+            policy_by_item.get((int(bom_key), 0, int(item_id))),
+        )
     ordered_lines = tuple(sorted(lines, key=lambda row: (str(row.sort_key), int(row.queue_line_id))))
     open_qty_by_line = {
         int(line.queue_line_id): _root_q(line.open_qty)
@@ -276,7 +301,8 @@ def allocate_readiness_curves(
                 )
                 continue
             bom_key = int(line.bom_key)
-            if not graph.get((bom_key, int(line.root_item_id))):
+            root_item_id = int(line.root_item_id)
+            if not graph_rows(bom_key, root_item_id, root_item_id):
                 reasons_by_line[line_id].add("ROOT_FROZEN_BOM_MISSING")
                 points_by_line[line_id].append(
                     ReadinessCurvePoint(horizon, Decimal("0"), None, ())
@@ -365,7 +391,7 @@ def allocate_readiness_curves(
                     if needed <= Decimal("0.0000001"):
                         return True, ready_date, ()
 
-                    policy = policy_by_item.get((bom_key, int(item_id)))
+                    policy = item_policy(bom_key, root_item_id, int(item_id))
                     can_kit = (
                         horizon_rank >= _HORIZON_RANK["kitting"]
                         and policy is not None
@@ -427,7 +453,9 @@ def allocate_readiness_curves(
                             )
                         )
                         return True, _max_date(ready_date, finish), ()
-                    if mode not in {"make", "rework"} or not graph.get((bom_key, int(item_id))):
+                    if mode not in {"make", "rework"} or not graph_rows(
+                        bom_key, root_item_id, int(item_id)
+                    ):
                         return blocked(
                             item_id=item_id,
                             required_qty=requested,
@@ -462,7 +490,9 @@ def allocate_readiness_curves(
                             destination=destination,
                             path=path,
                         )
-                    for component_id, norm in graph[(bom_key, int(item_id))]:
+                    for component_id, norm in graph_rows(
+                        bom_key, root_item_id, int(item_id)
+                    ):
                         ok, component_date, component_blockers = fulfill(
                             component_id,
                             needed * norm,
@@ -505,7 +535,9 @@ def allocate_readiness_curves(
 
                 root_date: date | None = as_of
                 visiting.add(int(line.root_item_id))
-                for component_id, norm in graph[(bom_key, int(line.root_item_id))]:
+                for component_id, norm in graph_rows(
+                    bom_key, root_item_id, root_item_id
+                ):
                     ok, component_date, component_blockers = fulfill(
                         component_id,
                         root_qty * norm,

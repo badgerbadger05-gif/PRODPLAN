@@ -243,3 +243,43 @@ def test_curve_exposes_ambiguous_frozen_route_instead_of_missing_warehouse():
     )
 
     assert row.blockers[0].reason == "FROZEN_SPEC_AMBIGUOUS"
+
+
+def test_curve_keeps_pinned_specification_routes_scoped_to_their_roots():
+    ready, blocked = allocate_readiness_curves(
+        (
+            ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),
+            ReadinessCurveLine(2, "002", 1, 200, Decimal("1"), "assembly"),
+        ),
+        (
+            FrozenBomEdge(1, 100, 20, Decimal("1"), root_item_id=100),
+            FrozenBomEdge(1, 20, 30, Decimal("1"), root_item_id=100),
+            FrozenBomEdge(1, 200, 20, Decimal("1"), root_item_id=200),
+            FrozenBomEdge(1, 20, 40, Decimal("1"), root_item_id=200),
+        ),
+        (ReadinessSupply("component-30", 30, Decimal("1"), "now", "wip"),),
+        (
+            ReplenishmentPolicy(
+                1,
+                20,
+                "make",
+                0,
+                "production",
+                9,
+                "wip",
+                root_item_id=100,
+            ),
+            ReplenishmentPolicy(
+                1,
+                20,
+                "make",
+                unavailable_reason="FROZEN_SPEC_AMBIGUOUS",
+                root_item_id=200,
+            ),
+        ),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert ready.points[-1].cumulative_qty == Decimal("1.000")
+    assert blocked.points[-1].cumulative_qty == Decimal("0")
+    assert blocked.blockers[0].reason == "FROZEN_SPEC_AMBIGUOUS"
