@@ -16,6 +16,7 @@ from app.models import (
     ProductionProduct,
     ProductionMaterialCustodyEvent,
     StockLedgerEntry,
+    StockRecorderPull,
     SyncLink,
 )
 from app.services import one_c_posted_transfer_sync as posted_sync
@@ -158,6 +159,178 @@ def _add_transfer_sle(
     db.add(row)
     db.flush()
     return row
+
+
+def test_manual_posted_transfer_uses_exact_order_basis_for_custody(db_session):
+    db = db_session
+    product_item = Item(
+        item_code="manual-product",
+        item_name="Manual product",
+        item_article="manual-product",
+        item_ref1c="manual-product-ref",
+        unit="шт",
+        status="active",
+    )
+    component = Item(
+        item_code="manual-component",
+        item_name="Manual component",
+        item_article="manual-component",
+        item_ref1c="manual-component-ref",
+        unit="шт",
+        status="active",
+    )
+    db.add_all([product_item, component])
+    db.flush()
+    order = ProductionOrder(
+        order_number="manual-order",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="manual-order-ref",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=product_item.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db.add(product)
+    db.add(
+        StockRecorderPull(
+            recorder_type=STOCK_TRANSFER_ENTITY,
+            recorder_ref="manual-transfer-ref",
+            order_ref=order.order_ref1c,
+            status="done",
+            source="test",
+        )
+    )
+    batch = _mk_transfer_batch(db, batch_key="manual-order-transfer")
+    outbound = _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="manual-transfer-ref",
+        item_id=component.item_id,
+        movement_kind="transfer_out",
+        warehouse_ref1c="source-warehouse",
+        qty=-3,
+        posting_at=datetime(2026, 5, 20, 12, 0),
+        line_no=1,
+    )
+    inbound = _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="manual-transfer-ref",
+        item_id=component.item_id,
+        movement_kind="transfer_in",
+        warehouse_ref1c="workshop-warehouse",
+        qty=3,
+        posting_at=datetime(2026, 5, 20, 12, 0),
+        line_no=2,
+    )
+
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="manual-transfer-ref",
+        stock_ledger_entries=[outbound, inbound],
+    ) == 1
+    db.flush()
+    event = db.query(ProductionMaterialCustodyEvent).one()
+    assert event.issue_id is None
+    assert event.product_id == product.product_id
+    assert event.component_item_id == component.item_id
+    assert event.location_kind == "workshop"
+    assert event.delta_qty == pytest.approx(3)
+    assert event.source_sle_id == inbound.id
+
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="manual-transfer-ref",
+        stock_ledger_entries=[outbound, inbound],
+    ) == 0
+
+
+def test_manual_transfer_order_basis_fails_closed_for_multiple_products(db_session):
+    db = db_session
+    first = Item(
+        item_code="ambiguous-first",
+        item_name="Ambiguous first",
+        item_article="ambiguous-first",
+        item_ref1c="ambiguous-first-ref",
+        unit="шт",
+        status="active",
+    )
+    second = Item(
+        item_code="ambiguous-second",
+        item_name="Ambiguous second",
+        item_article="ambiguous-second",
+        item_ref1c="ambiguous-second-ref",
+        unit="шт",
+        status="active",
+    )
+    db.add_all([first, second])
+    db.flush()
+    order = ProductionOrder(
+        order_number="ambiguous-order",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="ambiguous-order-ref",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    db.add_all(
+        [
+            ProductionProduct(
+                order_id=order.order_id,
+                item_id=first.item_id,
+                line_number=1,
+                quantity=1,
+                produced_qty=0,
+                remaining_qty=1,
+            ),
+            ProductionProduct(
+                order_id=order.order_id,
+                item_id=second.item_id,
+                line_number=2,
+                quantity=1,
+                produced_qty=0,
+                remaining_qty=1,
+            ),
+            StockRecorderPull(
+                recorder_type=STOCK_TRANSFER_ENTITY,
+                recorder_ref="ambiguous-transfer-ref",
+                order_ref=order.order_ref1c,
+                status="done",
+                source="test",
+            ),
+        ]
+    )
+    batch = _mk_transfer_batch(db, batch_key="ambiguous-order-transfer")
+    inbound = _add_transfer_sle(
+        db,
+        batch=batch,
+        transfer_ref="ambiguous-transfer-ref",
+        item_id=first.item_id,
+        movement_kind="transfer_in",
+        warehouse_ref1c="workshop-warehouse",
+        qty=1,
+        posting_at=datetime(2026, 5, 20, 12, 0),
+        line_no=1,
+    )
+
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ambiguous-transfer-ref",
+        stock_ledger_entries=[inbound],
+    ) == 0
+    assert db.query(ProductionMaterialCustodyEvent).count() == 0
 
 
 class _FakeOData:

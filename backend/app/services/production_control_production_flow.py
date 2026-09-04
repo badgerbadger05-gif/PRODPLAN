@@ -327,21 +327,10 @@ def produce_line(
             "qty превышает остаток, ещё не переданный в исполнительные документы"
         )
 
-    material_issue = (
-        db.query(ProductionMaterialIssue)
-        .filter(
-            ProductionMaterialIssue.product_id == int(product.product_id),
-            ProductionMaterialIssue.direction.in_(("issue", "in_place")),
-            ProductionMaterialIssue.status.in_(("posted", "issued")),
-        )
-        .order_by(ProductionMaterialIssue.issue_id.desc())
-        .first()
-    )
-    if material_issue is None:
-        raise ValueError(
-            "Нельзя создать выпуск без проведённого перемещения материалов по этой строке"
-        )
-
+    # Наличие локальной заявки перемещения не является фактом доставки. Ручное
+    # проведённое в 1С перемещение может не иметь ProductionMaterialIssue, а
+    # экспортированная заявка, наоборот, ещё не гарантирует физику. Единственный
+    # guard — сохранённая проекция custody принятого Ledger ниже.
     _ensure_workshop_reservation_covers(db, product, qty_f)
 
     manufacture = ProductionManufacture(

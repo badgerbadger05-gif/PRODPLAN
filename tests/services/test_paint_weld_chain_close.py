@@ -519,6 +519,55 @@ def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, mo
     assert {link.target_ref_key for link in links} == {"pw-resume-ref"}
 
 
+def test_close_chain_rolls_back_first_command_when_second_side_fails_before_export(
+    db_session, monkeypatch
+):
+    ctx = _setup_chain(db_session)
+    for side in ("weld", "paint"):
+        db_session.delete(ctx[side]["m"])
+    for side in ("weld", "paint"):
+        ctx[side]["product"].produced_qty = 0
+        ctx[side]["product"].remaining_qty = ctx[side]["product"].quantity
+    db_session.commit()
+
+    from app.services import production_control_production_flow as flow
+
+    calls = []
+
+    def _produce(db, product_id, **kwargs):
+        calls.append(int(product_id))
+        if len(calls) == 2:
+            raise ValueError("paint preparation failed")
+        product = db.get(ProductionProduct, int(product_id))
+        manufacture = ProductionManufacture(
+            product_id=int(product.product_id),
+            order_id=int(product.order_id),
+            qty=float(kwargs["qty"]),
+            status="draft",
+        )
+        db.add(manufacture)
+        db.commit()
+        return {
+            "manufacture_id": int(manufacture.manufacture_id),
+            "resumed": False,
+        }
+
+    monkeypatch.setattr(flow, "produce_line", _produce)
+
+    with pytest.raises(ValueError, match="paint preparation failed"):
+        close_paint_chain(
+            db_session,
+            product_id=ctx["paint"]["product"].product_id,
+            dry_run=False,
+        )
+
+    assert calls == [
+        int(ctx["weld"]["product"].product_id),
+        int(ctx["paint"]["product"].product_id),
+    ]
+    assert db_session.query(ProductionManufacture).count() == 0
+
+
 def test_close_chain_dry_run_reports_partially_posted_state(db_session):
     ctx = _setup_chain(db_session)
     ctx["paint"]["m"].exported_ref1c = None

@@ -11,12 +11,14 @@ from ..models import (
     ProductionMaterialCustodyEvent,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
+    ProductionProduct,
     StockLedgerEntry,
     SyncLink,
 )
 from .production_control_common import to_float as _to_float
 from .production_control_common import to_float_strict as _to_float_strict
 from .one_c_export_common import clean_ref1c as _clean_ref1c
+from .item_ledger.recorder_identity import build_recorder_identity_index
 
 _EPSILON = 1.0e-9
 _IDEMPOTENCY_PREFIX = "custody-event"
@@ -277,6 +279,88 @@ def _has_equivalent_physical_custody_event(
     )
 
 
+def _project_order_based_manual_transfer(
+    db: Session,
+    *,
+    recorder_ref: str,
+    stock_ledger_entries: Iterable[StockLedgerEntry],
+) -> int:
+    """Project a posted 1C transfer made manually for one exact order line.
+
+    Such a document legitimately has no PRODPLAN material-issue link.  Its
+    header basis, captured by StockRecorderPull, is nevertheless an exact
+    order identity.  Attribution remains fail-closed: precisely one order and
+    precisely one product line must resolve, otherwise no custody is written.
+    """
+    identity = build_recorder_identity_index(db, [recorder_ref])
+    order_ids = identity.order_ids.get(recorder_ref, set())
+    if len(order_ids) != 1:
+        return 0
+    products = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.order_id == int(next(iter(order_ids))))
+        .order_by(ProductionProduct.product_id.asc())
+        .all()
+    )
+    if len(products) != 1:
+        return 0
+    product = products[0]
+    appended = 0
+    for sle in stock_ledger_entries:
+        if (
+            str(sle.recorder_type or "") != _STOCK_TRANSFER_ENTITY
+            or str(sle.recorder_ref or "").strip() != recorder_ref
+            or not bool(sle.active)
+        ):
+            raise ValueError("custody projector received an unrelated or inactive SLE row")
+        if str(sle.movement_kind or "") != "transfer_in":
+            continue
+        qty = abs(_to_float_strict(sle.qty, field="ledger_event.qty"))
+        warehouse = _clean_ref1c(sle.warehouse_ref1c)
+        if qty <= _EPSILON or not warehouse:
+            continue
+        stable_identity = stable_physical_sle_identity(sle)
+        coordinate = stable_identity or f"sle:{int(sle.id)}"
+        payload = "|".join(
+            (
+                "manual-order-transfer",
+                str(int(product.product_id)),
+                str(int(sle.item_id)),
+                warehouse,
+                f"{qty:.6f}",
+                coordinate,
+            )
+        )
+        key = f"{_IDEMPOTENCY_PREFIX}:{hashlib.sha1(payload.encode('utf-8')).hexdigest()}"
+        if (
+            db.query(ProductionMaterialCustodyEvent.id)
+            .filter(ProductionMaterialCustodyEvent.idempotency_key == key)
+            .first()
+            is not None
+        ):
+            continue
+        db.add(
+            ProductionMaterialCustodyEvent(
+                issue_id=None,
+                product_id=int(product.product_id),
+                component_item_id=int(sle.item_id),
+                source_kind="transfer_posted",
+                source_sle_id=int(sle.id),
+                effective_at=sle.posting_at,
+                location_kind="workshop",
+                warehouse_ref1c=warehouse,
+                source_ref1c=None,
+                source_ref2c=recorder_ref,
+                delta_qty=qty,
+                idempotency_key=key,
+                document_number=None,
+                document_line_no=str(sle.line_no or "") or None,
+            )
+        )
+        appended += 1
+    return appended
+
+
 def project_transfer_custody_events_for_recorder(
     db: Session,
     *,
@@ -302,7 +386,11 @@ def project_transfer_custody_events_for_recorder(
         .first()
     )
     if link is None:
-        return 0
+        return _project_order_based_manual_transfer(
+            db,
+            recorder_ref=ref,
+            stock_ledger_entries=stock_ledger_entries,
+        )
     issue = (
         db.query(ProductionMaterialIssue)
         .options(joinedload(ProductionMaterialIssue.lines))

@@ -1170,16 +1170,27 @@ def close_paint_chain(
             )
         return int(plan["existing_manufacture_id"])
 
-    # Сварка первой: её выпуск — вход окраски.
-    weld_manufacture_id = _ensure_manufacture(
-        weld_plan,
-        weld_operation_executors,
-        allow_paint_weld_chain=True,
-    )
-    paint_manufacture_id = _ensure_manufacture(
-        paint_plan,
-        paint_operation_executors,
-    )
+    # Сварка первой: её выпуск — вход окраски.  produce_line фиксирует каждую
+    # локальную команду отдельным commit, поэтому ошибка второй стороны не
+    # откатывает первую транзакцией SQLAlchemy. До начала записи в 1С цепочка
+    # должна быть атомарной вручную: иначе первая команда навсегда занимает
+    # весь доступный объём и повторный запуск блокируется гардом commanded_qty.
+    try:
+        weld_manufacture_id = _ensure_manufacture(
+            weld_plan,
+            weld_operation_executors,
+            allow_paint_weld_chain=True,
+        )
+        paint_manufacture_id = _ensure_manufacture(
+            paint_plan,
+            paint_operation_executors,
+        )
+    except Exception:
+        for manufacture_id in reversed(created_manufacture_ids):
+            persisted = db.get(ProductionManufacture, int(manufacture_id))
+            if persisted is not None and not str(persisted.exported_ref1c or "").strip():
+                rollback_local_manufacture(db, int(manufacture_id))
+        raise
     weld_plan["manufacture_id"] = weld_manufacture_id
     paint_plan["manufacture_id"] = paint_manufacture_id
 

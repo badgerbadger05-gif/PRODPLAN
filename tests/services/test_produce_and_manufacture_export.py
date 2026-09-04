@@ -496,22 +496,33 @@ def test_produce_fails_closed_when_pinned_spec_revision_changed(db_session):
     )
 
 
-def test_produce_requires_posted_material_issue(db_session):
+def test_produce_accepts_ledger_custody_without_local_material_issue(db_session):
     db = db_session
     item = _mk_item(db, code="PRD-NOMOVE", ref1c="ref-prd-nomove")
+    component = _mk_item(db, code="COMP-NOMOVE", ref1c="ref-comp-nomove")
     product = _mk_product(db, item, qty=4.0)
+    spec = Specification(spec_name="Manual transfer spec")
+    db.add(spec)
+    db.flush()
+    product.spec_id = spec.spec_id
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=1,
+            component_type="Материал",
+        )
+    )
+    _stock_kit_on_workshop(db, product, component, qty=4)
     db.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).delete()
     state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
     state.issue_status = "not_requested"
     db.commit()
 
-    with pytest.raises(ValueError, match="перемещения материалов"):
-        produce_line(db, product.product_id, qty=1)
+    result = produce_line(db, product.product_id, qty=1)
 
-    db.refresh(product)
-    assert float(product.produced_qty) == 0
-    assert float(product.remaining_qty) == 4
-    assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 0
+    assert result["status"] == "pending_1c_fact"
+    assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 1
 
 
 def test_produce_refreshes_1c_spec_before_reservation_guard(db_session, monkeypatch):
