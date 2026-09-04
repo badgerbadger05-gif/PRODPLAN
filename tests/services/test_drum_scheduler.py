@@ -54,7 +54,7 @@ def test_readiness_gate_allows_ready_younger_line_to_pass_blocked_old_line():
     ]
     assert [slot.readiness_phase for slot in plan.slots] == ["now", "blocked"]
     assert plan.metrics["total_open_qty"] == "2"
-    assert plan.metrics["total_slot_qty"] == "2.000"
+    assert plan.metrics["total_slot_qty"] == "2"
 
 
 def test_readiness_curve_delays_each_increment_until_its_available_date():
@@ -147,7 +147,7 @@ def test_drum_does_not_persist_sub_quantum_decimal_capacity_residue() -> None:
         resource_capacity_by_id={10: Decimal("8.000")},
     )
 
-    assert all(slot.slot_qty >= Decimal("0.001") for slot in result.slots)
+    assert all(slot.slot_qty == slot.slot_qty.to_integral_value() for slot in result.slots)
     assert [(gap.queue_line_id, gap.gap_qty) for gap in result.gaps] == [
         (6, Decimal("1.000"))
     ]
@@ -299,4 +299,16 @@ def test_drum_fails_closed_for_rate_ambiguity(rates, message) -> None:
             schedule_from=date(2026, 7, 27),
             schedule_to=date(2026, 7, 27),
             resource_capacity_by_id={10: Decimal("1"), 11: Decimal("1")},
+        )
+
+
+def test_drum_rejects_fractional_finished_assembly_quantity() -> None:
+    with pytest.raises(ValueError, match="fractional root quantity"):
+        build_drum_plan(
+            (_line(1, "1.5", sort_key="a"),),
+            {1: (AssemblyRateProfile(10, Decimal("1")),)},
+            {date(2026, 7, 27): True},
+            schedule_from=date(2026, 7, 27),
+            schedule_to=date(2026, 7, 27),
+            resource_capacity_by_id={10: Decimal("1")},
         )

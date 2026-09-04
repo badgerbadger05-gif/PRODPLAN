@@ -455,11 +455,15 @@ input:focus, select:focus {
 .drumKpi strong { margin-top: 2px; font-size: 17px; }
 
 .drumBoard > .asyncStateContent {
-  align-items: flex-start;
+  min-height: 0;
+  align-items: stretch;
   overflow: hidden;
 }
 
 .drumGridWrap {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
   width: calc(100% - 16px);
   margin: 8px;
   border: 1px solid var(--line);
@@ -522,6 +526,7 @@ input:focus, select:focus {
 }
 .drumDayCol.dropArmed { outline: 1px dashed #6b7f99; outline-offset: -2px; }
 .drumMoveMessage { margin: 4px 8px; border: 1px solid #7da48a; background: #edf8f0; padding: 5px 8px; color: #245f35; font-size: 11px; }
+.drumMoveError { margin: 4px 8px; border: 1px solid #c96868; background: #fff0f0; padding: 5px 8px; color: #8f1e1e; font-size: 11px; }
 
 .drumTile {
   display: block;

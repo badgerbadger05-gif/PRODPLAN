@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -96,17 +96,20 @@ def move_drum_slot(
     if capacity <= 0:
         raise ValueError("для участка не настроена положительная мощность")
 
-    target_slots = (
+    resource_slots = (
         db.query(models.DrumSlot)
         .filter(
             models.DrumSlot.drum_schedule_id == int(schedule.id),
             models.DrumSlot.resource_id == target_resource,
-            models.DrumSlot.slot_date == new_date,
-            models.DrumSlot.id != int(slot.id),
+        )
+        .order_by(
+            models.DrumSlot.slot_date,
+            models.DrumSlot.slot_ordinal,
+            models.DrumSlot.id,
         )
         .all()
     )
-    item_ids = {int(row.item_id) for row in target_slots} | {int(slot.item_id)}
+    item_ids = {int(row.item_id) for row in resource_slots}
     rate_rows = (
         db.query(models.AssemblyRate)
         .filter(
@@ -118,23 +121,68 @@ def move_drum_slot(
     rate_by_item = {int(row.item_id): _d(row.qty_per_capacity) for row in rate_rows}
     if any(rate_by_item.get(item_id, Decimal("0")) <= 0 for item_id in item_ids):
         raise ValueError("не удалось проверить загрузку участка: отсутствует такт изделия")
-    target_load = _d(slot.slot_qty) / rate_by_item[int(slot.item_id)]
-    for other in target_slots:
-        target_load += _d(other.slot_qty) / rate_by_item[int(other.item_id)]
-    if target_load > capacity + Decimal("0.0000001"):
-        percent = (target_load / capacity * Decimal("100")).quantize(Decimal("1"))
-        raise ValueError(
-            f"не хватает мощности: загрузка участка на {new_date.isoformat()} "
-            f"станет {percent}%"
-        )
+    # A drop means insertion into the resource timeline, not stacking the tile
+    # on top of an already full day.  Repack the target day and its tail in the
+    # existing order around the tile pinned to its requested date, carrying
+    # overflow to later workdays and using the vacancy left at the source.
+    # Earlier unaffected days and every domain quantity remain untouched.
+    repack_from = min(old_date, new_date)
+    tail = [
+        row for row in resource_slots
+        if int(row.id) != int(slot.id) and row.slot_date >= repack_from
+    ]
+    ordered_tail = [slot, *tail]
+    placements: dict[int, date] = {int(slot.id): new_date}
+    current = repack_from
 
-    if slot.auto_slot_date is None:
-        slot.auto_slot_date = old_date
-    if slot.auto_resource_id is None:
-        slot.auto_resource_id = int(slot.resource_id)
-    slot.slot_date = new_date
-    slot.manual_moved_at = datetime.now(timezone.utc)
-    slot.manual_moved_by = str(moved_by or "operator").strip()[:100] or "operator"
+    def next_workday(candidate: date) -> date:
+        day = candidate
+        while day <= schedule.schedule_to and not is_workday(db, day):
+            day += timedelta(days=1)
+        return day
+
+    slot_load = _d(slot.slot_qty) / rate_by_item[int(slot.item_id)]
+    if slot_load > capacity + Decimal("0.0000001"):
+        raise ValueError(
+            f"плитка #{int(slot.id)} целиком не помещается в дневную мощность участка"
+        )
+    used_by_day: dict[date, Decimal] = {new_date: slot_load}
+
+    for row in tail:
+        rate_value = rate_by_item[int(row.item_id)]
+        load = _d(row.slot_qty) / rate_value
+        if load > capacity + Decimal("0.0000001"):
+            raise ValueError(
+                f"плитка #{int(row.id)} целиком не помещается в дневную мощность участка"
+            )
+        earliest = max(repack_from, row.readiness_date or repack_from)
+        if current < earliest:
+            current = earliest
+        current = next_workday(current)
+        while (
+            current <= schedule.schedule_to
+            and used_by_day.get(current, Decimal("0")) + load
+            > capacity + Decimal("0.0000001")
+        ):
+            current = next_workday(current + timedelta(days=1))
+        if current > schedule.schedule_to:
+            raise ValueError("вставка сдвигает плитки за горизонт барабана")
+        placements[int(row.id)] = current
+        used_by_day[current] = used_by_day.get(current, Decimal("0")) + load
+
+    stamp = datetime.now(timezone.utc)
+    actor = str(moved_by or "operator").strip()[:100] or "operator"
+    for row in ordered_tail:
+        placed = placements[int(row.id)]
+        if row.slot_date == placed:
+            continue
+        if row.auto_slot_date is None:
+            row.auto_slot_date = row.slot_date
+        if row.auto_resource_id is None:
+            row.auto_resource_id = int(row.resource_id)
+        row.slot_date = placed
+        row.manual_moved_at = stamp
+        row.manual_moved_by = actor
     db.commit()
     return {
         "ok": True,

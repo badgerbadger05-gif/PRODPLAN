@@ -15,7 +15,7 @@ import json
 from typing import Any
 
 
-_QTY_QUANTUM = Decimal("0.001")
+_QTY_QUANTUM = Decimal("1")
 
 
 def _dec(value: Any) -> Decimal:
@@ -132,7 +132,16 @@ def _normalize_queue_signature(lines: list[QueueLine]) -> str:
 
 
 def _open_qty(line: QueueLine) -> Decimal:
-    return max(_dec(line.planned_output_qty) - _dec(line.accepted_plan_output_qty), Decimal("0"))
+    quantity = max(
+        _dec(line.planned_output_qty) - _dec(line.accepted_plan_output_qty),
+        Decimal("0"),
+    )
+    whole = quantity.quantize(_QTY_QUANTUM, rounding=ROUND_DOWN)
+    if quantity != whole:
+        raise ValueError(
+            f"assembly queue line {int(line.queue_line_id)} has fractional root quantity {quantity}"
+        )
+    return whole
 
 
 def build_drum_plan(
@@ -249,13 +258,10 @@ def build_drum_plan(
                 free_capacity = max(resource_capacity - used, Decimal("0"))
                 available = free_capacity * rate
                 if available > 0:
-                    # Persisted drum quantities have scale 3.  Repeated
-                    # ``take / rate`` operations can leave a positive Decimal
-                    # residue such as 2.25E-27 after the day is physically
-                    # exhausted.  It must not become a slot that the database
-                    # rounds to 0.000; floor the candidate to the canonical
-                    # quantity quantum and leave any unusable residue for a
-                    # later day or an explicit capacity gap.
+                    # Finished assemblies are indivisible.  Capacity and takt
+                    # remain Decimal values, but only whole pieces can become
+                    # a persisted tile; unusable fractional capacity carries
+                    # no phantom partial assembly.
                     take = min(remaining, available).quantize(
                         _QTY_QUANTUM,
                         rounding=ROUND_DOWN,

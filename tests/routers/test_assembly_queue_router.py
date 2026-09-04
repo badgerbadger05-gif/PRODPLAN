@@ -516,6 +516,115 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
     assert board["slots"][0]["manual_override"] is True
 
 
+def test_drum_tile_move_inserts_and_cascades_full_days(client, db_session):
+    generation, _ = _accepted_generation(db_session)
+    first = date.today()
+    while first.weekday() >= 5:
+        first += timedelta(days=1)
+    days = [first]
+    while len(days) < 3:
+        candidate = days[-1] + timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate += timedelta(days=1)
+        days.append(candidate)
+
+    resource = models.ProductionResource(resource_name="Assembly cascade", capacity=1)
+    item = models.Item(item_code="MOVE-CASCADE", item_name="Move cascade tile")
+    db_session.add_all([resource, item])
+    db_session.flush()
+    db_session.add(models.AssemblyRate(
+        resource_id=resource.resource_id,
+        item_id=item.item_id,
+        qty_per_capacity=1,
+    ))
+    schedule = models.DrumSchedule(
+        ledger_generation_id=generation.id,
+        status="completed",
+        algorithm_version="tests/1",
+        schedule_from=days[0],
+        schedule_to=days[2],
+        queue_signature="q" * 64,
+        slot_signature="s" * 64,
+        gap_signature="g" * 64,
+        slot_row_count=3,
+        gap_row_count=0,
+        total_open_qty=3,
+        total_slot_qty=3,
+        total_gap_qty=0,
+        metrics={},
+    )
+    db_session.add(schedule)
+    db_session.flush()
+    slots = []
+    for ordinal, slot_date in enumerate(days):
+        queue = models.AssemblyQueueLine(
+            ledger_generation_id=generation.id,
+            planning_run_id=301 + ordinal,
+            plan_id=401 + ordinal,
+            plan_line_id=501 + ordinal,
+            item_id=item.item_id,
+            bucket_date=days[0],
+            period_from=days[0],
+            period_to=days[2],
+            planned_output_qty=1,
+            accepted_plan_output_qty=0,
+            assembly_remaining_qty=1,
+            original_priority=[days[0].isoformat(), ordinal],
+            sort_key=f"{days[0].isoformat()}|{ordinal:010d}",
+            line_status="open",
+        )
+        db_session.add(queue)
+        db_session.flush()
+        drum_slot = models.DrumSlot(
+            drum_schedule_id=schedule.id,
+            assembly_queue_line_id=queue.id,
+            plan_id=queue.plan_id,
+            plan_line_id=queue.plan_line_id,
+            item_id=item.item_id,
+            resource_id=resource.resource_id,
+            slot_date=slot_date,
+            auto_slot_date=slot_date,
+            auto_resource_id=resource.resource_id,
+            slot_qty=1,
+            planned_output_qty=1,
+            slot_ordinal=0,
+            original_priority=list(queue.original_priority),
+            readiness_phase="now",
+            readiness_date=days[0],
+        )
+        db_session.add(drum_slot)
+        slots.append(drum_slot)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/v1/production-control/drum/slots/{slots[2].id}/move",
+        json={"new_date": days[0].isoformat(), "moved_by": "test-master"},
+    )
+
+    assert response.status_code == 200, response.text
+    db_session.expire_all()
+    assert db_session.get(models.DrumSlot, slots[2].id).slot_date == days[0]
+    assert db_session.get(models.DrumSlot, slots[0].id).slot_date == days[1]
+    assert db_session.get(models.DrumSlot, slots[1].id).slot_date == days[2]
+    assert all(
+        db_session.get(models.DrumSlot, row.id).manual_moved_by == "test-master"
+        for row in slots
+    )
+
+    # Moving the same tile later reuses the vacancy at its source instead of
+    # trying to stack it on the full target day and rejecting the drop.
+    response = client.post(
+        f"/api/v1/production-control/drum/slots/{slots[2].id}/move",
+        json={"new_date": days[2].isoformat(), "moved_by": "test-master"},
+    )
+
+    assert response.status_code == 200, response.text
+    db_session.expire_all()
+    assert db_session.get(models.DrumSlot, slots[0].id).slot_date == days[0]
+    assert db_session.get(models.DrumSlot, slots[1].id).slot_date == days[1]
+    assert db_session.get(models.DrumSlot, slots[2].id).slot_date == days[2]
+
+
 def test_drum_router_fails_closed_without_persisted_schedule(db_session):
     _accepted_generation(db_session)
     db_session.commit()

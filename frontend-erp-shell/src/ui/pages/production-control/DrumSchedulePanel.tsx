@@ -43,6 +43,7 @@ const blockerLabels: Record<string, string> = {
   REPLENISHMENT_MODE_UNAVAILABLE: 'Недоступный способ обеспечения',
   LEAD_TIME_MISSING: 'Не задан срок обеспечения',
   OUTPUT_WAREHOUSE_MISSING: 'Не задан склад выпуска',
+  FROZEN_SPEC_AMBIGUOUS: 'В MRP для узла зафиксировано несколько спецификаций; маршрут неоднозначен',
   TARGET_WAREHOUSE_MISSING: 'Не задан склад точки потребления',
   ROOT_FROZEN_BOM_MISSING: 'Нет замороженной спецификации изделия',
   CUSTODY_SNAPSHOT_MISSING: 'Нет принятого снимка фактических остатков',
@@ -104,8 +105,8 @@ export function DrumSchedulePanel() {
     return () => controller.abort()
   }, [load])
 
-  const handleDrop = useCallback(async (resourceId: number, day: string) => {
-    const slot = response?.slots.find((row) => row.slot_id === draggedSlotId)
+  const handleDrop = useCallback(async (slotId: number | null, resourceId: number, day: string) => {
+    const slot = response?.slots.find((row) => row.slot_id === slotId)
     setDraggedSlotId(null)
     if (!slot || slot.resource_id !== resourceId || slot.slot_date === day) return
     setMovingSlotId(slot.slot_id)
@@ -120,7 +121,7 @@ export function DrumSchedulePanel() {
     } finally {
       setMovingSlotId(null)
     }
-  }, [draggedSlotId, load, response?.slots])
+  }, [load, response?.slots])
 
   const slotsByCell = useMemo(() => {
     const grouped = new Map<string, DrumSlot[]>()
@@ -143,6 +144,7 @@ export function DrumSchedulePanel() {
       </div>
 
       {message && <div className="drumMoveMessage" role="status">{message}</div>}
+      {error && response && <div className="drumMoveError" role="alert">{error}</div>}
 
       {response && (
         <div className="drumKpis">
@@ -188,7 +190,9 @@ export function DrumSchedulePanel() {
                       }}
                       onDrop={(event) => {
                         event.preventDefault()
-                        void handleDrop(resource.resource_id, day)
+                        const transferred = Number(event.dataTransfer.getData('text/plain'))
+                        const slotId = Number.isFinite(transferred) && transferred > 0 ? transferred : draggedSlotId
+                        void handleDrop(slotId, resource.resource_id, day)
                       }}
                     >
                       <div className="drumCell">
@@ -304,7 +308,10 @@ export function DrumSchedulePanel() {
                         {blocker.item_name && ` — ${blocker.item_name}`}
                       </div>
                       <div>{blockerLabels[blocker.reason] ?? blocker.reason}</div>
-                      {blocker.shortage_qty && <div>Не хватает {blocker.shortage_qty} шт. из {blocker.required_qty ?? '—'}</div>}
+                      <div>Расчёт по всему остатку строки, не только по этой плитке.</div>
+                      {blocker.shortage_qty && (
+                        <div>Свободно после старших плиток: {blocker.available_qty ?? '—'} из {blocker.required_qty ?? '—'}; не хватает {blocker.shortage_qty}.</div>
+                      )}
                     </div>
                   ))}
                 </section>

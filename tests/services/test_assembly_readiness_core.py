@@ -1,6 +1,8 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from app.services.item_ledger.assembly_readiness_core import (
     FrozenBomEdge,
     ReadinessCurveLine,
@@ -44,8 +46,8 @@ def test_partial_line_allocates_only_its_releasable_root_quantity():
     )
 
     assert row.status == "partial"
-    assert row.ready_qty == Decimal("2.500")
-    assert row.blockers[0].required_qty == Decimal("1.0000")
+    assert row.ready_qty == Decimal("2")
+    assert row.blockers[0].required_qty == Decimal("2")
     assert row.blockers[0].shortage_qty == Decimal("1.0000")
 
 
@@ -181,8 +183,8 @@ def test_curve_preserves_leaf_blocker_and_recursive_path_after_launch_horizon():
         as_of=date(2026, 9, 3),
     )
 
-    assert row.status == "partial"
-    assert row.points[-1].cumulative_qty == Decimal("0.500")
+    assert row.status == "blocked"
+    assert row.points[-1].cumulative_qty == Decimal("0")
     assert len(row.blockers) == 1
     blocker = row.blockers[0]
     assert blocker.item_id == 30
@@ -208,3 +210,36 @@ def test_curve_keeps_rework_as_an_explicit_launch_action():
 
     assert row.points[-1].cumulative_qty == Decimal("1.000")
     assert "rework" in {action.action_kind for action in row.points[-1].actions}
+
+
+def test_curve_rejects_fractional_finished_assembly_quantity():
+    with pytest.raises(ValueError, match="assembly root quantity must be whole"):
+        allocate_readiness_curves(
+            (ReadinessCurveLine(1, "001", 1, 100, Decimal("1.5"), "assembly"),),
+            (FrozenBomEdge(1, 100, 20, Decimal("1")),),
+            (),
+            (),
+            as_of=date(2026, 9, 3),
+        )
+
+
+def test_curve_exposes_ambiguous_frozen_route_instead_of_missing_warehouse():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (
+            FrozenBomEdge(1, 100, 20, Decimal("1")),
+            FrozenBomEdge(1, 20, 30, Decimal("1")),
+        ),
+        (),
+        (
+            ReplenishmentPolicy(
+                1,
+                20,
+                "make",
+                unavailable_reason="FROZEN_SPEC_AMBIGUOUS",
+            ),
+        ),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert row.blockers[0].reason == "FROZEN_SPEC_AMBIGUOUS"

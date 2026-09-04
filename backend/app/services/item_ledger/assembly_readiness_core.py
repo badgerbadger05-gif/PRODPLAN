@@ -9,6 +9,7 @@ from typing import Any
 
 
 QTY_QUANTUM = Decimal("0.001")
+ROOT_QTY_QUANTUM = Decimal("1")
 
 
 def _d(value: Any) -> Decimal:
@@ -74,6 +75,7 @@ class ReplenishmentPolicy:
     route_kind: str = ""
     resource_id: int | None = None
     output_warehouse_ref1c: str = ""
+    unavailable_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,21 @@ _SUPPLY_RANK = {"now": 0, "transfer": 1, "committed": 3}
 
 def _q(value: Decimal) -> Decimal:
     return max(_d(value), Decimal("0")).quantize(QTY_QUANTUM, rounding=ROUND_DOWN)
+
+
+def _root_q(value: Decimal) -> Decimal:
+    """Return an indivisible finished-assembly quantity.
+
+    Component norms and stock may legitimately have thousandth precision, but
+    the roots placed on the assembly drum are counted in pieces.  Silently
+    truncating a fractional plan would break conservation, so fail closed when
+    an upstream queue line itself is not integral.
+    """
+    quantity = _q(value)
+    whole = quantity.quantize(ROOT_QTY_QUANTUM, rounding=ROUND_DOWN)
+    if quantity != whole:
+        raise ValueError(f"assembly root quantity must be whole, got {quantity}")
+    return whole
 
 
 def _max_date(left: date | None, right: date | None) -> date | None:
@@ -203,11 +220,15 @@ def allocate_readiness_curves(
         graph[parent_key].sort(key=lambda row: row[0])
     policy_by_item = {(int(row.bom_key), int(row.item_id)): row for row in policies}
     ordered_lines = tuple(sorted(lines, key=lambda row: (str(row.sort_key), int(row.queue_line_id))))
+    open_qty_by_line = {
+        int(line.queue_line_id): _root_q(line.open_qty)
+        for line in ordered_lines
+    }
     if global_unavailable_reasons:
         return tuple(
             ReadinessCurveResult(
                 queue_line_id=int(line.queue_line_id),
-                open_qty=_q(line.open_qty),
+                open_qty=open_qty_by_line[int(line.queue_line_id)],
                 status="unavailable",
                 points=tuple(
                     ReadinessCurvePoint(horizon, Decimal("0"), None, ())
@@ -246,7 +267,7 @@ def allocate_readiness_curves(
 
         for line in ordered_lines:
             line_id = int(line.queue_line_id)
-            open_qty = _q(line.open_qty)
+            open_qty = open_qty_by_line[line_id]
             target = str(line.target_warehouse_ref1c or "").strip()
             if not target:
                 reasons_by_line[line_id].add("TARGET_WAREHOUSE_MISSING")
@@ -361,6 +382,15 @@ def allocate_readiness_curves(
                                 if policy is None
                                 else "HORIZON_DOES_NOT_ALLOW_REPLENISHMENT"
                             ),
+                            destination=destination,
+                            path=path,
+                        )
+                    if policy.unavailable_reason:
+                        return blocked(
+                            item_id=item_id,
+                            required_qty=requested,
+                            available_qty=requested - needed,
+                            reason=policy.unavailable_reason,
                             destination=destination,
                             path=path,
                         )
@@ -492,11 +522,13 @@ def allocate_readiness_curves(
             best_pool = dict(remaining)
             best_date: date | None = None
             best_actions: tuple[ReadinessAction, ...] = ()
-            # Quantized binary search avoids one-by-one iteration for large plans.
-            while high - low >= QTY_QUANTUM:
-                mid = ((low + high) / 2).quantize(QTY_QUANTUM, rounding=ROUND_DOWN)
+            # Finished assemblies are indivisible.  Component quantities keep
+            # their normal precision inside ``attempt``; only the root search
+            # advances in whole pieces.
+            while high - low >= ROOT_QTY_QUANTUM:
+                mid = ((low + high) / 2).quantize(ROOT_QTY_QUANTUM, rounding=ROUND_DOWN)
                 if mid <= low:
-                    mid = low + QTY_QUANTUM
+                    mid = low + ROOT_QTY_QUANTUM
                 trial_pool = dict(remaining)
                 ok, ready_date, actions, _ = attempt(mid, trial_pool)
                 if ok:
@@ -505,7 +537,7 @@ def allocate_readiness_curves(
                     best_date = ready_date
                     best_actions = actions
                 else:
-                    high = mid - QTY_QUANTUM
+                    high = mid - ROOT_QTY_QUANTUM
             if low < open_qty:
                 trial_pool = dict(remaining)
                 ok, ready_date, actions, full_blockers = attempt(open_qty, trial_pool)
@@ -518,7 +550,7 @@ def allocate_readiness_curves(
                     blockers_by_line[line_id] = full_blockers
             remaining = best_pool
             points_by_line[line_id].append(
-                ReadinessCurvePoint(horizon, _q(low), best_date, best_actions)
+                ReadinessCurvePoint(horizon, _root_q(low), best_date, best_actions)
             )
 
     results: list[ReadinessCurveResult] = []
@@ -528,15 +560,15 @@ def allocate_readiness_curves(
         now_qty = points[0].cumulative_qty if points else Decimal("0")
         status = (
             "unavailable" if reasons_by_line[int(line.queue_line_id)]
-            else "ready" if now_qty >= _q(line.open_qty)
-            else "recoverable" if launch_qty >= _q(line.open_qty)
+            else "ready" if now_qty >= open_qty_by_line[int(line.queue_line_id)]
+            else "recoverable" if launch_qty >= open_qty_by_line[int(line.queue_line_id)]
             else "partial" if launch_qty > 0
             else "blocked"
         )
         results.append(
             ReadinessCurveResult(
                 queue_line_id=int(line.queue_line_id),
-                open_qty=_q(line.open_qty),
+                open_qty=open_qty_by_line[int(line.queue_line_id)],
                 status=status,
                 points=points,
                 unavailable_reasons=tuple(sorted(reasons_by_line[int(line.queue_line_id)])),
@@ -551,24 +583,31 @@ def allocate_assembly_readiness(
     free_stock_by_item: dict[int, Decimal] | None,
 ) -> tuple[ReadinessResult, ...]:
     """Allocate shared stock once, oldest-first, without a second BOM explosion."""
+    ordered_lines = tuple(
+        sorted(lines, key=lambda row: (str(row.sort_key), int(row.queue_line_id)))
+    )
+    open_qty_by_line = {
+        int(line.queue_line_id): _root_q(line.open_qty)
+        for line in ordered_lines
+    }
     if free_stock_by_item is None:
         return tuple(
             ReadinessResult(
                 queue_line_id=int(line.queue_line_id),
                 status="unavailable",
-                open_qty=max(_d(line.open_qty), Decimal("0")),
+                open_qty=open_qty_by_line[int(line.queue_line_id)],
                 ready_qty=Decimal("0"),
                 blockers=(),
             )
-            for line in sorted(lines, key=lambda row: (str(row.sort_key), int(row.queue_line_id)))
+            for line in ordered_lines
         )
     available = {
         int(item_id): max(_d(qty), Decimal("0"))
         for item_id, qty in free_stock_by_item.items()
     }
     results: list[ReadinessResult] = []
-    for line in sorted(lines, key=lambda row: (str(row.sort_key), int(row.queue_line_id))):
-        open_qty = max(_d(line.open_qty), Decimal("0"))
+    for line in ordered_lines:
+        open_qty = open_qty_by_line[int(line.queue_line_id)]
         norms: dict[int, Decimal] = {}
         for component_item_id, raw_norm in line.component_norms:
             norm = _d(raw_norm)
@@ -587,11 +626,11 @@ def allocate_assembly_readiness(
         ready_qty = open_qty
         for component_item_id, norm in norms.items():
             possible = (available.get(component_item_id, Decimal("0")) / norm).quantize(
-                QTY_QUANTUM,
+                ROOT_QTY_QUANTUM,
                 rounding=ROUND_DOWN,
             )
             ready_qty = min(ready_qty, max(possible, Decimal("0")))
-        ready_qty = ready_qty.quantize(QTY_QUANTUM, rounding=ROUND_DOWN)
+        ready_qty = ready_qty.quantize(ROOT_QTY_QUANTUM, rounding=ROUND_DOWN)
 
         for component_item_id, norm in norms.items():
             available[component_item_id] = max(

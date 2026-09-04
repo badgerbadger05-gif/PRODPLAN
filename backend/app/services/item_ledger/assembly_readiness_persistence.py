@@ -297,8 +297,11 @@ def _curve_inputs(
             resource_id = None
             output_warehouse = ""
             route_kind = ""
+            unavailable_reason = ""
             if mode in {"make", "rework"}:
                 frozen_spec = frozen_spec_by_parent.get((run_id, item_id))
+                if (run_id, item_id) in ambiguous_frozen_specs:
+                    unavailable_reason = "FROZEN_SPEC_AMBIGUOUS"
                 spec = spec_by_ref.get(frozen_spec[0]) if frozen_spec else None
                 spec_is_current = bool(
                     spec is not None
@@ -325,6 +328,7 @@ def _curve_inputs(
                     route_kind=route_kind,
                     resource_id=resource_id,
                     output_warehouse_ref1c=output_warehouse,
+                    unavailable_reason=unavailable_reason,
                 )
             )
     return tuple(lines_list), edges, tuple(policies)

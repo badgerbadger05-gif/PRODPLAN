@@ -603,6 +603,29 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByText('Плитка перенесена на 2026-09-04')).toBeInTheDocument()
   })
 
+  it('keeps a rejected drum move visible instead of silently snapping back', async () => {
+    vi.mocked(moveDrumSlot).mockRejectedValueOnce(new Error('Вставка сдвигает плитки за горизонт'))
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(screen.getByRole('button', { name: 'Барабан сборки' }))
+    const tile = await screen.findByRole('button', { name: /Кронштейн: 4 шт., Можно собирать сейчас/ })
+    const target = screen.getByLabelText('Цех 1, 2026-09-04')
+    const dataTransfer = {
+      effectAllowed: 'move',
+      dropEffect: 'move',
+      setData: vi.fn(),
+      getData: vi.fn(() => '501'),
+    }
+
+    fireEvent.dragStart(tile, { dataTransfer })
+    fireEvent.dragOver(target, { dataTransfer })
+    fireEvent.drop(target, { dataTransfer })
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Вставка сдвигает плитки за горизонт')
+    expect(screen.getByRole('table', { name: 'Календарный барабан сборки' })).toBeInTheDocument()
+  })
+
   it('shows shelf launch metadata in a journal row and its card', async () => {
     vi.mocked(listProductionOrders).mockResolvedValue({
       rows: [{
