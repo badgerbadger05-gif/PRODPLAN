@@ -18,7 +18,7 @@ from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
 STAGE = "drum_schedule"
-ALGORITHM_VERSION = "drum-schedule/4-readiness-curve"
+ALGORITHM_VERSION = "drum-schedule/5-whole-piece-readiness-curve"
 
 
 def _d(value: Any) -> Decimal:

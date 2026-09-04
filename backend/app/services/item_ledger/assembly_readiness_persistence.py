@@ -37,7 +37,7 @@ from .assembly_readiness_core import (
 
 
 STAGE = "assembly_readiness"
-ALGORITHM_VERSION = "assembly-readiness/2-readiness-curve"
+ALGORITHM_VERSION = "assembly-readiness/3-whole-piece-readiness-curve"
 _NON_STOCK_TYPES = {"услуга", "работа", "операция"}
 
 
