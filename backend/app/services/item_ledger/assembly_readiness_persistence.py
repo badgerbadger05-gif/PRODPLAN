@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -32,7 +32,7 @@ from .assembly_readiness_core import (
 
 
 STAGE = "assembly_readiness"
-ALGORITHM_VERSION = "assembly-readiness/10-addressed-stock-transfers"
+ALGORITHM_VERSION = "assembly-readiness/11-calendar-bounded-allocation"
 
 
 def _d(value: Any) -> Decimal:
@@ -463,6 +463,17 @@ def materialize_assembly_readiness(
     ]
     lines, edges, policies = _curve_inputs(db, queue_rows)
     physical = _physical_supplies(db, int(generation.id), queue_rows)
+    # Read exactly the resource horizons used by the one canonical scheduler.
+    # Import locally because schedule persistence also materializes readiness.
+    from .drum_schedule_persistence import _rates_and_capacity
+
+    rates, _, _, horizon_by_resource = _rates_and_capacity(db, queue_rows)
+    deadlines = {
+        int(row.id): generation.cutoff.date() + timedelta(
+            days=horizon_by_resource[rates[int(row.item_id)][0].resource_id] - 1
+        )
+        for row in queue_rows if rates.get(int(row.item_id))
+    }
     results = allocate_readiness_curves(
         lines,
         edges,
@@ -470,6 +481,7 @@ def materialize_assembly_readiness(
         policies,
         as_of=generation.cutoff.date(),
         global_unavailable_reasons=("CUSTODY_SNAPSHOT_MISSING",) if physical is None else (),
+        allocation_deadline_by_line=deadlines,
     )
     item_ids = {
         int(action.item_id)

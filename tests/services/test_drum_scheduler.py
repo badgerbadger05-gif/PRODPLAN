@@ -1,6 +1,7 @@
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
+from dataclasses import replace
 
 import pytest
 
@@ -170,6 +171,21 @@ def _line(line_id: int, qty: str, *, sort_key: str, item_id: int = 1) -> QueueLi
         ready_qty=Decimal(qty),
         readiness_status="ready",
     )
+
+
+def test_fifo_reclaims_later_days_while_younger_work_fills_earlier_days():
+    older = replace(_line(1, "2", sort_key="001"),
+                    readiness_curve=(("launch", Decimal("2"), date(2026, 9, 8)),))
+    younger = _line(2, "3", sort_key="002")
+    plan = build_drum_plan(
+        (younger, older), {1: (AssemblyRateProfile(10, Decimal("1")),)}, {},
+        schedule_from=date(2026, 9, 7), schedule_to=date(2026, 9, 9),
+        resource_capacity_by_id={10: Decimal("1")},
+    )
+    assert sorted((s.slot_date, s.queue_line_id) for s in plan.slots) == [
+        (date(2026, 9, 7), 2), (date(2026, 9, 8), 1), (date(2026, 9, 9), 1),
+    ]
+    assert [(g.queue_line_id, g.gap_qty) for g in plan.gaps] == [(2, Decimal("2"))]
 
 
 def test_drum_splits_fifo_and_exposes_horizon_gap() -> None:

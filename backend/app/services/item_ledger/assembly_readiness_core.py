@@ -276,6 +276,7 @@ def allocate_readiness_curves(
     *,
     as_of: date,
     global_unavailable_reasons: tuple[str, ...] = (),
+    allocation_deadline_by_line: dict[int, date] | None = None,
 ) -> tuple[ReadinessCurveResult, ...]:
     """Build one cumulative consume-once readiness allocation.
 
@@ -814,6 +815,22 @@ def allocate_readiness_curves(
                         None,
                         _aggregate_actions(actions),
                         tuple(root_blockers),
+                    )
+                deadline = (allocation_deadline_by_line or {}).get(line_id)
+                if deadline is not None and root_date is not None and root_date > deadline:
+                    # A forecast outside this resource's calendar must not
+                    # reserve today's shared stock ahead of schedulable work.
+                    # Keep its actions/ETA as an explanation, but roll back
+                    # the trial pool just like any other infeasible batch.
+                    return False, root_date, _aggregate_actions(actions), (
+                        ReadinessBlocker(
+                            item_id=root_item_id,
+                            required_qty=root_qty,
+                            available_qty=Decimal("0"),
+                            shortage_qty=root_qty,
+                            reason="OUTSIDE_DRUM_HORIZON",
+                            destination_warehouse_ref1c=target,
+                        ),
                     )
                 return True, root_date, _aggregate_actions(actions), ()
 

@@ -24,7 +24,7 @@ from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
 STAGE = "drum_schedule"
-ALGORITHM_VERSION = "drum-schedule/10-saved-capacity"
+ALGORITHM_VERSION = "drum-schedule/11-fifo-eligible-work"
 
 
 def _d(value: Any) -> Decimal:

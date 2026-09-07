@@ -326,13 +326,15 @@ def build_drum_plan(
 
     slot_ordinal_by_line: dict[int, int] = {}
     gap_by_line: dict[int, CapacityGap] = {}
+    # Reserve eligible days oldest-first. Younger work can backfill earlier
+    # free days, but an earlier ETA must not buy it all subsequent capacity.
     for _phase, eligible_date, _horizon_rank, queue_line, phase_qty, readiness_phase in sorted(
         phased,
         key=lambda row: (
             row[0],
-            row[1],
             str(row[3].sort_key),
             int(row[3].queue_line_id),
+            row[1],
             row[2],
         ),
     ):

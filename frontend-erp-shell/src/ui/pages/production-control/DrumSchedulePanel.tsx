@@ -74,6 +74,7 @@ const blockerLabels: Record<string, string> = {
   FROZEN_BOM_MISSING: 'Нет замороженной спецификации',
   REPLENISHMENT_MODE_UNAVAILABLE: 'Недоступный способ обеспечения',
   LEAD_TIME_MISSING: 'Не задан срок обеспечения',
+  OUTSIDE_DRUM_HORIZON: 'Обеспечение ожидается за горизонтом барабана',
   OUTPUT_WAREHOUSE_MISSING: 'Не задан склад выпуска',
   FROZEN_SPEC_AMBIGUOUS: 'В MRP для узла зафиксировано несколько спецификаций; маршрут неоднозначен',
   TARGET_WAREHOUSE_MISSING: 'Не задан склад точки потребления',

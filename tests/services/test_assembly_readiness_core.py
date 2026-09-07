@@ -203,6 +203,38 @@ def test_curve_explains_kitting_then_recursive_make_launch():
     assert row.points[4].available_date == date(2026, 9, 6)
 
 
+def test_out_of_calendar_forecast_does_not_hoard_stock_for_nearby_assembly():
+    older, younger = allocate_readiness_curves(
+        (
+            ReadinessCurveLine(1, "001", 1, 100, Decimal("2"), "assembly"),
+            ReadinessCurveLine(2, "002", 1, 200, Decimal("1"), "assembly"),
+        ),
+        (
+            FrozenBomEdge(1, 100, 20, Decimal("1")),
+            FrozenBomEdge(1, 100, 30, Decimal("1")),
+            FrozenBomEdge(1, 200, 20, Decimal("1")),
+            FrozenBomEdge(1, 20, 40, Decimal("1")),
+        ),
+        (
+            ReadinessSupply("shared-metal", 40, Decimal("2"), "now", "assembly"),
+            ReadinessSupply("one-purchased-part", 30, Decimal("1"), "now", "assembly"),
+        ),
+        (
+            ReplenishmentPolicy(1, 20, "make", 1, "production", 1, "assembly"),
+            ReplenishmentPolicy(1, 30, "buy", 30, output_warehouse_ref1c="assembly"),
+        ),
+        as_of=date(2026, 9, 7),
+        allocation_deadline_by_line={1: date(2026, 10, 6), 2: date(2026, 9, 8)},
+    )
+    assert older.points[-1].cumulative_qty == 1
+    assert older.points[-1].available_date == date(2026, 9, 8)
+    assert older.blockers[0].reason == "OUTSIDE_DRUM_HORIZON"
+    assert any(a.action_kind == "buy" and a.available_date == date(2026, 10, 7)
+               for a in older.points[-1].required_actions)
+    assert younger.points[-1].cumulative_qty == 1
+    assert younger.points[-1].available_date == date(2026, 9, 8)
+
+
 def test_curve_keeps_frozen_bom_versions_separate_between_runs():
     rows = allocate_readiness_curves(
         (
