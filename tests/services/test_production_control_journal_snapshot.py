@@ -53,7 +53,8 @@ def test_public_journal_row_strips_internal_material_snapshot():
     assert "_route_sheet_snapshot" in source
 
 
-def test_drum_make_manifest_becomes_run_scoped_mechshop_pull(db_session):
+@pytest.mark.parametrize("action_kind", ["make", "rework", "kitting"])
+def test_drum_make_manifest_becomes_run_scoped_mechshop_pull(db_session, action_kind):
     generation = _building_generation(db_session, "journal-readiness-pull")
     line = models.AssemblyQueueLine(
         ledger_generation_id=generation.id,
@@ -81,7 +82,7 @@ def test_drum_make_manifest_becomes_run_scoped_mechshop_pull(db_session):
         ready_qty=0,
         launchable_qty=2,
         action_manifest=[{
-            "action_kind": "make", "item_id": 501, "qty": "4",
+            "action_kind": action_kind, "item_id": 501, "qty": "4",
             "available_date": "2026-09-06",
         }],
         evidence_signature="e" * 64,
@@ -104,7 +105,7 @@ def test_drum_make_manifest_becomes_run_scoped_mechshop_pull(db_session):
         slot_ordinal=0, original_priority=["2026-09-01", 9],
         readiness_phase="launch",
         action_manifest=[{
-            "action_kind": "make", "item_id": 501, "qty": "4",
+            "action_kind": action_kind, "item_id": 501, "qty": "4",
             "available_date": "2026-09-06",
         }],
     )

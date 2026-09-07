@@ -235,6 +235,59 @@ def test_out_of_calendar_forecast_does_not_hoard_stock_for_nearby_assembly():
     assert younger.points[-1].available_date == date(2026, 9, 8)
 
 
+def test_physical_gate_recurses_without_orders_or_lead_times_and_preserves_fifo():
+    older, younger = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("2"), "assembly"),
+         ReadinessCurveLine(2, "002", 1, 200, Decimal("1"), "assembly")),
+        (FrozenBomEdge(1, 100, 20, Decimal("1")),
+         FrozenBomEdge(1, 20, 30, Decimal("2")),
+         FrozenBomEdge(1, 30, 10, Decimal("3")),
+         FrozenBomEdge(1, 200, 10, Decimal("1"))),
+        (ReadinessSupply("physical", 10, Decimal("12"), "now", "assembly"),),
+        (ReplenishmentPolicy(1, 20, "make", None, "production", 1, "assembly"),
+         ReplenishmentPolicy(1, 30, "make", 30, "kitting", 2, "assembly"),
+         ReplenishmentPolicy(1, 10, "buy", 1, output_warehouse_ref1c="assembly")),
+        as_of=date(2026, 9, 7), physical_material_gate=True,
+    )
+    assert older.status == "recoverable"
+    assert older.points[-1].cumulative_qty == 2
+    assert older.points[-1].available_date == date(2026, 9, 7)
+    assert {(a.item_id, a.qty, a.action_kind) for a in older.points[-1].actions} == {
+        (20, Decimal("2"), "make"), (30, Decimal("4"), "kitting"),
+    }
+    assert all(a.confidence == "required" for a in older.points[-1].actions)
+    assert younger.status == "blocked"
+    assert younger.blockers[0].reason == "PURCHASED_COMPONENT_SHORTAGE"
+
+
+def test_physical_gate_does_not_cover_missing_purchase_with_future_supply():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (FrozenBomEdge(1, 100, 10, Decimal("1")),),
+        (ReadinessSupply("ordered", 10, Decimal("1"), "committed", "assembly",
+                         available_date=date(2026, 9, 7)),),
+        (ReplenishmentPolicy(1, 10, "buy", 0, output_warehouse_ref1c="assembly"),),
+        as_of=date(2026, 9, 7), physical_material_gate=True,
+    )
+    assert row.status == "blocked"
+    assert row.points[-1].cumulative_qty == 0
+    assert row.blockers[0].reason == "PURCHASED_COMPONENT_SHORTAGE"
+
+
+@pytest.mark.parametrize("stock_qty, expected_status", [(0, "unavailable"), (1, "ready")])
+def test_physical_gate_existing_node_closes_branch_and_unknown_bom_is_not_red(stock_qty, expected_status):
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), "assembly"),),
+        (FrozenBomEdge(1, 100, 20, Decimal("1")),),
+        (ReadinessSupply("node", 20, Decimal(stock_qty), "now", "assembly"),),
+        (ReplenishmentPolicy(1, 20, "make", unavailable_reason="NO_SPEC"),),
+        as_of=date(2026, 9, 7), physical_material_gate=True,
+    )
+    assert row.status == expected_status
+    assert row.points[-1].cumulative_qty == stock_qty
+    assert row.points[-1].actions == ()
+
+
 def test_curve_keeps_frozen_bom_versions_separate_between_runs():
     rows = allocate_readiness_curves(
         (

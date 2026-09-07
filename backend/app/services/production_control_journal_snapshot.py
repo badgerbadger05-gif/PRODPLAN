@@ -118,7 +118,7 @@ def _drum_readiness_pull_by_run_item(
             "readiness_phase": str(slot.readiness_phase),
         }
         for action in list(slot.action_manifest or []):
-            if str(action.get("action_kind") or "") not in {"make", "rework"}:
+            if str(action.get("action_kind") or "") not in {"make", "rework", "kitting"}:
                 continue
             item_id = int(action["item_id"])
             key = (int(line.planning_run_id), item_id)

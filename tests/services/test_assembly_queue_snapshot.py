@@ -7,6 +7,7 @@ from app import models
 from app.services.item_ledger import assembly_queue_snapshot
 from app.services.item_ledger import drum_schedule_persistence
 from app.services.item_ledger import live_plan_scope
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.item_ledger.drum_schedule_persistence import (
     materialize_drum_schedule,
 )
@@ -488,12 +489,14 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monk
                 item_id=component.item_id,
                 warehouse_ref1c="SHELF",
                 on_hand=Decimal("3"),
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
             ),
             models.StockBin(
                 ledger_generation_id=generation.id,
                 item_id=component.item_id,
                 warehouse_ref1c="OTHER",
                 on_hand=Decimal("4"),
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
             ),
         ]
     )
@@ -519,18 +522,20 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monk
         for row in db_session.query(models.DrumSlot).order_by(
             models.DrumSlot.slot_ordinal
         )
-    ] == [Decimal("5"), Decimal("5")]
+    ] == [Decimal("1"), Decimal("2")]
+    # Three units on the shelf and four transferable units at norm two
+    # physically cover three roots. A zero-day purchase is not stock.
     gap = db_session.query(models.DrumCapacityGap).one()
     assert gap.plan_line_id == line.id
-    assert gap.gap_qty == Decimal("2")
+    assert gap.gap_qty == Decimal("9")
     assert Decimal(first["total_open_qty"]) == Decimal("12")
     assert shelf["projection_rows"] == 1
     shelf_row = db_session.query(models.ShelfProjection).one()
-    assert shelf_row.target_qty == Decimal("12")
+    assert shelf_row.target_qty == Decimal("6")
     assert shelf_row.projected_qty == Decimal("3")
     assert shelf_row.transfer_qty == Decimal("0")
-    assert shelf_row.pull_qty == Decimal("9")
-    assert shelf_row.materialized_qty == Decimal("12")
+    assert shelf_row.pull_qty == Decimal("3")
+    assert shelf_row.materialized_qty == Decimal("4")
 
 
 def test_queue_line_without_rate_is_excluded_from_drum_only(db_session):

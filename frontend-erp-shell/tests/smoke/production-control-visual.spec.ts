@@ -322,3 +322,42 @@ test('drum master card renders saved readiness evidence and scrolls', async ({ p
   await expect.poll(async () => body.evaluate((node) => node.scrollTop > 0)).toBe(true)
   await page.screenshot({ path: testInfo.outputPath('drum-deficit-card.png'), fullPage: true })
 })
+
+test('drum shows yellow material feasibility without production orders', async ({ page }, testInfo) => {
+  const action = { ...drumSchedule.slots[0].action_manifest[1], confidence: 'required', available_date: '2026-09-04' }
+  const slot = {
+    ...drumSchedule.slots[0],
+    readiness_phase: 'launch', readiness_date: '2026-09-04', manual_override: false,
+    blocking_manifest: [], action_manifest: [action],
+    readiness_curve: ['now', 'transfer', 'kitting', 'committed', 'launch'].map((horizon) => ({
+      horizon, cumulative_qty: horizon === 'launch' ? '3' : '0',
+      available_date: horizon === 'launch' ? '2026-09-04' : null,
+      actions: horizon === 'launch' ? [action] : [], required_actions: [], blockers: [],
+    })),
+  }
+  await page.route('**/api/**', async (route) => {
+    const { pathname } = new URL(route.request().url())
+    if (pathname === '/api/v1/production-control/drum') {
+      await route.fulfill({ json: { ...drumSchedule, slots: [slot] } })
+      return
+    }
+    if (pathname === '/api/v1/resources/') {
+      await route.fulfill({ json: drumSchedule.resources })
+      return
+    }
+    await route.fulfill({ json: { rows: [], total: 0, truth_meta: drumSchedule.truth_meta } })
+  })
+  await page.goto('/#/production-control?view=drum')
+  const tile = page.getByRole('button', { name: /Лыжный модуль Fishride NEW: 3 шт., Материалы есть/ })
+  await expect(tile).toBeVisible()
+  await expect(tile).toHaveCSS('background-color', 'rgb(254, 243, 199)')
+  await expect(tile).toContainText('Изготовить узлы 3 из 3')
+  await expect(tile).toContainText('материалы на 2026-09-04')
+  await tile.click()
+  const dialog = page.getByRole('dialog', { name: /Плитка: Лыжный модуль Fishride NEW/ })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByText('Конёк для лыжи, чёрный').first()).toBeVisible()
+  await expect(dialog.getByText('Материалы есть для 3 из 3 — нужно изготовить узлы')).toBeVisible()
+  await expect(dialog.getByRole('link', { name: 'Открыть узел в очереди мехцеха' })).toBeVisible()
+  await page.screenshot({ path: testInfo.outputPath('drum-material-feasibility.png'), fullPage: true })
+})

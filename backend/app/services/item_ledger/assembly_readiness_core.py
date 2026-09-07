@@ -277,6 +277,7 @@ def allocate_readiness_curves(
     as_of: date,
     global_unavailable_reasons: tuple[str, ...] = (),
     allocation_deadline_by_line: dict[int, date] | None = None,
+    physical_material_gate: bool = False,
 ) -> tuple[ReadinessCurveResult, ...]:
     """Build one cumulative consume-once readiness allocation.
 
@@ -391,10 +392,17 @@ def allocate_readiness_curves(
         int(row.queue_line_id): [] for row in ordered_lines
     }
 
-    for horizon in READINESS_HORIZONS:
+    allocation_passes = (
+        ((horizon, (line,)) for line in ordered_lines for horizon in READINESS_HORIZONS)
+        if physical_material_gate
+        else ((horizon, ordered_lines) for horizon in READINESS_HORIZONS)
+    )
+    for horizon, horizon_lines in allocation_passes:
         horizon_rank = _HORIZON_RANK[horizon]
         supply_by_item: dict[int, list[ReadinessSupply]] = {}
         for row in supplies:
+            if physical_material_gate and row.layer == "committed":
+                continue
             if _SUPPLY_RANK.get(row.layer, 99) <= horizon_rank and _d(row.qty) > 0:
                 supply_by_item.setdefault(int(row.item_id), []).append(row)
         for item_rows in supply_by_item.values():
@@ -407,7 +415,7 @@ def allocate_readiness_curves(
                 )
             )
 
-        for line in ordered_lines:
+        for line in horizon_lines:
             line_id = int(line.queue_line_id)
             open_qty = open_qty_by_line[line_id]
             secured_qty = secured_by_line[line_id]
@@ -696,6 +704,8 @@ def allocate_readiness_curves(
                         return fail("BOM_CYCLE")
                     mode = str(policy.mode or "unavailable")
                     if mode == "buy":
+                        if physical_material_gate:
+                            return fail("PURCHASED_COMPONENT_SHORTAGE")
                         if not can_launch or policy.lead_days is None:
                             return fail("LEAD_TIME_MISSING")
                         finish = as_of + timedelta(days=max(int(policy.lead_days), 0))
@@ -724,7 +734,7 @@ def allocate_readiness_curves(
                                 else "REPLENISHMENT_MODE_UNAVAILABLE"
                             )
                         )
-                    if policy.lead_days is None:
+                    if policy.lead_days is None and not physical_material_gate:
                         return fail("LEAD_TIME_MISSING")
                     visiting.add(visit_scope)
                     child_date: date | None = as_of
@@ -761,14 +771,17 @@ def allocate_readiness_curves(
                     if nested_blockers:
                         return False, None, tuple(nested_blockers)
                     base = child_date or as_of
-                    finish = base + timedelta(days=max(int(policy.lead_days), 0))
+                    # Material feasibility is independent of production orders
+                    # and default lead-time estimates. The actions describe
+                    # work still required, never physical output already made.
+                    finish = as_of if physical_material_gate else base + timedelta(days=max(int(policy.lead_days), 0))
                     actions.append(
                         ReadinessAction(
                             action_kind=("kitting" if policy.route_kind == "kitting" else mode),
                             item_id=int(item_id),
                             qty=needed,
                             available_date=finish,
-                            confidence="forecast",
+                            confidence="required" if physical_material_gate else "forecast",
                             destination_warehouse_ref1c=output_warehouse,
                             resource_id=policy.resource_id,
                             path=path,
@@ -781,7 +794,7 @@ def allocate_readiness_curves(
                                 item_id=int(item_id),
                                 qty=needed,
                                 available_date=finish,
-                                confidence="forecast",
+                                confidence="required" if physical_material_gate else "forecast",
                                 source_warehouse_ref1c=output_warehouse,
                                 destination_warehouse_ref1c=destination,
                                 path=path,
@@ -902,6 +915,13 @@ def allocate_readiness_curves(
         points = tuple(points_by_line[int(line.queue_line_id)])
         launch_qty = points[-1].cumulative_qty if points else Decimal("0")
         now_qty = points[0].cumulative_qty if points else Decimal("0")
+        if physical_material_gate:
+            # Unknown BOM/routing is a data problem, not proof of a physical
+            # shortage. Only a missing purchased component is a red blocker.
+            reasons_by_line[int(line.queue_line_id)].update(
+                blocker.reason for blocker in blockers_by_line[int(line.queue_line_id)]
+                if blocker.reason != "PURCHASED_COMPONENT_SHORTAGE"
+            )
         status = (
             "unavailable" if reasons_by_line[int(line.queue_line_id)]
             else "ready" if now_qty >= open_qty_by_line[int(line.queue_line_id)]

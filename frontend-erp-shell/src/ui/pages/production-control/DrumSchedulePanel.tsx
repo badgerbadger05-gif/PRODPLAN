@@ -16,7 +16,7 @@ const horizonLabels: Record<string, string> = {
   transfer: 'После адресного перемещения',
   kitting: 'После комплектовки',
   committed: 'После подтверждённых поступлений',
-  launch: 'После запуска обеспечения',
+  launch: 'После изготовления недостающих узлов',
 }
 
 const phaseLabels: Record<string, string> = {
@@ -24,7 +24,7 @@ const phaseLabels: Record<string, string> = {
   transfer: 'После перемещения',
   kitting: 'После комплектовки',
   committed: 'После подтверждённого поступления',
-  launch: 'После запуска обеспечения',
+  launch: 'Материалы есть — изготовить узлы',
   blocked: 'Пока не собирается',
   unavailable: 'Недостаточно данных',
   mixed: 'Часть остатка заблокирована',
@@ -64,6 +64,7 @@ const confidenceLabels: Record<string, string> = {
   custody: 'передано участку',
   committed: 'подтверждено документом',
   forecast: 'прогноз при запуске',
+  required: 'нужно выполнить',
 }
 
 const blockerLabels: Record<string, string> = {
@@ -75,6 +76,7 @@ const blockerLabels: Record<string, string> = {
   REPLENISHMENT_MODE_UNAVAILABLE: 'Недоступный способ обеспечения',
   LEAD_TIME_MISSING: 'Не задан срок обеспечения',
   OUTSIDE_DRUM_HORIZON: 'Обеспечение ожидается за горизонтом барабана',
+  PURCHASED_COMPONENT_SHORTAGE: 'Не хватает покупного компонента',
   OUTPUT_WAREHOUSE_MISSING: 'Не задан склад выпуска',
   FROZEN_SPEC_AMBIGUOUS: 'В MRP для узла зафиксировано несколько спецификаций; маршрут неоднозначен',
   TARGET_WAREHOUSE_MISSING: 'Не задан склад точки потребления',
@@ -119,7 +121,7 @@ function blockerSearchValue(blocker: DrumSlot['blocking_manifest'][number]) {
 }
 
 function readinessDateText(slot: DrumEntry) {
-  if (slot.readiness_date) return `готовность ${slot.readiness_date}`
+  if (slot.readiness_date) return `${slot.readiness_phase === 'launch' ? 'материалы на' : 'готовность'} ${slot.readiness_date}`
   const blocker = (slot.blocking_manifest ?? [])[0]
   if (blocker) return `даты нет: ${blockerLabels[blocker.reason] ?? blocker.reason}`
   const reason = (slot.unavailable_reasons ?? [])[0]
@@ -311,7 +313,7 @@ export function DrumSchedulePanel() {
                             <span className="drumTileReadiness">
                               <span className="drumTileToday"><b>Сегодня можно</b> {curveQty(slot, 'now')} из {slot.slot_qty}</span>
                               <span><b>С комплектовкой</b> {curveQty(slot, 'kitting')} из {slot.slot_qty}</span>
-                              <span><b>После запуска</b> {curveQty(slot, 'launch')} из {slot.slot_qty}</span>
+                              <span><b>Изготовить узлы</b> {curveQty(slot, 'launch')} из {slot.slot_qty}</span>
                             </span>
                             {firstBlockerText(slot) && <span className="drumTileFirstBlocker">{firstBlockerText(slot)}</span>}
                             <span className="drumTileDate">{readinessDateText(slot)}</span>
@@ -410,7 +412,9 @@ export function DrumSchedulePanel() {
                 )}
               </div>
               <section className={`drumTodayAnswer ${phaseClasses[activeEntry.readiness_phase] ?? 'gateUnavailable'}`} aria-label="Ответ на текущий день">
-                <strong>Сегодня можно собрать {curveQty(activeEntry, 'now')} из {activeQty}</strong>
+                <strong>{activeEntry.readiness_phase === 'launch'
+                  ? `Материалы есть для ${curveQty(activeEntry, 'launch')} из ${activeQty} — нужно изготовить узлы`
+                  : `Сегодня можно собрать ${curveQty(activeEntry, 'now')} из ${activeQty}`}</strong>
                 {!!activeEntry.blocking_manifest?.length && <span>На остаток не закрыто позиций: {activeEntry.blocking_manifest.length}</span>}
               </section>
               <section className="drumReadinessLadder" aria-label="Лестница готовности">
@@ -445,9 +449,14 @@ export function DrumSchedulePanel() {
                             {(action.source_warehouse_name || action.source_warehouse_ref1c) && ` · ${action.source_warehouse_name || action.source_warehouse_ref1c}`}
                             {(action.destination_warehouse_name || action.destination_warehouse_ref1c) && ` → ${action.destination_warehouse_name || action.destination_warehouse_ref1c}`}
                             {action.resource_id != null && ` · ${action.resource_name || `участок #${action.resource_id}`}`}
-                            {action.available_date ? ` · к ${action.available_date}` : ''}
+                            {action.available_date && action.confidence !== 'required' ? ` · к ${action.available_date}` : ''}
                             {action.confidence && ` · ${confidenceLabels[action.confidence] ?? action.confidence}`}
                           </div>
+                          {['make', 'rework', 'kitting'].includes(action.action_kind) && (
+                            <a href={`#/production-control?view=mechshop&planning_contour=mrp&launch_source=drum_readiness&search=${encodeURIComponent(action.item_article || action.item_code || action.item_name || '')}`}>
+                              Открыть узел в очереди мехцеха
+                            </a>
+                          )}
                         </div>
                       ))}
                     </section>

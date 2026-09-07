@@ -547,7 +547,7 @@ input:focus, select:focus {
 .drumTile.gateTransfer { background: #fef3c7; color: #92400e; }
 .drumTile.gateKitting { background: #ffedd5; color: #9a3412; }
 .drumTile.gateCommitted { background: #dbeafe; color: #1e40af; }
-.drumTile.gateLaunch { background: #ede9fe; color: #5b21b6; }
+.drumTile.gateLaunch { background: #fef3c7; color: #92400e; }
 .drumTile.gateBlocked { background: #fee2e2; color: #991b1b; }
 .drumTile.gateUnavailable { background: #e5e7eb; color: #374151; }
 .drumTile:hover, .drumTile:focus-visible { border-color: #3b82f6; box-shadow: 0 0 0 1px #3b82f6; }
@@ -599,7 +599,7 @@ input:focus, select:focus {
 .drumTodayAnswer.gateTransfer,
 .drumTodayAnswer.gateKitting { border-color: #b7791f; background: #fff8e1; }
 .drumTodayAnswer.gateCommitted,
-.drumTodayAnswer.gateLaunch { border-color: #5145a6; background: #f5f3ff; }
+.drumTodayAnswer.gateLaunch { border-color: #d97706; background: #fffbeb; }
 .drumTodayAnswer.gateBlocked,
 .drumTodayAnswer.gateUnavailable { border-color: #b94444; background: #fff1f1; }
 .drumReadinessLadder { display: grid; gap: 6px; margin-top: 12px; }

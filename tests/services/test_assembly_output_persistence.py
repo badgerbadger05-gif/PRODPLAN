@@ -7,6 +7,7 @@ from app import models
 from app.services.item_ledger.assembly_output_persistence import materialize_assembly_output_allocations
 from app.services.item_ledger.assembly_queue_snapshot import build_assembly_queue_snapshot
 from app.services.item_ledger.drum_schedule_persistence import materialize_drum_schedule
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 
 def _building_generation(db, *, key: str, cutoff):
@@ -996,6 +997,7 @@ def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
                 item_id=component.item_id,
                 warehouse_ref1c="ASSEMBLY",
                 on_hand=Decimal("7"),
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
             ),
         ]
     )
