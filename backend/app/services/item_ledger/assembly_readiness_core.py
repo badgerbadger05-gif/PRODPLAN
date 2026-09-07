@@ -410,21 +410,21 @@ def allocate_readiness_curves(
             open_qty = open_qty_by_line[line_id]
             secured_qty = secured_by_line[line_id]
             residual_qty = _root_q(max(open_qty - secured_qty, Decimal("0")))
-            target = str(line.target_warehouse_ref1c or "").strip()
-            if not target:
-                reasons_by_line[line_id].add("TARGET_WAREHOUSE_MISSING")
-                points_by_line[line_id].append(
-                    ReadinessCurvePoint(horizon, Decimal("0"), None, ())
-                )
-                continue
-            bom_key = int(line.bom_key)
-            root_item_id = int(line.root_item_id)
             if line.unavailable_reasons:
                 reasons_by_line[line_id].update(line.unavailable_reasons)
                 points_by_line[line_id].append(
                     ReadinessCurvePoint(horizon, Decimal("0"), None, ())
                 )
                 continue
+            target = str(line.target_warehouse_ref1c or "").strip()
+            if not target:
+                reasons_by_line[line_id].add("NO_WAREHOUSE_BINDING")
+                points_by_line[line_id].append(
+                    ReadinessCurvePoint(horizon, Decimal("0"), None, ())
+                )
+                continue
+            bom_key = int(line.bom_key)
+            root_item_id = int(line.root_item_id)
             if not graph_rows(
                 bom_key,
                 root_item_id,

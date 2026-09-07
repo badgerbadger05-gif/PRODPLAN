@@ -101,6 +101,42 @@ def test_curve_does_not_promise_unaddressed_stock_from_another_warehouse():
     assert [point.cumulative_qty for point in row.points] == [Decimal("0.000")] * 5
 
 
+def test_curve_preserves_frozen_input_reason_when_target_is_unavailable():
+    [row] = allocate_readiness_curves(
+        (
+            ReadinessCurveLine(
+                1,
+                "001",
+                1,
+                100,
+                Decimal("1"),
+                "",
+                unavailable_reasons=("FROZEN_BOM_NODE_MISSING",),
+            ),
+        ),
+        (),
+        (),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert row.status == "unavailable"
+    assert row.unavailable_reasons == ("FROZEN_BOM_NODE_MISSING",)
+
+
+def test_curve_uses_canonical_route_reason_when_target_has_no_binding():
+    [row] = allocate_readiness_curves(
+        (ReadinessCurveLine(1, "001", 1, 100, Decimal("1"), ""),),
+        (),
+        (),
+        (),
+        as_of=date(2026, 9, 3),
+    )
+
+    assert row.status == "unavailable"
+    assert row.unavailable_reasons == ("NO_WAREHOUSE_BINDING",)
+
+
 def test_curve_does_not_let_blocked_old_line_hoard_shared_supply():
     rows = allocate_readiness_curves(
         (
