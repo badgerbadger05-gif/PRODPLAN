@@ -361,3 +361,35 @@ test('drum shows yellow material feasibility without production orders', async (
   await expect(dialog.getByRole('link', { name: 'Открыть узел в очереди мехцеха' })).toBeVisible()
   await page.screenshot({ path: testInfo.outputPath('drum-material-feasibility.png'), fullPage: true })
 })
+
+test('mechshop keeps drum work visible after MRP execution is closed', async ({ page }) => {
+  const row = {
+    ...orders[0], journal_row_key: 'work-item:501', work_item_id: 501,
+    product_id: null, order_id: null, source: 'mrp', order_source: 'mrp',
+    quantity: 0, remaining_qty: 0, launchable_qty: 0,
+    readiness_required_qty: 4, readiness_need_date: '2026-09-04',
+    launch_source: 'drum_readiness', available_actions: [],
+    selection_disabled_reason: 'Узел нужен барабану; незапущенного остатка MRP нет.',
+  }
+  await page.route('**/api/**', async (route) => {
+    const { pathname } = new URL(route.request().url())
+    if (pathname === '/api/v1/production-control/orders') {
+      await route.fulfill({ json: { rows: [row], total: 1, limit: 100, offset: 0, truth_meta: drumSchedule.truth_meta } })
+      return
+    }
+    if (pathname === '/api/v1/resources/') {
+      await route.fulfill({ json: [] })
+      return
+    }
+    if (pathname.endsWith('/materials')) {
+      await route.fulfill({ json: materials })
+      return
+    }
+    await route.abort('failed')
+  })
+  await page.goto('/#/production-control?view=mechshop&planning_contour=mrp&launch_source=drum_readiness')
+  const hint = page.getByRole('row').filter({ hasText: 'Для сборки: 4' })
+  await expect(hint).toBeVisible()
+  await expect(hint.getByRole('checkbox')).toBeDisabled()
+  await expect(hint).toContainText('Кронштейн опорный')
+})

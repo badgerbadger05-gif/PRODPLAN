@@ -151,6 +151,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
               )}
             </td>
             <td className="numCell">
+              {row.readiness_required_qty != null && (
+                <strong>Для сборки: {qty(row.readiness_required_qty)} {row.unit || ''}</strong>
+              )}
               <OutputFactSummary scope={isProposal ? 'proposal' : 'order'} planned={row.quantity} accepted={row.produced_qty} remaining={row.remaining_qty} available={outputFactsAvailable} compact />
               {isProposal && (
                 <span className="muted">К запуску: {qty(launchQuantity)} {row.unit || ''}</span>

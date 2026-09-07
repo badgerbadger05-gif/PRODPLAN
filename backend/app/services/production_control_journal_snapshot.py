@@ -417,10 +417,12 @@ def _build_rows(
 
     if len(rows) != total:
         raise ValueError("production-control journal builder row count changed during build")
+    readiness_pull = _drum_readiness_pull_by_run_item(db, int(generation.id))
     proposal_rows = list_make_proposals(
         db,
         ledger_generation_id=int(generation.id),
         accepted_run_ids=run_ids,
+        readiness_pull_by_run_item=readiness_pull,
     )
     from app.services.production_control_material_availability import (
         preview_make_work_items_coverage,
@@ -430,7 +432,6 @@ def _build_rows(
         proposal_rows,
         ledger_generation_id=int(generation.id),
     )
-    readiness_pull = _drum_readiness_pull_by_run_item(db, int(generation.id))
     for row in proposal_rows:
         coverage = proposal_coverage.get(int(row["work_item_id"]))
         if coverage is not None:

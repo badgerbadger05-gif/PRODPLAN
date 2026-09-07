@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -1501,6 +1501,7 @@ def list_make_proposals(
     *,
     ledger_generation_id: int,
     accepted_run_ids: Sequence[int],
+    readiness_pull_by_run_item: Mapping[Tuple[int, int], Mapping[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     """Project unmaterialized MAKE work items into the unified journal.
 
@@ -1513,6 +1514,7 @@ def list_make_proposals(
     run_ids = sorted({int(value) for value in accepted_run_ids})
     if not run_ids:
         return []
+    readiness_pull = readiness_pull_by_run_item or {}
 
     query = (
         db.query(ReplenishmentWorkItem)
@@ -1520,7 +1522,10 @@ def list_make_proposals(
             ReplenishmentWorkItem.ledger_generation_id == generation_id,
             ReplenishmentWorkItem.run_id.in_(run_ids),
             ReplenishmentWorkItem.replenishment_method == "make",
-            ReplenishmentWorkItem.replenishment_remaining_qty > 0,
+            or_(
+                ReplenishmentWorkItem.replenishment_remaining_qty > 0,
+                tuple_(ReplenishmentWorkItem.run_id, ReplenishmentWorkItem.item_id).in_(list(readiness_pull)),
+            ),
         )
         .order_by(ReplenishmentWorkItem.run_id.asc(), ReplenishmentWorkItem.id.asc())
     )
@@ -1646,7 +1651,8 @@ def list_make_proposals(
             allowance = shelf_allowance.get(int(work.item_id), 0.0)
             launchable_qty = min(launchable_qty, allowance)
             shelf_allowance[int(work.item_id)] = max(0.0, allowance - launchable_qty)
-        if launchable_qty <= 1e-9:
+        pull = readiness_pull.get((int(work.run_id), int(work.item_id)))
+        if launchable_qty <= 1e-9 and not pull:
             continue
         pair_metadata = pair_by_item.get(int(work.item_id))
         selection_disabled_reason = (
@@ -1654,6 +1660,14 @@ def list_make_proposals(
             if pair_metadata
             else ""
         ) or None
+        if launchable_qty <= 1e-9:
+            # Execution of an old MRP obligation is not proof that the node
+            # still physically exists. Keep the drum's required work visible,
+            # without reopening MRP or offering duplicate executable orders.
+            selection_disabled_reason = (
+                "Узел нужен барабану; незапущенного остатка MRP нет. "
+                "Смотрите количество для сборки и действующие задания."
+            )
         result.append(
             {
                 "journal_row_key": f"work-item:{int(work.id)}",

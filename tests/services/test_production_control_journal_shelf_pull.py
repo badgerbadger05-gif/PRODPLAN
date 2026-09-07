@@ -12,6 +12,7 @@ falls back to `item.optimal_batch` for an item that has a shelf.
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import pytest
 
 from app import models
 from app.services.production_control_journal import (
@@ -400,3 +401,26 @@ def test_launched_work_of_a_retired_run_still_nets_the_new_requirement(db_sessio
     # 8 remaining minus the 3 already in production against the same part.
     assert proposal["materialized_order_qty"] == 3.0
     assert proposal["launchable_qty"] == 5.0
+
+@pytest.mark.parametrize('remaining', [0, 8])
+def test_drum_required_work_stays_visible_when_mrp_or_shelf_has_no_launch(db_session, remaining):
+    generation, run, item, work = _scope(db_session, key=f'drum-work-{remaining}')
+    work.replenishment_remaining_qty = remaining
+    work.replenishment_fulfilled_qty = work.replenishment_required_qty - remaining
+    if remaining:
+        _shelf(db_session, generation=generation, item=item)
+        shelf = db_session.query(models.ShelfProjection).filter_by(ledger_generation_id=generation.id).one()
+        shelf.materialized_qty = 0
+    db_session.flush()
+    assert list_make_proposals(db_session, ledger_generation_id=generation.id,
+                               accepted_run_ids=[run.run_id]) == []
+    [row] = list_make_proposals(
+        db_session, ledger_generation_id=generation.id, accepted_run_ids=[run.run_id],
+        readiness_pull_by_run_item={(run.run_id, item.item_id): {'readiness_required_qty': 4}},
+    )
+    assert row['item_id'] == item.item_id
+    assert row['mrp_req_remaining_qty'] == remaining
+    assert row['launchable_qty'] == 0
+    assert row['available_actions'] == []
+    assert 'Узел нужен барабану' in row['selection_disabled_reason']
+    assert work.replenishment_remaining_qty == remaining
