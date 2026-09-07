@@ -10,6 +10,8 @@
 
 from datetime import datetime
 
+import pytest
+
 from app.models import (
     DefaultSpecification,
     Item,
@@ -213,12 +215,35 @@ def test_chain_route_sheet_is_single_with_two_operation_blocks(db_session):
     assert "Окраска — заказ 1С №1C-PAINT-1" in html
     assert "Сварка каркаса" in html
     assert "Покраска порошковая" in html
-    # состав — от сварной детали (сырьё), а не сама сварная деталь
     assert "Труба стальная 40х40" in html
-    # 2.5 м/ед × 6 шт сварки
     assert "15.000" in html
-    # шапка листа — по окрасочному (родительскому) заказу
     assert "Кронштейн после покраски" in html
+    assert "Кол-во на остаток сварочного заказа" in html
+
+
+@pytest.mark.parametrize("produced", [0, 4, 14])
+def test_chain_material_panel_and_print_use_same_weld_quantity(db_session, produced):
+    from tests.services.test_production_control_journal_snapshot import _building_generation
+    from app.services.production_control_material_availability import preview_materials
+
+    paint, weld, *_ = _setup_chain(db_session)
+    paint.quantity = 26
+    weld.quantity = 14
+    weld.produced_qty = produced
+    weld.remaining_qty = 999  # The compatibility cache is not output truth.
+    db_session.commit()
+    generation = _building_generation(db_session, "unequal-chain-quantities")
+    materials = preview_materials(db_session, paint.product_id, ledger_generation_id=generation.id)
+    welded_materials = preview_materials(db_session, weld.product_id, ledger_generation_id=generation.id)
+    payload = build_route_sheet_snapshot_payloads(db_session, [paint.product_id], ledger_generation_id=generation.id)
+    printed = payload[paint.product_id]["sheet"]["components"]
+    assert materials["qty"] == 26
+    assert [c["required_qty"] for c in materials["components"]] == [c["required_qty"] for c in welded_materials["components"]]
+    assert [c["required_qty"] for c in materials["components"]] == [c["required_qty"] for c in printed if c["required_qty"] > 0]
+    if produced < 14:
+        assert materials["components"][0]["required_qty"] == (14 - produced) * 2.5
+    else:
+        assert materials["components"] == []
 
 
 def test_route_sheet_quantities_ignore_corrupt_remaining_cache(db_session):

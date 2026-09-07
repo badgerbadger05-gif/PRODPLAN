@@ -349,6 +349,36 @@ def _no_network(monkeypatch):
 # Preview (dry-run)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("received, expected", [(26, 0), (20, 6), (0, 26)])
+def test_chain_uses_replenishment_after_frozen_stock(db_session, monkeypatch, received, expected):
+    db = db_session
+    _, _, painted_product = _setup_pair(db, weld_outstanding=26)
+    painted_product.quantity = 40
+    reservation = db.query(models.ReservationEntry).one()
+    reservation.reserved_qty = 40
+    reservation.covered_from_stock_at_freeze_qty = 14
+    reservation.realized_qty = received
+    reservation.replenishment_received_qty = received
+    db.commit()
+    _stub_demo(monkeypatch)
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    preview = open_paint_chain(db, painted_product_id=painted_product.product_id, dry_run=True)
+    assert preview["weld_needed"] is (expected > 0)
+    result = open_paint_chain(db, painted_product_id=painted_product.product_id, dry_run=False)
+    if expected:
+        welded_product = db.query(ProductionProduct).filter_by(order_id=result["welded"]["order_id"]).one()
+        assert welded_product.quantity == expected
+    else:
+        assert result["verdict"] == "stock_covers"
+        assert result["welded"] is None
+        assert db.query(PaintWeldChainLink).count() == 0
+        assert len(fake.posts) == 1
+    assert reservation.reserved_qty == 40
+    assert reservation.covered_from_stock_at_freeze_qty == 14
+
+
 def test_preview_stock_covers_no_weld(db_session, monkeypatch):
     db = db_session
     painted, welded, painted_product = _setup_pair(

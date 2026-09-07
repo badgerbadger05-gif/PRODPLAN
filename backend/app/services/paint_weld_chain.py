@@ -47,6 +47,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from .item_ledger.reservation import replenishment_remaining
+
 from ..models import (
     Item,
     MrpRequirement,
@@ -313,10 +315,10 @@ def _resolve_weld_obligation(
         realized_left -= realized
         open_by_product[int(product.product_id)] = max(quantity - realized, 0.0)
     allocated = sum(open_by_product.values())
-    raw_outstanding = max(
-        _to_float(reservation.reserved_qty) - _to_float(reservation.realized_qty),
-        0.0,
-    )
+    raw_outstanding = float(replenishment_remaining(
+        reservation.replenishment_required_qty,
+        reservation.replenishment_received_qty,
+    ))
     available = max(raw_outstanding - allocated, 0.0)
     open_orders = tuple(
         {

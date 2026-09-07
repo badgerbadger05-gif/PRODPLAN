@@ -401,10 +401,17 @@ def preview_materials(
     if not product:
         raise ValueError("Строка заказа не найдена")
     basis_spec_id, basis_item, custody_product_id = _paint_weld_material_basis(db, product)
+    # A linked executor owns both the material custody and the quantity to
+    # weld. The painted output can be larger because intermediates already
+    # existed when the obligation was frozen.
+    material_product = product
+    if custody_product_id != int(product.product_id):
+        material_product = db.get(ProductionProduct, custody_product_id)
+        basis_spec_id = _default_spec_id(db, material_product)
     frozen_components = (
         _frozen_components_for_product(
             db,
-            product,
+            material_product,
             parent_item_id=int(basis_item.item_id),
         )
         if basis_item is not None
@@ -412,7 +419,7 @@ def preview_materials(
     )
     spec_id, components = _components_for_product(
         db,
-        product,
+        material_product,
         spec_id_override=basis_spec_id,
     )
     if frozen_components is not None:

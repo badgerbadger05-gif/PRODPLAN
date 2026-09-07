@@ -1031,7 +1031,7 @@ def _render_route_sheets_html_from_payloads(
                 <tr><td colspan="10" class="material-signoff"><b>Материал выдан:</b> дата __________ подпись __________</td></tr>
                 <tr><td colspan="10" class="material-signoff"><b>Материал получен:</b> дата __________ подпись __________</td></tr>
                 <tr><td colspan="10"><b>Материалы и заготовки</b></td></tr>
-                <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="6">Кол-во по заказу</th></tr>
+                <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="6">{'Кол-во на остаток сварочного заказа' if chain else 'Кол-во на остаток заказа'}</th></tr>
                 {component_rows}
                 <tr><th>№</th><th>Цех / участок</th><th colspan="2">Операция</th><th>Трудоемкость</th><th>Исполнитель</th><th>Предъявлено</th><th>Несоотв.</th><th>Годн.</th><th>ОТК</th></tr>
                 {op_rows}
