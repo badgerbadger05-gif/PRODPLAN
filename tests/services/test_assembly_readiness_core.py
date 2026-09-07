@@ -23,6 +23,28 @@ def _line(line_id: int, sort_key: str, qty: str, *norms: tuple[int, str]):
     )
 
 
+def test_routed_physical_rework_stock_covers_transfer_once_before_new_launch():
+    rows = allocate_readiness_curves(
+        tuple(ReadinessCurveLine(i, str(i), 1, 100, Decimal("1"), "assembly")
+              for i in (1, 2)),
+        (FrozenBomEdge(1, 100, 10, Decimal("1")),),
+        (ReadinessSupply(
+            "stock-10", 10, Decimal("1"), "now", "store",
+            source_kind="physical_stock",
+            routable_destination_warehouse_refs=("assembly",),
+        ),),
+        (ReplenishmentPolicy(1, 10, "rework",
+                             unavailable_reason="REWORK_ROUTE_UNAVAILABLE"),),
+        as_of=date(2026, 9, 7),
+    )
+    assert rows[0].points[0].cumulative_qty == 0
+    assert rows[0].points[1].cumulative_qty == 1
+    assert rows[0].points[1].actions[0].action_kind == "transfer"
+    assert rows[0].points[1].actions[0].source_warehouse_ref1c == "store"
+    assert rows[0].points[1].actions[0].destination_warehouse_ref1c == "assembly"
+    assert rows[1].points[-1].cumulative_qty == 0
+
+
 def test_blocked_old_line_does_not_hoard_stock_needed_by_ready_younger_line():
     rows = allocate_assembly_readiness(
         (

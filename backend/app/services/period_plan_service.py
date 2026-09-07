@@ -3797,10 +3797,25 @@ def build_period_plan_execution_snapshot(
         .filter(MrpRunRoot.run_id == int(run.run_id))
         .scalar()
     )
-    if run.prior_run_id is not None and run_root_accepted <= 1e-9:
+    has_replenishment_execution = (
+        db.query(ReservationEntry.id)
+        .filter(
+            ReservationEntry.ledger_generation_id == int(generation_id),
+            ReservationEntry.run_id == int(run.run_id),
+            ReservationEntry.replenishment_received_qty > 0,
+        )
+        .first()
+        is not None
+    )
+    if (
+        run.prior_run_id is not None
+        and run_root_accepted <= 1e-9
+        and not has_replenishment_execution
+    ):
         # A replacement MRP has no execution history of its own at birth.  Its
         # requirements remain visible in the MRP result, while this journal
-        # intentionally stays empty until the first accepted root output.
+        # stays empty until its own accepted execution. Component receipts
+        # execute replenishment before a finished root can be assembled.
         rows = []
     else:
         rows, _meta = _build_execution_snapshot_rows(

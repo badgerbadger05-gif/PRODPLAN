@@ -1,7 +1,9 @@
 from datetime import date, datetime
 from decimal import Decimal
+import pytest
 
 from app import models
+from app.services.mrp_stock_helpers import DEFAULT_ORGANIZATION_REF1C
 from app.services.item_ledger.assembly_readiness_persistence import (
     _curve_inputs,
     _physical_supplies,
@@ -86,6 +88,45 @@ def _queue_scope(db):
     db.add(queue)
     db.flush()
     return queue, run, root, child
+
+
+@pytest.mark.parametrize("multiple_sources", [False, True])
+def test_stock_transfer_uses_issue_source_selection_and_frozen_destination(
+    db_session, multiple_sources,
+):
+    queue, run, root, child = _queue_scope(db_session)
+    generation = db_session.get(models.LedgerGeneration, queue.ledger_generation_id)
+    db_session.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=generation.id, cutoff=generation.cutoff,
+        status="complete", is_baseline=True, source_event_high_watermark_id=0,
+    ))
+    db_session.add_all([
+        models.MrpFreezeComponent(
+            run_id=run.run_id, freeze_version=2, root_item_id=root.item_id,
+            parent_item_id=root.item_id, component_item_id=child.item_id,
+            spec_ref="ROOT", norm_qty_per_unit=1, unit_coef=1,
+        ),
+        models.MrpFreezeBomNode(
+            run_id=run.run_id, freeze_version=2, root_item_id=root.item_id,
+            item_id=root.item_id, spec_ref="ROOT", replenishment_mode="make",
+            material_warehouse_ref1c="ASSEMBLY", output_warehouse_ref1c="FINISHED",
+        ),
+    ])
+    for warehouse in ("STORE", "SECOND") if multiple_sources else ("STORE",):
+        db_session.add(models.StockWarehouse(
+            warehouse_ref1c=warehouse, warehouse_name=warehouse,
+            is_selected=True, is_finished_goods=False,
+        ))
+        db_session.add(models.StockBin(
+            ledger_generation_id=generation.id, item_id=child.item_id,
+            warehouse_ref1c=warehouse, on_hand=3,
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        ))
+    db_session.flush()
+    supplies = _physical_supplies(db_session, generation.id, [queue])
+    assert supplies
+    for supply in supplies:
+        assert supply.routable_destination_warehouse_refs == ("ASSEMBLY",)
 
 
 def test_curve_inputs_use_only_frozen_branch_and_distinct_warehouse_roles(db_session):

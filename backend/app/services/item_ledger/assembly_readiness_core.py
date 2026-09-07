@@ -72,6 +72,7 @@ class ReadinessSupply:
     custody_owner_item_id: int | None = None
     source_kind: str = ""
     source_ref: str = ""
+    routable_destination_warehouse_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -566,6 +567,7 @@ def allocate_readiness_curves(
                                     or ""
                                 )
                                 != destination
+                                and destination not in source.routable_destination_warehouse_refs
                             ):
                                 continue
                         available = pool.get(source.source_key, Decimal("0"))

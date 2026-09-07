@@ -627,7 +627,10 @@ def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db
     assert row["execution_generation_id"] == generation_id
 
 
-def test_replacement_mrp_starts_at_zero_of_saved_remainder_with_empty_journal(db_session):
+@pytest.mark.parametrize("received_qty", [0, 1])
+def test_replacement_mrp_journal_exposes_own_receipts_before_root_output(
+    db_session, received_qty,
+):
     item = _make_purchased_item(db_session, "REPLACEMENT-JOURNAL")
     plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=12.0)
     line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
@@ -662,6 +665,31 @@ def test_replacement_mrp_starts_at_zero_of_saved_remainder_with_empty_journal(db
     ))
     db_session.flush()
 
+    requirement = MrpRequirement(
+        run_id=replacement.run_id,
+        item_id=item.item_id,
+        total_required_qty=2,
+        net_required_qty=2,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=generation_id,
+        run_id=replacement.run_id,
+        requirement_id=requirement.id,
+        item_id=item.item_id,
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="buy",
+        reserved_qty=2,
+        replenishment_required_qty=2,
+        replenishment_received_qty=received_qty,
+    ))
+    db_session.flush()
+
     payload = build_period_plan_execution_snapshot(
         db_session,
         plan.id,
@@ -669,7 +697,12 @@ def test_replacement_mrp_starts_at_zero_of_saved_remainder_with_empty_journal(db
         generation_id=generation_id,
     )
 
-    assert payload["rows"] == []
+    if received_qty:
+        assert len(payload["rows"]) == 1
+        assert payload["rows"][0]["completed_qty"] == received_qty
+        assert payload["rows"][0]["remaining_qty"] == 1
+    else:
+        assert payload["rows"] == []
     assert payload["summary"]["execution_completed_qty"] == 0
     assert payload["summary"]["execution_base_qty"] == 2
     assert payload["summary"]["execution_pct"] == 0

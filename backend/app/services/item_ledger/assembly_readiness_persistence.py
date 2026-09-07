@@ -19,6 +19,7 @@ from app.services.mrp_stock_helpers import (
 from app.services.production_material_custody_projection import (
     load_material_custody_projection,
 )
+from app.services.production_control_material_issues import _source_warehouse_options
 
 from .assembly_queue_snapshot import materialize_assembly_queue_lines
 from .assembly_readiness_core import (
@@ -31,7 +32,7 @@ from .assembly_readiness_core import (
 
 
 STAGE = "assembly_readiness"
-ALGORITHM_VERSION = "assembly-readiness/9-master-card-labels"
+ALGORITHM_VERSION = "assembly-readiness/10-addressed-stock-transfers"
 
 
 def _d(value: Any) -> Decimal:
@@ -63,6 +64,34 @@ def _physical_supplies(
         warehouse_column=models.StockBin.warehouse_ref1c,
         organization_column=models.StockBin.organization_ref,
     )
+    # Use the same eligible source candidates as material issuing. Readiness
+    # proposes addressed transfers; it does not issue documents or require an
+    # operator to pick one warehouse before showing that material is available.
+    # The destination belongs to the frozen consuming node.
+    run_ids = sorted({int(row.planning_run_id) for row in queue_rows})
+    consuming_nodes = (
+        db.query(models.MrpFreezeComponent.component_item_id,
+                 models.MrpFreezeBomNode.material_warehouse_ref1c)
+        .join(models.PlanningRun,
+              models.PlanningRun.run_id == models.MrpFreezeComponent.run_id)
+        .join(models.MrpFreezeBomNode,
+              (models.MrpFreezeBomNode.run_id == models.MrpFreezeComponent.run_id)
+              & (models.MrpFreezeBomNode.freeze_version == models.MrpFreezeComponent.freeze_version)
+              & (models.MrpFreezeBomNode.root_item_id == models.MrpFreezeComponent.root_item_id)
+              & (models.MrpFreezeBomNode.item_id == models.MrpFreezeComponent.parent_item_id)
+              & (models.MrpFreezeBomNode.spec_ref == models.MrpFreezeComponent.spec_ref))
+        .filter(models.MrpFreezeComponent.run_id.in_(run_ids or [0]),
+                models.MrpFreezeComponent.freeze_version == models.PlanningRun.active_freeze_version)
+        .distinct()
+        .all()
+    )
+    destinations_by_item: dict[int, set[str]] = {}
+    for item_id, destination in consuming_nodes:
+        if destination:
+            destinations_by_item.setdefault(int(item_id), set()).add(str(destination))
+    source_options = _source_warehouse_options(
+        db, sorted(destinations_by_item), ledger_generation_id=int(generation_id),
+    )
     result: list[ReadinessSupply] = []
     for item_id, warehouse_ref, physical_qty in query.group_by(
         models.StockBin.item_id, models.StockBin.warehouse_ref1c
@@ -85,6 +114,14 @@ def _physical_supplies(
                 confidence="physical",
                 source_kind="physical_stock",
                 source_ref=warehouse,
+                routable_destination_warehouse_refs=tuple(sorted(
+                    destination
+                    for destination in destinations_by_item.get(int(item_id), ())
+                    if warehouse != destination and warehouse in {
+                        str(option["ref1c"])
+                        for option in source_options.get(int(item_id), ())
+                    }
+                )),
             )
         )
 
