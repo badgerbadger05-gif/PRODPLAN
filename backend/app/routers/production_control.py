@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from typing import Annotated, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
@@ -485,7 +486,7 @@ def get_assembly_queue(
             ),
         )
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     if snapshot is None:
         readiness = planning_truth.get_truth_state(db)
         raise HTTPException(
@@ -533,7 +534,7 @@ def get_assembly_readiness(
             ),
         )
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
 
     query = (
         db.query(models.AssemblyReadiness, models.AssemblyQueueLine, models.AssemblyRate)
@@ -624,7 +625,7 @@ def get_drum_schedule(
             ),
         )
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     schedule = (
         db.query(models.DrumSchedule)
         .filter(models.DrumSchedule.ledger_generation_id == truth.generation_id)
@@ -965,7 +966,7 @@ def post_move_drum_slot(
         )
         return DrumSlotMoveResponse.model_validate(result)
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -990,7 +991,7 @@ def get_shelf_projections(
             ),
         )
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     query = db.query(models.ShelfProjection).filter(
         models.ShelfProjection.ledger_generation_id == truth.generation_id
     )
@@ -1431,9 +1432,9 @@ def list_root_products(
         options = list_root_product_options(db)
         return {"rows": options, "total": len(options)}
     except ProductionControlJournalSnapshotUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1486,9 +1487,9 @@ def get_orders_journal(
         journal["truth_meta"] = build_truth_meta(truth).model_dump()
         return journal
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except ProductionControlJournalSnapshotUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1523,7 +1524,7 @@ def patch_order_line_quantity(
             initiated_by=payload.initiated_by,
         )
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1548,7 +1549,7 @@ def get_order_line_materials(
     try:
         return get_materials_snapshot(db, int(product_id))
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except MaterialCoverageSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
     except ValueError as e:
@@ -1626,7 +1627,7 @@ def get_work_item_materials(
     except HTTPException:
         raise
     except planning_truth.PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

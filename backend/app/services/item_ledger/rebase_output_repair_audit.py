@@ -60,6 +60,26 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _fixed_boundary_utc(value: datetime, eligible_from: datetime) -> datetime:
+    """Compare legacy TIMESTAMP fixation with its timezone-aware projection.
+
+    ``production_plan_header.fixed_at`` is a legacy timestamp without timezone,
+    while ``assembly_queue_line.eligible_from`` is timezone-aware. PostgreSQL
+    projects the former into the session timezone when it is copied to the
+    latter. Treating the legacy wall clock as UTC shifts the same instant by
+    three hours on the Moscow stack and falsely reports that a queue line
+    predates its own plan fixation.
+    """
+
+    if (
+        (value.tzinfo is None or value.utcoffset() is None)
+        and eligible_from.tzinfo is not None
+        and eligible_from.utcoffset() is not None
+    ):
+        value = value.replace(tzinfo=eligible_from.tzinfo)
+    return _utc(value)
+
+
 def _hash(payload: Any) -> str:
     encoded = json.dumps(
         payload,
@@ -154,7 +174,7 @@ def _corrected_candidates(db: Session, candidates):
                 f"replacement plan_id={int(plan.id)} lacks immutable fixed_at"
             )
         current_boundary = _utc(candidate.eligible_from)
-        original_boundary = _utc(plan.fixed_at)
+        original_boundary = _fixed_boundary_utc(plan.fixed_at, candidate.eligible_from)
         if current_boundary < original_boundary:
             raise RebaseOutputRepairAuditError(
                 f"replacement plan_line_id={int(candidate.plan_line_id)} predates plan fixation"

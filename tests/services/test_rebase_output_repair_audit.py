@@ -10,6 +10,7 @@ from app.services.item_ledger.assembly_output_persistence import (
 )
 from app.services.item_ledger.rebase_output_repair_audit import (
     RebaseOutputRepairAuditError,
+    _fixed_boundary_utc,
     apply_rebase_output_repair,
     audit_rebase_output_repair,
 )
@@ -213,6 +214,15 @@ def test_audit_recovers_only_the_rebase_boundary_delta_and_is_read_only(db_sessi
     }
     assert after == before
     assert db_session.get(models.ProductionPlanLine, int(line.id)).remaining_output_qty == Decimal("5")
+
+
+def test_legacy_fixation_wall_clock_matches_aware_queue_boundary():
+    moscow = timezone(timedelta(hours=3))
+
+    assert _fixed_boundary_utc(
+        datetime(2026, 6, 2, 11, 12, 50),
+        datetime(2026, 6, 2, 11, 12, 50, tzinfo=moscow),
+    ) == datetime(2026, 6, 2, 8, 12, 50, tzinfo=timezone.utc)
 
 
 def test_audit_fails_closed_without_assembly_output_capability(db_session):

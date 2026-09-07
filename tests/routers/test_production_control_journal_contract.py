@@ -1,5 +1,7 @@
 """OpenAPI contract for the unified production journal."""
 
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from app.database import get_db
@@ -189,7 +191,7 @@ def test_get_order_line_materials_returns_503_when_future_supply_capability_miss
         ready=True,
         ledger_generation=1,
         generation_key="test",
-        cutoff=None,
+        cutoff=datetime(2026, 9, 7, 5, 32, 21, tzinfo=timezone.utc),
         source_watermarks={},
         capabilities={
             "physical_ledger": True,
@@ -198,7 +200,7 @@ def test_get_order_line_materials_returns_503_when_future_supply_capability_miss
         algorithm_version="test",
         replay_version="test",
         reason="Accepted Ledger generation lacks capabilities: future_supply",
-        accepted_at=None,
+        accepted_at=datetime(2026, 9, 7, 5, 33, tzinfo=timezone.utc),
     )
 
     def _materials_unavailable(*_args, **_kwargs):
@@ -218,3 +220,4 @@ def test_get_order_line_materials_returns_503_when_future_supply_capability_miss
     assert response.status_code == 503
     payload = response.json()
     assert payload["detail"]["code"] == "planning_truth_unavailable"
+    assert payload["detail"]["cutoff"] == "2026-09-07T05:32:21+00:00"
