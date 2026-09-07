@@ -464,7 +464,8 @@ def test_candidate_snapshot_contains_unmaterialized_make_proposal(db_session):
 
 
 @pytest.mark.parametrize("root_copies", [1, 2, 3])
-def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_session, root_copies):
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_session, root_copies, ambiguous):
     generation = _building_generation(db_session, "production-journal-paint-weld")
     run, painted_work = _make_proposal(db_session, generation)
     painted_item = db_session.get(models.Item, int(painted_work.item_id))
@@ -516,6 +517,15 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
             component_item_id=int(raw_item.item_id),
             spec_ref="frozen-weld-spec", spec_version="v1",
             norm_qty_per_unit=2, unit_coef=1,
+        ))
+    if ambiguous:
+        db_session.add(models.MrpFreezeComponent(
+            run_id=int(run.run_id), freeze_version=1,
+            root_item_id=int(raw_item.item_id),
+            parent_item_id=int(welded_item.item_id),
+            component_item_id=int(raw_item.item_id),
+            spec_ref="other-weld-spec", spec_version="v2",
+            norm_qty_per_unit=3, unit_coef=1,
         ))
     warehouse = models.StockWarehouse(
         warehouse_ref1c="paint-weld-stock",
@@ -596,8 +606,13 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
     )
     assert materials["coverage_basis"] == "welded_bom"
     assert materials["coverage_basis_item_id"] == welded_item.item_id
-    assert [row["component_item_id"] for row in materials["components"]] == [raw_item.item_id]
-    assert materials["components"][0]["required_qty"] == 20
+    if ambiguous:
+        assert materials["components"] == []
+        assert materials["coverage_status"] == "unavailable"
+        assert materials["coverage_label"] == "Неоднозначная спецификация"
+    else:
+        assert [row["component_item_id"] for row in materials["components"]] == [raw_item.item_id]
+        assert materials["components"][0]["required_qty"] == 20
 
     snapshot = build_candidate_snapshot(
         db_session,
@@ -610,7 +625,7 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
     }
     painted_row = rows[f"work-item:{painted_work.id}"]
     welded_row = rows[f"work-item:{welded_work.id}"]
-    assert painted_row["coverage_status"] == "ready"
+    assert painted_row["coverage_status"] == ("unavailable" if ambiguous else "ready")
     assert painted_row["paint_weld_pair"]["role"] == "painted"
     assert painted_row["paint_weld_pair"]["counterpart_item_id"] == welded_item.item_id
     assert welded_row["paint_weld_pair"]["role"] == "welded"

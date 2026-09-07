@@ -102,6 +102,10 @@ def _components_for_product(
     return spec_id, components
 
 
+class AmbiguousFrozenMaterialBom(ValueError):
+    pass
+
+
 def _unique_frozen_components(rows: Sequence[MrpFreezeComponent]) -> List[MrpFreezeComponent]:
     """Read one per-unit BOM, rather than its copies under every plan root."""
     unique: Dict[tuple, MrpFreezeComponent] = {}
@@ -115,7 +119,7 @@ def _unique_frozen_components(rows: Sequence[MrpFreezeComponent]) -> List[MrpFre
             "norm_qty_per_unit", "unit_coef",
         ))
         if key in signatures and signatures[key] != signature:
-            raise ValueError("Frozen material BOM is ambiguous across plan roots")
+            raise AmbiguousFrozenMaterialBom("Frozen material BOM is ambiguous across plan roots")
         signatures[key] = signature
         unique.setdefault(key, row)
     return list(unique.values())
@@ -429,15 +433,17 @@ def preview_materials(
     if custody_product_id != int(product.product_id):
         material_product = db.get(ProductionProduct, custody_product_id)
         basis_spec_id = _default_spec_id(db, material_product)
-    frozen_components = (
-        _frozen_components_for_product(
-            db,
-            material_product,
-            parent_item_id=int(basis_item.item_id),
+    ambiguous_bom = False
+    try:
+        frozen_components = (
+            _frozen_components_for_product(
+                db, material_product, parent_item_id=int(basis_item.item_id),
+            )
+            if basis_item is not None else None
         )
-        if basis_item is not None
-        else None
-    )
+    except AmbiguousFrozenMaterialBom:
+        ambiguous_bom = True
+        frozen_components = []
     spec_id, components = _components_for_product(
         db,
         material_product,
@@ -539,7 +545,7 @@ def preview_materials(
                 for eta in etas
             ]
 
-    order_coverage = _aggregate_coverage([str(c["coverage"]) for c in components])
+    order_coverage = "unavailable" if ambiguous_bom else _aggregate_coverage([str(c["coverage"]) for c in components])
 
     payload = {
         "ledger_generation_id": ledger_generation_id,
@@ -563,7 +569,7 @@ def preview_materials(
         "components": components,
         "coverage": order_coverage,
         "coverage_status": order_coverage,
-        "coverage_label": _ui_coverage_label(order_coverage),
+        "coverage_label": "Неоднозначная спецификация" if ambiguous_bom else _ui_coverage_label(order_coverage),
         "coverage_basis": "welded_bom" if basis_item is not None else "direct_bom",
         "coverage_basis_item_id": int(basis_item.item_id) if basis_item is not None else int(product.item_id),
         "coverage_basis_item_name": str(basis_item.item_name or "") if basis_item is not None else str(product.item.item_name or ""),
@@ -662,6 +668,7 @@ def preview_make_work_items_coverage(
     }
     welded_parent_ids = sorted(set(welded_by_painted.values()))
     frozen_norms: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
+    ambiguous_boms: set[Tuple[int, int]] = set()
     if proposal_run_ids and welded_parent_ids:
         frozen_rows = (
             db.query(MrpFreezeComponent)
@@ -672,10 +679,17 @@ def preview_make_work_items_coverage(
             .order_by(MrpFreezeComponent.id.asc())
             .all()
         )
-        for frozen in _unique_frozen_components([
-            row for row in frozen_rows
-            if freeze_by_run.get(int(row.run_id)) == int(row.freeze_version)
-        ]):
+        grouped: Dict[Tuple[int, int], List[MrpFreezeComponent]] = {}
+        for row in frozen_rows:
+            if freeze_by_run.get(int(row.run_id)) == int(row.freeze_version):
+                grouped.setdefault((int(row.run_id), int(row.parent_item_id)), []).append(row)
+        resolved = []
+        for key, group in grouped.items():
+            try:
+                resolved.extend(_unique_frozen_components(group))
+            except AmbiguousFrozenMaterialBom:
+                ambiguous_boms.add(key)
+        for frozen in resolved:
             frozen_norms.setdefault(
                 (int(frozen.run_id), int(frozen.parent_item_id)), []
             ).append(
@@ -737,6 +751,12 @@ def preview_make_work_items_coverage(
         quantity = _to_float_strict(row.get("quantity"), field="proposal.quantity")
         welded_item_id = welded_by_painted.get(int(row["item_id"]))
         run_id = int(row["source_run_id"]) if row.get("source_run_id") is not None else None
+        if (run_id, welded_item_id) in ambiguous_boms:
+            result[int(row["work_item_id"])] = {
+                "coverage_status": "unavailable",
+                "coverage_label": "Неоднозначная спецификация",
+            }
+            continue
         component_norms = (
             frozen_norms.get((run_id, welded_item_id), [])
             if run_id is not None and welded_item_id is not None
