@@ -53,6 +53,21 @@ def test_public_journal_row_strips_internal_material_snapshot():
     assert "_route_sheet_snapshot" in source
 
 
+@pytest.mark.parametrize("changed_field, changed_value", [
+    ("norm_qty_per_unit", 3),
+    ("unit_coef", 2),
+    ("spec_version", "other-revision"),
+])
+def test_material_bom_does_not_hide_conflicting_root_copies(changed_field, changed_value):
+    values = dict(run_id=1, freeze_version=1, parent_item_id=10,
+                  component_item_id=20, spec_ref="weld", spec_version="v1",
+                  norm_qty_per_unit=2, unit_coef=1)
+    first = models.MrpFreezeComponent(root_item_id=100, **values)
+    second = models.MrpFreezeComponent(root_item_id=200, **{**values, changed_field: changed_value})
+    with pytest.raises(ValueError, match="ambiguous across plan roots"):
+        material_availability._unique_frozen_components([first, second])
+
+
 @pytest.mark.parametrize("action_kind", ["make", "rework", "kitting"])
 def test_drum_make_manifest_becomes_run_scoped_mechshop_pull(db_session, action_kind):
     generation = _building_generation(db_session, "journal-readiness-pull")
@@ -448,7 +463,8 @@ def test_candidate_snapshot_contains_unmaterialized_make_proposal(db_session):
     assert db_session.query(models.ProductionOrder).count() == 0
 
 
-def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_session):
+@pytest.mark.parametrize("root_copies", [1, 2, 3])
+def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_session, root_copies):
     generation = _building_generation(db_session, "production-journal-paint-weld")
     run, painted_work = _make_proposal(db_session, generation)
     painted_item = db_session.get(models.Item, int(painted_work.item_id))
@@ -490,6 +506,17 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
             unit_coef=1,
         )
     )
+    # The same welded assembly belongs to several root products. Each root
+    # stores its own copy of the per-unit BOM, not an additional raw material.
+    for root_item in [painted_item, welded_item][:root_copies - 1]:
+        db_session.add(models.MrpFreezeComponent(
+            run_id=int(run.run_id), freeze_version=1,
+            root_item_id=int(root_item.item_id),
+            parent_item_id=int(welded_item.item_id),
+            component_item_id=int(raw_item.item_id),
+            spec_ref="frozen-weld-spec", spec_version="v1",
+            norm_qty_per_unit=2, unit_coef=1,
+        ))
     warehouse = models.StockWarehouse(
         warehouse_ref1c="paint-weld-stock",
         warehouse_code="PWS",

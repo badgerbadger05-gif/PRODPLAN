@@ -102,6 +102,25 @@ def _components_for_product(
     return spec_id, components
 
 
+def _unique_frozen_components(rows: Sequence[MrpFreezeComponent]) -> List[MrpFreezeComponent]:
+    """Read one per-unit BOM, rather than its copies under every plan root."""
+    unique: Dict[tuple, MrpFreezeComponent] = {}
+    signatures: Dict[tuple, tuple] = {}
+    for row in rows:
+        key = (row.run_id, row.freeze_version, row.parent_item_id, row.component_item_id)
+        signature = tuple(getattr(row, field) for field in (
+            "spec_ref", "spec_version", "child_spec_ref", "child_spec_version",
+            "parent_characteristic_ref", "parent_organization_ref", "parent_planning_stock_pool",
+            "component_characteristic_ref", "component_organization_ref", "component_planning_stock_pool",
+            "norm_qty_per_unit", "unit_coef",
+        ))
+        if key in signatures and signatures[key] != signature:
+            raise ValueError("Frozen material BOM is ambiguous across plan roots")
+        signatures[key] = signature
+        unique.setdefault(key, row)
+    return list(unique.values())
+
+
 def _frozen_components_for_product(
     db: Session,
     product: ProductionProduct,
@@ -131,7 +150,9 @@ def _frozen_components_for_product(
         field="production_output.remaining_qty",
     )
     components: List[Dict[str, Any]] = []
-    for frozen, item in rows:
+    items_by_id = {int(item.item_id): item for _, item in rows}
+    for frozen in _unique_frozen_components([frozen for frozen, _ in rows]):
+        item = items_by_id[int(frozen.component_item_id)]
         qty_per_unit = _to_float_strict(
             frozen.norm_qty_per_unit,
             field="mrp_freeze_component.norm_qty_per_unit",
@@ -642,7 +663,7 @@ def preview_make_work_items_coverage(
     welded_parent_ids = sorted(set(welded_by_painted.values()))
     frozen_norms: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
     if proposal_run_ids and welded_parent_ids:
-        for frozen in (
+        frozen_rows = (
             db.query(MrpFreezeComponent)
             .filter(
                 MrpFreezeComponent.run_id.in_(proposal_run_ids),
@@ -650,9 +671,11 @@ def preview_make_work_items_coverage(
             )
             .order_by(MrpFreezeComponent.id.asc())
             .all()
-        ):
-            if freeze_by_run.get(int(frozen.run_id)) != int(frozen.freeze_version):
-                continue
+        )
+        for frozen in _unique_frozen_components([
+            row for row in frozen_rows
+            if freeze_by_run.get(int(row.run_id)) == int(row.freeze_version)
+        ]):
             frozen_norms.setdefault(
                 (int(frozen.run_id), int(frozen.parent_item_id)), []
             ).append(
