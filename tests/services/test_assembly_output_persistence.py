@@ -23,6 +23,7 @@ def _building_generation(db, *, key: str, cutoff):
     generation = models.LedgerGeneration(
         generation_key=f"assembly-output-generation-{key}",
         status="building",
+        created_at=cutoff,
         cutoff=cutoff,
         capabilities={},
         source_watermarks={},

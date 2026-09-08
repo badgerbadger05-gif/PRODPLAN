@@ -628,3 +628,16 @@ def test_item_optimal_batch_owns_drum_rate_not_legacy_value(db_session, batch, e
     else:
         assert rates[item.item_id][0].qty_per_capacity == expected
         assert rates[item.item_id][0].qty_per_capacity * capacities[resource.resource_id] == 6
+
+
+@pytest.mark.parametrize("created, expected", [
+    ("2026-09-08T07:00:00+00:00", date(2026, 9, 8)),
+    ("2026-09-07T21:30:00+00:00", date(2026, 9, 8)),
+    ("2026-09-08T00:30:00", date(2026, 9, 8)),
+])
+def test_calendar_uses_new_build_day_in_moscow_with_old_ledger_cutoff(created, expected):
+    from datetime import datetime
+    from app.services.item_ledger.drum_schedule_persistence import _planning_start
+    generation = SimpleNamespace(cutoff=datetime.fromisoformat("2026-09-07T10:29:01+00:00"),
+                                 created_at=datetime.fromisoformat(created))
+    assert _planning_start(generation) == expected

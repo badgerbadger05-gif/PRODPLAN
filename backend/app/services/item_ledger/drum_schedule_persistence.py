@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -24,7 +25,7 @@ from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
 STAGE = "drum_schedule"
-ALGORITHM_VERSION = "drum-schedule/12-optimal-batch-blocked-tiles"
+ALGORITHM_VERSION = "drum-schedule/13-build-day-calendar"
 
 
 def _d(value: Any) -> Decimal:
@@ -166,6 +167,17 @@ def _rates_and_capacity(
     return normalized, capacity, horizon, horizon_by_resource
 
 
+def _planning_start(generation: models.LedgerGeneration) -> date:
+    # The fact cutoff and the calendar epoch are independent. A retained-plan
+    # refresh keeps yesterday's physical facts but starts a new calendar today.
+    # Persisted generation creation time makes retries deterministic.
+    def moscow_day(value: datetime) -> date:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(ZoneInfo("Europe/Moscow")).date()
+    return max(moscow_day(generation.cutoff), moscow_day(generation.created_at))
+
+
 def _plan(
     db: Session,
     generation: models.LedgerGeneration,
@@ -184,7 +196,7 @@ def _plan(
         raise ValueError("assembly readiness does not cover the open assembly queue")
     scheduled_rows = [row for row in queue_rows if int(row.item_id) in rates]
     excluded_rows = [row for row in queue_rows if int(row.item_id) not in rates]
-    schedule_from = generation.cutoff.date()
+    schedule_from = _planning_start(generation)
     schedule_to = schedule_from + timedelta(days=horizon - 1)
     resource_horizon_end = {
         resource_id: schedule_from + timedelta(days=days - 1)

@@ -46,6 +46,7 @@ def _contour(db, *, key: str, active_freeze_version: int):
     generation = models.LedgerGeneration(
         generation_key=f"shelf-generation-{key}",
         status="building",
+        created_at=CUTOFF,
         cutoff=CUTOFF,
         capabilities={},
         source_watermarks={},
