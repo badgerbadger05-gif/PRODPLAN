@@ -1202,3 +1202,103 @@ def test_fold_orders_an_issue_line_by_causality_across_a_clock_skew(db_session):
     custody = state.for_product(int(product.product_id))
     assert custody.in_transit == {}
     assert custody.at_workshop[int(component.item_id)] == pytest.approx(32.936)
+
+@pytest.mark.parametrize("terminal", ["done", "deleted", "active", "produced", "future", "unknown_time", "same_cutoff", "consumed", "returned", "transit"])
+def test_terminal_custody_release_is_published_only_at_new_cutoff(db_session, terminal):
+    from app.services.production_control_common import DONE_STATE_KEY
+    base = _generation(db_session, key=f"terminal-base-{terminal}", cutoff=datetime(2026, 7, 7))
+    product, _, component = _product(db_session, item_code=f"TERM-{terminal}")
+    manifest = _manifest(db_session, generation_id=base.id, source_event_high_watermark_id=0)
+    manifest.is_baseline = True
+    _seed_projection(db_session, generation_id=base.id, product_id=product.product_id,
+                     component_id=component.item_id, qty=144, source_event_high_watermark_id=0)
+    order = db_session.get(ProductionOrder, product.order_id)
+    order.order_state_key = DONE_STATE_KEY if terminal not in {"active", "produced"} else None
+    order.deletion_mark = terminal == "deleted"
+    if terminal == "deleted":
+        order.order_state_key = None
+    order.updated_at = datetime(2026, 7, 6)
+    if terminal == "future":
+        order.updated_at = datetime(2026, 7, 9)
+    if terminal == "unknown_time":
+        order.updated_at = None
+    if terminal == "produced":
+        product.produced_qty = product.quantity
+        product.remaining_qty = 0
+        product.control_state.status = "produced"
+    target = LedgerGeneration(
+        generation_key=f"terminal-target-{terminal}", status="building",
+        cutoff=base.cutoff if terminal == "same_cutoff" else datetime(2026, 7, 8),
+        source_watermarks={"parent_generation_id": base.id}, physical_import_batch_id=base.physical_import_batch_id,
+        algorithm_version="test", replay_version="test",
+    )
+    db_session.add(target)
+    db_session.flush()
+    if terminal == "transit":
+        db_session.query(ProductionMaterialCustodyProjection).filter_by(ledger_generation_id=base.id).update({"location_kind": "transit"})
+    if terminal in {"consumed", "returned"}:
+        posting_at = datetime(2026, 7, 7, 12)
+        sle = StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id, source_content_hash="f" * 64,
+            item_id=component.item_id, characteristic_ref="", organization_ref="",
+            warehouse_ref1c="WH-MAIN", qty=-44, qty_after=100, posting_at=posting_at,
+            record_type="Expense", movement_kind="assembly_out" if terminal == "consumed" else "transfer_out",
+            recorder_type="Document_Assembly", recorder_ref=f"terminal-{terminal}",
+            line_no="1", ingest_source="pull",
+        )
+        db_session.add(sle)
+        db_session.flush()
+        db_session.add(ProductionMaterialCustodyEvent(
+            product_id=product.product_id, component_item_id=component.item_id,
+            source_kind="consumed" if terminal == "consumed" else "transfer_returned",
+            source_sle_id=sle.id, effective_at=posting_at, location_kind="workshop",
+            warehouse_ref1c="WH-MAIN", delta_qty=-44, idempotency_key=f"terminal-physical-{terminal}",
+        ))
+        db_session.flush()
+    # NULL is legacy missing observation, not inferred from the current clock.
+    if terminal == "unknown_time":
+        db_session.query(ProductionOrder).filter_by(order_id=order.order_id).update({"updated_at": None})
+        db_session.expire(order)
+    build_material_custody_projection(db_session, ledger_generation_id=target.id)
+    releases = db_session.query(ProductionMaterialCustodyEvent).filter_by(source_kind="terminal_release").all()
+    expected = terminal in {"done", "deleted", "consumed", "returned", "transit"}
+    assert len(releases) == int(expected)
+    if expected:
+        assert releases[0].delta_qty == (-100 if terminal in {"consumed", "returned"} else -144)
+        assert releases[0].document_number == order.order_number
+        assert releases[0].source_ref2c.startswith("order-terminal-v1:deleted:" if terminal == "deleted" else "order-terminal-v1:done:")
+    state = load_material_custody_projection(db_session, ledger_generation_id=target.id)
+    assert state.for_product(product.product_id).total(component.item_id) == (0 if expected else 144)
+    assert load_material_custody_projection(db_session, ledger_generation_id=base.id).for_product(product.product_id).total(component.item_id) == 144
+    _, operational_state = load_current_accepted_material_custody(db_session, consumer="test.terminal_build")
+    assert operational_state.for_product(product.product_id).total(component.item_id) == 144
+    build_material_custody_projection(db_session, ledger_generation_id=target.id)
+    assert db_session.query(ProductionMaterialCustodyEvent).filter_by(source_kind="terminal_release").count() == int(expected)
+    if terminal == "returned":
+        # Returning already released material changes stock, not ownership.
+        target.status = "accepted"
+        next_target = LedgerGeneration(
+            generation_key="terminal-return-after-close", status="building",
+            cutoff=datetime(2026, 7, 10), physical_import_batch_id=target.physical_import_batch_id,
+            algorithm_version="test", replay_version="test",
+        )
+        db_session.add(next_target)
+        sle = StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id, source_content_hash="a" * 64,
+            item_id=component.item_id, characteristic_ref="", organization_ref="",
+            warehouse_ref1c="WH-MAIN", qty=-100, qty_after=0, posting_at=datetime(2026, 7, 9),
+            record_type="Expense", movement_kind="transfer_out", recorder_type="Document_Transfer",
+            recorder_ref="return-after-close", line_no="1", ingest_source="pull",
+        )
+        db_session.add(sle)
+        db_session.flush()
+        db_session.add(ProductionMaterialCustodyEvent(
+            product_id=product.product_id, component_item_id=component.item_id,
+            source_kind="transfer_returned", source_sle_id=sle.id, effective_at=sle.posting_at,
+            location_kind="workshop", warehouse_ref1c="WH-MAIN", delta_qty=-100,
+            idempotency_key="return-after-close",
+        ))
+        db_session.flush()
+        build_material_custody_projection(db_session, ledger_generation_id=next_target.id)
+        assert load_material_custody_projection(db_session, ledger_generation_id=next_target.id).for_product(product.product_id).total(component.item_id) == 0
+        assert sle.qty == -100

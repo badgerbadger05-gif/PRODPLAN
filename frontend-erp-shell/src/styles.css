@@ -1897,7 +1897,7 @@ input:focus, select:focus {
 
 .materialRow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 94px 96px;
+  grid-template-columns: minmax(0, 1fr) 96px;
   gap: 6px;
   align-items: start;
   border: 1px solid var(--line2);
@@ -1950,7 +1950,13 @@ input:focus, select:focus {
 }
 
 .matNums {
-  text-align: right;
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 8px;
+  border-top: 1px solid var(--line2);
+  padding-top: 5px;
 }
 
 .batchEditCell {

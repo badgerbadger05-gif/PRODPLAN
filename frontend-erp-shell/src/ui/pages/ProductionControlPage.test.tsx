@@ -1041,7 +1041,7 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6, 77))
     await waitFor(() => expect(within(rowFor('Кронштейн')).getByText(/К запуску: 6 шт/)).toBeInTheDocument())
     expect(await screen.findByRole('heading', { name: 'Комплектующие на 6 шт' })).toBeInTheDocument()
-    expect(screen.getByText('нужно 24')).toBeInTheDocument()
+    expect(screen.getByText('Нужно: 24')).toBeInTheDocument()
 
     await user.click(screen.getByRole('checkbox', { name: /MRP-R-701/ }))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
@@ -1088,6 +1088,21 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledTimes(2))
     expect(getWorkItemMaterials).toHaveBeenLastCalledWith(701, 10, 77)
     expect(await screen.findByText('Болт М8')).toBeInTheDocument()
+  })
+
+  it('distinguishes physical stock from negative availability and custody', async () => {
+    vi.mocked(getOrderMaterials).mockResolvedValue({
+      ...fakeMaterials(),
+      components: [{ ...fakeMaterials().components[0], stock_qty: 318,
+        reserved_qty: 492, reserved_for_order_qty: 0, available_qty: -174,
+        required_qty: 400, missing_qty: 574 }],
+    })
+    renderPage()
+    expect(await screen.findByText('Остаток: 318')).toBeInTheDocument()
+    expect(screen.getByText('Под другие заказы: 492')).toBeInTheDocument()
+    expect(screen.getByText('Доступно: -174')).toBeInTheDocument()
+    expect(screen.getByText('Дефицит: 574')).toBeInTheDocument()
+    expect(screen.queryByText('есть -174')).not.toBeInTheDocument()
   })
 
   it('re-quantifies a created local order and reloads its components', async () => {
@@ -1137,7 +1152,7 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(updateOrderQuantity).toHaveBeenCalledWith(901, 14))
     // Комплектация перечитывается с сервера, а не пересчитывается страницей.
     await waitFor(() => expect(vi.mocked(getOrderMaterials).mock.calls.length).toBeGreaterThan(1))
-    expect(await screen.findByText('нужно 56')).toBeInTheDocument()
+    expect(await screen.findByText('Нужно: 56')).toBeInTheDocument()
   })
 
   it('keeps the launch quantity read-only once the line is a fact outside', async () => {

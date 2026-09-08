@@ -48,6 +48,7 @@ export type MaterialRow = {
   item_code?: string | null
   qty_per_unit: number
   available_qty: number
+  stock_qty?: number | null
   required_qty: number
   missing_qty?: number
   unit?: string | null

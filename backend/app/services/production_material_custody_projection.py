@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
@@ -657,6 +658,16 @@ def _build_projection_from_seed_and_events(
         target_high_watermark_id=target_high_watermark_id,
     )
 
+    terminal_cells = {
+        (int(row.product_id), int(row.component_item_id), str(row.location_kind), str(row.warehouse_ref1c))
+        for row in db.query(models.ProductionMaterialCustodyEvent).filter(
+            models.ProductionMaterialCustodyEvent.source_kind == "terminal_release",
+            models.ProductionMaterialCustodyEvent.source_ref2c.like("order-terminal-v1:%"),
+            models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff,
+            models.ProductionMaterialCustodyEvent.id <= target_high_watermark_id,
+        ).all()
+    }
+
     for event in events:
         product = _ensure_material_custody_product_state(
             state,
@@ -704,6 +715,14 @@ def _build_projection_from_seed_and_events(
 
         key = (int(event.product_id), comp_id, location, warehouse)
         current_qty = projection_rows.get(key, 0.0)
+        # A return/consumption can contain unreserved stock. A confirmed order
+        # closure likewise releases the remainder, not material consumed by a
+        # late imported posting. Neither operation can create negative custody.
+        if (key in terminal_cells and physical_kind) or (
+            str(event.source_kind) == "terminal_release"
+            and str(event.source_ref2c or "").startswith("order-terminal-v1:")
+        ):
+            delta = max(delta, -current_qty)
         next_qty = current_qty + delta
         if next_qty < -_EPSILON:
             raise MaterialCustodySnapshotUnavailable(
@@ -877,6 +896,21 @@ def build_material_custody_projection(
         target_high_watermark_id=target_high_watermark_id,
     )
 
+    # Terminal state releases custody, never physical stock or frozen MRP
+    # obligations. Persist the observation as an event so readers do not filter
+    # historical snapshots by today's mutable order state.
+    if _append_terminal_custody_releases(db, generation=generation, cells=target_rows):
+        target_high_watermark_id = _event_high_watermark_id_at_cutoff(
+            db, cutoff=generation.cutoff,
+        )
+        _, target_rows = _build_projection_from_seed_and_events(
+            db, generation=generation,
+            baseline_generation_id=baseline_generation_id,
+            baseline_high_watermark_id=baseline_high_watermark_id,
+            baseline_cutoff=baseline_generation.cutoff,
+            target_high_watermark_id=target_high_watermark_id,
+        )
+
     for product_id, comp_id, location, warehouse in sorted(target_rows):
         reserved_qty = _to_float(target_rows[(product_id, comp_id, location, warehouse)])
         if reserved_qty <= _EPSILON:
@@ -915,6 +949,66 @@ def build_material_custody_projection(
         "manifest_id": int(manifest.ledger_generation_id),
         "valid": True,
     }
+
+
+def _append_terminal_custody_releases(
+    db: Session, *, generation: models.LedgerGeneration,
+    cells: dict[ProjectionRowKey, float],
+) -> int:
+    """Record confirmed terminal ownership at a new physical cutoff only.
+
+    Same-cutoff obligation publications must not inject events into already
+    accepted history. Unknown/future observations and production counters do
+    not authorize release. The preceding fold has already applied visible
+    consumption and returns; only its remaining cell balance is released.
+    """
+    from .production_control_common import DONE_STATE_KEY
+
+    accepted_cutoff = db.query(func.max(models.LedgerGeneration.cutoff)).filter(
+        models.LedgerGeneration.status == "accepted",
+    ).scalar()
+    cutoff = generation.cutoff.replace(tzinfo=None)
+    if accepted_cutoff is not None and cutoff <= accepted_cutoff.replace(tzinfo=None):
+        return 0
+    product_ids = {key[0] for key in cells}
+    if not product_ids:
+        return 0
+    observations = {}
+    rows = db.query(models.ProductionProduct, models.ProductionOrder).join(
+        models.ProductionOrder,
+        models.ProductionOrder.order_id == models.ProductionProduct.order_id,
+    ).filter(models.ProductionProduct.product_id.in_(product_ids)).all()
+    for product, order in rows:
+        state = str(order.order_state_key or "").lower()
+        terminal = bool(order.deletion_mark) or state == DONE_STATE_KEY
+        observed_at = order.updated_at
+        if terminal and observed_at is not None and observed_at.replace(tzinfo=None) <= cutoff:
+            observations[int(product.product_id)] = order
+    count = 0
+    for key, balance in sorted(cells.items()):
+        product_id, component_id, location, warehouse = key
+        order = observations.get(product_id)
+        if order is None or balance <= _EPSILON:
+            continue
+        coordinates = f"{generation.cutoff.isoformat()}|{key}|{balance}|{order.updated_at.isoformat()}"
+        event_key = "custody-terminal:" + hashlib.sha256(coordinates.encode()).hexdigest()
+        if db.query(models.ProductionMaterialCustodyEvent.id).filter_by(
+            idempotency_key=event_key,
+        ).first() is not None:
+            continue
+        db.add(models.ProductionMaterialCustodyEvent(
+            product_id=product_id, component_item_id=component_id,
+            source_kind="terminal_release", effective_at=generation.cutoff,
+            location_kind=location, warehouse_ref1c=warehouse,
+            source_ref1c=order.order_ref1c,
+            source_ref2c="order-terminal-v1:" + ("deleted" if order.deletion_mark else "done")
+            + ":" + order.updated_at.isoformat(),
+            document_number=order.order_number,
+            delta_qty=-balance, idempotency_key=event_key,
+        ))
+        count += 1
+    db.flush()
+    return count
 
 
 def validate_material_custody_projection(
@@ -1244,6 +1338,10 @@ def load_current_accepted_material_custody(
         # generation that proves its source SLE.  Until then the preceding
         # local transit/workshop reservation remains the safe current state.
         if event.source_sle_id is not None:
+            continue
+        if str(event.source_ref2c or "").startswith("order-terminal-v1:"):
+            # Builder observations become effective only with their accepted
+            # snapshot, never as the operational tail of an older generation.
             continue
         if str(event.source_kind) not in {"issue_created", "terminal_release"}:
             raise MaterialCustodySnapshotUnavailable(

@@ -164,13 +164,6 @@ export function ProductionDetailPane({
   }
 
   function expectedLine(m: NonNullable<MaterialsResponse['components']>[number]) {
-    const reservedOrders = m.reserved_orders ?? []
-    if ((m.missing_qty ?? 0) > 0 && reservedOrders.length) {
-      return `В резерве: ${reservedOrders.slice(0, 2).map((r) => {
-        const ref = r.order_number || `#${r.product_id}`
-        return `${ref} — ${qty(r.reserved_qty)} ${m.unit || ''}`
-      }).join('; ')}`
-    }
     const dates = m.expected_dates?.length ? m.expected_dates : (m.eta_dates ?? []).map((eta) => ({
       source: eta.source,
       order_number: eta.ref,
@@ -198,7 +191,6 @@ export function ProductionDetailPane({
     const own = m.reserved_for_order_qty ?? 0
     const atWorkshop = m.reserved_at_workshop_qty ?? 0
     const inTransit = m.reserved_in_transit_qty ?? 0
-    const other = m.reserved_qty ?? 0
     if (own > 0) {
       const place = atWorkshop > 0 && inTransit > 0
         ? `участок ${qty(atWorkshop)}, в пути ${qty(inTransit)}`
@@ -209,7 +201,6 @@ export function ProductionDetailPane({
             : qty(own)
       parts.push(`под эту строку: ${place}`)
     }
-    if (other > 0) parts.push(`чужой резерв: ${qty(other)}`)
     return parts.join('; ')
   }
 
@@ -419,7 +410,7 @@ export function ProductionDetailPane({
                     <em className="materialReserve">
                       {m.reserved_orders.slice(0, 3).map((r) => (
                         <span key={`${m.component_item_id}-${r.product_id}`}>
-                          в резерве {r.order_number || `#${r.product_id}`}: {qty(r.reserved_qty)} {m.unit || ''}
+                          удержано под {r.order_number || `#${r.product_id}`}: {qty(r.reserved_qty)} {m.unit || ''}
                         </span>
                       ))}
                       {m.reserved_orders.length > 3 && <span>ещё {m.reserved_orders.length - 3}</span>}
@@ -427,9 +418,12 @@ export function ProductionDetailPane({
                   )}
                 </div>
                 <div className="matNums">
-                  <span>нужно {qty(m.required_qty)}</span>
-                  <span>есть {qty(m.available_qty)}</span>
-                  {(m.missing_qty ?? 0) > 0 && <span className="matMissing">нет {qty(m.missing_qty)}</span>}
+                  <span>Нужно: {qty(m.required_qty)}</span>
+                  <span title="Физический остаток по принятому Ledger до вычета удержаний">Остаток: {m.stock_qty == null ? 'н/д' : qty(m.stock_qty)}</span>
+                  <span>Под другие заказы: {m.reserved_qty == null ? 'н/д' : qty(m.reserved_qty)}</span>
+                  <span>Под эту строку: {m.reserved_for_order_qty == null ? 'н/д' : qty(m.reserved_for_order_qty)}</span>
+                  <span title="Свободный остаток после вычета удержаний. Отрицательное значение означает превышение удержаний над остатком.">Доступно: {qty(m.available_qty)}</span>
+                  <span className={(m.missing_qty ?? 0) > 0 ? 'matMissing' : undefined}>Дефицит: {m.missing_qty == null ? 'н/д' : qty(m.missing_qty)}</span>
                 </div>
                 <span className={`miniPill ${m.availability_status || m.coverage_status || 'unknown'}`}>
                   {m.coverage_label || coverageLabels[String(m.availability_status || m.coverage_status || '')] || m.availability_status || m.coverage_status}
