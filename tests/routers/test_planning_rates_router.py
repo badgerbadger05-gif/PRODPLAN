@@ -433,3 +433,17 @@ def test_resource_patch_updates_capacity_and_validates(client, contour):
         ).status_code
         == 404
     )
+
+
+def test_rate_editor_and_item_batch_share_one_value(client, contour, db_session):
+    response = client.put("/api/v1/planning-rates/assembly-rates", json={"rows": [{
+        "item_id": contour["fg_a"], "resource_id": contour["resource_a"],
+        "qty_per_capacity": 3,
+    }]})
+    assert response.status_code == 200
+    item = db_session.get(models.Item, contour["fg_a"])
+    assert item.optimal_batch == Decimal("3")
+    item.optimal_batch = Decimal("4")
+    db_session.commit()
+    response = client.get("/api/v1/planning-rates/assembly-rates")
+    assert response.json()["rows"][0]["qty_per_capacity"] == 4

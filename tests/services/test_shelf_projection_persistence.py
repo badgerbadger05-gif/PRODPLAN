@@ -96,6 +96,7 @@ def _contour(db, *, key: str, active_freeze_version: int):
             remaining_output_qty=Decimal("12"),
         )
     )
+    item.optimal_batch = Decimal("1")
     db.add(
         models.AssemblyRate(
             resource_id=resource.resource_id,

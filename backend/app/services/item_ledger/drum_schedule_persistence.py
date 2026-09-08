@@ -24,7 +24,7 @@ from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
 
 
 STAGE = "drum_schedule"
-ALGORITHM_VERSION = "drum-schedule/11-fifo-eligible-work"
+ALGORITHM_VERSION = "drum-schedule/12-optimal-batch-blocked-tiles"
 
 
 def _d(value: Any) -> Decimal:
@@ -116,12 +116,20 @@ def _rates_and_capacity(
         if item_ids
         else []
     )
+    items = {int(item.item_id): item for item in db.query(models.Item)
+             .filter(models.Item.item_id.in_(item_ids)).all()} if item_ids else {}
     rates: dict[int, list[AssemblyRateProfile]] = {}
     for row in rate_rows:
+        item = items[int(row.item_id)]
+        # A blank optimal batch explicitly excludes this item from the drum.
+        # AssemblyRate owns the resource binding only; its legacy numeric
+        # column must never override the shared item setting.
+        if item.optimal_batch is None:
+            continue
         rates.setdefault(int(row.item_id), []).append(
             AssemblyRateProfile(
                 resource_id=int(row.resource_id),
-                qty_per_capacity=_d(row.qty_per_capacity),
+                qty_per_capacity=_d(item.optimal_batch),
             )
         )
     normalized = {item_id: tuple(values) for item_id, values in rates.items()}

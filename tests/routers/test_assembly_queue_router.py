@@ -631,7 +631,7 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
         target += timedelta(days=1)
 
     resource = models.ProductionResource(resource_name="Assembly move", capacity=1)
-    item = models.Item(item_code="MOVE-1", item_name="Move tile")
+    item = models.Item(item_code="MOVE-1", item_name="Move tile", optimal_batch=1)
     db_session.add_all([resource, item])
     db_session.flush()
     rate = models.AssemblyRate(
@@ -790,7 +790,7 @@ def test_drum_tile_move_inserts_and_cascades_full_days(client, db_session):
         days.append(candidate)
 
     resource = models.ProductionResource(resource_name="Assembly cascade", capacity=1)
-    item = models.Item(item_code="MOVE-CASCADE", item_name="Move cascade tile")
+    item = models.Item(item_code="MOVE-CASCADE", item_name="Move cascade tile", optimal_batch=1)
     db_session.add_all([resource, item])
     db_session.flush()
     db_session.add(models.AssemblyRate(

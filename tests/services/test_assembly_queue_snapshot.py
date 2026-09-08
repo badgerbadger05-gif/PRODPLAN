@@ -388,6 +388,7 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monk
         bucket_date=date(2026, 8, 3),
         qty="12",
     )
+    item.optimal_batch = Decimal("1")
     db_session.add(
         models.AssemblyRate(
             resource_id=resource.resource_id,
@@ -522,20 +523,22 @@ def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monk
         for row in db_session.query(models.DrumSlot).order_by(
             models.DrumSlot.slot_ordinal
         )
-    ] == [Decimal("1"), Decimal("2")]
+    ] == [Decimal("1"), Decimal("2"), Decimal("2"), Decimal("5")]
     # Three units on the shelf and four transferable units at norm two
-    # physically cover three roots. A zero-day purchase is not stock.
+    # physically cover three roots. The remaining red work now occupies
+    # seven calendar units; only two roots exceed the capacity horizon.
+    # The shelf demand remains capped by the frozen replenishment need.
     gap = db_session.query(models.DrumCapacityGap).one()
     assert gap.plan_line_id == line.id
-    assert gap.gap_qty == Decimal("9")
+    assert gap.gap_qty == Decimal("2")
     assert Decimal(first["total_open_qty"]) == Decimal("12")
     assert shelf["projection_rows"] == 1
     shelf_row = db_session.query(models.ShelfProjection).one()
-    assert shelf_row.target_qty == Decimal("6")
+    assert shelf_row.target_qty == Decimal("12")
     assert shelf_row.projected_qty == Decimal("3")
     assert shelf_row.transfer_qty == Decimal("0")
-    assert shelf_row.pull_qty == Decimal("3")
-    assert shelf_row.materialized_qty == Decimal("4")
+    assert shelf_row.pull_qty == Decimal("9")
+    assert shelf_row.materialized_qty == Decimal("12")
 
 
 def test_queue_line_without_rate_is_excluded_from_drum_only(db_session):

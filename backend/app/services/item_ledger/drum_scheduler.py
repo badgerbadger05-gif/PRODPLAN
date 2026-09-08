@@ -359,39 +359,9 @@ def build_drum_plan(
             resource_last_day = schedule_from
 
         gap_date = _last_workday(calendar, schedule_from, resource_last_day)
-        if readiness_phase in {"blocked", "unavailable"}:
-            existing_gap = gap_by_line.get(int(queue_line.queue_line_id))
-            gap_by_line[int(queue_line.queue_line_id)] = CapacityGap(
-                queue_line_id=int(queue_line.queue_line_id),
-                plan_id=int(queue_line.plan_id),
-                plan_line_id=int(queue_line.plan_line_id),
-                item_id=int(queue_line.item_id),
-                resource_id=resource_id,
-                gap_date=gap_date,
-                required_qty=(
-                    phase_qty
-                    if existing_gap is None
-                    else existing_gap.required_qty + phase_qty
-                ),
-                available_capacity=Decimal("0"),
-                gap_qty=(
-                    phase_qty
-                    if existing_gap is None
-                    else existing_gap.gap_qty + phase_qty
-                ),
-                planned_output_qty=_dec(queue_line.planned_output_qty),
-                accepted_plan_output_qty=_dec(queue_line.accepted_plan_output_qty),
-                assembly_remaining_qty=_dec(queue_line.assembly_remaining_qty),
-                original_priority=tuple(queue_line.original_priority),
-                readiness_phase=(
-                    readiness_phase
-                    if existing_gap is None
-                    or existing_gap.readiness_phase == readiness_phase
-                    else "mixed"
-                ),
-            )
-            continue
-
+        # Blocked work occupies the remaining calendar capacity after feasible
+        # FIFO work. Its saved gate and blocker manifest explain the stop;
+        # scheduling it is not a claim that materials are available.
         remaining = phase_qty
         current = max(schedule_from, eligible_date)
         slot_ordinal = slot_ordinal_by_line.get(int(queue_line.queue_line_id), 0)

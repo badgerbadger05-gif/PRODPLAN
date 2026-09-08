@@ -61,14 +61,13 @@ def test_readiness_gate_allows_ready_younger_line_to_pass_blocked_old_line():
 
     assert [(slot.queue_line_id, slot.slot_date) for slot in plan.slots] == [
         (2, date(2026, 9, 3)),
+        (1, date(2026, 9, 4)),
     ]
-    assert [slot.readiness_phase for slot in plan.slots] == ["now"]
-    assert [(gap.queue_line_id, gap.readiness_phase) for gap in plan.gaps] == [
-        (1, "blocked")
-    ]
+    assert [slot.readiness_phase for slot in plan.slots] == ["now", "blocked"]
+    assert plan.gaps == ()
     assert plan.metrics["total_open_qty"] == "2"
-    assert plan.metrics["total_slot_qty"] == "1"
-    assert plan.metrics["total_gap_qty"] == "1"
+    assert plan.metrics["total_slot_qty"] == "2"
+    assert plan.metrics["total_gap_qty"] == "0"
 
 
 def test_readiness_curve_delays_each_increment_until_its_available_date():
@@ -554,7 +553,7 @@ def test_drum_rejects_non_whole_saved_ready_quantity(ready_qty: str) -> None:
         )
 
 
-def test_blocked_gap_is_dated_on_the_last_workday_not_the_weekend() -> None:
+def test_blocked_work_uses_capacity_and_keeps_overflow_on_last_workday() -> None:
     line = _line(1, "2", sort_key="a")
     line = QueueLine(
         **{
@@ -569,10 +568,12 @@ def test_blocked_gap_is_dated_on_the_last_workday_not_the_weekend() -> None:
         {},
         schedule_from=date(2026, 9, 4),  # Friday
         schedule_to=date(2026, 9, 6),  # Sunday
-        resource_capacity_by_id={10: Decimal("10")},
+        resource_capacity_by_id={10: Decimal("1")},
     )
 
-    assert result.slots == ()
+    assert len(result.slots) == 1
+    assert result.slots[0].slot_qty == Decimal("1")
+    assert result.slots[0].readiness_phase == "blocked"
     assert result.gaps[0].gap_date == date(2026, 9, 4)
     assert result.gaps[0].readiness_phase == "blocked"
 
@@ -608,3 +609,22 @@ def test_tile_curve_keeps_saved_explanations_for_every_horizon() -> None:
     assert ready_date == date(2026, 9, 8)
     assert curve[0]["blockers"][0]["reason"] == "HORIZON_DOES_NOT_ALLOW_REPLENISHMENT"
     assert curve[1]["required_actions"][0]["action_kind"] == "buy"
+
+
+@pytest.mark.parametrize("batch, expected", [(None, None), (Decimal("3"), Decimal("3"))])
+def test_item_optimal_batch_owns_drum_rate_not_legacy_value(db_session, batch, expected):
+    from app import models
+    from app.services.item_ledger.drum_schedule_persistence import _rates_and_capacity
+    item = models.Item(item_code="BATCH-OWNER", item_name="Batch owner", optimal_batch=batch)
+    resource = models.ProductionResource(resource_name="Batch capacity", capacity=2)
+    db_session.add_all([item, resource])
+    db_session.flush()
+    db_session.add(models.AssemblyRate(item_id=item.item_id, resource_id=resource.resource_id,
+                                      qty_per_capacity=99))
+    db_session.flush()
+    rates, capacities, _, _ = _rates_and_capacity(db_session, [SimpleNamespace(item_id=item.item_id)])
+    if expected is None:
+        assert item.item_id not in rates
+    else:
+        assert rates[item.item_id][0].qty_per_capacity == expected
+        assert rates[item.item_id][0].qty_per_capacity * capacities[resource.resource_id] == 6

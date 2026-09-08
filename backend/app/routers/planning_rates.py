@@ -1,14 +1,10 @@
 """Admin CRUD for the drum/shelf reference data (`.docs/assembly-queue-and-drum.md`,
 `.docs/shelves-buffers-and-mechshop-pull.md`).
 
-Both contours fail closed on missing reference rows and until now nothing could
-fill them:
-
-* ``AssemblyRate`` (такт сборки) — its absence aborts generation acceptance with
-  ``missing assembly rate for item ...``;
-* ``ShelfPolicy`` (полка) — without a row the shelf projection stays empty
-  forever, so the mech-shop pull never appears;
-* ``ProductionResource.capacity`` — the drum divides by it.
+The assembly rate editor writes Item.optimal_batch (units per capacity).
+AssemblyRate retains the finishing-resource binding and a legacy compatibility
+column; the drum reads the shared item value. Blank item batches exclude work
+from the drum without deleting plan obligations.
 
 This router is deliberately reference-data only: it never writes a plan, a
 requirement, a slot or a projection, and it never touches an accepted
@@ -242,7 +238,7 @@ def _rate_payload(
         "item_name": item.item_name if item is not None else None,
         "resource_id": int(row.resource_id),
         "resource_name": resources.get(int(row.resource_id)),
-        "qty_per_capacity": _f(row.qty_per_capacity),
+        "qty_per_capacity": _f(item.optimal_batch) if item is not None else 0.0,
     }
 
 
@@ -332,7 +328,8 @@ def upsert_assembly_rates(
     updated = 0
     touched: list[models.AssemblyRate] = []
     for row in payload.rows:
-        _require_item(db, int(row.item_id))
+        item = _require_item(db, int(row.item_id))
+        item.optimal_batch = row.qty_per_capacity
         _require_resource(db, int(row.resource_id))
         existing = (
             db.query(models.AssemblyRate)

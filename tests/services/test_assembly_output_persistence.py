@@ -928,6 +928,7 @@ def test_queue_rows_follow_allocations_and_feed_drum_schedule(db_session):
     )
     db_session.add(resource)
     db_session.flush()
+    item.optimal_batch = Decimal("1")
     db_session.add(
         models.AssemblyRate(
             resource_id=resource.resource_id,
