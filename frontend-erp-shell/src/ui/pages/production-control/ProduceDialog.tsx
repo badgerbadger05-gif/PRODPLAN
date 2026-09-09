@@ -115,8 +115,8 @@ export function ProduceDialog({
         </div>
         <div className="dialogBody">
           <div className="fieldHint">Укажите фактическое количество — оно может быть меньше или больше заказа. Выпуск и сдельный наряд будут оформлены на это количество, затем заказ завершится в 1С.</div>
-          <label className="dialogField">
-            <input type="checkbox" checked={producePartial} disabled={produceSaving}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '10px 0' }}>
+            <input style={{ width: 'auto', height: 'auto', margin: 0 }} type="checkbox" checked={producePartial} disabled={produceSaving}
               onChange={(e) => setProducePartial(e.target.checked)} />
             Частичный выпуск
           </label>
