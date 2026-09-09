@@ -54,12 +54,15 @@ def _accepted_journal_truth(db_session):
 class _FakeClient:
     def __init__(self, *, ref_key: str = "pw-chain-ref") -> None:
         self.ref_key = ref_key
+        self.docs = {}
         self.posts: list = []
         self.patches: list = []
         self.operations: list = []
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
+        if entity == "Document_СдельныйНаряд":
+            self.docs[self.ref_key] = {**payload, "Ref_Key": self.ref_key, "DeletionMark": False}
         return {"Ref_Key": self.ref_key}
 
     def patch(self, entity_ref, payload, **_):
@@ -68,8 +71,25 @@ class _FakeClient:
 
     def post_operation(self, operation_path):
         self.operations.append(operation_path)
+        if "Document_СдельныйНаряд" in operation_path:
+            import re
+            ref = re.search("guid'([^']+)'", operation_path).group(1)
+            if ref in self.docs:
+                self.docs[ref]["Posted"] = "/Unpost" not in operation_path
 
     def _make_request(self, endpoint, params=None, **_):
+        if str(endpoint).startswith("Document_СдельныйНаряд"):
+            import re
+            if str(endpoint).endswith("_Операции"):
+                order = re.search("guid'([^']+)'", (params or {}).get("$filter", "")).group(1)
+                rows = [{**row, "Ref_Key": ref} for ref, doc in self.docs.items() for row in doc.get("Операции", []) if row.get("ЗаказНаПроизводство_Key") == order]
+                skip = (params or {}).get("$skip", 0)
+                return {"value": rows[skip:skip + 250]}
+            if str(endpoint) == "Document_СдельныйНаряд":
+                marker = re.search(r"substringof\('([^']+)'", (params or {}).get("$filter", "")).group(1)
+                return {"value": [doc for doc in self.docs.values() if marker in doc.get("Комментарий", "")]}
+            ref = re.search("guid'([^']+)'", str(endpoint)).group(1)
+            return self.docs.get(ref, {})
         if "InformationRegister_ЦеныНоменклатуры" in str(endpoint):
             return {"value": []}
         return {}
@@ -330,30 +350,22 @@ def test_combined_repeat_is_noop(db_session, monkeypatch):
     assert len(fake.posts) == posts_after_first
 
 
-def test_combined_refuses_weld_closed_by_separate_piecework(db_session, monkeypatch):
+def test_combined_accepts_separate_weld_piecework_from_live_1c(db_session, monkeypatch):
     ctx = _setup_chain(db_session)
-    db_session.add(
-        SyncLink(
-            source_system="PRODPLAN",
-            source_doctype="piecework",
-            source_id=ctx["weld"]["m"].manufacture_id,
-            target_entity="Document_СдельныйНаряд",
-            target_ref_key="separate-pw-ref",
-            target_number="PW-SEP",
-            status="success",
-        )
-    )
-    db_session.commit()
-
-    result = exporter.export_chain_piecework_to_1c(
-        db_session,
+    fake = _FakeClient(ref_key="paint-only-ref")
+    _stub_live(monkeypatch, fake)
+    entries, _ = exporter._collect_export_entries(db_session, [ctx["weld"]["m"].manufacture_id])
+    payload = exporter._build_header_payload(entries[0], operation_ref="")
+    # Manual 1C document: there is deliberately no local SyncLink.
+    fake.docs["manual-weld-ref"] = {**payload, "Комментарий": "Ручной наряд", "Ref_Key": "manual-weld-ref", "Posted": True, "DeletionMark": False}
+    result = exporter.export_chain_piecework_to_1c(db_session,
         weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
-        paint_manufacture_id=ctx["paint"]["m"].manufacture_id,
-        dry_run=True,
-    )
-
-    assert result["status"] == "error"
-    assert "отдельным сдельным" in result["error"]
+        paint_manufacture_id=ctx["paint"]["m"].manufacture_id, dry_run=False)
+    assert result["status"] == "ok"
+    assert len(fake.posts) == 1
+    assert {row["Операция_Key"] for row in fake.posts[0][1]["Операции"]} == {"op-paint"}
+    weld_link = db_session.query(SyncLink).filter_by(source_doctype="piecework", source_id=ctx["weld"]["m"].manufacture_id).one()
+    assert weld_link.target_ref_key == "manual-weld-ref"
 
 
 # ---------------------------------------------------------------------------
@@ -920,3 +932,67 @@ def test_two_partial_chain_batches_get_distinct_assemblies_and_piecework(db_sess
     links = db_session.query(SyncLink).filter_by(source_doctype="piecework").all()
     assert len(links) == 4
     assert {link.target_ref_key for link in links} == {"piecework-batch-1", "piecework-batch-2"}
+
+
+def test_standalone_weld_before_production_then_chain_pays_only_paint(db_session, monkeypatch):
+    ctx = _setup_chain(db_session)
+    for side in ("weld", "paint"):
+        db_session.delete(ctx[side]["m"])
+        ctx[side]["product"].produced_qty = 0
+    db_session.commit()
+    fake = _FakeClient(ref_key="standalone-weld-ref")
+    _stub_live(monkeypatch, fake)
+    _stub_manufactures_export(monkeypatch, failing_ids=set())
+    operations = exporter._piecework_operation_defaults(db_session, ctx["weld"]["product"]).operation_lines
+    selected = [{"spec_operation_id": operations[0].spec_operation_id, "employee_ref1c": "employee-chain-ref"}]
+    result = exporter.create_standalone_piecework(db_session, ctx["paint"]["product"].product_id,
+        qty=6, operation_executors=selected, request_key="labor-before-production")
+    assert result["created"] == 1
+    assert db_session.query(ProductionManufacture).count() == 0
+    assert "ДокументОснование" not in fake.posts[0][1]
+    assert fake.posts[0][1]["ЗаказНаПроизводство_Key"] == ctx["weld"]["order"].order_ref1c
+    repeated = exporter.create_standalone_piecework(db_session, ctx["paint"]["product"].product_id,
+        qty=6, operation_executors=selected, request_key="labor-before-production")
+    assert repeated["status"] == "existing"
+    assert len(fake.posts) == 1
+    fake.ref_key = "chain-paint-ref"
+    closed = close_paint_chain(db_session, product_id=ctx["paint"]["product"].product_id,
+        weld_qty=6, paint_qty=10, partial=False, executor="Иванов", request_key="produce-after-labor", dry_run=False)
+    assert closed["order_completion"]["orders_closed"] == 2
+    assert len(fake.posts) == 2
+    assert {row["Операция_Key"] for row in fake.posts[1][1]["Операции"]} == {"op-paint"}
+    assert db_session.query(ProductionManufacture).count() == 2
+
+
+@pytest.mark.parametrize("posted, deleted, paid_qty, expected_qty", [(True, False, 4, 2), (True, True, 6, 6), (False, False, 6, None)])
+def test_live_piecework_coverage_partial_deleted_and_unposted(db_session, monkeypatch, posted, deleted, paid_qty, expected_qty):
+    ctx = _setup_chain(db_session)
+    fake = _FakeClient(ref_key="remaining-ref")
+    _stub_live(monkeypatch, fake)
+    entries, _ = exporter._collect_export_entries(db_session, [ctx["weld"]["m"].manufacture_id])
+    payload = exporter._build_header_payload(entries[0], operation_ref="")
+    for row in payload["Операции"]:
+        row["КоличествоФакт"] = paid_qty
+    fake.docs["manual-ref"] = {**payload, "Комментарий": "Ручной", "Ref_Key": "manual-ref", "Posted": posted, "DeletionMark": deleted}
+    result = exporter.export_chain_piecework_to_1c(db_session,
+        weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
+        paint_manufacture_id=ctx["paint"]["m"].manufacture_id, dry_run=False)
+    if expected_qty is None:
+        assert result["status"] == "error"
+        assert not fake.posts
+    else:
+        assert result["status"] == "ok"
+        row = next(row for row in fake.posts[0][1]["Операции"] if row["Операция_Key"] == "op-weld")
+        assert row["КоличествоФакт"] == expected_qty
+
+
+def test_piecework_read_failure_never_creates_a_document(db_session, monkeypatch):
+    ctx = _setup_chain(db_session)
+    fake = _FakeClient()
+    _stub_live(monkeypatch, fake)
+    fake._make_request = lambda *args, **kwargs: {}
+    result = exporter.export_chain_piecework_to_1c(db_session,
+        weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
+        paint_manufacture_id=ctx["paint"]["m"].manufacture_id, dry_run=False)
+    assert result["status"] == "error"
+    assert not fake.posts

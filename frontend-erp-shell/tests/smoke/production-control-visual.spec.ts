@@ -394,6 +394,49 @@ test('mechshop keeps drum work visible after MRP execution is closed', async ({ 
   await expect(hint).toContainText('Кронштейн опорный')
 })
 
+test('standalone piecework selects welding operations without production', async ({ page }, testInfo) => {
+  let command: Record<string, unknown> | null = null
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path.endsWith('/piecework-options')) {
+      await route.fulfill({ json: { product_id: 501, item_name: 'Опора, после сварки', quantity: 10, operations: [
+        { spec_operation_id: 51, operation_id: 61, line_number: 1, operation_name: 'Сварка' },
+        { spec_operation_id: 52, operation_id: 62, line_number: 2, operation_name: 'Зачистка' },
+      ] } })
+    } else if (path.endsWith('/piecework')) {
+      command = route.request().postDataJSON()
+      await route.fulfill({ json: { status: 'ok', message: 'Сдельный наряд оформлен', product_id: 501, command_id: 1, created: 1 } })
+    } else if (path.endsWith('/orders')) {
+      await route.fulfill({ json: { rows: [{ ...orders[0], order_ref1c: 'order-ref-101', available_actions: ['produce'] }], total: 1,
+        truth_meta: { ledger_generation: 77, truth_status: 'accepted', cutoff: '2026-09-09T00:00:00Z' } } })
+    } else if (path.endsWith('/employees')) {
+      await route.fulfill({ json: { rows: [{ employee_id: 1, employee_ref1c: 'E1', employee_type: 'employee', employee_name: 'Иванов' }], total: 1 } })
+    } else if (path.endsWith('/materials')) {
+      await route.fulfill({ json: materials })
+    } else if (path.endsWith('/resources/')) {
+      await route.fulfill({ json: [] })
+    } else if (path.endsWith('/period-plans')) {
+      await route.fulfill({ json: { rows: [], total: 0 } })
+    } else {
+      await route.abort('failed')
+    }
+  })
+  await page.goto('/#/production-control')
+  await page.getByRole('row').filter({ hasText: 'Кронштейн опорный' }).first().getByRole('checkbox').check()
+  const button = page.getByRole('button', { name: 'Сдельный наряд', exact: true })
+  await expect(button).toHaveCSS('background-color', 'rgb(255, 56, 164)')
+  await button.click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toContainText('Опора, после сварки')
+  await dialog.getByRole('checkbox', { name: 'Оформить операцию Зачистка' }).uncheck()
+  await dialog.getByRole('combobox').first().selectOption('E1')
+  await dialog.getByRole('spinbutton').fill('6')
+  await page.screenshot({ path: testInfo.outputPath('standalone-piecework.png') })
+  await dialog.getByRole('button', { name: 'Создать сдельный наряд' }).click()
+  await expect.poll(() => command).toMatchObject({ qty: 6, operation_executors: [{ spec_operation_id: 51, employee_ref1c: 'E1' }] })
+  await expect(page.getByText('Сдельный наряд оформлен')).toBeVisible()
+})
+
 test('unified Produce sends actual quantity and partial intent', async ({ page }, testInfo) => {
   let command: Record<string, unknown> | null = null
   await page.route('**/api/**', async (route) => {

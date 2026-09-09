@@ -298,3 +298,13 @@ export function closeProductionOrder(productId: number, payload: { dry_run?: boo
     body: JSON.stringify(payload),
   })
 }
+
+export function getStandalonePieceworkOptions(productId: number) {
+  return api<ApiSchemas['StandalonePieceworkOptionsResponse']>(`/v1/production-control/orders/${productId}/piecework-options`)
+}
+
+export function createStandalonePiecework(productId: number, payload: ApiSchemas['StandalonePieceworkPayload']) {
+  return api<ApiSchemas['StandalonePieceworkResultResponse']>(`/v1/production-control/orders/${productId}/piecework`, {
+    method: 'POST', body: JSON.stringify(payload),
+  })
+}

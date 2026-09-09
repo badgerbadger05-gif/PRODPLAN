@@ -1141,6 +1141,17 @@ class ProductionMaterialCustodyProjection(Base):
     ledger_generation = relationship("LedgerGeneration")
 
 
+class ProductionPieceworkCommand(Base):
+    """Operator request for labor only; never a production/stock fact."""
+    __tablename__ = "production_piecework_commands"
+    id = Column(Integer, primary_key=True)
+    product_id = Column(Integer, ForeignKey("production_products.product_id"), nullable=False)
+    request_key = Column(String(100), nullable=False, unique=True)
+    target_qty = Column(DECIMAL(15, 3), nullable=False)
+    operation_executors = Column(CrossPlatformJSON, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
 class ProductionManufacture(Base):
     """
     A record of one "Произвести" click on a production_products line. Local

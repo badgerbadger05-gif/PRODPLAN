@@ -8,6 +8,7 @@ type Props = {
   onExportTo1C: () => void
   onSyncFrom1C: () => void
   onProduce: () => void
+  onPiecework: () => void
   onPrintSelected: () => void
   onDeleteSelected: () => void
   onOpenSettings: () => void
@@ -25,6 +26,7 @@ export function ProductionCommandBar({
   onExportTo1C,
   onSyncFrom1C,
   onProduce,
+  onPiecework,
   onPrintSelected,
   onDeleteSelected,
   onOpenSettings,
@@ -41,6 +43,9 @@ export function ProductionCommandBar({
     <div className="commandBar">
       <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
       <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный; завершить заказ или оставить частичный выпуск">Произвести</button>
+      <button onClick={onPiecework} disabled={!canProduce || loading}
+        style={{ background: '#ff38a4', borderColor: '#c21874', color: '#111', fontWeight: 700 }}
+        title="Оформить работу сварщика отдельно от производства и окраски">Сдельный наряд</button>
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <div className="barSeparator" />
       <button onClick={onPrintSelected} disabled={!selectedOrders.length}>Печать маршрутных</button>

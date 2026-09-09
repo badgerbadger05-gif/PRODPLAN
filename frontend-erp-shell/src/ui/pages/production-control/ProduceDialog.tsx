@@ -14,6 +14,9 @@ export type ProduceChainSide = {
 }
 
 type Props = {
+  pieceworkOnly?: boolean
+  selectedOperationIds?: number[]
+  setSelectedOperationIds?: Dispatch<SetStateAction<number[]>>
   produceRow: OrderRow
   produceError: string
   canProduceRow: boolean
@@ -42,6 +45,9 @@ function employeeLabel(employee: EmployeeOption) {
 }
 
 export function ProduceDialog({
+  pieceworkOnly = false,
+  selectedOperationIds = [],
+  setSelectedOperationIds,
   produceRow,
   produceError,
   canProduceRow,
@@ -69,9 +75,9 @@ export function ProduceDialog({
   // Правило одно на оба пути: пока хоть одна операция без исполнителя, в 1С
   // ничего не уходит. Сторона без операций спецификации берёт исполнителя из
   // общего поля — как и обычная строка без операций.
-  const needsHeaderExecutor = produceOperations.length === 0
-    || chainSides.some((side) => side.operations.length === 0)
-  const executorsIncomplete = employees.length > 0 && (
+  const needsHeaderExecutor = !pieceworkOnly && (produceOperations.length === 0
+    || chainSides.some((side) => side.operations.length === 0))
+  const executorsIncomplete = (pieceworkOnly && selectedOperationIds.length === 0) || employees.length > 0 && (
     (produceOperations.length > 0 && !allOperationExecutorsSelected)
     || (needsHeaderExecutor && !produceEmployeeRef)
   )
@@ -81,6 +87,10 @@ export function ProduceDialog({
       <div className="operationExecutorList">
         {operations.map((operation) => (
           <div className="operationExecutorRow" key={`${sideKey}-${operation.spec_operation_id}`}>
+            {pieceworkOnly && <input type="checkbox" aria-label={`Оформить операцию ${operation.operation_name}`}
+              style={{ width: 'auto' }} checked={selectedOperationIds.includes(operation.spec_operation_id)}
+              onChange={(e) => setSelectedOperationIds?.((current) => e.target.checked
+                ? [...current, operation.spec_operation_id] : current.filter((id) => id !== operation.spec_operation_id))} />}
             <div className="operationExecutorMeta">
               <strong>{operation.line_number}. {operation.operation_name || 'Операция'}</strong>
               <span>{operation.stage_name || 'Этап не указан'} · норма {Number(operation.time_norm ?? 0).toLocaleString('ru-RU')}</span>
@@ -92,7 +102,7 @@ export function ProduceDialog({
                 ...current,
                 [operation.spec_operation_id]: e.target.value,
               }))}
-              disabled={produceSaving || employeesLoading || produceOperationsLoading}
+              disabled={produceSaving || employeesLoading || produceOperationsLoading || (pieceworkOnly && !selectedOperationIds.includes(operation.spec_operation_id))}
             >
               <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
               {employees.map((employee) => (
@@ -111,16 +121,17 @@ export function ProduceDialog({
     <div className="dialogOverlay" role="dialog" aria-modal="true" aria-labelledby="produce-dialog-title" onClick={(e) => { if (e.target === e.currentTarget) setProduceOpen(false) }}>
       <div className="dialogBox">
         <div className="dialogHeader" id="produce-dialog-title">
-          {isChain ? 'Произвести цепочку' : 'Произвести'} - {produceRow.item_name}
+          {pieceworkOnly ? 'Сдельный наряд' : isChain ? 'Произвести цепочку' : 'Произвести'} - {produceRow.item_name}
         </div>
         <div className="dialogBody">
-          <div className="fieldHint">Укажите фактическое количество — оно может быть меньше или больше заказа. Выпуск и сдельный наряд будут оформлены на это количество, затем заказ завершится в 1С.</div>
+          {!pieceworkOnly && <><div className="fieldHint">Укажите фактическое количество — оно может быть меньше или больше заказа. Выпуск и сдельный наряд будут оформлены на это количество, затем заказ завершится в 1С.</div>
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '10px 0' }}>
             <input style={{ width: 'auto', height: 'auto', margin: 0 }} type="checkbox" checked={producePartial} disabled={produceSaving}
               onChange={(e) => setProducePartial(e.target.checked)} />
             Частичный выпуск
           </label>
-          <div className="fieldHint">При частичном выпуске заказ остаётся открытым. Следующая операция создаст новые производство и сдельный наряд под тем же заказом. Материалы проверяются перед выпуском.</div>
+          <div className="fieldHint">При частичном выпуске заказ остаётся открытым. Следующая операция создаст новые производство и сдельный наряд под тем же заказом. Материалы проверяются перед выпуском.</div></>}
+          {pieceworkOnly && <div className="fieldHint">Укажите общее выполненное количество по выбранным операциям этого заказа. Уже оформленное в 1С количество будет исключено. Производство и окраска не оформляются, заказ не закрывается.</div>}
           {produceError && <div className="dialogError" role="alert">{produceError}</div>}
           {!canProduceRow && (
             <div className="fieldHint danger">Эта строка уже произведена полностью.</div>
@@ -136,7 +147,7 @@ export function ProduceDialog({
             </div>
           ) : (
             <div className="dialogField">
-              <label>Количество ({produceRow.unit || 'шт'})</label>
+              <label>{pieceworkOnly ? 'Всего выполнено по выбранным операциям' : 'Количество'} ({produceRow.unit || 'шт'})</label>
               <input
                 aria-label={`Количество (${produceRow.unit || 'шт'})`}
                 type="number"
@@ -199,10 +210,11 @@ export function ProduceDialog({
           <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
           <button
             className="primary"
+            style={pieceworkOnly ? { background: '#ff38a4', borderColor: '#c21874', color: '#111' } : undefined}
             onClick={() => void submitProduce()}
             disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || executorsIncomplete}
           >
-            {produceSaving ? 'Выполняем...' : 'Произвести'}
+            {produceSaving ? 'Выполняем...' : pieceworkOnly ? 'Создать сдельный наряд' : 'Произвести'}
           </button>
         </div>
       </div>

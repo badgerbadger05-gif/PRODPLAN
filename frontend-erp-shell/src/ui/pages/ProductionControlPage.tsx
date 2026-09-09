@@ -29,6 +29,8 @@ import {
   updateOrderQuantity,
   openPaintWeldChains,
   closePaintWeldChain,
+  getStandalonePieceworkOptions,
+  createStandalonePiecework,
   postMaterialIssues,
   produceOrderLine,
   returnLeftoverComponents,
@@ -122,6 +124,9 @@ export function ProductionControlPage() {
   const [produceEmployeeRef, setProduceEmployeeRef] = useState('')
   // Цепочка «сварка → окраска» закрывается одним комбинированным нарядом,
   // поэтому исполнителей выбирают сразу на обе стороны в том же диалоге.
+  const [pieceworkOnly, setPieceworkOnly] = useState(false)
+  const [pieceworkRow, setPieceworkRow] = useState<OrderRow | null>(null)
+  const [pieceworkOperations, setPieceworkOperations] = useState<number[]>([])
   const [producePartial, setProducePartial] = useState(false)
   const [produceRequestKey, setProduceRequestKey] = useState('')
   const [produceChainSides, setProduceChainSides] = useState<ProduceChainSide[] | null>(null)
@@ -567,12 +572,14 @@ export function ProductionControlPage() {
 
   // Исполнителей выбирают до записи в 1С: наряд с пустой строкой регистра
   // «Сдельные наряды» 1С не проводит, а документ к тому моменту уже создан.
-  async function openProduceDialog(productId: number | null | undefined) {
+  async function openProduceDialog(productId: number | null | undefined, laborOnly = false) {
     if (!productId) return
     const row = rows.find((item) => item.product_id === productId)
     if (!row) return
     const chain = row.paint_weld_chain
     const counterpartProductId = chain?.counterpart_product_id ?? null
+    setPieceworkOnly(laborOnly)
+    setPieceworkRow(null)
     setProduceError('')
     setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
     setProducePartial(false)
@@ -585,6 +592,15 @@ export function ProductionControlPage() {
     setEmployeesLoading(true)
     setProduceOperationsLoading(true)
     try {
+      if (laborOnly) {
+        const [employeeList, options] = await Promise.all([listProductionEmployees(), getStandalonePieceworkOptions(productId)])
+        setEmployees(employeeList.rows ?? [])
+        setProduceOperations(options.operations)
+        setPieceworkOperations(options.operations.map((op) => op.spec_operation_id))
+        setPieceworkRow({ ...row, product_id: options.product_id, item_name: options.item_name })
+        setProduceQty(String(options.quantity))
+        return
+      }
       const [employeeList, operationList, counterpartOperations] = await Promise.all([
         listProductionEmployees(),
         listProductionOperations(productId),
@@ -645,6 +661,23 @@ export function ProductionControlPage() {
     const headerExecutor = produceEmployeeRef
       ? employees.find((employee) => employee.employee_ref1c === produceEmployeeRef)?.employee_name
       : undefined
+    if (pieceworkOnly) {
+      const qty = Number(produceQty)
+      if (!Number.isFinite(qty) || qty <= 0) { setProduceError('Количество должно быть больше нуля'); return }
+      setProduceSaving(true)
+      setProduceError('')
+      try {
+        const result = await createStandalonePiecework(productId, {
+          qty, request_key: produceRequestKey,
+          operation_executors: operationExecutorsOf(produceOperations.filter((op) => pieceworkOperations.includes(op.spec_operation_id))),
+        })
+        setProduceOpen(false)
+        setMessage(result.message)
+        await load(offsetRef.current)
+      } catch (e) { setProduceError(e instanceof Error ? e.message : String(e)) }
+      finally { setProduceSaving(false) }
+      return
+    }
     if (produceChainSides) {
       // Отправляем выбранные оператором количества и исполнителей обеих сторон.
       setProduceError('')
@@ -711,7 +744,7 @@ export function ProductionControlPage() {
     }
   }
 
-  async function produceActiveLine(productId: number | null | undefined) {
+  async function produceActiveLine(productId: number | null | undefined, laborOnly = false) {
     if (!productId) return
     if (!beginDangerousMutation()) return
     setLoading(true)
@@ -720,7 +753,7 @@ export function ProductionControlPage() {
     try {
       // Оба пути — строка и цепочка «сварка → окраска» — проходят через один
       // диалог: пока хоть одна операция без исполнителя, в 1С ничего не уходит.
-      await openProduceDialog(productId)
+      await openProduceDialog(productId, laborOnly)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -885,6 +918,7 @@ export function ProductionControlPage() {
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}
+          onPiecework={() => void produceActiveLine(selectedRows[0]?.product_id, true)}
           onPrintSelected={() => openRouteSheets(selectedRows.flatMap(productionRowProductIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
@@ -1004,7 +1038,10 @@ export function ProductionControlPage() {
       />
       {produceOpen && activeRow && (
         <ProduceDialog
-          produceRow={activeRow}
+          produceRow={pieceworkOnly && pieceworkRow ? pieceworkRow : activeRow}
+          pieceworkOnly={pieceworkOnly}
+          selectedOperationIds={pieceworkOperations}
+          setSelectedOperationIds={setPieceworkOperations}
           produceError={produceError}
           // Закрытие цепочки возобновляемо: обе стороны могут быть уже
           // произведены, а комбинированный наряд — ещё нет. Что закрывать,
@@ -1025,7 +1062,7 @@ export function ProductionControlPage() {
           produceOperationsLoading={produceOperationsLoading}
           produceEmployeeRef={produceEmployeeRef}
           setProduceEmployeeRef={setProduceEmployeeRef}
-          allOperationExecutorsSelected={produceOperations.length > 0 && produceOperations.every(
+          allOperationExecutorsSelected={produceOperations.length > 0 && produceOperations.filter((op) => !pieceworkOnly || pieceworkOperations.includes(op.spec_operation_id)).every(
             (operation) => Boolean(produceOperationEmployees[operation.spec_operation_id]),
           )}
           setProduceOpen={setProduceOpen}

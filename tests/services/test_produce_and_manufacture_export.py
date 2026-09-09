@@ -233,6 +233,7 @@ class _FakeClient:
         self.ref_key = ref_key
         self.fail = fail
         self.parent_order_doc = parent_order_doc or {}
+        self.docs = {}
         self.posts: list = []
         self.patches: list = []
         self.gets: list = []
@@ -240,6 +241,8 @@ class _FakeClient:
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
+        if entity == "Document_СдельныйНаряд":
+            self.docs[self.ref_key] = {**payload, "Ref_Key": self.ref_key, "DeletionMark": False}
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
@@ -251,11 +254,28 @@ class _FakeClient:
         return {}
 
     def _make_request(self, endpoint, params=None, **_):
+        if str(endpoint).startswith("Document_СдельныйНаряд"):
+            import re
+            if str(endpoint).endswith("_Операции"):
+                order = re.search("guid'([^']+)'", (params or {}).get("$filter", "")).group(1)
+                rows = [{**row, "Ref_Key": ref} for ref, doc in self.docs.items() for row in doc.get("Операции", []) if row.get("ЗаказНаПроизводство_Key") == order]
+                skip = (params or {}).get("$skip", 0)
+                return {"value": rows[skip:skip + 250]}
+            if str(endpoint) == "Document_СдельныйНаряд":
+                marker = re.search(r"substringof\('([^']+)'", (params or {}).get("$filter", "")).group(1)
+                return {"value": [doc for doc in self.docs.values() if marker in doc.get("Комментарий", "")]}
+            ref = re.search("guid'([^']+)'", str(endpoint)).group(1)
+            return self.docs.get(ref, {})
         self.gets.append((endpoint, params or {}))
         return dict(self.parent_order_doc)
 
     def post_operation(self, operation_path):
         self.operations.append(operation_path)
+        if "Document_СдельныйНаряд" in operation_path:
+            import re
+            ref = re.search("guid'([^']+)'", operation_path).group(1)
+            if ref in self.docs:
+                self.docs[ref]["Posted"] = "/Unpost" not in operation_path
 
 
 class _PostFailsAfterCreateClient(_FakeClient):

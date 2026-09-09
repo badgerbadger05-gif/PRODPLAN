@@ -68,3 +68,8 @@ def manufacture_number(db: Session, manufacture: ProductionManufacture) -> str:
 def piecework_number(db: Session, manufacture: ProductionManufacture) -> str:
     """Return stable, bounded number for Document_СдельныйНаряд."""
     return f"PW{int(manufacture.manufacture_id) % 1_000_000_000:09d}"
+
+
+def standalone_piecework_number(command_id: int) -> str:
+    """Disjoint namespace from PW manufacture-backed labor commands."""
+    return f"PL{int(command_id) % 1_000_000_000:09d}"

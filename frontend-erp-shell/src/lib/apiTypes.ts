@@ -2545,6 +2545,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/orders/{product_id}/piecework-options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Standalone Piecework Options */
+        get: operations["get_standalone_piecework_options_api_v1_production_control_orders__product_id__piecework_options_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/production-control/orders/{product_id}/piecework": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post Standalone Piecework */
+        post: operations["post_standalone_piecework_api_v1_production_control_orders__product_id__piecework_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/purchase-control/orders": {
         parameters: {
             query?: never;
@@ -6581,6 +6615,46 @@ export interface components {
             /** Items */
             items: components["schemas"]["SpecificationSearchItemResponse"][];
             meta: components["schemas"]["SpecificationSearchMetaResponse"];
+        };
+        /** StandalonePieceworkOptionsResponse */
+        StandalonePieceworkOptionsResponse: {
+            /** Product Id */
+            product_id: number;
+            /** Item Name */
+            item_name: string;
+            /** Quantity */
+            quantity: number;
+            /** Unit */
+            unit?: string | null;
+            /** Operations */
+            operations: components["schemas"]["ProductionOperationOptionResponse"][];
+        };
+        /** StandalonePieceworkPayload */
+        StandalonePieceworkPayload: {
+            /** Qty */
+            qty: number;
+            /** Request Key */
+            request_key: string;
+            /** Operation Executors */
+            operation_executors: {
+                [key: string]: unknown;
+            }[];
+        };
+        /** StandalonePieceworkResultResponse */
+        StandalonePieceworkResultResponse: {
+            /** Status */
+            status: string;
+            /** Message */
+            message: string;
+            /** Product Id */
+            product_id: number;
+            /** Command Id */
+            command_id: number;
+            /**
+             * Created
+             * @default 0
+             */
+            created: number;
         };
         /** StockWarehouseListResponse */
         StockWarehouseListResponse: {
@@ -11528,6 +11602,72 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_standalone_piecework_options_api_v1_production_control_orders__product_id__piecework_options_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StandalonePieceworkOptionsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_standalone_piecework_api_v1_production_control_orders__product_id__piecework_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StandalonePieceworkPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StandalonePieceworkResultResponse"];
                 };
             };
             /** @description Validation Error */

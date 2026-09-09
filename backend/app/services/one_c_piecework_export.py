@@ -20,7 +20,7 @@ operation_ref is still accepted as a manual single-operation override.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -104,6 +104,7 @@ class PieceworkExportEntry:
     structural_unit_ref1c: Optional[str] = None
     employee_ref1c: Optional[str] = None
     employee_type: str = "employee"
+    characteristic_ref1c: Optional[str] = None
     document_datetime: Optional[str] = None
     target_ref_key: Optional[str] = None
     unpost_before_patch: bool = False
@@ -482,6 +483,7 @@ def _collect_export_entries(
             item_name=str(item.item_name or "") if item else "",
             unit_ref1c=_clean_ref1c(item.unit) if item else None,
             qty=float(m.qty or 0),
+            characteristic_ref1c=m.product.characteristic_ref1c,
             operation_ref1c=operation_defaults.operation_ref1c,
             time_norm=operation_defaults.time_norm,
             price=operation_defaults.price,
@@ -568,6 +570,8 @@ def _build_header_payload(
             "Нормочасы": float(entry.qty) * row_time_norm,
             "КлючСвязи": base_link_key + idx - 1,
         }
+        if entry.characteristic_ref1c:
+            operation_row["Характеристика_Key"] = entry.characteristic_ref1c
         if row_price > 0:
             operation_row["Расценка"] = row_price
             operation_row["Стоимость"] = float(entry.qty) * row_price
@@ -795,165 +799,52 @@ def export_piecework_to_1c(
     business_operation_ref: Optional[str] = None,
     dry_run: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Export selected ProductionManufactures to 1C as Document_СдельныйНаряд
-    The document is closed with the same Date/ДатаЗакрытия value and then
-    conducted through 1C OData Post. Idempotent via sync_link
-    (source_doctype='piecework').
-
-    Enforces the full chain: parent ProductionManufacture is auto-exported as
-    Document_СборкаЗапасов first (which itself ensures Document_ЗаказНаПроизводство
-    is in 1C), so the piecework order can carry a valid ДокументОснование.
-    """
-    parent_export = _chain_export_parent_manufactures(
-        db, list(manufacture_ids), dry_run=dry_run
-    )
+    """Export labor for production; reconcile actual 1C operations before writing."""
+    parent = _chain_export_parent_manufactures(db, list(manufacture_ids), dry_run=dry_run)
     entries, skipped = _collect_export_entries(db, list(manufacture_ids))
-
-    eligible: List[PieceworkExportEntry] = []
-    already_linked: List[PieceworkExportEntry] = []
+    result = {"status": "ok", "dry_run": dry_run, "entity": PIECEWORK_ENTITY,
+              "manufactures_requested": len(manufacture_ids), "manufactures_eligible": len(entries),
+              "manufactures_already_linked": 0, "manufactures_created": 0, "manufactures_error": 0,
+              "entries": [], "payloads": [], "piecework_price_lookup": [], "skipped_rows": skipped, "parent_manufactures_export": parent}
     for entry in entries:
-        link = _existing_link(db, entry.manufacture_id)
-        if link and link.status == "success" and (link.target_ref_key or ""):
+        previous_link = _existing_link(db, entry.manufacture_id)
+        if dry_run and previous_link and previous_link.status == "success" and previous_link.target_ref_key:
+            result["manufactures_eligible"] -= 1
+            result["manufactures_already_linked"] += 1
             entry.status = "existing"
-            entry.target_ref_key = str(link.target_ref_key)
-            entry.reason = "уже выгружен в 1С (sync_link)"
-            already_linked.append(entry)
+            result["entries"].append(asdict(entry))
             continue
-        if link and _clean_ref1c(link.target_ref_key):
-            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
-            # The previous attempt may have died after the document was created
-            # AND posted (e.g. the closing PATCH failed). 1C refuses to PATCH a
-            # posted document, so the retry must unpost it first — exactly as
-            # the manufacture exporter does.
-            entry.unpost_before_patch = True
-            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
-        eligible.append(entry)
-
-    summary: Dict[str, Any] = {
-        "status": "ok",
-        "dry_run": bool(dry_run),
-        "entity": PIECEWORK_ENTITY,
-        "manufactures_requested": len(manufacture_ids),
-        "manufactures_eligible": len(eligible),
-        "manufactures_already_linked": len(already_linked),
-        "manufactures_created": 0,
-        "manufactures_error": 0,
-        "skipped_rows": skipped,
-        "entries": [],
-        "parent_manufactures_export": parent_export,
-        "piecework_price_lookup": [],
-    }
-
-    config = _load_odata_config()
-    organization_ref = organization_ref or _config_ref1c(
-        config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C
-    )
-    structural_unit_ref = structural_unit_ref or _config_ref1c(
-        config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
-    )
-    price_type_ref = _piecework_price_type_ref(config)
-
-    payloads: List[Dict[str, Any]] = []
-    exportable: List[PieceworkExportEntry] = []
-    build_errors = 0
-    for entry in eligible:
-        # A single unusable выпуск (no spec operation) must not blow up the
-        # whole batch: mark that entry and keep exporting the rest.
+        if operation_ref:
+            entry.operation_lines = [PieceworkOperationLine(operation_ref1c=operation_ref,
+                time_norm=time_norm or entry.time_norm, price=price or entry.price,
+                employee_ref1c=entry.employee_ref1c, employee_type=entry.employee_type)]
         try:
-            payload = _build_header_payload(
-                entry,
-                operation_ref=operation_ref,
-                time_norm=time_norm,
-                price=price,
-                organization_ref=organization_ref,
-                structural_unit_ref=structural_unit_ref,
-                business_operation_ref=business_operation_ref,
-            )
-        except Exception as exc:  # noqa: BLE001 — per-entry isolation
-            entry.status = "error"
-            entry.error = str(exc)
-            build_errors += 1
+            if dry_run:
+                config = _load_odata_config()
+                payload = _build_header_payload(entry, operation_ref=operation_ref, time_norm=time_norm, price=price,
+                    organization_ref=organization_ref or _config_ref1c(config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C),
+                    structural_unit_ref=structural_unit_ref or entry.structural_unit_ref1c or _config_ref1c(
+                        config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C),
+                    business_operation_ref=business_operation_ref)
+                result["payloads"].append({"manufacture_id": entry.manufacture_id, "payload": payload})
+            else:
+                one = _export_checked_piecework(db, [entry], dry_run=False, organization_ref=organization_ref, structural_unit_ref=structural_unit_ref, business_operation_ref=business_operation_ref)
+                result["piecework_price_lookup"].extend(one.get("piecework_price_lookup", []))
+                result["manufactures_created"] += one["created"]
+                result["manufactures_error"] += one["errored"]
+                result["manufactures_already_linked"] += int(one["status"] == "existing")
+        except Exception as exc:
+            entry.status, entry.error = "error", str(exc)
+            result["manufactures_error"] += 1
             if not dry_run:
                 _record_manufacture_export_error(db, entry.manufacture_id, str(exc))
-                _upsert_link(
-                    db,
-                    entry=entry,
-                    payload_hash="",
-                    target_ref_key=_clean_ref1c(entry.target_ref_key) or None,
-                    status="error",
-                    last_error=str(exc),
-                )
-            continue
-        exportable.append(entry)
-        payloads.append({"manufacture_id": entry.manufacture_id, "number": entry.number, "payload": payload})
-
-    if build_errors and not dry_run:
-        db.commit()
-    eligible = exportable
-    summary["manufactures_error"] = build_errors
-    summary["status"] = "ok" if build_errors == 0 else "partial_error"
-
-    if dry_run:
-        summary["entries"] = [asdict(e) for e in entries]
-        summary["payloads"] = payloads
-        return summary
-
-    client = _create_odata_client(config, OData1CClient)
-    for entry, payload_envelope in zip(eligible, payloads):
-        price_lookup = _enrich_payload_prices_from_1c(
-            client,
-            entry,
-            payload_envelope["payload"],
-            price_type_ref=price_type_ref,
-        )
-        summary["piecework_price_lookup"].append(price_lookup)
-        _add_brigade_composition_to_payload(client, entry, payload_envelope["payload"])
-
-    def _mark_success(entry: PieceworkExportEntry, ref_key: str) -> None:
-        _post_document_operational(
-            client,
-            entity=PIECEWORK_ENTITY,
-            ref_key=ref_key,
-            unpost_first=False,
-        )
-        # 1C can move Date to the posting moment. Keep the business timestamp
-        # identical to creation time and mark the piecework document closed.
-        # The parent Document_ЗаказНаПроизводство is never touched: its state is
-        # set in 1C by the operator and only read back into PRODPLAN by the sync.
-        patch = getattr(client, "patch", None)
-        if patch is not None and entry.document_datetime:
-            patch(
-                f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
-                {
-                    "Date": entry.document_datetime,
-                    "Закрыт": True,
-                    "ДатаЗакрытия": entry.document_datetime,
-                },
-            )
-
-    def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
-        _record_manufacture_export_error(db, entry.manufacture_id, error)
-
-    created, errored = _post_export_entries(
-        db,
-        entries=zip(eligible, payloads),
-        client=client,
-        target_entity=PIECEWORK_ENTITY,
-        missing_ref_error=f"1C did not return Ref_Key for new {PIECEWORK_ENTITY}",
-        upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
-        on_success=_mark_success,
-        on_error=_mark_error,
-        log_error=lambda entry: (
-            f"[1C piecework export] manufacture_id={entry.manufacture_id} failed: {entry.error}"
-        ),
-    )
-
-    summary["manufactures_created"] = created
-    summary["manufactures_error"] = errored + build_errors
-    summary["entries"] = [asdict(e) for e in entries]
-    summary["status"] = "ok" if errored + build_errors == 0 else "partial_error"
-    return summary
+                _upsert_link(db, entry=entry, payload_hash="", target_ref_key=previous_link.target_ref_key if previous_link else None,
+                             status="error", last_error=str(exc))
+                db.commit()
+        result["entries"].append(asdict(entry))
+    if result["manufactures_error"]:
+        result["status"] = "partial_error"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1037,173 +928,302 @@ def export_chain_piecework_to_1c(
     business_operation_ref: Optional[str] = None,
     dry_run: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Один комбинированный Document_СдельныйНаряд на цепочку «окраска↔сварка».
-
-    Основание — окрасочная СборкаЗапасов; строки сварки и окраски несут каждая
-    свой ЗаказНаПроизводство_Key, участок и номенклатуру. Состояние самих
-    заказов экспорт не трогает — его ставит оператор в 1С, PRODPLAN только
-    читает его обратно синком. Идемпотентно: sync_link 'piecework' пишется на
-    оба manufacture с одним target_ref_key; повтор — no-op.
-    """
-    parent_export = _chain_export_parent_manufactures(
-        db,
-        [int(weld_manufacture_id), int(paint_manufacture_id)],
-        dry_run=dry_run,
-    )
-    entries, skipped = _collect_export_entries(
-        db, [int(weld_manufacture_id), int(paint_manufacture_id)]
-    )
-    entries_by_id = {int(entry.manufacture_id): entry for entry in entries}
-    weld_entry = entries_by_id.get(int(weld_manufacture_id))
-    paint_entry = entries_by_id.get(int(paint_manufacture_id))
-
-    summary: Dict[str, Any] = {
-        "status": "ok",
-        "dry_run": bool(dry_run),
-        "entity": PIECEWORK_ENTITY,
-        "combined": True,
-        "weld_manufacture_id": int(weld_manufacture_id),
-        "paint_manufacture_id": int(paint_manufacture_id),
-        "skipped_rows": skipped,
-        "parent_manufactures_export": parent_export,
-        "piecework_price_lookup": [],
-    }
-    if weld_entry is None or paint_entry is None:
-        summary["status"] = "error"
-        summary["error"] = "не собраны данные по обоим выпускам цепочки (см. skipped_rows)"
-        return summary
-
-    paint_link = _existing_link(db, paint_entry.manufacture_id)
-    weld_link = _existing_link(db, weld_entry.manufacture_id)
-    if paint_link and paint_link.status == "success" and (paint_link.target_ref_key or ""):
-        if not (weld_link and weld_link.status == "success"
-                and str(weld_link.target_ref_key or "") == str(paint_link.target_ref_key)):
-            summary["status"] = "error"
-            summary["error"] = "Наряд окраски не подтверждён как общий для обоих выпусков; требуется проверка связей"
-            return summary
-        summary["status"] = "existing"
-        summary["target_ref_key"] = str(paint_link.target_ref_key)
-        summary["reason"] = "комбинированный сдельный уже выгружен (sync_link)"
-        return summary
-    if weld_link and weld_link.status == "success" and (weld_link.target_ref_key or ""):
-        summary["status"] = "error"
-        summary["error"] = "сварочный выпуск уже закрыт отдельным сдельным нарядом"
-        return summary
-    if paint_link and _clean_ref1c(paint_link.target_ref_key):
-        paint_entry.target_ref_key = _clean_ref1c(paint_link.target_ref_key)
-        paint_entry.unpost_before_patch = True
-        paint_entry.reason = (
-            "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
-        )
-
-    config = _load_odata_config()
-    organization_ref = organization_ref or _config_ref1c(
-        config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C
-    )
-    default_structural_unit = _config_ref1c(
-        config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
-    )
-    price_type_ref = _piecework_price_type_ref(config)
-
-    # Один документ — один момент времени для обоих блоков.
-    when = _current_1c_datetime()
-    weld_entry.document_datetime = when
-    paint_entry.document_datetime = when
-
-    try:
-        weld_payload = _build_header_payload(
-            weld_entry,
-            operation_ref="",
-            organization_ref=organization_ref,
-            # участок построчно: сварочный блок — участок сварки
-            structural_unit_ref=weld_entry.structural_unit_ref1c or default_structural_unit,
-            business_operation_ref=business_operation_ref,
-        )
-        paint_payload = _build_header_payload(
-            paint_entry,
-            operation_ref="",
-            organization_ref=organization_ref,
-            structural_unit_ref=paint_entry.structural_unit_ref1c or default_structural_unit,
-            business_operation_ref=business_operation_ref,
-        )
-    except Exception as exc:  # noqa: BLE001 — вернуть диагностику, а не 500
-        summary["status"] = "error"
-        summary["error"] = str(exc)
-        return summary
-    combined = _merge_chain_payloads(weld_payload=weld_payload, paint_payload=paint_payload)
-    payload_envelope = {
-        "manufacture_id": paint_entry.manufacture_id,
-        "number": paint_entry.number,
-        "payload": combined,
-    }
-
+    """Complete only unpaid operations; separate weld labor is retained in 1C."""
+    parent = _chain_export_parent_manufactures(db, [weld_manufacture_id, paint_manufacture_id], dry_run=dry_run)
+    entries, skipped = _collect_export_entries(db, [weld_manufacture_id, paint_manufacture_id])
+    by_id = {entry.manufacture_id: entry for entry in entries}
+    if any(mid not in by_id for mid in (weld_manufacture_id, paint_manufacture_id)):
+        return {"status": "error", "error": "не собраны данные по обоим выпускам цепочки", "skipped_rows": skipped}
+    ordered = [by_id[weld_manufacture_id], by_id[paint_manufacture_id]]
     if dry_run:
-        summary["entries"] = [asdict(weld_entry), asdict(paint_entry)]
-        summary["payloads"] = [payload_envelope]
+        config = _load_odata_config()
+        payloads = [_build_header_payload(entry, operation_ref="",
+            organization_ref=organization_ref or _config_ref1c(config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C),
+            structural_unit_ref=entry.structural_unit_ref1c or _config_ref1c(
+                config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C),
+            business_operation_ref=business_operation_ref) for entry in ordered]
+        payload = _merge_chain_payloads(weld_payload=payloads[0], paint_payload=payloads[1])
+        return {"status": "ok", "combined": True, "dry_run": True, "entries": [asdict(e) for e in ordered],
+                "payloads": [{"payload": payload}], "parent_manufactures_export": parent}
+    try:
+        result = _export_checked_piecework(db, ordered, dry_run=False, combined=True)
+    except ValueError as exc:
+        return {"status": "error", "error": str(exc)}
+    result["parent_manufactures_export"] = parent
+    return result
+
+
+# Labor coverage is a document-write guard, never a source of production facts.
+def _labor_key(row):
+    def key(name):
+        value = _clean_ref1c(row.get(name)).lower()
+        return "" if value == EMPTY_REF1C else value
+    return tuple(key(name) for name in (
+        "ЗаказНаПроизводство_Key", "Номенклатура_Key", "Характеристика_Key", "Операция_Key", "Этап_Key",
+    ))
+
+
+def _read_piecework_rows(client, order_refs, *, retry_ref=None):
+    """Read every matching line, including weld rows in a painted-header document."""
+    import math
+    rows, docs = [], {}
+    for order_ref in sorted(set(order_refs)):
+        for page in range(100):
+            response = client._make_request(PIECEWORK_ENTITY + "_Операции", params={
+                "$filter": f"ЗаказНаПроизводство_Key eq guid'{order_ref}'",
+                "$orderby": "Ref_Key,LineNumber", "$top": 250, "$skip": page * 250,
+            })
+            if not isinstance(response, dict) or not isinstance(response.get("value"), list):
+                raise ValueError("1С не вернула полный список операций сдельных нарядов")
+            batch = response["value"]
+            for row in batch:
+                if _clean_ref1c(row.get("ЗаказНаПроизводство_Key")).lower() != order_ref.lower():
+                    raise ValueError("1С вернула операции другого заказа")
+                ref = _clean_ref1c(row.get("Ref_Key"))
+                if not ref:
+                    raise ValueError("У операции сдельного наряда нет ссылки на документ")
+                if ref not in docs:
+                    docs[ref] = client._make_request(f"{PIECEWORK_ENTITY}(guid'{ref}')")
+                doc = docs[ref]
+                if not isinstance(doc, dict) or "Posted" not in doc or "DeletionMark" not in doc:
+                    raise ValueError("1С не подтвердила состояние сдельного наряда")
+                if doc["DeletionMark"] is True:
+                    continue
+                if "КоличествоФакт" not in row:
+                    raise ValueError("1С не вернула количество операции")
+                qty = float(row.get("КоличествоФакт") or 0)
+                if not math.isfinite(qty) or qty < 0:
+                    raise ValueError("Некорректное количество операции в сдельном наряде 1С")
+                if doc["Posted"] is not True:
+                    if ref == retry_ref:
+                        continue
+                    row = {**row, "_unposted": True}
+                rows.append({**row, "_qty": qty, "_ref": ref})
+            if len(batch) < 250:
+                break
+        else:
+            raise ValueError("Список сдельных нарядов усечён; создание заблокировано")
+    return rows
+
+
+def _missing_piecework_payload(entry, payload, existing_rows, target_qty):
+    import math
+    missing, references = [], set()
+    keys = [_labor_key(row) for row in payload["Операции"]]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Операция повторяется в спецификации без отличающегося этапа; требуется уточнение")
+    for row in payload["Операции"]:
+        key = _labor_key(row)
+        covered = 0.0
+        for previous in existing_rows:
+            previous_key = _labor_key(previous)
+            # A manual row without a stage can match only one requested stage.
+            matches = previous_key == key
+            if not previous_key[-1] and previous_key[:-1] == key[:-1]:
+                if sum(candidate[:-1] == key[:-1] for candidate in keys) > 1:
+                    raise ValueError("В наряде 1С не указан этап повторяющейся операции")
+                matches = True
+            if not matches:
+                continue
+            if previous.get("_unposted"):
+                raise ValueError(f"Есть непроведённый сдельный наряд {previous['_ref']}; проведите или отмените его в 1С")
+            covered += previous["_qty"]
+            references.add(previous["_ref"])
+        qty = min(float(row["КоличествоФакт"]), max(float(target_qty) - covered, 0.0))
+        if not math.isfinite(qty):
+            raise ValueError("Некорректное количество сдельного наряда")
+        if qty <= 1e-6:
+            continue
+        missing.append({**row, "КоличествоПлан": qty, "КоличествоФакт": qty,
+                        "Нормочасы": qty * float(row.get("НормаВремени") or 0),
+                        "Стоимость": qty * float(row.get("Расценка") or 0)})
+    for index, row in enumerate(missing, 1):
+        row["LineNumber"] = index
+    return {**payload, "Операции": missing}, sorted(references)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _piecework_write_lock(db, order_ids):
+    """Session locks survive exporter commits and serialize both UI commands."""
+    from sqlalchemy import text
+    if db.get_bind().dialect.name != "postgresql":
+        yield
+        return
+    with db.get_bind().connect() as connection:
+        locked = []
+        try:
+            for order_id in sorted(set(order_ids)):
+                if not connection.execute(text("SELECT pg_try_advisory_lock(87123, :id)"), {"id": int(order_id)}).scalar():
+                    raise ValueError("По этому заказу уже оформляется сдельный наряд. Повторите после завершения операции.")
+                locked.append(order_id)
+            yield
+        finally:
+            for order_id in reversed(locked):
+                connection.execute(text("SELECT pg_advisory_unlock(87123, :id)"), {"id": int(order_id)})
+
+
+def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalone=False, organization_ref=None, structural_unit_ref=None, business_operation_ref=None):
+    """One writer for standalone labor, single manufacture and combined chain."""
+    from sqlalchemy import func
+    config = _load_odata_config()
+    client = _create_odata_client(config, OData1CClient)
+    source_doctype = "standalone_piecework" if standalone else "piecework"
+    with _piecework_write_lock(db, [entry.order_id for entry in entries]):
+        payloads = []
+        existing_refs = {}
+        target = entries[-1]
+        link = _find_sync_link(db, SyncLink, source_doctype=source_doctype,
+                              source_id=target.manufacture_id, target_entity=PIECEWORK_ENTITY)
+        retry_ref = _clean_ref1c(link.target_ref_key) if link else ""
+        # Recover POST-after-timeout by stable identity, including unposted headers.
+        marker = f"PRODPLAN source={source_doctype}/{target.manufacture_id};"
+        found = client._make_request(PIECEWORK_ENTITY, params={
+            "$filter": f"substringof('{marker}', Комментарий)", "$top": 2,
+        })
+        if not isinstance(found, dict) or not isinstance(found.get("value"), list):
+            raise ValueError("1С не подтвердила поиск ранее созданного сдельного наряда")
+        candidates = [doc for doc in found["value"] if doc.get("DeletionMark") is not True]
+        if len(candidates) > 1:
+            raise ValueError("В 1С несколько нарядов одной команды; требуется проверка")
+        if candidates:
+            retry_ref = _clean_ref1c(candidates[0].get("Ref_Key"))
+        live = _read_piecework_rows(client, [e.order_ref1c for e in entries], retry_ref=retry_ref)
+        for entry in entries:
+            payload = _build_header_payload(entry, operation_ref="", business_operation_ref=business_operation_ref, organization_ref=organization_ref or _config_ref1c(
+                config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C),
+                structural_unit_ref=structural_unit_ref or entry.structural_unit_ref1c or _config_ref1c(
+                    config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C))
+            target_qty = entry.qty if standalone else float(db.query(func.sum(ProductionManufacture.qty)).filter(
+                ProductionManufacture.product_id == entry.product_id,
+                ProductionManufacture.manufacture_id <= entry.manufacture_id,
+                ProductionManufacture.status != "cancelled").scalar() or 0)
+            payload, refs = _missing_piecework_payload(entry, payload, live, target_qty)
+            existing_refs[entry.manufacture_id] = refs
+            payloads.append(payload)
+        payload = _merge_chain_payloads(weld_payload=payloads[0], paint_payload=payloads[1]) if combined else payloads[0]
+        payload["Комментарий"] = marker + (f" order_id={target.order_id}; product_id={target.product_id}" if standalone else " " + str(payload.get("Комментарий") or ""))
+        summary = {"status": "ok", "dry_run": dry_run, "entries": [asdict(e) for e in entries],
+                   "payloads": [payload] if payload["Операции"] else [], "created": 0, "errored": 0,
+                   "manufactures_created": 0, "manufactures_error": 0, "covered_refs": existing_refs}
+        if dry_run:
+            return summary
+
+        def save_links(*, entry, payload_hash, target_ref_key, status, last_error):
+            for index, current in enumerate(entries):
+                ref = target_ref_key if payloads[index]["Операции"] else next(iter(existing_refs[current.manufacture_id]), None)
+                _upsert_sync_link(db, SyncLink, source_doctype=source_doctype,
+                    source_id=current.manufacture_id, target_entity=PIECEWORK_ENTITY,
+                    target_number=target.number, payload_hash=payload_hash,
+                    target_ref_key=ref, status=status, last_error=last_error)
+
+        if not payload["Операции"]:
+            save_links(entry=target, payload_hash="live-coverage", target_ref_key=retry_ref,
+                       status="success", last_error=None)
+            db.commit()
+            for entry in entries:
+                entry.status = "existing"
+                entry.target_ref_key = next(iter(existing_refs[entry.manufacture_id]), None)
+            summary.update(status="existing", target_ref_key=entries[-1].target_ref_key,
+                           entries=[asdict(e) for e in entries], message="Операции уже оформлены в 1С; новый наряд не создан")
+            return summary
+        if retry_ref:
+            doc = client._make_request(f"{PIECEWORK_ENTITY}(guid'{retry_ref}')")
+            if doc.get("Posted") is True and not doc.get("DeletionMark"):
+                raise ValueError("Ранее созданный наряд проведён, но не покрывает выбранные операции; требуется проверка")
+            target.target_ref_key = retry_ref
+            target.unpost_before_patch = False
+        summary["piecework_price_lookup"] = [_enrich_payload_prices_from_1c(client, target, payload, price_type_ref=_piecework_price_type_ref(config))]
+        _add_brigade_composition_to_payload(client, target, payload)
+
+        def posted(entry, ref):
+            _post_document_operational(client, entity=PIECEWORK_ENTITY, ref_key=ref, unpost_first=False)
+            client.patch(f"{PIECEWORK_ENTITY}(guid'{ref}')", {
+                "Date": entry.document_datetime, "Закрыт": True, "ДатаЗакрытия": entry.document_datetime})
+            doc = client._make_request(f"{PIECEWORK_ENTITY}(guid'{ref}')")
+            if doc.get("Posted") is not True or doc.get("DeletionMark") is not False:
+                raise ValueError("1С не подтвердила проведение сдельного наряда")
+            for wanted in payload["Операции"]:
+                actual = sum(float(row.get("КоличествоФакт") or 0) for row in doc.get("Операции", []) if _labor_key(row) == _labor_key(wanted))
+                if abs(actual - float(wanted["КоличествоФакт"])) > 1e-6:
+                    raise ValueError("1С не подтвердила количество операции в сдельном наряде")
+
+        def failed(entry, error):
+            if not standalone:
+                for current in entries:
+                    _record_manufacture_export_error(db, current.manufacture_id, error)
+
+        created, errors = _post_export_entries(db, entries=[(target, {"payload": payload})], client=client,
+            target_entity=PIECEWORK_ENTITY, missing_ref_error="1С не вернула ссылку на наряд",
+            upsert_link=save_links, on_success=posted, on_error=failed)
+        for index, entry in enumerate(entries):
+            entry.target_ref_key = target.target_ref_key if payloads[index]["Операции"] else next(iter(existing_refs[entry.manufacture_id]), None)
+        summary.update(status="ok" if not errors else "partial_error", created=created, errored=errors,
+            manufactures_created=created, manufactures_error=errors, target_ref_key=target.target_ref_key,
+            entries=[asdict(e) for e in entries], message="Сдельный наряд оформлен; уже оплаченные операции исключены")
         return summary
 
-    client = _create_odata_client(config, OData1CClient)
-    summary["piecework_price_lookup"].append(
-        _enrich_payload_prices_from_1c(client, paint_entry, combined, price_type_ref=price_type_ref)
-    )
-    _add_brigade_composition_to_payload(client, paint_entry, combined)
 
-    def _upsert_links(*, entry: PieceworkExportEntry, payload_hash: str, target_ref_key: Optional[str], status: str, last_error: Optional[str]) -> None:
-        # Один 1С-документ на оба выпуска: линк на каждый manufacture, чтобы
-        # штатный export_piecework_to_1c не создал дубль ни по одной стороне.
-        for manufacture_id in (int(weld_entry.manufacture_id), int(paint_entry.manufacture_id)):
-            _upsert_sync_link(
-                db,
-                SyncLink,
-                source_doctype="piecework",
-                source_id=manufacture_id,
-                target_entity=PIECEWORK_ENTITY,
-                target_number=paint_entry.number,
-                payload_hash=payload_hash,
-                target_ref_key=target_ref_key,
-                status=status,
-                last_error=last_error,
-            )
+def standalone_piecework_product(db, product_id):
+    """The separate button targets welding when either linked side is selected."""
+    from ..models import PaintWeldChainLink
+    product = db.get(ProductionProduct, int(product_id))
+    if product is None:
+        raise ValueError("Строка заказа не найдена")
+    link = db.query(PaintWeldChainLink).filter(
+        (PaintWeldChainLink.painted_order_id == product.order_id)
+        | (PaintWeldChainLink.welded_order_id == product.order_id)).one_or_none()
+    if link is not None:
+        from .paint_weld_chain import _chain_link_for_product
+        _, _, product = _chain_link_for_product(db, product_id)
+    return product
 
-    def _mark_success(entry: PieceworkExportEntry, ref_key: str) -> None:
-        _post_document_operational(
-            client,
-            entity=PIECEWORK_ENTITY,
-            ref_key=ref_key,
-            unpost_first=False,
-        )
-        patch = getattr(client, "patch", None)
-        if patch is not None and when:
-            patch(
-                f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
-                {"Date": when, "Закрыт": True, "ДатаЗакрытия": when},
-            )
-        # Состояние заказов цепочки не пишется: заказ закрывает оператор в 1С,
-        # PRODPLAN узнаёт об этом только read-back синком.
 
-    def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
-        for chain_entry in (weld_entry, paint_entry):
-            _record_manufacture_export_error(db, chain_entry.manufacture_id, error)
-
-    created, errored = _post_export_entries(
-        db,
-        entries=[(paint_entry, payload_envelope)],
-        client=client,
-        target_entity=PIECEWORK_ENTITY,
-        missing_ref_error=f"1C did not return Ref_Key for new {PIECEWORK_ENTITY}",
-        upsert_link=_upsert_links,
-        on_success=_mark_success,
-        on_error=_mark_error,
-        log_error=lambda entry: (
-            f"[1C chain piecework export] manufactures=({weld_manufacture_id},{paint_manufacture_id}) "
-            f"failed: {entry.error}"
-        ),
-    )
-
-    summary["created"] = created
-    summary["errored"] = errored
-    summary["entries"] = [asdict(weld_entry), asdict(paint_entry)]
-    summary["target_ref_key"] = paint_entry.target_ref_key
-    summary["status"] = "ok" if errored == 0 else "partial_error"
-    return summary
+def create_standalone_piecework(db, product_id, *, qty, operation_executors, request_key):
+    import math
+    from ..models import ProductionPieceworkCommand
+    from .planning_truth import require_accepted_truth
+    require_accepted_truth(db, "standalone_piecework_command")
+    product = standalone_piecework_product(db, product_id)
+    if not product.order.order_ref1c or product.order.deletion_mark:
+        raise ValueError("Для сдельного нужен существующий заказ в 1С")
+    if not math.isfinite(qty) or qty <= 0:
+        raise ValueError("Количество должно быть положительным")
+    if not operation_executors:
+        raise ValueError("Выберите хотя бы одну операцию и исполнителя")
+    command = db.query(ProductionPieceworkCommand).filter_by(request_key=request_key).one_or_none()
+    if command is None:
+        command = ProductionPieceworkCommand(product_id=product.product_id, request_key=request_key,
+                    target_qty=qty, operation_executors=operation_executors)
+        db.add(command)
+        db.flush()
+    elif command.product_id != product.product_id or float(command.target_qty) != qty or command.operation_executors != operation_executors:
+        raise ValueError("Параметры повторной команды изменились. Откройте новый диалог.")
+    defaults = _piecework_operation_defaults(db, product)
+    by_id = {line.spec_operation_id: line for line in defaults.operation_lines}
+    selected, seen = [], set()
+    for row in command.operation_executors:
+        spec_id = row.get("spec_operation_id")
+        if spec_id not in by_id or spec_id in seen:
+            raise ValueError("Выбрана чужая или повторяющаяся операция спецификации")
+        seen.add(spec_id)
+        employee = db.query(Employee).filter_by(employee_ref1c=row.get("employee_ref1c"), deletion_mark=False).one_or_none()
+        if employee is None:
+            raise ValueError("Исполнитель операции не найден")
+        selected.append(replace(by_id[spec_id], employee_ref1c=employee.employee_ref1c,
+                                employee_type=employee.employee_type or "employee"))
+    from .one_c_document_numbers import standalone_piecework_number
+    entry = PieceworkExportEntry(manufacture_id=command.id, product_id=product.product_id,
+        order_id=product.order_id, order_ref1c=product.order.order_ref1c, basis_ref1c=None,
+        item_ref1c=product.item.item_ref1c, item_name=product.item.item_name,
+        unit_ref1c=product.item.unit, qty=float(command.target_qty), number=standalone_piecework_number(command.id),
+        spec_ref1c=defaults.spec_ref1c, characteristic_ref1c=product.characteristic_ref1c,
+        structural_unit_ref1c=defaults.structural_unit_ref1c, operation_lines=selected)
+    db.commit()
+    result = _export_checked_piecework(db, [entry], dry_run=False, standalone=True)
+    if result.get("errored"):
+        raise ValueError(entry.error or "Не удалось оформить сдельный наряд; повторите ту же команду")
+    return {**result, "product_id": product.product_id, "command_id": command.id,
+            "message": result["message"] + ". Производство и закрытие заказа не выполнялись."}

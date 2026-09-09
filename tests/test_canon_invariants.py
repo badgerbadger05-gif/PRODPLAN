@@ -635,17 +635,12 @@ def test_direct_1c_writer_registry_is_exact() -> None:
         ),
         (
             "backend/app/services/one_c_piecework_export.py",
-            "export_piecework_to_1c",
+            "_export_checked_piecework",
             "_post_export_entries",
         ),
         (
             "backend/app/services/one_c_piecework_export.py",
-            "export_chain_piecework_to_1c",
-            "_post_export_entries",
-        ),
-        (
-            "backend/app/services/one_c_piecework_export.py",
-            "_mark_success",
+            "posted",
             "patch",
         ),
         (

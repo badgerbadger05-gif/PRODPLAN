@@ -2111,3 +2111,48 @@ def post_print_route_sheets(
 
 
 router.include_router(settings_router)
+
+
+class StandalonePieceworkPayload(BaseModel):
+    qty: float = Field(gt=0, allow_inf_nan=False)
+    request_key: str = Field(min_length=1, max_length=100)
+    operation_executors: List[dict] = Field(min_length=1)
+
+
+class StandalonePieceworkOptionsResponse(BaseModel):
+    product_id: int
+    item_name: str
+    quantity: float
+    unit: Optional[str] = None
+    operations: List[ProductionOperationOptionResponse]
+
+
+class StandalonePieceworkResultResponse(BaseModel):
+    status: str
+    message: str
+    product_id: int
+    command_id: int
+    created: int = 0
+
+
+@router.get("/orders/{product_id}/piecework-options", response_model=StandalonePieceworkOptionsResponse)
+def get_standalone_piecework_options(product_id: int, db: Session = Depends(get_db)):
+    from app.services.one_c_piecework_export import standalone_piecework_product
+    try:
+        product = standalone_piecework_product(db, product_id)
+        operations = get_order_line_operations(product.product_id, db)
+        return {"product_id": product.product_id, "item_name": product.item.item_name,
+                "quantity": float(product.quantity), "unit": product.item.unit,
+                "operations": operations["rows"]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/orders/{product_id}/piecework", response_model=StandalonePieceworkResultResponse)
+def post_standalone_piecework(product_id: int, payload: StandalonePieceworkPayload, db: Session = Depends(get_db)):
+    from app.services.one_c_piecework_export import create_standalone_piecework
+    try:
+        return create_standalone_piecework(db, product_id, qty=payload.qty,
+            operation_executors=payload.operation_executors, request_key=payload.request_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

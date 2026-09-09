@@ -23,6 +23,8 @@ vi.mock('../../services/productionControl', () => ({
   materializeMakeWorkItems: vi.fn(),
   openPaintWeldChains: vi.fn(),
   closePaintWeldChain: vi.fn(),
+  getStandalonePieceworkOptions: vi.fn(),
+  createStandalonePiecework: vi.fn(),
   saveProductionControlSettings: vi.fn(),
   getOrderMaterials: vi.fn(),
   getWorkItemMaterials: vi.fn(),
@@ -68,6 +70,8 @@ import {
   materializeMakeWorkItems,
   openPaintWeldChains,
   closePaintWeldChain,
+  getStandalonePieceworkOptions,
+  createStandalonePiecework,
   updateOrderQuantity,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
@@ -1525,4 +1529,36 @@ describe('ProductionControlPage — characterization', () => {
     })
     expect(await screen.findByText('В журнале производства нет заказов')).toBeVisible()
   })
+  it('opens bright pink standalone labor dialog and sends only selected operations', async () => {
+    vi.mocked(getStandalonePieceworkOptions).mockResolvedValue({
+      product_id: 501, item_name: 'Сварная деталь', quantity: 10,
+      operations: [
+        { spec_operation_id: 51, operation_id: 61, line_number: 1, operation_name: 'Сварка' },
+        { spec_operation_id: 52, operation_id: 62, line_number: 2, operation_name: 'Зачистка' },
+      ],
+    } as never)
+    vi.mocked(createStandalonePiecework).mockResolvedValue({ status: 'ok', message: 'Наряд сварки оформлен' } as never)
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    const button = screen.getByRole('button', { name: 'Сдельный наряд' })
+    expect(button).toHaveStyle({ background: '#ff38a4' })
+    await user.click(button)
+    const dialog = await screen.findByRole('dialog')
+    await within(dialog).findByText(/Сдельный наряд - Сварная деталь/)
+    expect(within(dialog).queryByRole('checkbox', { name: 'Частичный выпуск' })).toBeNull()
+    await user.click(within(dialog).getByRole('checkbox', { name: 'Оформить операцию Зачистка' }))
+    await user.selectOptions(within(dialog).getAllByRole('combobox')[0], 'E1')
+    await user.clear(within(dialog).getByRole('spinbutton'))
+    await user.type(within(dialog).getByRole('spinbutton'), '6')
+    await user.click(within(dialog).getByRole('button', { name: 'Создать сдельный наряд' }))
+    await waitFor(() => expect(createStandalonePiecework).toHaveBeenCalledWith(101, {
+      qty: 6, request_key: expect.any(String),
+      operation_executors: [{ spec_operation_id: 51, operation_id: 61, line_number: 1, employee_ref1c: 'E1' }],
+    }))
+    expect(produceOrderLine).not.toHaveBeenCalled()
+    expect(closePaintWeldChain).not.toHaveBeenCalled()
+  })
+
 })

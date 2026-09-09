@@ -156,6 +156,7 @@ class _FakeClient:
         self.ref_key = ref_key
         self.fail = fail
         self.prices = prices or {}
+        self.docs = {}
         self.posts: list = []
         self.patches: list = []
         self.operations: list = []
@@ -165,19 +166,40 @@ class _FakeClient:
         self.posts.append((entity, payload))
         if self.fail:
             raise RuntimeError("simulated 1C failure")
+        self.docs[self.ref_key] = {**payload, "Ref_Key": self.ref_key, "DeletionMark": False}
         return {"Ref_Key": self.ref_key}
 
     def patch(self, entity_ref, payload, **_):
         self.patches.append((entity_ref, payload))
+        import re
+        ref = re.search("guid'([^']+)'", entity_ref).group(1)
+        self.docs.setdefault(ref, {"Ref_Key": ref, "DeletionMark": False}).update(payload)
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {}
 
     def post_operation(self, operation_path):
         self.operations.append(operation_path)
+        import re
+        ref = re.search("guid'([^']+)'", operation_path).group(1)
+        if ref in self.docs:
+            self.docs[ref]["Posted"] = "/Unpost" not in operation_path
 
     def _make_request(self, endpoint, params=None, **_):
         self.requests.append((endpoint, params or {}))
+        if str(endpoint).startswith("Document_СдельныйНаряд"):
+            import re
+            if str(endpoint).endswith("_Операции"):
+                order = re.search("guid'([^']+)'", (params or {}).get("$filter", "")).group(1)
+                rows = [{**row, "Ref_Key": ref} for ref, doc in self.docs.items() for row in doc.get("Операции", []) if row.get("ЗаказНаПроизводство_Key") == order]
+                skip = (params or {}).get("$skip", 0)
+                return {"value": rows[skip:skip + 250]}
+            if str(endpoint) == "Document_СдельныйНаряд":
+                marker = re.search(r"substringof\('([^']+)'", (params or {}).get("$filter", "")).group(1)
+                return {"value": [doc for doc in self.docs.values() if marker in doc.get("Комментарий", "")]}
+            ref = re.search("guid'([^']+)'", str(endpoint)).group(1)
+            return self.docs.get(ref, {})
+
         if "InformationRegister_ЦеныНоменклатуры" in endpoint:
             query = str((params or {}).get("$filter") or "")
             for operation_ref, price in self.prices.items():
@@ -630,7 +652,6 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     assert fake.patches[0][0] == "Document_СдельныйНаряд(guid'existing-ref')"
     # 1C refuses to PATCH a posted document: the retry unposts it first.
     assert fake.operations == [
-        "Document_СдельныйНаряд(guid'existing-ref')/Unpost",
         "Document_СдельныйНаряд(guid'existing-ref')/Post?PostingModeOperational=true",
     ]
     assert fake.patches[1][0] == "Document_СдельныйНаряд(guid'existing-ref')"
