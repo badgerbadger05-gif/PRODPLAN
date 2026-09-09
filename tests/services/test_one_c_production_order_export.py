@@ -165,6 +165,9 @@ class _FakeClient:
         self.get_calls.append((entity, kwargs))
         return list(self.existing_docs)
 
+    def _make_request(self, endpoint, **kwargs):
+        return {"СостояниеЗаказа_Key": self.patches[-1][1]["СостояниеЗаказа_Key"]}
+
     def post(self, entity, payload, **_kwargs):
         self.posts.append((entity, payload))
         if self.fail:
@@ -1144,7 +1147,7 @@ def test_close_uses_canonical_done_defaults_when_optional_config_is_absent():
     }
 
 
-def test_close_live_writes_patch_to_1c_without_mutating_local_order(db_session, monkeypatch):
+def test_close_live_reads_confirmed_state_back_to_local_order(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PXC", ref1c="dddddddd-dddd-dddd-dddd-dddddddddddd")
     run = _mk_run(db)
@@ -1177,7 +1180,7 @@ def test_close_live_writes_patch_to_1c_without_mutating_local_order(db_session, 
     unchanged = db.get(ProductionOrder, order.order_id)
     assert unchanged is not None
     assert unchanged.deletion_mark is False
-    assert unchanged.order_state_key == order.order_state_key
+    assert unchanged.order_state_key == "done-state-ref"
 
 
 def test_close_fails_closed_when_link_missing_or_ineligible(db_session, monkeypatch):
@@ -1220,3 +1223,48 @@ def test_close_uses_done_variant_fallback_when_config_value_is_empty(db_session,
 
     assert result["orders_eligible"] == 1
     assert result["payloads"][0]["payload"]["ВариантЗавершения"] == exporter.DONE_VARIANT_VALUE
+
+@pytest.mark.parametrize("mode", ["single", "chain", "partial", "missing_piecework", "readback_mismatch", "under", "over", "explicit_partial"])
+def test_produce_finalization_requires_complete_documents_and_confirms_order_state(db_session, monkeypatch, mode):
+    db = db_session
+    run = _mk_run(db)
+    orders = []
+    mids = []
+    for index in range(2 if mode == "chain" else 1):
+        item = _mk_item(db, code=f"FINAL-{mode}-{index}", ref1c=f"item-final-{index}")
+        order = _mk_mrp_order(db, item, run_id=run.run_id, qty=2)
+        order.order_ref1c = f"order-final-{index}"
+        _mk_sync_link_for_order(db, order, target_ref_key=order.order_ref1c)
+        product = db.query(models.ProductionProduct).filter_by(order_id=order.order_id).one()
+        manufacture = models.ProductionManufacture(
+            order_id=order.order_id, product_id=product.product_id,
+            complete_order=False if mode == "explicit_partial" else (True if mode in {"under", "over"} else None),
+            qty=1 if mode in {"partial", "under"} else (3 if mode == "over" else 2), status="exported", exported_ref1c=f"assembly-final-{index}",
+        )
+        db.add(manufacture)
+        db.flush()
+        if mode != "missing_piecework":
+            db.add(models.SyncLink(source_doctype="piecework", source_id=manufacture.manufacture_id,
+                                   target_entity="Document_СдельныйНаряд", target_ref_key=f"piecework-final-{index}", status="success"))
+        orders.append(order)
+        mids.append(manufacture.manufacture_id)
+    db.commit()
+    _stub_close_config(monkeypatch, base_url="http://test/odata")
+    fake = _FakeClient()
+    if mode == "readback_mismatch":
+        fake._make_request = lambda *a, **kw: {"СостояниеЗаказа_Key": "still-open"}
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+    result = exporter.finalize_produced_orders_to_1c(db, [o.order_id for o in orders], manufacture_ids=mids)
+    if mode in {"single", "chain", "under", "over"}:
+        assert result["orders_closed"] == len(orders)
+        assert len(fake.patches) == len(orders)
+        assert all(o.order_state_key == "done-state-ref" for o in orders)
+    elif mode in {"partial", "explicit_partial"}:
+        assert result["status"] == "partial_production"
+        assert not fake.patches
+    else:
+        assert result["resume_required"] is True
+        assert result["orders_closed"] == 0
+        if mode == "missing_piecework":
+            assert not fake.patches
+        assert all(o.order_state_key is None for o in orders)

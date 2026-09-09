@@ -45,6 +45,8 @@ class ChainClosePayload(BaseModel):
     """Закрытие цепочки из окна журнала (этап 4): любая сторона цепочки."""
 
     product_id: int
+    partial: bool = False
+    request_key: Optional[str] = None
     weld_qty: Optional[float] = None
     paint_qty: Optional[float] = None
     executor: Optional[str] = None
@@ -156,6 +158,8 @@ async def chain_close(payload: ChainClosePayload, db: Session = Depends(get_db))
         return close_paint_chain(
             db,
             product_id=int(payload.product_id),
+            partial=payload.partial,
+            request_key=payload.request_key,
             weld_qty=payload.weld_qty,
             paint_qty=payload.paint_qty,
             executor=payload.executor,

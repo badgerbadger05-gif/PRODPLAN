@@ -1156,7 +1156,7 @@ def test_repeat_produce_resumes_when_piecework_order_is_missing(db_session, monk
         db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 1
     )
 
-    # Once the наряд exists, the line is fully commanded again — no more resume.
+    # Once the piecework exists, retry must continue order completion without another assembly.
     db.add(SyncLink(
         source_doctype="piecework",
         source_id=mid,
@@ -1168,8 +1168,18 @@ def test_repeat_produce_resumes_when_piecework_order_is_missing(db_session, monk
     ))
     db.commit()
 
-    with pytest.raises(ValueError, match="весь объём"):
-        produce_line(db, product.product_id, qty=6)
+    closing = produce_line(db, product.product_id, qty=6)
+    assert closing["resumed"] is True
+    assert closing["manufacture_id"] == mid
+    assert "завершаем заказ" in closing["resume_reason"]
+    assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 1
+    from app.services.production_control_common import DONE_STATE_KEY
+    product.order.order_state_key = DONE_STATE_KEY
+    db.commit()
+    # One side may already be closed when the other side's close failed.
+    chain_retry = produce_line(db, product.product_id, qty=6, allow_paint_weld_chain=True)
+    assert chain_retry["resumed"] is True
+    assert chain_retry["manufacture_id"] == mid
 
 
 def test_export_failure_detail_surfaces_skipped_rows():
@@ -1629,3 +1639,71 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
         Decimal("2"),
         Decimal("5"),
     ]
+
+
+@pytest.mark.parametrize("qty", [7, 11])
+def test_actual_quantity_completion_retry_and_partial_new_command(db_session, qty):
+    db = db_session
+    product = _mk_product(db, _mk_item(db, code=f"ACTUAL-{qty}"), qty=10)
+    first = produce_line(db, product.product_id, qty=qty, complete_order=False, request_key="shift-1")
+    m = db.get(ProductionManufacture, first["manufacture_id"])
+    m.status = "exported"
+    m.exported_ref1c = "first-assembly"
+    db.add(SyncLink(source_doctype="piecework", source_id=m.manufacture_id,
+                    target_entity=piecework_exporter.PIECEWORK_ENTITY, target_ref_key="first-piecework", status="success"))
+    db.commit()
+    retry = produce_line(db, product.product_id, qty=qty, complete_order=False, request_key="shift-1")
+    assert retry["manufacture_id"] == m.manufacture_id
+    second = produce_line(db, product.product_id, qty=2, complete_order=True, request_key="shift-2")
+    assert second["manufacture_id"] != m.manufacture_id
+    final = db.get(ProductionManufacture, second["manufacture_id"])
+    final.status = "exported"
+    final.exported_ref1c = "second-assembly"
+    db.add(SyncLink(source_doctype="piecework", source_id=final.manufacture_id,
+                    target_entity=piecework_exporter.PIECEWORK_ENTITY, target_ref_key="second-piecework", status="success"))
+    db.commit()
+    # A fresh browser request after failed order completion resumes the final
+    # command even when actual output does not match the original order.
+    resume = produce_line(db, product.product_id, qty=2, complete_order=True, request_key="retry-final")
+    assert resume["manufacture_id"] == final.manufacture_id
+    assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 2
+    assert float(product.quantity) == 10
+    assert float(product.produced_qty) == 0
+
+
+@pytest.mark.parametrize("qty", [float("nan"), float("inf"), -1])
+def test_actual_quantity_rejects_nonfinite_or_negative(db_session, qty):
+    with pytest.raises(ValueError):
+        produce_line(db_session, 1, qty=qty, complete_order=True)
+
+
+@pytest.mark.parametrize("foreign_held, allowed", [(0, True), (2, False)])
+def test_actual_overage_uses_only_free_material_at_bound_workshop(db_session, monkeypatch, foreign_held, allowed):
+    db = db_session
+    item = _mk_item(db, code="ACTUAL-STOCK")
+    component = _mk_item(db, code="ACTUAL-MATERIAL")
+    spec = Specification(spec_name="Actual quantity specification")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+    product = _mk_product(db, item, qty=10)
+    _stock_kit_on_workshop(db, product, component, 10)
+    generation_id = db.get(PlanningTruthState, 1).current_generation_id
+    db.add(models.StockBin(ledger_generation_id=generation_id, item_id=component.item_id,
+                           warehouse_ref1c="workshop-ref", on_hand=11))
+    if foreign_held:
+        other = _mk_product(db, _mk_item(db, code="OTHER-ORDER"))
+        db.add(models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=generation_id, product_id=other.product_id,
+            component_item_id=component.item_id, location_kind="workshop", warehouse_ref1c="workshop-ref",
+            reserved_qty=foreign_held, source_event_high_watermark_id=0))
+    db.commit()
+    from types import SimpleNamespace
+    monkeypatch.setattr(exporter, "_binding_for_product", lambda *args: SimpleNamespace(warehouse_ref1c="workshop-ref"))
+    if allowed:
+        result = produce_line(db, product.product_id, qty=11, complete_order=True)
+        assert result["qty"] == 11
+    else:
+        with pytest.raises(ValueError, match="Недостаточно компонентов"):
+            produce_line(db, product.product_id, qty=11, complete_order=True)

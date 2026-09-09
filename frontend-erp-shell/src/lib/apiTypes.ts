@@ -3582,6 +3582,13 @@ export interface components {
         ChainClosePayload: {
             /** Product Id */
             product_id: number;
+            /**
+             * Partial
+             * @default false
+             */
+            partial: boolean;
+            /** Request Key */
+            request_key?: string | null;
             /** Weld Qty */
             weld_qty?: number | null;
             /** Paint Qty */
@@ -5157,6 +5164,13 @@ export interface components {
         };
         /** ProduceLinePayload */
         ProduceLinePayload: {
+            /**
+             * Partial
+             * @default false
+             */
+            partial: boolean;
+            /** Request Key */
+            request_key?: string | null;
             /** Qty */
             qty?: number | null;
             /** Executor */

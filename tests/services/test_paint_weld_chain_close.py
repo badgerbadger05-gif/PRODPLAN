@@ -76,6 +76,11 @@ class _FakeClient:
 
 
 def _stub_live(monkeypatch, fake) -> None:
+    from app.services import one_c_production_order_export as orders
+    monkeypatch.setattr(orders, "close_production_orders_to_1c", lambda db, ids, dry_run=True: {
+        "status": "ok", "orders_eligible": len(ids), "orders_closed": 0 if dry_run else len(ids),
+        "orders_error": 0, "dry_run": dry_run,
+    })
     monkeypatch.setattr(
         exporter,
         "_load_odata_config",
@@ -408,7 +413,7 @@ def test_close_chain_resolves_from_either_side(db_session):
     assert from_weld["paint"]["product_id"] == from_paint["paint"]["product_id"]
 
 
-def test_close_chain_live_exports_combined_without_closing_orders(db_session, monkeypatch):
+def test_produce_chain_exports_combined_then_completes_both_orders(db_session, monkeypatch):
     ctx = _setup_chain(db_session)
     fake = _FakeClient(ref_key="pw-close-ref")
     _stub_live(monkeypatch, fake)
@@ -444,7 +449,8 @@ def test_close_chain_live_exports_combined_without_closing_orders(db_session, mo
     assert result["piecework_export"]["status"] == "ok"
     assert len(fake.posts) == 1
 
-    # заказы остаются открытыми: их закрывает оператор в 1С
+    assert result["order_completion"]["orders_closed"] == 2
+    # The order exporter is stubbed separately from the piecework client.
     assert all("ЗаказНаПроизводство" not in path for path, _ in fake.patches)
     db_session.refresh(ctx["weld"]["order"])
     db_session.refresh(ctx["paint"]["order"])
@@ -641,7 +647,7 @@ def test_close_chain_dry_run_reports_partially_posted_state(db_session):
     assert result["pending_sides"] == ["paint"]
 
 
-def test_close_chain_never_writes_order_completion(db_session, monkeypatch):
+def test_partial_chain_keeps_orders_open(db_session, monkeypatch):
     """Цепочечный путь не пишет состояние заказа ни при каком выпуске."""
     ctx = _setup_chain(db_session)
     # Сварка покрыта лишь частично, окраска — полностью. Ни та, ни другая
@@ -781,7 +787,7 @@ def test_close_chain_routes_each_side_executors_to_its_own_produce(db_session, m
     assert captured[paint_product_id]["executor"] == "Иванов"
     # сварная деталь выпускается только внутри цепочки
     assert captured[weld_product_id]["allow_paint_weld_chain"] is True
-    assert not captured[paint_product_id].get("allow_paint_weld_chain")
+    assert captured[paint_product_id]["allow_paint_weld_chain"] is True
     assert captured[paint_product_id]["anticipated_material_receipts"] == {
         int(ctx["weld"]["item"].item_id): float(ctx["weld"]["m"].qty)
     }
@@ -889,3 +895,28 @@ def test_close_chain_without_link_raises(db_session):
         assert False, "ожидали ValueError"
     except ValueError as exc:
         assert "цепочка" in str(exc)
+
+
+def test_two_partial_chain_batches_get_distinct_assemblies_and_piecework(db_session, monkeypatch):
+    ctx = _setup_chain(db_session)
+    for side in ("weld", "paint"):
+        db_session.delete(ctx[side]["m"])
+        ctx[side]["product"].produced_qty = 0
+    db_session.commit()
+    fake = _FakeClient(ref_key="piecework-batch-1")
+    _stub_live(monkeypatch, fake)
+    _stub_manufactures_export(monkeypatch, failing_ids=set())
+    first = close_paint_chain(db_session, product_id=ctx["paint"]["product"].product_id,
+                             weld_qty=3, paint_qty=3, partial=True, request_key="batch-1", executor="Иванов", dry_run=False)
+    assert first["order_completion"]["status"] == "partial_production"
+    fake.ref_key = "piecework-batch-2"
+    second = close_paint_chain(db_session, product_id=ctx["paint"]["product"].product_id,
+                              weld_qty=4, paint_qty=4, partial=False, request_key="batch-2", executor="Иванов", dry_run=False)
+    assert second["order_completion"]["orders_closed"] == 2
+    for side in ("weld", "paint"):
+        assert first[side]["manufacture_id"] != second[side]["manufacture_id"]
+    assert len(fake.posts) == 2
+    assert db_session.query(ProductionManufacture).count() == 4
+    links = db_session.query(SyncLink).filter_by(source_doctype="piecework").all()
+    assert len(links) == 4
+    assert {link.target_ref_key for link in links} == {"piecework-batch-1", "piecework-batch-2"}

@@ -20,7 +20,9 @@ type Props = {
   produceQty: string
   setProduceQty: Dispatch<SetStateAction<string>>
   produceSaving: boolean
-  produceOverageQty: number
+  producePartial: boolean
+  setProducePartial: Dispatch<SetStateAction<boolean>>
+  setProduceChainSides: Dispatch<SetStateAction<ProduceChainSide[] | null>>
   produceOperations: ProductionOperationOption[]
   produceChainSides?: ProduceChainSide[] | null
   produceOperationEmployees: Record<number, string>
@@ -46,7 +48,9 @@ export function ProduceDialog({
   produceQty,
   setProduceQty,
   produceSaving,
-  produceOverageQty,
+  producePartial,
+  setProducePartial,
+  setProduceChainSides,
   produceOperations,
   produceChainSides,
   produceOperationEmployees,
@@ -110,18 +114,24 @@ export function ProduceDialog({
           {isChain ? 'Произвести цепочку' : 'Произвести'} - {produceRow.item_name}
         </div>
         <div className="dialogBody">
+          <div className="fieldHint">Укажите фактическое количество — оно может быть меньше или больше заказа. Выпуск и сдельный наряд будут оформлены на это количество, затем заказ завершится в 1С.</div>
+          <label className="dialogField">
+            <input type="checkbox" checked={producePartial} disabled={produceSaving}
+              onChange={(e) => setProducePartial(e.target.checked)} />
+            Частичный выпуск
+          </label>
+          <div className="fieldHint">При частичном выпуске заказ остаётся открытым. Следующая операция создаст новые производство и сдельный наряд под тем же заказом. Материалы проверяются перед выпуском.</div>
           {produceError && <div className="dialogError" role="alert">{produceError}</div>}
           {!canProduceRow && (
             <div className="fieldHint danger">Эта строка уже произведена полностью.</div>
           )}
           {isChain ? (
-            // Количества сторон цепочки задаёт бэкенд по остатку каждой стороны:
-            // одно поле на два заказа означало бы вторую формулу количества.
+            // Каждая сторона сохраняет отдельное фактическое количество.
             <div className="dialogField">
               <label>Цепочка «сварка → окраска»</label>
               <div className="fieldHint">
-                Один комбинированный сдельный наряд на обе стороны. Количества берутся
-                по остатку каждой стороны.
+                Один комбинированный сдельный наряд на обе стороны за этот выпуск.
+                Укажите фактическое количество каждой стороны.
               </div>
             </div>
           ) : (
@@ -136,18 +146,17 @@ export function ProduceDialog({
                 onChange={(e) => setProduceQty(e.target.value)}
                 disabled={produceSaving}
               />
-              {produceOverageQty > 0.000001 && (
-                <div className="fieldHint">
-                  Больше плана на {produceOverageQty.toLocaleString('ru-RU')}: будет создано дополнительное перемещение материалов.
-                </div>
-              )}
+
             </div>
           )}
           {isChain && chainSides.map((side) => (
             <div className="dialogField" key={side.key}>
               <label>{side.title}{side.itemName ? ` — ${side.itemName}` : ''}</label>
               <div className="fieldHint">
-                Остаток {Number(side.qty ?? 0).toLocaleString('ru-RU')} {side.unit || 'шт'}
+                <input aria-label={`Количество: ${side.title}`} type="number" min={0} step={1}
+                  value={side.qty ?? 0} disabled={produceSaving}
+                  onChange={(e) => setProduceChainSides((current) => current?.map((entry) =>
+                    entry.key === side.key ? { ...entry, qty: Number(e.target.value) } : entry) ?? null)} />
               </div>
               {side.operations.length > 0 ? operationList(side.operations, side.key) : (
                 <div className="fieldHint danger">
@@ -193,7 +202,7 @@ export function ProduceDialog({
             onClick={() => void submitProduce()}
             disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || executorsIncomplete}
           >
-            {produceSaving ? 'Создаём...' : 'Создать в 1С'}
+            {produceSaving ? 'Выполняем...' : 'Произвести'}
           </button>
         </div>
       </div>

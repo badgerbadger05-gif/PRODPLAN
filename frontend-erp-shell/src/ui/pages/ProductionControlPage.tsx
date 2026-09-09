@@ -18,7 +18,6 @@ import {
   deleteProductionOrder,
   exportMaterialIssuesTo1C,
   fetchRouteSheetsPrintHtml,
-  closeProductionOrder,
   getOrderMaterials,
   getWorkItemMaterials,
   getProductionControlSettings,
@@ -123,6 +122,8 @@ export function ProductionControlPage() {
   const [produceEmployeeRef, setProduceEmployeeRef] = useState('')
   // Цепочка «сварка → окраска» закрывается одним комбинированным нарядом,
   // поэтому исполнителей выбирают сразу на обе стороны в том же диалоге.
+  const [producePartial, setProducePartial] = useState(false)
+  const [produceRequestKey, setProduceRequestKey] = useState('')
   const [produceChainSides, setProduceChainSides] = useState<ProduceChainSide[] | null>(null)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [warehouses, setWarehouses] = useState<ControlWarehouse[]>([])
@@ -162,7 +163,7 @@ export function ProductionControlPage() {
     const requestSeq = ++listRequestSeq.current
     setLoading(true)
     setError('')
-    setMessage('')
+    // Keep the command outcome visible across the following list refresh.
     try {
       const params = buildProductionOrderParams({
         filters: filtersRef.current,
@@ -574,6 +575,8 @@ export function ProductionControlPage() {
     const counterpartProductId = chain?.counterpart_product_id ?? null
     setProduceError('')
     setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
+    setProducePartial(false)
+    setProduceRequestKey(crypto.randomUUID())
     setProduceOperationEmployees({})
     setProduceEmployeeRef('')
     setProduceOperations([])
@@ -643,8 +646,7 @@ export function ProductionControlPage() {
       ? employees.find((employee) => employee.employee_ref1c === produceEmployeeRef)?.employee_name
       : undefined
     if (produceChainSides) {
-      // Цепочка: количества сторон считает бэкенд по остатку каждой из них,
-      // отсюда уходят только исполнители обеих сторон.
+      // Отправляем выбранные оператором количества и исполнителей обеих сторон.
       setProduceError('')
       setProduceSaving(true)
       try {
@@ -655,6 +657,10 @@ export function ProductionControlPage() {
           produceChainSides.find((side) => side.key === 'paint')?.operations ?? [],
         )
         const result = await closePaintWeldChain(productId, {
+          partial: producePartial,
+          request_key: produceRequestKey,
+          weld_qty: produceChainSides.find((side) => side.key === 'weld')?.qty ?? undefined,
+          paint_qty: produceChainSides.find((side) => side.key === 'paint')?.qty ?? undefined,
           ...(headerExecutor ? { executor: headerExecutor } : {}),
           ...(weldExecutors.length ? { weld_operation_executors: weldExecutors } : {}),
           ...(paintExecutors.length ? { paint_operation_executors: paintExecutors } : {}),
@@ -676,7 +682,7 @@ export function ProductionControlPage() {
       return
     }
     const qty = Number(produceQty)
-    if (!Number.isFinite(qty) || qty <= 0) {
+    if (!Number.isFinite(qty) || qty < 0) {
       setProduceError('Количество должно быть больше нуля')
       return
     }
@@ -685,13 +691,15 @@ export function ProductionControlPage() {
     try {
       const operationExecutors = operationExecutorsOf(produceOperations)
       const result = await produceOrderLine(productId, {
-        qty,
+        partial: producePartial,
+        request_key: produceRequestKey,
+        ...(qty > 0 ? { qty } : {}),
         ...(headerExecutor ? { executor: headerExecutor } : {}),
         ...(operationExecutors.length ? { operation_executors: operationExecutors } : {}),
       })
       setProduceOpen(false)
       setMessage(
-        `Сборка запасов и сдельный наряд созданы в 1С на ${result.qty} ед. ` +
+        result.message || `Сборка запасов и сдельный наряд созданы в 1С на ${result.qty} ед. ` +
         'Факт ожидает считывания проведения в Item Ledger.',
       )
       await loadMaterials(productId)
@@ -734,37 +742,6 @@ export function ProductionControlPage() {
       setMessage(`Возврат остатков: создано заявок ${created}${skipped ? `, пропущено ${skipped}` : ''}`)
       await loadMaterials(productId)
       await load(offsetRef.current)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      endDangerousMutation()
-      setLoading(false)
-    }
-  }
-
-  async function closeActiveOrder(productId: number | null | undefined) {
-    if (!productId) return
-    const active = rows.find((row) => row.product_id === productId)
-    if (!active || !active.available_actions?.includes('close_1c')) return
-    if (!beginDangerousMutation()) return
-    setLoading(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await closeProductionOrder(productId, { dry_run: false })
-      const confirmed = result.status === 'ok'
-        && result.dry_run === false
-        && result.orders_closed === 1
-        && result.orders_error === 0
-      await load(offsetRef.current)
-      if (confirmed) {
-        setMessage(`Заказ закрыт в 1С по кнопке: ${active.order_prodplan_number || active.order_number}`)
-      } else {
-        setError(
-          `Закрытие заказа в 1С не подтверждено: статус ${result.status || 'неизвестен'}, `
-          + `закрыто ${result.orders_closed ?? 0}, ошибок ${result.orders_error ?? 0}`,
-        )
-      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -904,12 +881,10 @@ export function ProductionControlPage() {
         {view !== 'drum' && <ProductionCommandBar
           rows={rows}
           selectedIds={selectedIds}
-          canClose={selectedRows.length === 1 && selectedRows[0].available_actions.includes('close_1c')}
           loading={loading}
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}
-          onClose={() => void closeActiveOrder(selectedRows[0]?.product_id)}
           onPrintSelected={() => openRouteSheets(selectedRows.flatMap(productionRowProductIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
@@ -1034,11 +1009,13 @@ export function ProductionControlPage() {
           // Закрытие цепочки возобновляемо: обе стороны могут быть уже
           // произведены, а комбинированный наряд — ещё нет. Что закрывать,
           // решает бэкенд по остатку каждой стороны.
-          canProduceRow={activeRow.paint_weld_chain ? true : (activeRow.remaining_qty ?? 0) > 0}
+          canProduceRow={true}
           produceQty={produceQty}
           setProduceQty={setProduceQty}
           produceSaving={produceSaving}
-          produceOverageQty={Math.max(0, Number(produceQty) - (activeRow.remaining_qty ?? 0))}
+          producePartial={producePartial}
+          setProducePartial={setProducePartial}
+          setProduceChainSides={setProduceChainSides}
           produceOperations={produceOperations}
           produceChainSides={produceChainSides}
           produceOperationEmployees={produceOperationEmployees}

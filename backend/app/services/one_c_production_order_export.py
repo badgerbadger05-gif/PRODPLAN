@@ -975,6 +975,13 @@ def close_production_orders_to_1c(
                 raise ValueError("SyncLink target_ref_key diverged before close write")
 
             client.patch(f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref1c}')", payload)
+            observed = client._make_request(f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref1c}')")
+            if _clean_ref1c(observed.get("СостояниеЗаказа_Key")) != _clean_ref1c(payload["СостояниеЗаказа_Key"]):
+                raise ValueError("1С не подтвердила состояние Завершён после закрытия")
+            order = db.get(ProductionOrder, int(entry.order_id))
+            order.order_state_key = observed["СостояниеЗаказа_Key"]
+            order.order_state_name = "Завершён"
+            db.commit()
             closed += 1
         except Exception as exc:
             entry.status = "error"
@@ -986,6 +993,54 @@ def close_production_orders_to_1c(
     summary["status"] = "ok" if errored == 0 else "partial_error"
     summary["entries"] = [asdict(entry) for entry in entries]
     return summary
+
+
+def finalize_produced_orders_to_1c(db: Session, order_ids: List[int], *, manufacture_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+    """Last step of the explicit Produce command; never a background closure."""
+    from ..models import ProductionManufacture
+    from .one_c_manufacture_export import commanded_qty_by_product
+    from .production_output_truth import accepted_product_output
+    from .production_control_production_flow import _piecework_order_is_in_1c
+
+    ids = sorted(set(int(value) for value in order_ids))
+    products = db.query(ProductionProduct).filter(ProductionProduct.order_id.in_(ids)).all()
+    commanded = commanded_qty_by_product(db, [int(p.product_id) for p in products])
+    current = [db.get(ProductionManufacture, mid) for mid in (manufacture_ids or [])]
+    explicitly_partial = bool(current) and all(m is not None and m.complete_order is False for m in current)
+    explicit_completion = bool(current) and all(m is not None and m.complete_order is True for m in current)
+    if explicitly_partial or (not explicit_completion and (not products or any(
+        commanded.get(int(p.product_id), 0) < float(p.quantity) - 1e-6
+        and accepted_product_output(p).remaining_qty > 0
+        for p in products
+    ))):
+        return {"status": "partial_production", "orders_closed": 0,
+                "message": "Выпуск и сдельный оформлены. Выбран частичный выпуск: заказ остаётся открытым. Следующий выпуск создаст новые документы."}
+    manufactures = db.query(ProductionManufacture).filter(
+        ProductionManufacture.product_id.in_([int(p.product_id) for p in products]),
+        ProductionManufacture.status != "cancelled",
+    ).all()
+    try:
+        if not manufactures or any(
+            not str(m.exported_ref1c or "").strip()
+            or str(m.status) != "exported"
+            or not _piecework_order_is_in_1c(db, int(m.manufacture_id))
+            for m in manufactures
+        ):
+            raise ValueError("Не все выпуски и сдельные наряды подтверждены в 1С")
+        # Validate the whole chain before changing either order.
+        preview = close_production_orders_to_1c(db, ids, dry_run=True)
+        if int(preview.get("orders_eligible", 0)) != len(ids):
+            raise ValueError(str(preview.get("skipped_rows") or "Заказы не готовы к завершению"))
+        result = close_production_orders_to_1c(db, ids, dry_run=False)
+        if int(result.get("orders_closed", 0)) != len(ids) or result.get("orders_error"):
+            result.update(status="partial", resume_required=True,
+                          message="Выпуск и сдельный оформлены, но завершение заказов не подтверждено. Повторите «Произвести».")
+        else:
+            result.update(resume_required=False, message="Выпуск и сдельный оформлены, заказы завершены в 1С.")
+        return result
+    except Exception as exc:
+        return {"status": "partial", "resume_required": True, "orders_closed": 0,
+                "message": f"Выпуск и сдельный оформлены, завершение заказа не выполнено: {exc}. Повторите «Произвести»."}
 
 
 def _entry_origin_token(db: Session, entry: ProductionOrderExportEntry) -> str:

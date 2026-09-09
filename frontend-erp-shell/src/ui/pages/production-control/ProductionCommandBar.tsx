@@ -8,10 +8,8 @@ type Props = {
   onExportTo1C: () => void
   onSyncFrom1C: () => void
   onProduce: () => void
-  onClose: () => void
   onPrintSelected: () => void
   onDeleteSelected: () => void
-  canClose: boolean
   onOpenSettings: () => void
   onRefresh: () => void
   onSelectAll: () => void
@@ -27,10 +25,8 @@ export function ProductionCommandBar({
   onExportTo1C,
   onSyncFrom1C,
   onProduce,
-  onClose,
   onPrintSelected,
   onDeleteSelected,
-  canClose,
   onOpenSettings,
   onRefresh,
   onSelectAll,
@@ -44,8 +40,7 @@ export function ProductionCommandBar({
   return (
     <div className="commandBar">
       <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
-      <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back">Произвести</button>
-      <button onClick={onClose} disabled={!canClose || loading} title="Закрыть заказ в 1С: только по явной санкции оператора">Закрыть в 1С</button>
+      <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Оформить выпуск и сдельный наряд, затем завершить полностью выпущенный заказ в 1С">Произвести</button>
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <div className="barSeparator" />
       <button onClick={onPrintSelected} disabled={!selectedOrders.length}>Печать маршрутных</button>

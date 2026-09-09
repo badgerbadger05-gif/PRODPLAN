@@ -1233,6 +1233,8 @@ class ExportMaterialIssuesPayload(BaseModel):
 
 
 class ProduceLinePayload(BaseModel):
+    partial: bool = False
+    request_key: Optional[str] = None
     # The executable quantity is server-owned.  An explicit value remains
     # accepted for non-UI integrations but is bounded again by the service.
     qty: Optional[float] = None
@@ -1675,6 +1677,8 @@ def post_produce_line(
             db,
             int(product_id),
             qty=payload.qty,
+            complete_order=not payload.partial,
+            request_key=payload.request_key,
             executor=payload.executor,
             operation_executors=payload.operation_executors,
             comment=payload.comment,
@@ -1718,8 +1722,13 @@ def post_produce_line(
                     "1С не создала и не провела СдельныйНаряд",
                 )
             )
+        from app.services.one_c_production_order_export import finalize_produced_orders_to_1c
+        completion = finalize_produced_orders_to_1c(db, [int(command["order_id"])], manufacture_ids=[manufacture_id])
         return {
             **command,
+            "order_completion": completion,
+            "message": completion["message"],
+            "resume_required": bool(completion.get("resume_required")),
             "manufacture_export": manufacture_export,
             "piecework_export": piecework_export,
             "ledger_readback": "queued",

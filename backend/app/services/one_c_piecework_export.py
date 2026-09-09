@@ -1077,6 +1077,11 @@ def export_chain_piecework_to_1c(
     paint_link = _existing_link(db, paint_entry.manufacture_id)
     weld_link = _existing_link(db, weld_entry.manufacture_id)
     if paint_link and paint_link.status == "success" and (paint_link.target_ref_key or ""):
+        if not (weld_link and weld_link.status == "success"
+                and str(weld_link.target_ref_key or "") == str(paint_link.target_ref_key)):
+            summary["status"] = "error"
+            summary["error"] = "Наряд окраски не подтверждён как общий для обоих выпусков; требуется проверка связей"
+            return summary
         summary["status"] = "existing"
         summary["target_ref_key"] = str(paint_link.target_ref_key)
         summary["reason"] = "комбинированный сдельный уже выгружен (sync_link)"

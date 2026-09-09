@@ -191,22 +191,19 @@ export type OperationExecutorSelection = {
   employee_name?: string
 }
 
-export type ProduceLinePayload = {
-  qty?: number
-  executor?: string | null
+export type ProduceLinePayload = Omit<ApiSchemas['ProduceLinePayload'], 'operation_executors'> & {
   operation_executors?: OperationExecutorSelection[]
-  comment?: string | null
 }
 
-// Закрытие цепочки «сварка → окраска»: исполнители обеих сторон уходят одним
-// действием, тем же правилом, что и у обычной строки.
-export type PaintWeldChainClosePayload = {
-  executor?: string | null
+export type PaintWeldChainClosePayload = Partial<Pick<ApiSchemas['ChainClosePayload'],
+  'weld_qty' | 'paint_qty' | 'partial' | 'request_key' | 'executor'>> & {
   weld_operation_executors?: OperationExecutorSelection[]
   paint_operation_executors?: OperationExecutorSelection[]
 }
 
 export type ProduceLineResult = {
+  message?: string
+  resume_required?: boolean
   status: string
   manufacture_id: number
   product_id: number

@@ -29,7 +29,6 @@ vi.mock('../../services/productionControl', () => ({
   updateOrderStatus: vi.fn(),
   postMaterialIssues: vi.fn(),
   fetchRouteSheetsPrintHtml: vi.fn(),
-  closeProductionOrder: vi.fn(),
   exportMaterialIssuesTo1C: vi.fn(),
   markMaterialIssueAssembled: vi.fn(),
   syncExecutionFrom1C: vi.fn(),
@@ -65,7 +64,6 @@ import {
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
   produceOrderLine,
-  closeProductionOrder,
   listRootProductOptions,
   materializeMakeWorkItems,
   openPaintWeldChains,
@@ -393,10 +391,6 @@ beforeEach(() => {
     entries: [],
     skipped_rows: [],
   })
-  vi.mocked(closeProductionOrder).mockResolvedValue({
-    status: 'ok', dry_run: false, orders_requested: 1, orders_eligible: 1,
-    orders_closed: 1, orders_error: 0,
-  })
   vi.mocked(syncExecutionFrom1C).mockResolvedValue({
     orders: { orders_updated: 1, errors: [] },
     transfers: { candidates: 2, advanced: 0, errors: [] },
@@ -429,7 +423,6 @@ describe('ProductionControlPage — characterization', () => {
     for (const label of [
       'Запустить в 1С',
       'Произвести',
-      'Закрыть в 1С',
       'Синхронизировать',
       'Печать маршрутных',
       'Удалить',
@@ -1161,7 +1154,7 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByRole('spinbutton', { name: 'Количество запуска' })).toBeNull()
   })
 
-  it('asks for an executor on every operation before producing a row', async () => {
+  it.each([false, true])('asks for executors and sends explicit partial=%s', async (partial) => {
     // 1С не проводит сдельный наряд с пустой строкой регистра «Сдельные наряды»,
     // поэтому исполнители выбираются до записи, а не подставляются заглушкой.
     vi.mocked(listProductionOperations).mockResolvedValue({
@@ -1191,7 +1184,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(produceBtn)
 
     const dialog = await screen.findByRole('dialog')
-    const submit = within(dialog).getByRole('button', { name: 'Создать в 1С' })
+    const submit = within(dialog).getByRole('button', { name: 'Произвести' })
     // Пока хоть одна операция без исполнителя — в 1С ничего не уходит.
     await waitFor(() => expect(submit).toBeDisabled())
     expect(produceOrderLine).not.toHaveBeenCalled()
@@ -1203,9 +1196,15 @@ describe('ProductionControlPage — characterization', () => {
     await user.selectOptions(selects[1], 'E1')
     expect(submit).toBeEnabled()
 
+    const quantity = within(dialog).getByRole('spinbutton')
+    await user.clear(quantity)
+    await user.type(quantity, partial ? '7' : '11')
+    if (partial) await user.click(within(dialog).getByRole('checkbox', { name: 'Частичный выпуск' }))
     await user.click(submit)
     await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(101, {
-      qty: 10,
+      partial,
+      request_key: expect.any(String),
+      qty: partial ? 7 : 11,
       operation_executors: [
         { spec_operation_id: 51, operation_id: 61, line_number: 1, employee_ref1c: 'E1' },
         { spec_operation_id: 52, operation_id: 62, line_number: 2, employee_ref1c: 'E1' },
@@ -1349,7 +1348,7 @@ describe('ProductionControlPage — characterization', () => {
     expect(dialog.textContent).toContain('Сварка — Кронштейн после сварки')
     expect(dialog.textContent).toContain('Окраска — Кронштейн после окраски')
 
-    const submit = within(dialog).getByRole('button', { name: 'Создать в 1С' })
+    const submit = within(dialog).getByRole('button', { name: 'Произвести' })
     await waitFor(() => expect(submit).toBeDisabled())
     expect(closePaintWeldChain).not.toHaveBeenCalled()
 
@@ -1364,6 +1363,10 @@ describe('ProductionControlPage — characterization', () => {
 
     await user.click(submit)
     await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101, {
+      partial: false,
+      request_key: expect.any(String),
+      weld_qty: expect.any(Number),
+      paint_qty: expect.any(Number),
       weld_operation_executors: [
         { spec_operation_id: 71, operation_id: 81, line_number: 1, employee_ref1c: 'E1' },
       ],
@@ -1374,39 +1377,11 @@ describe('ProductionControlPage — characterization', () => {
     expect(produceOrderLine).not.toHaveBeenCalled()
   })
 
-  it('runs sanctioned close-to-1C action for selected row', async () => {
-    const user = userEvent.setup()
+  it('offers Produce without a separate close button', async () => {
     renderPage()
     await screen.findByText('Вал')
-
-    const closeBtn = screen.getByRole('button', { name: 'Закрыть в 1С' })
-    expect(closeBtn).toBeDisabled()
-
-    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
-    expect(closeBtn).toBeEnabled()
-
-    await user.click(closeBtn)
-    await waitFor(() => expect(closeProductionOrder).toHaveBeenCalledWith(
-      101,
-      { dry_run: false },
-    ))
-    expect(screen.getByText(/Заказ закрыт в 1С по кнопке/)).toBeInTheDocument()
-  })
-
-  it('does not confirm close when 1C export reports a partial error', async () => {
-    vi.mocked(closeProductionOrder).mockResolvedValueOnce({
-      status: 'partial_error', dry_run: false, orders_requested: 1, orders_eligible: 1,
-      orders_closed: 0, orders_error: 1,
-    })
-    const user = userEvent.setup()
-    renderPage()
-    await screen.findByText('Вал')
-
-    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
-    await user.click(screen.getByRole('button', { name: 'Закрыть в 1С' }))
-
-    expect(await screen.findByText(/Закрытие заказа в 1С не подтверждено/)).toBeInTheDocument()
-    expect(screen.queryByText(/Заказ закрыт в 1С по кнопке/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Закрыть в 1С' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Произвести' })).toBeInTheDocument()
   })
 
   it('"Синхронизировать" reads order completion and transfer state from 1C', async () => {

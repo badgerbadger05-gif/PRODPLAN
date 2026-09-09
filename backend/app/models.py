@@ -1148,6 +1148,10 @@ class ProductionManufacture(Base):
     product line are allowed (partial production across shifts/days).
     """
     __tablename__ = "production_manufactures"
+    __table_args__ = (UniqueConstraint("product_id", "request_key", name="uq_manufacture_product_request"),)
+    # NULL preserves the intent of commands created before unified Produce.
+    complete_order = Column(Boolean, nullable=True)
+    request_key = Column(String(100), nullable=True)
 
     manufacture_id = Column(Integer, primary_key=True, index=True)
     product_id = Column(

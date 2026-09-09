@@ -1036,6 +1036,8 @@ def close_paint_chain(
     db: Session,
     *,
     product_id: int,
+    partial: Optional[bool] = None,
+    request_key: Optional[str] = None,
     weld_qty: Optional[float] = None,
     paint_qty: Optional[float] = None,
     executor: Optional[str] = None,
@@ -1050,7 +1052,8 @@ def close_paint_chain(
 
     Порядок (dry_run=False): выпуск сварочной строки → выпуск окрасочной →
     экспорт обеих СборкаЗапасов → один комбинированный СдельныйНаряд
-    (основание — окрасочная СборкаЗапасов), закрывающий оба заказа.
+    (основание — окрасочная СборкаЗапасов) → подтверждённое завершение обоих
+    заказов в 1С, если оператор не выбрал частичный выпуск.
 
     Количества по умолчанию — физический остаток из принятого Ledger-кэша
     (`quantity - produced_qty`), а не многописательное legacy-поле
@@ -1098,7 +1101,7 @@ def close_paint_chain(
             "product_id": int(product.product_id),
             "order_id": int(product.order_id),
             "remaining_qty": remaining,
-            "qty_to_produce": planned if remaining > 0 and planned > 0 else 0.0,
+            "qty_to_produce": planned if planned > 0 else 0.0,
             "existing_manufacture_id": int(existing.manufacture_id) if existing else None,
             "manufacture_ref1c": (
                 str(existing.exported_ref1c or "").strip() or None if existing else None
@@ -1157,6 +1160,8 @@ def close_paint_chain(
                 db,
                 plan["product_id"],
                 qty=plan["qty_to_produce"],
+                complete_order=None if partial is None else not partial,
+                request_key=request_key,
                 executor=executor,
                 operation_executors=operation_executors,
                 comment=comment,
@@ -1196,6 +1201,7 @@ def close_paint_chain(
         paint_manufacture_id = _ensure_manufacture(
             paint_plan,
             paint_operation_executors,
+            allow_paint_weld_chain=True,
             anticipated_material_receipts={
                 int(weld_product.item_id): _to_float(weld_manufacture.qty)
             },
@@ -1372,8 +1378,14 @@ def close_paint_chain(
             "Требуется докат: повторите закрытие цепочки."
         )
         return result
-    result["chain_state"] = "closed"
-    result["resume_required"] = False
+    from .one_c_production_order_export import finalize_produced_orders_to_1c
+    completion = finalize_produced_orders_to_1c(db, [int(weld_product.order_id), int(paint_product.order_id)], manufacture_ids=[weld_manufacture_id, paint_manufacture_id])
+    result["order_completion"] = completion
+    result["message"] = completion["message"]
+    result["chain_state"] = "closed" if completion.get("status") == "ok" else "orders_pending"
+    result["resume_required"] = bool(completion.get("resume_required"))
+    if result["resume_required"]:
+        result["status"] = "partial"
     result["ledger_readback"] = "queued"
     db.commit()
     return result

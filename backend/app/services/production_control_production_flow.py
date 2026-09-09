@@ -112,6 +112,7 @@ def _ensure_workshop_reservation_covers(
     product: ProductionProduct,
     qty: Optional[float] = None,
     anticipated_material_receipts: Optional[Dict[int, float]] = None,
+    allow_free_workshop_stock: bool = False,
 ) -> None:
     """
     Block a production event that would consume more material than is
@@ -150,7 +151,7 @@ def _ensure_workshop_reservation_covers(
     if not spec_rows:
         return
     per_unit = {int(row.item_id): _to_float(row.quantity) for row in spec_rows}
-    _, state = load_current_accepted_material_custody(
+    generation_id, state = load_current_accepted_material_custody(
         db,
         consumer="production_output_material_guard",
     )
@@ -160,13 +161,31 @@ def _ensure_workshop_reservation_covers(
         for item_id, receipt_qty in (anticipated_material_receipts or {}).items()
     }
 
+    free_at_workshop: Dict[int, float] = {}
+    if allow_free_workshop_stock:
+        from sqlalchemy import func
+        from ..models import StockBin
+        from .one_c_manufacture_export import _binding_for_product
+        binding = _binding_for_product(db, product)
+        warehouse = str(binding.warehouse_ref1c or "") if binding else ""
+        if warehouse:
+            stock = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
+                StockBin.ledger_generation_id == generation_id,
+                StockBin.warehouse_ref1c == warehouse,
+                StockBin.item_id.in_(per_unit),
+            ).group_by(StockBin.item_id).all()
+            free_at_workshop = {
+                int(cid): max(float(on_hand) - state.by_warehouse_item.get((warehouse, int(cid)), 0.0), 0.0)
+                for cid, on_hand in stock
+            }
+
     shortfall_by_item: Dict[int, tuple] = {}
     for cid, per in per_unit.items():
         needed = per * qty
         if needed <= 1e-9:
             continue
         held = reservation.at_workshop.get(cid, 0.0)
-        available_for_command = held + anticipated.get(cid, 0.0)
+        available_for_command = held + free_at_workshop.get(cid, 0.0) + anticipated.get(cid, 0.0)
         if available_for_command + 1e-6 < needed:
             shortfall_by_item[cid] = (needed, available_for_command)
     if shortfall_by_item:
@@ -204,7 +223,7 @@ def _piecework_order_is_in_1c(db: Session, manufacture_id: int) -> bool:
     )
 
 
-def _resumable_manufacture(db: Session, product_id: int):
+def _resumable_manufacture(db: Session, product_id: int, *, include_completed_order: bool = False):
     """
     An unfinished «Произвести» of this line that must be continued, not repeated.
 
@@ -225,7 +244,13 @@ def _resumable_manufacture(db: Session, product_id: int):
         if not str(manufacture.exported_ref1c or "").strip():
             continue
         if _piecework_order_is_in_1c(db, int(manufacture.manufacture_id)):
-            continue
+            product = db.get(ProductionProduct, int(product_id))
+            from .production_control_common import DONE_STATE_KEY
+            total = commanded_qty_by_product(db, [int(product_id)]).get(int(product_id), 0)
+            if (manufacture.complete_order is False or product is None or (not include_completed_order and str(product.order.order_state_key or "").lower() == DONE_STATE_KEY)
+                or (manufacture.complete_order is None and total < float(product.quantity) - 1e-6 and accepted_product_output(product).remaining_qty > 0)):
+                continue
+            return manufacture, "Документы выпуска созданы; завершаем заказ в 1С без повторного выпуска"
         if str(manufacture.status or "").lower() == "error":
             reason = (
                 "СборкаЗапасов уже создана в 1С, но не завершена "
@@ -246,6 +271,8 @@ def produce_line(
     operation_executors: Optional[List[Dict[str, Any]]] = None,
     comment: Optional[str] = None,
     allow_paint_weld_chain: bool = False,
+    complete_order: Optional[bool] = None,
+    request_key: Optional[str] = None,
     anticipated_material_receipts: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     """
@@ -260,7 +287,8 @@ def produce_line(
     Item Ledger may change factual execution through canonical FIFO.
     """
     requested_qty = float(qty) if qty is not None else None
-    if requested_qty is not None and requested_qty <= 0:
+    import math
+    if requested_qty is not None and (not math.isfinite(requested_qty) or requested_qty <= 0):
         raise ValueError("qty должен быть положительным")
 
     product = (
@@ -291,7 +319,15 @@ def produce_line(
     # Document_СборкаЗапасов, so a second press must finish that chain instead
     # of creating a duplicate assembly (or dying on the "всё уже скомандовано"
     # guard when the наряд step failed).
-    resumable = _resumable_manufacture(db, int(product.product_id))
+    resumable = _resumable_manufacture(db, int(product.product_id), include_completed_order=allow_paint_weld_chain)
+    if request_key:
+        previous = db.query(ProductionManufacture).filter(
+            ProductionManufacture.product_id == int(product_id),
+            ProductionManufacture.request_key == request_key,
+            ProductionManufacture.status != "cancelled",
+        ).one_or_none()
+        if previous is not None:
+            resumable = (previous, "Повтор команды: используются ранее созданные документы")
     if resumable is not None:
         manufacture, resume_reason = resumable
         state = _ensure_state(db, product)
@@ -329,12 +365,15 @@ def produce_line(
         max(0.0, order_quantity - commanded_before),
         float(accepted_output.remaining_qty),
     )
-    if command_remaining <= 1e-9:
+    from .production_control_common import DONE_STATE_KEY
+    if product.order.deletion_mark or str(product.order.order_state_key or "").lower() == DONE_STATE_KEY:
+        raise ValueError("Заказ уже завершён в 1С")
+    if command_remaining <= 1e-9 and (requested_qty is None or complete_order is None):
         raise ValueError(
             "По этой строке уже создана исполнительная команда на весь объём"
         )
     qty_f = command_remaining if requested_qty is None else requested_qty
-    if qty_f - command_remaining > 1e-6:
+    if complete_order is None and qty_f - command_remaining > 1e-6:
         raise ValueError(
             "qty превышает остаток, ещё не переданный в исполнительные документы"
         )
@@ -348,12 +387,15 @@ def produce_line(
         product,
         qty_f,
         anticipated_material_receipts=anticipated_material_receipts,
+        allow_free_workshop_stock=complete_order is not None,
     )
 
     manufacture = ProductionManufacture(
         product_id=int(product.product_id),
         order_id=int(product.order_id),
         qty=qty_f,
+        complete_order=complete_order,
+        request_key=request_key,
         executor=(str(executor).strip() if executor else None) or None,
         comment=(str(comment).strip() if comment else None) or None,
         status="draft",

@@ -393,3 +393,36 @@ test('mechshop keeps drum work visible after MRP execution is closed', async ({ 
   await expect(hint.getByRole('checkbox')).toBeDisabled()
   await expect(hint).toContainText('Кронштейн опорный')
 })
+
+test('unified Produce sends actual quantity and partial intent', async ({ page }, testInfo) => {
+  let command: Record<string, unknown> | null = null
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path.endsWith('/produce')) {
+      command = route.request().postDataJSON()
+      await route.fulfill({ json: { qty: 7, message: 'Частичный выпуск оформлен, заказ открыт' } })
+    } else if (path.endsWith('/orders')) {
+      await route.fulfill({ json: { rows: [{ ...orders[0], order_ref1c: 'order-ref-101', available_actions: ['produce'] }], total: 1,
+        truth_meta: { ledger_generation: 77, truth_status: 'accepted', cutoff: '2026-09-09T00:00:00Z' } } })
+    } else if (path.endsWith('/materials')) {
+      await route.fulfill({ json: materials })
+    } else if (path.endsWith('/resources/')) {
+      await route.fulfill({ json: [] })
+    } else if (path.endsWith('/employees') || path.endsWith('/operations') || path.endsWith('/period-plans')) {
+      await route.fulfill({ json: { rows: [], total: 0 } })
+    } else {
+      await route.abort('failed')
+    }
+  })
+  await page.goto('/#/production-control')
+  await page.getByRole('row').filter({ hasText: 'Кронштейн опорный' }).first().getByRole('checkbox').check()
+  await expect(page.getByRole('button', { name: 'Закрыть в 1С', exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Произвести', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.getByRole('spinbutton').fill('7')
+  await dialog.getByRole('checkbox', { name: 'Частичный выпуск' }).check()
+  await page.screenshot({ path: testInfo.outputPath('unified-produce.png') })
+  await dialog.getByRole('button', { name: 'Произвести', exact: true }).click()
+  await expect.poll(() => command).toMatchObject({ qty: 7, partial: true, request_key: expect.any(String) })
+  await expect(page.getByText('Частичный выпуск оформлен, заказ открыт')).toBeVisible()
+})
