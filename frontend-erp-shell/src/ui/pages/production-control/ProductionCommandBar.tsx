@@ -40,7 +40,7 @@ export function ProductionCommandBar({
   return (
     <div className="commandBar">
       <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
-      <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Оформить выпуск и сдельный наряд, затем завершить полностью выпущенный заказ в 1С">Произвести</button>
+      <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный; завершить заказ или оставить частичный выпуск">Произвести</button>
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <div className="barSeparator" />
       <button onClick={onPrintSelected} disabled={!selectedOrders.length}>Печать маршрутных</button>
