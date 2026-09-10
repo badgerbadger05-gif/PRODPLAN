@@ -74,7 +74,6 @@ import {
   getStandalonePieceworkOptions,
   createStandalonePiecework,
   updateOrderQuantity,
-  returnLeftoverComponents,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 import {

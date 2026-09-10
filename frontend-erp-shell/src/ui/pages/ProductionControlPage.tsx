@@ -934,7 +934,7 @@ export function ProductionControlPage() {
       return () => window.clearTimeout(timer)
     }
     return undefined
-  }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials, materialsRefreshToken, truthMeta?.ledger_generation])
+  }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.current_identity, activeRow?.source_revision, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials, materialsRefreshToken, truthMeta?.ledger_generation])
 
   async function refreshJournal() {
     await load(offsetRef.current)

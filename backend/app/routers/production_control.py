@@ -1216,7 +1216,10 @@ def _require_current_production_identities(
                 "expected_source_revision": manifest.source_revision,
             },
         )
-    wanted = sorted({str(identity).strip() for identity in identities if str(identity).strip()})
+    raw_wanted = [str(identity).strip() for identity in identities if str(identity).strip()]
+    wanted = sorted(set(raw_wanted))
+    if len(raw_wanted) != len(wanted):
+        raise HTTPException(status_code=409, detail={"code": "production_current_identity_duplicate"})
     rows = [
         row for row in load_current_execution_rows(
             db,
@@ -1228,12 +1231,30 @@ def _require_current_production_identities(
     if len(rows) != len(wanted):
         raise CurrentExecutionUnavailable("current production identities are missing or ambiguous")
     if locator_key is not None and locator_values is not None:
-        resolved = {
-            int((row.payload or {}).get(locator_key) or 0)
-            for row in rows
-            if (row.payload or {}).get(locator_key) is not None
-        }
-        if resolved != {int(value) for value in locator_values}:
+        requested_locators = {int(value) for value in locator_values}
+        resolved: set[int] = set()
+        for value in requested_locators:
+            direct = [
+                row for row in rows
+                if int((row.payload or {}).get(locator_key) or 0) == value
+            ]
+            if len(direct) == 1:
+                resolved.add(value)
+                continue
+            if locator_key != "product_id" or not hasattr(db, "get"):
+                continue
+            product = db.get(models.ProductionProduct, value)
+            if product is None or product.source_mrp_requirement_id is None:
+                continue
+            exact = [
+                row for row in rows
+                if int((row.payload or {}).get("source_mrp_requirement_id") or 0)
+                == int(product.source_mrp_requirement_id)
+                and int((row.payload or {}).get("item_id") or 0) == int(product.item_id)
+            ]
+            if len(exact) == 1:
+                resolved.add(value)
+        if resolved != requested_locators:
             raise HTTPException(status_code=409, detail={"code": "production_current_locator_stale"})
     return manifest, rows
 
@@ -2142,22 +2163,55 @@ def post_open_paint_weld_chains(
                 if painted_items
                 else []
             )
-            expected_item_ids = {int(pair.welded_item_id) for pair in pair_rows}
-            if expected_item_ids:
+            if pair_rows:
                 current_rows = load_current_execution_rows(
                     db,
                     entity_kind="production_control_journal",
                     scope_key="production:all-live-orders",
                 )
-                for item_id in expected_item_ids:
+                for source_row in source_rows:
+                    source_payload = source_row.payload or {}
+                    pair = next(
+                        (
+                            candidate for candidate in pair_rows
+                            if int(candidate.painted_item_id)
+                            == int(source_payload.get("item_id") or 0)
+                        ),
+                        None,
+                    )
+                    if pair is None:
+                        continue
+                    run_id = source_payload.get("source_run_id")
+                    if run_id is None:
+                        raise CurrentExecutionUnavailable("paint/weld source run is missing")
+                    run = db.get(models.PlanningRun, int(run_id))
+                    freeze_version = getattr(run, "active_freeze_version", None) if run else None
+                    requirement_query = db.query(models.MrpRequirement).filter(
+                        models.MrpRequirement.run_id == int(run_id),
+                        models.MrpRequirement.item_id == int(pair.welded_item_id),
+                    )
+                    if freeze_version is not None:
+                        requirement_query = requirement_query.filter(
+                            models.MrpRequirement.freeze_version == int(freeze_version)
+                        )
+                    requirements = requirement_query.all()
+                    if len(requirements) != 1:
+                        raise CurrentExecutionUnavailable(
+                            "paint/weld counterpart requirement is missing or ambiguous"
+                        )
+                    requirement_id = int(requirements[0].id)
                     anchored = [
                         row for row in current_rows
-                        if int((row.payload or {}).get("item_id") or 0) == item_id
-                        and (row.payload or {}).get("source_mrp_requirement_id") is not None
+                        if int((row.payload or {}).get("source_mrp_requirement_id") or 0)
+                        == requirement_id
+                        and int((row.payload or {}).get("item_id") or 0)
+                        == int(pair.welded_item_id)
+                        and int((row.payload or {}).get("source_run_id") or 0)
+                        == int(run_id)
                     ]
                     if len(anchored) != 1:
                         raise CurrentExecutionUnavailable(
-                            "paint/weld counterpart lacks one stable current proposal anchor"
+                            "paint/weld counterpart lacks one exact current proposal anchor"
                         )
         result = open_paint_chains_for_products(
             db,
@@ -2174,28 +2228,41 @@ def post_open_paint_weld_chains(
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
         )
-        output_rows = [
-            row for row in current_rows
-            if int((row.payload or {}).get("product_id") or 0) in output_ids
-        ]
+        output_by_product: dict[int, list] = {
+            product_id: [
+                row for row in current_rows
+                if int((row.payload or {}).get("product_id") or 0) == product_id
+            ]
+            for product_id in output_ids
+        }
+        output_rows = []
         if hasattr(db, "query"):
             # A newly-created counterpart may not have a product-scoped row
             # until the next publication. Resolve it through exactly one
-            # persisted MRP proposal identity for its item instead of exposing
-            # an unanchored numeric product id to the next action.
+            # persisted MRP proposal identity for its exact requirement+item,
+            # never by item alone.
             for product_id in sorted(output_ids):
-                if any(int((row.payload or {}).get("product_id") or 0) == product_id for row in output_rows):
+                direct = output_by_product[product_id]
+                if len(direct) == 1:
+                    output_rows.extend(direct)
                     continue
+                if len(direct) > 1:
+                    raise CurrentExecutionUnavailable("paint/weld product current anchor is ambiguous")
                 product = db.get(models.ProductionProduct, product_id)
                 if product is None:
                     continue
                 proposal_rows = [
                     row for row in current_rows
                     if int((row.payload or {}).get("item_id") or 0) == int(product.item_id)
+                    and int((row.payload or {}).get("source_mrp_requirement_id") or 0)
+                    == int(product.source_mrp_requirement_id or 0)
                     and (row.payload or {}).get("source_mrp_requirement_id") is not None
                 ]
                 if len(proposal_rows) == 1:
                     output_rows.append(proposal_rows[0])
+        else:
+            for product_id in sorted(output_ids):
+                output_rows.extend(output_by_product[product_id])
         if len(output_rows) != len(output_ids):
             raise CurrentExecutionUnavailable("paint/weld counterpart lacks a current production anchor")
         result["current_identities"] = [str(row.business_identity) for row in output_rows]
