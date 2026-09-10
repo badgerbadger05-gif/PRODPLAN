@@ -1976,8 +1976,10 @@ class PurchaseExportBatch(Base):
             name="ck_purchase_export_batch_status",
         ),
         CheckConstraint(
-            "(planning_read_snapshot_id IS NOT NULL AND current_execution_scope_id IS NULL) "
-            "OR (planning_read_snapshot_id IS NULL AND current_execution_scope_id IS NOT NULL)",
+            "(planning_read_snapshot_id IS NOT NULL AND current_execution_scope_id IS NULL "
+            "AND current_execution_source_revision IS NULL) "
+            "OR (planning_read_snapshot_id IS NULL AND current_execution_scope_id IS NOT NULL "
+            "AND current_execution_source_revision IS NOT NULL)",
             name="ck_purchase_export_batch_exactly_one_source_anchor",
         ),
         UniqueConstraint("idempotency_key", name="uq_purchase_export_batch_idempotency_key"),

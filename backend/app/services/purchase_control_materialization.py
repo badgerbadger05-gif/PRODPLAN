@@ -1509,7 +1509,10 @@ def materialize_rows(
                 current_execution_source_revision = str(current_manifest.source_revision)
             else:
                 planning_read_snapshot_id = int(
-                    _to_int(meta.get("planning_read_snapshot_id"), field="planning_read_snapshot_id")
+                    _to_int(
+                        meta.get("planning_read_snapshot_id") or meta.get("snapshot_id"),
+                        field="planning_read_snapshot_id",
+                    )
                 )
                 if planning_read_snapshot_id <= 0:
                     raise PurchaseControlMaterializationError(

@@ -111,6 +111,14 @@ def test_purchase_export_batch_metadata_contract():
         "ck_purchase_export_batch_status",
         "ck_purchase_export_batch_exactly_one_source_anchor",
     } <= checks
+    anchor_check = next(
+        constraint
+        for constraint in table.constraints
+        if constraint.name == "ck_purchase_export_batch_exactly_one_source_anchor"
+    )
+    anchor_sql = str(anchor_check.sqltext)
+    assert "current_execution_source_revision IS NOT NULL" in anchor_sql
+    assert "current_execution_source_revision IS NULL" in anchor_sql
 
     indexes = {index.name for index in table.indexes}
     assert {

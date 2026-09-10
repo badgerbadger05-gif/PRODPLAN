@@ -36,8 +36,10 @@ def upgrade() -> None:
     op.create_check_constraint(
         "ck_purchase_export_batch_exactly_one_source_anchor",
         "purchase_export_batch",
-        "(planning_read_snapshot_id IS NOT NULL AND current_execution_scope_id IS NULL) "
-        "OR (planning_read_snapshot_id IS NULL AND current_execution_scope_id IS NOT NULL)",
+        "(planning_read_snapshot_id IS NOT NULL AND current_execution_scope_id IS NULL "
+        "AND current_execution_source_revision IS NULL) "
+        "OR (planning_read_snapshot_id IS NULL AND current_execution_scope_id IS NOT NULL "
+        "AND current_execution_source_revision IS NOT NULL)",
     )
     op.create_index(
         "ix_purchase_export_batch_current_execution_scope_id",
@@ -72,8 +74,6 @@ def downgrade() -> None:
         "purchase_export_batch",
         type_="foreignkey",
     )
-    # Keep the legacy FK nullable during downgrade: current batches have no
-    # valid PlanningReadSnapshot identity and must not be relinked by guesswork.
     op.drop_column("purchase_export_batch", "current_execution_source_revision")
     op.drop_column("purchase_export_batch", "current_execution_scope_id")
     op.alter_column(
