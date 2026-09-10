@@ -275,6 +275,8 @@ boundaries, focused PostgreSQL gate, migration round-trip и полного pyte
 * `05188599` — implementation wiring for pointer-aware current journal scope;
   historical generation filtering remains only the pre-R3 no-pointer fixture
   compatibility path.
+* `6e00c41a` — PostgreSQL current-journal reader now fails closed when a
+  plan-bound active pointer is absent.
 * `tests/r3/test_r3_contract.py` — deterministic identity, incomplete/reordered
   page rejection, pointer-only current read и frozen provenance checks.
 * `docs/r3-identity-acceptance-contract.md` — boundary/owner summary without
@@ -340,7 +342,7 @@ $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='
 139 passed in 15.31s
 
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q
-1949 passed, 35 warnings in 198.04s (0:03:18); 0 skipped
+1949 passed, 35 warnings in 221.11s (0:03:41); 0 skipped
 ```
 
 Удалённые пути: **нет**. Сохранён untracked `current-execution-full-pytest.log`;
