@@ -341,6 +341,70 @@ def test_current_future_supply_correction_reuses_row_and_audits_once(db_session)
     ).count() == 3
 
 
+def test_current_future_supply_reverse_return_keeps_owner_and_audits_once(db_session):
+    """A signed return reopens the same current owner, not a generation copy."""
+    generation, batch, item = _context(db_session, "stable-reverse-return")
+    replace_future_supply_capture(
+        db_session, generation.id, batch.id,
+        [_evidence(generation, item, kind="supplier_order", ref="SO-R", line="1", ordered="10", realized="8")],
+    )
+    batch.status = "completed"
+    generation.status = "accepted"
+    pointer = models.PlanningTruthState(id=1, current_generation_id=generation.id)
+    db_session.add(pointer)
+    db_session.flush()
+    publish_current_future_supply(db_session, generation.id)
+
+    current = db_session.query(models.LedgerFutureSupplyCurrent).one()
+    current_id = int(current.id)
+    identity = "supplier_order:SO-R:1:local-1"
+    assert current.current_identity == identity
+    assert current.open_qty_at_cutoff == Decimal("2")
+    assert db_session.query(models.LedgerFutureSupplyCurrent).count() == 1
+    assert db_session.query(models.LedgerFutureSupplyCurrentChange).filter_by(
+        current_identity=identity
+    ).count() == 1
+
+    physical = models.PhysicalImportBatch(
+        batch_key="future-physical-stable-reverse-return-b", status="completed",
+        cutoff=datetime(2026, 8, 3, 23, 59), source_watermarks={},
+    )
+    target = models.LedgerGeneration(
+        generation_key="future-generation-stable-reverse-return-b", status="building",
+        cutoff=physical.cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical, algorithm_version="test",
+    )
+    db_session.add_all([physical, target])
+    db_session.flush()
+    target_batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+        batch_key="future-snapshot-stable-reverse-return-b",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+    )
+    db_session.add(target_batch)
+    db_session.flush()
+    replace_future_supply_capture(
+        db_session, target.id, target_batch.id,
+        [_evidence(target, item, kind="supplier_order", ref="SO-R", line="1", ordered="10", realized="3")],
+    )
+    target_batch.status = "completed"
+    target.status = "accepted"
+    pointer.current_generation_id = target.id
+    db_session.flush()
+    publish_current_future_supply(db_session, target.id)
+
+    current = db_session.query(models.LedgerFutureSupplyCurrent).one()
+    assert int(current.id) == current_id
+    assert current.open_qty_at_cutoff == Decimal("7")
+    assert db_session.query(models.LedgerFutureSupplyCurrent).count() == 1
+    changes = db_session.query(models.LedgerFutureSupplyCurrentChange).filter_by(
+        current_identity=identity
+    ).order_by(models.LedgerFutureSupplyCurrentChange.id).all()
+    assert len(changes) == 2
+    assert changes[-1].operation == "update"
+    assert changes[-1].after_payload["open_qty_at_cutoff"] == "7"
+
+
 def test_building_future_supply_correction_cannot_mutate_current_without_publish(db_session):
     generation, batch, item = _context(db_session, "building-current-boundary")
     replace_future_supply_capture(
