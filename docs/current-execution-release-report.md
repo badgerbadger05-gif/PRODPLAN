@@ -140,11 +140,12 @@ exit 0
 `psql` и `pg_isready` также отсутствуют. Поэтому migration пустой БД,
 двухсессионный rollback и численный baseline не выдаются за выполненные.
 
-Обязательный полный gate с `ca885897`:
+Обязательный полный gate с финального R2 implementation-состояния
+(`ca885897`; последующие commits меняют только report):
 
 ```text
 pytest -q
-1920 passed, 5 skipped, 35 warnings in 196.84s (0:03:16)
+1920 passed, 5 skipped, 35 warnings in 184.38s (0:03:04)
 ```
 
 Пять skip распределены так: три существующих opt-in PostgreSQL теста
