@@ -74,8 +74,8 @@ pytest -q tests/contracts/test_r1_semantic_contract.py tests/test_canon_invarian
 
 Финальный focused semantic/canon/closure/rebase gate после всех R1 tail docs:
 `93 passed`.
-Сохранённый full pytest gate current-execution после test-first fixtures:
-`1914 passed, 3 skipped, 35 warnings`; исходный untracked
+Фактический full pytest gate оркестратора на commit `b47b02d7`:
+`1915 passed, 3 skipped, 35 warnings in 184.48s`; исходный untracked
 `current-execution-full-pytest.log` сохранён без изменений.
 
 ### Removed paths and residual risks
