@@ -17,6 +17,7 @@ from app.services.item_ledger.current_physical import (
     fold_current_stock,
     senior_hold_qty,
 )
+from app.services.item_ledger.physical import LedgerKey, rebuild_running_balance
 from app.services.mrp_stock_helpers import planning_stock_by_item
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.production_material_custody_projection import (
@@ -92,7 +93,10 @@ def test_current_reader_does_not_fall_back_to_requested_generation(db_session, b
         on_hand=Decimal("-2.500"),
     ))
     db_session.flush()
-    assert planning_stock_by_item(db_session, ledger_generation_id=building_ledger_generation.id)[item.item_id] == -2.5
+    with pytest.raises(ValueError, match="current StockBin provenance"):
+        planning_stock_by_item(
+            db_session, ledger_generation_id=building_ledger_generation.id
+        )
 
 
 def test_late_custody_event_is_explicitly_visible_for_baseline_rewind(db_session):
@@ -114,3 +118,50 @@ def test_late_custody_event_is_explicitly_visible_for_baseline_rewind(db_session
         baseline_high_watermark_id=0,
         target_high_watermark_id=event.id,
     ) == [event.id]
+
+
+def test_building_candidate_stock_is_not_visible_until_explicit_publication(
+    db_session, building_ledger_generation
+):
+    item = models.Item(item_code="R6-MVCC", item_name="R6 MVCC", unit="шт", status="active")
+    db_session.add(item)
+    db_session.flush()
+    key = LedgerKey(item.item_id, "", DEFAULT_ORGANIZATION_REF1C, "WH-R6")
+    db_session.add(models.StockBin(
+        ledger_generation_id=building_ledger_generation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-R6",
+        on_hand=Decimal("10"),
+        is_current=True,
+    ))
+    batch = models.PhysicalImportBatch(batch_key="r6-mvcc-batch", status="completed")
+    candidate = models.LedgerGeneration(
+        generation_key="r6-mvcc-candidate", status="building", source_watermarks={},
+        capabilities={}, physical_import_batch=batch, algorithm_version="r6", replay_version="r6",
+    )
+    db_session.add(candidate)
+    db_session.flush()
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=batch.id, source_content_hash="r6-mvcc".ljust(64, "0"),
+        item_id=item.item_id, characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-R6", qty=Decimal("-4"), qty_after=Decimal("0"),
+        posting_at=datetime(2026, 9, 10), record_type="Expense", movement_kind="consume",
+        recorder_type="Document_R6", recorder_ref="r6-mvcc", line_no="1", ingest_source="test",
+    ))
+    db_session.flush()
+    rebuild_running_balance(db_session, key, ledger_generation_id=candidate.id, publish_current=False)
+    assert planning_stock_by_item(db_session, building_ledger_generation.id)[item.item_id] == 10.0
+    staged = db_session.query(models.StockBin).filter_by(ledger_generation_id=candidate.id).one()
+    assert staged.is_current is False and staged.on_hand == Decimal("-4")
+    rebuild_running_balance(db_session, key, ledger_generation_id=candidate.id, publish_current=True)
+    with pytest.raises(ValueError, match="current StockBin provenance"):
+        planning_stock_by_item(db_session, building_ledger_generation.id)
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = candidate.id
+    assert planning_stock_by_item(db_session, candidate.id)[item.item_id] == -4.0
+
+
+def test_reservation_consumption_default_is_not_current_without_explicit_publication():
+    column = models.ReservationConsumptionAllocation.__table__.c.is_current
+    assert column.default is not None and column.default.arg is False

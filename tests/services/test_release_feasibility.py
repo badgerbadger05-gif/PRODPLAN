@@ -335,8 +335,8 @@ def test_material_custody_is_not_free_for_a_new_release(db_session, monkeypatch)
         by_warehouse_item={(MAIN_WAREHOUSE, int(material.item_id)): 20.0}
     )
     monkeypatch.setattr(
-        "app.services.production_material_custody_projection.load_material_custody_projection",
-        lambda _db, *, ledger_generation_id: custody,
+        "app.services.production_material_custody_projection.load_compact_current_material_custody",
+        lambda _db, *, consumer: (1, custody),
     )
 
     payload = analyze_release(db_session, product, 25.0)
