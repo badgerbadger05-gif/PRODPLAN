@@ -32,6 +32,11 @@ from app.services.planning_truth import (
     require_accepted_truth,
 )
 from app.services.planning_run_candidate import _resolve_parent_generation_id
+from app.services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    load_current_execution_rows,
+    require_current_execution_scope,
+)
 
 
 CONSUMER = "mrp_result"
@@ -822,3 +827,203 @@ def read_mrp_result_rows(
         "limit": effective_limit,
         "offset": effective_offset,
     }
+
+
+def _current_mrp_scope(db: Session):
+    """Resolve the sole user-facing MRP result owner.
+
+    The old snapshot helpers above remain available to migration/build code,
+    but these public read functions intentionally never fall back to them.
+    """
+
+    return require_current_execution_scope(
+        db,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    )
+
+
+def _current_mrp_row_value(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _read_current_mrp_rows(
+    db: Session,
+    run_id: int,
+    *,
+    row_kind: str,
+    item_id: int | None,
+    root_item_id: int | None,
+    area_id: int | None,
+    date_from: str | date | None,
+    date_to: str | date | None,
+    supplier_ref1c: str | None,
+    category_id: int | None,
+    category_ref1c: str | None,
+    limit: int,
+    offset: int,
+    sort_dir: str,
+) -> dict[str, Any]:
+    kind = str(row_kind or "").strip().lower()
+    if kind not in ROW_KINDS:
+        raise ValueError(f"unsupported MRP result row kind: {row_kind}")
+    scope = _current_mrp_scope(db)
+    all_rows: list[tuple[Any, dict[str, Any]]] = []
+    for current in load_current_execution_rows(
+        db,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    ):
+        payload = dict(current.payload or {})
+        if int(payload.get("run_id") or 0) != int(run_id):
+            continue
+        if str(payload.get("row_kind") or "").strip().lower() != kind:
+            continue
+        all_rows.append((current, payload))
+
+    def _as_text(value: Any) -> str:
+        return str(value or "")
+
+    filtered: list[tuple[Any, dict[str, Any]]] = []
+    start = date_from.isoformat() if isinstance(date_from, date) else str(date_from or "")
+    end = date_to.isoformat() if isinstance(date_to, date) else str(date_to or "")
+    for current, payload in all_rows:
+        if item_id is not None and int(payload.get("item_id") or 0) != int(item_id):
+            continue
+        roots = payload.get("root_item_ids") or payload.get("root_item_id")
+        if root_item_id is not None:
+            if isinstance(roots, list):
+                if int(root_item_id) not in {int(value) for value in roots}:
+                    continue
+            elif int(roots or 0) != int(root_item_id):
+                continue
+        if area_id is not None and int(payload.get("area_id") or 0) != int(area_id):
+            continue
+        if supplier_ref1c is not None:
+            supplier = _as_text(payload.get("supplier_ref1c"))
+            supplier_name = _as_text(payload.get("supplier_name")).strip()
+            if supplier_ref1c == "__missing_supplier_name":
+                if supplier_name:
+                    continue
+            elif supplier != str(supplier_ref1c):
+                continue
+        if category_id is not None and int(payload.get("category_id") or 0) != int(category_id):
+            continue
+        if category_ref1c is not None:
+            category_ref = _as_text(payload.get("category_ref1c")).strip()
+            if category_ref1c == "__missing_category":
+                if int(payload.get("category_id") or 0) or category_ref:
+                    continue
+            elif category_ref != str(category_ref1c):
+                continue
+        row_date = _as_text(_current_mrp_row_value(
+            payload, "date", "need_date", "required_date", "period_from", "sort_key"
+        ))
+        if start and row_date < start:
+            continue
+        if end and row_date >= end:
+            continue
+        filtered.append((current, payload))
+
+    filtered.sort(
+        key=lambda pair: (
+            _as_text(pair[1].get("sort_key") or pair[1].get("date") or ""),
+            str(pair[0].business_identity),
+        ),
+        reverse=str(sort_dir or "").lower() == "desc",
+    )
+    total = len(filtered)
+    effective_limit = max(1, min(int(limit or 100), _MAX_PAGE))
+    effective_offset = max(0, int(offset or 0))
+    page = filtered[effective_offset : effective_offset + effective_limit]
+    generation = db.get(models.LedgerGeneration, int(scope.source_generation_id or 0))
+    cutoff = generation.cutoff.isoformat() if generation and generation.cutoff else None
+    source_revision = str(scope.source_revision)
+    response_rows = []
+    for current, payload in page:
+        row_payload = dict(payload)
+        row_payload.setdefault("current_identity", str(current.business_identity))
+        row_payload.setdefault("source_revision", source_revision)
+        response_rows.append(row_payload)
+    total_qty = sum(float((payload or {}).get("qty") or 0) for _, payload in filtered)
+    return {
+        "snapshot_id": int(scope.id),
+        "current_identity": f"scope:{int(scope.id)}",
+        "source_revision": source_revision,
+        "run_id": int(run_id),
+        "ledger_generation": int(scope.source_generation_id or 0),
+        "cutoff": cutoff,
+        "truth_status": "accepted",
+        "truth_reason": None,
+        "rows": response_rows,
+        "total": total,
+        "total_qty": total_qty,
+        "limit": effective_limit,
+        "offset": effective_offset,
+    }
+
+
+def read_mrp_result_manifest(
+    db: Session, run_id: int, *, snapshot_id: int | None = None
+) -> dict[str, Any]:
+    scope = _current_mrp_scope(db)
+    if snapshot_id is not None and int(snapshot_id) != int(scope.id):
+        raise CurrentExecutionUnavailable("current MRP manifest identity does not match")
+    generation = db.get(models.LedgerGeneration, int(scope.source_generation_id or 0))
+    if generation is None or generation.cutoff is None:
+        raise CurrentExecutionUnavailable("current MRP source cutoff is missing")
+    summary = dict(scope.summary or {})
+    return {
+        "snapshot_id": int(scope.id),
+        "current_identity": f"scope:{int(scope.id)}",
+        "source_revision": str(scope.source_revision),
+        "run_id": int(run_id),
+        "ledger_generation": int(scope.source_generation_id or 0),
+        "cutoff": generation.cutoff.isoformat(),
+        "truth_status": "accepted",
+        "truth_reason": None,
+        **summary,
+    }
+
+
+def read_mrp_result_rows(
+    db: Session,
+    run_id: int,
+    *,
+    row_kind: str,
+    snapshot_id: int | None = None,
+    item_id: int | None = None,
+    root_item_id: int | None = None,
+    area_id: int | None = None,
+    date_from: str | date | None = None,
+    date_to: str | date | None = None,
+    supplier_ref1c: str | None = None,
+    category_id: int | None = None,
+    category_ref1c: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_dir: str = "asc",
+) -> dict[str, Any]:
+    scope = _current_mrp_scope(db)
+    if snapshot_id is not None and int(snapshot_id) != int(scope.id):
+        raise CurrentExecutionUnavailable("current MRP manifest identity does not match")
+    return _read_current_mrp_rows(
+        db,
+        int(run_id),
+        row_kind=row_kind,
+        item_id=item_id,
+        root_item_id=root_item_id,
+        area_id=area_id,
+        date_from=date_from,
+        date_to=date_to,
+        supplier_ref1c=supplier_ref1c,
+        category_id=category_id,
+        category_ref1c=category_ref1c,
+        limit=limit,
+        offset=offset,
+        sort_dir=sort_dir,
+    )

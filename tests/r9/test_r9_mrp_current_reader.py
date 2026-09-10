@@ -72,7 +72,12 @@ def test_mrp_reader_uses_persisted_current_rows_and_manifest(db_session):
     result = read_mrp_result_rows(db_session, 41, row_kind="production")
     manifest = read_mrp_result_manifest(db_session, 41)
 
-    assert result["rows"] == [{"item_id": 10, "qty": 7, "run_id": 41, "row_kind": "production"}]
+    assert result["rows"][0].items() >= {
+        "item_id": 10,
+        "qty": 7,
+        "run_id": 41,
+        "row_kind": "production",
+    }.items()
     assert result["current_identity"]
     assert result["source_revision"].startswith("accepted:g")
     assert manifest["current_identity"] == result["current_identity"]
