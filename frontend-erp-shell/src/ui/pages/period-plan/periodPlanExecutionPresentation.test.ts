@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { executionWorkItemPresentation } from './periodPlanExecutionPresentation'
+import {
+  executionJournalRowPresentation,
+  executionWorkItemPresentation,
+} from './periodPlanExecutionPresentation'
 
 describe('period execution presentation', () => {
   it('renders persisted navigation and quantities without domain derivation', () => {
@@ -8,14 +11,31 @@ describe('period execution presentation', () => {
       qty: 5,
       assigned_qty: 0,
       unassigned_qty: 5,
-      current_identity: 'mrp-run:41:requirement:101:planned-purchase:701',
-      navigation_href: '#/mrp-runs/41?tab=purchases&current_identity=mrp-run%3A41%3Arequirement%3A101%3Aplanned-purchase%3A701',
+      current_identity: 'mrp-run:41:purchase:requirement:101:item:501:allocation:default',
+      navigation_href: '#/mrp-runs/41?tab=purchases&current_identity=mrp-run%3A41%3Apurchase%3Arequirement%3A101%3Aitem%3A501%3Aallocation%3Adefault',
       navigation_reason: null,
     })).toEqual({
-      href: '#/mrp-runs/41?tab=purchases&current_identity=mrp-run%3A41%3Arequirement%3A101%3Aplanned-purchase%3A701',
+      href: '#/mrp-runs/41?tab=purchases&current_identity=mrp-run%3A41%3Apurchase%3Arequirement%3A101%3Aitem%3A501%3Aallocation%3Adefault',
       assignedQty: 0,
       unassignedQty: 5,
       unavailableReason: null,
+    })
+  })
+
+  it('does not derive status or quantities when accepted DTO fields are unavailable', () => {
+    expect(executionJournalRowPresentation({
+      status_label: null,
+      explanations: ['Current execution is unavailable'],
+      current_identity: null,
+      source_revision: null,
+      unassigned_qty: null,
+    })).toEqual({
+      statusLabel: null,
+      explanations: ['Current execution is unavailable'],
+      currentIdentity: null,
+      sourceRevision: null,
+      unassignedQty: null,
+      unavailable: true,
     })
   })
 
