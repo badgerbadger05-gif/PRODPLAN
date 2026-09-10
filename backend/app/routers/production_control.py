@@ -42,12 +42,10 @@ from ..services.production_control_journal_snapshot import (
     CONSUMER as PRODUCTION_JOURNAL_CONSUMER,
     PROPOSAL_ROW_KIND as PRODUCTION_JOURNAL_PROPOSAL_ROW_KIND,
     SNAPSHOT_KEY as PRODUCTION_JOURNAL_SNAPSHOT_KEY,
-    RouteSheetSnapshotUnavailable,
     ProductionControlJournalSnapshotUnavailable,
     list_root_product_options,
     read_snapshot as read_production_control_journal_snapshot,
     _public_journal_row,
-    read_route_sheet_snapshot_rows,
 )
 from ..services.production_control_material_availability import (
     MaterialCoverageSnapshotUnavailable,
@@ -62,7 +60,7 @@ from ..services.item_ledger.current_execution import (
 )
 from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
-    mark_route_sheets_printed_by_snapshot_members,
+    mark_route_sheets_printed_by_snapshot_members as mark_route_sheets_printed_by_members,
     render_route_sheets_from_snapshots,
 )
 from ..services.production_control_production_flow import (
@@ -86,12 +84,6 @@ from .production_control_settings import router as settings_router
 
 
 router = APIRouter(prefix="/v1/production-control", tags=["production-control"])
-
-
-def _route_sheet_snapshot_error(exc: RouteSheetSnapshotUnavailable) -> dict[str, object]:
-    detail = exc.as_dict()
-    detail.setdefault("code", "route_sheet_snapshot_unavailable")
-    return detail
 
 
 def _route_sheet_member_ids(payloads: List[dict]) -> List[int]:
@@ -1096,6 +1088,8 @@ class OrderLineQuantityPayload(BaseModel):
 class OpenPaintWeldChainsPayload(BaseModel):
     product_ids: List[int]
     initiated_by: Optional[str] = None
+    current_identities: List[str] = Field(default_factory=list)
+    expected_source_revision: Optional[str] = None
 
 
 class ExportProductionOrdersPayload(BaseModel):
@@ -1250,7 +1244,9 @@ class AssembleMaterialIssuePayload(BaseModel):
 
 
 class PrintRouteSheetsPayload(BaseModel):
-    product_ids: List[int]
+    product_ids: List[int] = Field(default_factory=list)
+    current_identities: List[str] = Field(default_factory=list)
+    expected_source_revision: Optional[str] = None
     mark_printed: bool = True
     auto_print: bool = True
 
@@ -1719,15 +1715,11 @@ def get_work_item_materials(
     work_item_id: int,
     qty: Optional[float] = None,
     ledger_generation_id: Optional[int] = Query(default=None, gt=0),
+    current_identity: Optional[str] = None,
+    expected_source_revision: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """Preview BOM coverage for a saved MRP row without creating an order.
-
-    The journal row and its detail request must use the same immutable Ledger
-    generation.  A newer accepted generation may be published between the two
-    requests, so an explicitly pinned, previously published journal snapshot
-    remains readable.
-    """
+    """Read persisted current coverage for an MRP row without replaying BOM."""
     try:
         from ..services.item_ledger.current_execution import (
             CurrentExecutionUnavailable,
@@ -1739,6 +1731,19 @@ def get_work_item_materials(
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
         )
+        if not current_identity or not expected_source_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "production_current_identity_and_revision_required"},
+            )
+        if str(expected_source_revision) != str(current_manifest.source_revision):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "production_current_revision_stale",
+                    "expected_source_revision": current_manifest.source_revision,
+                },
+            )
         current_generation_id = int(current_manifest.source_generation_id or 0)
         work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
         if work is None or int(work.ledger_generation_id) != current_generation_id:
@@ -1751,34 +1756,24 @@ def get_work_item_materials(
             )
             if int((row.payload or {}).get("source_mrp_requirement_id") or 0) == int(work.requirement_id)
             and int((row.payload or {}).get("item_id") or 0) == int(work.item_id)
+            and str(row.business_identity) == str(current_identity)
         ]
         if len(current_rows) != 1:
             raise CurrentExecutionUnavailable("current work-item material row is missing or ambiguous")
         current_payload = dict(current_rows[0].payload or {})
+        if "work_item_id" in current_payload:
+            raise CurrentExecutionUnavailable("current work-item payload contains a generation-local locator")
         if ledger_generation_id is not None and int(ledger_generation_id) != current_generation_id:
             raise HTTPException(status_code=409, detail="Требуется актуальное принятое поколение")
-        requested_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
-        remaining_qty = float(work.replenishment_remaining_qty)
-        if requested_qty <= 0 or requested_qty > remaining_qty + 1e-6:
-            raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
         persisted_material = current_payload.get("material_coverage_snapshot")
-        if qty is not None:
-            generated = preview_make_work_item_materials(
-                db,
-                work_item_id=int(work.id),
-                item_id=int(work.item_id),
-                quantity=requested_qty,
-                spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
-                ledger_generation_id=current_generation_id,
-                order_number=f"MRP-R-{int(work.requirement_id)}",
-                run_id=int(work.run_id),
-            )
-            generated["truth_status"] = "accepted"
-            generation = db.get(models.LedgerGeneration, current_generation_id)
-            generated["cutoff"] = generation.cutoff.isoformat() if generation and generation.cutoff else None
-            return generated
         if not isinstance(persisted_material, dict):
             raise CurrentExecutionUnavailable("current work-item material coverage is missing")
+        stored_qty = persisted_material.get("line_quantity")
+        requested_qty = float(qty if qty is not None else stored_qty or 0)
+        if requested_qty <= 0:
+            raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
+        if stored_qty is None or abs(float(stored_qty) - requested_qty) > 1e-6:
+            raise CurrentExecutionUnavailable("current work-item material coverage is not persisted for requested quantity")
         persisted = dict(persisted_material)
         persisted["truth_status"] = "accepted"
         generation = db.get(models.LedgerGeneration, int(current_manifest.source_generation_id or 0))
@@ -2118,16 +2113,100 @@ def post_open_paint_weld_chains(
     """
     if not payload.product_ids:
         raise HTTPException(status_code=400, detail="Не выбраны строки заказов")
-    result = open_paint_chains_for_products(
-        db,
-        product_ids=payload.product_ids,
-        initiated_by=payload.initiated_by,
-    )
-    if result.get("status") == "partial_error":
-        errors = result.get("errors") or []
-        detail = "; ".join(str(row.get("error") or "ошибка цепочки") for row in errors)
-        raise HTTPException(status_code=400, detail=detail or "Не удалось открыть цепочку окраска-сварка")
-    return result
+    try:
+        _manifest, source_rows = _require_current_production_identities(
+            db,
+            identities=[str(identity) for identity in payload.current_identities],
+            expected_source_revision=payload.expected_source_revision,
+            locator_key="product_id",
+            locator_values={int(value) for value in payload.product_ids},
+        )
+        # If the pair metadata already identifies a welded counterpart, require
+        # its current row before invoking the committing legacy chain service.
+        # This prevents a missing current anchor from turning into a committed
+        # but unusable chain.  A pair created by the service itself is handled
+        # by the post-call fail-closed check below.
+        if hasattr(db, "query"):
+            painted_items = {
+                int((row.payload or {}).get("item_id"))
+                for row in source_rows
+                if (row.payload or {}).get("item_id") is not None
+            }
+            pair_rows = (
+                db.query(models.PaintWeldPair)
+                .filter(
+                    models.PaintWeldPair.painted_item_id.in_(painted_items),
+                    models.PaintWeldPair.is_active.is_(True),
+                )
+                .all()
+                if painted_items
+                else []
+            )
+            expected_item_ids = {int(pair.welded_item_id) for pair in pair_rows}
+            if expected_item_ids:
+                current_rows = load_current_execution_rows(
+                    db,
+                    entity_kind="production_control_journal",
+                    scope_key="production:all-live-orders",
+                )
+                for item_id in expected_item_ids:
+                    anchored = [
+                        row for row in current_rows
+                        if int((row.payload or {}).get("item_id") or 0) == item_id
+                        and (row.payload or {}).get("source_mrp_requirement_id") is not None
+                    ]
+                    if len(anchored) != 1:
+                        raise CurrentExecutionUnavailable(
+                            "paint/weld counterpart lacks one stable current proposal anchor"
+                        )
+        result = open_paint_chains_for_products(
+            db,
+            product_ids=payload.product_ids,
+            initiated_by=payload.initiated_by,
+        )
+        if result.get("status") == "partial_error":
+            errors = result.get("errors") or []
+            detail = "; ".join(str(row.get("error") or "ошибка цепочки") for row in errors)
+            raise HTTPException(status_code=400, detail=detail or "Не удалось открыть цепочку окраска-сварка")
+        output_ids = {int(value) for value in result.get("product_ids") or payload.product_ids}
+        current_rows = load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        output_rows = [
+            row for row in current_rows
+            if int((row.payload or {}).get("product_id") or 0) in output_ids
+        ]
+        if hasattr(db, "query"):
+            # A newly-created counterpart may not have a product-scoped row
+            # until the next publication. Resolve it through exactly one
+            # persisted MRP proposal identity for its item instead of exposing
+            # an unanchored numeric product id to the next action.
+            for product_id in sorted(output_ids):
+                if any(int((row.payload or {}).get("product_id") or 0) == product_id for row in output_rows):
+                    continue
+                product = db.get(models.ProductionProduct, product_id)
+                if product is None:
+                    continue
+                proposal_rows = [
+                    row for row in current_rows
+                    if int((row.payload or {}).get("item_id") or 0) == int(product.item_id)
+                    and (row.payload or {}).get("source_mrp_requirement_id") is not None
+                ]
+                if len(proposal_rows) == 1:
+                    output_rows.append(proposal_rows[0])
+        if len(output_rows) != len(output_ids):
+            raise CurrentExecutionUnavailable("paint/weld counterpart lacks a current production anchor")
+        result["current_identities"] = [str(row.business_identity) for row in output_rows]
+        result["source_revision"] = str(payload.expected_source_revision)
+        return result
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/orders/export-to-1c", response_model=dict)
@@ -2318,9 +2397,48 @@ def post_sync_execution_from_1c(dry_run: bool = False, db: Session = Depends(get
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _current_route_sheet_payloads(
+    db: Session,
+    *,
+    product_ids: list[int],
+    current_identities: list[str],
+    expected_source_revision: Optional[str],
+) -> list[dict]:
+    requested = {int(value) for value in product_ids}
+    if not requested:
+        raise ValueError("Не выбраны строки заказа")
+    _require_current_production_identities(
+        db,
+        identities=[str(identity) for identity in current_identities],
+        expected_source_revision=expected_source_revision,
+        locator_key="product_id",
+        locator_values=requested,
+    )
+    rows = [
+        row for row in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        if int((row.payload or {}).get("product_id") or 0) in requested
+    ]
+    if len(rows) != len(requested):
+        raise CurrentExecutionUnavailable("current route-sheet membership is missing or ambiguous")
+    payloads: list[dict] = []
+    for row in rows:
+        payload = row.payload or {}
+        route_payload = payload.get("route_sheet_payload") or payload.get("_route_sheet_snapshot")
+        if not isinstance(route_payload, dict):
+            raise CurrentExecutionUnavailable("current route-sheet payload is missing")
+        payloads.append(dict(route_payload))
+    return payloads
+
+
 @router.get("/route-sheets/print", response_class=HTMLResponse)
 def print_route_sheets(
     product_ids: str = Query(..., description="Comma-separated production product ids"),
+    current_identities: str = Query(..., description="Comma-separated current production identities"),
+    expected_source_revision: str = Query(...),
     mark_printed: bool = False,
     auto_print: bool = False,
     db: Session = Depends(get_db),
@@ -2329,15 +2447,24 @@ def print_route_sheets(
         ids = [int(x) for x in product_ids.split(",") if x.strip()]
         if not ids:
             raise ValueError("Не выбраны строки заказа")
-        route_payloads = read_route_sheet_snapshot_rows(db, ids)
+        identities = [value.strip() for value in current_identities.split(",") if value.strip()]
+        route_payloads = _current_route_sheet_payloads(
+            db,
+            product_ids=ids,
+            current_identities=identities,
+            expected_source_revision=expected_source_revision,
+        )
         html = render_route_sheets_from_snapshots(route_payloads, auto_print=auto_print)
         # Compatibility-only query parameter.  GET is strictly read-only even
         # when an old bookmark sends mark_printed=true; persistence belongs to
         # the explicit POST endpoint below.
         _ = mark_printed
         return HTMLResponse(content=html)
-    except RouteSheetSnapshotUnavailable as exc:
-        raise HTTPException(status_code=503, detail=_route_sheet_snapshot_error(exc)) from exc
+    except HTTPException:
+        raise
+    except CurrentExecutionUnavailable as exc:
+        detail = {"code": "production_control_current_unavailable", "reason": str(exc)}
+        raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2351,13 +2478,23 @@ def post_print_route_sheets(
         ids = [int(x) for x in payload.product_ids if x is not None]
         if not ids:
             raise ValueError("Не выбраны строки заказа")
-        route_payloads = read_route_sheet_snapshot_rows(db, ids)
+        route_payloads = _current_route_sheet_payloads(
+            db,
+            product_ids=ids,
+            current_identities=list(payload.current_identities),
+            expected_source_revision=payload.expected_source_revision,
+        )
         html = render_route_sheets_from_snapshots(route_payloads, auto_print=bool(payload.auto_print))
         if payload.mark_printed:
-            mark_route_sheets_printed_by_snapshot_members(db, _route_sheet_member_ids(route_payloads))
+            # Mark exactly the current sheet members; do not rediscover a
+            # historical paint/weld chain by numeric product id.
+            mark_route_sheets_printed_by_members(db, _route_sheet_member_ids(route_payloads))
         return HTMLResponse(content=html)
-    except RouteSheetSnapshotUnavailable as exc:
-        raise HTTPException(status_code=503, detail=_route_sheet_snapshot_error(exc)) from exc
+    except HTTPException:
+        raise
+    except CurrentExecutionUnavailable as exc:
+        detail = {"code": "production_control_current_unavailable", "reason": str(exc)}
+        raise HTTPException(status_code=503, detail=detail) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

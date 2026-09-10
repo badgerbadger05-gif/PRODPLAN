@@ -2124,10 +2124,9 @@ export interface paths {
          * Get Work Item Materials
          * @description Preview BOM coverage for a saved MRP row without creating an order.
          *
-         *     The journal row and its detail request must use the same immutable Ledger
-         *     generation.  A newer accepted generation may be published between the two
-         *     requests, so an explicitly pinned, previously published journal snapshot
-         *     remains readable.
+         *     The journal row and its detail request must carry the current stable
+         *     identity and accepted execution revision. Historical snapshots are not
+         *     a runtime fallback.
          */
         get: operations["get_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_get"];
         put?: never;
@@ -4938,6 +4937,10 @@ export interface components {
             product_ids: number[];
             /** Initiated By */
             initiated_by?: string | null;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** OrderLineQuantityPayload */
         OrderLineQuantityPayload: {
@@ -5189,6 +5192,10 @@ export interface components {
         PrintRouteSheetsPayload: {
             /** Product Ids */
             product_ids: number[];
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
             /**
              * Mark Printed
              * @default true
@@ -10764,6 +10771,8 @@ export interface operations {
             query?: {
                 qty?: number | null;
                 ledger_generation_id?: number | null;
+                current_identity?: string | null;
+                expected_source_revision?: string | null;
             };
             header?: never;
             path: {
@@ -11391,6 +11400,9 @@ export interface operations {
             query: {
                 /** @description Comma-separated production product ids */
                 product_ids: string;
+                /** @description Comma-separated current production identities */
+                current_identities: string;
+                expected_source_revision: string;
                 mark_printed?: boolean;
                 auto_print?: boolean;
             };

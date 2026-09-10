@@ -425,6 +425,7 @@ def _build_rows(
         readiness_pull_by_run_item=readiness_pull,
     )
     from app.services.production_control_material_availability import (
+        preview_make_work_item_materials,
         preview_make_work_items_coverage,
     )
     proposal_coverage = preview_make_work_items_coverage(
@@ -440,6 +441,20 @@ def _build_rows(
             row["material_coverage_status"] = coverage["coverage_status"]
             row["material_coverage_label"] = coverage["coverage_label"]
             row["material_coverage_calculated_at"] = generation.cutoff.isoformat()
+        # Persist the exact proposal quantity coverage at publication time.
+        # Current GETs must not replay BOM/ledger/custody; a different requested
+        # quantity is therefore rejected until a worker publishes that quantity.
+        if row.get("spec_id") is not None and row.get("launchable_qty") not in (None, 0):
+            row["material_coverage_snapshot"] = preview_make_work_item_materials(
+                db,
+                work_item_id=int(row["work_item_id"]),
+                item_id=int(row["item_id"]),
+                quantity=float(row["launchable_qty"]),
+                spec_id=int(row["spec_id"]),
+                ledger_generation_id=int(generation.id),
+                order_number=f"MRP-R-{int(row['source_mrp_requirement_id'])}",
+                run_id=int(row["source_run_id"]) if row.get("source_run_id") is not None else None,
+            )
         source_run_id = row.get("source_run_id")
         pull = (
             readiness_pull.get((int(source_run_id), int(row["item_id"])))

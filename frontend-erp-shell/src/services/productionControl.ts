@@ -108,7 +108,7 @@ export type OrderQuantityUpdateResult = {
 export function updateOrderQuantity(
   productId: number,
   quantity: number,
-  currentIdentity?: string,
+  currentIdentity?: string | null,
   expectedSourceRevision?: string | null,
 ) {
   return api<OrderQuantityUpdateResult>(`/v1/production-control/orders/${productId}/quantity`, {
@@ -150,11 +150,19 @@ export function getOrderMaterials(productId: number) {
   return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
 }
 
-export function getWorkItemMaterials(workItemId: number, quantity: number, ledgerGenerationId: number) {
+export function getWorkItemMaterials(
+  workItemId: number,
+  quantity: number,
+  ledgerGenerationId: number,
+  currentIdentity?: string | null,
+  expectedSourceRevision?: string | null,
+) {
   const params = new URLSearchParams({
     qty: String(quantity),
     ledger_generation_id: String(ledgerGenerationId),
   })
+  if (currentIdentity) params.set('current_identity', currentIdentity)
+  if (expectedSourceRevision) params.set('expected_source_revision', expectedSourceRevision)
   return api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
 }
 
@@ -188,10 +196,20 @@ export function postMaterialIssues(productIds: number[], initiatedBy: string, so
   })
 }
 
-export function fetchRouteSheetsPrintHtml(productIds: number[]): Promise<string> {
+export function fetchRouteSheetsPrintHtml(
+  productIds: number[],
+  currentIdentities: string[] = [],
+  expectedSourceRevision?: string | null,
+): Promise<string> {
   return apiText('/v1/production-control/route-sheets/print', {
     method: 'POST',
-    body: JSON.stringify({ product_ids: productIds, mark_printed: true, auto_print: true }),
+    body: JSON.stringify({
+      product_ids: productIds,
+      current_identities: currentIdentities,
+      expected_source_revision: expectedSourceRevision,
+      mark_printed: true,
+      auto_print: true,
+    }),
   })
 }
 
@@ -249,12 +267,23 @@ export type OpenPaintWeldChainsResult = {
   product_ids: number[]
   entries: Array<Record<string, unknown>>
   errors: Array<Record<string, unknown>>
+  current_identities?: string[]
+  source_revision?: string | null
 }
 
-export function openPaintWeldChains(productIds: number[]) {
+export function openPaintWeldChains(
+  productIds: number[],
+  currentIdentities: string[] = [],
+  expectedSourceRevision?: string | null,
+) {
   return api<OpenPaintWeldChainsResult>('/v1/production-control/orders/open-paint-weld-chains', {
     method: 'POST',
-    body: JSON.stringify({ product_ids: productIds, initiated_by: 'erp-shell' }),
+    body: JSON.stringify({
+      product_ids: productIds,
+      initiated_by: 'erp-shell',
+      current_identities: currentIdentities,
+      expected_source_revision: expectedSourceRevision,
+    }),
   })
 }
 

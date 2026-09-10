@@ -293,9 +293,9 @@ export function ProductionControlPage() {
   )
 
   const loadWorkItemMaterials = useCallback(
-    (workItemId: number, quantity: number, ledgerGenerationId: number) => requestMaterials(
+    (workItemId: number, quantity: number, ledgerGenerationId: number, currentIdentity?: string | null, sourceRevision?: string | null) => requestMaterials(
       -workItemId,
-      () => getWorkItemMaterials(workItemId, quantity, ledgerGenerationId),
+      () => getWorkItemMaterials(workItemId, quantity, ledgerGenerationId, currentIdentity, sourceRevision),
     ),
     [requestMaterials],
   )
@@ -374,9 +374,28 @@ export function ProductionControlPage() {
     if (printWindow && !printWindow.closed) printWindow.close()
   }
 
-  function renderRouteSheets(ids: number[], printWindow: Window | null) {
+  function currentActionSelection(ids: number[]) {
+    const requested = Array.from(new Set(ids))
+    const selected = rows.filter((row) => row.product_id != null && requested.includes(row.product_id))
+    const identities = selected.map((row) => row.current_identity)
+    const revisions = new Set(selected.map((row) => row.source_revision).filter(Boolean))
+    if (selected.length !== requested.length || identities.some((identity) => !identity) || revisions.size !== 1) {
+      throw new Error('Текущие строки исполнения недоступны: требуется полный identity и единая revision')
+    }
+    return { identities: identities as string[], sourceRevision: Array.from(revisions)[0] as string }
+  }
+
+  function renderRouteSheets(ids: number[], printWindow: Window | null, currentIdentities?: string[], sourceRevision?: string) {
     if (!ids.length || !printWindow || printWindow.closed) return
-    void fetchRouteSheetsPrintHtml(ids)
+    let context = { identities: currentIdentities, sourceRevision }
+    try {
+      if (!context.identities || !context.sourceRevision) context = currentActionSelection(ids)
+    } catch (e) {
+      closeRouteSheetWindow(printWindow)
+      setError(e instanceof Error ? e.message : String(e))
+      return
+    }
+    void fetchRouteSheetsPrintHtml(ids, context.identities, context.sourceRevision)
       .then((html) => {
         printWindow.document.open()
         printWindow.document.write(html)
@@ -491,7 +510,8 @@ export function ProductionControlPage() {
       )) {
         return
       }
-      const chains = await openPaintWeldChains(ids)
+      const chainContext = currentActionSelection(ids)
+      const chains = await openPaintWeldChains(ids, chainContext.identities, chainContext.sourceRevision)
       ids = Array.from(new Set(chains.product_ids ?? ids))
       printWindow = prepareRouteSheetWindow()
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
@@ -537,7 +557,7 @@ export function ProductionControlPage() {
           : `${summary}. Печать не открыта: браузер заблокировал окно.`,
       )
       await load(offsetRef.current)
-      renderRouteSheets(ids, printWindow)
+      renderRouteSheets(ids, printWindow, chains.current_identities, chains.source_revision ?? chainContext.sourceRevision)
     } catch (e) {
       closeRouteSheetWindow(printWindow)
       setError(e instanceof Error ? e.message : String(e))
@@ -908,6 +928,8 @@ export function ProductionControlPage() {
         workItemId,
         launchQty,
         truthMeta.ledger_generation as number,
+        activeRow.current_identity,
+        activeRow.source_revision,
       ), 250)
       return () => window.clearTimeout(timer)
     }
@@ -1067,6 +1089,8 @@ export function ProductionControlPage() {
                     activeRow.work_item_id,
                     launchQty,
                     truthMeta.ledger_generation,
+                    activeRow.current_identity,
+                    activeRow.source_revision,
                   )
                 }
               }}
