@@ -182,10 +182,13 @@ projection; перескок через unseen physical/backdated event запр
 является вторым владельцем количества.
 
 Future supply разделяет immutable generation capture и compact current read.
-`current_identity` обязан следовать внешней identity заказа/строки, а
-`is_current` переключается только вместе с accepted truth pointer; BUILDING и
-исторические копии current reader не видит. Исторические readers могут явно
-запрашивать generation evidence для сборки candidate.
+`LedgerFutureSupply` остаётся immutable generation evidence, а
+`LedgerFutureSupplyCurrent` — единственный compact current quantity owner по
+`current_identity`; `LedgerFutureSupplyCurrentChange` хранит before/after audit.
+Legacy `is_current` не является runtime-reader fallback. Compact publication и
+accepted truth pointer переключаются атомарно; BUILDING и ambiguous/rejected
+capture current reader не видит. Исторические readers могут явно запрашивать
+generation evidence для сборки candidate.
 
 Specification import сначала приводит payload к семантическому canonical form
 (включая Decimal и порядок строк), затем сравнивает единственный revision hash.

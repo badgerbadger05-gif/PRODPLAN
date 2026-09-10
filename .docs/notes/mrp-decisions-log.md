@@ -794,9 +794,12 @@ rebase сохраняет исходную матрицу и уже принят
 successor, а foreign retained plan/run не становится частью replacement.
 
 Future supply разделён на immutable generation capture и compact current read.
-`current_identity` exact evidence строится из stable order/proposal identity,
-`is_current` переключается только при принятии truth pointer; BUILDING rows и
-исторические копии не видны текущему GET. Semantic specification hash
+`LedgerFutureSupplyCurrent` — единственный current quantity owner по stable
+`current_identity`, а `LedgerFutureSupplyCurrentChange` хранит append-only
+before/after audit; `LedgerFutureSupply` остаётся generation evidence.
+Legacy `is_current` не используется runtime readers. Compact owner и truth
+pointer публикуются атомарно; BUILDING/ambiguous rows и исторические копии не
+видны текущему GET. Semantic specification hash
 нормализует Decimal/order/display noise: equivalent import — no-op, genuine
 change — одна revision/rebase request. Предметные формулы остаются в
 канонических модулях, этот журнал фиксирует только решение о владельце и

@@ -13,14 +13,14 @@ OData, боевые workers, deploy и push не использовались.
 | R4 — транзакционные основания и текущее исполнение | принято локально | current writer, typed provenance, role separation, rebuild closure, PG atomicity и полный gate зелёные |
 | R5 — исправления, отмены и backdate | принято локально | signed replay, explicit history mode, mixed provenance, correction audit, migration and full local gate зелёные |
 | R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
-| R7 — выпуск плана, MRP и будущие поставки | принято локально | implementation `13d546e4`, docs `9b9f0388`; focused/migration/full gates зелёные |
+| R7 — выпуск плана, MRP и будущие поставки | принято локально (после correction gate) | test-first `acc7a505`, `f784882f`, `d82853a4`, `340c143d`; implementation `8580aa92`, `91491516`, `b4524df2`; focused/PG/migration/full gates зелёные |
 | R8 — барабан, полки и мехцех | не начато | только owner/identity contract |
 | R9 — API, UI и обменные ссылки | не начато | UI/backend migration не выполнялась |
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R7 приняты локально; R8–R11 намеренно не продвигаются.
+волны. R1–R7 приняты локально только после соответствующих exit gates; R8–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -657,22 +657,40 @@ migration/promotion; active BUILDING rows и explicit custody rewind baselines
 fail closed до следующей accepted publication. Live/prod contour намеренно не
 проверялся. R8–R11 не начинались.
 
-## R7 evidence — локальная приёмка
+## R7 evidence — локальная приёмка после correction gate
 
-R7 имеет статус `принято локально`: focused, migration/round-trip и полный
-pytest gates зелёные, полный прогон с финального implementation commit имеет
-ноль skip. Production/SSH/OData/live 1С/боевые workers/deploy/push не
-использовались.
+R7 имеет статус `принято локально` только после correction gate: focused,
+двухсессионный PostgreSQL/MVCC gate, seeded migration round-trip и полный
+pytest на финальном implementation commit завершились без skip. Retained
+обязательства не копируются и не retarget-ятся; current future supply имеет
+отдельного compact owner и append-only change audit. Production/SSH/OData/live
+1С/боевые workers/deploy/push не использовались.
 
 ### Commits, files and contract
 
 * `1a7d7151` — test-first stable `LedgerFutureSupply.current_identity` и
-  staged `is_current` contract.
+  staged identity contract.
 * `a1c0af7d` — test-first semantic specification import: порядок строк,
   Decimal formatting и display noise не создают новую revision/rebase.
 * `13d546e4` — implementation: stable future-supply identity/current
-  publication, migration `20260910_10`, current GET/material-availability
+  staging, migration `20260910_10`, current GET/material-availability
   guards, numeric specification canonicalization и publication integration.
+* `acc7a505`, `f784882f` — test-first retained-run rebase after unrelated
+  refreshes and stale-copy exclusion by immutable run anchor.
+* `d82853a4` — test-first proof that obligation refresh does not invoke the
+  legacy retained-reservation copy writer.
+* `340c143d` — test-first stable current-owner correction/return, schema
+  metadata and two-session PostgreSQL publication/no-op gate.
+* `060a99da` — test-first explicit reverse supplier return: `10 → 8` leaves
+  open `2`, then `10 → 3` reopens `7` on the same current row with one audit
+  edge and no current-row multiplication.
+* `8580aa92` — implementation: `LedgerFutureSupplyCurrent` compact owner,
+  `LedgerFutureSupplyCurrentChange` audit, exact-only current publication,
+  retained-run anchor readers, and no-copy/no-retarget obligation refresh.
+* `91491516` — reversible migration `20260910_11`: downgrade restores legacy
+  marker only through an unambiguous identity/generation/capture-batch mapping.
+* `b4524df2` — rebuild-clear SQL and production-control fixture updated for
+  the compact current owner.
 
 Существующий canonical output path сохранён: `document_net_output.py` →
 `assembly_output_core.py` → `assembly_output_persistence.py`; stable
@@ -688,9 +706,14 @@ preservation, exact/FIFO output and document return netting, closed/fully
 produced rebase, Decimal/tie-break/idempotent replay, future-supply rejection
 and closure history, and fail-closed missing/ambiguous source evidence.
 BUILDING current rows are staged and invisible; accepted publication switches
-the pointer-bound current marker. Equivalent specification import and repeated
-rebase/capture are no-ops; genuine specification change creates one revision
-request.
+the pointer-bound compact owner. One identity survives 100 distinct accepted
+technical generations with unchanged ID/update timestamp and no audit churn;
+correction `6 → 2 → 7` reuses that ID with one audit edge per business change,
+and the explicit reverse-return fixture separately proves `10 → 8 → 3`
+(`open 2 → 7`) on the same current row with exactly one additional audit edge.
+Explicit close emits one immutable close audit. Equivalent specification
+import and repeated rebase/capture are no-ops; genuine specification change
+creates one revision request.
 
 ### Red, focused and migration evidence
 
@@ -704,39 +727,61 @@ pytest -q tests/services/test_spec_component_child_spec_sync.py::test_semantical
 1 failed — числовые `1.000` и `1` давали разные revision hashes
 ```
 
-Focused R7/affected suites после implementation:
+Focused R7/affected suites после correction implementation:
 
 ```text
-pytest -q tests/services/test_future_supply_capture.py tests/services/test_ledger_future_supply_schema.py tests/services/test_spec_component_child_spec_sync.py tests/services/test_specification_revision.py tests/routers/test_item_ledger_router.py::test_future_supply_lists_only_open_exact_orders tests/services/test_item_ledger_position_generation_truth.py tests/services/test_assembly_output_persistence.py tests/services/test_assembly_queue_snapshot.py tests/services/test_candidate_future_supply.py tests/services/test_carry_forward_retained_reservations.py
-90 passed in 9.97s
+pytest -q tests/r7/test_r7_postgres_integration.py tests/services/test_future_supply_capture.py tests/services/test_ledger_future_supply_schema.py tests/services/test_specification_mrp_rebase.py tests/services/test_obligation_refresh_orchestrator.py tests/services/test_obligation_refresh_publish.py tests/services/test_carry_forward_retained_reservations.py tests/test_ledger_rebuild_operations.py tests/test_canon_invariants.py
+135 passed in 23.21s
 
-pytest -q tests/services/test_obligation_refresh_publish.py tests/services/test_obligation_refresh_orchestrator.py tests/services/test_specification_mrp_rebase.py tests/services/test_physical_refresh_future_supply.py
-67 passed in 8.92s
-
-pytest -q tests/services/test_assembly_output_core.py tests/services/test_assembly_output_persistence.py tests/services/test_production_output_cache.py tests/services/test_specification_mrp_rebase.py tests/services/test_rebase_output_repair_audit.py tests/services/test_candidate_future_supply.py tests/services/test_physical_refresh_future_supply.py tests/services/test_supplier_future_supply.py tests/services/test_wip_future_supply.py
-84 passed in 8.36s
+pytest -q tests/services/test_future_supply_capture.py::test_current_future_supply_reverse_return_keeps_owner_and_audits_once
+1 passed in 0.45s
 ```
+
+Real PostgreSQL two-session/MVCC gate on the named local contour:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
+pytest -q tests/r7/test_r7_postgres_integration.py
+1 passed in 0.81s
+```
+
+The independent reader saw the old pointer/quantity while publication was
+uncommitted, then the new quantity on the same current row ID after commit;
+two exact retries added no audit rows. The fixture restores a valid prior
+pointer (or the explicit NULL known-empty state) and cleans only its named
+rows.
 
 Local PostgreSQL migration/round-trip/verify on the named R2 contour:
 
 ```text
 python tools/pg_rebuild_check.py --dsn postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2 --stages migrate,round-trip,verify --no-seed
-PASS migrate 20260910_10 (head)
+PASS migrate 20260910_11 (head)
 PASS round-trip head -> 20260726_14 -> head
 PASS verify; overall: PASS (smoke mode)
+```
+
+Seeded current-owner downgrade/upgrade proof (same local DSN, exact named
+seed `r7-seeded-roundtrip-20260910`, removed after verification):
+
+```text
+alembic upgrade head -> downgrade 20260910_10 -> upgrade head: PASS
+legacy staging is_current after downgrade: true
+compact current row backfilled after upgrade: present
+seed cleanup: exact rows only
 ```
 
 ### Final R7 gate and residual risks
 
 `current-execution-full-pytest.log` — чужой untracked файл, сохранён без
-изменений. Финальный full pytest с implementation `13d546e4`:
+изменений. Финальный full pytest с correction implementation `b4524df2`:
 
 ```text
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
 pytest -q
-2007 passed, 35 warnings in 204.86s (0:03:24)
+2012 passed, 35 warnings in 211.28s (0:03:31)
 ```
 
 Skip отсутствуют. Остаточный риск — production contour намеренно не
 проверялся; current publication и generation evidence остаются локально
-проверенными на named PostgreSQL contour.
+проверенными на named PostgreSQL contour. Migration downgrade fail-closes при
+отсутствующем или неоднозначном staging source; R10 cleanup ещё не начинался.

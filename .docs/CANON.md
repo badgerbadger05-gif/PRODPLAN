@@ -162,13 +162,17 @@ remaining output сохраняются, а `ProductionPlanExecutionFact` име
 документа берётся только из `document_net_output.py`, затем применяется
 адресный матч и детерминированный FIFO через `assembly_output_core.py`.
 
-`LedgerFutureSupply` хранит immutable capture под generation для воспроизводимой
-истории, но текущий читатель использует только rows с `is_current=true`,
-переключённых атомарно вместе с accepted `PlanningTruthState` pointer. Каждая
-exact строка обязана иметь `current_identity` из `(supply_kind, source_ref,
-source_line_ref, source_local_id)`; generation и `source_content_hash` не
-заменяют бизнес-идентичность. BUILDING capture остаётся невидимым до
-publication; старые rows не выбираются current read.
+`LedgerFutureSupply` хранит immutable generation capture для воспроизводимой
+истории. Единственный current quantity owner — compact
+`LedgerFutureSupplyCurrent`, одна строка на `current_identity`; изменения
+фиксируются в append-only `LedgerFutureSupplyCurrentChange`. Текущий читатель
+не выбирает generation rows и не использует legacy `is_current`; публикация
+compact owner и accepted `PlanningTruthState` pointer атомарна. Каждая exact
+строка обязана иметь `current_identity` из `(supply_kind, source_ref,
+source_line_ref, source_local_id)`; generation, cutoff и `source_content_hash`
+не заменяют бизнес-идентичность. BUILDING и ambiguous/rejected capture остаются
+невидимыми current read до доказанной exact publication; старые generation rows
+остаются только provenance/audit.
 
 Specification rebase закрывает прежний MRP и создаёт successor только на
 сохранённый remaining basis; исходная матрица и уже принятый выпуск не
