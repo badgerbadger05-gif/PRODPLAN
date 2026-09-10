@@ -263,6 +263,13 @@ boundaries, focused PostgreSQL gate, migration round-trip и полного pyte
   visibility guard, generation/obligation publication pointers and canonical
   frozen-basis writer.
 * `36ea6472` — candidate-discard mapping cleanup preserving accepted history.
+* `39acb56e` — test-first current-reader regression tests: pointer-only
+  resolution, no ancestor traversal, and stale/missing pointer failures.
+* `091601df` — test-first PostgreSQL migration backfill regression and updates
+  for the explicit pointer contract in existing fixtures.
+* `0dacd38d` — implementation: fail-closed current-MRP resolver, pointer-based
+  period-plan reader and mutation guard, current-pointer scope API, and
+  deterministic migration backfill with ambiguity diagnosis.
 * `tests/r3/test_r3_contract.py` — deterministic identity, incomplete/reordered
   page rejection, pointer-only current read и frozen provenance checks.
 * `docs/r3-identity-acceptance-contract.md` — boundary/owner summary without
@@ -287,6 +294,10 @@ boundaries, focused PostgreSQL gate, migration round-trip и полного pyte
   active pointer. Runtime identity collision fails closed; explicit legacy
   migration preflight rejects ambiguous active duplicates before the unique
   index and maps inactive/history copies deterministically.
+* Existing fixed plans are backfilled into `PlanningLivePointer` during the
+  R3 migration. Missing, retired, stale, non-fixed, or plan-mismatched active
+  pointers fail closed; historical rebuild paths retain explicit generation
+  lineage only where the read is semantically historical.
 
 ### Commands and results
 
@@ -295,6 +306,12 @@ boundaries, focused PostgreSQL gate, migration round-trip и полного pyte
 ```text
 pytest -q tests/r3/test_r3_contract.py
 ERROR during collection: ModuleNotFoundError: app.services.item_ledger.r3_contract
+
+pytest -q tests/r3/test_r3_current_pointer_readers.py
+ERROR during collection: ImportError: cannot import name CurrentMrpResolutionError
+
+pytest -q tests/r3/test_r3_postgres_integration.py::test_r3_postgres_pointer_backfill_maps_existing_fixed_plan
+FAILED: migration module had no backfill_live_pointers helper
 ```
 
 Focused and migration gates:
@@ -308,11 +325,14 @@ PASS migrate 20260910_01 (head)
 PASS round-trip head -> 20260726_14 -> head
 PASS verify; overall: PASS (smoke mode)
 
-$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3 tests/services/test_physical_refresh_discard.py tests/routers/test_item_ledger_admin_discard.py
-29 passed in 3.90s
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3 tests/services/test_period_plan_obligation_refresh_contract.py tests/services/test_mrp_mutation_guard.py tests/services/test_journal_truth_selectors.py
+34 passed in 4.07s
+
+$env:PRODPLAN_R2_TEST_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3/test_r3_postgres_integration.py::test_r3_postgres_pointer_backfill_maps_existing_fixed_plan
+1 passed in 0.26s
 
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q
-1944 passed, 35 warnings in 214.90s (0:03:34); 0 skipped
+1948 passed, 35 warnings in 207.97s (0:03:27); 0 skipped
 ```
 
 Удалённые пути: **нет**. Сохранён untracked `current-execution-full-pytest.log`;
