@@ -170,6 +170,8 @@ def _mrp_snapshot_identity(
         )
     return {
         "snapshot_id": int(manifest["snapshot_id"]),
+        "current_identity": manifest.get("current_identity") or f"mrp-run:{int(run_id)}",
+        "source_revision": manifest.get("source_revision"),
         "ledger_generation": int(manifest["ledger_generation"]),
         "cutoff": str(manifest["cutoff"]),
         "truth_status": str(manifest["truth_status"]),
