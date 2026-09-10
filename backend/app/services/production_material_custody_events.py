@@ -398,21 +398,21 @@ def _project_order_based_manual_transfer(
             db,
             entity_kind="shelf_projection",
             scope_key="shelf:all-live-mrps",
-            source_revision=f"custody:transfer:{ref}",
+            source_revision=f"custody:transfer:{recorder_ref}",
             reason="custody_coverage_changed",
         )
         invalidate_current_execution_scope(
             db,
             entity_kind="assembly_readiness",
             scope_key="assembly:all-live-plans",
-            source_revision=f"custody:transfer:{ref}",
+            source_revision=f"custody:transfer:{recorder_ref}",
             reason="custody_coverage_changed",
         )
         invalidate_current_execution_scope(
             db,
             entity_kind="drum_schedule",
             scope_key="drum:all-live-plans",
-            source_revision=f"custody:transfer:{ref}",
+            source_revision=f"custody:transfer:{recorder_ref}",
             reason="custody_coverage_changed",
         )
     return appended
