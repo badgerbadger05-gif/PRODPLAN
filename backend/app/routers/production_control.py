@@ -540,11 +540,16 @@ def get_assembly_queue(
                 "priority_key": list(payload.get("original_priority") or []),
                 "sort_key": str(payload.get("sort_key") or ""),
             })
-        total_qty = sum(float(row.get("assembly_remaining_qty") or 0) for row in payload_rows)
+        summary = dict(current_scope.summary or {})
+        if "total_rows" not in summary or "total_queue_qty" not in summary:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "assembly_queue_unavailable", "reason": "current queue summary is missing"},
+            )
         return AssemblyQueueResponse.model_validate({
             "rows": payload_rows[offset:offset + limit],
-            "total_rows": len(payload_rows),
-            "total_queue_qty": total_qty,
+            "total_rows": int(summary["total_rows"]),
+            "total_queue_qty": float(summary["total_queue_qty"]),
             "limit": limit,
             "offset": offset,
             "truth_meta": build_truth_meta(truth),

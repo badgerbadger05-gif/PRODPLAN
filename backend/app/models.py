@@ -2887,6 +2887,7 @@ class CurrentExecutionScope(Base):
     )
     result_ready = Column(Boolean, nullable=False, server_default=text("true"))
     content_hash = Column(String(64), nullable=False)
+    summary = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
     updated_at = Column(TIMESTAMP, nullable=False, server_default=func.now(), onupdate=func.now())
 
     source_generation = relationship("LedgerGeneration")

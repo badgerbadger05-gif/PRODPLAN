@@ -107,6 +107,7 @@ def publish_current_execution_scope(
     result_ready: bool = True,
     complete_scope: bool = True,
     entity_kinds: Iterable[str] | None = None,
+    summary: dict[str, Any] | None = None,
 ) -> CurrentExecutionPublishResult:
     """Publish one complete current scope with stable IDs and no-op semantics."""
 
@@ -171,6 +172,7 @@ def publish_current_execution_scope(
                 source_generation_id=source_generation_id,
                 result_ready=True,
                 content_hash=scope_hash,
+                summary=_jsonable(summary or {}),
             ))
         else:
             # The manifest is both the valid-empty marker and the accepted
@@ -181,6 +183,8 @@ def publish_current_execution_scope(
             manifest.source_generation_id = source_generation_id
             manifest.result_ready = True
             manifest.content_hash = scope_hash
+            if summary is not None:
+                manifest.summary = _jsonable(summary)
     existing_query = db.query(models.CurrentExecutionRow).filter(
         models.CurrentExecutionRow.scope_key == scope,
     )
@@ -408,6 +412,16 @@ def publish_current_execution_from_generation(
         scope_key="assembly:all-live-plans",
         rows=queue_payload,
         entity_kinds=("assembly_queue",),
+        summary={
+            "total_rows": len(queue_payload),
+            "total_queue_qty": str(sum(
+                (
+                    Decimal(str(row["payload"].get("assembly_remaining_qty") or "0"))
+                    for row in queue_payload
+                ),
+                Decimal("0"),
+            )),
+        },
     )
 
     readiness_payload = []
