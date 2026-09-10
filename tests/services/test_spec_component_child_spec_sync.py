@@ -142,3 +142,30 @@ def test_second_sync_change_enqueues_automatic_rebase(db_session, monkeypatch):
     queued = db_session.query(SpecificationRebaseQueue).one()
     assert queued.status == "pending"
     assert queued.old_content_hash != queued.new_content_hash
+
+
+def test_semantically_equivalent_spec_import_is_idempotent(db_session, monkeypatch):
+    """Ordering/decimal/display noise does not create a specification rebase."""
+    _add_item(db_session, "nom-a")
+    _add_item(db_session, "nom-b")
+    _patch_client(
+        monkeypatch,
+        [_spec_record([
+            _comp("c1", "nom-a", "1.000", "", type_="Материал"),
+            _comp("c2", "nom-b", "2.000", "", type_="Материал"),
+        ])],
+    )
+    first = specification_sync.sync_specifications_from_odata(db_session, _req())
+
+    _patch_client(
+        monkeypatch,
+        [_spec_record([
+            {**_comp("c2", "nom-b", "2", "", type_="Материал"), "Presentation": "noise"},
+            {**_comp("c1", "nom-a", "1", "", type_="Материал"), "Presentation": "other"},
+        ])],
+    )
+    second = specification_sync.sync_specifications_from_odata(db_session, _req())
+
+    assert first["revisions_created"] == 1
+    assert second["revisions_created"] == 0
+    assert second["rebase_requests_queued"] == 0
