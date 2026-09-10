@@ -279,6 +279,14 @@ def move_current_drum_slot(
     )
     if slot is None:
         raise ValueError("stable current drum slot is absent from accepted schedule")
+    from .current_execution import invalidate_current_execution_scope
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="drum_schedule",
+        scope_key="drum:all-live-plans",
+        source_revision=f"manual:{expected_source_revision}",
+        reason="manual_drum_command",
+    )
     result = move_drum_slot(
         db,
         int(slot.id),
@@ -289,7 +297,6 @@ def move_current_drum_slot(
     )
     from .current_execution import publish_current_execution_from_generation
     publish_current_execution_from_generation(db, generation_id=int(truth.generation_id))
-    db.commit()
     return {
         **result,
         "slot_id": int(current.id),
