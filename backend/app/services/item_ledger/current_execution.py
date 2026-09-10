@@ -879,6 +879,7 @@ def publish_current_obligation_views_from_generation(
     )
 
     mrp_rows: list[dict[str, Any]] = []
+    mrp_metadata: dict[str, Any] = {}
     mrp_snapshots = db.query(models.PlanningReadSnapshot).filter(
         models.PlanningReadSnapshot.consumer == "mrp_result",
         models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
@@ -886,12 +887,21 @@ def publish_current_obligation_views_from_generation(
     ).order_by(models.PlanningReadSnapshot.snapshot_key.asc(), models.PlanningReadSnapshot.id.asc()).all()
     for snapshot in mrp_snapshots:
         run_marker = snapshot.snapshot_key.removeprefix("run:").split(":", 1)[0]
+        snapshot_payload = dict(snapshot.payload or {})
+        snapshot_summary = dict(snapshot_payload.get("summary") or {})
+        mrp_metadata[run_marker] = {
+            "snapshot_key": str(snapshot.snapshot_key),
+            "summary": snapshot_summary,
+            "row_counts": dict(snapshot_summary.get("row_counts") or snapshot_payload.get("row_counts") or {}),
+            "total_qty": dict(snapshot_summary.get("total_qty") or snapshot_payload.get("total_qty") or {}),
+        }
         for row in db.query(models.PlanningReadRow).filter(
             models.PlanningReadRow.snapshot_id == int(snapshot.id),
         ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
             payload = dict(row.payload or {})
             payload.setdefault("run_id", int(run_marker) if run_marker.isdigit() else None)
             payload.setdefault("row_kind", str(row.row_kind))
+            payload.setdefault("sort_key", str(row.sort_key or ""))
             mrp_rows.append({
                 "entity_kind": "mrp_result",
                 "business_identity": f"{snapshot.snapshot_key}:{row.row_kind}:{row.row_key}",
@@ -903,7 +913,7 @@ def publish_current_obligation_views_from_generation(
         entity_kind="mrp_result",
         scope_key="mrp:all-live-plans",
         rows=mrp_rows,
-        summary={"total_rows": len(mrp_rows)},
+        summary={"total_rows": len(mrp_rows), "runs": mrp_metadata},
     )
 
     execution_rows: list[dict[str, Any]] = []

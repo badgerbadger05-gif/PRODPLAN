@@ -659,7 +659,7 @@ def _resolve_snapshot(
     return requested
 
 
-def read_mrp_result_manifest(
+def _read_mrp_snapshot_manifest(
     db: Session, run_id: int, *, snapshot_id: int | None = None
 ) -> dict[str, Any]:
     """Read the immutable manifest; never calculate or publish."""
@@ -684,7 +684,7 @@ def read_mrp_result_manifest(
     }
 
 
-def read_mrp_result_rows(
+def _read_mrp_snapshot_rows(
     db: Session,
     run_id: int,
     *,
@@ -872,6 +872,9 @@ def _read_current_mrp_rows(
     if kind not in ROW_KINDS:
         raise ValueError(f"unsupported MRP result row kind: {row_kind}")
     scope = _current_mrp_scope(db)
+    run_meta = dict((scope.summary or {}).get("runs") or {}).get(str(int(run_id)))
+    if not isinstance(run_meta, dict):
+        raise CurrentExecutionUnavailable("current MRP run is missing")
     all_rows: list[tuple[Any, dict[str, Any]]] = []
     for current in load_current_execution_rows(
         db,
@@ -920,20 +923,19 @@ def _read_current_mrp_rows(
                     continue
             elif category_ref != str(category_ref1c):
                 continue
+        sort_key = _as_text(payload.get("sort_key"))
         row_date = _as_text(_current_mrp_row_value(
             payload, "date", "need_date", "required_date", "period_from", "sort_key"
         ))
-        if start and row_date < start:
+        if start and (sort_key and sort_key < f"{start}|" or not sort_key and row_date < start):
             continue
-        if end and row_date >= end:
+        if end and (sort_key and sort_key >= f"{end}|\uffff" or not sort_key and row_date > end):
             continue
         filtered.append((current, payload))
 
+    filtered.sort(key=lambda pair: str(pair[0].business_identity))
     filtered.sort(
-        key=lambda pair: (
-            _as_text(pair[1].get("sort_key") or pair[1].get("date") or ""),
-            str(pair[0].business_identity),
-        ),
+        key=lambda pair: _as_text(pair[1].get("sort_key") or pair[1].get("date") or ""),
         reverse=str(sort_dir or "").lower() == "desc",
     )
     total = len(filtered)
@@ -946,13 +948,17 @@ def _read_current_mrp_rows(
     response_rows = []
     for current, payload in page:
         row_payload = dict(payload)
-        row_payload.setdefault("current_identity", str(current.business_identity))
+        row_payload.setdefault("current_identity", f"mrp-run:{int(run_id)}")
         row_payload.setdefault("source_revision", source_revision)
         response_rows.append(row_payload)
-    total_qty = sum(float((payload or {}).get("qty") or 0) for _, payload in filtered)
+    unfiltered = not any((item_id, root_item_id, area_id, date_from, date_to, supplier_ref1c, category_id, category_ref1c))
+    persisted_total = dict(run_meta.get("total_qty") or {}).get(kind)
+    total_qty = float(persisted_total) if unfiltered and persisted_total is not None else sum(
+        float((payload or {}).get("qty") or 0) for _, payload in filtered
+    )
     return {
         "snapshot_id": int(scope.id),
-        "current_identity": f"scope:{int(scope.id)}",
+        "current_identity": f"mrp-run:{int(run_id)}",
         "source_revision": source_revision,
         "run_id": int(run_id),
         "ledger_generation": int(scope.source_generation_id or 0),
@@ -973,13 +979,20 @@ def read_mrp_result_manifest(
     scope = _current_mrp_scope(db)
     if snapshot_id is not None and int(snapshot_id) != int(scope.id):
         raise CurrentExecutionUnavailable("current MRP manifest identity does not match")
+    run_meta = dict((scope.summary or {}).get("runs") or {}).get(str(int(run_id)))
+    if not isinstance(run_meta, dict):
+        raise CurrentExecutionUnavailable("current MRP run is missing")
     generation = db.get(models.LedgerGeneration, int(scope.source_generation_id or 0))
     if generation is None or generation.cutoff is None:
         raise CurrentExecutionUnavailable("current MRP source cutoff is missing")
-    summary = dict(scope.summary or {})
+    summary = dict(run_meta.get("summary") or {})
+    if run_meta.get("row_counts") is not None:
+        summary["row_counts"] = dict(run_meta.get("row_counts") or {})
+    if run_meta.get("total_qty") is not None:
+        summary["total_qty"] = dict(run_meta.get("total_qty") or {})
     return {
         "snapshot_id": int(scope.id),
-        "current_identity": f"scope:{int(scope.id)}",
+        "current_identity": f"mrp-run:{int(run_id)}",
         "source_revision": str(scope.source_revision),
         "run_id": int(run_id),
         "ledger_generation": int(scope.source_generation_id or 0),
