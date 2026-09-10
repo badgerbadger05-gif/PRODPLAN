@@ -78,26 +78,78 @@ def get_orders(
     (`line_status = to_order`) последнего FIXED_SNAPSHOT-прогона.
     """
     try:
-        return list_journal(
-            db,
-            order_id=order_id,
-            supplier_id=supplier_id,
-            state=state,
-            phase=phase,
-            line_status=line_status,
-            search=search,
-            date_from=date_from,
-            date_to=date_to,
-            active_only=active_only,
-            include_to_order=include_to_order,
-            horizon_period_to=horizon_period_to,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-            limit=limit,
-            offset=offset,
+        from ..services.item_ledger.current_execution import (
+            CurrentExecutionUnavailable,
+            load_current_execution_rows,
+            require_current_execution_scope,
         )
+        current_manifest = require_current_execution_scope(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )]
+        if horizon_period_to is not None:
+            from ..services.purchase_control_journal import _reconcile_buy_row_for_horizon
+            rows = [
+                projected
+                for row in rows
+                for projected in [_reconcile_buy_row_for_horizon(row, horizon_period_to.isoformat())]
+                if projected is not None
+            ]
+        if order_id is not None:
+            rows = [row for row in rows if row.get("order_id") == int(order_id)]
+        if supplier_id is not None:
+            rows = [row for row in rows if row.get("supplier_id") == int(supplier_id)]
+        if state:
+            rows = [row for row in rows if str(row.get("order_state_name") or "") == str(state)]
+        if phase:
+            rows = [row for row in rows if str(row.get("supply_phase") or "") == str(phase)]
+        if line_status:
+            rows = [row for row in rows if str(row.get("line_status") or "") == str(line_status)]
+        if not include_to_order:
+            rows = [row for row in rows if row.get("line_status") != "to_order"]
+        if active_only:
+            rows = [row for row in rows if float(row.get("remaining_qty") or 0) > 0]
+        if search:
+            needle = str(search).casefold()
+            rows = [row for row in rows if needle in " ".join(
+                str(row.get(key) or "") for key in ("order_number", "item_name", "item_code", "item_article", "supplier_name")
+            ).casefold()]
+        if date_from:
+            rows = [row for row in rows if row.get("delivery_date") is not None and str(row["delivery_date"]) >= str(date_from)]
+        if date_to:
+            rows = [row for row in rows if row.get("delivery_date") is not None and str(row["delivery_date"]) <= str(date_to)]
+        sort_key = sort_by if sort_by in {"delivery_date", "order_date", "order_number", "item_code", "remaining_qty"} else "delivery_date"
+        rows.sort(key=lambda row: (row.get(sort_key) is None, row.get(sort_key) if row.get(sort_key) is not None else "", row.get("row_key")))
+        if str(sort_dir or "asc").casefold() == "desc":
+            rows.reverse()
+        effective_limit = max(1, min(int(limit or 100), 500))
+        effective_offset = max(0, int(offset or 0))
+        saved = dict(current_manifest.summary or {})
+        saved_summary = saved.get("summary")
+        if not isinstance(saved_summary, dict):
+            raise CurrentExecutionUnavailable("purchase current summary is missing")
+        return {
+                "rows": rows[effective_offset:effective_offset + effective_limit],
+                "total": len(rows),
+                "limit": effective_limit,
+                "offset": effective_offset,
+                "run_id": saved.get("run_id"),
+                "run_ids": list(saved.get("run_ids") or []),
+                "truth_status": saved.get("truth_status"),
+                "ledger_generation_id": current_manifest.source_generation_id,
+                "summary": saved_summary,
+                "meta": saved,
+        }
     except PurchaseJournalSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "purchase_control_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

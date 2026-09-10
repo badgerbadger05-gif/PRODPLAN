@@ -1682,6 +1682,10 @@ def accept_generation_build(
                 else _parent_generation_id(generation)
             ),
         )
+        from .current_execution import publish_current_obligation_views_from_generation
+        publish_current_obligation_views_from_generation(
+            db, generation_id=int(generation.id)
+        )
     return {
         **validation,
         "status": "accepted",

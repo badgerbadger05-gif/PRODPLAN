@@ -1333,30 +1333,71 @@ def get_orders_journal(
 ):
     try:
         truth = planning_truth.require_accepted_truth(db, "production_control.orders")
-        journal = read_production_control_journal_snapshot(
-            db,
-            product_id=product_id,
-            order_id=order_id,
-            root_item_id=root_item_id,
-            workshop_id=workshop_id,
-            status=status,
-            coverage_status=coverage_status,
-            planning_contour=planning_contour,
-            launch_source=launch_source,
-            search=search,
-            date_from=date_from,
-            date_to=date_to,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-            limit=limit,
-            offset=offset,
+        # R9 current owner.  Rows are served verbatim from the compact current
+        # scope; no snapshot replay, generation guessing or client-side totals
+        # are involved.
+        from ..services.item_ledger.current_execution import (
+            CurrentExecutionUnavailable,
+            load_current_execution_rows,
+            require_current_execution_scope,
         )
-        journal["truth_meta"] = build_truth_meta(truth).model_dump()
-        return journal
+        current_manifest = require_current_execution_scope(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )]
+        if product_id is not None:
+            rows = [row for row in rows if row.get("product_id") == int(product_id)]
+        if order_id is not None:
+            rows = [row for row in rows if row.get("order_id") == int(order_id)]
+        if root_item_id is not None:
+            rows = [row for row in rows if row.get("root_item_id") == int(root_item_id)]
+        if workshop_id is not None:
+            rows = [row for row in rows if row.get("workshop_id") == int(workshop_id)]
+        if status:
+            rows = [row for row in rows if str(row.get("status") or "") == str(status)]
+        if coverage_status:
+            rows = [row for row in rows if str(row.get("coverage_status") or "") == str(coverage_status)]
+        if planning_contour:
+            rows = [row for row in rows if str(row.get("planning_contour") or "") == str(planning_contour)]
+        if launch_source:
+            rows = [row for row in rows if str(row.get("launch_source") or "") == str(launch_source)]
+        if date_from:
+            rows = [row for row in rows if row.get("planned_start_date") is not None and str(row["planned_start_date"]) >= str(date_from)]
+        if date_to:
+            rows = [row for row in rows if row.get("planned_finish_date") is not None and str(row["planned_finish_date"]) <= str(date_to)]
+        if search:
+            needle = str(search).casefold()
+            rows = [row for row in rows if needle in " ".join(
+                str(row.get(key) or "") for key in ("order_number", "item_name", "item_code", "item_article")
+            ).casefold()]
+        rows.sort(key=lambda row: (
+            row.get(sort_by or "planned_start_date") is None,
+            str(row.get(sort_by or "planned_start_date") or ""),
+        ), reverse=str(sort_dir or "asc").lower() == "desc")
+        effective_limit = max(1, min(int(limit or 100), 500))
+        effective_offset = max(0, int(offset or 0))
+        saved = dict(current_manifest.summary or {})
+        return ProductionOrderJournalResponse.model_validate({
+            "rows": rows[effective_offset:effective_offset + effective_limit],
+            "total": len(rows),
+            "limit": effective_limit,
+            "offset": effective_offset,
+            "latest_run_id": saved.get("latest_run_id"),
+            "latest_source_plan_id": saved.get("latest_source_plan_id"),
+            "truth_meta": build_truth_meta(truth),
+        })
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except ProductionControlJournalSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(exc)}) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

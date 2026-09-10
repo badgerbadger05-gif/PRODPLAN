@@ -755,7 +755,7 @@ def publish_current_execution_from_generation(
 
 
 def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
-    """Resolve a stable business key without using technical snapshot ids."""
+    """Resolve a required business key; technical row ids are never valid."""
     for key in (
         "row_key", "journal_row_key", "business_identity", "requirement_id",
         "source_mrp_requirement_id", "order_id", "product_id", "item_id",
@@ -763,7 +763,9 @@ def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
         value = payload.get(key)
         if value not in (None, ""):
             return str(value) if key in {"row_key", "journal_row_key", "business_identity"} else f"{key}:{value}"
-    return f"payload:{_hash(payload)}:{fallback}"
+    raise CurrentExecutionUnavailable(
+        "accepted snapshot row lacks a stable business identity"
+    )
 
 
 def publish_current_obligation_views_from_generation(
@@ -812,7 +814,7 @@ def publish_current_obligation_views_from_generation(
         production_rows = [
             {
                 "entity_kind": "production_control_journal",
-                "business_identity": _snapshot_row_identity(dict(row.payload or {}), str(row.id)),
+                "business_identity": _snapshot_row_identity(dict(row.payload or {}), "production"),
                 "scope_key": "production:all-live-orders",
                 "payload": dict(row.payload or {}),
             }
@@ -820,12 +822,14 @@ def publish_current_obligation_views_from_generation(
                 models.PlanningReadRow.snapshot_id == int(production.id),
             ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all()
         ]
+    production_summary = dict((production.payload or {}).get("meta") or {}) if production is not None else {}
+    production_summary["total_rows"] = len(production_rows)
     _publish(
         consumer="production_control_journal",
         entity_kind="production_control_journal",
         scope_key="production:all-live-orders",
         rows=production_rows,
-        summary={"total_rows": len(production_rows)},
+        summary=production_summary,
     )
 
     purchase = db.query(models.PlanningReadSnapshot).filter(
@@ -843,7 +847,7 @@ def publish_current_obligation_views_from_generation(
                 "entity_kind": "purchase_control_journal",
                 "business_identity": _snapshot_row_identity(
                     dict(row.get("payload") or row) if isinstance(row, dict) else {},
-                    str(index),
+                    "purchase",
                 ),
                 "scope_key": "purchase:all-live-plans",
                 "payload": dict(row.get("payload") or row) if isinstance(row, dict) else {},
@@ -851,12 +855,16 @@ def publish_current_obligation_views_from_generation(
             for index, row in enumerate(purchase_source_rows)
             if isinstance(row, dict)
         ]
+    purchase_summary = dict(purchase_payload.get("meta") or {})
+    if isinstance(purchase_payload.get("summary"), dict):
+        purchase_summary["summary"] = dict(purchase_payload["summary"])
+    purchase_summary["total_rows"] = len(purchase_rows)
     _publish(
         consumer="purchase_control_journal",
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
         rows=purchase_rows,
-        summary=dict(purchase_payload.get("summary") or {"total_rows": len(purchase_rows)}),
+        summary=purchase_summary,
     )
 
     mrp_rows: list[dict[str, Any]] = []
@@ -906,7 +914,7 @@ def publish_current_obligation_views_from_generation(
             row_payload = dict(row)
             row_payload.setdefault("run_id", run_id)
             row_payload.setdefault("plan_id", plan.get("id"))
-            identity = _snapshot_row_identity(row_payload, str(index))
+            identity = _snapshot_row_identity(row_payload, "period-plan")
             execution_rows.append({
                 "entity_kind": "period_plan_execution",
                 "business_identity": f"plan:{plan.get('id')}:{identity}",
