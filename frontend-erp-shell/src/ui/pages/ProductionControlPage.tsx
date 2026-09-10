@@ -89,7 +89,7 @@ export function ProductionControlPage() {
     initialUrlState.current.activeProductId,
   )
   const [activeCurrentIdentity, setActiveCurrentIdentity] = useState<string | null>(
-    initialUrlState.current.activeCurrentIdentity,
+    initialUrlState.current.activeCurrentIdentity ?? null,
   )
   const [materials, setMaterials] = useState<MaterialsResponse | null>(null)
   const [materialsLoading, setMaterialsLoading] = useState(false)
