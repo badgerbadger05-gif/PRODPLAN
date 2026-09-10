@@ -193,3 +193,17 @@ def test_r1_artifact_names_semantics_and_separates_technical_lineage():
         "не является бизнес-идентичностью",
     ):
         assert marker in text
+
+
+def test_r1_historical_report_time_mode_is_explicitly_decided():
+    root = Path(__file__).parents[2]
+    artifact = (root / "docs" / "r1-data-contract-inventory.md").read_text(
+        encoding="utf-8"
+    )
+    decisions = (root / ".docs" / "notes" / "mrp-decisions-log.md").read_text(
+        encoding="utf-8"
+    )
+    for marker in ("as_occurred", "as_known", "known_at", "posting_at"):
+        assert marker in decisions
+    assert "режим отчёта выбирается явно" in decisions
+    assert "Исторический отчёт" not in artifact.split("## 6.", 1)[1]
