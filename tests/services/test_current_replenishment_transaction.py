@@ -67,7 +67,7 @@ def _world(db, *, prefix=None):
             period_from=date(2026, 9, 1),
             period_to=date(2026, 9, 30),
             bom_level=0,
-            planning_stock_pool="default",
+            planning_stock_pool="selected",
             characteristic_ref="",
             organization_ref="",
             freeze_version=1,
@@ -405,6 +405,19 @@ def test_complete_scope_locks_only_one_distribution_pool(db_session):
     db_session.commit()
     foreign = db_session.get(models.ReservationEntry, reservations[1].id)
     foreign.planning_stock_pool = "foreign"
+    foreign_reserve = Reserve(
+        reserve_id=reserves[1].reserve_id,
+        item_id=reserves[1].item_id,
+        mode=reserves[1].mode,
+        reserved_qty=reserves[1].reserved_qty,
+        due_date=reserves[1].due_date,
+        plan_period_from=reserves[1].plan_period_from,
+        plan_period_to=reserves[1].plan_period_to,
+        run_id=reserves[1].run_id,
+        requirement_id=reserves[1].requirement_id,
+        planning_stock_pool="foreign",
+    )
+    reserves = reserves[:1] + (foreign_reserve,)
     foreign_allocation = db_session.query(models.ReservationConsumptionAllocation).filter_by(
         reservation_id=reservations[1].id, is_current=True
     ).one()
