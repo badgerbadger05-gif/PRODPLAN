@@ -39,6 +39,18 @@ def upgrade() -> None:
             "WHERE business_identity IS NULL"
         )
     )
+    duplicate = op.get_bind().execute(
+        sa.text(
+            "SELECT business_identity FROM stock_ledger_entry "
+            "WHERE active = true GROUP BY business_identity "
+            "HAVING count(*) > 1 LIMIT 1"
+        )
+    ).scalar()
+    if duplicate is not None:
+        raise RuntimeError(
+            "R3 migration refuses ambiguous active duplicate business identity "
+            f"{duplicate}"
+        )
     op.alter_column("stock_ledger_entry", "business_identity", nullable=False, server_default="")
     op.create_index(
         "uq_stock_ledger_entry_active_business_identity",

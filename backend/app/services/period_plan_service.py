@@ -1963,6 +1963,10 @@ def _freeze_one_run(
         now,
         baseline_at=shared_pools.baseline_at,
         physical_import_batch_id=shared_pools.physical_import_batch_id,
+        frozen_basis_generation_id=(
+            int(run.ledger_generation_id)
+            if run.ledger_generation_id is not None else None
+        ),
     )
     allocation_rows = _write_freeze_allocation(
         db, run, new_version, trace, req_by_item, shared_pools.stock_initial, now

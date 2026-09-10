@@ -35,6 +35,23 @@ def require_import_batch(
         raise PhysicalVisibilityError(
             f"physical import batch {batch.id} is {batch.status}; completed required"
         )
+    if not bool(batch.source_complete):
+        raise PhysicalVisibilityError(
+            f"physical import batch {batch.id} is incomplete; source_complete required"
+        )
+    if batch.expected_page_count is not None:
+        pages = (
+            db.query(models.PhysicalImportPage.page_no)
+            .filter(models.PhysicalImportPage.import_batch_id == int(batch.id))
+            .order_by(models.PhysicalImportPage.id.asc())
+            .all()
+        )
+        numbers = [int(page_no) for (page_no,) in pages]
+        expected = int(batch.expected_page_count)
+        if numbers != list(range(1, expected + 1)):
+            raise PhysicalVisibilityError(
+                f"physical import batch {batch.id} has incomplete or reordered pages"
+            )
     return batch
 
 

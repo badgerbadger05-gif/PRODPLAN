@@ -10,6 +10,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from app import models
@@ -17,6 +18,23 @@ from app import models
 
 class ImportCompletenessError(ValueError):
     """A source page set is incomplete or arrived in an invalid order."""
+
+
+def validate_legacy_identity_mapping(rows) -> None:
+    """Fail closed when a legacy identity has more than one active copy."""
+    active_by_identity: dict[str, int] = {}
+    for row in rows:
+        identity = str(row.get("business_identity") or "").strip()
+        if not identity:
+            raise ValueError("legacy mapping has empty business identity")
+        if bool(row.get("active")):
+            active_by_identity[identity] = active_by_identity.get(identity, 0) + 1
+    duplicate = next(
+        (identity for identity, count in active_by_identity.items() if count > 1),
+        None,
+    )
+    if duplicate is not None:
+        raise ValueError(f"active duplicate business identity {duplicate}")
 
 
 def business_identity_for_movement(
@@ -115,3 +133,97 @@ def current_live_run(session: Session, plan_id: int) -> models.PlanningRun:
     if run is None:
         raise LookupError(f"live MRP pointer references missing run {int(pointer.run_id)}")
     return run
+
+
+def set_live_pointer(session: Session, plan_id: int, run_id: int) -> models.PlanningLivePointer:
+    """Atomically replace the one live MRP pointer for a plan."""
+    plan = session.get(models.ProductionPlanHeader, int(plan_id))
+    run = session.get(models.PlanningRun, int(run_id))
+    if plan is None or run is None or int(run.source_plan_id or -1) != int(plan_id):
+        raise ValueError("live MRP pointer identities do not match the plan")
+    pointer = session.get(models.PlanningLivePointer, int(plan_id))
+    if pointer is None:
+        pointer = models.PlanningLivePointer(plan_id=int(plan_id), run_id=int(run_id))
+        session.add(pointer)
+    else:
+        pointer.run_id = int(run_id)
+        pointer.status = "active"
+    session.flush()
+    return pointer
+
+
+def record_successor(
+    session: Session,
+    plan_id: int,
+    predecessor_run_id: int,
+    successor_run_id: int,
+    *,
+    reason: str,
+) -> models.PlanningRunSuccessor:
+    """Insert one idempotent business successor edge."""
+    if int(predecessor_run_id) == int(successor_run_id):
+        raise ValueError("a run cannot be its own successor")
+    existing = (
+        session.query(models.PlanningRunSuccessor)
+        .filter_by(
+            plan_id=int(plan_id), predecessor_run_id=int(predecessor_run_id),
+            successor_run_id=int(successor_run_id),
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        return existing
+    row = models.PlanningRunSuccessor(
+        plan_id=int(plan_id), predecessor_run_id=int(predecessor_run_id),
+        successor_run_id=int(successor_run_id), reason=str(reason),
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def retire_live_pointer(session: Session, plan_id: int) -> None:
+    """Retire a plan with no successor without inventing a replacement run."""
+    pointer = session.get(models.PlanningLivePointer, int(plan_id))
+    if pointer is not None:
+        pointer.status = "retired"
+        session.flush()
+
+
+@event.listens_for(Session, "before_flush")
+def _r3_identity_before_flush(session: Session, _flush_context, _instances) -> None:
+    """Enforce identity/mapping for every runtime physical writer.
+
+    Test fixtures and legacy rows may omit ``ingest_source``; runtime writers
+    cannot.  This keeps the historical server default from being a working
+    fallback while preserving compatibility for old read-only fixtures.
+    """
+    for entry in tuple(session.new):
+        if not isinstance(entry, models.StockLedgerEntry):
+            continue
+        source = str(entry.ingest_source or "").strip()
+        if not source or source == "test":
+            continue
+        identity = str(entry.business_identity or "").strip()
+        if not identity:
+            identity = business_identity_for_movement(
+                entry.recorder_type, entry.recorder_ref, entry.line_no
+            )
+            entry.business_identity = identity
+        active_rows = (
+            session.query(models.StockLedgerEntry)
+            .filter(
+                models.StockLedgerEntry.business_identity == identity,
+                models.StockLedgerEntry.active.is_(True),
+            )
+            .all()
+        )
+        if any(not (row in session.dirty and row.active is False) for row in active_rows):
+            raise ValueError(f"active duplicate business identity {identity}")
+        session.add(
+            models.StockLedgerBusinessIdentityMap(
+                business_identity=identity,
+                stock_ledger_entry=entry,
+                mapping_reason="runtime-accepted",
+            )
+        )

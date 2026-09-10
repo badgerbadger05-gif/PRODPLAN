@@ -477,6 +477,7 @@ def _write_freeze_baseline(
     *,
     baseline_at: datetime | None,
     physical_import_batch_id: int | None,
+    frozen_basis_generation_id: int | None = None,
 ) -> int:
     """Frozen supply position per pool for every item with gross > 0.
 
@@ -500,6 +501,7 @@ def _write_freeze_baseline(
                 frozen_at=now,
                 baseline_at=baseline_at,
                 physical_import_batch_id=physical_import_batch_id,
+                frozen_basis_generation_id=frozen_basis_generation_id,
                 stock_qty=_to_float(stock_initial.get(int(iid), 0.0)),
                 # Deprecated diagnostic columns. They must never be populated
                 # from ProductionProduct/SupplierOrderItem legacy counters.

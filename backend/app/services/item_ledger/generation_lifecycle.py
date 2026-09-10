@@ -1336,6 +1336,20 @@ def _promote_accepted_generation_read_snapshots(
         generation,
         expected_parent_id=expected_parent_id,
     )
+    # R3 explicit business pointer: current reads must not traverse sealed
+    # generation/prior-run ancestry.  The pointer update is in this same
+    # caller-owned publication transaction.
+    from .r3_contract import record_successor, set_live_pointer
+    for run_id in sorted({int(value) for value in fixed_run_ids}):
+        run = db.get(models.PlanningRun, run_id)
+        if run is None or run.source_plan_id is None:
+            continue
+        set_live_pointer(db, int(run.source_plan_id), int(run.run_id))
+        if run.prior_run_id is not None:
+            record_successor(
+                db, int(run.source_plan_id), int(run.prior_run_id),
+                int(run.run_id), reason="mrp-publish",
+            )
 
     # Only the live obligations of this generation get a result snapshot, and
     # "live" is the sealed lineage scope — a fact-only fork inherits its runs

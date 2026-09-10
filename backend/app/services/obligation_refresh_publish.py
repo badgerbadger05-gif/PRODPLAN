@@ -37,6 +37,11 @@ from app.services.obligation_refresh_manifest import (
     _current_parents,
 )
 from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
+from app.services.item_ledger.r3_contract import (
+    record_successor,
+    retire_live_pointer,
+    set_live_pointer,
+)
 from app.services.planning_run_candidate import _resolve_parent_generation_id
 
 
@@ -85,6 +90,29 @@ _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "future_supply",
     "production_control_journal",
 })
+
+
+def _sync_business_mrp_pointers(
+    db: Session,
+    *,
+    additions: list[models.PlanningRun],
+    replacements: list[models.PlanningRun],
+    retained: list[models.PlanningRun],
+    retired: list[models.PlanningRun],
+) -> None:
+    """Persist live MRP pointer/successor history in the publish transaction."""
+    for run in [*retained, *additions, *replacements]:
+        if run.source_plan_id is not None:
+            set_live_pointer(db, int(run.source_plan_id), int(run.run_id))
+    for run in replacements:
+        if run.source_plan_id is not None and run.prior_run_id is not None:
+            record_successor(
+                db, int(run.source_plan_id), int(run.prior_run_id),
+                int(run.run_id), reason="obligation-rebase",
+            )
+    for run in retired:
+        if run.source_plan_id is not None:
+            retire_live_pointer(db, int(run.source_plan_id))
 
 
 def _utc(value: datetime | None, field: str) -> datetime:
@@ -789,6 +817,10 @@ def _exact_retry(
         ).all()
         if any(int(row.locked_by_run_id) != int(candidate.run_id) for row in locked_rows):
             return None
+    _sync_business_mrp_pointers(
+        db, additions=additions, replacements=replacements,
+        retained=retained, retired=retired,
+    )
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
         parent_run_ids=tuple(sorted(
@@ -1044,6 +1076,10 @@ def publish_obligation_refresh_batch(
         # cutoff must see and carry every plan fixed before that cutoff.
         candidate.fixed_at = addition_fixed_at[int(candidate.run_id)]
         candidate.finished_at = accepted_at
+    _sync_business_mrp_pointers(
+        db, additions=additions, replacements=replacements,
+        retained=retained, retired=retired,
+    )
     for snapshot in [
         *candidate_read_snapshots,
         candidate_purchase_journal,
