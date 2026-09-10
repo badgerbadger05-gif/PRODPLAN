@@ -811,7 +811,7 @@ async def period_plans_execution_journal(
             entity_kind="period_plan_execution",
             scope_key="period-plan:all-live-plans",
         ) if row.payload and int(row.payload.get("plan_id") or 0) == int(plan_id)
-        and (run_id is None or int(row.payload.get("run_id") or 0) == int(run_id))]
+        and int(row.payload.get("run_id") or 0) == int(resolved_run.run_id)]
         current_payload = {
             "plan": dict(selected.get("plan") or {}),
             "run_id": int(selected.get("run_id") or 0),

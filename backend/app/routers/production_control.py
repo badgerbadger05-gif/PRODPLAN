@@ -1297,6 +1297,38 @@ class ProductionControlRootProductOptionsResponse(BaseModel):
     total: int
 
 
+def _canonical_journal_sort(
+    rows: list[dict],
+    *,
+    field: Optional[str],
+    descending: bool,
+) -> None:
+    """Sort journal rows with NULLS LAST and ascending business ties."""
+
+    primary_field = str(field or "order_date").strip() or "order_date"
+
+    def _tie_key(row: dict) -> tuple[str, int, str]:
+        raw_line = row.get("line_number")
+        try:
+            line_number = int(raw_line) if raw_line is not None else 0
+        except (TypeError, ValueError):
+            line_number = 0
+        return (
+            str(row.get("order_number") or ""),
+            line_number,
+            str(raw_line or ""),
+        )
+
+    rows.sort(key=_tie_key)
+    present = [row for row in rows if row.get(primary_field) not in (None, "")]
+    missing = [row for row in rows if row.get(primary_field) in (None, "")]
+    present.sort(
+        key=lambda row: str(row.get(primary_field) or ""),
+        reverse=descending,
+    )
+    rows[:] = present + missing
+
+
 @router.get("/orders/root-products", response_model=ProductionControlRootProductOptionsResponse)
 def list_root_products(
     db: Session = Depends(get_db),
@@ -1403,11 +1435,10 @@ def get_orders_journal(
             ).casefold()]
         sort_field = str(sort_by or "").strip().lower()
         descending = str(sort_dir or "").strip().lower() == "desc"
-        if sort_field in {"planned_start_date", "planned_finish_date", "readiness_need_date", "readiness_action_date", "readiness_priority_key"}:
-            rows.sort(key=lambda row: (row.get(sort_field) is None, str(row.get(sort_field) or ""), str(row.get("order_number") or ""), int(row.get("line_number") or 0)), reverse=descending)
+        if sort_field in {"order_date", "planned_start_date", "planned_finish_date", "readiness_need_date", "readiness_action_date", "readiness_priority_key"}:
+            _canonical_journal_sort(rows, field=sort_field, descending=descending)
         else:
-            rows.sort(key=lambda row: (str(row.get("order_number") or ""), int(row.get("line_number") or 0)))
-            rows.sort(key=lambda row: (str(row.get("order_date") or "") == "", str(row.get("order_date") or "")), reverse=True)
+            _canonical_journal_sort(rows, field="order_date", descending=True)
         for row in rows:
             row.pop("__r9_root_item_ids", None)
         effective_limit = max(1, min(int(limit or 100), 500))
