@@ -301,6 +301,16 @@ def discard_physical_refresh_candidate(
     deleted_supersessions = db.query(models.StockLedgerFactSupersession).filter(
         models.StockLedgerFactSupersession.import_batch_id > cut
     ).delete(synchronize_session=False)
+    # R3 identity mappings belong to the same candidate boundary.  Remove
+    # rejected candidate edges before deleting their SLE rows; accepted
+    # historical mappings at/below the retained boundary remain immutable.
+    db.query(models.StockLedgerBusinessIdentityMap).filter(
+        models.StockLedgerBusinessIdentityMap.stock_ledger_entry_id.in_(
+            db.query(models.StockLedgerEntry.id).filter(
+                models.StockLedgerEntry.ingest_batch_id > cut
+            )
+        )
+    ).delete(synchronize_session=False)
     deleted_entries = db.query(models.StockLedgerEntry).filter(
         models.StockLedgerEntry.ingest_batch_id > cut
     ).delete(synchronize_session=False)
