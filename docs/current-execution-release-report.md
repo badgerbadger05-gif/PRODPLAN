@@ -13,15 +13,14 @@ OData, боевые workers, deploy и push не использовались.
 | R4 — транзакционные основания и текущее исполнение | принято локально | current writer, typed provenance, role separation, rebuild closure, PG atomicity и полный gate зелёные |
 | R5 — исправления, отмены и backdate | принято локально | signed replay, explicit history mode, mixed provenance, correction audit, migration and full local gate зелёные |
 | R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
-| R7 — выпуск плана, MRP и будущие поставки | в работе, не принято | implementation `13d546e4`; focused evidence ниже; full 0-skip gate ещё не снят |
+| R7 — выпуск плана, MRP и будущие поставки | принято локально | implementation `13d546e4`, docs `9b9f0388`; focused/migration/full gates зелёные |
 | R8 — барабан, полки и мехцех | не начато | только owner/identity contract |
 | R9 — API, UI и обменные ссылки | не начато | UI/backend migration не выполнялась |
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R6 приняты локально; R7 остаётся не принятым до полного exit gate;
-R8–R11 намеренно не продвигаются.
+волны. R1–R7 приняты локально; R8–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -658,11 +657,11 @@ migration/promotion; active BUILDING rows и explicit custody rewind baselines
 fail closed до следующей accepted publication. Live/prod contour намеренно не
 проверялся. R8–R11 не начинались.
 
-## R7 evidence — test-first implementation в работе
+## R7 evidence — локальная приёмка
 
-R7 не объявляется `принято локально`: focused и migration gates зелёные, но
-после implementation требуется полный pytest на финальном commit с нулём
-skip. Production/SSH/OData/live 1С/боевые workers/deploy/push не
+R7 имеет статус `принято локально`: focused, migration/round-trip и полный
+pytest gates зелёные, полный прогон с финального implementation commit имеет
+ноль skip. Production/SSH/OData/live 1С/боевые workers/deploy/push не
 использовались.
 
 ### Commits, files and contract
@@ -682,6 +681,16 @@ skip. Production/SSH/OData/live 1С/боевые workers/deploy/push не
 remaining roots; R7 не создаёт второй output/FIFO engine. Future supply
 разделён на immutable generation evidence и pointer-bound compact current rows.
 Удалённые пути: **нет**.
+
+Existing regression evidence covers plan `10 → accepted 4 → successor remaining
+6` without double-credit, immutable source matrix, foreign retained run
+preservation, exact/FIFO output and document return netting, closed/fully
+produced rebase, Decimal/tie-break/idempotent replay, future-supply rejection
+and closure history, and fail-closed missing/ambiguous source evidence.
+BUILDING current rows are staged and invisible; accepted publication switches
+the pointer-bound current marker. Equivalent specification import and repeated
+rebase/capture are no-ops; genuine specification change creates one revision
+request.
 
 ### Red, focused and migration evidence
 
@@ -717,11 +726,17 @@ PASS round-trip head -> 20260726_14 -> head
 PASS verify; overall: PASS (smoke mode)
 ```
 
-### Residual R7 gate
+### Final R7 gate and residual risks
 
 `current-execution-full-pytest.log` — чужой untracked файл, сохранён без
-изменений. Full pytest с финального `13d546e4` и 0 skipped ещё должен быть
-снят; до этого R7 остаётся `не принято`. Остаточный риск — полная
-orchestration/PG evidence проверяет existing output/rebase paths и новый
-future-supply publication boundary раздельно; production contour намеренно не
-проверялся.
+изменений. Финальный full pytest с implementation `13d546e4`:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
+pytest -q
+2007 passed, 35 warnings in 204.86s (0:03:24)
+```
+
+Skip отсутствуют. Остаточный риск — production contour намеренно не
+проверялся; current publication и generation evidence остаются локально
+проверенными на named PostgreSQL contour.
