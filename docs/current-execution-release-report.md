@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальные волны R1–R7. Продовые БД, SSH,
+Дата среза: 2026-09-10. Область: локальные волны R1–R8. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 ## Сводка волн
@@ -14,13 +14,13 @@ OData, боевые workers, deploy и push не использовались.
 | R5 — исправления, отмены и backdate | принято локально | signed replay, explicit history mode, mixed provenance, correction audit, migration and full local gate зелёные |
 | R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
 | R7 — выпуск плана, MRP и будущие поставки | принято локально (после correction gate) | test-first `acc7a505`, `f784882f`, `d82853a4`, `340c143d`; implementation `8580aa92`, `91491516`, `b4524df2`; focused/PG/migration/full gates зелёные |
-| R8 — барабан, полки и мехцех | не начато | только owner/identity contract |
+| R8 — барабан, полки и мехцех | принято локально | stable current owner, manifest/readiness handshake, invalidation hooks, PG/MVCC и full gate зелёные |
 | R9 — API, UI и обменные ссылки | не начато | UI/backend migration не выполнялась |
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R7 приняты локально только после соответствующих exit gates; R8–R11 намеренно не продвигаются.
+волны. R1–R8 приняты локально только после соответствующих exit gates; R9–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -785,3 +785,98 @@ Skip отсутствуют. Остаточный риск — production contou
 проверялся; current publication и generation evidence остаются локально
 проверенными на named PostgreSQL contour. Migration downgrade fail-closes при
 отсутствующем или неоднозначном staging source; R10 cleanup ещё не начинался.
+
+## R8 evidence — локальная приёмка
+
+R8 закрывает только очередь сборки, readiness, барабан и полки. Публичные
+current GET требуют единственный persisted `CurrentExecutionScope` manifest:
+он хранит valid-empty состояние, accepted source revision/generation и
+сохранённое summary. Отсутствующий, stale, неготовый или нестыкующийся с
+`PlanningTruthState` manifest даёт 503; fallback к `PlanningReadSnapshot` или
+generation-scoped GET удалён. `CurrentExecutionRow` — compact business owner;
+generation ids остаются только provenance.
+
+### Commits, files and invariants
+
+Test-first commits:
+
+* `e8a0433f` — red regression: generation-local queue ids churn readiness/drum
+  current rows and audit.
+* `5e3f66e7` — red regressions for all four contours (queue/readiness/drum/
+  shelf) and current drum ordering.
+* `97fbc692` — typed same-date/same-resource priority ordering regression.
+* `b05544d6` — reference mutation invalidation behavior and no-op semantics.
+* `e1cd8fa9`, `b4a67f4d` — custody invalidation/idempotent retry and unrelated
+  queue-scope preservation.
+
+Implementation/fix commits:
+
+* `cec32cc9` — stable queue-owner mapping for readiness/drum, typed canonical
+  current drum sort, and semantic no-op guards for rates/resources/shelf
+  policies.
+* `bb324555` — fixed transfer-custody invalidation revision propagation.
+
+Relevant implementation is in
+`backend/app/services/item_ledger/current_execution.py`,
+`backend/app/routers/production_control.py`,
+`backend/app/routers/planning_rates.py`, `backend/app/routers/resources.py`,
+and the existing `CurrentExecutionRow/CurrentExecutionScope` migrations
+`20260910_12`–`20260910_14`. Legacy route tests now explicitly prove missing
+current manifests fail closed. `current-execution-full-pytest.log` remains the
+pre-existing untracked file and was not touched.
+
+### Red, focused, PostgreSQL and migration evidence
+
+Красные test-first проверки до реализации:
+
+```text
+pytest -q tests/r8/test_r8_current_execution.py::test_r8_generation_local_queue_ids_do_not_churn_current_readiness_or_drum
+1 failed — current change/audit count grew from 4 to 6 on generation-local queue ids
+
+pytest -q tests/routers/test_assembly_queue_router.py::test_current_drum_get_sorts_persisted_slots_by_date_resource_priority_and_ordinal
+1 failed — returned [10, 20], expected canonical [20, 10]
+
+pytest -q tests/r8/test_r8_invalidation_wiring.py::test_r8_reference_writers_are_idempotent_before_invalidating_on_real_change
+1 failed — semantic no-op reference writes invalidated readiness
+```
+
+Focused current/canon/custody/affected gate with the local DSN:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
+pytest -q tests/r8 tests/routers/test_assembly_queue_router.py tests/test_canon_invariants.py tests/test_openapi_contract_sync.py tests/test_ledger_rebuild_operations.py tests/services/test_production_material_custody_projection.py tests/services/test_one_c_posted_transfer_sync.py
+116 passed in 22.65s
+```
+
+Migration and seeded round-trip/verify:
+
+```text
+python -m alembic -c alembic.ini upgrade head
+INFO ... PostgresqlImpl ... (head 20260910_14)
+python tools/pg_rebuild_check.py --dsn $env:PRODPLAN_PG_CHECK_DSN --stages migrate,round-trip,verify
+PASS migrate 20260910_14 (head)
+PASS round-trip head -> 20260726_14 -> head
+PASS verify ... summary projection executable
+---- overall: PASS (smoke mode)
+```
+
+Финальный full gate на том же DSN и с теми же тремя переменными:
+
+```text
+pytest -q
+2038 passed, 35 warnings in 216.65s (0:03:36)
+```
+
+Skip отсутствуют. Удалённые пути: **нет**. Production/SSH/OData/live 1С,
+боевые workers, deploy и push не использовались.
+
+### Остаточные риски
+
+Реальный WorkCalendarDay writer/API в R8-контуре отсутствует: для него
+зафиксирован обязательный transactional hook
+`invalidate_current_execution_for_calendar_change`; до его вызова календарь
+не считается применённым и current GET остаётся stale/fail-closed. Excluded
+drum detail требует дальнейшего расширения persisted current payload, если
+потребуется отдельный построчный список, хотя schedule metrics уже сохраняются
+в current summary. R9 API/UI и R10 cleanup не начинались; production contour
+намеренно не проверялся.

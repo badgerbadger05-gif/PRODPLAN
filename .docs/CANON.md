@@ -317,6 +317,31 @@ provenance старых generation builds, но не являются вторы
 После completed R4 marker их writer для того же scope отклоняется. Это не
 смешивает supplier receipt replenishment с assembly_out material consumption.
 
+## R8. Очередь, readiness, барабан и полки
+
+Текущая область исполнения имеет одного compact owner: `CurrentExecutionRow`
+и единственный `CurrentExecutionScope` manifest. Manifest одновременно
+представляет готовый пустой scope и accepted semantic pointer
+(`source_revision`, `source_generation_id`, content hash и summary). Current
+GET читает только этот persisted owner; отсутствие, stale/mismatched или
+неготовое состояние fail-closed и не переключается на `PlanningReadSnapshot`
+или generation-scoped rows.
+
+Generation-local ids из staging (`AssemblyQueueLine.id` и зависимые ids) не
+являются частью current business identity. Readiness и drum сохраняют ссылку
+на stable current queue owner по `plan_line_id`; повтор публикации новой
+technical generation с тем же результатом не создаёт row/audit churn.
+Очередь и drum читаются oldest-first по полной typed tie-break цепочке:
+дата, ресурс, `original_priority`, ordinal и stable identity.
+
+Писатели reference data, custody events и manual commands инвалидируют только
+затронутые manifests в той же транзакционной границе; семантический no-op не
+инвалидирует результат. Accepted current scope не считается применённым, пока
+worker не опубликовал новый persisted result. Для будущего WorkCalendarDay
+writer обязательна транзакционная граница
+`invalidate_current_execution_for_calendar_change`; без неё календарное
+изменение остаётся stale/fail-closed.
+
 ## R5. Исправления, возвраты и backdate
 
 Текущий supplier-receipt результат строится тем же единственным allocator и

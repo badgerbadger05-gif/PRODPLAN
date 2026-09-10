@@ -227,3 +227,25 @@ FIFO части одного стабильного pair получают `mixed
 сохраняются вместе, `history_mode` выбирается явно, closed reservation не
 переоткрывается и assignment не переносится на новую obligation только по
 совпадению item.
+
+## R8. Текущая область исполнения
+
+Очередь assembly, readiness, drum и shelf имеют единый compact current owner:
+`CurrentExecutionRow`; `CurrentExecutionScope` — единственный manifest и
+semantic pointer, включая валидный пустой scope, source revision/generation,
+content hash и сохранённое summary. Публичный GET читает только опубликованный
+manifest/current rows. Missing, stale, not-ready или mismatched manifest
+fail-closed; generation-scoped rows и `PlanningReadSnapshot` не являются
+runtime fallback.
+
+Generation-local staging ids не входят в business payload: readiness и drum
+ссылаются на stable current queue owner. Новая accepted technical generation
+с тем же результатом меняет только manifest provenance, без current row,
+updated_at или audit churn. Current drum order использует typed deterministic
+date/resource/priority/ordinal tie-break.
+
+Reference, custody и manual mutation writers инвалидируют только свои
+зависимые manifests и делают это на фактическом semantic change; no-op update
+не инвалидирует готовый результат. Calendar writers обязаны вызвать
+`invalidate_current_execution_for_calendar_change` в той же транзакции; без
+этого current execution остаётся unavailable до следующей публикации worker.
