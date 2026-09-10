@@ -39,6 +39,7 @@ vi.mock('../../services/productionControl', () => ({
   updateItem: vi.fn(),
   updateOrderQuantity: vi.fn(),
   deleteProductionOrder: vi.fn(),
+  returnLeftoverComponents: vi.fn(),
 }))
 
 vi.mock('../../services/resources', () => ({
@@ -73,6 +74,7 @@ import {
   getStandalonePieceworkOptions,
   createStandalonePiecework,
   updateOrderQuantity,
+  returnLeftoverComponents,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 import {
@@ -111,6 +113,8 @@ function fakeRows(): OrderRow[] {
       workshop_name: 'Цех 1',
       launch_source: 'mrp_remaining',
       available_actions: ['close_1c'],
+      current_identity: 'production:order:101',
+      source_revision: 'rev-7',
       comment: '',
     },
     {
@@ -137,6 +141,8 @@ function fakeRows(): OrderRow[] {
       issue_count: 0,
       launch_source: 'mrp_remaining',
       available_actions: [],
+      current_identity: 'production:order:102',
+      source_revision: 'rev-7',
       comment: '',
     },
   ]
@@ -965,7 +971,7 @@ describe('ProductionControlPage — characterization', () => {
     const statusSelect = within(rowFor('Кронштейн')).getByRole('combobox')
     await user.selectOptions(statusSelect, 'done')
 
-    expect(updateOrderStatus).toHaveBeenCalledWith(101, 'done')
+    expect(updateOrderStatus).toHaveBeenCalledWith(101, 'done', 'production:order:101', 'rev-7')
   })
 
   it('selecting a row and clicking "Запустить в 1С" posts issues then exports to 1C', async () => {
@@ -1146,7 +1152,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.type(input, '14')
     await user.tab()
 
-    await waitFor(() => expect(updateOrderQuantity).toHaveBeenCalledWith(901, 14))
+    await waitFor(() => expect(updateOrderQuantity).toHaveBeenCalledWith(901, 14, 'production:order:901', 'rev-7'))
     // Комплектация перечитывается с сервера, а не пересчитывается страницей.
     await waitFor(() => expect(vi.mocked(getOrderMaterials).mock.calls.length).toBeGreaterThan(1))
     expect(await screen.findByText('Нужно: 56')).toBeInTheDocument()
@@ -1430,7 +1436,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(deleteBtn)
 
     expect(window.confirm).toHaveBeenCalled()
-    await waitFor(() => expect(deleteProductionOrder).toHaveBeenCalledWith(101))
+    await waitFor(() => expect(deleteProductionOrder).toHaveBeenCalledWith(101, 'production:order:101', 'rev-7'))
   })
 
   it('runs only one dangerous delete mutation when the command is double-clicked', async () => {

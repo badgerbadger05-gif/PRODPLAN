@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { closeProductionOrder, listProductionOrders, listRootProductOptions, updateItem, updateOrderQuantity } from './productionControl'
+import {
+  closeProductionOrder,
+  deleteProductionOrder,
+  listProductionOrders,
+  listRootProductOptions,
+  returnLeftoverComponents,
+  updateItem,
+  updateOrderQuantity,
+  updateOrderStatus,
+} from './productionControl'
 
 describe('production-control item update boundary', () => {
   afterEach(() => {
@@ -134,12 +143,52 @@ describe('production-control launch quantity boundary', () => {
     )
     vi.stubGlobal('fetch', fetchMock)
 
-    const result = await updateOrderQuantity(901, 14)
+    const result = await updateOrderQuantity(901, 14, 'production:order:901', 'rev-7')
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(url).toBe('/api/v1/production-control/orders/901/quantity')
     expect(init.method).toBe('PATCH')
-    expect(JSON.parse(String(init.body))).toEqual({ quantity: 14, initiated_by: 'erp-shell' })
+    expect(JSON.parse(String(init.body))).toEqual({
+      quantity: 14,
+      initiated_by: 'erp-shell',
+      current_identity: 'production:order:901',
+      expected_source_revision: 'rev-7',
+    })
     expect(result.quantity).toBe(14)
+  })
+})
+
+describe('production-control current action transport', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('sends identity and revision for state changes', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await updateOrderStatus(901, 'done', 'production:order:901', 'rev-7')
+
+    expect(JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body))).toEqual({
+      status: 'done',
+      current_identity: 'production:order:901',
+      expected_source_revision: 'rev-7',
+    })
+  })
+
+  it('sends identity and revision for delete and leftover return', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await deleteProductionOrder(901, 'production:order:901', 'rev-7')
+    await returnLeftoverComponents(901, 'erp-shell', 'production:order:901', 'rev-7')
+
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      '/api/v1/production-control/orders/901?current_identity=production%3Aorder%3A901&expected_source_revision=rev-7',
+    )
+    expect(fetchMock.mock.calls[1]![0]).toBe(
+      '/api/v1/production-control/orders/901/return-leftovers?initiated_by=erp-shell&current_identity=production%3Aorder%3A901&expected_source_revision=rev-7',
+    )
   })
 })
