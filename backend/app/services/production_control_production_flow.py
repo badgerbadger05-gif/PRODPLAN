@@ -170,7 +170,7 @@ def _ensure_workshop_reservation_covers(
         warehouse = str(binding.warehouse_ref1c or "") if binding else ""
         if warehouse:
             stock = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
-                StockBin.ledger_generation_id == generation_id,
+                StockBin.is_current.is_(True),
                 StockBin.warehouse_ref1c == warehouse,
                 StockBin.item_id.in_(per_unit),
             ).group_by(StockBin.item_id).all()

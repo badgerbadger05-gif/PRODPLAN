@@ -307,7 +307,7 @@ def _building_generation(db: Session, generation_id: int) -> models.LedgerGenera
 
 
 def materialize_generation_stock_bins(
-    db: Session, generation_id: int
+    db: Session, generation_id: int, *, publish_current: bool = True
 ) -> dict[str, Any]:
     """Fold the immutable visible prefix without reading SLE.active/qty_after."""
     generation = _building_generation(db, generation_id)
@@ -324,17 +324,29 @@ def materialize_generation_stock_bins(
         state["on_hand"] += _d(row.qty)
         state["last_entry_id"] = int(row.id)
 
-    existing = {
-        (
-            int(row.item_id),
-            str(row.characteristic_ref or ""),
-            str(row.organization_ref or ""),
-            str(row.warehouse_ref1c or ""),
-        ): row
-        for row in db.query(models.StockBin).filter(
+    candidate_query = db.query(models.StockBin)
+    if publish_current:
+        candidate_query = candidate_query.filter(
+            (models.StockBin.ledger_generation_id == int(generation.id))
+            | models.StockBin.is_current.is_(True)
+        )
+    else:
+        candidate_query = candidate_query.filter(
             models.StockBin.ledger_generation_id == int(generation.id)
-        ).all()
-    }
+        )
+    candidates = candidate_query.all()
+    prior_current = db.query(models.StockBin).filter(
+        models.StockBin.is_current.is_(True)
+    ).all() if publish_current else []
+    existing = {}
+    for row in candidates:
+        key = (
+            int(row.item_id), str(row.characteristic_ref or ""),
+            str(row.organization_ref or ""), str(row.warehouse_ref1c or ""),
+        )
+        # Prefer a candidate row when promoting a previously staged build.
+        if key not in existing or int(row.ledger_generation_id) == int(generation.id):
+            existing[key] = row
     for key, state in grouped.items():
         bin_row = existing.pop(key, None)
         if bin_row is None:
@@ -346,11 +358,21 @@ def materialize_generation_stock_bins(
                 warehouse_ref1c=key[3],
             )
             db.add(bin_row)
+        bin_row.is_current = bool(publish_current)
         bin_row.on_hand = state["on_hand"]
         bin_row.last_entry_id = state["last_entry_id"]
         bin_row.reconcile_pending_qty = Decimal("0")
     for stale in existing.values():
-        db.delete(stale)
+        if not publish_current:
+            db.delete(stale)
+    if publish_current:
+        # Accepted current state is compact: superseded rows are removed, not
+        # retained as generation fan-out copies.  A failed/building candidate
+        # remains scoped to its building generation and can be discarded with
+        # that generation's lifecycle cleanup before publication.
+        for stale in prior_current:
+            if not stale.is_current:
+                db.delete(stale)
     db.flush()
     return {
         "physical_facts": len(rows),
@@ -779,8 +801,10 @@ def _stock_bin_fold_checkpoint(
         )
         qty, _last = expected_bins.get(key, (Decimal("0"), int(row.id)))
         expected_bins[key] = (qty + _d(row.qty), int(row.id))
+    # StockBin is the compact current projection.  Generation id is provenance,
+    # never a selector and never a fan-out dimension.
     bins = db.query(models.StockBin).filter(
-        models.StockBin.ledger_generation_id == int(generation.id)
+        models.StockBin.is_current.is_(True)
     ).all()
     actual_bins = {
         (
@@ -1640,6 +1664,10 @@ def accept_generation_build(
         if generation.accepted_at is None:
             generation.accepted_at = datetime.now(timezone.utc)
         generation.reason = None
+        from ..production_material_custody_projection import publish_current_material_custody
+        publish_current_material_custody(
+            db, ledger_generation_id=int(generation.id)
+        )
         _promote_accepted_generation_read_snapshots(
             db,
             generation=generation,

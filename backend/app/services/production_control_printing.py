@@ -272,7 +272,7 @@ def _multi_stock_warehouse_item_ids(
     rows = (
         db.query(StockBin.item_id, StockBin.warehouse_ref1c)
         .filter(
-            StockBin.ledger_generation_id == ledger_generation_id,
+            StockBin.is_current.is_(True),
             StockBin.item_id.in_(ids),
             StockBin.on_hand > 0,
         )

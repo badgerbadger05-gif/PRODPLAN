@@ -57,7 +57,7 @@ def _physical_supplies(
         models.StockBin.item_id,
         models.StockBin.warehouse_ref1c,
         func.sum(models.StockBin.on_hand),
-    ).filter(models.StockBin.ledger_generation_id == int(generation_id))
+    ).filter(models.StockBin.is_current.is_(True))
     query = apply_planning_warehouse_scope(
         query,
         scope,

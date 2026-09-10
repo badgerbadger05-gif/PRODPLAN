@@ -381,7 +381,9 @@ def reconcile_opening_balance(
                 source="balance_seed",
                 entry_id=int(entry.id),
             ))
-        rebuild_running_balance(db, key, ledger_generation_id=int(generation.id))
+        rebuild_running_balance(
+            db, key, ledger_generation_id=int(generation.id), publish_current=False
+        )
 
     metrics = {
         "checkpoint_version": CHECKPOINT_VERSION,

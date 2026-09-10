@@ -278,7 +278,7 @@ def build_shared_pools(
         current_scope = planning_warehouse_scope(db)
         current_query = (
             db.query(StockBin.id, StockBin.item_id, StockBin.characteristic_ref)
-            .filter(StockBin.ledger_generation_id == int(ledger_generation_id))
+            .filter(StockBin.is_current.is_(True))
             .filter(func.abs(func.coalesce(StockBin.on_hand, 0)) > EPS)
         )
         current_query = apply_planning_warehouse_scope(
@@ -1275,6 +1275,7 @@ def freeze_candidate_snapshots(
             ).all()
         ]
         if retained_reservations:
+            from .item_ledger.current_physical import senior_hold_qty
             allocated = {
                 int(row.reservation_id): _to_float(row.allocated_qty)
                 for row in db.query(
@@ -1284,8 +1285,8 @@ def freeze_candidate_snapshots(
                     ).label("allocated_qty"),
                 )
                 .filter(
-                    ReservationConsumptionAllocation.ledger_generation_id == target_id,
                     ReservationConsumptionAllocation.allocation_role == "material_consumption",
+                    ReservationConsumptionAllocation.is_current.is_(True),
                     ReservationConsumptionAllocation.reservation_id.in_(
                         [int(row.id) for row in retained_reservations]
                     ),
@@ -1305,8 +1306,10 @@ def freeze_candidate_snapshots(
                 )
                 reserved_qty = _to_float(reservation.reserved_qty)
                 attributed_qty = allocated.get(int(reservation.id), 0.0)
-                senior_hold_qty = max(reserved_qty - attributed_qty, 0.0)
-                if senior_hold_qty <= EPS:
+                hold_qty = senior_hold_qty(reserved_qty, [
+                    {"allocation_role": "material_consumption", "allocated_qty": attributed_qty}
+                ])
+                if hold_qty <= EPS:
                     continue
                 key = (
                     int(reservation.item_id),
@@ -1314,7 +1317,7 @@ def freeze_candidate_snapshots(
                     str(reservation.organization_ref or EMPTY_REF),
                     str(reservation.planning_stock_pool or DEFAULT_STOCK_POOL),
                 )
-                retained_stock_by_key[key] += senior_hold_qty
+                retained_stock_by_key[key] += float(hold_qty)
             for (item_id, characteristic_ref, organization_ref, planning_stock_pool), hold_qty in (
                 retained_stock_by_key.items()
             ):

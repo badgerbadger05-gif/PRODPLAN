@@ -314,7 +314,7 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
         db.query(models.StockBin.warehouse_ref1c, func.sum(models.StockBin.on_hand))
         .filter(
             models.StockBin.item_id == int(item_id),
-            models.StockBin.ledger_generation_id == generation_id,
+            models.StockBin.is_current.is_(True),
         )
         .group_by(models.StockBin.warehouse_ref1c)
         .all()
@@ -337,7 +337,7 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
         db.query(models.StockBin.id)
         .filter(
             models.StockBin.item_id == int(item_id),
-            models.StockBin.ledger_generation_id == generation_id,
+            models.StockBin.is_current.is_(True),
             func.abs(models.StockBin.reconcile_pending_qty) > EPS,
         )
         .first()

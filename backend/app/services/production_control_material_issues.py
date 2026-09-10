@@ -125,7 +125,7 @@ def _auto_select_source_warehouse(
     rows = (
         db.query(StockBin.warehouse_ref1c, StockBin.item_id)
         .filter(
-            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.is_current.is_(True),
             StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
         )
         .all()
@@ -201,7 +201,7 @@ def _source_warehouse_options(
             StockBin.item_id, StockBin.warehouse_ref1c, func.sum(StockBin.on_hand),
         )
         .filter(
-            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.is_current.is_(True),
             StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
         )
         .group_by(StockBin.item_id, StockBin.warehouse_ref1c)
@@ -297,7 +297,7 @@ def _destination_stock_by_component(
     rows = (
         db.query(StockBin.item_id, func.sum(StockBin.on_hand))
         .filter(
-            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.is_current.is_(True),
             StockBin.item_id.in_(component_ids), StockBin.warehouse_ref1c == destination_ref,
             StockBin.on_hand > 0,
         )
@@ -624,7 +624,7 @@ def _free_destination_stock(
     rows = (
         db.query(StockBin.item_id, func.sum(StockBin.on_hand))
         .filter(
-            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.is_current.is_(True),
             StockBin.item_id.in_(component_item_ids), StockBin.warehouse_ref1c == dest,
         )
         .group_by(StockBin.item_id)

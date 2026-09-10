@@ -311,7 +311,9 @@ def _snap_balance_at_cutoff(
             )
         )
         db.flush()
-        rebuild_running_balance(db, key, ledger_generation_id=int(generation.id))
+        rebuild_running_balance(
+            db, key, ledger_generation_id=int(generation.id), publish_current=False
+        )
 
     generation.physical_import_batch_id = int(batch.id)
     generation.source_watermarks = {

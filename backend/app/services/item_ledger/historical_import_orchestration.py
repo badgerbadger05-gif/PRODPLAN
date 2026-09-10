@@ -289,6 +289,7 @@ def run_historical_physical_import(
                     # Physical facts are shared. Generation StockBin and
                     # reservations are built by later generation-scoped stages.
                     ledger_generation_id=None,
+                    publish_current=False,
                     max_posting_at=to_inclusive,
                     strict_historical=True,
                 )

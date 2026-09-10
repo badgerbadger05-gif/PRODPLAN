@@ -242,7 +242,7 @@ def _warehouse_breakdown(db: Session, item_ids: Sequence[int]) -> Dict[int, List
             func.sum(StockBin.on_hand),
         )
         .filter(
-            StockBin.ledger_generation_id == int(truth.generation_id),
+            StockBin.is_current.is_(True),
             StockBin.item_id.in_(ids),
         )
         .group_by(StockBin.item_id, StockBin.warehouse_ref1c)

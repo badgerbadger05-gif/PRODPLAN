@@ -150,7 +150,7 @@ def _stock(
     rows = (
         db.query(models.StockBin.warehouse_ref1c, func.sum(models.StockBin.on_hand))
         .filter(
-            models.StockBin.ledger_generation_id == int(generation_id),
+            models.StockBin.is_current.is_(True),
             models.StockBin.item_id == int(item_id),
         )
         .group_by(models.StockBin.warehouse_ref1c)

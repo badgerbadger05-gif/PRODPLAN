@@ -612,6 +612,7 @@ def initialize_material_custody_baseline(
             warehouse_ref1c=warehouse,
             reserved_qty=qty,
             source_event_high_watermark_id=watermark,
+            is_current=False,
             built_at=now,
         ))
     db.add(models.ProductionMaterialCustodyProjectionManifest(
@@ -924,6 +925,7 @@ def build_material_custody_projection(
                 warehouse_ref1c=warehouse,
                 reserved_qty=reserved_qty,
                 source_event_high_watermark_id=int(target_high_watermark_id),
+                is_current=False,
             )
         )
 
@@ -1156,6 +1158,41 @@ def validate_material_custody_projection(
     }
 
 
+def publish_current_material_custody(
+    db: Session, *, ledger_generation_id: int
+) -> int:
+    """Promote one validated building custody projection atomically.
+
+    Candidate rows stay ``is_current=false`` while a generation is building.
+    The acceptance transaction calls this only after all gates pass; obsolete
+    current rows are then deleted so accepted custody remains compact while
+    immutable events and the selected rewind baseline retain provenance.
+    """
+    generation_id = int(ledger_generation_id)
+    candidate = db.query(models.ProductionMaterialCustodyProjection).filter_by(
+        ledger_generation_id=generation_id,
+        is_current=False,
+    ).all()
+    if not candidate:
+        manifest = _read_manifest(db, generation_id=generation_id)
+        if manifest is None or str(manifest.status) != "complete":
+            raise MaterialCustodySnapshotUnavailable(
+                expected_generation_id=generation_id,
+                stored_generation_id=None,
+                reason="cannot publish custody without a complete candidate manifest",
+            )
+    old = db.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+        models.ProductionMaterialCustodyProjection.ledger_generation_id != generation_id,
+    ).all()
+    for row in old:
+        db.delete(row)
+    for row in candidate:
+        row.is_current = True
+    db.flush()
+    return len(candidate)
+
+
 
 def load_material_custody_projection(
     db: Session,
@@ -1305,10 +1342,43 @@ def load_current_accepted_material_custody(
             stored_generation_id=generation_id,
             reason="accepted custody snapshot watermark is ahead of the event stream",
         )
-    state = load_material_custody_projection(
-        db,
-        ledger_generation_id=generation_id,
+    current_rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .filter(models.ProductionMaterialCustodyProjection.is_current.is_(True))
+        .all()
     )
+    if current_rows:
+        if any(
+            int(row.source_event_high_watermark_id or 0) != manifest_watermark
+            for row in current_rows
+        ):
+            raise MaterialCustodySnapshotUnavailable(
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="compact current custody watermark mismatches accepted manifest",
+            )
+        state = _state_from_projection_rows(current_rows)
+    else:
+        legacy_rows = (
+            db.query(models.ProductionMaterialCustodyProjection)
+            .filter_by(ledger_generation_id=generation_id)
+            .all()
+        )
+        if legacy_rows:
+            raise MaterialCustodySnapshotUnavailable(
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="accepted custody projection has no compact current marker",
+            )
+        # A complete accepted manifest with no cells is a valid empty current
+        # scope. Late events dated inside the cutoff require an explicit
+        # reconstruction from the retained baseline, never a generation-row
+        # fallback; the result is made current by the next publication.
+        state = MaterialCustodyState()
+        if current_event_watermark != manifest_watermark:
+            state = load_material_custody_projection(
+                db, ledger_generation_id=generation_id,
+            )
     if current_event_watermark == manifest_watermark:
         return generation_id, state
 

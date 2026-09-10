@@ -1129,6 +1129,13 @@ class ProductionMaterialCustodyProjection(Base):
             "ledger_generation_id",
             "product_id",
         ),
+        Index(
+            "ux_pm_custody_current_cell",
+            "product_id", "component_item_id", "location_kind", "warehouse_ref1c",
+            unique=True,
+            postgresql_where=text("is_current = true"),
+            sqlite_where=text("is_current = 1"),
+        ),
     )
 
     id = Column(BigIntPK, primary_key=True, index=True)
@@ -1156,6 +1163,9 @@ class ProductionMaterialCustodyProjection(Base):
     warehouse_ref1c = Column(String(36), nullable=False)
     reserved_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     source_event_high_watermark_id = Column(BigInteger, nullable=False, default=0)
+    # One compact current state is published alongside immutable generation
+    # projections. Historical rows are explicitly false after R6 migration.
+    is_current = Column(Boolean, nullable=False, default=True, server_default="true")
     built_at = Column(
         TIMESTAMP,
         default=func.now(),
@@ -3700,7 +3710,7 @@ class StockBin(Base):
             "characteristic_ref",
             "organization_ref",
             "warehouse_ref1c",
-            name="ux_stock_bin_ledger_key",
+            name="ux_stock_bin_generation_key",
         ),
         Index(
             "ix_stock_bin_ledger_key",
@@ -3708,6 +3718,13 @@ class StockBin(Base):
             "characteristic_ref",
             "organization_ref",
             "warehouse_ref1c",
+        ),
+        Index(
+            "ux_stock_bin_current_physical_key",
+            "item_id", "characteristic_ref", "organization_ref", "warehouse_ref1c",
+            unique=True,
+            postgresql_where=text("is_current = true"),
+            sqlite_where=text("is_current = 1"),
         ),
     )
 
@@ -3730,6 +3747,7 @@ class StockBin(Base):
     # matched, or an adjustment-SLE applied). NULL = never reconciled ().
     last_reconciled_at = Column(TIMESTAMP, nullable=True)
     last_entry_id = Column(BigInteger, nullable=True)
+    is_current = Column(Boolean, nullable=False, default=True, server_default="true")
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
 
     item = relationship("Item")

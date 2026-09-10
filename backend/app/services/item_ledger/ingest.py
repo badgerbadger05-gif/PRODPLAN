@@ -332,6 +332,7 @@ def pull_recorder_movements(
     source: Optional[str] = None,
     import_batch: Optional[models.PhysicalImportBatch] = None,
     ledger_generation_id: Optional[int] = None,
+    publish_current: bool = True,
     max_posting_at: Optional[datetime] = None,
     strict_historical: bool = False,
 ) -> PullResult:
@@ -640,7 +641,8 @@ def pull_recorder_movements(
     result.inserted = len(normalized)
     for key in touched:
         rebuild_running_balance(
-            session, key, ledger_generation_id=ledger_generation_id
+            session, key, ledger_generation_id=ledger_generation_id,
+            publish_current=publish_current,
         )
     result.touched_keys = list(touched.keys())
 
@@ -767,6 +769,7 @@ def process_pending_pulls(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     limit: Optional[int] = None,
     ledger_generation_id: Optional[int] = None,
+    publish_current: bool = True,
 ) -> List[PullResult]:
     """Drain queued recorders (status in {pending, error}, under the attempt cap).
 
@@ -803,6 +806,7 @@ def process_pending_pulls(
                 client=client,
                 source=source,
                 ledger_generation_id=ledger_generation_id,
+                publish_current=publish_current,
             )
             session.commit()
         except Exception as exc:  # noqa: BLE001 — isolate a bad recorder

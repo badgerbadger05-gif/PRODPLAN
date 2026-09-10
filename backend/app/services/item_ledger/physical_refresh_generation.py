@@ -341,7 +341,7 @@ def fork_physical_refresh_generation(
     )
     db.add(candidate)
     db.flush()
-    materialize_generation_stock_bins(db, int(candidate.id))
+    materialize_generation_stock_bins(db, int(candidate.id), publish_current=False)
     provenance = _clone_supplier_receipt_provenance(
         db,
         parent_generation_id=int(parent.id),

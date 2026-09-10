@@ -184,6 +184,7 @@ def rebuild_running_balance(
     from_posting_at: Optional[datetime] = None,
     *,
     ledger_generation_id: Optional[int] = None,
+    publish_current: bool = True,
 ) -> Decimal:
     """Recompute qty_after forward for one ledger key and refold stock_bin.on_hand.
 
@@ -231,17 +232,26 @@ def rebuild_running_balance(
     on_hand = _dec(on_hand)
 
     if ledger_generation_id is not None:
-        bin_row = (
-            session.query(models.StockBin)
-            .filter(
-                models.StockBin.ledger_generation_id == int(ledger_generation_id),
+        candidate_query = session.query(models.StockBin).filter(
+            models.StockBin.ledger_generation_id == int(ledger_generation_id),
+            models.StockBin.item_id == ledger_key.item_id,
+            models.StockBin.characteristic_ref == ledger_key.characteristic_ref,
+            models.StockBin.organization_ref == ledger_key.organization_ref,
+            models.StockBin.warehouse_ref1c == ledger_key.warehouse_ref1c,
+        )
+        bin_row = candidate_query.one_or_none()
+        if publish_current:
+            current = session.query(models.StockBin).filter(
+                models.StockBin.is_current.is_(True),
                 models.StockBin.item_id == ledger_key.item_id,
                 models.StockBin.characteristic_ref == ledger_key.characteristic_ref,
                 models.StockBin.organization_ref == ledger_key.organization_ref,
                 models.StockBin.warehouse_ref1c == ledger_key.warehouse_ref1c,
-            )
-            .one_or_none()
-        )
+            ).one_or_none()
+            if current is not None and current is not bin_row:
+                current.is_current = False
+            if bin_row is None:
+                bin_row = current
         if bin_row is None:
             bin_row = models.StockBin(
                 ledger_generation_id=int(ledger_generation_id),
@@ -251,6 +261,7 @@ def rebuild_running_balance(
                 warehouse_ref1c=ledger_key.warehouse_ref1c,
             )
             session.add(bin_row)
+        bin_row.is_current = bool(publish_current)
         bin_row.on_hand = on_hand
         bin_row.last_entry_id = last_entry_id
     session.flush()
