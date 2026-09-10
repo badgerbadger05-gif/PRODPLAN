@@ -172,9 +172,11 @@ def publish_current_execution_scope(
                 result_ready=True,
                 content_hash=scope_hash,
             ))
-        elif bool(manifest.result_ready) and str(manifest.content_hash) == scope_hash:
-            pass
         else:
+            # The manifest is both the valid-empty marker and the accepted
+            # semantic pointer.  Technical generation/revision provenance is
+            # advanced even when the business payload is unchanged; current
+            # rows and their change audit remain byte-stable in that case.
             manifest.source_revision = revision
             manifest.source_generation_id = source_generation_id
             manifest.result_ready = True
@@ -301,6 +303,28 @@ def get_current_execution_scope(
         models.CurrentExecutionScope.entity_kind == str(entity_kind),
         models.CurrentExecutionScope.scope_key == str(scope_key),
     ).one_or_none()
+
+
+def require_current_execution_scope(
+    db: Session,
+    *,
+    entity_kind: str,
+    scope_key: str,
+) -> models.CurrentExecutionScope:
+    """Return only a scope whose manifest matches the accepted semantic pointer."""
+    manifest = get_current_execution_scope(db, entity_kind=entity_kind, scope_key=scope_key)
+    if manifest is None:
+        raise CurrentExecutionUnavailable("current execution manifest is missing")
+    if not bool(manifest.result_ready):
+        raise CurrentExecutionUnavailable("current execution manifest is not ready")
+    if manifest.source_generation_id is not None:
+        truth_pointer = db.get(models.PlanningTruthState, 1)
+        if truth_pointer is None or int(truth_pointer.current_generation_id or 0) != int(manifest.source_generation_id):
+            raise CurrentExecutionUnavailable("current execution manifest is stale for accepted truth")
+        generation = db.get(models.LedgerGeneration, int(manifest.source_generation_id))
+        if generation is None or str(generation.status or "") != "accepted":
+            raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    return manifest
 
 
 def invalidate_current_execution_scope(

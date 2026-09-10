@@ -2904,7 +2904,7 @@ class CurrentExecutionChange(Base):
     id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
     current_row_id = Column(
         BigInteger,
-        ForeignKey("current_execution_row.id", ondelete="RESTRICT"),
+        ForeignKey("current_execution_row.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )

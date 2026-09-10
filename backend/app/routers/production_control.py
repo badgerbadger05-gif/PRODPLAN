@@ -480,12 +480,17 @@ def get_assembly_queue(
 ) -> AssemblyQueueResponse:
     """Read the compact current queue; legacy snapshots serve only old data."""
     from ..services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
         get_current_execution_scope,
         load_current_execution_rows,
+        require_current_execution_scope,
     )
-    current_scope = get_current_execution_scope(
-        db, entity_kind="assembly_queue", scope_key="assembly:all-live-plans"
-    )
+    try:
+        current_scope = require_current_execution_scope(
+            db, entity_kind="assembly_queue", scope_key="assembly:all-live-plans"
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "assembly_queue_unavailable", "reason": str(exc)}) from exc
     current_rows = load_current_execution_rows(db, entity_kind="assembly_queue")
     if current_scope is not None:
         if not bool(current_scope.result_ready):
@@ -595,12 +600,17 @@ def get_assembly_readiness(
 ) -> AssemblyReadinessListResponse:
     """Read the persisted release recommendation; never calculate readiness in GET."""
     from ..services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
         get_current_execution_scope,
         load_current_execution_rows,
+        require_current_execution_scope,
     )
-    current_scope = get_current_execution_scope(
-        db, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
-    )
+    try:
+        current_scope = require_current_execution_scope(
+            db, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "assembly_readiness_unavailable", "reason": str(exc)}) from exc
     current_rows = load_current_execution_rows(db, entity_kind="assembly_readiness")
     if current_scope is not None:
         if not bool(current_scope.result_ready):
@@ -760,12 +770,17 @@ def get_drum_schedule(
 ) -> DrumScheduleResponse:
     """Read the persisted drum of the exact accepted generation."""
     from ..services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
         get_current_execution_scope,
         load_current_execution_rows,
+        require_current_execution_scope,
     )
-    current_scope = get_current_execution_scope(
-        db, entity_kind="drum_schedule", scope_key="drum:all-live-plans"
-    )
+    try:
+        current_scope = require_current_execution_scope(
+            db, entity_kind="drum_schedule", scope_key="drum:all-live-plans"
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "drum_schedule_unavailable", "reason": str(exc)}) from exc
     current_schedule = load_current_execution_rows(db, entity_kind="drum_schedule", scope_key="drum:all-live-plans")
     if current_scope is not None:
         if not bool(current_scope.result_ready):
@@ -1288,12 +1303,17 @@ def get_shelf_projections(
 ) -> ShelfProjectionResponse:
     """Read persisted shelf pull priorities of the accepted generation."""
     from ..services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
         get_current_execution_scope,
         load_current_execution_rows,
+        require_current_execution_scope,
     )
-    current_scope = get_current_execution_scope(
-        db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps"
-    )
+    try:
+        current_scope = require_current_execution_scope(
+            db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps"
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "shelf_projection_unavailable", "reason": str(exc)}) from exc
     current_rows = load_current_execution_rows(db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps")
     if current_scope is not None:
         if not bool(current_scope.result_ready):
