@@ -1221,6 +1221,36 @@ def publish_current_material_custody(
             row.is_current = False
         else:
             db.delete(row)
+    # Migration may leave non-current copies from accepted/failed generations.
+    # They are not reconstructable rewind bases unless their manifest is an
+    # explicit baseline; remove them at the next accepted publication while
+    # retaining active BUILDING staging.
+    stale_history = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .join(
+            models.LedgerGeneration,
+            models.LedgerGeneration.id
+            == models.ProductionMaterialCustodyProjection.ledger_generation_id,
+        )
+        .outerjoin(
+            models.ProductionMaterialCustodyProjectionManifest,
+            models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id
+            == models.ProductionMaterialCustodyProjection.ledger_generation_id,
+        )
+        .filter(
+            models.ProductionMaterialCustodyProjection.is_current.is_(False),
+            models.ProductionMaterialCustodyProjection.ledger_generation_id
+            != generation_id,
+            models.LedgerGeneration.status != "building",
+            or_(
+                models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id.is_(None),
+                models.ProductionMaterialCustodyProjectionManifest.is_baseline.is_(False),
+            ),
+        )
+        .all()
+    )
+    for row in stale_history:
+        db.delete(row)
     # Clear retained baseline markers before promoting the candidate so the
     # partial unique current-cell index is valid on SQLite as well as PG.
     db.flush()

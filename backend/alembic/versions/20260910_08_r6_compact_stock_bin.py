@@ -19,8 +19,12 @@ def _deduplicate(bind) -> None:
         "SELECT current_generation_id FROM planning_truth_state WHERE id = 1"
     )).scalar()
     rows = bind.execute(sa.text(
-        "SELECT id, item_id, characteristic_ref, organization_ref, warehouse_ref1c, ledger_generation_id "
-        "FROM stock_bin ORDER BY item_id, characteristic_ref, organization_ref, warehouse_ref1c, id"
+        "SELECT b.id, b.item_id, b.characteristic_ref, b.organization_ref, "
+        "b.warehouse_ref1c, b.ledger_generation_id, g.status AS generation_status "
+        "FROM stock_bin b LEFT JOIN ledger_generation g "
+        "ON g.id = b.ledger_generation_id "
+        "ORDER BY b.item_id, b.characteristic_ref, b.organization_ref, "
+        "b.warehouse_ref1c, b.id"
     )).mappings().all()
     groups = {}
     for row in rows:
@@ -29,16 +33,37 @@ def _deduplicate(bind) -> None:
     for key, candidates in groups.items():
         if any(row["ledger_generation_id"] is None for row in candidates):
             raise RuntimeError(f"R6 StockBin provenance missing for physical key {key}")
+        if any(row["generation_status"] is None for row in candidates):
+            raise RuntimeError(f"R6 StockBin generation missing for physical key {key}")
+        by_generation = {}
+        for row in candidates:
+            by_generation.setdefault(int(row["ledger_generation_id"]), 0)
+            by_generation[int(row["ledger_generation_id"])] += 1
+        if any(count != 1 for count in by_generation.values()):
+            raise RuntimeError(
+                f"R6 StockBin migration ambiguous duplicate generation for physical key {key}"
+            )
         if current is None and len(candidates) > 1:
             raise RuntimeError(
                 f"R6 StockBin migration ambiguous for physical key {key}: no accepted generation"
             )
-        selected = [row for row in candidates if current is not None and row["ledger_generation_id"] == int(current)]
-        if current is not None and len(selected) != 1:
+        if current is None and any(row["generation_status"] != "building" for row in candidates):
             raise RuntimeError(
-                f"R6 StockBin migration ambiguous for physical key {key}: "
-                f"expected one row for accepted generation {current}, found {len(selected)}"
+                f"R6 StockBin migration has non-building history without accepted pointer for {key}"
             )
+        selected = [row for row in candidates if current is not None and row["ledger_generation_id"] == int(current)]
+        if current is not None:
+            if len(selected) > 1:
+                raise RuntimeError(
+                    f"R6 StockBin migration ambiguous for physical key {key}: "
+                    f"expected one row for accepted generation {current}, found {len(selected)}"
+                )
+            if len(selected) == 0 and any(
+                row["generation_status"] != "building" for row in candidates
+            ):
+                raise RuntimeError(
+                    f"R6 StockBin migration missing accepted row for physical key {key}"
+                )
 
 
 def upgrade() -> None:
@@ -53,6 +78,18 @@ def upgrade() -> None:
             "UPDATE stock_bin SET is_current = true WHERE ledger_generation_id = "
             "(SELECT current_generation_id FROM planning_truth_state WHERE id = 1)"
         ))
+    # Do not retain accepted/failed generation copies after the compact
+    # projection is selected.  BUILDING rows are explicit staging and remain
+    # available for their own generation lifecycle cleanup.
+    bind.execute(sa.text(
+        "DELETE FROM stock_bin "
+        "WHERE ledger_generation_id IN ("
+        "  SELECT g.id FROM ledger_generation g "
+        "  WHERE g.status <> 'building' "
+        "    AND g.id <> COALESCE((SELECT current_generation_id "
+        "                         FROM planning_truth_state WHERE id = 1), -1)"
+        ")"
+    ))
     with op.batch_alter_table("stock_bin") as batch:
         batch.drop_constraint("ux_stock_bin_ledger_key", type_="unique")
         batch.create_unique_constraint("ux_stock_bin_generation_key", [

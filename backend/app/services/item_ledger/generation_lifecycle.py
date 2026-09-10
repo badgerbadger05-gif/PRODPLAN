@@ -324,20 +324,20 @@ def materialize_generation_stock_bins(
         state["on_hand"] += _d(row.qty)
         state["last_entry_id"] = int(row.id)
 
-    candidate_query = db.query(models.StockBin)
-    if publish_current:
-        candidate_query = candidate_query.filter(
-            (models.StockBin.ledger_generation_id == int(generation.id))
-            | models.StockBin.is_current.is_(True)
-        )
-    else:
-        candidate_query = candidate_query.filter(
-            models.StockBin.ledger_generation_id == int(generation.id)
-        )
-    candidates = candidate_query.all()
     prior_current = db.query(models.StockBin).filter(
         models.StockBin.is_current.is_(True)
     ).all() if publish_current else []
+    if publish_current:
+        # Release the previous current-key ownership before promoting the
+        # candidate; otherwise the partial unique index sees two generations.
+        for row in prior_current:
+            row.is_current = False
+        db.flush()
+    # Publication consumes only this generation's candidate rows.  Historical
+    # current rows are not candidates and are deleted after the handoff.
+    candidates = db.query(models.StockBin).filter(
+        models.StockBin.ledger_generation_id == int(generation.id)
+    ).all()
     existing = {}
     for row in candidates:
         key = (
@@ -363,15 +363,14 @@ def materialize_generation_stock_bins(
         bin_row.last_entry_id = state["last_entry_id"]
         bin_row.reconcile_pending_qty = Decimal("0")
     for stale in existing.values():
-        if not publish_current:
-            db.delete(stale)
+        db.delete(stale)
     if publish_current:
         # Accepted current state is compact: superseded rows are removed, not
         # retained as generation fan-out copies.  A failed/building candidate
         # remains scoped to its building generation and can be discarded with
         # that generation's lifecycle cleanup before publication.
         for stale in prior_current:
-            if not stale.is_current:
+            if int(stale.ledger_generation_id) != int(generation.id):
                 db.delete(stale)
     db.flush()
     return {

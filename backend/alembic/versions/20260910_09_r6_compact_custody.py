@@ -43,6 +43,27 @@ def upgrade() -> None:
         )
         """
     ))
+    # Keep only the accepted current projection, explicit rewind baselines,
+    # and active BUILDING staging.  Historical accepted/failed copies are not
+    # a rewind basis by themselves and would recreate generation fan-out.
+    bind.execute(sa.text(
+        """
+        DELETE FROM production_material_custody_projection
+        WHERE ledger_generation_id NOT IN (
+            SELECT g.id
+            FROM ledger_generation g
+            WHERE g.status = 'building'
+            UNION
+            SELECT current_generation_id
+            FROM planning_truth_state
+            WHERE id = 1 AND current_generation_id IS NOT NULL
+            UNION
+            SELECT ledger_generation_id
+            FROM production_material_custody_projection_manifest
+            WHERE is_baseline = true
+        )
+        """
+    ))
     op.create_index(
         "ux_pm_custody_current_cell",
         "production_material_custody_projection",
