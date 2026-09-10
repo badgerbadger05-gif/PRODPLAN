@@ -414,6 +414,43 @@ def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
     )
     db_session.flush()
 
+    # A pre-R10 carry-forward copy may still exist in an older technical
+    # generation.  It is not the retained run's canonical reservation set and
+    # must not be summed into the rebase denominator.
+    stale_physical = models.PhysicalImportBatch(
+        batch_key="spec-rebase-retained-stale-physical",
+        status="completed",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        completed_at=CUTOFF,
+    )
+    stale_generation = models.LedgerGeneration(
+        generation_key="spec-rebase-retained-stale-generation",
+        status="accepted",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=stale_physical,
+        algorithm_version="test",
+        accepted_at=CUTOFF,
+    )
+    db_session.add_all([stale_physical, stale_generation])
+    db_session.flush()
+    db_session.add(
+        models.ReservationEntry(
+            ledger_generation_id=int(stale_generation.id),
+            item_id=1,
+            run_id=int(run.run_id),
+            requirement_id=int(requirement.id),
+            priority_period_from=date(2026, 8, 1),
+            priority_period_to=date(2026, 8, 31),
+            reserved_qty=Decimal("99"),
+            replenishment_required_qty=Decimal("99"),
+            lifecycle_status="active",
+        )
+    )
+    db_session.flush()
+
     current = generation
     for ordinal in (1, 2):
         physical = models.PhysicalImportBatch(
@@ -456,5 +493,7 @@ def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
     retained_rows = db_session.query(models.ReservationEntry).filter_by(
         run_id=int(run.run_id),
     ).all()
-    assert len(retained_rows) == 1
-    assert int(retained_rows[0].ledger_generation_id) == int(generation.id)
+    assert len(retained_rows) == 2
+    assert {int(row.ledger_generation_id) for row in retained_rows} == {
+        int(generation.id), int(stale_generation.id)
+    }
