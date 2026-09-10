@@ -11,6 +11,7 @@ from app.services.item_ledger.r3_contract import (
     CurrentMrpResolutionError,
     current_live_run,
 )
+from app.services.item_ledger.live_plan_scope import current_live_run_ids
 
 
 def _current_plan(db):
@@ -81,6 +82,14 @@ def test_period_plan_current_reader_fails_closed_without_pointer(db_session):
         period_plan_service.list_mrp_runs_for_plan(db_session, plan.id)
 
 
+def test_current_scope_fails_closed_when_fixed_plan_pointer_is_missing(db_session):
+    _plan, _run = _current_plan(db_session)
+    db_session.commit()
+
+    with pytest.raises(CurrentMrpResolutionError, match="active MRP pointer"):
+        current_live_run_ids(db_session)
+
+
 def test_current_pointer_rejects_retired_or_mismatched_run(db_session):
     plan, run = _current_plan(db_session)
     run.status = "CLOSED"
@@ -114,3 +123,28 @@ def test_current_journal_selector_uses_pointer_when_run_is_on_old_generation(db_
     assert _accepted_fixed_run_ids(
         db_session, ledger_generation_id=int(current_generation_id)
     ) == [int(run.run_id)]
+
+
+def test_current_journal_fails_closed_when_old_generation_pointer_is_missing(db_session):
+    plan, run = _current_plan(db_session)
+    old = models.LedgerGeneration(
+        generation_key="r3-current-reader-old-generation-missing-pointer",
+        status="accepted",
+        cutoff=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        accepted_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        algorithm_version="r3-current-reader-old-missing-pointer",
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch_id=run.ledger_generation.physical_import_batch_id,
+    )
+    db_session.add(old)
+    db_session.flush()
+    run.ledger_generation_id = old.id
+    run.ledger_cutoff = old.cutoff
+    db_session.commit()
+
+    current_generation_id = db_session.get(models.PlanningTruthState, 1).current_generation_id
+    with pytest.raises(CurrentMrpResolutionError, match="active MRP pointer"):
+        _accepted_fixed_run_ids(
+            db_session, ledger_generation_id=int(current_generation_id)
+        )
