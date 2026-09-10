@@ -517,6 +517,7 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     ledger_generation_id: int,
     evidence: Iterable[SupplierDocumentEvidence],
     cycle_id: str,
+    writer_mode: str = "historical",
 ) -> SupplierReceiptBuildResult:
     """Persist provenance and rebuild supplier coverage rows idempotently."""
     rows = tuple(evidence)
@@ -724,19 +725,24 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             ))
         reservation = allocation.reservation
         if reservation.id is not None:
-            if _append_reservation_event(
-                db,
-                allocation=allocation,
-                cycle_id=cycle_id,
-            ):
-                folded_reservations.add(int(reservation.id))
-            else:
-                event_key = (
-                    f"{'realize' if allocation.qty > 0 else 'unrealize'}:"
-                    f"{int(reservation.id)}:{int(allocation.fact.sle_id)}"
-                )
-                if _event_exists(db, int(reservation.ledger_generation_id), event_key):
+            if writer_mode == "historical":
+                if _append_reservation_event(
+                    db,
+                    allocation=allocation,
+                    cycle_id=cycle_id,
+                ):
                     folded_reservations.add(int(reservation.id))
+                else:
+                    event_key = (
+                        f"{'realize' if allocation.qty > 0 else 'unrealize'}:"
+                        f"{int(reservation.id)}:{int(allocation.fact.sle_id)}"
+                    )
+                    if _event_exists(db, int(reservation.ledger_generation_id), event_key):
+                        folded_reservations.add(int(reservation.id))
+            elif writer_mode != "current":
+                raise ValueError(
+                    "supplier receipt writer_mode must be historical or current"
+                )
     for reservation_id in sorted(folded_reservations):
         fold_reservation_entry(db, reservation_id)
     db.flush()
@@ -754,6 +760,7 @@ def rebuild_supplier_receipt_coverage(
     ledger_generation_id: int,
     evidence: Iterable[SupplierDocumentEvidence],
     cycle_id: str,
+    writer_mode: str = "historical",
 ) -> SupplierReceiptBuildResult:
     """Atomically replace one generation's supplier-derived read model.
 
@@ -768,6 +775,7 @@ def rebuild_supplier_receipt_coverage(
             ledger_generation_id=ledger_generation_id,
             evidence=rows,
             cycle_id=cycle_id,
+            writer_mode=writer_mode,
         )
 
 

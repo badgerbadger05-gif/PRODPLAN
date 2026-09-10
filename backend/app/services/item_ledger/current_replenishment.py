@@ -214,6 +214,7 @@ def apply_current_replenishment(
     reserves: Iterable[Reserve],
     complete_scope: bool,
     distribution_scope: DistributionScope | None = None,
+    allow_building: bool = False,
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     writer: str = WRITER_KEY,
 ) -> CurrentReplenishmentResult:
@@ -254,7 +255,9 @@ def apply_current_replenishment(
     )
     if generation is None:
         raise CurrentReplenishmentError(f"generation {generation_id} does not exist")
-    if _text(generation.status) != "accepted":
+    if _text(generation.status) != "accepted" and not (
+        allow_building and _text(generation.status) == "building"
+    ):
         raise CurrentReplenishmentError("current replenishment requires accepted generation")
 
     state = (
@@ -606,7 +609,11 @@ def reject_legacy_supplier_receipt_writer(
 
 
 def apply_current_replenishment_for_accepted_generation(
-    db: Session, *, generation_id: int, source_revision: int | None = None
+    db: Session,
+    *,
+    generation_id: int,
+    source_revision: int | None = None,
+    allow_building: bool = False,
 ) -> tuple[CurrentReplenishmentResult, ...]:
     """Publish current supplier-receipt replenishment at physical acceptance.
 
@@ -619,7 +626,10 @@ def apply_current_replenishment_for_accepted_generation(
     """
 
     generation = db.get(models.LedgerGeneration, int(generation_id))
-    if generation is None or _text(generation.status) != "accepted":
+    if generation is None or (
+        _text(generation.status) != "accepted"
+        and not (allow_building and _text(generation.status) == "building")
+    ):
         raise CurrentReplenishmentError(
             "current replenishment publication requires an accepted generation"
         )
@@ -653,32 +663,76 @@ def apply_current_replenishment_for_accepted_generation(
                 f"receipt facts for item {item_id} have ambiguous distribution pools"
             )
     facts_by_item: dict[int, tuple[Fact, ...]] = {}
-    sle_rows = (
-        db.query(models.StockLedgerEntry)
+    # Use the complete visible physical prefix, then restrict it by persisted
+    # typed supplier provenance.  A raw positive ``receipt`` movement is not
+    # sufficient: internal transfers and other receipt-like rows are not BUY.
+    from .physical_visibility import visible_sles_for_generation
+
+    visible = {
+        int(row.id): row
+        for row in visible_sles_for_generation(db, int(generation_id))
+        if bool(row.active)
+    }
+    provenance = (
+        db.query(models.StockLedgerSupplierReceiptProvenance)
         .filter(
-            models.StockLedgerEntry.ingest_batch_id == generation.physical_import_batch_id,
-            models.StockLedgerEntry.active.is_(True),
-            models.StockLedgerEntry.movement_kind == "receipt",
-            models.StockLedgerEntry.qty > 0,
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+            == int(generation_id),
+            models.StockLedgerSupplierReceiptProvenance.operation_kind.in_(
+                ("supplier_receipt", "correction")
+            ),
+            models.StockLedgerSupplierReceiptProvenance.match_status != "excluded_non_supplier",
         )
-        .order_by(models.StockLedgerEntry.id.asc())
+        .order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.asc())
         .all()
     )
+    requirement_by_sle: dict[int, int | None] = {}
+    for row in provenance:
+        links = (
+            db.query(models.PurchaseExportObligationAllocation.reservation_id)
+            .filter(
+                models.PurchaseExportObligationAllocation.ledger_generation_id
+                == int(generation_id),
+                models.PurchaseExportObligationAllocation.supplier_order_ref
+                == _text(row.supplier_order_ref),
+                models.PurchaseExportObligationAllocation.supplier_order_line_no
+                == _text(row.supplier_order_line_no),
+            )
+            .all()
+        )
+        requirement_ids = {
+            int(entry.requirement_id)
+            for (reservation_id,) in links
+            for entry in [db.get(models.ReservationEntry, int(reservation_id))]
+            if entry is not None
+        }
+        requirement_by_sle[int(row.stock_ledger_entry_id)] = (
+            next(iter(requirement_ids)) if len(requirement_ids) == 1 else None
+        )
+    typed_facts: list[Fact] = []
+    for row in provenance:
+        sle = visible.get(int(row.stock_ledger_entry_id))
+        if sle is None or _decimal(sle.qty) == 0:
+            continue
+        typed_facts.append(
+            Fact(
+                fact_id=str(sle.id),
+                item_id=int(sle.item_id),
+                mode="buy",
+                qty=_decimal(sle.qty),
+                posting_at=sle.posting_at,
+                requirement_id=requirement_by_sle.get(int(sle.id)),
+                order_ref=_text(row.supplier_order_ref) or None,
+            )
+        )
     for item_id, scope_set in item_scopes.items():
         scope = next(iter(scope_set))
         facts_by_item[item_id] = tuple(
-            Fact(
-                fact_id=str(row.id),
-                item_id=int(row.item_id),
-                mode="buy",
-                qty=_decimal(row.qty),
-                posting_at=row.posting_at,
-                characteristic_ref=scope[1],
-                organization_ref=scope[2],
-                planning_stock_pool=scope[3],
-            )
-            for row in sle_rows
-            if int(row.item_id) == item_id
+            Fact(**{**fact.__dict__, "characteristic_ref": scope[1],
+                    "organization_ref": scope[2],
+                    "planning_stock_pool": scope[3]})
+            for fact in typed_facts
+            if int(fact.item_id) == item_id
         )
     revision = int(source_revision if source_revision is not None else generation.id)
     result: list[CurrentReplenishmentResult] = []
@@ -717,6 +771,7 @@ def apply_current_replenishment_for_accepted_generation(
                 reserves=reserve_rows,
                 distribution_scope=scope,
                 complete_scope=True,
+                allow_building=allow_building,
             )
         )
     return tuple(result)

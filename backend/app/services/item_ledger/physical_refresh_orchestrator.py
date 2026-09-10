@@ -696,16 +696,6 @@ def run_physical_refresh(
             expected_parent_id=int(parent.id),
             planning_pool_by_warehouse=pool_mapping,
         )
-        # R4 current replenishment is the sole accepted-physical writer for
-        # supplier receipt assignment/execution.  It runs in this same caller
-        # transaction; no new generation or snapshot is created.
-        from .current_replenishment import (
-            apply_current_replenishment_for_accepted_generation,
-        )
-
-        apply_current_replenishment_for_accepted_generation(
-            db, generation_id=int(physical_generation.id)
-        )
         fixed_run_ids = tuple(
             int(run_id)
             for (run_id,) in db.query(models.PlanningRun.run_id)

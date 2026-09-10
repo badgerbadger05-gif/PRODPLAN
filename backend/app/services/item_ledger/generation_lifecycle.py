@@ -1522,6 +1522,7 @@ def accept_generation_build(
             ledger_generation_id=int(generation.id),
             evidence=extraction.evidence if extraction is not None else (),
             cycle_id=f"historical-supplier:g{generation.id}:accept",
+            writer_mode="current",
         )
         _persist_non_supplier_receipt_rows(
             db,
@@ -1540,6 +1541,17 @@ def accept_generation_build(
                     )
                 )
             ),
+        )
+        # Make current replenishment the sole execution writer before any
+        # read-model candidate or work-item snapshot is built.  The surrounding
+        # savepoint still rolls this provisional accepted status back on any
+        # later gate failure; publication remains atomic at the caller commit.
+        from .current_replenishment import (
+            apply_current_replenishment_for_accepted_generation,
+        )
+
+        current_replenishment = apply_current_replenishment_for_accepted_generation(
+            db, generation_id=int(generation.id), allow_building=True
         )
         assembly_outputs = materialize_assembly_output_allocations(
             db, int(generation.id)
@@ -1623,7 +1635,8 @@ def accept_generation_build(
         }
         generation.capabilities = dict(capabilities)
         generation.status = "accepted"
-        generation.accepted_at = datetime.now(timezone.utc)
+        if generation.accepted_at is None:
+            generation.accepted_at = datetime.now(timezone.utc)
         generation.reason = None
         _promote_accepted_generation_read_snapshots(
             db,
@@ -1665,4 +1678,12 @@ def accept_generation_build(
             "surplus_qty": str(supplier.surplus_qty),
             "status_counts": validation["supplier_receipt_status_counts"],
         },
+        "current_replenishment": [
+            {
+                "source_revision": int(result.source_revision),
+                "changed_pairs": int(result.changed_pairs),
+                "idempotent": bool(result.idempotent),
+            }
+            for result in current_replenishment
+        ],
     }
