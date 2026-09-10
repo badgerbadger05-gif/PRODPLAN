@@ -40,6 +40,8 @@ vi.mock('../../services/planning', () => ({
 
 const summary: MrpSummary = {
   snapshot_id: 901,
+  current_identity: 'mrp-run:41',
+  source_revision: 'accepted:g77',
   ledger_generation: 77,
   cutoff: '2026-07-20T08:31:00+00:00',
   truth_status: 'accepted',
@@ -94,6 +96,8 @@ const productionRows: MrpProductionRow[] = [
 
 const purchaseRows: MrpPurchaseRow[] = [
   {
+    current_identity: 'run:41:v1:purchase:purchase-a',
+    source_revision: 'accepted:g77',
     purchase_id: 2001,
     source_purchase_ids: [201, 202],
     item_id: 601,
@@ -112,6 +116,8 @@ const purchaseRows: MrpPurchaseRow[] = [
     supplier_coverage_label: '4 / 10 шт (40%)',
   },
   {
+    current_identity: 'run:41:v1:purchase:purchase-b',
+    source_revision: 'accepted:g77',
     purchase_id: 2002,
     source_purchase_ids: [203],
     item_id: 602,
@@ -130,6 +136,8 @@ const purchaseRows: MrpPurchaseRow[] = [
     supplier_coverage_label: '12 / 20 кг (60%)',
   },
   {
+    current_identity: 'run:41:v1:purchase:purchase-c',
+    source_revision: 'accepted:g77',
     purchase_id: 2003,
     item_id: 603,
     item_name: 'Позиция без поставщика',
@@ -167,6 +175,8 @@ const capacityRows: MrpCapacityRow[] = [{
 function paged<T>(rows: T[], total = rows.length, offset = 0) {
   return {
     snapshot_id: 901,
+    current_identity: 'mrp-run:41',
+    source_revision: 'accepted:g77',
     ledger_generation: 77,
     cutoff: '2026-07-20T08:31:00+00:00',
     truth_status: 'accepted',
@@ -315,6 +325,7 @@ describe('MrpResultPage characterization', () => {
     vi.mocked(getPlanningResultProduction).mockResolvedValue({
       ...paged(productionRows),
       snapshot_id: 902,
+      source_revision: 'accepted:g78',
     })
 
     renderPage()
@@ -418,11 +429,12 @@ describe('MrpResultPage characterization', () => {
     ))
 
     await user.click(screen.getByRole('checkbox', { name: 'Выбрать Подшипник' }))
-    await user.click(screen.getByRole('button', { name: 'Выгрузить в 1С (2)' }))
+    await user.click(screen.getByRole('button', { name: 'Выгрузить в 1С (1)' }))
     expect(exportPurchasesTo1C).toHaveBeenCalledWith(41, {
       date_from: undefined,
       date_to: undefined,
-      purchase_ids: [201, 202],
+      current_identities: ['run:41:v1:purchase:purchase-a'],
+      expected_source_revision: 'accepted:g77',
       dry_run: false,
       allow_production: true,
     })
@@ -506,7 +518,7 @@ describe('MrpResultPage characterization', () => {
     await screen.findByText('Подшипник')
     await user.click(screen.getByRole('checkbox', { name: 'Выбрать Подшипник' }))
 
-    const action = screen.getByRole('button', { name: 'Выгрузить в 1С (2)' })
+    const action = screen.getByRole('button', { name: 'Выгрузить в 1С (1)' })
     fireEvent.click(action)
     fireEvent.click(action)
     expect(exportPurchasesTo1C).toHaveBeenCalledTimes(1)
