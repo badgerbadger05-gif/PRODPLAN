@@ -8,6 +8,8 @@ second physical quantity or a reason to release a reservation hold.
 from decimal import Decimal
 from types import SimpleNamespace
 from datetime import datetime, timezone
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +25,43 @@ from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.production_material_custody_projection import (
     _late_events_behind_baseline,
 )
+
+
+def test_stock_bin_migration_allows_a_new_building_only_physical_key():
+    """R6 upgrade keeps explicit BUILDING staging absent from accepted fold."""
+    sa = pytest.importorskip("sqlalchemy")
+    path = (
+        Path(__file__).parents[2]
+        / "backend/alembic/versions/20260910_08_r6_compact_stock_bin.py"
+    )
+    spec = spec_from_file_location("r6_stock_bin_migration", path)
+    migration = module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(migration)
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE planning_truth_state (id INTEGER PRIMARY KEY, current_generation_id INTEGER)"
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE ledger_generation (id INTEGER PRIMARY KEY, status VARCHAR(16))"
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE stock_bin (id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL, "
+            "characteristic_ref VARCHAR(36), organization_ref VARCHAR(36), "
+            "warehouse_ref1c VARCHAR(36), ledger_generation_id INTEGER NOT NULL)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO planning_truth_state VALUES (1, 10)"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO ledger_generation VALUES (10, 'accepted'), (11, 'building')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO stock_bin VALUES "
+            "(1, 1, '', 'ORG', 'WH', 10), (2, 2, '', 'ORG', 'WH', 11)"
+        )
+        migration._deduplicate(conn)
 
 
 def test_compact_stock_fold_keeps_full_key_and_negative_physical_quantity():
