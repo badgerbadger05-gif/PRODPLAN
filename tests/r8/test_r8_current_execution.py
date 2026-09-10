@@ -6,6 +6,7 @@ import pytest
 from app import models
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
+    drum_slot_identity,
     load_current_execution_rows,
     order_execution_queue,
     publish_current_execution_scope,
@@ -175,3 +176,49 @@ def test_r8_empty_readiness_scope_does_not_close_queue_scope(db_session):
     assert [row.business_identity for row in load_current_execution_rows(
         db_session, entity_kind="assembly_queue"
     )] == ["queue:1"]
+
+
+def test_r8_manual_tile_survives_new_generation_queue_ids(db_session):
+    identity = drum_slot_identity(77, 0)
+    first = {
+        "entity_kind": "drum_slot",
+        "business_identity": identity,
+        "scope_key": "drum:all-live-plans",
+        "payload": {
+            "plan_line_id": 77,
+            "queue_line_id": 101,
+            "slot_ordinal": 0,
+            "resource_id": 5,
+            "slot_date": "2026-09-10",
+        },
+        "manual_input": {
+            "slot_date": "2026-09-12",
+            "resource_id": 5,
+            "moved_by": "master",
+        },
+    }
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="drum:all-live-plans",
+        rows=[first],
+        entity_kinds=("drum_slot",),
+    )
+    current_id = int(db_session.query(models.CurrentExecutionRow).one().id)
+    second = {
+        **first,
+        "payload": {**first["payload"], "queue_line_id": 202, "slot_date": "2026-09-11"},
+    }
+    second.pop("manual_input")
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g2",
+        scope_key="drum:all-live-plans",
+        rows=[second],
+        entity_kinds=("drum_slot",),
+    )
+    current = db_session.query(models.CurrentExecutionRow).one()
+    assert int(current.id) == current_id
+    assert current.payload["queue_line_id"] == 202
+    assert current.payload["slot_date"] == "2026-09-11"
+    assert current.manual_input["slot_date"] == "2026-09-12"
