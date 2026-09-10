@@ -205,5 +205,5 @@ def test_r1_historical_report_time_mode_is_explicitly_decided():
     )
     for marker in ("as_occurred", "as_known", "known_at", "posting_at"):
         assert marker in decisions
-    assert "режим отчёта выбирается явно" in decisions
+    assert "history_mode" in decisions
     assert "Исторический отчёт" not in artifact.split("## 6.", 1)[1]
