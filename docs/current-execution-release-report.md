@@ -973,6 +973,50 @@ pytest -q tests/r9/test_r9_production_remaining_current_links.py \
 25 passed, 2 warnings in 3.29s
 ```
 
+Coherent current-read/no-DML slice (test-first commits `6ac7b07f`,
+`628b4f4c`, `5728df70`; implementation `ccb39657`):
+
+* `load_current_execution_coherent` locks only the manifest with PostgreSQL
+  `FOR SHARE OF current_execution_scope`, then starts a second statement for
+  rows. This avoids the READ COMMITTED mixed snapshot (new manifest + old
+  rows) and preserves a ready empty scope as a valid result.
+* `tests/r9/test_r9_current_coherent_reads.py` covers writer-first and
+  reader-first two-session interleavings, including the writer wait and the
+  old-or-new boundary.
+* `tests/r9/test_r9_current_get_contract_matrix.py` inventories production,
+  purchase, period, MRP and assembly current readers, observes SQL writes,
+  checks real representative route adapters fail closed at 503 before legacy
+  readers, and verifies route-sheet GET with `mark_printed=true` performs no
+  marking. The MRP grouped/detail/category/capacity/export matrix is also
+  checked against the real current gate and legacy snapshot internals are
+  prohibited by raising test doubles.
+
+Focused local result:
+
+```text
+pytest -q tests/r9/test_r9_current_coherent_reads.py \
+  tests/r9/test_r9_current_get_contract_matrix.py \
+  tests/r9/test_r9_current_obligation_views.py \
+  tests/r9/test_r9_mrp_current_reader.py \
+  tests/r9/test_r9_production_remaining_current_links.py
+48 passed, 2 skipped in 4.68s
+```
+
+Real local PostgreSQL interleaving/no-DML result on
+`127.0.0.1:55444/prodplan_r2`:
+
+```text
+PRODPLAN_R2_TEST_DSN=PRODPLAN_TEST_PG_URL=PRODPLAN_PG_CHECK_DSN=<local DSN>
+pytest -q tests/r9/test_r9_current_coherent_reads.py \
+  tests/r9/test_r9_current_get_contract_matrix.py
+8 passed in 2.51s
+```
+
+This is not R9 acceptance: the full API/UI/Playwright gate and final full
+pytest remain outstanding. No production, network, OData, worker, deploy or
+push path was used; `current-execution-full-pytest.log` remains untracked and
+unchanged.
+
 The impacted snapshot-only route characterization was intentionally changed to
 prove a missing current manifest returns 503 even when legacy rows would exist;
 no snapshot fallback was restored. Work-item material GETs return only the
