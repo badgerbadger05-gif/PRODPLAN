@@ -17,6 +17,26 @@ from app.services.item_ledger.physical_visibility import visible_sles_for_genera
 from tests.services.test_current_replenishment_transaction import _reserves, _world
 
 
+def _retire_synthetic_facts(session, facts):
+    """Keep the shared local PostgreSQL rehearsal free of active test facts."""
+    ids = [int(fact.fact_id) for fact in facts]
+    if not ids:
+        return
+    session.execute(
+        sa.text("UPDATE stock_ledger_entry SET active = false WHERE id = ANY(:ids)"),
+        {"ids": ids},
+    )
+    session.commit()
+    remaining = session.execute(
+        sa.text(
+            "SELECT count(*) FROM stock_ledger_entry "
+            "WHERE id = ANY(:ids) AND active = true"
+        ),
+        {"ids": ids},
+    ).scalar_one()
+    assert remaining == 0
+
+
 def _receipt_facts(facts):
     return tuple(
         ReceiptFact(
@@ -178,6 +198,7 @@ def test_postgresql_receipt_replay_retry_and_stale_revision_are_atomic():
     engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
     Session = sessionmaker(bind=engine, expire_on_commit=False)
     writer = Session()
+    facts = ()
     try:
         generation_id, _item_id, reservations, facts = _world(
             writer, prefix="r5-pg"
@@ -224,4 +245,9 @@ def test_postgresql_receipt_replay_retry_and_stale_revision_are_atomic():
     finally:
         writer.rollback()
         writer.close()
+        cleanup = Session()
+        try:
+            _retire_synthetic_facts(cleanup, facts)
+        finally:
+            cleanup.close()
         engine.dispose()
