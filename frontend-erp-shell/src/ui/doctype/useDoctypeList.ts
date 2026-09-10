@@ -17,7 +17,7 @@ function errorMessage(error: unknown) {
 
 export function useDoctypeList<Row, Filters extends object, Detail>(
   doctype: Doctype<Row, Filters, Detail>,
-  options: { limit?: number; access: AccessSubject },
+  options: { limit?: number; access: AccessSubject; initialActiveRow?: (row: Row) => boolean },
 ) {
   const limit = options.limit ?? DEFAULT_LIMIT
   const isSelectable = doctype.selectable
@@ -122,6 +122,8 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
           return new Set([...current].filter((id) => visible.has(id)))
         })
         setActiveId((current) => {
+          const initial = options.initialActiveRow ? permittedRows.find(options.initialActiveRow) : undefined
+          if (initial) return rowId(initial)
           if (current != null && permittedRows.some((row) => rowId(row) === current)) return current
           return permittedRows[0] ? rowId(permittedRows[0]) : null
         })
@@ -136,7 +138,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       })
 
     return () => controller.abort()
-  }, [accessKey, appliedFilters, doctype.dataSource, doctype.permissions, enabled, limit, offset, reloadKey, rowId, sort])
+  }, [accessKey, appliedFilters, doctype.dataSource, doctype.permissions, enabled, limit, offset, options.initialActiveRow, reloadKey, rowId, sort])
 
   useEffect(() => {
     if (!activeRow || !doctype.dataSource.detail) {

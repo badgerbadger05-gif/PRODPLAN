@@ -9,6 +9,7 @@ import { OutputFactSummary } from './OutputFactSummary'
 type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
+  activeIdentity?: string | null
   selectedIds: Set<number>
   launchQtyByWorkItem: Readonly<Record<number, number>>
   sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
@@ -34,7 +35,7 @@ function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
 }
 
-export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyByWorkItem, sort, outputFactsAvailable, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
+export function ProductionOrdersTable({ rows, activeRow, activeIdentity, selectedIds, launchQtyByWorkItem, sort, outputFactsAvailable, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
       <colgroup>
@@ -83,9 +84,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, launchQtyB
           return (
           <tr
             key={row.journal_row_key || rowId}
-            className={`${rowId === (activeRow ? productionRowId(activeRow) : null) ? 'activeRow ' : ''}${weldedRow ? 'weldedPaintWeldRow' : ''}`.trim()}
+            className={`${activeIdentity ? (row.current_identity === activeIdentity ? 'activeRow ' : '') : rowId === (activeRow ? productionRowId(activeRow) : null) ? 'activeRow ' : ''}${weldedRow ? 'weldedPaintWeldRow' : ''}`.trim()}
             tabIndex={0}
-            aria-selected={rowId === (activeRow ? productionRowId(activeRow) : null)}
+            aria-selected={activeIdentity ? row.current_identity === activeIdentity : rowId === (activeRow ? productionRowId(activeRow) : null)}
             onClick={() => onActivate(rowId)}
             onDoubleClick={() => { if (!isProposal) onOpenMaterials(row) }}
             onKeyDown={(event) => {

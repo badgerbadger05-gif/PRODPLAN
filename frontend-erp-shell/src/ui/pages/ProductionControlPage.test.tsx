@@ -559,7 +559,8 @@ describe('ProductionControlPage — characterization', () => {
       )
       expect(params.get('product_id')).toBe('101')
       expect(params.get('order_id')).toBe('5')
-      expect(params.get('active_product_id')).toBe('102')
+      expect(params.get('active_product_id')).toBeNull()
+      expect(params.get('current_identity')).toBe('production:order:102')
     })
   })
 
@@ -1293,6 +1294,7 @@ describe('ProductionControlPage — characterization', () => {
         pair_id: 8, role: 'welded' as const, counterpart_item_id: 101,
         counterpart_item_name: 'Кронштейн после окраски', counterpart_item_article: '', counterpart_item_code: '',
       },
+      current_identity: 'production:order:102',
     }
     vi.mocked(listProductionOrders).mockResolvedValue({
       rows: [paint, welded], total: 2, limit: 100, offset: 0, latest_run_id: 77,

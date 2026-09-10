@@ -58,6 +58,7 @@ describe('production control model', () => {
       view: 'mechshop',
       offset: 100,
       activeProductId: 2,
+      activeCurrentIdentity: null,
     })
 
     expect(next.get('product_id')).toBe('9')
@@ -78,6 +79,7 @@ describe('production control model', () => {
       view: 'mechshop',
       offset: 100,
       activeProductId: 2,
+      activeCurrentIdentity: null,
     })
   })
 
@@ -90,6 +92,7 @@ describe('production control model', () => {
       view: 'orders',
       offset: 0,
       activeProductId: null,
+      activeCurrentIdentity: null,
     })
   })
 

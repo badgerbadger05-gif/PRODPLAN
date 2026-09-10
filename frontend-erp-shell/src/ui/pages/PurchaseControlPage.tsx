@@ -30,12 +30,14 @@ export function PurchaseControlPage() {
   const access = session?.user ?? transitionalAccess
   const [searchParams] = useSearchParams()
   const focusOrderId = searchParams.get('order_id')
+  const focusCurrentIdentity = searchParams.get('current_identity')?.trim() || null
+  const isFocusedPurchaseRow = useCallback((row: { current_identity?: string }) => row.current_identity === focusCurrentIdentity, [focusCurrentIdentity])
   const focusSearch = searchParams.get('search')
   const doctype = useMemo(
     () => createPurchaseOrdersDoctype({ orderId: focusOrderId, search: focusSearch }),
     [focusOrderId, focusSearch],
   )
-  const journal = useDoctypeList(doctype, { limit, access })
+  const journal = useDoctypeList(doctype, { limit, access, initialActiveRow: isFocusedPurchaseRow })
   const [suppliers, setSuppliers] = useState<PurchaseSupplierOption[]>([])
   const [states, setStates] = useState<string[]>([])
 

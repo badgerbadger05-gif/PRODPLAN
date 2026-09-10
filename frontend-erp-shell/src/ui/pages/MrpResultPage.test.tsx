@@ -70,6 +70,8 @@ const summary: MrpSummary = {
 
 const productionRows: MrpProductionRow[] = [
   {
+    current_identity: 'run:41:production:requirement:501:item:501:allocation:default',
+    source_revision: 'accepted:g77',
     order_id: 1001,
     source_order_ids: [101, 102],
     item_id: 501,
@@ -155,6 +157,8 @@ const purchaseRows: MrpPurchaseRow[] = [
 ]
 
 const reworkRows: MrpReworkRow[] = [{
+  current_identity: 'run:41:rework:item:701:allocation:default',
+  source_revision: 'accepted:g77',
   rework_id: 3001,
   item_id: 701,
   item_name: 'Корпус на доработку',
@@ -367,6 +371,16 @@ describe('MrpResultPage characterization', () => {
 
     const row = await screen.findByText('Лист стальной')
     expect(row.closest('tr')).toHaveClass('activeRow')
+  })
+
+  it('highlights production rows by current identity, independent of numeric locators', async () => {
+    renderPage('/mrp-runs/41?current_identity=run%3A41%3Aproduction%3Arequirement%3A501%3Aitem%3A501%3Aallocation%3Adefault')
+    expect((await screen.findByText('Насос ГА-1')).closest('tr')).toHaveClass('activeRow')
+  })
+
+  it('highlights rework rows by current identity, independent of numeric locators', async () => {
+    renderPage('/mrp-runs/41?tab=rework&current_identity=run%3A41%3Arework%3Aitem%3A701%3Aallocation%3Adefault')
+    expect((await screen.findByText('Корпус на доработку')).closest('tr')).toHaveClass('activeRow')
   })
 
   it('invalidates tabs for date and root filters and pages with the active offset', async () => {

@@ -88,6 +88,9 @@ export function ProductionControlPage() {
   const [activeId, setActiveId] = useState<number | null>(
     initialUrlState.current.activeProductId,
   )
+  const [activeCurrentIdentity, setActiveCurrentIdentity] = useState<string | null>(
+    initialUrlState.current.activeCurrentIdentity,
+  )
   const [materials, setMaterials] = useState<MaterialsResponse | null>(null)
   const [materialsLoading, setMaterialsLoading] = useState(false)
   const [materialsError, setMaterialsError] = useState('')
@@ -155,13 +158,18 @@ export function ProductionControlPage() {
       view,
       offset,
       activeProductId: activeId,
+      activeCurrentIdentity,
     }), { replace: true })
     // URL params are cloned from the current render, but changes to external
     // product_id/order_id must not reset locally owned journal state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId, filters, offset, setSearchParams, view])
+  }, [activeCurrentIdentity, activeId, filters, offset, setSearchParams, view])
 
-  const activeRow = useMemo(() => activeProductionRow(rows, activeId), [rows, activeId])
+  const activeRow = useMemo(() => (
+    activeCurrentIdentity
+      ? rows.find((row) => row.current_identity === activeCurrentIdentity) ?? activeProductionRow(rows, activeId)
+      : activeProductionRow(rows, activeId)
+  ), [activeCurrentIdentity, activeId, rows])
   const selectedRows = useMemo(() => selectedProductionRows(rows, selectedIds), [rows, selectedIds])
 
   const load = useCallback(async (nextOffset: number) => {
@@ -185,11 +193,18 @@ export function ProductionControlPage() {
       setTruthMeta(data.truth_meta)
       setOffset(data.offset ?? nextOffset)
       setActiveId((current) => {
+        if (initialUrlState.current.activeCurrentIdentity) {
+          const focused = data.rows?.find((row) => row.current_identity === initialUrlState.current.activeCurrentIdentity)
+          if (focused) return productionRowId(focused)
+        }
         const focusedProductId = Number(focusProductId || 0)
         if (focusedProductId && data.rows?.some((row) => row.product_id === focusedProductId)) return focusedProductId
         if (current && data.rows?.some((row) => productionRowId(row) === current)) return current
         return data.rows?.[0] ? productionRowId(data.rows[0]) : null
       })
+      if (initialUrlState.current.activeCurrentIdentity && data.rows?.some((row) => row.current_identity === initialUrlState.current.activeCurrentIdentity)) {
+        setActiveCurrentIdentity(initialUrlState.current.activeCurrentIdentity)
+      }
     } catch (e) {
       if (requestSeq !== listRequestSeq.current) return
       setTruthMeta(truthBadgeMetaFromApiError(e))
@@ -1049,7 +1064,11 @@ export function ProductionControlPage() {
                   sortDir: filters.sort_dir,
                 }}
                 onSelectIds={setSelectedIds}
-                onActivate={setActiveId}
+                activeIdentity={activeCurrentIdentity}
+                onActivate={(id) => {
+                  setActiveCurrentIdentity(rows.find((row) => productionRowId(row) === id)?.current_identity ?? null)
+                  setActiveId(id)
+                }}
                 onOpenMaterials={(row) => { if (row.product_id != null) void loadMaterials(row.product_id) }}
                 onChangeStatus={(row, status) => void changeStatus(row, status)}
                 onToggleSort={toggleSort}

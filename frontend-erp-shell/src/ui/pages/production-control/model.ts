@@ -25,6 +25,7 @@ export type ProductionControlUrlState = {
   view: ProductionControlView
   offset: number
   activeProductId: number | null
+  activeCurrentIdentity?: string | null
 }
 
 const URL_FILTER_KEYS = [
@@ -74,6 +75,7 @@ export function parseProductionControlUrlState(
     view,
     offset: nonNegativeInteger(params.get('offset')),
     activeProductId: positiveInteger(params.get('active_product_id')),
+    activeCurrentIdentity: params.get('current_identity')?.trim() || null,
   }
 }
 
@@ -85,6 +87,7 @@ export function writeProductionControlUrlState(
   for (const key of URL_FILTER_KEYS) next.delete(key)
   next.delete('offset')
   next.delete('active_product_id')
+  next.delete('current_identity')
   next.delete('view')
 
   for (const [key, value] of Object.entries(state.filters)) {
@@ -95,7 +98,12 @@ export function writeProductionControlUrlState(
   }
   if (state.offset > 0) next.set('offset', String(state.offset))
   if (state.activeProductId != null && state.activeProductId > 0) {
-    next.set('active_product_id', String(state.activeProductId))
+    // Kept only for the in-memory legacy state shape; new links use the
+    // stable current identity below and never emit a generation-local ID.
+    if (state.activeCurrentIdentity == null) next.set('active_product_id', String(state.activeProductId))
+  }
+  if (state.activeCurrentIdentity) {
+    next.set('current_identity', state.activeCurrentIdentity)
   }
   if (state.view !== 'orders') next.set('view', state.view)
   return next

@@ -66,6 +66,7 @@ export function MrpResultPage() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const queryTab = parseMrpResultTab(searchParams.get('tab'))
+  const highlightedIdentity = searchParams.get('current_identity')?.trim() || null
   const highlightedProductionId = parsePositiveId(searchParams.get('planned_order_id'))
   const highlightedPurchaseId = parsePositiveId(searchParams.get('purchase_id'))
   const highlightedReworkId = parsePositiveId(searchParams.get('rework_id'))
@@ -414,12 +415,13 @@ export function MrpResultPage() {
 
         <div className="tablePane resultTablePane">
           {!truthAccepted && <div className="emptyState">Фактические данные MRP недоступны. Дождитесь принятого Ledger-снимка.</div>}
-          {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} />}
+          {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} highlightedIdentity={highlightedIdentity} />}
           {tab === 'purchases' && (
             <PurchaseResultTable
               rows={purchaseRows}
               selectedIds={selectedPurchaseIdentities}
               highlightedId={highlightedPurchaseId}
+              highlightedIdentity={highlightedIdentity}
               supplierFilter={purchaseSupplierFilter}
               categoryFilter={purchaseCategoryFilter}
               supplierOptions={purchaseSupplierOptions}
@@ -429,8 +431,8 @@ export function MrpResultPage() {
               onSelectedIdsChange={setSelectedPurchaseIdentities}
             />
           )}
-          {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
-          {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
+          {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} highlightedIdentity={highlightedIdentity} />}
+          {tab === 'capacity' && <CapacityResultTable rows={capacityRows} highlightedIdentity={highlightedIdentity} />}
         </div>
       </DocumentWindow>
       <RootProductFilterDialog
@@ -454,9 +456,10 @@ function Metric({ title, value, hint }: { title: string; value: string; hint?: s
   )
 }
 
-function ProductionResultTable({ rows, highlightedId }: {
+function ProductionResultTable({ rows, highlightedId, highlightedIdentity }: {
   rows: MrpProductionRow[]
   highlightedId: number | null
+  highlightedIdentity: string | null
 }) {
   return (
     <table className="journalTable resultTable">
@@ -473,7 +476,7 @@ function ProductionResultTable({ rows, highlightedId }: {
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.order_id} className={highlightedId && productionSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.current_identity || row.order_id} className={highlightedIdentity ? row.current_identity === highlightedIdentity ? 'activeRow' : undefined : highlightedId && productionSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''} {row.badge || ''}</span>
@@ -495,6 +498,7 @@ function PurchaseResultTable({
   rows,
   selectedIds,
   highlightedId,
+  highlightedIdentity,
   supplierFilter,
   categoryFilter,
   supplierOptions,
@@ -506,6 +510,7 @@ function PurchaseResultTable({
   rows: MrpPurchaseRow[]
   selectedIds: Set<string>
   highlightedId: number | null
+  highlightedIdentity: string | null
   supplierFilter: string
   categoryFilter: string
   supplierOptions: Array<{ value: string; label: string }>
@@ -585,7 +590,7 @@ function PurchaseResultTable({
           const coverageLabel = row.supplier_coverage_label || '—'
           const coverageStatus = row.supplier_coverage_status
           return (
-          <tr key={row.current_identity || row.purchase_id} className={highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.current_identity || row.purchase_id} className={highlightedIdentity ? row.current_identity === highlightedIdentity ? 'activeRow' : undefined : highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
               {purchaseCurrentIdentity(row) ? (
               <input
@@ -622,7 +627,7 @@ function PurchaseResultTable({
   )
 }
 
-function ReworkResultTable({ rows, highlightedId }: { rows: MrpReworkRow[]; highlightedId: number | null }) {
+function ReworkResultTable({ rows, highlightedId, highlightedIdentity }: { rows: MrpReworkRow[]; highlightedId: number | null; highlightedIdentity: string | null }) {
   return (
     <table className="journalTable resultTable">
       <thead>
@@ -638,7 +643,7 @@ function ReworkResultTable({ rows, highlightedId }: { rows: MrpReworkRow[]; high
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.rework_id} className={highlightedId === row.rework_id ? 'activeRow' : undefined}>
+          <tr key={row.current_identity || row.rework_id} className={highlightedIdentity ? row.current_identity === highlightedIdentity ? 'activeRow' : undefined : highlightedId === row.rework_id ? 'activeRow' : undefined}>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''} {row.badge || ''}</span>
@@ -663,7 +668,7 @@ function ReworkResultTable({ rows, highlightedId }: { rows: MrpReworkRow[]; high
   )
 }
 
-function CapacityResultTable({ rows }: { rows: MrpCapacityRow[] }) {
+function CapacityResultTable({ rows, highlightedIdentity }: { rows: MrpCapacityRow[]; highlightedIdentity: string | null }) {
   return (
     <table className="journalTable resultTable">
       <thead>
@@ -678,7 +683,7 @@ function CapacityResultTable({ rows }: { rows: MrpCapacityRow[] }) {
       </thead>
       <tbody>
         {rows.map((row, index) => (
-          <tr key={`${row.area_id}-${row.bucket_date || index}`}>
+          <tr key={row.current_identity || `${row.area_id}-${row.bucket_date || index}`} className={highlightedIdentity ? row.current_identity === highlightedIdentity ? 'activeRow' : undefined : undefined}>
             <td className="itemCell">
               <strong>Участок #{row.area_id}</strong>
               <span>производственная мощность</span>

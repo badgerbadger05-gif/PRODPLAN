@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PurchaseRow } from '../../domain/purchaseControl'
@@ -469,7 +469,9 @@ describe('PurchaseControlPage Doctype migration', () => {
     })
     renderPage('/purchase-control?current_identity=purchase%3Areq%3A10')
 
-    const row = await screen.findByText('Шестерня')
+    await screen.findAllByText('Шестерня')
+    const tables = document.querySelectorAll('.productionOrdersTable')
+    const row = within(tables[tables.length - 1] as HTMLElement).getByText('Шестерня')
     expect(row.closest('tr')).toHaveClass('activeRow')
   })
 
