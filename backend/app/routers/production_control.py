@@ -1410,9 +1410,21 @@ def get_orders_journal(
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
         )
+        current_work_items = {
+            (int(work.requirement_id), int(work.item_id)): int(work.id)
+            for work in db.query(models.ReplenishmentWorkItem).filter(
+                models.ReplenishmentWorkItem.ledger_generation_id == int(current_manifest.source_generation_id or 0),
+            ).all()
+        }
         rows = []
         for current_row in current_records:
             payload = dict(current_row.payload or {})
+            requirement_id = payload.get("source_mrp_requirement_id")
+            item_id = payload.get("item_id")
+            if requirement_id not in (None, "") and item_id not in (None, ""):
+                locator = current_work_items.get((int(requirement_id), int(item_id)))
+                if locator is not None:
+                    payload["work_item_id"] = locator
             payload["__r9_root_item_ids"] = list(payload.get("root_item_ids") or [])
             payload.pop("root_item_ids", None)
             payload["current_identity"] = str(current_row.business_identity)
@@ -1580,23 +1592,24 @@ def get_work_item_materials(
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
         )
+        current_generation_id = int(current_manifest.source_generation_id or 0)
+        work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
+        if work is None or int(work.ledger_generation_id) != current_generation_id:
+            raise CurrentExecutionUnavailable("current work-item provenance is missing or stale")
         current_rows = [
             row for row in load_current_execution_rows(
                 db,
                 entity_kind="production_control_journal",
                 scope_key="production:all-live-orders",
             )
-            if int((row.payload or {}).get("work_item_id") or 0) == int(work_item_id)
+            if int((row.payload or {}).get("source_mrp_requirement_id") or 0) == int(work.requirement_id)
+            and int((row.payload or {}).get("item_id") or 0) == int(work.item_id)
         ]
         if len(current_rows) != 1:
             raise CurrentExecutionUnavailable("current work-item material row is missing or ambiguous")
         current_payload = dict(current_rows[0].payload or {})
-        current_generation_id = int(current_manifest.source_generation_id or 0)
         if ledger_generation_id is not None and int(ledger_generation_id) != current_generation_id:
             raise HTTPException(status_code=409, detail="Требуется актуальное принятое поколение")
-        work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
-        if work is None or int(work.ledger_generation_id) != current_generation_id:
-            raise CurrentExecutionUnavailable("current work-item provenance is missing or stale")
         requested_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
         remaining_qty = float(work.replenishment_remaining_qty)
         if requested_qty <= 0 or requested_qty > remaining_qty + 1e-6:

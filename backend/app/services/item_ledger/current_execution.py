@@ -768,6 +768,45 @@ def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
     )
 
 
+def _production_snapshot_identity(payload: dict[str, Any]) -> str:
+    """Resolve production journal identity without generation-local work IDs."""
+
+    requirement_id = payload.get("source_mrp_requirement_id") or payload.get("requirement_id")
+    if requirement_id not in (None, ""):
+        discriminator = (
+            payload.get("source_mrp_allocation_key")
+            or payload.get("source_mrp_allocation_id")
+            or payload.get("item_id")
+            or "default"
+        )
+        return f"production-mrp-requirement:{int(requirement_id)}:{discriminator}"
+    order_id = payload.get("order_id")
+    if order_id not in (None, ""):
+        line = payload.get("line_number") or payload.get("product_id") or payload.get("item_id")
+        if line in (None, ""):
+            raise CurrentExecutionUnavailable("production order row lacks stable line identity")
+        return f"production-order-line:{int(order_id)}:{line}"
+    journal_key = str(payload.get("journal_row_key") or payload.get("row_key") or "")
+    if journal_key.startswith("work-item:"):
+        raise CurrentExecutionUnavailable(
+            "production proposal lacks stable MRP requirement identity"
+        )
+    return _snapshot_row_identity(payload, "production")
+
+
+def _production_semantic_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop generation-local proposal locators from the current business row."""
+
+    result = dict(payload)
+    if result.get("source_mrp_requirement_id") not in (None, "") or str(
+        result.get("journal_row_key") or result.get("row_key") or ""
+    ).startswith("work-item:"):
+        result.pop("work_item_id", None)
+        result.pop("journal_row_key", None)
+        result.pop("row_key", None)
+    return result
+
+
 def publish_current_obligation_views_from_generation(
     db: Session,
     generation_id: int,
@@ -814,10 +853,10 @@ def publish_current_obligation_views_from_generation(
         production_rows = [
             {
                 "entity_kind": "production_control_journal",
-                "business_identity": _snapshot_row_identity(dict(row.payload or {}), "production"),
+                "business_identity": _production_snapshot_identity(dict(row.payload or {})),
                 "scope_key": "production:all-live-orders",
                 "payload": {
-                    **dict(row.payload or {}),
+                    **_production_semantic_payload(dict(row.payload or {})),
                     "root_item_ids": [
                         int(member.root_item_id)
                         for member in db.query(models.PlanningReadRootMember).filter(
