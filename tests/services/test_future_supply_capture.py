@@ -72,6 +72,22 @@ def test_captures_exact_wip_and_supplier_evidence(db_session):
     assert batch.status == "building"
 
 
+def test_capture_assigns_stable_current_identity_and_stays_staged_until_publish(
+    db_session,
+):
+    generation, batch, item = _context(db_session, "stable-current")
+    replace_future_supply_capture(
+        db_session,
+        generation.id,
+        batch.id,
+        [_evidence(generation, item, kind="supplier_order", ref="SO-7", line="004")],
+    )
+
+    row = db_session.query(models.LedgerFutureSupply).one()
+    assert row.current_identity == "supplier_order:SO-7:004:local-1"
+    assert row.is_current is False
+
+
 def test_exact_evidence_carries_source_requirement_id_into_persisted_row(db_session):
     generation, batch, item = _context(db_session, "requirement")
     rows = [_evidence(generation, item, source_requirement_id="77")]

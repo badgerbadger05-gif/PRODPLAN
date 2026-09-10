@@ -19,6 +19,8 @@ def test_ledger_future_supply_metadata_contract():
     assert not table.c.ledger_generation_id.nullable
     assert not table.c.capture_batch_id.nullable
     assert not table.c.capture_cutoff.nullable
+    assert not table.c.current_identity.nullable
+    assert not table.c.is_current.nullable
 
     foreign_keys = {
         (foreign_key.parent.name, foreign_key.target_fullname, foreign_key.ondelete)
@@ -49,6 +51,7 @@ def test_ledger_future_supply_metadata_contract():
         "ix_ledger_future_supply_generation_kind_item_eta",
         "ix_ledger_future_supply_generation_item_eta",
         "ix_ledger_future_supply_source_requirement_id",
+        "ux_ledger_future_supply_current_identity",
     } <= indexes
 
 
