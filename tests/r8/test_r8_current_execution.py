@@ -111,6 +111,7 @@ def test_r8_complete_scope_cannot_clear_a_foreign_mrp_shelf(db_session):
         scope_key="shelf:mrp:1",
         rows=[],
         complete_scope=True,
+        entity_kinds=("shelf_projection",),
     )
     current = load_current_execution_rows(
         db_session, entity_kind="shelf_projection", scope_key="shelf:mrp:2"
@@ -147,8 +148,30 @@ def test_r8_closure_hides_current_row_but_preserves_bounded_change_history(db_se
         scope_key="assembly:all-live-plans",
         rows=[],
         complete_scope=True,
+        entity_kinds=("assembly_queue",),
     )
     assert load_current_execution_rows(db_session, entity_kind="assembly_queue") == []
     current = db_session.query(models.CurrentExecutionRow).one()
     assert current.result_status == "closed"
     assert db_session.query(models.CurrentExecutionChange).count() == 2
+
+
+def test_r8_empty_readiness_scope_does_not_close_queue_scope(db_session):
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        entity_kinds=("assembly_queue",),
+        rows=[_queue("queue:1", period="2026-09-10", plan_id=1, line_id=1)],
+    )
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        entity_kinds=("assembly_readiness",),
+        rows=[],
+        complete_scope=True,
+    )
+    assert [row.business_identity for row in load_current_execution_rows(
+        db_session, entity_kind="assembly_queue"
+    )] == ["queue:1"]
