@@ -221,6 +221,24 @@ def test_r9_materials_read_current_payload_without_snapshot_fallback(db_session)
     assert result["components"][0]["item_id"] == 20
 
 
+def test_r9_materials_missing_current_manifest_returns_503(db_session):
+    generation = _accepted_generation(db_session)
+    _snapshot(
+        db_session,
+        generation,
+        consumer="production_control_journal",
+        key="journal:v1",
+        rows=[{"row_key": "legacy:material", "payload": {
+            "product_id": 77,
+            "material_coverage_snapshot": {"components": []},
+        }}],
+    )
+    db_session.commit()
+    with pytest.raises(Exception) as caught:
+        get_order_line_materials(77, db=db_session)
+    assert getattr(caught.value, "status_code", None) == 503
+
+
 def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
     first = _accepted_generation(db_session)
     _snapshot(
