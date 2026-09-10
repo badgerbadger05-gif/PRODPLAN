@@ -369,3 +369,92 @@ def test_rebase_finds_live_run_through_multiple_accepted_fact_forks(
 
     assert result["status"] == "rebased"
     assert result["remaining_root_lines"][0]["qty"] == "2.000"
+
+
+def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
+    db_session,
+    monkeypatch,
+):
+    """A retained run stays anchored to its own generation across refreshes.
+
+    Rebase is a business operation on that run, not a read of the latest
+    technical generation.  The reservation therefore remains discoverable by
+    run identity after two fact/obligation refresh generations have advanced
+    the truth pointer without copying or retargeting the retained rows.
+    """
+    generation, plan, run, _line = _world(
+        db_session,
+        accepted_qty=Decimal("8"),
+    )
+    requirement = models.MrpRequirement(
+        run_id=int(run.run_id),
+        item_id=1,
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="open",
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    db_session.add(
+        models.ReservationEntry(
+            ledger_generation_id=int(generation.id),
+            item_id=1,
+            run_id=int(run.run_id),
+            requirement_id=int(requirement.id),
+            priority_period_from=date(2026, 8, 1),
+            priority_period_to=date(2026, 8, 31),
+            reserved_qty=Decimal("5"),
+            replenishment_required_qty=Decimal("5"),
+            replenishment_received_qty=Decimal("2"),
+            realized_qty=Decimal("2"),
+            lifecycle_status="active",
+        )
+    )
+    db_session.flush()
+
+    current = generation
+    for ordinal in (1, 2):
+        physical = models.PhysicalImportBatch(
+            batch_key=f"spec-rebase-retained-refresh-{ordinal}",
+            status="completed",
+            cutoff=CUTOFF,
+            source_watermarks={},
+            completed_at=CUTOFF,
+        )
+        current = models.LedgerGeneration(
+            generation_key=f"spec-rebase-retained-refresh-{ordinal}",
+            status="accepted",
+            cutoff=CUTOFF,
+            source_watermarks={
+                "generation_kind": "physical_refresh",
+                "parent_generation_id": int(current.id),
+            },
+            capabilities={},
+            physical_import_batch=physical,
+            algorithm_version="test",
+            accepted_at=CUTOFF,
+        )
+        db_session.add_all([physical, current])
+        db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(current.id)
+    db_session.commit()
+
+    _stub_publication(monkeypatch, db_session)
+    result = rebase_fixed_plan_remaining_roots(
+        db_session,
+        int(run.run_id),
+        changed_spec_refs=("spec-retained-after-refresh",),
+        started_by="test",
+    )
+
+    assert result["status"] == "rebased"
+    correction = {int(row["item_id"]): row for row in result["component_correction"]}
+    assert correction[1]["old_remaining"] == "3.000"
+    # The retained reservation was not copied/retargeted by the refreshes.
+    retained_rows = db_session.query(models.ReservationEntry).filter_by(
+        run_id=int(run.run_id),
+    ).all()
+    assert len(retained_rows) == 1
+    assert int(retained_rows[0].ledger_generation_id) == int(generation.id)
