@@ -34,6 +34,11 @@ from app.services.production_material_custody_projection import (
 )
 from app.services.planning_truth import publish_generation
 from app.services.production_material_custody_events import append_material_issue_custody_event
+from app.services.item_ledger.current_execution import (
+    get_current_execution_scope,
+    load_current_execution_rows,
+    publish_current_execution_scope,
+)
 
 
 def test_same_1c_timestamp_accepts_postgres_aware_and_legacy_naive_wall_time():
@@ -289,6 +294,101 @@ def test_local_issue_event_advances_compact_current_custody_without_rebuild(db_s
     )
     assert generation_id == generation.id
     assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 3
+
+
+def test_custody_event_invalidates_current_execution_once_and_duplicate_retry_is_noop(db_session):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key="custody-r8-invalidation", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="R8CUSTODY")
+    manifest = _manifest(db_session, generation_id=generation.id, source_event_high_watermark_id=0)
+    manifest.is_baseline = True
+    issue = ProductionMaterialIssue(
+        document_number="MT-R8-CUSTODY",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-DST",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    line = ProductionMaterialIssueLine(
+        issue_id=issue.issue_id,
+        component_item_id=component.item_id,
+        required_qty=1,
+        issued_qty=0,
+    )
+    db_session.add(line)
+    db_session.flush()
+    for kind, scope in (
+        ("assembly_readiness", "assembly:all-live-plans"),
+        ("drum_schedule", "drum:all-live-plans"),
+        ("shelf_projection", "shelf:all-live-mrps"),
+    ):
+        publish_current_execution_scope(
+            db_session,
+            source_revision="accepted:r8-custody",
+            source_generation_id=generation.id,
+            scope_key=scope,
+            entity_kinds=(kind,),
+            rows=[{
+                "entity_kind": kind,
+                "business_identity": f"{kind}:custody",
+                "scope_key": scope,
+                "payload": {"value": "ready"},
+            }],
+        )
+    db_session.commit()
+
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=1,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        effective_at=cutoff + timedelta(minutes=1),
+    ) is True
+    assert all(
+        get_current_execution_scope(db_session, entity_kind=kind, scope_key=scope).result_ready is False
+        for kind, scope in (
+            ("assembly_readiness", "assembly:all-live-plans"),
+            ("drum_schedule", "drum:all-live-plans"),
+            ("shelf_projection", "shelf:all-live-mrps"),
+        )
+    )
+
+    for kind, scope in (
+        ("assembly_readiness", "assembly:all-live-plans"),
+        ("drum_schedule", "drum:all-live-plans"),
+        ("shelf_projection", "shelf:all-live-mrps"),
+    ):
+        manifest = get_current_execution_scope(db_session, entity_kind=kind, scope_key=scope)
+        manifest.result_ready = True
+        for row in load_current_execution_rows(db_session, entity_kind=kind, scope_key=scope):
+            row.result_ready = True
+    line.custody_event_revision = 0
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=1,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        effective_at=cutoff + timedelta(minutes=1),
+    ) is False
+    assert all(
+        get_current_execution_scope(db_session, entity_kind=kind, scope_key=scope).result_ready is True
+        for kind, scope in (
+            ("assembly_readiness", "assembly:all-live-plans"),
+            ("drum_schedule", "drum:all-live-plans"),
+            ("shelf_projection", "shelf:all-live-mrps"),
+        )
+    )
 
 
 def test_local_tail_does_not_skip_unseen_physical_event(db_session):
