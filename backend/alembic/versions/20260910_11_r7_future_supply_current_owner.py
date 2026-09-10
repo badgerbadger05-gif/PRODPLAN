@@ -68,7 +68,9 @@ def upgrade() -> None:
 
     bind = op.get_bind()
     rows = bind.execute(sa.text(
-        """SELECT current_identity, ledger_generation_id, capture_batch_id,
+        """SELECT current_identity,
+                         ledger_generation_id AS source_generation_id,
+                         capture_batch_id AS source_capture_batch_id,
                          supply_kind, item_id, characteristic_ref,
                          organization_ref, planning_stock_pool,
                          destination_warehouse_ref1c, source_ref,
