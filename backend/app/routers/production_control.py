@@ -479,9 +479,17 @@ def get_assembly_queue(
     db: Session = Depends(get_db),
 ) -> AssemblyQueueResponse:
     """Read the compact current queue; legacy snapshots serve only old data."""
-    from ..services.item_ledger.current_execution import load_current_execution_rows
+    from ..services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+    current_scope = get_current_execution_scope(
+        db, entity_kind="assembly_queue", scope_key="assembly:all-live-plans"
+    )
     current_rows = load_current_execution_rows(db, entity_kind="assembly_queue")
-    if current_rows:
+    if current_scope is not None:
+        if not bool(current_scope.result_ready):
+            raise HTTPException(status_code=503, detail={"code": "assembly_queue_unavailable", "reason": "current queue result is not ready"})
         try:
             truth = planning_truth.require_accepted_truth(
                 db,
@@ -586,9 +594,17 @@ def get_assembly_readiness(
     db: Session = Depends(get_db),
 ) -> AssemblyReadinessListResponse:
     """Read the persisted release recommendation; never calculate readiness in GET."""
-    from ..services.item_ledger.current_execution import load_current_execution_rows
+    from ..services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+    current_scope = get_current_execution_scope(
+        db, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
+    )
     current_rows = load_current_execution_rows(db, entity_kind="assembly_readiness")
-    if current_rows:
+    if current_scope is not None:
+        if not bool(current_scope.result_ready):
+            raise HTTPException(status_code=503, detail={"code": "assembly_readiness_unavailable", "reason": "current readiness result is not ready"})
         try:
             truth = planning_truth.require_accepted_truth(
                 db,
@@ -743,9 +759,17 @@ def get_drum_schedule(
     db: Session = Depends(get_db),
 ) -> DrumScheduleResponse:
     """Read the persisted drum of the exact accepted generation."""
-    from ..services.item_ledger.current_execution import load_current_execution_rows
+    from ..services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+    current_scope = get_current_execution_scope(
+        db, entity_kind="drum_schedule", scope_key="drum:all-live-plans"
+    )
     current_schedule = load_current_execution_rows(db, entity_kind="drum_schedule", scope_key="drum:all-live-plans")
-    if current_schedule:
+    if current_scope is not None:
+        if not bool(current_scope.result_ready):
+            raise HTTPException(status_code=503, detail={"code": "drum_schedule_unavailable", "reason": "current drum result is not ready"})
         try:
             truth = planning_truth.require_accepted_truth(
                 db,
@@ -758,7 +782,12 @@ def get_drum_schedule(
             )
         except planning_truth.PlanningTruthUnavailable as exc:
             raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
-        schedule_payload = dict(current_schedule[0].payload or {})
+        schedule_payload = dict(current_schedule[0].payload or {}) if current_schedule else {
+            "schedule_from": truth.cutoff.date().isoformat() if truth.cutoff else "",
+            "schedule_to": truth.cutoff.date().isoformat() if truth.cutoff else "",
+            "working_days": [],
+            "metrics": {},
+        }
         slots = load_current_execution_rows(db, entity_kind="drum_slot", scope_key="drum:all-live-plans")
         gaps = load_current_execution_rows(db, entity_kind="drum_gap", scope_key="drum:all-live-plans")
         item_ids = {
@@ -1258,9 +1287,17 @@ def get_shelf_projections(
     db: Session = Depends(get_db),
 ) -> ShelfProjectionResponse:
     """Read persisted shelf pull priorities of the accepted generation."""
-    from ..services.item_ledger.current_execution import load_current_execution_rows
+    from ..services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+    current_scope = get_current_execution_scope(
+        db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps"
+    )
     current_rows = load_current_execution_rows(db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps")
-    if current_rows:
+    if current_scope is not None:
+        if not bool(current_scope.result_ready):
+            raise HTTPException(status_code=503, detail={"code": "shelf_projection_unavailable", "reason": "current shelf result is not ready"})
         try:
             truth = planning_truth.require_accepted_truth(
                 db,
