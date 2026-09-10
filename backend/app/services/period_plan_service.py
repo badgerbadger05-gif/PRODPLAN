@@ -55,6 +55,7 @@ from .mrp_stock_helpers import (
 from .planning_run_candidate import _resolve_parent_generation_id
 from .forecast import forecast_payload as _forecast_payload
 from .item_ledger.live_plan_scope import live_plan_run_ids
+from .item_ledger.r3_contract import current_live_run
 from .item_ledger.reservation import (
     replenishment_execution_pct,
     replenishment_execution_status,
@@ -741,20 +742,11 @@ def list_mrp_runs_for_plan(db: Session, plan_id: int, *, limit: int = 50) -> Dic
     generation = db.get(LedgerGeneration, int(truth.current_generation_id))
     if generation is None or str(generation.status) != "accepted":
         raise ValueError("Current accepted Ledger truth is unavailable")
-    live_run_ids = live_plan_run_ids(db, generation)
-    if not live_run_ids:
-        return {"rows": [], "total": 0}
-    runs = (
-        db.query(PlanningRun)
-        .filter(
-            PlanningRun.source_plan_id == int(plan_id),
-            PlanningRun.run_id.in_(live_run_ids),
-            PlanningRun.status == "FIXED_SNAPSHOT",
-        )
-        .order_by(PlanningRun.run_id.desc())
-        .limit(max(1, min(int(limit or 50), 200)))
-        .all()
-    )
+    # Current MRP is a business pointer, not a generation/ancestor query.
+    # ``live_plan_run_ids`` remains the owner of historical sealed scope for
+    # rebuilds, but a current reader must fail closed when its pointer is bad.
+    current = current_live_run(db, int(plan_id))
+    runs = [current]
     rows = []
     for r in runs:
         rows.append({

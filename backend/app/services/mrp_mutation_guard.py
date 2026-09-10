@@ -19,6 +19,7 @@ from app.services.item_ledger.live_plan_scope import (
     sealed_generation_lineage_ids,
     sealed_run_anchor,
 )
+from app.services.item_ledger.r3_contract import current_live_run
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -77,6 +78,20 @@ def require_current_run(
         raise MrpMutationLineageError(
             f"planning run {run_id} is not a FIXED_SNAPSHOT"
         )
+    # Detached historical/system runs predate the plan-bound pointer contract
+    # and remain validated by their sealed Ledger lineage.  Every plan-bound
+    # current run, however, must be the explicit active pointer; no generation
+    # scan may select a sibling or stale MRP.
+    if run.source_plan_id is not None:
+        try:
+            pointer_run = current_live_run(db, int(run.source_plan_id))
+        except (LookupError, ValueError) as exc:
+            raise MrpMutationLineageError(str(exc)) from exc
+        if int(pointer_run.run_id) != int(run.run_id):
+            raise MrpMutationLineageError(
+                f"planning run {run_id} is not the active MRP pointer for plan "
+                f"{int(run.source_plan_id)}"
+            )
     generation_id = int(truth.generation_id)
     generation = db.get(models.LedgerGeneration, generation_id)
     if generation is None:

@@ -10,6 +10,33 @@ branch_labels = None
 depends_on = None
 
 
+def backfill_live_pointers(bind) -> None:
+    """Populate explicit current-MRP pointers from unambiguous fixed runs."""
+    duplicate_plan = bind.execute(
+        sa.text(
+            "SELECT source_plan_id FROM planning_run "
+            "WHERE status = 'FIXED_SNAPSHOT' AND source_plan_id IS NOT NULL "
+            "GROUP BY source_plan_id HAVING count(*) > 1 LIMIT 1"
+        )
+    ).scalar()
+    if duplicate_plan is not None:
+        raise RuntimeError(
+            "R3 migration refuses ambiguous current MRP pointer backfill for "
+            f"plan {duplicate_plan}"
+        )
+    bind.execute(
+        sa.text(
+            "INSERT INTO planning_live_pointer (plan_id, run_id, status) "
+            "SELECT pr.source_plan_id, pr.run_id, 'active' "
+            "FROM planning_run pr "
+            "JOIN production_plan_header p ON p.id = pr.source_plan_id "
+            "WHERE pr.status = 'FIXED_SNAPSHOT' "
+            "AND pr.source_plan_id IS NOT NULL "
+            "AND p.status = 'fixed'"
+        )
+    )
+
+
 def upgrade() -> None:
     op.add_column("physical_import_batch", sa.Column("expected_page_count", sa.Integer(), nullable=True))
     op.add_column("physical_import_batch", sa.Column("received_page_count", sa.Integer(), nullable=False, server_default="0"))
@@ -87,6 +114,10 @@ def upgrade() -> None:
         sa.CheckConstraint("status IN ('active', 'retired')", name="ck_planning_live_pointer_status"),
     )
     op.create_index("ix_planning_live_pointer_run_id", "planning_live_pointer", ["run_id"])
+    # Existing fixed plans must not emerge from this migration with an empty
+    # pointer table.  The source-plan uniqueness constraint makes this mapping
+    # deterministic; an ambiguity is diagnosed before any pointer is written.
+    backfill_live_pointers(op.get_bind())
     op.create_table(
         "planning_run_successor",
         sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),

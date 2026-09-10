@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app import models
+from .r3_contract import CurrentMrpResolutionError, current_live_run
 
 
 def _same_instant(left: datetime | None, right: datetime | None) -> bool:
@@ -110,6 +111,32 @@ def sealed_generation_lineage_ids(
 
 class RunAnchorError(ValueError):
     """A planning run is not a live obligation of the given Ledger generation."""
+
+
+def current_live_run_ids(
+    db: Session,
+    *,
+    plan_ids: tuple[int, ...] | None = None,
+) -> tuple[int, ...]:
+    """Resolve current MRP runs from active pointers without lineage traversal.
+
+    This is the current-read boundary.  ``live_plan_run_ids`` below remains
+    available for historical generation rebuilds and publication manifests,
+    where sealed generation scope is the intended semantic.
+    """
+    query = db.query(models.PlanningLivePointer).filter(
+        models.PlanningLivePointer.status == "active"
+    )
+    if plan_ids is not None:
+        normalized = tuple(sorted({int(value) for value in plan_ids}))
+        query = query.filter(models.PlanningLivePointer.plan_id.in_(normalized or (-1,)))
+    run_ids = []
+    for pointer in query.order_by(models.PlanningLivePointer.plan_id.asc()).all():
+        try:
+            run_ids.append(int(current_live_run(db, int(pointer.plan_id)).run_id))
+        except CurrentMrpResolutionError:
+            raise
+    return tuple(run_ids)
 
 
 def sealed_run_anchor(

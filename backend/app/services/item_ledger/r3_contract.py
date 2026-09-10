@@ -20,6 +20,10 @@ class ImportCompletenessError(ValueError):
     """A source page set is incomplete or arrived in an invalid order."""
 
 
+class CurrentMrpResolutionError(LookupError):
+    """The explicit current-MRP pointer is absent or cannot be trusted."""
+
+
 def validate_legacy_identity_mapping(rows) -> None:
     """Fail closed when a legacy identity has more than one active copy."""
     active_by_identity: dict[str, int] = {}
@@ -121,17 +125,37 @@ def finalize_import(session: Session, import_batch_id: int) -> models.PhysicalIm
 
 
 def current_live_run(session: Session, plan_id: int) -> models.PlanningRun:
-    """Resolve current MRP by the explicit pointer, never by parent traversal."""
-    pointer = (
-        session.query(models.PlanningLivePointer)
-        .filter_by(plan_id=int(plan_id), status="active")
-        .one_or_none()
-    )
-    if pointer is None:
-        raise LookupError(f"no active MRP pointer for plan {int(plan_id)}")
+    """Resolve current MRP by the explicit pointer, never by parent traversal.
+
+    The pointer is a business identity boundary.  A pointer to a retired,
+    building, foreign-plan, or non-fixed run is stale and must not silently
+    fall back to a generation lineage or the numerically latest run.
+    """
+    plan = session.get(models.ProductionPlanHeader, int(plan_id))
+    if plan is None:
+        raise CurrentMrpResolutionError(f"production plan {int(plan_id)} does not exist")
+    pointer = session.get(models.PlanningLivePointer, int(plan_id))
+    if pointer is None or str(pointer.status or "") != "active":
+        raise CurrentMrpResolutionError(
+            f"no active MRP pointer for plan {int(plan_id)}"
+        )
     run = session.get(models.PlanningRun, int(pointer.run_id))
     if run is None:
-        raise LookupError(f"live MRP pointer references missing run {int(pointer.run_id)}")
+        raise CurrentMrpResolutionError(
+            f"live MRP pointer references missing run {int(pointer.run_id)}"
+        )
+    if int(run.source_plan_id or -1) != int(plan_id):
+        raise CurrentMrpResolutionError(
+            f"live MRP pointer for plan {int(plan_id)} references another plan"
+        )
+    if str(run.status or "").upper() != "FIXED_SNAPSHOT":
+        raise CurrentMrpResolutionError(
+            f"live MRP pointer for plan {int(plan_id)} references a run that is not FIXED_SNAPSHOT"
+        )
+    if str(plan.status or "").lower() != "fixed":
+        raise CurrentMrpResolutionError(
+            f"live MRP pointer for plan {int(plan_id)} references a non-fixed plan"
+        )
     return run
 
 
