@@ -159,3 +159,59 @@ def test_r9_production_route_does_not_fallback_to_legacy_snapshot(db_session):
         get_orders_journal(db=db_session)
     assert getattr(caught.value, "status_code", None) == 503
     assert "current" in str(getattr(caught.value, "detail", "")).lower()
+
+
+def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
+    first = _accepted_generation(db_session)
+    _snapshot(
+        db_session, first, consumer="purchase_control_journal", key="journal:v1",
+        rows=[{"row_key": "buy:stable", "payload": {"row_key": "buy:stable", "to_order_qty": 2}}],
+    )
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, first.id)
+    db_session.commit()
+    current_id = load_current_execution_rows(
+        db_session, entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )[0].id
+    changes_before = db_session.query(models.CurrentExecutionChange).count()
+
+    second = models.LedgerGeneration(
+        generation_key="r9-obligation-views-generation-2",
+        status="accepted",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc),
+        source_watermarks={},
+        capabilities=first.capabilities,
+        physical_import_batch=first.physical_import_batch,
+        algorithm_version="r9-test",
+        replay_version="r9-test",
+        accepted_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    db_session.add(second)
+    db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = second.id
+    _snapshot(
+        db_session, second, consumer="purchase_control_journal", key="journal:v1",
+        rows=[{"row_key": "buy:stable", "payload": {"row_key": "buy:stable", "to_order_qty": 2}}],
+    )
+    db_session.commit()
+    result = publish_current_obligation_views_from_generation(db_session, second.id)
+    db_session.commit()
+    current = load_current_execution_rows(
+        db_session, entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )[0]
+    assert result["purchase_control_journal"].idempotent
+    assert current.id == current_id
+    assert db_session.query(models.CurrentExecutionChange).count() == changes_before
+
+
+def test_r9_missing_business_identity_fails_closed(db_session):
+    generation = _accepted_generation(db_session)
+    _snapshot(
+        db_session, generation, consumer="purchase_control_journal", key="journal:v1",
+        rows=[{"row_key": "technical-row-only", "payload": {"to_order_qty": 2}}],
+    )
+    db_session.commit()
+    with pytest.raises(CurrentExecutionUnavailable, match="business identity"):
+        publish_current_obligation_views_from_generation(db_session, generation.id)
