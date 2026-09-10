@@ -58,3 +58,66 @@ def test_current_stock_mvcc_keeps_previous_value_until_commit():
         left.close()
         right.close()
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_local_custody_marker_lock_serializes_two_writers_before_event_insert():
+    """The marker lock is held before either writer can allocate an event id."""
+    dsn = _dsn()
+    sa = pytest.importorskip("sqlalchemy")
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    from app.services.production_material_custody_projection import (
+        lock_current_custody_marker,
+    )
+
+    engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
+    left = engine.connect()
+    right = engine.connect()
+    left_session = Session(bind=left)
+    right_session = Session(bind=right)
+    left_tx = None
+    right_tx = None
+    seeded_marker = False
+    try:
+        marker_exists = right.execute(
+            sa.text("SELECT 1 FROM planning_truth_state WHERE id = 1")
+        ).scalar()
+        if marker_exists is None:
+            # A pristine migration contour may not yet have a planning pointer.
+            # Seed only the nullable singleton marker for this lock-only proof;
+            # cleanup below restores the contour exactly.
+            with engine.begin() as setup:
+                setup.execute(
+                    sa.text(
+                        "INSERT INTO planning_truth_state "
+                        "(id, current_generation_id) VALUES (1, NULL)"
+                    )
+                )
+            seeded_marker = True
+
+        # T1 obtains the exact lock used by append_material_issue_custody_event
+        # before inserting/flushing its event, and deliberately keeps it open.
+        left_tx = left_session.begin()
+        assert lock_current_custody_marker(left_session) is not None
+
+        right_tx = right_session.begin()
+        right_session.execute(sa.text("SET LOCAL lock_timeout = '500ms'"))
+        with pytest.raises(OperationalError):
+            lock_current_custody_marker(right_session)
+    finally:
+        if right_tx is not None:
+            right_tx.rollback()
+        if left_tx is not None:
+            left_tx.rollback()
+        left_session.close()
+        right_session.close()
+        left.close()
+        right.close()
+        if seeded_marker:
+            with engine.begin() as cleanup:
+                cleanup.execute(
+                    sa.text("DELETE FROM planning_truth_state WHERE id = 1")
+                )
+        engine.dispose()
