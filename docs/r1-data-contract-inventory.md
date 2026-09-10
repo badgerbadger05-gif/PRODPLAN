@@ -141,6 +141,22 @@ provenance, никогда как business identity.
   передают transport IDs; `src/domain` отображает готовый backend metadata.
   UI не вычисляет и не сохраняет generation/snapshot.
 
+### R4 current replenishment writer boundary
+
+* `current_replenishment.py` is the sole current supplier-receipt assignment
+  writer. Its accepted physical publication caller is
+  `physical_refresh_orchestrator`; the call remains inside the caller-owned
+  transaction.
+* `ReservationConsumptionAllocation(is_current=true)` is the current basis
+  with stable `(sle_id, reservation_id)` identity. `ledger_generation_id` is
+  provenance only. `CurrentReplenishmentState` stores canonical distribution
+  scope, source stream, revision and checksum; `CurrentReplenishmentAudit`
+  stores changed pairs only.
+* `supplier_receipt_allocation.py`/`ReservationEvent` remain historical
+  generation-build provenance and are guarded after a completed current marker;
+  they do not own current supplier receipt execution. Assembly-out material
+  consumption is a separate semantic path and is not folded into this writer.
+
 ## 4. Классы данных и допустимые писатели
 
 | Класс | Примеры | Допустимый писатель | Запрещённый shortcut |

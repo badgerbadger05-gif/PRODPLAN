@@ -253,3 +253,35 @@ read-model. Frontend выполняет только форматировани�
 - один живой канонический `planning_run` на фиксированный план и неизменяемая
   цепочка закрытых исторических run этого же плана;
 - отсутствие ссылок на несуществующую документацию.
+
+## R4. Текущее пополнение и границы транзакции
+
+Принятое физическое replenishment назначается единственным писателем
+`backend/app/services/item_ledger/current_replenishment.py`. Его production
+publication boundary — `physical_refresh_orchestrator` после принятия
+поколения; assignments, execution-поля и компактный source/revision marker
+публикуются одной транзакцией. `ledger_generation_id` в этой таблице — только
+provenance: он не является идентичностью текущей пары и не фильтрует current
+read.
+
+`ReservationConsumptionAllocation` — каноническое основание текущего
+назначения со стабильной парой `(sle_id, reservation_id)` и `is_current`; при
+изменении обновляются только затронутые пары. `CurrentReplenishmentAudit`
+хранит только фактические insert/update/delete basis changes, а
+`CurrentReplenishmentState` — checksum входа, canonical distribution scope и
+source stream/revision. Scope строится из `(item, characteristic, organization,
+planning_stock_pool, mode)`; source key не может подменить этот ключ. Полный
+scope обязателен, а подтверждённый пустой scope передаётся явно и очищает
+только свой scope; неопределённый empty input fail-closed.
+
+В этой существующей таблице `allocation_role` обязателен: старые
+`material_consumption` строки участвуют в freeze/custody validation, а R4
+`replenishment_receipt` строки участвуют только в current replenishment read.
+Ни один из этих двух ролей не может быть ошибочно посчитан другой. Migration
+backfill явно помечает исторические rows и не создаёт параллельного quantity
+owner.
+
+`supplier_receipt_allocation.py` и `ReservationEvent` сохраняют историческое
+provenance старых generation builds, но не являются вторым текущим владельцем.
+После completed R4 marker их writer для того же scope отклоняется. Это не
+смешивает supplier receipt replenishment с assembly_out material consumption.

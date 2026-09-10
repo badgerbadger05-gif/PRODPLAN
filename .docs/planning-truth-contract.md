@@ -151,3 +151,27 @@ GET, открытие страницы, фильтрация и экспорт �
    публикация не копирует неизменённые пары fact/receiver.
 9. Количества назначений используют точный `Decimal(15,3)` контракт; округление
    и замена неизвестного значения нулём запрещены.
+
+## Транзакционное текущее пополнение (R4)
+
+Текущая supplier-receipt replenishment assignment является одной
+транзакционной проекцией: assignments, `ReservationEntry` execution fields и
+compact source/revision marker либо видны вместе после commit, либо не видны
+вовсе. Писатель — `current_replenishment.py`; generation и snapshot не
+создаются и не являются identity текущей пары.
+
+Scope marker идентифицируется полным ключом `(item, characteristic,
+organization, planning_stock_pool, mode)`. `source_key` и `source_revision`
+хранятся отдельно и не могут обойти stale/drift check. `complete_scope=True`
+обязателен; пустой, но подтверждённый scope обязан передаваться явно и может
+очистить только собственный scope. Неопределённый или частичный вход
+fail-closed.
+
+`ReservationConsumptionAllocation` с `is_current` хранит стабильное основание
+`(sle_id, reservation_id)` независимо от generation provenance. Audit хранит
+только изменённые пары. Исторический `ReservationEvent` supplier writer не
+является параллельным current owner и после принятого R4 marker блокируется
+для того же scope; assembly_out consumption не смешивается с supplier receipt.
+В таблице явно хранится `allocation_role`: `material_consumption` используется
+freeze/custody consumers, `replenishment_receipt` — только current
+replenishment reader. Пересечение ролей в quantity sums запрещено.

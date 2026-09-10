@@ -698,3 +698,45 @@ readiness к складу точки потребления. Автоматич�
 Минимальный incremental scope для backdate и UI-форма коррекции после
 закрытия остаются задачами зависимых волн. Факт после закрытия не удаляется и
 не переоткрывает план автоматически.
+
+## 33. Транзакционное текущее replenishment R4 (10.09.2026)
+
+Принят один current writer — `current_replenishment.py`, вызываемый после
+принятия физического поколения в `physical_refresh_orchestrator` в той же
+транзакции. Он использует существующее `ReservationConsumptionAllocation` как
+каноническое основание стабильной пары `(sle_id, reservation_id)` и меняет
+только изменившиеся пары. `is_current` и generation provenance не являются
+двумя копиями бизнес-идентичности.
+
+Ключом marker является полный distribution scope: item, characteristic,
+organization, planning stock pool и mode. Source stream key хранится отдельно
+от scope; checksum включает canonical scope, факты и frozen reservations.
+Повтор exact revision с тем же payload — no-op, drift — ошибка, stale revision
+— ошибка. Подтверждённый empty scope задаётся явно и очищает только свой scope;
+неполный или неуказанный scope не публикуется.
+
+Assignments, execution-поля резерва и compact source/revision state marker
+публикуются атомарно; generation/source_watermarks и snapshots не мутируются.
+`CurrentReplenishmentAudit` содержит только фактические изменения basis.
+Supplier `ReservationEvent` остаётся историческим provenance для старых
+generation builds и не является вторым current owner: после completed R4
+marker его writer для того же scope отклоняется. Это решение не объединяет
+supplier receipt replenishment с assembly_out material consumption.
+
+## 34. Роли allocation basis в существующей таблице (10.09.2026)
+
+Одна таблица `ReservationConsumptionAllocation` сохраняется как канонический
+owner, но каждая строка имеет обязательный `allocation_role`:
+`material_consumption` для assembly_out/freeze/custody и
+`replenishment_receipt` для R4 supplier receipt. Migration `20260910_05`
+backfill-ит старые rows явно; current index и generation uniqueness включают
+роль. Freeze, validation и material-consumption writer фильтруют только
+`material_consumption`, current reader/writer — только
+`replenishment_receipt`. Это исключает смешение количества без создания
+второго ledger или FIFO engine.
+
+Typed current adapter принимает только persisted supplier provenance
+(`supplier_receipt`/`correction`), назначает `requirement_id` лишь для
+однозначного `match_status=exact`, остальные факты идут FIFO. Visible fact
+scope — полный accepted physical prefix, а default source revision — его
+`physical_import_batch_id`.

@@ -10,7 +10,7 @@ OData, боевые workers, deploy и push не использовались.
 | R1 — контракт данных, границы и предметные решения | принято локально | test-first `fd57f8fd`, документный gate `48cbd509`, implementation/docs `299ae84b` + follow-up решения; focused gate ниже |
 | R2 — локальный PostgreSQL и baseline | принято локально | WSL PostgreSQL 16 runtime, migration/rollback/API baseline/full gate зелёные; Docker остаётся необязательным альтернативным runtime |
 | R3 — устойчивые идентичности и принятие физики | принято локально | runtime writers, completeness/publish guards, live-MRP pointer, successor/frozen provenance и migration mapping проверены; focused PG и full gate зелёные |
-| R4 — транзакционные основания и текущее исполнение | не начато | runtime writers не переносились |
+| R4 — транзакционные основания и текущее исполнение | принято локально | current writer, typed provenance, role separation, rebuild closure, PG atomicity и полный gate зелёные |
 | R5 — исправления, отмены и backdate | не начато | incremental persistence scope отложен в зависимую волну |
 | R6 — физический Ledger и custody | не начато | только контрактные границы R1 |
 | R7 — выпуск плана, MRP и будущие поставки | не начато | только зафиксированы границы successor MRP |
@@ -19,8 +19,8 @@ OData, боевые workers, deploy и push не использовались.
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
-`принято локально` для R1 и R2 выставлено только после их зелёных gates;
-R3–R11 намеренно не продвигаются.
+`принято локально` выставляется только после полного exit gate соответствующей
+волны. R4 пока не принимается; R5–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -359,4 +359,82 @@ $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='
 Остаточные риски: migration round-trip и runtime integration выполнены только
 на локальном WSL PostgreSQL 16.15; production contour не проверялся и не
 разрешён текущей задачей. Удалённых путей нет, untracked
-`current-execution-full-pytest.log` сохранён без изменений. R4 не начиналась.
+`current-execution-full-pytest.log` сохранён без изменений.
+
+## R4 evidence — локальная приёмка
+
+R4 имеет статус `принято локально` после focused PG/canon gate, migration smoke
+и полного pytest с нулём skips. Реализован один current writer для
+адресного/FIFO replenishment: `current_replenishment.py` меняет только
+изменившиеся пары, execution-поля и компактный source/revision marker в одной
+транзакции. `ReservationConsumptionAllocation` остаётся каноническим
+основанием со стабильным `(sle_id, reservation_id)` и `is_current`; generation
+используется только как provenance. Supplier `ReservationEvent` не является
+вторым текущим владельцем: после completed R4 marker его writer отклоняется.
+
+### Commits and fixtures
+
+* `01e7631d` — test-first canonical scope, explicit empty scope и PostgreSQL
+  atomic visibility regressions.
+* `e1a140e5` — test-first publication adapter и supplier `ReservationEvent`
+  guard; `0a8c54cc` — точная область assertion для PG visibility.
+* `67df9d4c` — implementation: canonical scope/source stream separation,
+  source-key migration `20260910_04`, production physical-refresh caller,
+  legacy-writer guard и accepted-generation adapter.
+* `e740aadd` — implementation correction: current writer runs before accepted
+  snapshots/work-items; supplier path persists typed provenance only in R4
+  mode; obligation refresh uses the same current writer.
+* `16c114c2` — implementation correction: `allocation_role` separates
+  `material_consumption` from `replenishment_receipt`, with migration
+  `20260910_05` and consumer filters.
+* `79361d9a` — portable SQLite checksum migration, role-aware metadata gate и
+  regenerated OpenAPI contract.
+* `0c6fa319` — test fixture isolation for repeated shared PostgreSQL runs.
+* `d82a257d` — current R4 state/audit added to the rebuild clear-set, closing
+  the migrated-schema FK invariant.
+* `tests/services/test_current_replenishment_transaction.py` — stable IDs,
+  exact retry/drift, stale revision, foreign pool, empty complete scope,
+  rollback boundaries, adapter/guard и real PG visibility.
+* `tests/r4/test_r4_postgres_integration.py` — два PostgreSQL соединения и
+  concurrency lock/no-double-apply.
+
+### Commands and results
+
+Красный test-first прогон до implementation:
+
+```text
+pytest -q tests/services/test_current_replenishment_transaction.py
+12 passed, 2 failed, 1 skipped
+```
+
+Focused gate с локальным WSL PostgreSQL DSN после implementation:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'
+pytest -q tests/services/test_current_replenishment_transaction.py tests/r4/test_r4_postgres_integration.py tests/services/test_supplier_receipt_allocation.py tests/services/test_generation_lifecycle.py tests/services/test_obligation_refresh_orchestrator.py tests/routers/test_item_ledger_router.py tests/services/test_reservation_replenishment_core_migration.py tests/test_canon_invariants.py
+160 passed in 21.26s
+```
+
+Migration smoke на том же DSN:
+
+```text
+python tools/pg_rebuild_check.py --dsn $env:PRODPLAN_PG_CHECK_DSN --stages migrate
+PASS migrate 20260910_05 (head)
+```
+
+Финальный full pytest с implementation commit `d82a257d`:
+
+```text
+pytest -q
+1971 passed, 35 warnings in 199.30s (0:03:19)
+```
+
+В полном gate skips отсутствуют; focused gate также завершился без skips.
+
+Удалённые пути: **нет**. `current-execution-full-pytest.log` — чужой untracked
+файл, сохранён без изменений. Production/SSH/OData/live 1С/workers/deploy/push
+не использовались.
+
+Остаточные риски: adapter намеренно fail-closed при неоднозначных pool scope;
+локальная приёмка не является production rollout и не проверяет production
+contour. R5–R11 не начинались.
