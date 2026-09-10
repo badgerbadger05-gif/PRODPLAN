@@ -1037,13 +1037,13 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
     await screen.findByText('Расчёт MRP · заказ ещё не создан')
     expect(within(rowFor('Кронштейн')).getByText('Не создан')).toBeInTheDocument()
-    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 10, 77))
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 10, 77, 'production:order:101', 'rev-7'))
 
     const launchInput = screen.getByRole('spinbutton', { name: 'Количество запуска' })
     await user.clear(launchInput)
     await user.type(launchInput, '6')
     await user.tab()
-    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6, 77))
+    await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledWith(701, 6, 77, 'production:order:101', 'rev-7'))
     await waitFor(() => expect(within(rowFor('Кронштейн')).getByText(/К запуску: 6 шт/)).toBeInTheDocument())
     expect(await screen.findByRole('heading', { name: 'Комплектующие на 6 шт' })).toBeInTheDocument()
     expect(screen.getByText('Нужно: 24')).toBeInTheDocument()
@@ -1056,7 +1056,7 @@ describe('ProductionControlPage — characterization', () => {
       launch_qty: 6,
       expected_materialized_qty: 0,
     }], ['production:order:101'], 'rev-7'))
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/текущие строки материалов недоступны/i))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/текущие строки исполнения недоступны/i))
     expect(postMaterialIssues).not.toHaveBeenCalled()
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })
@@ -1092,7 +1092,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Обновить' }))
 
     await waitFor(() => expect(getWorkItemMaterials).toHaveBeenCalledTimes(2))
-    expect(getWorkItemMaterials).toHaveBeenLastCalledWith(701, 10, 77)
+    expect(getWorkItemMaterials).toHaveBeenLastCalledWith(701, 10, 77, 'production:order:101', 'rev-7')
     expect(await screen.findByText('Болт М8')).toBeInTheDocument()
   })
 
@@ -1256,7 +1256,7 @@ describe('ProductionControlPage — characterization', () => {
     expect(window.confirm).toHaveBeenCalledWith(
       'Будет открыта цепочка сварка → окраска. Сначала будет запущена сварная деталь: Кронштейн после сварки. Продолжить?',
     )
-    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101]))
+    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101], ['production:order:101'], 'rev-7'))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
       [101, 102], 'erp-shell', undefined, ['production:order:101', 'production:order:102'], 'rev-7',
     ))

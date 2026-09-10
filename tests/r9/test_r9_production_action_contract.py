@@ -162,6 +162,19 @@ def test_export_piecework_openapi_keeps_all_request_fields():
     assert {"manufacture_ids", "operation_ref", "time_norm", "price", "organization_ref", "structural_unit_ref", "business_operation_ref", "dry_run", "allow_production"} <= set(fields)
 
 
+def test_production_remaining_links_openapi_require_current_cas_fields():
+    from app.main import app
+
+    schema = TestClient(app).get("/openapi.json").json()
+    chain_fields = schema["components"]["schemas"]["OpenPaintWeldChainsPayload"]["properties"]
+    route_fields = schema["components"]["schemas"]["PrintRouteSheetsPayload"]["properties"]
+    assert {"current_identities", "expected_source_revision"} <= set(chain_fields)
+    assert {"current_identities", "expected_source_revision"} <= set(route_fields)
+    materials = schema["paths"]["/api/v1/production-control/work-items/{work_item_id}/materials"]["get"]["parameters"]
+    query_names = {parameter["name"] for parameter in materials if parameter["in"] == "query"}
+    assert {"current_identity", "expected_source_revision"} <= query_names
+
+
 @pytest.mark.parametrize(
     ("handler", "payload"),
     [
