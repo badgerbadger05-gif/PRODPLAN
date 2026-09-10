@@ -11,7 +11,7 @@ from app.services.item_ledger.current_execution import (
     publish_current_obligation_views_from_generation,
     require_current_execution_scope,
 )
-from app.routers.production_control import get_orders_journal, list_root_products
+from app.routers.production_control import get_orders_journal, list_root_products, get_order_line_materials
 
 
 def _accepted_generation(db_session):
@@ -189,6 +189,29 @@ def test_r9_root_products_read_current_production_rows(db_session):
     result = list_root_products(db=db_session)
     assert result["total"] == 1
     assert result["rows"][0]["item_id"] == 10
+
+
+def test_r9_materials_read_current_payload_without_snapshot_fallback(db_session):
+    generation = _accepted_generation(db_session)
+    _snapshot(
+        db_session,
+        generation,
+        consumer="production_control_journal",
+        key="journal:v1",
+        rows=[{"row_key": "order:material", "payload": {
+            "journal_row_key": "order:material", "product_id": 77, "item_id": 10,
+            "material_coverage_snapshot": {
+                "ledger_generation_id": generation.id,
+                "components": [{"item_id": 20, "required_qty": 2}],
+            },
+        }}],
+    )
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+
+    result = get_order_line_materials(77, db=db_session)
+    assert result["components"][0]["item_id"] == 20
 
 
 def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
