@@ -911,7 +911,9 @@ snapshot не используется:
 | `production-control /orders/root-products` | persisted `root_product_options` in the current manifest | `test_r9_root_products_read_current_production_rows` |
 | production material/work-item reads | persisted `material_coverage_snapshot` on the current journal row | `test_r9_materials_read_current_payload_without_snapshot_fallback`, missing-manifest 503 regression |
 | purchase journal selection/materialize | `CurrentExecutionRow(purchase_control_journal)` identities plus `CurrentExecutionScope.source_revision`; current export batch anchors to scope, legacy snapshot FK remains nullable for historical batches | `tests/r9/test_r9_current_obligation_views.py`, `tests/r9/test_r9_purchase_current_anchor.py`, `tests/services/test_purchase_export_materialization_schema.py` |
-| MRP result rows/manifest/exports | compact `mrp_result` rows; top identity `mrp-run:{run_id}`, row identity remains business row key | `tests/r9/test_r9_mrp_current_reader.py` |
+| MRP summary/detail/grouped/category/capacity | compact `mrp_result` rows and per-run manifest; missing current scope is 503, with no legacy snapshot fallback | `tests/r9/test_r9_mrp_current_reader.py` |
+| MRP production/purchase/rework exports | current row/manifest identity and `source_revision` are returned for CSV/XLSX; rework export no longer references an undefined identity | `test_mrp_export_returns_current_identity_and_revision`, `test_mrp_rework_export_returns_current_identity_and_revision` |
+| MRP purchase export-to-1C | stable selected current identities + expected revision are required; identities resolve to current purchase rows, unknown/foreign rows fail closed; local fake retry proves one send/read-back | `test_mrp_purchases_to_1c_resolves_current_identity_and_revision`, `test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity` |
 | period execution | exact resolved current run; no all-run mixing | `backend/app/routers/plan.py`, commit `4b07347c` |
 
 Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
@@ -919,9 +921,11 @@ Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
 503), `85a23cba`, `91549375`, `677b3115`, `d0c51a4f` (root/material current
 reader regressions), `0bcc5635`, `2d6e8d11` (purchase current anchor/sort/schema
 and row transport red
-contract). Implementation commits: `4b07347c`, `59b4880d`,
+contract), `a323c6ff`, `a922cdf2`, `a92bc147` (complete MRP endpoint
+inventory, current export-to-1C identity/CAS and local fake retry contracts).
+Implementation commits: `4b07347c`, `59b4880d`,
 `1e5d611b`, `3573a758`, `1a87817c`, `de1a9b89`, `288d2ce8`, `0698737f`,
-`d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`.
+`d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`, `6f91171d`.
 
 Focused current-reader gate:
 
@@ -929,7 +933,17 @@ Focused current-reader gate:
 pytest -q tests/r9 tests/services/test_purchase_control_materialization.py \
   tests/services/test_purchase_export_materialization_schema.py \
   tests/services/test_supplier_future_supply.py
-64 passed in 8.1s
+42 passed in 5.60s (MRP/current-reader focused rerun)
+
+```text
+pytest -q tests/services/test_one_c_purchase_order_export.py \
+  -k "recovers_exact_posted_batch_without_duplicate or retry"
+5 passed, 13 deselected in 0.82s
+```
+
+The service-level fake-1C read-back test keeps the external `post_count` at
+one after a local SyncLink loss; the router test additionally checks the
+stable current idempotency adapter contract.
 ```
 
 Frontend static gates on the current checkout:
@@ -940,8 +954,7 @@ npm run lint    # PASS
 npx vitest run src/ui/pages/PurchaseControlPage.test.tsx --reporter=dot  # 9 passed
 ```
 
-Не выполнены и не заявляются: all MRP grouped/detail route parity, production
-export/read-back fault
+Не выполнены и не заявляются: production export/read-back fault
 gate, API OpenAPI regeneration, PostgreSQL MVCC gate, Playwright critical path,
 and full `pytest` from the final R9 implementation commit. `current-execution-
 full-pytest.log` сохранён и не изменён. Удалённые пути: **нет**; remaining
