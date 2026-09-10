@@ -90,3 +90,29 @@ def test_real_fastapi_read_endpoint_returns_measured_latency():
     assert payload["api_sample_count"] >= 5
     assert latency["p50"] >= 0
     assert latency["p95"] >= latency["p50"]
+
+
+@pytest.mark.integration
+def test_api_baseline_seed_is_idempotent_and_has_required_timestamps():
+    dsn = _r2_dsn()
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PRODPLAN_R2_TEST_DSN"] = dsn
+    command = [sys.executable, "tools/r2-baseline.py", "--dsn", dsn]
+    first = subprocess.run(command, cwd=repo_root, env=env, capture_output=True, text=True)
+    second = subprocess.run(command, cwd=repo_root, env=env, capture_output=True, text=True)
+    assert first.returncode == 0, f"first baseline failed:\n{first.stdout}\n{first.stderr}"
+    assert second.returncode == 0, f"second baseline failed:\n{second.stdout}\n{second.stderr}"
+    import json
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(sa.text("SELECT count(*) FROM items WHERE item_code LIKE 'r2-%'")).scalar_one() == 3
+            assert connection.execute(
+                sa.text("SELECT count(*) FROM items WHERE item_code LIKE 'r2-%' AND created_at IS NOT NULL AND updated_at IS NOT NULL")
+            ).scalar_one() == 3
+        assert json.loads(first.stdout)["api_sample_count"] == json.loads(second.stdout)["api_sample_count"]
+    finally:
+        engine.dispose()

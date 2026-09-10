@@ -34,6 +34,21 @@ def test_r2_start_verify_entrypoint_is_documented_and_non_destructive():
     assert "PRODPLAN_R2_TEST_DSN" in docs
 
 
+def test_r2_windows_entrypoint_supports_wsl_without_apt_or_workers():
+    wrapper = (ROOT / "scripts" / "r2-postgres.ps1").read_text(encoding="utf-8")
+    wsl = (ROOT / "scripts" / "r2-postgres-wsl.ps1").read_text(encoding="utf-8")
+    assert "Runtime" in wrapper
+    assert "r2-postgres-wsl.ps1" in wrapper
+    assert "pg_lsclusters" in wsl
+    assert "pg_createcluster" in wsl
+    assert "55441" in wsl
+    assert "prodplan_r2" in wsl
+    assert "r2_user" in wsl
+    assert "apt install" not in wsl.lower()
+    assert "worker" not in wsl.lower()
+    assert "docker" not in wsl.lower()
+
+
 def test_synthetic_fixture_covers_r2_contract_without_credentials():
     data = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert data["seed"] == "r2-fixed-20260910-v1"
@@ -79,4 +94,6 @@ def test_baseline_declares_a_real_db_backed_fastapi_latency_probe():
     assert '"p50"' in source
     assert '"p95"' in source
     assert '"api_latency_ms": None' not in source
-
+    assert "created_at" in source
+    assert "updated_at" in source
+    assert "ON CONFLICT (item_code)" in source
