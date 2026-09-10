@@ -931,8 +931,8 @@ Implementation commits: `4b07347c`, `59b4880d`,
 `d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`, `6f91171d`,
 `03ffdbec`, `756e1dfb`.
 Current-link test-first commits are `b64126d5`, `a5509e9b`, `496f7e87`,
-`7499319e`, `5b9d3e17`, and `d6877dba`; implementation commits are `7a89adfa`
-and `c63e76b5`. The snapshot-only route characterization was updated in
+`7499319e`, `5b9d3e17`, `d6877dba`, and `c463175a`; implementation commits are
+`7a89adfa`, `c63e76b5`, and `3c21002d`. The snapshot-only route characterization was updated in
 `dce15e8e` to assert a missing-current 503 rather than preserve the cancelled
 fallback.
 
