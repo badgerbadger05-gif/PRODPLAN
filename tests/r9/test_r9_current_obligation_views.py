@@ -239,6 +239,69 @@ def test_r9_materials_missing_current_manifest_returns_503(db_session):
     assert getattr(caught.value, "status_code", None) == 503
 
 
+def test_r9_production_proposal_identity_survives_new_technical_generation(db_session):
+    first = _accepted_generation(db_session)
+    payload = {
+        "journal_row_key": "work-item:701",
+        "work_item_id": 701,
+        "source_mrp_requirement_id": 900,
+        "source_mrp_allocation_key": "alloc:A",
+        "item_id": 10,
+        "quantity": 5,
+        "remaining_qty": 5,
+    }
+    _snapshot(
+        db_session, first, consumer="production_control_journal", key="journal:v1",
+        rows=[{"row_key": "work-item:701", "payload": payload}],
+    )
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, first.id)
+    db_session.commit()
+    first_row = load_current_execution_rows(
+        db_session, entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )[0]
+    changes_before = db_session.query(models.CurrentExecutionChange).count()
+
+    second_batch = models.PhysicalImportBatch(
+        batch_key="r9-obligation-views-batch-2",
+        status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc),
+        source_watermarks={},
+    )
+    second = models.LedgerGeneration(
+        generation_key="r9-obligation-views-generation-2",
+        status="accepted",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc),
+        source_watermarks={},
+        capabilities={"physical_ledger": True, "reservation_replay": True, "assembly_queue": True},
+        physical_import_batch=second_batch,
+        algorithm_version="r9-test",
+        replay_version="r9-test",
+        accepted_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    db_session.add(second)
+    db_session.flush()
+    db_session.query(models.PlanningTruthState).filter(models.PlanningTruthState.id == 1).update(
+        {"current_generation_id": second.id}
+    )
+    _snapshot(
+        db_session, second, consumer="production_control_journal", key="journal:v1",
+        rows=[{"row_key": "work-item:701", "payload": payload}],
+    )
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, second.id)
+    db_session.commit()
+
+    current = load_current_execution_rows(
+        db_session, entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )[0]
+    assert current.id == first_row.id
+    assert current.business_identity == "production-mrp-requirement:900:alloc:A"
+    assert db_session.query(models.CurrentExecutionChange).count() == changes_before
+
+
 def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
     first = _accepted_generation(db_session)
     _snapshot(
