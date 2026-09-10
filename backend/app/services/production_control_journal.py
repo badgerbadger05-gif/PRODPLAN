@@ -371,6 +371,14 @@ def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[i
     for plan_id in sorted(plan_ids):
         pointer = db.get(PlanningLivePointer, int(plan_id))
         if pointer is None:
+            try:
+                is_postgres = db.get_bind().dialect.name == "postgresql"
+            except Exception:  # pragma: no cover - unbound unit sessions
+                is_postgres = False
+            if is_postgres:
+                raise ValueError(
+                    f"no active MRP pointer for plan {int(plan_id)}"
+                )
             selected.update(
                 int(row[0]) for row in legacy_rows
                 if int(db.get(PlanningRun, int(row[0])).source_plan_id or -1) == plan_id
