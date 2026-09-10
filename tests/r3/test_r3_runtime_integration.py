@@ -103,7 +103,7 @@ def test_pointer_and_successor_are_idempotent_and_direct(db_session):
         period_to=date(2026, 9, 30), status="fixed",
     )
     first = models.PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=1)
-    second = models.PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=1)
+    second = models.PlanningRun(status="BUILDING_SNAPSHOT", config_snapshot={}, source_plan_id=1)
     db_session.add(plan)
     db_session.flush()
     first.source_plan_id = plan.id
