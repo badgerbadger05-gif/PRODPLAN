@@ -752,3 +752,169 @@ def publish_current_execution_from_generation(
         "drum": drum_result,
         "shelf": shelf_result,
     }
+
+
+def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
+    """Resolve a stable business key without using technical snapshot ids."""
+    for key in (
+        "row_key", "journal_row_key", "business_identity", "requirement_id",
+        "source_mrp_requirement_id", "order_id", "product_id", "item_id",
+    ):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value) if key in {"row_key", "journal_row_key", "business_identity"} else f"{key}:{value}"
+    return f"payload:{_hash(payload)}:{fallback}"
+
+
+def publish_current_obligation_views_from_generation(
+    db: Session,
+    generation_id: int,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Promote accepted obligation/read-model snapshots to compact current rows.
+
+    The immutable snapshots remain publication evidence.  User reads use these
+    rows, so a technical generation id is provenance only and never a current
+    identity.  The operation is deliberately a no-op when the same semantic
+    payload is published again.
+    """
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise CurrentExecutionUnavailable("current obligation views require an accepted generation")
+
+    results: dict[str, CurrentExecutionPublishResult] = {}
+
+    def _publish(
+        *,
+        consumer: str,
+        entity_kind: str,
+        scope_key: str,
+        rows: list[dict[str, Any]],
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        results[consumer] = publish_current_execution_scope(
+            db,
+            source_revision=f"accepted:g{int(generation.id)}:{consumer}",
+            source_generation_id=int(generation.id),
+            scope_key=scope_key,
+            rows=rows,
+            entity_kinds=(entity_kind,),
+            summary=summary,
+        )
+
+    production = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "production_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one_or_none()
+    production_rows: list[dict[str, Any]] = []
+    if production is not None:
+        production_rows = [
+            {
+                "entity_kind": "production_control_journal",
+                "business_identity": _snapshot_row_identity(dict(row.payload or {}), str(row.id)),
+                "scope_key": "production:all-live-orders",
+                "payload": dict(row.payload or {}),
+            }
+            for row in db.query(models.PlanningReadRow).filter(
+                models.PlanningReadRow.snapshot_id == int(production.id),
+            ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all()
+        ]
+    _publish(
+        consumer="production_control_journal",
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+        rows=production_rows,
+        summary={"total_rows": len(production_rows)},
+    )
+
+    purchase = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one_or_none()
+    purchase_payload = dict(purchase.payload or {}) if purchase is not None else {}
+    purchase_source_rows = purchase_payload.get("rows")
+    purchase_rows: list[dict[str, Any]] = []
+    if isinstance(purchase_source_rows, list):
+        purchase_rows = [
+            {
+                "entity_kind": "purchase_control_journal",
+                "business_identity": _snapshot_row_identity(dict(row), str(index)),
+                "scope_key": "purchase:all-live-plans",
+                "payload": dict(row),
+            }
+            for index, row in enumerate(purchase_source_rows)
+            if isinstance(row, dict)
+        ]
+    _publish(
+        consumer="purchase_control_journal",
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        rows=purchase_rows,
+        summary=dict(purchase_payload.get("summary") or {"total_rows": len(purchase_rows)}),
+    )
+
+    mrp_rows: list[dict[str, Any]] = []
+    mrp_snapshots = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "mrp_result",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc(), models.PlanningReadSnapshot.id.asc()).all()
+    for snapshot in mrp_snapshots:
+        run_marker = snapshot.snapshot_key.removeprefix("run:").split(":", 1)[0]
+        for row in db.query(models.PlanningReadRow).filter(
+            models.PlanningReadRow.snapshot_id == int(snapshot.id),
+        ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
+            payload = dict(row.payload or {})
+            payload.setdefault("run_id", int(run_marker) if run_marker.isdigit() else None)
+            payload.setdefault("row_kind", str(row.row_kind))
+            mrp_rows.append({
+                "entity_kind": "mrp_result",
+                "business_identity": f"{snapshot.snapshot_key}:{row.row_kind}:{row.row_key}",
+                "scope_key": "mrp:all-live-plans",
+                "payload": payload,
+            })
+    _publish(
+        consumer="mrp_result",
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+        rows=mrp_rows,
+        summary={"total_rows": len(mrp_rows)},
+    )
+
+    execution_rows: list[dict[str, Any]] = []
+    execution_snapshots = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "period_plan_execution",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc(), models.PlanningReadSnapshot.id.asc()).all()
+    for snapshot in execution_snapshots:
+        payload = dict(snapshot.payload or {})
+        plan = dict(payload.get("plan") or {})
+        run_id = payload.get("run_id")
+        source_rows = payload.get("rows")
+        if not isinstance(source_rows, list):
+            continue
+        for index, row in enumerate(source_rows):
+            if not isinstance(row, dict):
+                continue
+            row_payload = dict(row)
+            row_payload.setdefault("run_id", run_id)
+            row_payload.setdefault("plan_id", plan.get("id"))
+            identity = _snapshot_row_identity(row_payload, str(index))
+            execution_rows.append({
+                "entity_kind": "period_plan_execution",
+                "business_identity": f"plan:{plan.get('id')}:{identity}",
+                "scope_key": "period-plan:all-live-plans",
+                "payload": row_payload,
+            })
+    _publish(
+        consumer="period_plan_execution",
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
+        rows=execution_rows,
+        summary={"total_rows": len(execution_rows)},
+    )
+    return results

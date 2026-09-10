@@ -1097,6 +1097,12 @@ def publish_obligation_refresh_batch(
         snapshot.truth_status = "accepted"
         snapshot.reason = None
         snapshot.published_at = accepted_at
+    # Current user-facing obligation/result views are promoted only after all
+    # candidate snapshots have crossed the accepted boundary.  Snapshot rows
+    # remain immutable evidence; the compact current owner is the runtime read
+    # model and never selects by a historical generation id.
+    from .item_ledger.current_execution import publish_current_obligation_views_from_generation
+    publish_current_obligation_views_from_generation(db, int(target.id))
     try:
         db.flush()
     except IntegrityError as exc:
