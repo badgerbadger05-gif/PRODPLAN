@@ -311,6 +311,25 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
         order_date=dt.datetime(2026, 7, 20),
         order_ref1c="SUP-42",
     ))
+    db_session.add(models.LedgerFutureSupplyCurrent(
+        current_identity="supplier_order:SUP-42:1:",
+        source_generation_id=int(generation_id),
+        source_capture_batch_id=int(batch.id),
+        supply_kind="supplier_order",
+        item_id=seeded["a"],
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="W1",
+        source_ref="SUP-42",
+        source_line_ref="1",
+        ordered_qty_at_cutoff=Decimal("12"),
+        realized_qty_at_cutoff=Decimal("5"),
+        open_qty_at_cutoff=Decimal("7"),
+        eta_date=dt.date(2026, 8, 15),
+        source_state_key="ordered",
+        capture_cutoff=dt.datetime(2026, 7, 23, 23, 59),
+        source_content_hash="a" * 64,
+        evidence_status="exact",
+    ))
     db_session.commit()
 
     response = client.get(f"/api/v1/item-ledger/{seeded['a']}/future-supply")
