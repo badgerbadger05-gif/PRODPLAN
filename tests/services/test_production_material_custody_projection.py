@@ -290,6 +290,65 @@ def test_local_issue_event_advances_compact_current_custody_without_rebuild(db_s
     assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 3
 
 
+def test_local_tail_does_not_skip_unseen_physical_event(db_session):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key="custody-compact-gap", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="COMPACTGAP")
+    manifest = _manifest(
+        db_session, generation_id=generation.id, source_event_high_watermark_id=0
+    )
+    manifest.is_baseline = True
+    db_session.add(
+        ProductionMaterialCustodyEvent(
+            issue_id=None,
+            product_id=product.product_id,
+            component_item_id=component.item_id,
+            source_kind="transfer_posted",
+            source_sle_id=999,
+            effective_at=cutoff + timedelta(minutes=1),
+            location_kind="workshop",
+            warehouse_ref1c="WH-MAIN",
+            delta_qty=2,
+            idempotency_key="custody-compact-gap:physical",
+        )
+    )
+    db_session.flush()
+    issue = ProductionMaterialIssue(
+        document_number="MT-COMPACT-GAP",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-DST",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    line = ProductionMaterialIssueLine(
+        issue_id=issue.issue_id,
+        component_item_id=component.item_id,
+        required_qty=1,
+        issued_qty=0,
+    )
+    db_session.add(line)
+    db_session.flush()
+    append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=1,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        effective_at=cutoff + timedelta(minutes=2),
+    )
+    with pytest.raises(MaterialCustodySnapshotUnavailable, match="unpublished event tail"):
+        load_compact_current_material_custody(
+            db_session, consumer="test.compact.gap"
+        )
+
+
 def test_current_accepted_custody_refolds_an_event_dated_inside_the_cutoff(
     db_session,
 ):
