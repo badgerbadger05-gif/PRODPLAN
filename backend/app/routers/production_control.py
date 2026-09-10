@@ -55,7 +55,11 @@ from ..services.production_control_material_availability import (
     preview_make_work_item_materials,
 )
 from ..services.production_control_live_launch import overlay_execution_state, overlay_launch_facts
-from ..services.item_ledger.current_execution import CurrentExecutionUnavailable
+from ..services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    load_current_execution_rows,
+    require_current_execution_scope,
+)
 from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
     mark_route_sheets_printed_by_snapshot_members,
@@ -1055,6 +1059,8 @@ class LineStatePayload(BaseModel):
     planned_start_date: Optional[str] = None
     planned_finish_date: Optional[str] = None
     comment: Optional[str] = None
+    current_identity: Optional[str] = None
+    expected_source_revision: Optional[str] = None
 
 
 class MaterialIssueCreatePayload(BaseModel):
@@ -1062,6 +1068,8 @@ class MaterialIssueCreatePayload(BaseModel):
     initiated_by: Optional[str] = None
     warehouse_ref1c: Optional[str] = None
     source_warehouse_ref1c: Optional[str] = None
+    current_identities: List[str] = Field(default_factory=list)
+    expected_source_revision: Optional[str] = None
 
 
 class MakeWorkItemLaunchPayload(BaseModel):
@@ -1110,10 +1118,14 @@ class ProduceLinePayload(BaseModel):
     executor: Optional[str] = None
     operation_executors: Optional[List[dict]] = None
     comment: Optional[str] = None
+    current_identity: Optional[str] = None
+    expected_source_revision: Optional[str] = None
 
 
 class CloseProductionOrderPayload(BaseModel):
     dry_run: bool = True
+    current_identity: Optional[str] = None
+    expected_source_revision: Optional[str] = None
 
 
 class ExportManufacturesPayload(BaseModel):
@@ -1134,6 +1146,48 @@ class ExportPieceworkPayload(BaseModel):
     dry_run: bool = True
     # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
+
+
+def _require_current_production_action(
+    db: Session,
+    *,
+    product_id: int,
+    current_identity: Optional[str],
+    expected_source_revision: Optional[str],
+):
+    """Resolve a technical product locator only through the current journal row."""
+    if not current_identity or not expected_source_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "production_current_identity_and_revision_required",
+            },
+        )
+    manifest = require_current_execution_scope(
+        db,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
+    if str(expected_source_revision) != str(manifest.source_revision):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "production_current_revision_stale",
+                "expected_source_revision": manifest.source_revision,
+            },
+        )
+    rows = [
+        row for row in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        if str(row.business_identity) == str(current_identity)
+        and int((row.payload or {}).get("product_id") or 0) == int(product_id)
+    ]
+    if len(rows) != 1:
+        raise CurrentExecutionUnavailable("current production action identity is missing or ambiguous")
+    return manifest, rows[0]
 
 
 class AssembleMaterialIssuePayload(BaseModel):
@@ -1692,6 +1746,12 @@ def post_produce_line(
     these document writes is itself a production fact.
     """
     try:
+        _require_current_production_action(
+            db,
+            product_id=int(product_id),
+            current_identity=payload.current_identity,
+            expected_source_revision=payload.expected_source_revision,
+        )
         command = produce_line(
             db,
             int(product_id),
@@ -1752,6 +1812,13 @@ def post_produce_line(
             "piecework_export": piecework_export,
             "ledger_readback": "queued",
         }
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "production_control_current_unavailable", "reason": str(e)},
+        ) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1765,6 +1832,12 @@ def post_close_production_order(
     db: Session = Depends(get_db),
 ):
     try:
+        _require_current_production_action(
+            db,
+            product_id=int(product_id),
+            current_identity=payload.current_identity,
+            expected_source_revision=payload.expected_source_revision,
+        )
         product = (
             db.query(ProductionProduct)
             .filter(ProductionProduct.product_id == int(product_id))
@@ -1777,6 +1850,13 @@ def post_close_production_order(
             [int(product.order_id)],
             dry_run=bool(payload.dry_run),
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "production_control_current_unavailable", "reason": str(e)},
+        ) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
