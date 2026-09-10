@@ -3980,6 +3980,14 @@ class ReservationConsumptionAllocation(Base):
             "reservation_id",
             name="uq_res_consumption_generation_sle_reservation",
         ),
+        Index(
+            "uq_res_consumption_current_sle_reservation",
+            "sle_id",
+            "reservation_id",
+            unique=True,
+            postgresql_where=text("is_current = true"),
+            sqlite_where=text("is_current = 1"),
+        ),
         CheckConstraint(
             "match_rule IN ('pegged', 'fifo')",
             name="ck_reservation_consumption_allocation_match_rule",
@@ -4037,6 +4045,10 @@ class ReservationConsumptionAllocation(Base):
     organization_ref = Column(String(36), nullable=False, server_default="")
     planning_stock_pool = Column(String(64), nullable=False, server_default="default")
     idempotency_key = Column(String(160), nullable=False)
+    # Current R4 assignments reuse this canonical table while historical
+    # generations remain immutable rows.  The partial unique index makes the
+    # current fact/recipient identity stable without colliding with history.
+    is_current = Column(Boolean, nullable=False, default=False, server_default="false")
     event_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
     ingested_at = Column(
         TIMESTAMP, nullable=False, default=func.now(), server_default=func.now(),
@@ -4047,6 +4059,75 @@ class ReservationConsumptionAllocation(Base):
     stock_ledger_entry = relationship("StockLedgerEntry")
     requirement = relationship("MrpRequirement")
     item = relationship("Item")
+
+
+class CurrentReplenishmentState(Base):
+    """Compact source/revision marker owned by the current writer."""
+
+    __tablename__ = "current_replenishment_state"
+    __table_args__ = (
+        UniqueConstraint("scope_key", name="uq_current_replenishment_state_scope"),
+        CheckConstraint(
+            "writer_key = 'current_replenishment'",
+            name="ck_current_replenishment_state_writer",
+        ),
+        CheckConstraint(
+            "status IN ('applying', 'completed')",
+            name="ck_current_replenishment_state_status",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    scope_key = Column(String(160), nullable=False)
+    ledger_generation_id = Column(
+        BigInteger, ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    source_revision = Column(BigInteger, nullable=False)
+    writer_key = Column(String(64), nullable=False, server_default="current_replenishment")
+    status = Column(String(16), nullable=False, server_default="completed")
+    changed_pairs = Column(Integer, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    ledger_generation = relationship("LedgerGeneration")
+
+
+class CurrentReplenishmentAudit(Base):
+    """Audit only actual assignment basis changes; no quantity fold reads it."""
+
+    __tablename__ = "current_replenishment_audit"
+    __table_args__ = (
+        UniqueConstraint(
+            "scope_key", "source_revision", "sle_id", "reservation_id", "operation",
+            name="uq_current_replenishment_audit_change",
+        ),
+        Index("ix_current_replenishment_audit_reservation", "reservation_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    state_id = Column(
+        BigInteger, ForeignKey("current_replenishment_state.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    ledger_generation_id = Column(
+        BigInteger, ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    scope_key = Column(String(160), nullable=False)
+    source_revision = Column(BigInteger, nullable=False)
+    sle_id = Column(BigInteger, ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"), nullable=False)
+    reservation_id = Column(BigInteger, ForeignKey("reservation_entry.id", ondelete="RESTRICT"), nullable=False)
+    operation = Column(String(16), nullable=False)
+    before_qty = Column(DECIMAL(15, 3), nullable=True)
+    after_qty = Column(DECIMAL(15, 3), nullable=True)
+    before_match_rule = Column(String(16), nullable=True)
+    after_match_rule = Column(String(16), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    state = relationship("CurrentReplenishmentState")
+    ledger_generation = relationship("LedgerGeneration")
+    reservation = relationship("ReservationEntry")
+    stock_ledger_entry = relationship("StockLedgerEntry")
 
 
 class ReplenishmentWorkItem(Base):

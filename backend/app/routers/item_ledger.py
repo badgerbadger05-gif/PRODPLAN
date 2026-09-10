@@ -31,6 +31,7 @@ from .. import models
 from ..database import get_db
 from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..services.item_ledger.physical_visibility import visible_sle_query
+from ..services.item_ledger.current_replenishment import read_current_replenishment
 from ..services.item_ledger.reservation import replenishment_remaining
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
@@ -139,6 +140,13 @@ class ItemLedgerReservationPriority(BaseModel):
     period_to: Optional[str]
 
 
+class ItemLedgerReservationAllocation(BaseModel):
+    id: int
+    sle_id: int
+    allocated_qty: float
+    match_rule: str
+
+
 class ItemLedgerReservationRow(BaseModel):
     reservation_id: int
     run_id: Optional[int]
@@ -153,6 +161,7 @@ class ItemLedgerReservationRow(BaseModel):
     replenishment_received_qty: float
     replenishment_remaining_qty: float
     lifecycle_status: str
+    allocations: List[ItemLedgerReservationAllocation]
 
 
 class ItemLedgerReservationsResponse(BaseModel):
@@ -608,6 +617,19 @@ def get_reservations(
     if run_id is not None:
         q = q.filter(models.ReservationEntry.run_id == int(run_id))
     entries = q.order_by(models.ReservationEntry.id.asc()).all()
+    current_allocations = read_current_replenishment(
+        db, generation_id=generation_id, item_id=int(item_id)
+    )
+    allocations_by_reservation: Dict[int, List[dict]] = {}
+    for allocation in current_allocations:
+        allocations_by_reservation.setdefault(int(allocation["reservation_id"]), []).append(
+            {
+                "id": int(allocation["id"]),
+                "sle_id": int(allocation["sle_id"]),
+                "allocated_qty": float(allocation["allocated_qty"]),
+                "match_rule": str(allocation["match_rule"]),
+            }
+        )
 
     # resolve run → plan names in one pass.
     run_ids = {int(e.run_id) for e in entries if e.run_id is not None}
@@ -654,6 +676,7 @@ def get_reservations(
                 )
             ),
             "lifecycle_status": e.lifecycle_status,
+            "allocations": allocations_by_reservation.get(int(e.id), []),
         })
     return {"rows": rows, "truth_meta": _truth_meta(truth)}
 
