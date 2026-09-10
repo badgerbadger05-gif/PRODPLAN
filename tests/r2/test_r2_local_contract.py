@@ -49,6 +49,20 @@ def test_r2_windows_entrypoint_supports_wsl_without_apt_or_workers():
     assert "docker" not in wsl.lower()
 
 
+def test_r2_wsl_runtime_owns_root_commands_and_exact_keeper_state():
+    wsl = (ROOT / "scripts" / "r2-postgres-wsl.ps1").read_text(encoding="utf-8")
+    assert "-u root" in wsl
+    assert "sudo" not in wsl.lower()
+    assert "Start-Process" in wsl
+    assert "tail" in wsl
+    assert "WindowStyle Hidden" in wsl
+    assert "LOCALAPPDATA" in wsl
+    assert "keeper" in wsl.lower()
+    assert "Get-Process" in wsl
+    assert "Stop-Process" in wsl
+    assert "start_utc" in wsl or "startUtc" in wsl
+
+
 def test_synthetic_fixture_covers_r2_contract_without_credentials():
     data = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert data["seed"] == "r2-fixed-20260910-v1"
