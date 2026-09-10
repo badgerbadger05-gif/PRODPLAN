@@ -532,3 +532,129 @@ def test_legacy_current_writer_is_rejected_and_separate_reader_sees_one_state(db
         assert other.query(models.CurrentReplenishmentState).count() == 1
     finally:
         other.close()
+
+
+def test_scope_identity_is_canonical_and_source_stream_cannot_bypass_revision(db_session):
+    generation_id, _item_id, reservations, facts = _world(db_session)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:stream-a",
+        source_revision=4,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    with pytest.raises(CurrentReplenishmentError, match="source stream|revision"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:stream-b",
+            source_revision=1,
+            facts=facts,
+            reserves=reserves,
+            complete_scope=True,
+        )
+
+
+def test_verified_empty_scope_clears_only_that_distribution_scope(db_session):
+    generation_id, item_id, reservations, facts = _world(db_session)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    foreign = db_session.get(models.ReservationEntry, reservations[1].id)
+    foreign.planning_stock_pool = "foreign"
+    foreign_row = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        reservation_id=reservations[1].id, is_current=True
+    ).one()
+    foreign_row.planning_stock_pool = "foreign"
+    db_session.commit()
+    with pytest.raises(CurrentReplenishmentError, match="distribution_scope"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:r4",
+            source_revision=2,
+            facts=(),
+            reserves=(),
+            complete_scope=True,
+        )
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=2,
+        facts=(),
+        reserves=(),
+        distribution_scope=(item_id, "", "", "selected", "buy"),
+        complete_scope=True,
+    )
+    db_session.commit()
+    assert result.deleted == 1
+    assert db_session.get(models.ReservationConsumptionAllocation, foreign_row.id) is not None
+    assert db_session.get(models.ReservationConsumptionAllocation, foreign_row.id).is_current is True
+
+
+def test_postgresql_visibility_is_atomic_across_current_state_and_execution():
+    dsn = __import__("os").environ.get("PRODPLAN_R2_TEST_DSN")
+    if not dsn:
+        pytest.skip("PRODPLAN_R2_TEST_DSN is not configured")
+    pytest.importorskip("psycopg2")
+    import sqlalchemy as sa
+    from sqlalchemy.orm import Session
+    from app.r2_local_contract import validate_r2_dsn
+
+    validate_r2_dsn(dsn)
+    engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
+    writer = Session(engine)
+    reader = Session(engine)
+    try:
+        generation_id, item_id, reservations, facts = _world(writer, prefix="pg-visible")
+        reserves = _reserves(reservations)
+        apply_current_replenishment(
+            writer,
+            generation_id=generation_id,
+            source_key="physical:visible",
+            source_revision=1,
+            facts=facts,
+            reserves=reserves,
+            complete_scope=True,
+        )
+        writer.commit()
+        reader.expire_all()
+        before = read_current_replenishment(reader, generation_id=generation_id, item_id=item_id)
+        changed = list(facts)
+        changed[0] = Fact(**{**facts[0].__dict__, "qty": Decimal("6")})
+        apply_current_replenishment(
+            writer,
+            generation_id=generation_id,
+            source_key="physical:visible",
+            source_revision=2,
+            facts=changed,
+            reserves=reserves,
+            complete_scope=True,
+        )
+        still_old = read_current_replenishment(reader, generation_id=generation_id, item_id=item_id)
+        assert [(r["allocated_qty"], r["id"]) for r in still_old] == [
+            (r["allocated_qty"], r["id"]) for r in before
+        ]
+        writer.commit()
+        reader.expire_all()
+        after = read_current_replenishment(reader, generation_id=generation_id, item_id=item_id)
+        assert after[0]["allocated_qty"] == Decimal("6")
+        assert reader.query(models.CurrentReplenishmentState).filter_by(source_revision=2).count() == 1
+    finally:
+        writer.rollback()
+        writer.close()
+        reader.close()
+        engine.dispose()
