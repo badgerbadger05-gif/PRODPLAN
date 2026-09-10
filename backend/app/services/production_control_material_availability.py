@@ -819,7 +819,7 @@ def _snapshot_matches_line_command(
     return abs(_to_float(product.quantity) - _to_float(stored)) <= 1e-6
 
 
-def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
+def _get_materials_snapshot_legacy(db: Session, product_id: int) -> Dict[str, Any]:
     """Read coverage only from the accepted production-journal snapshot."""
     from .. import models
     from .planning_truth import get_latest_read_snapshot
@@ -937,3 +937,38 @@ def _active_product_ids(db: Session, *, limit: int = 0) -> List[int]:
     if limit:
         query = query.limit(max(0, int(limit)))
     return [int(row[0]) for row in query.all()]
+
+
+def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
+    """Read the persisted current journal coverage; never replay a snapshot."""
+
+    from .. import models
+    from .item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
+        load_current_execution_rows,
+        require_current_execution_scope,
+    )
+
+    manifest = require_current_execution_scope(
+        db,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
+    matching = [
+        row for row in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        if int((row.payload or {}).get("product_id") or 0) == int(product_id)
+    ]
+    if len(matching) != 1:
+        raise CurrentExecutionUnavailable("current production material row is missing or ambiguous")
+    material = (matching[0].payload or {}).get("material_coverage_snapshot")
+    if not isinstance(material, dict):
+        raise CurrentExecutionUnavailable("current production material coverage is missing")
+    public = public_materials_payload(material)
+    public["truth_status"] = "accepted"
+    generation = db.get(models.LedgerGeneration, int(manifest.source_generation_id or 0))
+    public["cutoff"] = generation.cutoff.isoformat() if generation and generation.cutoff else None
+    return public
