@@ -285,9 +285,10 @@ def test_r9_production_proposal_identity_survives_new_technical_generation(db_se
     db_session.query(models.PlanningTruthState).filter(models.PlanningTruthState.id == 1).update(
         {"current_generation_id": second.id}
     )
+    second_payload = {**payload, "journal_row_key": "work-item:702", "work_item_id": 702}
     _snapshot(
         db_session, second, consumer="production_control_journal", key="journal:v1",
-        rows=[{"row_key": "work-item:701", "payload": payload}],
+        rows=[{"row_key": "work-item:702", "payload": second_payload}],
     )
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, second.id)
@@ -299,6 +300,8 @@ def test_r9_production_proposal_identity_survives_new_technical_generation(db_se
     )[0]
     assert current.id == first_row.id
     assert current.business_identity == "production-mrp-requirement:900:alloc:A"
+    first_updated_at = first_row.updated_at
+    assert current.updated_at == first_updated_at
     assert db_session.query(models.CurrentExecutionChange).count() == changes_before
 
 
