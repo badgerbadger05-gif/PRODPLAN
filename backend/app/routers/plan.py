@@ -74,7 +74,24 @@ def _read_all_mrp_snapshot_rows(
     date_to: Optional[str] = None,
     sort_dir: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Read all export rows while pinning every page to one snapshot id."""
+    """Read all current rows while pinning every page to one manifest revision.
+
+    The historical name is retained for builder/migration call sites only;
+    a user-facing grouped/detail/export request must establish the current
+    manifest before any paging helper can touch rows.  This prevents a
+    missing current scope from falling through to a legacy snapshot.
+    """
+    try:
+        require_current_execution_scope(
+            db,
+            entity_kind="mrp_result",
+            scope_key="mrp:all-live-plans",
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "mrp_result_current_unavailable", "reason": str(exc)},
+        ) from exc
     rows: list[dict[str, Any]] = []
     offset = 0
     pinned_snapshot_id = snapshot_id

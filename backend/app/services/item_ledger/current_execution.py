@@ -309,6 +309,88 @@ def get_current_execution_scope(
     ).one_or_none()
 
 
+def load_current_execution_coherent(
+    db: Session,
+    *,
+    entity_kind: str,
+    scope_key: str,
+) -> tuple[models.CurrentExecutionScope, list[models.CurrentExecutionRow]]:
+    """Read one current scope and its rows under one publication boundary.
+
+    The manifest is the publication lock.  A publisher locks it before
+    replacing current rows, so this reader either locks the old complete
+    scope or waits for the new complete scope; it cannot observe a manifest
+    from one publication and rows from another.  The separate row query also
+    preserves a valid empty scope, which is distinct from a missing/not-ready
+    manifest.
+    """
+    scope_model = models.CurrentExecutionScope
+    row_model = models.CurrentExecutionRow
+    # Lock the manifest in its own statement.  At READ COMMITTED PostgreSQL
+    # rechecks a row after waiting for the publisher, while an outer-join
+    # statement can retain its pre-wait snapshot for the nullable rows and
+    # return a new manifest with old rows.  The second statement therefore
+    # starts only after the publication lock is acquired and sees one whole
+    # committed version.  A row-share lock is sufficient and avoids locking
+    # the nullable side of an outer join.
+    manifest = (
+        db.query(scope_model)
+        .filter(
+            scope_model.entity_kind == str(entity_kind),
+            scope_model.scope_key == str(scope_key),
+        )
+        .with_for_update(read=True, of=scope_model)
+        .one_or_none()
+    )
+    if manifest is None:
+        raise CurrentExecutionUnavailable("current execution manifest is missing")
+    if not bool(manifest.result_ready):
+        raise CurrentExecutionUnavailable("current execution manifest is not ready")
+
+    # Refresh the accepted-truth pointer after acquiring the publication lock;
+    # a generation publisher cannot advance the pointer and this manifest in
+    # between these reads within the same transaction.
+    truth_pointer = (
+        db.query(models.PlanningTruthState)
+        .populate_existing()
+        .filter(models.PlanningTruthState.id == 1)
+        .one_or_none()
+    )
+    expected_generation_id = int(truth_pointer.current_generation_id or 0) if truth_pointer else 0
+    if expected_generation_id:
+        if int(manifest.source_generation_id or 0) != expected_generation_id:
+            raise CurrentExecutionUnavailable("current execution manifest is stale for accepted truth")
+        generation = (
+            db.query(models.LedgerGeneration)
+            .populate_existing()
+            .filter(models.LedgerGeneration.id == expected_generation_id)
+            .one_or_none()
+        )
+        if generation is None or str(generation.status or "") != "accepted":
+            raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    elif manifest.source_generation_id is not None:
+        generation = (
+            db.query(models.LedgerGeneration)
+            .populate_existing()
+            .filter(models.LedgerGeneration.id == int(manifest.source_generation_id))
+            .one_or_none()
+        )
+        if generation is None or str(generation.status or "") != "accepted":
+            raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    rows = (
+        db.query(row_model)
+        .filter(
+            row_model.entity_kind == str(entity_kind),
+            row_model.scope_key == str(scope_key),
+            row_model.result_status == "accepted",
+            row_model.result_ready.is_(True),
+        )
+        .order_by(row_model.business_identity.asc(), row_model.id.asc())
+        .all()
+    )
+    return manifest, rows
+
+
 def require_current_execution_scope(
     db: Session,
     *,
@@ -316,23 +398,9 @@ def require_current_execution_scope(
     scope_key: str,
 ) -> models.CurrentExecutionScope:
     """Return only a scope whose manifest matches the accepted semantic pointer."""
-    manifest = get_current_execution_scope(db, entity_kind=entity_kind, scope_key=scope_key)
-    if manifest is None:
-        raise CurrentExecutionUnavailable("current execution manifest is missing")
-    if not bool(manifest.result_ready):
-        raise CurrentExecutionUnavailable("current execution manifest is not ready")
-    truth_pointer = db.get(models.PlanningTruthState, 1)
-    expected_generation_id = int(truth_pointer.current_generation_id or 0) if truth_pointer else 0
-    if expected_generation_id:
-        if int(manifest.source_generation_id or 0) != expected_generation_id:
-            raise CurrentExecutionUnavailable("current execution manifest is stale for accepted truth")
-        generation = db.get(models.LedgerGeneration, expected_generation_id)
-        if generation is None or str(generation.status or "") != "accepted":
-            raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
-    elif manifest.source_generation_id is not None:
-        generation = db.get(models.LedgerGeneration, int(manifest.source_generation_id))
-        if generation is None or str(generation.status or "") != "accepted":
-            raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    manifest, _rows = load_current_execution_coherent(
+        db, entity_kind=entity_kind, scope_key=scope_key,
+    )
     return manifest
 
 
