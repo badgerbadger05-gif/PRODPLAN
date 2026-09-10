@@ -460,6 +460,23 @@ def test_persistence_ignores_legacy_received_qty_and_cross_generation_pin(db_ses
     assert provenance.evidence_payload["signed_qty"] == "3"
 
 
+def test_r4_current_writer_persists_supplier_provenance_without_reservation_events(
+    db_session,
+):
+    generation, req = _persistence_fixture(db_session, legacy_received=0)
+    result = rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="r4-current",
+        writer_mode="current",
+    )
+    db_session.commit()
+    assert result.exact_fact_count == 1
+    assert db_session.query(models.ReservationEvent).count() == 0
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 1
+
+
 @pytest.mark.parametrize(
     ("supplier_line_characteristic", "evidence_characteristic"),
     [
