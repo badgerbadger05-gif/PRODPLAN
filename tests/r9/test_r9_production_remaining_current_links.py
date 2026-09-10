@@ -123,6 +123,8 @@ def test_open_paint_weld_fails_closed_when_counterpart_lacks_current_anchor(monk
     import app.routers.production_control as router
 
     row = _current_row(product_id=77)
+    row.payload.update({"item_id": 10, "source_run_id": 5, "source_mrp_requirement_id": 11})
+    db = _AnchorDb(requirements=[SimpleNamespace(id=101, run_id=5, item_id=20, freeze_version=1)])
     monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
     monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [row])
     monkeypatch.setattr(
@@ -139,7 +141,7 @@ def test_open_paint_weld_fails_closed_when_counterpart_lacks_current_anchor(monk
                 expected_source_revision="accepted:g7",
                 initiated_by="test",
             ),
-            db=object(),
+            db=db,
         )
     assert getattr(caught.value, "status_code", None) == 503
 
