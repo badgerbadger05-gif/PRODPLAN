@@ -30,6 +30,7 @@ from .historical_replay_core import (
 
 
 WRITER_KEY = "current_replenishment"
+DistributionScope = tuple[int, str, str, str, str]
 
 
 class CurrentReplenishmentError(ValueError):
@@ -80,8 +81,15 @@ def _allocation_scope(
     )
 
 
-def _input_checksum(facts: tuple[Fact, ...], reserves: tuple[Reserve, ...]) -> str:
+def _scope_key(scope: DistributionScope) -> str:
+    return json.dumps(list(scope), ensure_ascii=False, separators=(",", ":"))
+
+
+def _input_checksum(
+    facts: tuple[Fact, ...], reserves: tuple[Reserve, ...], scope_key: str
+) -> str:
     payload = {
+        "distribution_scope": scope_key,
         "facts": [
             {
                 "id": str(row.fact_id),
@@ -130,8 +138,11 @@ def _as_allocation(row: models.ReservationConsumptionAllocation) -> Allocation:
 
 
 def _require_complete_scope(
-    facts: tuple[Fact, ...], reserves: tuple[Reserve, ...], complete_scope: bool
-) -> tuple[int, str, str, str, str] | None:
+    facts: tuple[Fact, ...],
+    reserves: tuple[Reserve, ...],
+    complete_scope: bool,
+    distribution_scope: DistributionScope | None,
+) -> DistributionScope:
     if complete_scope is not True:
         raise CurrentReplenishmentError(
             "current replenishment requires an explicit complete scope"
@@ -147,7 +158,18 @@ def _require_complete_scope(
         raise CurrentReplenishmentError(
             "complete scope must cover exactly one distribution pool"
         )
-    return next(iter(scopes)) if scopes else None
+    if not scopes:
+        if distribution_scope is None:
+            raise CurrentReplenishmentError(
+                "empty complete scope requires distribution_scope"
+            )
+        return tuple(distribution_scope)
+    derived = next(iter(scopes))
+    if distribution_scope is not None and tuple(distribution_scope) != derived:
+        raise CurrentReplenishmentError(
+            "distribution_scope does not match complete scope inputs"
+        )
+    return derived
 
 
 def _audit_change(
@@ -157,7 +179,7 @@ def _audit_change(
     generation: models.LedgerGeneration,
     entry: models.ReservationEntry,
     fact_id: str,
-    source_key: str,
+    scope_key: str,
     source_revision: int,
     operation: str,
     before: Allocation | None,
@@ -169,7 +191,7 @@ def _audit_change(
         models.CurrentReplenishmentAudit(
             state_id=int(state.id),
             ledger_generation_id=int(generation.id),
-            scope_key=str(source_key),
+            scope_key=str(scope_key),
             source_revision=int(source_revision),
             sle_id=int(fact_id),
             reservation_id=int(entry.id),
@@ -191,6 +213,7 @@ def apply_current_replenishment(
     facts: Iterable[Fact],
     reserves: Iterable[Reserve],
     complete_scope: bool,
+    distribution_scope: DistributionScope | None = None,
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     writer: str = WRITER_KEY,
 ) -> CurrentReplenishmentResult:
@@ -205,8 +228,11 @@ def apply_current_replenishment(
 
     fact_rows = tuple(facts)
     reserve_rows = tuple(reserves)
-    distribution_scope = _require_complete_scope(fact_rows, reserve_rows, complete_scope)
-    input_checksum = _input_checksum(fact_rows, reserve_rows)
+    distribution_scope = _require_complete_scope(
+        fact_rows, reserve_rows, complete_scope, distribution_scope
+    )
+    canonical_scope_key = _scope_key(distribution_scope)
+    input_checksum = _input_checksum(fact_rows, reserve_rows, canonical_scope_key)
     if _text(writer) != WRITER_KEY:
         raise CurrentReplenishmentError(
             "single current writer is current_replenishment; legacy writer is retired"
@@ -233,13 +259,17 @@ def apply_current_replenishment(
 
     state = (
         db.query(models.CurrentReplenishmentState)
-        .filter(models.CurrentReplenishmentState.scope_key == _text(source_key))
+        .filter(models.CurrentReplenishmentState.scope_key == canonical_scope_key)
         .with_for_update()
         .one_or_none()
     )
     if state is not None:
         if _text(state.writer_key) != WRITER_KEY:
             raise CurrentReplenishmentError("single current writer is current_replenishment")
+        if _text(state.source_key) != _text(source_key):
+            raise CurrentReplenishmentError(
+                "source stream changed for canonical distribution scope"
+            )
         previous_revision = int(state.source_revision)
         if revision < previous_revision:
             raise CurrentReplenishmentError(
@@ -250,7 +280,8 @@ def apply_current_replenishment(
                 raise CurrentReplenishmentError("same source revision has payload drift")
             if _text(state.status) != "completed":
                 raise CurrentReplenishmentError("current source marker is still applying")
-            if int(state.ledger_generation_id) != int(generation.id):
+            generation_changed = int(state.ledger_generation_id) != int(generation.id)
+            if generation_changed:
                 state.ledger_generation_id = int(generation.id)
                 state.updated_at = datetime.now(timezone.utc)
                 db.flush()
@@ -263,11 +294,12 @@ def apply_current_replenishment(
                 deleted=0,
                 changed_pairs=0,
                 audit_events=0,
-                idempotent=True,
+                idempotent=not generation_changed,
             )
     else:
         state = models.CurrentReplenishmentState(
-            scope_key=_text(source_key),
+            scope_key=canonical_scope_key,
+            source_key=_text(source_key),
             ledger_generation_id=int(generation.id),
             source_revision=revision,
             scope_checksum=input_checksum,
@@ -279,8 +311,18 @@ def apply_current_replenishment(
 
     allocations = (
         db.query(models.ReservationConsumptionAllocation)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReservationConsumptionAllocation.reservation_id,
+        )
         .filter(
             models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.item_id == distribution_scope[0],
+            models.ReservationConsumptionAllocation.characteristic_ref == distribution_scope[1],
+            models.ReservationConsumptionAllocation.organization_ref == distribution_scope[2],
+            models.ReservationConsumptionAllocation.planning_stock_pool == distribution_scope[3],
+            models.ReservationEntry.realization_mode == distribution_scope[4],
         )
         .with_for_update()
         .order_by(models.ReservationConsumptionAllocation.id.asc())
@@ -288,10 +330,20 @@ def apply_current_replenishment(
     )
     legacy_allocations = (
         db.query(models.ReservationConsumptionAllocation)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReservationConsumptionAllocation.reservation_id,
+        )
         .filter(
             models.ReservationConsumptionAllocation.ledger_generation_id
             == int(generation.id),
             models.ReservationConsumptionAllocation.is_current.is_(False),
+            models.ReservationConsumptionAllocation.item_id == distribution_scope[0],
+            models.ReservationConsumptionAllocation.characteristic_ref == distribution_scope[1],
+            models.ReservationConsumptionAllocation.organization_ref == distribution_scope[2],
+            models.ReservationConsumptionAllocation.planning_stock_pool == distribution_scope[3],
+            models.ReservationEntry.realization_mode == distribution_scope[4],
         )
         .with_for_update()
         .all()
@@ -358,7 +410,7 @@ def apply_current_replenishment(
             generation=generation,
             entry=entry,
             fact_id=old.fact_id,
-            source_key=_text(source_key),
+            scope_key=canonical_scope_key,
             source_revision=revision,
             operation="delete",
             before=old,
@@ -382,7 +434,7 @@ def apply_current_replenishment(
             generation=generation,
             entry=entry,
             fact_id=update.after.fact_id,
-            source_key=_text(source_key),
+            scope_key=canonical_scope_key,
             source_revision=revision,
             operation="update",
             before=update.before,
@@ -436,7 +488,7 @@ def apply_current_replenishment(
             generation=generation,
             entry=entry,
             fact_id=insertion.fact_id,
-            source_key=_text(source_key),
+            scope_key=canonical_scope_key,
             source_revision=revision,
             operation="insert",
             before=None,
@@ -522,3 +574,149 @@ def read_current_replenishment(
         }
         for row in query.all()
     ]
+
+
+def reject_legacy_supplier_receipt_writer(
+    db: Session, reservation: models.ReservationEntry
+) -> None:
+    """Retire ReservationEvent as a second writer after R4 owns a scope.
+
+    ``ReservationEvent`` remains historical evidence for pre-R4 generation
+    builds.  Once the accepted current writer has a completed marker for this
+    business scope, a supplier-receipt rebuild must not fold the same receipt
+    into the reservation a second time.
+    """
+
+    scope = (
+        int(reservation.item_id),
+        _text(reservation.characteristic_ref),
+        _text(reservation.organization_ref),
+        _text(reservation.planning_stock_pool),
+        _text(reservation.realization_mode),
+    )
+    state = (
+        db.query(models.CurrentReplenishmentState)
+        .filter(models.CurrentReplenishmentState.scope_key == _scope_key(scope))
+        .first()
+    )
+    if state is not None and _text(state.status) == "completed":
+        raise CurrentReplenishmentError(
+            "supplier receipt ReservationEvent writer is retired for an R4 current scope"
+        )
+
+
+def apply_current_replenishment_for_accepted_generation(
+    db: Session, *, generation_id: int, source_revision: int | None = None
+) -> tuple[CurrentReplenishmentResult, ...]:
+    """Publish current supplier-receipt replenishment at physical acceptance.
+
+    This is the production orchestration adapter: it reads only the accepted
+    generation's positive receipt facts and its frozen buy reservations, then
+    delegates all persistence to :func:`apply_current_replenishment` in the
+    caller's transaction.  A single item cannot be silently fanned out to
+    multiple pools because the physical receipt has no pool identity; such an
+    ambiguous input fails closed.
+    """
+
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or _text(generation.status) != "accepted":
+        raise CurrentReplenishmentError(
+            "current replenishment publication requires an accepted generation"
+        )
+    reservations = tuple(
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.ledger_generation_id == int(generation_id),
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.realization_mode == "buy",
+            models.ReservationEntry.replenishment_required_qty > 0,
+        )
+        .order_by(models.ReservationEntry.id.asc())
+        .all()
+    )
+    if not reservations:
+        return ()
+    item_scopes: dict[int, set[DistributionScope]] = {}
+    for row in reservations:
+        item_scopes.setdefault(int(row.item_id), set()).add(
+            (
+                int(row.item_id),
+                _text(row.characteristic_ref),
+                _text(row.organization_ref),
+                _text(row.planning_stock_pool),
+                _text(row.realization_mode),
+            )
+        )
+    for item_id, scopes in item_scopes.items():
+        if len(scopes) > 1:
+            raise CurrentReplenishmentError(
+                f"receipt facts for item {item_id} have ambiguous distribution pools"
+            )
+    facts_by_item: dict[int, tuple[Fact, ...]] = {}
+    sle_rows = (
+        db.query(models.StockLedgerEntry)
+        .filter(
+            models.StockLedgerEntry.ingest_batch_id == generation.physical_import_batch_id,
+            models.StockLedgerEntry.active.is_(True),
+            models.StockLedgerEntry.movement_kind == "receipt",
+            models.StockLedgerEntry.qty > 0,
+        )
+        .order_by(models.StockLedgerEntry.id.asc())
+        .all()
+    )
+    for item_id, scope_set in item_scopes.items():
+        scope = next(iter(scope_set))
+        facts_by_item[item_id] = tuple(
+            Fact(
+                fact_id=str(row.id),
+                item_id=int(row.item_id),
+                mode="buy",
+                qty=_decimal(row.qty),
+                posting_at=row.posting_at,
+                characteristic_ref=scope[1],
+                organization_ref=scope[2],
+                planning_stock_pool=scope[3],
+            )
+            for row in sle_rows
+            if int(row.item_id) == item_id
+        )
+    revision = int(source_revision if source_revision is not None else generation.id)
+    result: list[CurrentReplenishmentResult] = []
+    for item_id, scope_set in sorted(item_scopes.items()):
+        scope = next(iter(scope_set))
+        reserve_rows = tuple(
+            Reserve(
+                reserve_id=str(row.id),
+                item_id=int(row.item_id),
+                mode="buy",
+                reserved_qty=_decimal(row.replenishment_required_qty),
+                due_date=row.priority_period_to,
+                plan_period_from=row.priority_period_from,
+                plan_period_to=row.priority_period_to,
+                run_id=int(row.run_id or 0),
+                requirement_id=int(row.requirement_id),
+                characteristic_ref=scope[1],
+                organization_ref=scope[2],
+                planning_stock_pool=scope[3],
+            )
+            for row in reservations
+            if int(row.item_id) == item_id
+        )
+        facts = facts_by_item[item_id]
+        if not facts:
+            # An accepted complete scope with no physical receipt explicitly
+            # clears only this scope; it is not an unavailable empty import.
+            facts = ()
+        result.append(
+            apply_current_replenishment(
+                db,
+                generation_id=int(generation_id),
+                source_key="accepted-physical-receipts",
+                source_revision=revision,
+                facts=facts,
+                reserves=reserve_rows,
+                distribution_scope=scope,
+                complete_scope=True,
+            )
+        )
+    return tuple(result)

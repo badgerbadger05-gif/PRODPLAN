@@ -4079,6 +4079,7 @@ class CurrentReplenishmentState(Base):
 
     id = Column(BigIntPK, primary_key=True, autoincrement=True)
     scope_key = Column(String(160), nullable=False)
+    source_key = Column(String(160), nullable=False, server_default="")
     ledger_generation_id = Column(
         BigInteger, ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
         nullable=False, index=True,

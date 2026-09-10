@@ -22,6 +22,7 @@ from .reservation import (
 
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
+from .current_replenishment import reject_legacy_supplier_receipt_writer
 
 
 RECEIPT_OPERATION = "8d97069c"
@@ -199,6 +200,10 @@ def _append_reservation_event(
     reservation = allocation.reservation
     if reservation.id is None:
         return False
+    # ReservationEvent remains historical evidence only.  Once the accepted
+    # current scope has an R4 marker, this competing replenishment writer is
+    # explicitly retired for that reservation.
+    reject_legacy_supplier_receipt_writer(db, reservation)
     qty = _decimal(allocation.qty)
     if qty == 0:
         return False
