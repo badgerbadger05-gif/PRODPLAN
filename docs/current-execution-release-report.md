@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальные волны R1 и R2. Продовые БД, SSH,
+Дата среза: 2026-09-10. Область: локальные волны R1–R4. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 ## Сводка волн
@@ -20,7 +20,7 @@ OData, боевые workers, deploy и push не использовались.
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R4 пока не принимается; R5–R11 намеренно не продвигаются.
+волны. R1–R4 приняты локально; R5–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -87,7 +87,7 @@ pytest -q tests/contracts/test_r1_semantic_contract.py tests/test_canon_invarian
 Остаточные риски: backdate требует доказать минимальный incremental scope в
 R5; schema/persistence пока generation-bound; API/UI ещё не передают новый
 `history_mode`; persistence и downstream API/UI migration ещё не проверялись.
-Эти риски не разрешают объявлять R3–R11 выполненными.
+Эти риски не разрешают объявлять R5–R11 выполненными.
 
 ## R2 evidence
 
@@ -242,7 +242,7 @@ SSH/OData, live 1С, deploy или workers нет.
 
 R3 принято локально после подключения runtime writers и atomic publish
 boundaries, focused PostgreSQL gate, migration round-trip и полного pytest с
-нулём skips. R4 не начиналась.
+нулём skips. R4 принята локально в отдельном разделе ниже.
 
 ### Commits and files
 
