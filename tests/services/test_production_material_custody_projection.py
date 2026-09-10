@@ -11,6 +11,7 @@ from app.models import (
     PhysicalImportBatch,
     ProductionMaterialCustodyEvent,
     ProductionMaterialIssue,
+    ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionMaterialCustodyProjectionManifest,
     ProductionMaterialCustodyProjection,
@@ -27,9 +28,11 @@ from app.services.production_material_custody_projection import (
     publish_current_material_custody,
     _same_1c_timestamp,
     load_current_accepted_material_custody,
+    load_compact_current_material_custody,
     load_material_custody_projection,
 )
 from app.services.planning_truth import publish_generation
+from app.services.production_material_custody_events import append_material_issue_custody_event
 
 
 def test_same_1c_timestamp_accepts_postgres_aware_and_legacy_naive_wall_time():
@@ -237,6 +240,54 @@ def test_current_accepted_custody_folds_local_events_after_cutoff(db_session):
     assert generation_id == generation.id
     assert state.for_product(product.product_id).in_transit[component.item_id] == 5
     assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 5
+
+
+def test_local_issue_event_advances_compact_current_custody_without_rebuild(db_session):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key="custody-compact-local", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="COMPACTLOCAL")
+    manifest = _manifest(
+        db_session, generation_id=generation.id, source_event_high_watermark_id=0
+    )
+    manifest.is_baseline = True
+    issue = ProductionMaterialIssue(
+        document_number="MT-COMPACT-LOCAL",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-DST",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    line = ProductionMaterialIssueLine(
+        issue_id=issue.issue_id,
+        component_item_id=component.item_id,
+        required_qty=3,
+        issued_qty=0,
+    )
+    db_session.add(line)
+    db_session.flush()
+    appended = append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=3,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        effective_at=cutoff + timedelta(minutes=1),
+    )
+    assert appended is True
+    db_session.flush()
+
+    generation_id, state = load_compact_current_material_custody(
+        db_session, consumer="test.compact.local"
+    )
+    assert generation_id == generation.id
+    assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 3
 
 
 def test_current_accepted_custody_refolds_an_event_dated_inside_the_cutoff(
@@ -826,8 +877,25 @@ def test_published_custody_keeps_rewind_baseline_cells(db_session):
     target.status = "accepted"
     db_session.flush()
 
-    # This append is newer than target's watermark but dated after the retained
-    # baseline cutoff, so the next build must rewind to the baseline cells.
+    intermediate = _generation(
+        db_session,
+        key="custody-retention-intermediate",
+        cutoff=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+    intermediate.status = "building"
+    db_session.flush()
+    build_material_custody_projection(
+        db_session, ledger_generation_id=intermediate.id
+    )
+    assert publish_current_material_custody(
+        db_session, ledger_generation_id=intermediate.id
+    ) == 1
+    intermediate.status = "accepted"
+    db_session.flush()
+
+    # This append is newer than the intermediate watermark but dated inside its
+    # window. The intermediate cells are compacted away, so the next build must
+    # skip its orphan manifest and rewind to the retained baseline cells.
     _event(
         db_session,
         source_kind="issue_created",
@@ -838,12 +906,12 @@ def test_published_custody_keeps_rewind_baseline_cells(db_session):
         warehouse="WH-MAIN",
         qty=2,
         key="custody:retention:late",
-        effective_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+        effective_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
     )
     next_target = _generation(
         db_session,
         key="custody-retention-next",
-        cutoff=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        cutoff=datetime(2026, 8, 5, tzinfo=timezone.utc),
     )
     next_target.status = "building"
     db_session.flush()
