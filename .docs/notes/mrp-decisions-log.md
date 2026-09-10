@@ -740,3 +740,29 @@ Typed current adapter принимает только persisted supplier provena
 однозначного `match_status=exact`, остальные факты идут FIFO. Visible fact
 scope — полный accepted physical prefix, а default source revision — его
 `physical_import_batch_id`.
+
+## 35. Исправления, возвраты и backdate R5 (10.09.2026)
+
+R5 не создаёт второй FIFO/quantity owner: current publication повторно
+использует allocator из `supplier_receipt_allocation.py` и транзакционный writer
+R4. Канонический вход — полный signed stream accepted supplier facts в явном
+scope. Положительный receipt формирует basis, correction и supplier return
+уменьшают ранее назначенный basis; отрицательная строка не публикуется как
+текущая quantity. Replay идёт до фактического конца входного scope, а
+unmatched over-return остаётся диагностируемым `unmatched_return_qty`/audit
+reason и не порождает отрицательных allocations.
+
+Для истории сохраняются обе оси: `posting_at` означает время события, `known_at`
+— время принятия/correction. Caller обязан выбрать `history_mode`:
+`as_occurred` или `as_known`; fallback запрещён. Return с exact original
+reference, supplier-order line и без ссылки применяет соответствующее
+каноническое правило; адресная закупка ограничена persisted export cap, остаток
+проходит FIFO. Closed/unknown reservation не переоткрывается, а item-only
+совпадение не переносит assignment на новую obligation.
+
+Стабильная persistence identity остаётся `(sle_id, reservation_id)` и
+`allocation_role`. Если exact и FIFO части одного receipt попали в один pair,
+сохраняется `match_rule=mixed`; `pegged` допускается только для полностью
+addressed basis. `CurrentReplenishmentAudit.reason` и `basis_fact_ids` фиксируют
+только реальные basis changes с exactly-once source revision. Generation/snapshot
+не становятся идентичностью результата.

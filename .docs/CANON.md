@@ -285,3 +285,22 @@ owner.
 provenance старых generation builds, но не являются вторым текущим владельцем.
 После completed R4 marker их writer для того же scope отклоняется. Это не
 смешивает supplier receipt replenishment с assembly_out material consumption.
+
+## R5. Исправления, возвраты и backdate
+
+Текущий supplier-receipt результат строится тем же единственным allocator и
+current writer, что и R4. Полный signed stream accepted supplier facts
+replay-ится до фактической convergence boundary: correction/return уменьшает
+назначенный basis, но отрицательная строка не становится текущей quantity.
+Closed или неизвестная reservation не переоткрывается; unmatched return/surplus
+остаётся явным результатом.
+
+`posting_at` и `known_at` сохраняются у каждого факта, а отчёт выбирает явный
+`history_mode`: `as_occurred` либо `as_known`. Return rules, backdate и равные
+времена используют канонический allocator и устойчивый `sle_id` tie-break.
+
+Если exact и FIFO части попали в одну стабильную пару `(sle_id,
+reservation_id)`, provenance равен `mixed`; `pegged` означает только полностью
+addressed basis. Audit хранит reason и полный basis fact-id set только для
+реальных insert/update/delete basis changes. Generation и snapshot остаются
+provenance/technical data, а не identity current assignment.

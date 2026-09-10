@@ -175,3 +175,11 @@ fail-closed.
 В таблице явно хранится `allocation_role`: `material_consumption` используется
 freeze/custody consumers, `replenishment_receipt` — только current
 replenishment reader. Пересечение ролей в quantity sums запрещено.
+
+R5 использует этот же writer для полного signed replay supplier receipts,
+corrections и returns. Current хранит только положительный итог basis; exact и
+FIFO части одного стабильного pair получают `mixed`, а over-return остаётся
+явным unmatched result без отрицательной allocation. `posting_at` и `known_at`
+сохраняются вместе, `history_mode` выбирается явно, closed reservation не
+переоткрывается и assignment не переносится на новую obligation только по
+совпадению item.

@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальные волны R1–R4. Продовые БД, SSH,
+Дата среза: 2026-09-10. Область: локальные волны R1–R5. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 ## Сводка волн
@@ -11,7 +11,7 @@ OData, боевые workers, deploy и push не использовались.
 | R2 — локальный PostgreSQL и baseline | принято локально | WSL PostgreSQL 16 runtime, migration/rollback/API baseline/full gate зелёные; Docker остаётся необязательным альтернативным runtime |
 | R3 — устойчивые идентичности и принятие физики | принято локально | runtime writers, completeness/publish guards, live-MRP pointer, successor/frozen provenance и migration mapping проверены; focused PG и full gate зелёные |
 | R4 — транзакционные основания и текущее исполнение | принято локально | current writer, typed provenance, role separation, rebuild closure, PG atomicity и полный gate зелёные |
-| R5 — исправления, отмены и backdate | не начато | incremental persistence scope отложен в зависимую волну |
+| R5 — исправления, отмены и backdate | принято локально | signed replay, explicit history mode, mixed provenance, correction audit, migration and full local gate зелёные |
 | R6 — физический Ledger и custody | не начато | только контрактные границы R1 |
 | R7 — выпуск плана, MRP и будущие поставки | не начато | только зафиксированы границы successor MRP |
 | R8 — барабан, полки и мехцех | не начато | только owner/identity contract |
@@ -20,7 +20,7 @@ OData, боевые workers, deploy и push не использовались.
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R4 приняты локально; R5–R11 намеренно не продвигаются.
+волны. R1–R5 приняты локально; R6–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -87,7 +87,7 @@ pytest -q tests/contracts/test_r1_semantic_contract.py tests/test_canon_invarian
 Остаточные риски: backdate требует доказать минимальный incremental scope в
 R5; schema/persistence пока generation-bound; API/UI ещё не передают новый
 `history_mode`; persistence и downstream API/UI migration ещё не проверялись.
-Эти риски не разрешают объявлять R5–R11 выполненными.
+Эти риски не разрешают объявлять R6–R11 выполненными.
 
 ## R2 evidence
 
@@ -437,4 +437,95 @@ pytest -q
 
 Остаточные риски: adapter намеренно fail-closed при неоднозначных pool scope;
 локальная приёмка не является production rollout и не проверяет production
-contour. R5–R11 не начинались.
+contour. R6–R11 не начинались.
+
+## R5 evidence — локальная приёмка
+
+R5 имеет статус `принято локально` после focused semantic/legacy/canon gate,
+реального PostgreSQL replay gate, migration head `20260910_07` и полного pytest
+с нулём skips. Реализован signed replay corrections/returns поверх единого R4
+allocator/current writer: explicit `as_occurred`/`as_known`, сохранение
+`posting_at`/`known_at`, полная convergence boundary, closed/unknown fail-closed,
+mixed exact/FIFO provenance и явный over-return result. Production persistence
+не запускалась; OpenAPI surface не менялся, поскольку новый route/DTO не
+добавлялся.
+
+### Commits and fixtures
+
+* `9bbd8efe` — test-first базовые R5 fixtures для correction, cancel, return,
+  backdate, Decimal и metamorphic replay.
+* `ba4972d5` — test-first расширение return modes, addressed/aggregated caps,
+  history modes, unknown/closed и foreign pool.
+* `e855eaee` — test-first выравнивание ожидаемых результатов с полным
+  каноническим replay.
+* `066f5e0e` — test-first PostgreSQL/current integration: persisted correction
+  audit, exactly-once retry и out-of-order supersession с одной active version.
+* `45acb52c` — test-first mixed addressed provenance и over-return surplus.
+* `07e471b2` — implementation: signed replay/current-writer integration,
+  `known_at`, correction audit reason/basis IDs и migrations `20260910_06`,
+  `20260910_07` (`mixed` match rule).
+
+Fixtures: `tests/r5/test_r5_correction_returns.py` содержит hand-calculated
+addressed/FIFO, exact original/order-line/no-ref returns, backdate time-axis,
+out-of-order versions, closed/unknown obligations, foreign pool, Decimal,
+convergence and metamorphic cases. `tests/r5/test_r5_current_replay_integration.py`
+проверяет persisted correction audit, idempotent retry, stale revision, physical
+source guard, PostgreSQL path и supersession visibility.
+
+### Commands and results
+
+Красный test-first regression до implementation correction:
+
+```text
+pytest -q tests/r5/test_r5_correction_returns.py tests/r5/test_r5_current_replay_integration.py
+2 failed, 13 passed, 1 skipped — mixed provenance и unmatched_return_qty отсутствовали
+```
+
+Focused R5/affected/canon gate на локальном PostgreSQL:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'
+$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55442/prodplan_r2'
+pytest -q tests/r5/test_r5_correction_returns.py tests/r5/test_r5_current_replay_integration.py tests/services/test_supplier_receipt_allocation.py tests/services/test_current_replenishment_transaction.py tests/services/test_generation_lifecycle.py tests/services/test_obligation_refresh_orchestrator.py tests/services/test_reservation_consumption_allocation_schema.py tests/test_canon_invariants.py
+160 passed in 18.42s
+```
+
+R5 PostgreSQL replay subset after migration:
+
+```text
+pytest -q tests/r5/test_r5_current_replay_integration.py tests/r5/test_r5_correction_returns.py
+16 passed in 0.75s
+```
+
+Migration/round-trip/verify на чистом именованном локальном WSL PG16 cluster
+(`r5gate`, port 55442; основной R2 contour 55441 не изменялся):
+
+```text
+python tools/pg_rebuild_check.py --dsn $env:PRODPLAN_PG_CHECK_DSN --stages migrate,round-trip,verify
+PASS migrate 20260910_07 (head)
+PASS round-trip head -> 20260726_14 -> head
+PASS verify smoke: executable; known-empty failure; summary projection executable
+```
+
+Финальный полный gate с implementation commit `07e471b2`:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL='postgresql://r2_user:r2_local_only@127.0.0.1:55443/prodplan_r2'
+$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55442/prodplan_r2'
+pytest -q
+1987 passed, 35 warnings in 205.07s (0:03:25)
+```
+
+### Removed paths and residual risks
+
+Удалённые пути: **нет**. `current-execution-full-pytest.log` — чужой untracked
+файл, сохранён без изменений. Для финального full gate использованы два
+изолированных локальных WSL PostgreSQL 16.15 cluster: `r5integration` (55443)
+для integration tests и `r5gate` (55442) для чистого migration round-trip;
+production/SSH/OData/live 1С/workers/deploy/push не использовались.
+
+Остаточные риски: API/UI не получили новый history-mode route в R5 и продолжают
+использовать существующий current read contract; production contour не
+проверялся. Основной orchestrator contour 55441 ранее содержал накопленные
+integration rows, поэтому rebuild round-trip был доказан на отдельном named
+local contour, без очистки или остановки orchestrator DB.
