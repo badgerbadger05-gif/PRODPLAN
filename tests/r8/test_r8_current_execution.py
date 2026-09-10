@@ -12,6 +12,7 @@ from app.services.item_ledger.current_execution import (
     load_current_execution_rows,
     order_execution_queue,
     publish_current_execution_scope,
+    require_current_execution_scope,
 )
 
 
@@ -246,3 +247,31 @@ def test_r8_dependency_invalidation_makes_current_read_fail_closed(db_session):
         scope_key="assembly:all-live-plans",
     ).result_ready is False
     assert load_current_execution_rows(db_session, entity_kind="assembly_queue") == []
+
+
+def test_r8_scope_pointer_drift_fails_closed_even_when_manifest_is_ready(db_session):
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        rows=[_queue("queue:1", period="2026-09-10", plan_id=1, line_id=1)],
+        entity_kinds=("assembly_queue",),
+    )
+    pointer = db_session.query(models.CurrentExecutionPointer).one()
+    pointer.content_hash = "0" * 64
+    db_session.flush()
+    with pytest.raises(CurrentExecutionUnavailable, match="drift"):
+        require_current_execution_scope(
+            db_session,
+            entity_kind="assembly_queue",
+            scope_key="assembly:all-live-plans",
+        )
+
+
+def test_r8_missing_manifest_fails_closed_instead_of_using_legacy_snapshot(db_session):
+    with pytest.raises(CurrentExecutionUnavailable, match="manifest"):
+        require_current_execution_scope(
+            db_session,
+            entity_kind="assembly_queue",
+            scope_key="assembly:all-live-plans",
+        )
