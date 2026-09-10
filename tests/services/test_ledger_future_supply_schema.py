@@ -64,6 +64,22 @@ def test_ledger_future_supply_sqlite_schema_has_constraints():
     assert "ck_ledger_future_supply_evidence_status" in checks
 
 
+def test_ledger_future_supply_current_owner_metadata_contract():
+    current = models.LedgerFutureSupplyCurrent.__table__
+    change = models.LedgerFutureSupplyCurrentChange.__table__
+    assert current.name == "ledger_future_supply_current"
+    assert change.name == "ledger_future_supply_current_change"
+    assert not current.c.current_identity.nullable
+    assert not current.c.source_generation_id.nullable
+    assert not current.c.source_capture_batch_id.nullable
+    assert {tuple(column.name for column in c.columns) for c in current.constraints if c.__class__.__name__ == "UniqueConstraint"} >= {
+        ("current_identity",),
+    }
+    assert {"current_identity", "current_row_id", "source_generation_id", "operation", "before_payload", "after_payload"} <= {
+        column.name for column in change.columns
+    }
+
+
 def test_ledger_future_supply_migration_follows_shared_head():
     path = (
         Path(__file__).resolve().parents[2]

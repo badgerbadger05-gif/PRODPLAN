@@ -302,6 +302,44 @@ def test_current_future_supply_correction_reuses_row_and_audits_once(db_session)
         current_identity="supplier_order:SO-C:1:local-1"
     ).count() == 2
 
+    # A signed return/correction reopens the same source identity.  It updates
+    # the stable row once and appends exactly one business audit edge rather
+    # than creating a generation copy.
+    physical = models.PhysicalImportBatch(
+        batch_key="future-physical-stable-correction-return", status="completed",
+        cutoff=datetime(2026, 8, 2, 23, 59), source_watermarks={},
+    )
+    target = models.LedgerGeneration(
+        generation_key="future-generation-stable-correction-return", status="building",
+        cutoff=physical.cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical, algorithm_version="test",
+    )
+    db_session.add_all([physical, target])
+    db_session.flush()
+    target_batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+        batch_key="future-snapshot-stable-correction-return",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+    )
+    db_session.add(target_batch)
+    db_session.flush()
+    replace_future_supply_capture(
+        db_session, target.id, target_batch.id,
+        [_evidence(target, item, kind="supplier_order", ref="SO-C", line="1", ordered="10", realized="3")],
+    )
+    target_batch.status = "completed"
+    target.status = "accepted"
+    pointer.current_generation_id = target.id
+    db_session.flush()
+    publish_current_future_supply(db_session, target.id)
+
+    current = db_session.query(models.LedgerFutureSupplyCurrent).one()
+    assert int(current.id) == row_id
+    assert current.open_qty_at_cutoff == Decimal("7")
+    assert db_session.query(models.LedgerFutureSupplyCurrentChange).filter_by(
+        current_identity="supplier_order:SO-C:1:local-1"
+    ).count() == 3
+
 
 def test_building_future_supply_correction_cannot_mutate_current_without_publish(db_session):
     generation, batch, item = _context(db_session, "building-current-boundary")
