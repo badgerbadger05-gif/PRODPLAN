@@ -3,9 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   closeProductionOrder,
   deleteProductionOrder,
+  fetchRouteSheetsPrintHtml,
+  getWorkItemMaterials,
   listProductionOrders,
   listRootProductOptions,
   returnLeftoverComponents,
+  openPaintWeldChains,
   updateItem,
   updateOrderQuantity,
   updateOrderStatus,
@@ -190,5 +193,28 @@ describe('production-control current action transport', () => {
     expect(fetchMock.mock.calls[1]![0]).toBe(
       '/api/v1/production-control/orders/901/return-leftovers?initiated_by=erp-shell&current_identity=production%3Aorder%3A901&expected_source_revision=rev-7',
     )
+  })
+
+  it('sends current identity and revision for work-item materials, chain opening and route print', async () => {
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('route-sheets')) return new Response('<html/>', { status: 200 })
+      return new Response('{}', { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await getWorkItemMaterials(701, 5, 77, 'production-mrp-requirement:900:alloc:A', 'rev-7')
+    await openPaintWeldChains([101], ['production:order:101'], 'rev-7')
+    await fetchRouteSheetsPrintHtml([101], ['production:order:101'], 'rev-7')
+
+    expect(fetchMock.mock.calls[0]![0]).toContain('current_identity=production-mrp-requirement%3A900%3Aalloc%3AA')
+    expect(fetchMock.mock.calls[0]![0]).toContain('expected_source_revision=rev-7')
+    expect(JSON.parse(String((fetchMock.mock.calls[1]![1] as RequestInit).body))).toMatchObject({
+      current_identities: ['production:order:101'],
+      expected_source_revision: 'rev-7',
+    })
+    expect(JSON.parse(String((fetchMock.mock.calls[2]![1] as RequestInit).body))).toMatchObject({
+      current_identities: ['production:order:101'],
+      expected_source_revision: 'rev-7',
+    })
   })
 })
