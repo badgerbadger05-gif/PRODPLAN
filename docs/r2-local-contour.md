@@ -1,20 +1,28 @@
 # R2 local PostgreSQL contour
 
-R2 uses a disposable PostgreSQL-only Docker service with an explicit identity:
-`127.0.0.1:55441/prodplan_r2`, user `r2_user`, compose project
-`prodplan-r2-local`. The compose file starts no backend, frontend or worker and
-does not define external hosts. It is never a production connection.
+R2 uses a PostgreSQL-only local runtime with an explicit identity:
+`127.0.0.1:55441/prodplan_r2`, user `r2_user`. Docker Compose remains
+supported; on Windows the supported WSL runtime uses the named `Ubuntu`
+PostgreSQL 16 cluster on port `55441`. Neither runtime starts backend,
+frontend or worker processes, defines external hosts, or connects to a
+production database.
 
 ## Start and verify
 
-From the repository root, the single reproducible command is:
+From the repository root, the single reproducible Windows command is:
 
 ```powershell
-pwsh -NoProfile -File .\scripts\r2-postgres.ps1 start-verify
+pwsh -NoProfile -File .\scripts\r2-postgres.ps1 -Runtime wsl -Action start-verify
 ```
 
-The script only runs `up`/`stop`; it has no destructive `down -v` path. When
-the service is available, set the explicit DSN for tests and migration:
+The WSL entrypoint checks `psql`, `pg_lsclusters`, `pg_createcluster`,
+`pg_ctlcluster` and non-interactive `sudo`; it never runs `apt install`. It
+idempotently starts/verifies PostgreSQL 16 on port `55441`, provisions only
+`r2_user`/`prodplan_r2` when necessary, and verifies the exact local identity.
+Stopping acts only on the verified cluster owning port `55441`. The Docker
+command remains available as `-Runtime docker` and retains its non-destructive
+`up`/`stop` behavior; it has no `down -v` path. When the service is available,
+set the explicit DSN for tests and migration:
 
 ```powershell
 $env:PRODPLAN_R2_TEST_DSN = 'postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'
@@ -40,14 +48,20 @@ three deterministic item rows and probes the real FastAPI read route
 `p95` and `max` values plus `api_sample_count`; it never fabricates `null`.
 The route is representative of the DB-backed item-list read path and performs
 no mutation. The output and environment must be stored with the run before any
-thresholds are tuned.
+thresholds are tuned. A final repeated WSL run recorded:
+
+```text
+PostgreSQL 16.15 / Ubuntu / 127.0.0.1:55441
+seed=r2-fixed-20260910-v1, plans=2, movements=7
+sql_write_count=12, temp_table_bytes=32768
+api_sample_count=9, p50=3.705ms, p95=4.406ms, max=4.406ms
+elapsed_ms=1761.512
+```
 
 ## Current environment result
 
-On 2026-09-10 the safe checks found Docker CLI installed but its Linux engine
-pipe unavailable; no local PostgreSQL service, `psql` or `pg_isready` executable
-was available. WSL also could not reach its local service. Therefore the
-PostgreSQL migration, two-session rollback test and numeric baseline (including
-the API latency samples) remain blocked and are not reported as green. The
-probe refuses to run without a validated local DSN and a migrated `items`
+On 2026-09-10 Docker Desktop's Linux engine pipe was unavailable, but the
+supported WSL runtime was live and verified. Migration, two-session rollback,
+numeric baseline and API latency all passed against the explicit local DSN.
+The probe refuses to run without a validated local DSN and migrated `items`
 table. No external or production connection was attempted.

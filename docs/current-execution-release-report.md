@@ -8,7 +8,7 @@ OData, боевые workers, deploy и push не использовались.
 | Волна | Статус на срезе | Доказательство/граница |
 |---|---|---|
 | R1 — контракт данных, границы и предметные решения | принято локально | test-first `fd57f8fd`, документный gate `48cbd509`, implementation/docs `299ae84b` + follow-up решения; focused gate ниже |
-| R2 — локальный PostgreSQL и baseline | проверка заблокирована инфраструктурой | test-first `3f5f2914` + API probe `4eba5cfc`, implementation `ca885897` + `80fe4721`; static gate зелёный, Docker/PostgreSQL runtime недоступен |
+| R2 — локальный PostgreSQL и baseline | принято локально | WSL PostgreSQL 16 runtime, migration/rollback/API baseline/full gate зелёные; Docker остаётся необязательным альтернативным runtime |
 | R3 — устойчивые идентичности и принятие физики | не начато | production persistence не менялась |
 | R4 — транзакционные основания и текущее исполнение | не начато | runtime writers не переносились |
 | R5 — исправления, отмены и backdate | не начато | incremental persistence scope отложен в зависимую волну |
@@ -19,8 +19,8 @@ OData, боевые workers, deploy и push не использовались.
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
-`принято локально` для R1 выставлено только после зелёного документного gate;
-остальные волны намеренно не продвигаются.
+`принято локально` для R1 и R2 выставлено только после их зелёных gates;
+R3–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -103,6 +103,13 @@ R5; schema/persistence пока generation-bound; API/UI ещё не перед�
 * `80fe4721` — implementation API probe: детерминированный seed items,
   реальный `GET /api/v1/items/` через FastAPI `TestClient`, warm-up и 9
   измеренных samples.
+* `2c748a4a` — test-first обязательные timestamps/idempotence seed и WSL
+  runtime entrypoint.
+* `3fba61af` — implementation WSL runtime/identity guard и обязательные
+  `created_at`/`updated_at` для synthetic items.
+* `d29196a4` — test-first WSL `psql` transport для существующего локального
+  PostgreSQL rehearsal.
+* `c7962afa` — implementation WSL `psql` transport в `pg_rebuild_check.py`.
 * `tests/r2/test_r2_local_contract.py` и
   `tests/r2/test_r2_postgres_integration.py` — guard, migration, две сессии и
   rollback-проверки.
@@ -111,9 +118,10 @@ R5; schema/persistence пока generation-bound; API/UI ещё не перед�
   агрегированная закупка, FIFO/backdate, отмена, rework, material custody,
   закрытие и смена MRP без переноса исполнения.
 * `docker-compose.r2.yml`, `scripts/r2-postgres.ps1`,
-  `scripts/r2-postgres.sh`, `backend/app/r2_local_contract.py`,
-  `tools/r2-baseline.py`, `docs/r2-local-contour.md` — локальный PG-only
-  contour без backend/frontend/workers и external hosts.
+  `scripts/r2-postgres-wsl.ps1`, `scripts/r2-postgres.sh`,
+  `backend/app/r2_local_contract.py`, `tools/r2-baseline.py`,
+  `tools/pg_rebuild_check.py`, `docs/r2-local-contour.md` — локальный PG-only
+  contour без backend/frontend/worker процессов и external hosts.
 
 ### Commands and results
 
@@ -124,11 +132,11 @@ pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integrati
 4 failed, 1 passed, 2 skipped
 ```
 
-После реализации focused R2/canon gate:
+После реализации focused R2/canon/WSL rehearsal gate на живом DSN:
 
 ```text
 pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py tests/test_canon_invariants.py
-38 passed, 3 skipped in 5.52s
+52 passed in 19.95s
 ```
 
 Красный API-latency test-first прогон до реализации probe:
@@ -145,42 +153,66 @@ docker compose -f docker-compose.r2.yml config --quiet
 exit 0
 ```
 
-Единая команда запуска/проверки задокументирована как
-`pwsh -NoProfile -File .\scripts\r2-postgres.ps1 start-verify`. Реальный
-`verify` остановился на фактическом blocker: Docker CLI не смог открыть
-`npipe:////./pipe/dockerDesktopLinuxEngine`; локальные PostgreSQL service,
-`psql` и `pg_isready` также отсутствуют. Поэтому migration пустой БД,
-двухсессионный rollback и численный baseline не выдаются за выполненные.
+Единая команда запуска/проверки Windows задокументирована как
+`pwsh -NoProfile -File .\scripts\r2-postgres.ps1 -Runtime wsl -Action start-verify`.
+Фактический результат:
+
+```text
+prodplan_r2|r2_user|127.0.0.1
+R2 WSL PostgreSQL identity verified: 127.0.0.1:55441/prodplan_r2
+```
+
+Docker Desktop остаётся недоступен, но это необязательный альтернативный
+runtime; WSL PostgreSQL 16.15 является поддержанным локальным contour.
+
+Migration/round-trip/rehearsal:
+
+```text
+python tools/pg_rebuild_check.py --dsn $env:PRODPLAN_PG_CHECK_DSN --stages migrate,round-trip,clear,verify
+PASS migrate     20260909_02 (head)
+PASS round-trip  head -> 20260726_14 -> head
+SKIP clear       refusing destructive clear on a database this run did not create
+PASS verify      smoke: executable; known-empty failure; summary projection executable
+---- overall: PASS (smoke mode)
+```
+
+The clear skip is intentional protection for the named pre-existing local
+database; no destructive clear was executed.
 
 Обязательный полный gate с финального R2 implementation-состояния
-(`80fe4721`; report-only docs commit следует отдельно):
+(`c7962afa`, поверх `3fba61af`; report-only docs commit следует отдельно):
 
 ```text
 pytest -q
-1921 passed, 6 skipped, 35 warnings in 191.64s (0:03:11)
+1930 passed, 35 warnings in 203.87s (0:03:23)
 ```
 
-Шесть skip распределены так: три существующих opt-in PostgreSQL теста
-(`test_material_issue_locking.py`, `test_pg_rebuild_check.py`,
-`test_reservation_replenishment_core_migration.py`) и три новых R2
-integration-теста (migration, rollback, API latency) при отсутствии
-`PRODPLAN_R2_TEST_DSN`. Все три старых skip
-относятся к новому R2 контракту; после появления именно локального R2 DSN их
-нужно перевести в обязательный gate, а не оставлять скрытым skip. Ни один skip
-не переключался на production/default DSN.
+В полном gate skip отсутствуют: три прежних PostgreSQL проверки и три новых
+R2 integration-проверки были выполнены на явном WSL DSN. `pg_rebuild_check`
+получил WSL `psql` transport; ни один тест не переключался на
+production/default DSN.
 
 `tools/r2-baseline.py` фиксирует seed/объёмы, elapsed time, SQL writes,
 temporary table bytes и server identity. После успешной миграции он также
 возвращает числовые `api_sample_count`, `api_latency_ms.min`, `p50`, `p95` и
 `max` для DB-backed `GET /api/v1/items/?skip=0&limit=100`; `null` fallback
-удалён. Запуск baseline и получение численных latency отложены тем же
-инфраструктурным blocker, измерения и пороги не выдумывались.
+удалён. Фактический повторный baseline на WSL PostgreSQL 16.15:
+
+```text
+seed=r2-fixed-20260910-v1, plans=2, movements=7
+sql_write_count=12, temp_table_bytes=32768, elapsed_ms=1761.512
+api_endpoint=/api/v1/items/?skip=0&limit=100, api_sample_count=9
+api_latency_ms: min=3.483, p50=3.705, p95=4.406, max=4.406
+database=prodplan_r2, user=r2_user, server_address=127.0.0.1/32
+```
+
+Повтор idempotent seed сохранил ровно 3 synthetic item rows с ненулевыми
+`created_at`/`updated_at`.
 
 Удалённые пути: **нет**. Изменений production persistence, внешних адресов,
 SSH/OData, live 1С, deploy или workers нет.
 
-Остаточные риски: локальная PostgreSQL migration/concurrency и baseline ещё
-не доказаны; численная API latency пока не снята из-за отсутствующего
-runtime; три прежних PG skip требуют обязательного повторного прогона в
-доступном локальном контуре. Поэтому R2 не помечена `принято локально` и R3
-не начиналась.
+Остаточные риски: destructive `clear` rehearsal намеренно не выполнялся на
+уже существующем локальном кластере; Docker runtime не проверен из-за
+неработающего Docker Desktop, но WSL runtime воспроизводим и зелёный. R3 не
+начиналась.
