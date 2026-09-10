@@ -9,7 +9,7 @@ OData, боевые workers, deploy и push не использовались.
 |---|---|---|
 | R1 — контракт данных, границы и предметные решения | принято локально | test-first `fd57f8fd`, документный gate `48cbd509`, implementation/docs `299ae84b` + follow-up решения; focused gate ниже |
 | R2 — локальный PostgreSQL и baseline | принято локально | WSL PostgreSQL 16 runtime, migration/rollback/API baseline/full gate зелёные; Docker остаётся необязательным альтернативным runtime |
-| R3 — устойчивые идентичности и принятие физики | промежуточно: schema/contract slice проверен, не принято | implementation и full gate зелёные; orchestration writers ещё не переведены полностью |
+| R3 — устойчивые идентичности и принятие физики | принято локально | runtime writers, completeness/publish guards, live-MRP pointer, successor/frozen provenance и migration mapping проверены; focused PG и full gate зелёные |
 | R4 — транзакционные основания и текущее исполнение | не начато | runtime writers не переносились |
 | R5 — исправления, отмены и backdate | не начато | incremental persistence scope отложен в зависимую волну |
 | R6 — физический Ledger и custody | не начато | только контрактные границы R1 |
@@ -238,11 +238,11 @@ SSH/OData, live 1С, deploy или workers нет.
 неработающего Docker Desktop, но WSL runtime и keeper воспроизводимы и
 зелёные. R3 началась отдельным промежуточным schema/contract slice; см. ниже.
 
-## R3 evidence — промежуточный contract/schema slice
+## R3 evidence — accepted local gate
 
-R3 не объявляется принятой локально: выполнены schema/contract и migration
-guards, но зависимое подключение всех orchestration writers остаётся в R3 и
-не переносится в R4.
+R3 принято локально после подключения runtime writers и atomic publish
+boundaries, focused PostgreSQL gate, migration round-trip и полного pytest с
+нулём skips. R4 не начиналась.
 
 ### Commits and files
 
@@ -255,6 +255,14 @@ guards, но зависимое подключение всех orchestration wr
   provenance, R3 migration `20260910_01` и ingest identity writer.
 * `1ec015ec` — mechanical follow-up: ORM mapping table и закрытие FK/clear
   contract в `tools/sql/clear_rebuildable_ledger_projections.sql`.
+* `42c7739c` — additional runtime integration tests for identity, mapping,
+  pointer/successor, completeness and frozen provenance.
+* `67ce079f` — PostgreSQL integration coverage for R3 schema/visibility and
+  100-repeat identity stability.
+* `37cec300` — implementation wiring: runtime identity enforcement, physical
+  visibility guard, generation/obligation publication pointers and canonical
+  frozen-basis writer.
+* `36ea6472` — candidate-discard mapping cleanup preserving accepted history.
 * `tests/r3/test_r3_contract.py` — deterministic identity, incomplete/reordered
   page rejection, pointer-only current read и frozen provenance checks.
 * `docs/r3-identity-acceptance-contract.md` — boundary/owner summary without
@@ -274,6 +282,11 @@ guards, но зависимое подключение всех orchestration wr
   business history and does not replace technical generation lineage. Frozen
   requirements gain `frozen_basis_generation_id`; current facts cannot rewrite
   that basis.
+* Initial add/replacement publication updates pointer and successor in the
+  caller-owned transaction; retry is idempotent, while retirement leaves no
+  active pointer. Runtime identity collision fails closed; explicit legacy
+  migration preflight rejects ambiguous active duplicates before the unique
+  index and maps inactive/history copies deterministically.
 
 ### Commands and results
 
@@ -295,15 +308,17 @@ PASS migrate 20260910_01 (head)
 PASS round-trip head -> 20260726_14 -> head
 PASS verify; overall: PASS (smoke mode)
 
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3 tests/services/test_physical_refresh_discard.py tests/routers/test_item_ledger_admin_discard.py
+29 passed in 3.90s
+
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q
-1936 passed, 35 warnings in 220.74s (0:03:40)
+1944 passed, 35 warnings in 214.90s (0:03:34); 0 skipped
 ```
 
 Удалённые пути: **нет**. Сохранён untracked `current-execution-full-pytest.log`;
 его содержимое не изменялось.
 
-Остаточные риски/граница принятия: существующие orchestration writers ещё
-должны записывать page receipts и атомарно поддерживать live pointer/successor
-при публикации MRP; текущий slice предоставляет таблицы, guards и reader, но
-не заявляет завершение этой интеграции. Полный R3 acceptance gate поэтому не
-пройден, R4 не начиналась.
+Остаточные риски: migration round-trip и runtime integration выполнены только
+на локальном WSL PostgreSQL 16.15; production contour не проверялся и не
+разрешён текущей задачей. Удалённых путей нет, untracked
+`current-execution-full-pytest.log` сохранён без изменений. R4 не начиналась.
