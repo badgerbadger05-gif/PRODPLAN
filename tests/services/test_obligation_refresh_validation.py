@@ -452,6 +452,8 @@ def test_obligation_refresh_validation_rejects_execution_allocation_metric_row_d
             organization_ref="",
             planning_stock_pool="selected",
             idempotency_key=f"drift:g{target.id}:r{reservation.id}:sle{fact.id}",
+            allocation_role="material_consumption",
+            is_current=True,
             event_at=CUTOFF,
         )
     )

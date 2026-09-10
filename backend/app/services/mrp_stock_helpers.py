@@ -23,6 +23,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    PlanningTruthState,
     StockBin,
     StockWarehouse,
 )
@@ -96,8 +97,19 @@ def planning_stock_by_item(
     if item_ids is not None and not item_ids:
         return {}
     scope = planning_warehouse_scope(db)
-    # Current StockBin is compact and generation-independent.  The accepted
-    # generation remains the truth boundary checked by callers.
+    # Current StockBin is compact, but the requested provenance must still be
+    # the live truth pointer.  Never silently return a newer compact row to a
+    # stale generation-bound caller.
+    pointer = db.get(PlanningTruthState, 1)
+    current_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    if current_generation_id != int(ledger_generation_id):
+        raise ValueError(
+            "current StockBin provenance does not match requested Ledger generation"
+        )
     query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
         StockBin.is_current.is_(True)
     )
@@ -110,10 +122,24 @@ def planning_stock_by_item(
         organization_column=StockBin.organization_ref,
         organization_ref=organization_ref,
     )
-    return {
+    result = {
         int(item_id): float(quantity or 0)
         for item_id, quantity in query.group_by(StockBin.item_id).all()
     }
+    # A malformed compact projection must fail closed even if its rows happen
+    # to satisfy the requested query filters.
+    provenance_ids = {
+        int(generation_id)
+        for (generation_id,) in db.query(StockBin.ledger_generation_id)
+        .filter(StockBin.is_current.is_(True))
+        .distinct()
+        .all()
+    }
+    if provenance_ids and provenance_ids != {int(ledger_generation_id)}:
+        raise ValueError(
+            "current StockBin provenance contains a stale or ambiguous generation"
+        )
+    return result
 
 
 def _production_supply_qty_expr():
@@ -146,12 +172,14 @@ def effective_free_stock_by_item_all(db: Session) -> Dict[int, float]:
     warehouses cannot reduce stock counted elsewhere.
     """
     from .planning_truth import require_accepted
-    from .production_material_custody_projection import load_material_custody_projection
+    from .production_material_custody_projection import (
+        load_compact_current_material_custody,
+    )
 
     truth = require_accepted(db)
     physical = planning_stock_by_item(db, int(truth.generation_id))
-    custody = load_material_custody_projection(
-        db, ledger_generation_id=int(truth.generation_id)
+    _generation_id, custody = load_compact_current_material_custody(
+        db, consumer="mrp.stock.free"
     )
     scope = planning_warehouse_scope(db)
     reserved: Dict[int, float] = {}

@@ -228,11 +228,12 @@ def _warehouse_breakdown(db: Session, item_ids: Sequence[int]) -> Dict[int, List
     # Legacy-таблица остатков как запасной источник запрещена: разошедшиеся
     # цифры в шапке и в разбивке по складам объяснить будет нечем.
     truth = require_accepted(db)
-    from .production_material_custody_projection import load_material_custody_projection
+    from .production_material_custody_projection import (
+        load_compact_current_material_custody,
+    )
 
-    custody = load_material_custody_projection(
-        db,
-        ledger_generation_id=int(truth.generation_id),
+    _generation_id, custody = load_compact_current_material_custody(
+        db, consumer="release.feasibility"
     )
     result: Dict[int, List[Dict[str, Any]]] = {}
     rows = (

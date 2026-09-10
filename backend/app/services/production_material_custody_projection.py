@@ -1463,3 +1463,69 @@ def load_current_accepted_material_custody(
             state.by_warehouse_item[(warehouse, component_id)] = next_warehouse_qty
 
     return generation_id, state
+
+
+def load_compact_current_material_custody(
+    db: Session,
+    *,
+    consumer: str,
+) -> tuple[int, MaterialCustodyState]:
+    """Read the already-published compact custody projection only.
+
+    This is the read-model path for synchronous availability/release checks.
+    It deliberately does not replay events, search an older generation, or
+    rebuild a missing projection.  A non-empty event tail or malformed marker
+    is unavailable until the publication worker promotes a validated compact
+    state.
+    """
+    from .planning_truth import require_accepted_truth
+
+    truth = require_accepted_truth(db, consumer)
+    generation_id = int(truth.generation_id)
+    manifest = _read_manifest(db, generation_id=generation_id)
+    if manifest is None or str(manifest.status) != "complete":
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=None if manifest is None else int(manifest.ledger_generation_id),
+            reason="compact current custody manifest is missing or incomplete",
+        )
+    watermark = int(manifest.source_event_high_watermark_id)
+    observed = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0)).scalar()
+        or 0
+    )
+    if observed != watermark:
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason="compact current custody has an unpublished event tail",
+        )
+    rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .filter(models.ProductionMaterialCustodyProjection.is_current.is_(True))
+        .all()
+    )
+    if not rows:
+        generation_rows = (
+            db.query(models.ProductionMaterialCustodyProjection)
+            .filter_by(ledger_generation_id=generation_id)
+            .count()
+        )
+        if generation_rows:
+            raise MaterialCustodySnapshotUnavailable(
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="accepted custody projection has no compact current marker",
+            )
+        return generation_id, MaterialCustodyState()
+    if any(
+        int(row.ledger_generation_id) != generation_id
+        or int(row.source_event_high_watermark_id or 0) != watermark
+        for row in rows
+    ):
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason="compact current custody provenance is stale or ambiguous",
+        )
+    return generation_id, _state_from_projection_rows(rows)

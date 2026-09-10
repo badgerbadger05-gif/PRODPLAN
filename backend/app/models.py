@@ -4078,7 +4078,9 @@ class ReservationConsumptionAllocation(Base):
     # Current R4 assignments reuse this canonical table while historical
     # generations remain immutable rows.  The partial unique index makes the
     # current fact/recipient identity stable without colliding with history.
-    is_current = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Legacy material-consumption builders must opt in explicitly; otherwise
+    # an unreviewed historical row could leak into the compact current owner.
+    is_current = Column(Boolean, nullable=False, default=False, server_default="false")
     event_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
     ingested_at = Column(
         TIMESTAMP, nullable=False, default=func.now(), server_default=func.now(),

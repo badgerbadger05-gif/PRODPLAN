@@ -472,6 +472,8 @@ def test_dynamic_retained_hold_releases_stock_when_consumption_arrives(db_sessio
         organization_ref="",
         planning_stock_pool="default",
         idempotency_key=f"hold-{item.item_id}-40",
+        allocation_role="material_consumption",
+        is_current=True,
     ))
     for row in db_session.query(models.LedgerFutureSupply).filter_by(
         ledger_generation_id=target.id,

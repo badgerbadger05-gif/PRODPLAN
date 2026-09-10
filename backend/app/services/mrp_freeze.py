@@ -55,6 +55,7 @@ from ..models import (
     ProductionPlanLine,
     ProductionProduct,
     ProductionResource,
+    PlanningTruthState,
     ReservationConsumptionAllocation,
     ReservationEntry,
     SpecComponent,
@@ -430,8 +431,36 @@ def _assert_baseline_within_physical_history(
 
 
 def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[int, float]:
-    """Read planning stock from one exact accepted generation, with no fallback."""
-    return planning_stock_by_item(db, int(ledger_generation_id))
+    """Read compact current stock or an explicit historical build candidate.
+
+    Current readers must match the live pointer.  Freeze/rebuild work may,
+    however, deliberately consume a not-yet-published generation while it is
+    building; that path reads only its generation-scoped StockBin projection
+    and never treats it as current.
+    """
+    requested = int(ledger_generation_id)
+    pointer = db.get(PlanningTruthState, 1)
+    current = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    if current == requested:
+        return planning_stock_by_item(db, requested)
+    scope = planning_warehouse_scope(db)
+    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
+        StockBin.ledger_generation_id == requested
+    )
+    query = apply_planning_warehouse_scope(
+        query,
+        scope,
+        warehouse_column=StockBin.warehouse_ref1c,
+        organization_column=StockBin.organization_ref,
+    )
+    return {
+        int(item_id): _to_float(qty or 0)
+        for item_id, qty in query.group_by(StockBin.item_id).all()
+    }
 
 
 def _ledger_stock_by_item_at(
