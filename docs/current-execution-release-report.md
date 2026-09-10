@@ -916,6 +916,7 @@ snapshot не используется:
 | MRP purchase export-to-1C | stable selected current identities + expected revision are required; identities resolve to current purchase rows, unknown/foreign rows fail closed; router adapter emits a canonical idempotency key | `test_mrp_purchases_to_1c_resolves_current_identity_and_revision`, `test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity` |
 | MRP result UI export action | selection stores only `row.current_identity`; missing identity is non-selectable; POST carries `current_identities` and `expected_source_revision` | `MrpResultPage.test.tsx` — 12 passed; `c2e4e7aa`, `38b6c692` |
 | period execution | exact resolved current run; no all-run mixing | `backend/app/routers/plan.py`, commit `4b07347c` |
+| production row actions | state/quantity/delete/return/material issue/export/from-work-items validate current identities and accepted manifest revision; UI forwards CAS fields and rejects incomplete context | `tests/r9/test_r9_production_action_contract.py`, `ProductionControlPage.test.tsx`, `productionControl.test.ts`; test-first `fb3f873e`, `d2da64d1`, implementation `756e1dfb` |
 
 Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
 (MRP current reader/fail-closed and metadata parity), `2610d9e7` (MRP HTTP
@@ -926,7 +927,8 @@ contract), `a323c6ff`, `a922cdf2`, `a92bc147` (complete MRP endpoint
 inventory, current export-to-1C identity/CAS and local fake retry contracts).
 Implementation commits: `4b07347c`, `59b4880d`,
 `1e5d611b`, `3573a758`, `1a87817c`, `de1a9b89`, `288d2ce8`, `0698737f`,
-`d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`, `6f91171d`.
+`d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`, `6f91171d`,
+`03ffdbec`, `756e1dfb`.
 
 Focused current-reader gate:
 
@@ -941,6 +943,23 @@ pytest -q tests/services/test_one_c_purchase_order_export.py \
   -k "recovers_exact_posted_batch_without_duplicate or retry"
 5 passed, 13 deselected in 0.82s
 ```
+
+Production action focused gate:
+
+```text
+pytest -q tests/r9/test_r9_production_action_contract.py
+9 passed in 2.68s
+npx vitest run src/services/productionControl.test.ts src/ui/pages/ProductionControlPage.test.tsx --reporter=dot
+2 files passed, 54 tests passed
+pytest -q tests/services/test_production_order_sync.py -k "fact_cache_keeps_cancellation_separate_from_physical_remaining"
+1 passed, 25 deselected in 0.62s
+```
+
+The impacted legacy journal characterization test still expects a 200 response
+from a snapshot-only fixture and fails against the intentional R9 no-fallback
+boundary (`1 failed, 11 passed` in the combined production command); it was not
+weakened. This slice therefore remains intermediate and does not claim the full
+R9 gate.
 
 The service-level fake-1C read-back test keeps the external `post_count` at
 one after a local SyncLink loss. The router test checks only the stable
