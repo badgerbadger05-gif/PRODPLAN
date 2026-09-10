@@ -16,6 +16,136 @@ from app.services.item_ledger.current_execution import (
 )
 
 
+def _seed_generation_execution_rows(db, *, generation_id: int, queue_line_id: int):
+    """Seed identical staged queue/readiness/drum rows with a generation-local queue id."""
+    from datetime import date
+
+    queue = models.AssemblyQueueLine(
+        id=queue_line_id,
+        ledger_generation_id=generation_id,
+        planning_run_id=101,
+        plan_id=201,
+        plan_line_id=301,
+        item_id=401,
+        bucket_date=date(2026, 9, 10),
+        period_from=date(2026, 9, 10),
+        period_to=date(2026, 9, 10),
+        planned_output_qty=Decimal("10"),
+        accepted_plan_output_qty=Decimal("0"),
+        assembly_remaining_qty=Decimal("10"),
+        original_priority=["2026-09-10", 201, 301],
+        sort_key="2026-09-10|201|301",
+        line_status="open",
+    )
+    db.add(queue)
+    db.flush()
+    db.add(models.AssemblyReadiness(
+        ledger_generation_id=generation_id,
+        assembly_queue_line_id=queue_line_id,
+        status="ready",
+        open_qty=Decimal("10"),
+        ready_qty=Decimal("10"),
+        transferable_qty=Decimal("0"),
+        kitting_qty=Decimal("0"),
+        committed_qty=Decimal("0"),
+        launchable_qty=Decimal("10"),
+        evidence_signature=f"r8-{generation_id}",
+    ))
+    schedule = models.DrumSchedule(
+        ledger_generation_id=generation_id,
+        status="completed",
+        algorithm_version="tests/r8",
+        schedule_from=date(2026, 9, 10),
+        schedule_to=date(2026, 9, 10),
+        working_days=["2026-09-10"],
+        resource_horizon_ends={},
+        resource_daily_capacities={},
+        queue_signature=f"q-{generation_id}",
+        slot_signature=f"s-{generation_id}",
+        gap_signature=f"g-{generation_id}",
+        slot_row_count=1,
+        gap_row_count=0,
+        total_open_qty=Decimal("10"),
+        total_slot_qty=Decimal("10"),
+        total_gap_qty=Decimal("0"),
+        metrics={"total_open_qty": "10", "total_slot_qty": "10", "total_gap_qty": "0"},
+    )
+    db.add(schedule)
+    db.flush()
+    db.add(models.DrumSlot(
+        drum_schedule_id=schedule.id,
+        assembly_queue_line_id=queue_line_id,
+        plan_id=201,
+        plan_line_id=301,
+        item_id=401,
+        resource_id=501,
+        slot_date=date(2026, 9, 10),
+        auto_slot_date=date(2026, 9, 10),
+        slot_qty=Decimal("10"),
+        capacity_load=Decimal("1"),
+        planned_output_qty=Decimal("10"),
+        accepted_plan_output_qty=Decimal("0"),
+        assembly_remaining_qty=Decimal("10"),
+        slot_ordinal=0,
+        original_priority=["2026-09-10", 201, 301],
+        readiness_phase="now",
+    ))
+    db.flush()
+
+
+def test_r8_generation_local_queue_ids_do_not_churn_current_readiness_or_drum(
+    db_session,
+):
+    """Technical generation copies must not become current business changes."""
+    from datetime import datetime, timezone
+    from app.services.item_ledger.current_execution import publish_current_execution_from_generation
+
+    cutoff = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    physical1 = models.PhysicalImportBatch(
+        batch_key="r8-stable-queue-id-1", status="completed", cutoff=cutoff, source_watermarks={}
+    )
+    generation1 = models.LedgerGeneration(
+        generation_key="r8-stable-queue-id-g1", status="accepted", cutoff=cutoff,
+        accepted_at=cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical1, algorithm_version="tests/r8",
+    )
+    db_session.add_all([physical1, generation1])
+    db_session.flush()
+    _seed_generation_execution_rows(db_session, generation_id=int(generation1.id), queue_line_id=1001)
+    publish_current_execution_from_generation(db_session, int(generation1.id))
+    db_session.flush()
+    first = {
+        (row.entity_kind, row.business_identity): (int(row.id), row.updated_at)
+        for row in db_session.query(models.CurrentExecutionRow).all()
+    }
+    first_changes = db_session.query(models.CurrentExecutionChange).count()
+
+    physical2 = models.PhysicalImportBatch(
+        batch_key="r8-stable-queue-id-2", status="completed", cutoff=cutoff, source_watermarks={}
+    )
+    generation2 = models.LedgerGeneration(
+        generation_key="r8-stable-queue-id-g2", status="accepted", cutoff=cutoff,
+        accepted_at=cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical2, algorithm_version="tests/r8",
+    )
+    db_session.add_all([physical2, generation2])
+    db_session.flush()
+    _seed_generation_execution_rows(db_session, generation_id=int(generation2.id), queue_line_id=2001)
+    publish_current_execution_from_generation(db_session, int(generation2.id))
+    db_session.flush()
+
+    current = db_session.query(models.CurrentExecutionRow).all()
+    assert {(row.entity_kind, row.business_identity): (int(row.id), row.updated_at) for row in current} == first
+    assert db_session.query(models.CurrentExecutionChange).count() == first_changes
+    readiness = next(row for row in current if row.entity_kind == "assembly_readiness")
+    drum_slot = next(row for row in current if row.entity_kind == "drum_slot")
+    queue = next(row for row in current if row.entity_kind == "assembly_queue")
+    assert readiness.payload["queue_line_id"] == queue.id
+    assert drum_slot.payload["queue_line_id"] == queue.id
+    assert readiness.source_generation_id == generation2.id
+    assert drum_slot.source_generation_id == generation2.id
+
+
 def _queue(identity: str, *, period: str, plan_id: int, line_id: int, qty: str = "1"):
     return {
         "entity_kind": "assembly_queue",

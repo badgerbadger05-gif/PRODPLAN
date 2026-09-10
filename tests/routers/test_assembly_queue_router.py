@@ -104,6 +104,13 @@ def _publish_snapshot(db, payload):
     db.flush()
 
 
+def _publish_current(db, generation):
+    from app.services.item_ledger.current_execution import publish_current_execution_from_generation
+
+    publish_current_execution_from_generation(db, int(generation.id))
+    db.commit()
+
+
 def test_assembly_readiness_reads_only_the_accepted_generation(client, db_session):
     generation, _ = _accepted_generation(db_session)
     item = models.Item(item_code="FG-READY", item_name="Ready machine")
@@ -140,6 +147,7 @@ def test_assembly_readiness_reads_only_the_accepted_generation(client, db_sessio
         )
     )
     db_session.commit()
+    _publish_current(db_session, generation)
 
     response = client.get("/api/v1/production-control/assembly-readiness")
 
@@ -242,6 +250,7 @@ def test_assembly_readiness_preserves_frozen_oldest_first_order(client, db_sessi
         )
         rows.append(queue)
     db_session.commit()
+    _publish_current(db_session, generation)
 
     payload = client.get("/api/v1/production-control/assembly-readiness").json()
 
