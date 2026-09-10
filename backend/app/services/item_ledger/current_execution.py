@@ -364,6 +364,35 @@ def invalidate_current_execution_scope(
     return True
 
 
+def invalidate_current_execution_for_calendar_change(
+    db: Session,
+    *,
+    source_revision: str,
+    reason: str = "calendar_changed",
+) -> tuple[str, ...]:
+    """Invalidate every calendar-dependent current result as one domain hook.
+
+    WorkCalendarDay has no HTTP writer in this contour.  Its import/admin writer
+    must call this hook in the same transaction as the calendar mutation; a
+    missing hook is intentionally fail-closed rather than silently serving a
+    schedule built for the previous working-day boundary.
+    """
+    invalidated: list[str] = []
+    for entity_kind, scope_key in (
+        ("assembly_readiness", "assembly:all-live-plans"),
+        ("drum_schedule", "drum:all-live-plans"),
+    ):
+        if invalidate_current_execution_scope(
+            db,
+            entity_kind=entity_kind,
+            scope_key=scope_key,
+            source_revision=str(source_revision),
+            reason=reason,
+        ):
+            invalidated.append(entity_kind)
+    return tuple(invalidated)
+
+
 def publish_current_execution_from_generation(
     db: Session,
     generation_id: int,

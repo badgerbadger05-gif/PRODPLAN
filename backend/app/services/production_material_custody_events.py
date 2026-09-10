@@ -167,6 +167,29 @@ def append_material_issue_custody_event(
     from .production_material_custody_projection import apply_local_custody_event_to_current
 
     apply_local_custody_event_to_current(db, event=event)
+    from .item_ledger.current_execution import invalidate_current_execution_scope
+
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="shelf_projection",
+        scope_key="shelf:all-live-mrps",
+        source_revision=f"custody:event:{int(event.id)}",
+        reason="custody_coverage_changed",
+    )
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="assembly_readiness",
+        scope_key="assembly:all-live-plans",
+        source_revision=f"custody:event:{int(event.id)}",
+        reason="custody_coverage_changed",
+    )
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="drum_schedule",
+        scope_key="drum:all-live-plans",
+        source_revision=f"custody:event:{int(event.id)}",
+        reason="custody_coverage_changed",
+    )
     return True
 
 
@@ -368,6 +391,30 @@ def _project_order_based_manual_transfer(
             )
         )
         appended += 1
+    if appended:
+        from .item_ledger.current_execution import invalidate_current_execution_scope
+
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="shelf_projection",
+            scope_key="shelf:all-live-mrps",
+            source_revision=f"custody:transfer:{ref}",
+            reason="custody_coverage_changed",
+        )
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="assembly_readiness",
+            scope_key="assembly:all-live-plans",
+            source_revision=f"custody:transfer:{ref}",
+            reason="custody_coverage_changed",
+        )
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="drum_schedule",
+            scope_key="drum:all-live-plans",
+            source_revision=f"custody:transfer:{ref}",
+            reason="custody_coverage_changed",
+        )
     return appended
 
 

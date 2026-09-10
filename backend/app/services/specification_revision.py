@@ -147,6 +147,22 @@ def record_specification_revisions(
                 queued += 1
             changed_refs.append(str(spec.spec_ref1c or ""))
     db.flush()
+    if changed_refs:
+        from .item_ledger.current_execution import invalidate_current_execution_scope
+
+        for entity_kind, scope_key in (
+            ("assembly_queue", "assembly:all-live-plans"),
+            ("assembly_readiness", "assembly:all-live-plans"),
+            ("drum_schedule", "drum:all-live-plans"),
+            ("shelf_projection", "shelf:all-live-mrps"),
+        ):
+            invalidate_current_execution_scope(
+                db,
+                entity_kind=entity_kind,
+                scope_key=scope_key,
+                source_revision="specification:" + ",".join(sorted(changed_refs)),
+                reason="specification_revision_changed",
+            )
     return {
         "revisions_created": created,
         "rebase_requests_queued": queued,
