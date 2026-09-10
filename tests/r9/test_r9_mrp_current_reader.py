@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 import pytest
 
@@ -238,7 +238,7 @@ def test_mrp_reader_uses_per_run_summary_and_keeps_identity_tie_ascending(db_ses
                 row_kind="production",
                 item_id=10,
                 sort_key="2026-09-10|same",
-                payload={"item_id": 10, "qty": 1, "run_id": run_id, "row_kind": "production"},
+                payload={"item_id": 10, "qty": 1, "run_id": run_id, "row_kind": "production", "agg_key": key},
             ))
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, generation.id)
@@ -248,7 +248,7 @@ def test_mrp_reader_uses_per_run_summary_and_keeps_identity_tie_ascending(db_ses
     rows = read_mrp_result_rows(db_session, 62, row_kind="production", sort_dir="desc")
     assert manifest["snapshot_total_qty"] == {"production": 9}
     assert [row["current_identity"] for row in rows["rows"]] == [
-        "run:62:v1:production:a", "run:62:v1:production:b"
+        "mrp-run:62:production:a", "mrp-run:62:production:b"
     ]
 
 
@@ -351,7 +351,21 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
             "qty": 2,
             "run_id": 41,
             "row_kind": "purchase",
+            "unit": "шт",
+            "bucket_date": "2026-09-10",
         },
+    ))
+    db_session.add(models.PlannedPurchase(
+        purchase_id=7001,
+        run_id=41,
+        item_id=10,
+        requested_qty=2,
+        planned_qty=2,
+        qty=2,
+        need_date=date(2026, 9, 10),
+        order_date=date(2026, 9, 10),
+        lead_time_days=1,
+        bucket_date=date(2026, 9, 10),
     ))
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, generation.id)
@@ -361,7 +375,7 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
         entity_kind="mrp_result",
         scope_key="mrp:all-live-plans",
     )
-    current_identity = "run:41:v1:purchase:purchase:41:1"
+    current_identity = "mrp-run:41:purchase:item:10|unit:шт"
     fake_state = {"calls": 0, "sends": 0, "persisted_ref": None}
 
     def fake_exporter(**kwargs):
