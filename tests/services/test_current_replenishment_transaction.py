@@ -654,7 +654,12 @@ def test_postgresql_visibility_is_atomic_across_current_state_and_execution():
         reader.expire_all()
         after = read_current_replenishment(reader, generation_id=generation_id, item_id=item_id)
         assert after[0]["allocated_qty"] == Decimal("6")
-        assert reader.query(models.CurrentReplenishmentState).filter_by(source_revision=2).count() == 1
+        assert (
+            reader.query(models.CurrentReplenishmentState)
+            .filter_by(ledger_generation_id=generation_id, source_revision=2)
+            .count()
+            == 1
+        )
     finally:
         writer.rollback()
         writer.close()
