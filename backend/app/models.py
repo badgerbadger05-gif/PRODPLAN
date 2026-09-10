@@ -49,6 +49,33 @@ class PhysicalImportBatch(Base):
     reason = Column(TEXT, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # R3 source completeness is independent of calculation generations.
+    expected_page_count = Column(Integer, nullable=True)
+    received_page_count = Column(Integer, nullable=False, default=0, server_default="0")
+    source_complete = Column(Boolean, nullable=False, default=True, server_default="true")
+
+
+class PhysicalImportPage(Base):
+    """One idempotent page of a source import, before publication."""
+
+    __tablename__ = "physical_import_page"
+    __table_args__ = (
+        UniqueConstraint("import_batch_id", "page_no", name="uq_physical_import_page_number"),
+        UniqueConstraint("import_batch_id", "page_token", name="uq_physical_import_page_token"),
+        CheckConstraint("page_no > 0", name="ck_physical_import_page_positive"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    import_batch_id = Column(
+        BigInteger, ForeignKey("physical_import_batch.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    page_no = Column(Integer, nullable=False)
+    page_token = Column(String(256), nullable=False)
+    content_hash = Column(String(64), nullable=False)
+    received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    import_batch = relationship("PhysicalImportBatch")
 
 
 class LedgerGeneration(Base):
@@ -1634,6 +1661,52 @@ class PlanningRun(Base):
     ledger_generation = relationship("LedgerGeneration")
 
 
+class PlanningLivePointer(Base):
+    """Explicit current MRP pointer; current reads do not traverse ancestors."""
+
+    __tablename__ = "planning_live_pointer"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'retired')", name="ck_planning_live_pointer_status"),
+    )
+
+    plan_id = Column(
+        Integer, ForeignKey("production_plan_header.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    run_id = Column(
+        Integer, ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=False, unique=True, index=True,
+    )
+    status = Column(String(16), nullable=False, default="active", server_default="active")
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    plan = relationship("ProductionPlanHeader")
+    run = relationship("PlanningRun")
+
+
+class PlanningRunSuccessor(Base):
+    """Business successor edge, separate from technical generation lineage."""
+
+    __tablename__ = "planning_run_successor"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id", "predecessor_run_id", "successor_run_id",
+            name="uq_planning_run_successor_edge",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    plan_id = Column(Integer, ForeignKey("production_plan_header.id", ondelete="RESTRICT"), nullable=False, index=True)
+    predecessor_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="RESTRICT"), nullable=False, index=True)
+    successor_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="RESTRICT"), nullable=False, index=True)
+    reason = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    plan = relationship("ProductionPlanHeader")
+    predecessor_run = relationship("PlanningRun", foreign_keys=[predecessor_run_id])
+    successor_run = relationship("PlanningRun", foreign_keys=[successor_run_id])
+
+
 class PlannedOrder(Base):
     __tablename__ = "planned_order"
 
@@ -2747,6 +2820,14 @@ class MrpFreezeBaseline(Base):
         nullable=True,
         index=True,
     )
+    # Explicit frozen-basis provenance.  Current facts may advance without
+    # rewriting this immutable basis.
+    frozen_basis_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     stock_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     produced_total = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     received_total = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
@@ -2755,6 +2836,7 @@ class MrpFreezeBaseline(Base):
 
     run = relationship("PlanningRun")
     item = relationship("Item")
+    frozen_basis_generation = relationship("LedgerGeneration")
 
 
 class MrpFreezeAllocation(Base):
@@ -2996,6 +3078,8 @@ class StockLedgerEntry(Base):
         index=True,
     )
     source_content_hash = Column(String(64), nullable=False)
+    # Stable business identity, independent of import batch/generation.
+    business_identity = Column(String(256), nullable=False, server_default="")
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=False, server_default="")
     organization_ref = Column(String(36), nullable=False, server_default="")

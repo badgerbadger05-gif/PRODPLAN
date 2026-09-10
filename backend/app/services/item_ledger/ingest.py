@@ -44,6 +44,7 @@ from .physical import (
     ensure_physical_import_batch,
     rebuild_running_balance,
 )
+from .r3_contract import business_identity_for_movement
 
 # Register + document-pull tags.
 REGISTER_ENTITY = "AccumulationRegister_ЗапасыНаСкладах"
@@ -594,6 +595,9 @@ def pull_recorder_movements(
         entry = models.StockLedgerEntry(
                 ingest_batch_id=import_batch.id,
                 source_content_hash=content_hash,
+                business_identity=business_identity_for_movement(
+                    recorder_type, recorder_ref, line_no
+                ),
                 item_id=key.item_id,
                 characteristic_ref=key.characteristic_ref,
                 organization_ref=key.organization_ref,
