@@ -909,6 +909,7 @@ def publish_current_obligation_views_from_generation(
         plan = dict(payload.get("plan") or {})
         run_id = payload.get("run_id")
         execution_metadata[str(snapshot.snapshot_key)] = {
+            "snapshot_key": str(snapshot.snapshot_key),
             "plan": plan,
             "run_id": run_id,
             "summary": dict(payload.get("summary") or {}),

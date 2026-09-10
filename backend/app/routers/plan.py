@@ -778,6 +778,11 @@ async def period_plans_execution_journal(
             load_current_execution_rows,
             require_current_execution_scope,
         )
+        from ..services.period_plan_service import (
+            _finalize_execution_payload,
+            _get_plan,
+            _resolve_execution_run,
+        )
         manifest = require_current_execution_scope(
             db,
             entity_kind="period_plan_execution",
@@ -787,13 +792,15 @@ async def period_plans_execution_journal(
         snapshots = saved.get("snapshots")
         if not isinstance(snapshots, dict):
             raise CurrentExecutionUnavailable("period-plan current metadata is missing")
+        plan = _get_plan(db, int(plan_id))
+        resolved_run = _resolve_execution_run(db, plan, run_id)
         selected = None
         for metadata in snapshots.values():
             if not isinstance(metadata, dict):
                 continue
             if int(dict(metadata.get("plan") or {}).get("id") or 0) != int(plan_id):
                 continue
-            if run_id is not None and int(metadata.get("run_id") or 0) != int(run_id):
+            if int(metadata.get("run_id") or 0) != int(resolved_run.run_id):
                 continue
             selected = metadata
             break
@@ -805,36 +812,32 @@ async def period_plans_execution_journal(
             scope_key="period-plan:all-live-plans",
         ) if row.payload and int(row.payload.get("plan_id") or 0) == int(plan_id)
         and (run_id is None or int(row.payload.get("run_id") or 0) == int(run_id))]
-        if root_item_id is not None:
-            rows = [row for row in rows if row.get("root_item_id") == int(root_item_id)]
-        if bom_level is not None:
-            rows = [row for row in rows if row.get("bom_level") == int(bom_level)]
-        if flow is not None:
-            rows = [row for row in rows if str(row.get("flow") or "") == str(flow)]
-        if status is not None:
-            rows = [row for row in rows if str(row.get("status") or "") == str(status)]
-        if not include_net_zero:
-            rows = [row for row in rows if float(row.get("net_qty") or 0) != 0]
-        rows.sort(key=lambda row: (str(row.get(sort_by) or ""), str(row.get("item_code") or "")), reverse=sort_dir == "desc")
-        effective_limit = max(1, min(int(limit or 100), 500))
-        effective_offset = max(0, int(offset or 0))
-        return ExecutionJournalResponse.model_validate({
+        current_payload = {
             "plan": dict(selected.get("plan") or {}),
             "run_id": int(selected.get("run_id") or 0),
-            "rows": rows[effective_offset:effective_offset + effective_limit],
+            "rows": rows,
             "plan_output_rows": list(selected.get("plan_output_rows") or []),
             "summary": dict(selected.get("summary") or {}),
-            "total": len(rows),
-            "limit": effective_limit,
-            "offset": effective_offset,
             "truth_status": selected.get("truth_status"),
             "ledger_generation": manifest.source_generation_id,
             "truth_generation_id": selected.get("truth_generation_id"),
             "cutoff": selected.get("cutoff"),
             "truth_cutoff": selected.get("truth_cutoff"),
             "truth_reason": selected.get("truth_reason"),
-            "facets": dict(selected.get("facets") or {}),
-        })
+        }
+        return ExecutionJournalResponse.model_validate(_finalize_execution_payload(
+            db,
+            current_payload,
+            root_item_id=root_item_id,
+            bom_level=bom_level,
+            flow=flow,
+            status=status,
+            include_net_zero=include_net_zero,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            limit=limit,
+            offset=offset,
+        ))
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "period_plan_execution_unavailable", "reason": str(e)}) from e
     except HTTPException:
