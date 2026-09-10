@@ -305,6 +305,8 @@ class DrumSlotRow(BaseModel):
     manual_moved_at: str | None = None
     manual_moved_by: str | None = None
     original_priority: list[Union[str, int]]
+    current_identity: str | None = None
+    source_revision: str | None = None
 
 
 class DrumSlotMoveRequest(BaseModel):
@@ -358,6 +360,8 @@ class DrumGapRow(BaseModel):
     unavailable_reasons: list[str] = Field(default_factory=list)
     blocking_manifest: list[ReadinessBlockerResponse] = Field(default_factory=list)
     original_priority: list[Union[str, int]]
+    current_identity: str | None = None
+    source_revision: str | None = None
 
 
 class DrumResourceRow(BaseModel):
@@ -781,9 +785,9 @@ def get_drum_schedule(
             slot_rows.append({
                 "slot_id": int(row.id),
                 "queue_line_id": int(payload.get("queue_line_id") or 0),
-                "run_id": None,
-                "period_from": None,
-                "period_to": None,
+                "run_id": int(payload.get("run_id")) if payload.get("run_id") is not None else None,
+                "period_from": payload.get("period_from"),
+                "period_to": payload.get("period_to"),
                 "plan_id": int(payload.get("plan_id") or 0),
                 "plan_line_id": int(payload.get("plan_line_id") or 0),
                 "item_id": int(payload.get("item_id") or 0),
@@ -793,9 +797,11 @@ def get_drum_schedule(
                 "slot_date": payload.get("slot_date"),
                 "auto_slot_date": payload.get("auto_slot_date"),
                 "slot_qty": float(payload.get("slot_qty") or 0),
-                "planned_output_qty": None,
-                "accepted_plan_output_qty": None,
-                "assembly_remaining_qty": None,
+                "planned_output_qty": float(payload.get("planned_output_qty")) if payload.get("planned_output_qty") is not None else None,
+                "accepted_plan_output_qty": float(payload.get("accepted_plan_output_qty")) if payload.get("accepted_plan_output_qty") is not None else None,
+                "assembly_remaining_qty": float(payload.get("assembly_remaining_qty")) if payload.get("assembly_remaining_qty") is not None else None,
+                "current_identity": str(row.business_identity),
+                "source_revision": str(row.source_revision),
                 "slot_ordinal": int(payload.get("slot_ordinal") or 0),
                 "readiness_phase": str(payload.get("readiness_phase") or "unavailable"),
                 "readiness_date": payload.get("readiness_date"),
@@ -815,9 +821,9 @@ def get_drum_schedule(
             gap_rows.append({
                 "gap_id": int(row.id),
                 "queue_line_id": int(payload.get("queue_line_id") or 0),
-                "run_id": None,
-                "period_from": None,
-                "period_to": None,
+                "run_id": int(payload.get("run_id")) if payload.get("run_id") is not None else None,
+                "period_from": payload.get("period_from"),
+                "period_to": payload.get("period_to"),
                 "plan_id": int(payload.get("plan_id") or 0),
                 "plan_line_id": int(payload.get("plan_line_id") or 0),
                 "item_id": int(payload.get("item_id") or 0),
@@ -828,9 +834,11 @@ def get_drum_schedule(
                 "required_qty": float(payload.get("required_qty") or 0),
                 "available_capacity": float(payload.get("available_capacity") or 0),
                 "gap_qty": float(payload.get("gap_qty") or 0),
-                "planned_output_qty": None,
-                "accepted_plan_output_qty": None,
-                "assembly_remaining_qty": None,
+                "planned_output_qty": float(payload.get("planned_output_qty")) if payload.get("planned_output_qty") is not None else None,
+                "accepted_plan_output_qty": float(payload.get("accepted_plan_output_qty")) if payload.get("accepted_plan_output_qty") is not None else None,
+                "assembly_remaining_qty": float(payload.get("assembly_remaining_qty")) if payload.get("assembly_remaining_qty") is not None else None,
+                "current_identity": str(row.business_identity),
+                "source_revision": str(row.source_revision),
                 "readiness_phase": str(payload.get("readiness_phase") or "unavailable"),
                 "readiness_date": payload.get("readiness_date"),
                 "readiness_curve": list(payload.get("readiness_curve") or []),

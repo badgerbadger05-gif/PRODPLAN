@@ -2866,6 +2866,32 @@ class CurrentExecutionRow(Base):
     source_generation = relationship("LedgerGeneration")
 
 
+class CurrentExecutionScope(Base):
+    """Readiness manifest for a complete current execution scope, including empty scopes."""
+
+    __tablename__ = "current_execution_scope"
+    __table_args__ = (
+        UniqueConstraint("entity_kind", "scope_key", name="uq_current_execution_scope_kind_key"),
+        Index("ix_current_execution_scope_revision", "entity_kind", "source_revision"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
+    entity_kind = Column(String(40), nullable=False)
+    scope_key = Column(String(256), nullable=False)
+    source_revision = Column(String(256), nullable=False)
+    source_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    result_ready = Column(Boolean, nullable=False, server_default=text("true"))
+    content_hash = Column(String(64), nullable=False)
+    updated_at = Column(TIMESTAMP, nullable=False, server_default=func.now(), onupdate=func.now())
+
+    source_generation = relationship("LedgerGeneration")
+
+
 class CurrentExecutionChange(Base):
     """Bounded append-only audit of real current execution changes only."""
 

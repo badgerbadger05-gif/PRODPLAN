@@ -151,6 +151,34 @@ def publish_current_execution_scope(
         expected_kinds = set(actual_kinds)
     if not expected_kinds:
         raise CurrentExecutionUnavailable("empty complete scope requires explicit entity kinds")
+    for kind in sorted(expected_kinds):
+        entries = [
+            (identity, payload, manual)
+            for (entry_kind, identity), (payload, manual, _content_hash, _manual_supplied)
+            in incoming.items()
+            if entry_kind == kind
+        ]
+        scope_hash = _hash(entries)
+        manifest = db.query(models.CurrentExecutionScope).filter(
+            models.CurrentExecutionScope.entity_kind == kind,
+            models.CurrentExecutionScope.scope_key == scope,
+        ).with_for_update().one_or_none()
+        if manifest is None:
+            db.add(models.CurrentExecutionScope(
+                entity_kind=kind,
+                scope_key=scope,
+                source_revision=revision,
+                source_generation_id=source_generation_id,
+                result_ready=True,
+                content_hash=scope_hash,
+            ))
+        elif bool(manifest.result_ready) and str(manifest.content_hash) == scope_hash:
+            pass
+        else:
+            manifest.source_revision = revision
+            manifest.source_generation_id = source_generation_id
+            manifest.result_ready = True
+            manifest.content_hash = scope_hash
     existing_query = db.query(models.CurrentExecutionRow).filter(
         models.CurrentExecutionRow.scope_key == scope,
     )
@@ -260,6 +288,19 @@ def load_current_execution_rows(
         models.CurrentExecutionRow.business_identity.asc(),
         models.CurrentExecutionRow.id.asc(),
     ).all()
+
+
+def get_current_execution_scope(
+    db: Session,
+    *,
+    entity_kind: str,
+    scope_key: str,
+) -> models.CurrentExecutionScope | None:
+    """Return the persisted scope manifest; ``None`` means never published."""
+    return db.query(models.CurrentExecutionScope).filter(
+        models.CurrentExecutionScope.entity_kind == str(entity_kind),
+        models.CurrentExecutionScope.scope_key == str(scope_key),
+    ).one_or_none()
 
 
 def publish_current_execution_from_generation(
@@ -381,7 +422,10 @@ def publish_current_execution_from_generation(
             ).all()
             if row.manual_input
         }
-        for slot in db.query(models.DrumSlot).filter(
+        for slot, queue in db.query(models.DrumSlot, models.AssemblyQueueLine).join(
+            models.AssemblyQueueLine,
+            models.AssemblyQueueLine.id == models.DrumSlot.assembly_queue_line_id,
+        ).filter(
             models.DrumSlot.drum_schedule_id == int(schedule.id),
         ).order_by(
             models.DrumSlot.slot_date.asc(),
@@ -395,12 +439,18 @@ def publish_current_execution_from_generation(
                 "queue_line_id": int(slot.assembly_queue_line_id),
                 "plan_id": int(slot.plan_id),
                 "plan_line_id": int(slot.plan_line_id),
+                "run_id": int(queue.planning_run_id),
+                "period_from": queue.period_from.isoformat(),
+                "period_to": queue.period_to.isoformat(),
                 "item_id": int(slot.item_id),
                 "resource_id": int(slot.resource_id),
                 "slot_date": slot.slot_date.isoformat(),
                 "auto_slot_date": slot.auto_slot_date.isoformat() if slot.auto_slot_date else None,
                 "slot_qty": str(slot.slot_qty),
                 "capacity_load": str(slot.capacity_load) if slot.capacity_load is not None else None,
+                "planned_output_qty": str(slot.planned_output_qty) if slot.planned_output_qty is not None else None,
+                "accepted_plan_output_qty": str(slot.accepted_plan_output_qty) if slot.accepted_plan_output_qty is not None else None,
+                "assembly_remaining_qty": str(slot.assembly_remaining_qty) if slot.assembly_remaining_qty is not None else None,
                 "slot_ordinal": int(slot.slot_ordinal),
                 "readiness_phase": str(slot.readiness_phase),
                 "readiness_date": slot.readiness_date.isoformat() if slot.readiness_date else None,

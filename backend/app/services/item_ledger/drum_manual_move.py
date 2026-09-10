@@ -46,6 +46,7 @@ def move_drum_slot(
     new_resource_id: int | None = None,
     moved_by: str | None = None,
     today: date | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
     """Move a current accepted tile without changing queue priority or readiness.
 
@@ -207,7 +208,10 @@ def move_drum_slot(
             row.auto_slot_date = placed
             row.auto_resource_id = int(row.resource_id)
         row.slot_date = placed
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return {
         "ok": True,
         "moved": True,
@@ -281,6 +285,7 @@ def move_current_drum_slot(
         new_date,
         new_resource_id=new_resource_id,
         moved_by=moved_by,
+        commit=False,
     )
     from .current_execution import publish_current_execution_from_generation
     publish_current_execution_from_generation(db, generation_id=int(truth.generation_id))
