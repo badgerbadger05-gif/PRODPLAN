@@ -1,10 +1,13 @@
 """R9 purchase-control current anchor and transport contracts."""
 
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from app import models
 from app.main import app
 from app.routers.purchase_control import _canonical_purchase_sort
+from app.routers.purchase_control import get_orders
+from app.services.item_ledger import current_execution
 
 
 def test_purchase_export_batch_has_nullable_current_scope_anchor():
@@ -46,3 +49,25 @@ def test_purchase_row_transport_contract_exposes_current_identity_and_revision()
     assert "current_identity" in response
     assert "current_identities" in response
     assert "source_revision" in response
+
+
+def test_purchase_get_attaches_manifest_revision_to_stable_row(monkeypatch):
+    manifest = SimpleNamespace(
+        id=17,
+        source_generation_id=42,
+        source_revision="accepted:g42-noop-2",
+        summary={"summary": {"total_rows": 1}},
+    )
+    row = SimpleNamespace(
+        business_identity="purchase:req:9",
+        source_revision="accepted:g41",
+        payload={"row_key": "legacy-generation-row", "remaining_qty": 2},
+    )
+    monkeypatch.setattr(current_execution, "require_current_execution_scope", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(current_execution, "load_current_execution_rows", lambda *args, **kwargs: [row])
+
+    result = get_orders(db=object(), horizon_period_to=None, limit=100, offset=0)
+
+    assert result["rows"][0]["current_identity"] == "purchase:req:9"
+    assert result["rows"][0]["source_revision"] == "accepted:g42-noop-2"
+    assert result["source_revision"] == "accepted:g42-noop-2"
