@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальная волна R1. Продовые БД, SSH,
+Дата среза: 2026-09-10. Область: локальные волны R1 и R2. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 ## Сводка волн
@@ -8,7 +8,7 @@ OData, боевые workers, deploy и push не использовались.
 | Волна | Статус на срезе | Доказательство/граница |
 |---|---|---|
 | R1 — контракт данных, границы и предметные решения | принято локально | test-first `fd57f8fd`, документный gate `48cbd509`, implementation/docs `299ae84b` + follow-up решения; focused gate ниже |
-| R2 — локальный PostgreSQL и baseline | не начато | не запускалась; отдельная волна |
+| R2 — локальный PostgreSQL и baseline | проверка заблокирована инфраструктурой | test-first `3f5f2914`, implementation `ca885897`; static gate зелёный, Docker/PostgreSQL runtime недоступен |
 | R3 — устойчивые идентичности и принятие физики | не начато | production persistence не менялась |
 | R4 — транзакционные основания и текущее исполнение | не начато | runtime writers не переносились |
 | R5 — исправления, отмены и backdate | не начато | incremental persistence scope отложен в зависимую волну |
@@ -88,3 +88,82 @@ pytest -q tests/contracts/test_r1_semantic_contract.py tests/test_canon_invarian
 R5; schema/persistence пока generation-bound; API/UI ещё не передают новый
 `history_mode`; миграция и PostgreSQL concurrency не проверялись. Эти риски не
 разрешают объявлять R2–R11 выполненными.
+
+## R2 evidence
+
+### Commits and files
+
+* `3f5f2914` — test-first контракт изолированного PostgreSQL-контура и
+  синтетический набор.
+* `ca885897` — implementation: PG-only compose, explicit local DSN guard,
+  start/verify scripts, baseline runner, integration migration/rollback tests
+  и регистрация integration marker.
+* `tests/r2/test_r2_local_contract.py` и
+  `tests/r2/test_r2_postgres_integration.py` — guard, migration, две сессии и
+  rollback-проверки.
+* `tests/r2/fixtures/r2_synthetic_seed.json` — фиксированный seed
+  `r2-fixed-20260910-v1`: 2 плана, общая деталь, 2 пула, адресная и
+  агрегированная закупка, FIFO/backdate, отмена, rework, material custody,
+  закрытие и смена MRP без переноса исполнения.
+* `docker-compose.r2.yml`, `scripts/r2-postgres.ps1`,
+  `scripts/r2-postgres.sh`, `backend/app/r2_local_contract.py`,
+  `tools/r2-baseline.py`, `docs/r2-local-contour.md` — локальный PG-only
+  contour без backend/frontend/workers и external hosts.
+
+### Commands and results
+
+Красный test-first прогон до реализации:
+
+```text
+pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py
+4 failed, 1 passed, 2 skipped
+```
+
+После реализации focused R2/canon gate:
+
+```text
+pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py tests/test_canon_invariants.py
+37 passed, 2 skipped in 5.49s
+```
+
+Проверка синтаксиса compose прошла:
+
+```text
+docker compose -f docker-compose.r2.yml config --quiet
+exit 0
+```
+
+Единая команда запуска/проверки задокументирована как
+`pwsh -NoProfile -File .\scripts\r2-postgres.ps1 start-verify`. Реальный
+`verify` остановился на фактическом blocker: Docker CLI не смог открыть
+`npipe:////./pipe/dockerDesktopLinuxEngine`; локальные PostgreSQL service,
+`psql` и `pg_isready` также отсутствуют. Поэтому migration пустой БД,
+двухсессионный rollback и численный baseline не выдаются за выполненные.
+
+Обязательный полный gate с `ca885897`:
+
+```text
+pytest -q
+1920 passed, 5 skipped, 35 warnings in 196.84s (0:03:16)
+```
+
+Пять skip распределены так: три существующих opt-in PostgreSQL теста
+(`test_material_issue_locking.py`, `test_pg_rebuild_check.py`,
+`test_reservation_replenishment_core_migration.py`) и два новых R2
+integration-теста при отсутствии `PRODPLAN_R2_TEST_DSN`. Все три старых skip
+относятся к новому R2 контракту; после появления именно локального R2 DSN их
+нужно перевести в обязательный gate, а не оставлять скрытым skip. Ни один skip
+не переключался на production/default DSN.
+
+`tools/r2-baseline.py` фиксирует seed/объёмы, elapsed time, SQL writes,
+temporary table bytes и server identity; API latency явно `null`, поскольку
+R2 намеренно поднимает только PostgreSQL. Запуск baseline отложен тем же
+инфраструктурным blocker, измерения и пороги не выдумывались.
+
+Удалённые пути: **нет**. Изменений production persistence, внешних адресов,
+SSH/OData, live 1С, deploy или workers нет.
+
+Остаточные риски: локальная PostgreSQL migration/concurrency и baseline ещё
+не доказаны; API latency отсутствует до API-волны; три прежних PG skip требуют
+обязательного повторного прогона в доступном локальном контуре. Поэтому R2 не
+помечена `принято локально` и R3 не начиналась.
