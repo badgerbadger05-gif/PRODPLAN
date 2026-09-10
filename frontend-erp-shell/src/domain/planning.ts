@@ -29,6 +29,8 @@ export type StartPlanningRunResponse = {
 
 export type MrpSummary = {
   snapshot_id: number | null
+  current_identity?: string | null
+  source_revision?: string | null
   ledger_generation: number | null
   cutoff: string | null
   truth_status: string
@@ -55,6 +57,8 @@ export type MrpSummary = {
 }
 
 export type MrpProductionRow = {
+  current_identity?: string | null
+  source_revision?: string | null
   order_id: number
   requirement_id?: number
   item_id: number
@@ -84,6 +88,8 @@ export type MrpProductionRow = {
 }
 
 export type MrpPurchaseRow = {
+  current_identity?: string | null
+  source_revision?: string | null
   purchase_id: number
   item_id: number
   item_name?: string | null
@@ -114,6 +120,8 @@ export type MrpPurchaseRow = {
 }
 
 export type MrpReworkRow = {
+  current_identity?: string | null
+  source_revision?: string | null
   rework_id: number
   item_id: number
   item_name?: string | null
@@ -134,6 +142,8 @@ export type MrpReworkRow = {
 }
 
 export type MrpCapacityRow = {
+  current_identity?: string | null
+  source_revision?: string | null
   area_id: number
   bucket_date?: string | null
   hours_planned: number
@@ -144,6 +154,8 @@ export type MrpCapacityRow = {
 
 export type MrpPagedResponse<T> = {
   snapshot_id: number | null
+  current_identity?: string | null
+  source_revision?: string | null
   ledger_generation: number | null
   cutoff: string | null
   truth_status: string

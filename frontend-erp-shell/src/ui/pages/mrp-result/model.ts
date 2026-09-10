@@ -56,13 +56,18 @@ export function buildPurchaseCategoryFilterParam(categoryFilter: string): { cate
   return { category_ref1c: categoryFilter }
 }
 
-export function toggleMany(set: Set<number>, ids: number[], checked: boolean) {
+export function toggleMany<T>(set: Set<T>, ids: T[], checked: boolean) {
   const next = new Set(set)
   ids.forEach((id) => {
     if (checked) next.add(id)
     else next.delete(id)
   })
   return next
+}
+
+export function purchaseCurrentIdentity(row: MrpPurchaseRow) {
+  const value = String(row.current_identity || '').trim()
+  return value || null
 }
 
 export function productionSourceIds(row: MrpProductionRow) {

@@ -5955,6 +5955,10 @@ export interface components {
             date_from?: string | null;
             /** Date To */
             date_to?: string | null;
+            /** Stable current row identities */
+            current_identities: string[];
+            /** Accepted current publication revision */
+            expected_source_revision: string;
             /** Purchase Ids */
             purchase_ids?: number[] | null;
             /**

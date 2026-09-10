@@ -28,6 +28,7 @@ import {
   parsePositiveId,
   productionSourceIds,
   purchaseFilterOptions,
+  purchaseCurrentIdentity,
   purchaseSourceIds,
   supplierDisplayName,
   toggleMany,
@@ -87,7 +88,7 @@ export function MrpResultPage() {
   const [draftDateTo, setDraftDateTo] = useState('')
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
-  const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
+  const [selectedPurchaseIdentities, setSelectedPurchaseIdentities] = useState<Set<string>>(new Set())
   const [purchaseSupplierFilter, setPurchaseSupplierFilter] = useState('')
   const [purchaseCategoryFilter, setPurchaseCategoryFilter] = useState('')
   const [rootItemId, setRootItemId] = useState<number | null>(null)
@@ -100,7 +101,9 @@ export function MrpResultPage() {
   const mutationInFlight = useRef(false)
   const previousRunId = useRef(runId)
   const snapshotId = summary?.snapshot_id ?? null
-  const truthAccepted = summary?.truth_status === 'accepted' && snapshotId !== null
+  const truthAccepted = summary?.truth_status === 'accepted'
+    && snapshotId !== null
+    && Boolean(summary.current_identity && summary.source_revision)
   const truthUnavailableReason = summary && !truthAccepted
     ? summary.truth_reason || `Снимок MRP недоступен: ${summary.truth_status || 'unavailable'}`
     : ''
@@ -113,7 +116,7 @@ export function MrpResultPage() {
   const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
   const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
   const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
-  const selectedCount = tab === 'purchases' ? selectedPurchaseIds.size : 0
+  const selectedCount = tab === 'purchases' ? selectedPurchaseIdentities.size : 0
 
   useEffect(() => {
     if (queryTab) setTab(queryTab)
@@ -132,7 +135,7 @@ export function MrpResultPage() {
     setPurchaseTotal(0)
     setReworkTotal(0)
     setCapacityTotal(0)
-    setSelectedPurchaseIds(new Set())
+    setSelectedPurchaseIdentities(new Set())
     setPurchaseSupplierFilter('')
     setPurchaseCategoryFilter('')
   }, [])
@@ -201,9 +204,8 @@ export function MrpResultPage() {
         setCapacityTotal(data.total ?? 0)
       }
       const identityMatches = data.truth_status === 'accepted'
-        && data.snapshot_id === snapshotId
-        && data.ledger_generation === summary?.ledger_generation
-        && data.cutoff === summary?.cutoff
+        && data.current_identity === summary?.current_identity
+        && data.source_revision === summary?.source_revision
       if (!identityMatches) {
         const mismatchReason = data.truth_reason || 'Ответ вкладки не соответствует зафиксированному снимку MRP'
         setSummary((current) => current ? {
@@ -287,7 +289,7 @@ export function MrpResultPage() {
   }
 
   async function exportSelectedPurchasesTo1C() {
-    if (!truthAccepted || !selectedPurchaseIds.size || mutationInFlight.current) return
+    if (!truthAccepted || !selectedPurchaseIdentities.size || !summary?.source_revision || mutationInFlight.current) return
     mutationInFlight.current = true
     setExporting(true)
     setError('')
@@ -296,12 +298,13 @@ export function MrpResultPage() {
       const result = await exportPurchasesTo1C(runId, {
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
-        purchase_ids: Array.from(selectedPurchaseIds),
+        current_identities: Array.from(selectedPurchaseIdentities),
+        expected_source_revision: summary.source_revision,
         dry_run: false,
         allow_production: true,
       })
       setMessage(formatActionResult('Выгрузка закупок в 1С', result))
-      setSelectedPurchaseIds(new Set())
+      setSelectedPurchaseIdentities(new Set())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -319,7 +322,7 @@ export function MrpResultPage() {
   function applyPurchaseFilters(nextSupplierFilter: string, nextCategoryFilter: string) {
     setPurchaseSupplierFilter(nextSupplierFilter)
     setPurchaseCategoryFilter(nextCategoryFilter)
-    setSelectedPurchaseIds(new Set())
+    setSelectedPurchaseIdentities(new Set())
     setPurchaseRows([])
     setPurchaseTotal(0)
     setLoadedTabs((prev) => ({ ...prev, purchases: false }))
@@ -373,7 +376,7 @@ export function MrpResultPage() {
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
           <button onClick={() => { void loadSummary() }} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={!truthAccepted || loading || exporting}>XLSX</button>}
-          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthAccepted || !selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
+          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthAccepted || !selectedPurchaseIdentities.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIdentities.size})</button>}
           <div className="barSeparator" />
           <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
           <span className="toolbarText">{rootProductLabel(rootOptions, rootItemId)}</span>
@@ -415,7 +418,7 @@ export function MrpResultPage() {
           {tab === 'purchases' && (
             <PurchaseResultTable
               rows={purchaseRows}
-              selectedIds={selectedPurchaseIds}
+              selectedIds={selectedPurchaseIdentities}
               highlightedId={highlightedPurchaseId}
               supplierFilter={purchaseSupplierFilter}
               categoryFilter={purchaseCategoryFilter}
@@ -423,7 +426,7 @@ export function MrpResultPage() {
               categoryOptions={purchaseCategoryOptions}
               onSupplierFilterChange={(value) => applyPurchaseFilters(value, purchaseCategoryFilter)}
               onCategoryFilterChange={(value) => applyPurchaseFilters(purchaseSupplierFilter, value)}
-              onSelectedIdsChange={setSelectedPurchaseIds}
+              onSelectedIdsChange={setSelectedPurchaseIdentities}
             />
           )}
           {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
@@ -501,7 +504,7 @@ function PurchaseResultTable({
   onSelectedIdsChange,
 }: {
   rows: MrpPurchaseRow[]
-  selectedIds: Set<number>
+  selectedIds: Set<string>
   highlightedId: number | null
   supplierFilter: string
   categoryFilter: string
@@ -509,9 +512,12 @@ function PurchaseResultTable({
   categoryOptions: Array<{ value: string; label: string }>
   onSupplierFilterChange: (value: string) => void
   onCategoryFilterChange: (value: string) => void
-  onSelectedIdsChange: (ids: Set<number>) => void
+  onSelectedIdsChange: (ids: Set<string>) => void
 }) {
-  const visibleIds = rows.flatMap(purchaseSourceIds)
+  const visibleIds = rows.flatMap((row) => {
+    const identity = purchaseCurrentIdentity(row)
+    return identity ? [identity] : []
+  })
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
 
   return (
@@ -579,14 +585,16 @@ function PurchaseResultTable({
           const coverageLabel = row.supplier_coverage_label || '—'
           const coverageStatus = row.supplier_coverage_status
           return (
-          <tr key={row.purchase_id} className={highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.current_identity || row.purchase_id} className={highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
+              {purchaseCurrentIdentity(row) ? (
               <input
-                type="checkbox"
-                checked={purchaseSourceIds(row).every((id) => selectedIds.has(id))}
-                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, purchaseSourceIds(row), e.target.checked))}
+                  type="checkbox"
+                  checked={selectedIds.has(purchaseCurrentIdentity(row) as string)}
+                  onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, [purchaseCurrentIdentity(row) as string], e.target.checked))}
                 aria-label={`Выбрать ${row.item_name || row.item_article || row.purchase_id}`}
               />
+              ) : <span title="Текущая identity недоступна">—</span>}
             </td>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>

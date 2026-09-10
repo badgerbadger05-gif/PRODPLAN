@@ -85,6 +85,8 @@ export function exportPlanningResultRework(runId: number, params: MrpSnapshotQue
 export function exportPurchasesTo1C(runId: number, body: {
   date_from?: string
   date_to?: string
+  current_identities: string[]
+  expected_source_revision: string
   purchase_ids?: number[]
   dry_run?: boolean
   allow_production?: boolean
