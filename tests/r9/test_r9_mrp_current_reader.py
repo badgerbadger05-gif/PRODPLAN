@@ -6,12 +6,14 @@ from app import models
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     publish_current_obligation_views_from_generation,
+    require_current_execution_scope,
 )
 from app.services.mrp_result_snapshot import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )
 from app.routers.plan import get_planning_result_summary
+from app.routers.plan import _mrp_snapshot_identity
 
 
 def _generation(db):
@@ -169,6 +171,33 @@ def test_mrp_reader_uses_per_run_summary_and_keeps_identity_tie_ascending(db_ses
     assert [row["current_identity"] for row in rows["rows"]] == [
         "run:62:v1:production:a", "run:62:v1:production:b"
     ]
+
+
+def test_mrp_grouped_identity_uses_current_business_anchor(db_session):
+    generation = _generation(db_session)
+    snapshot = models.PlanningReadSnapshot(
+        consumer="mrp_result",
+        snapshot_key="run:63:v1",
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload={"summary": {"row_counts": {"production": 0}, "total_qty": {"production": 0}}},
+        published_at=generation.cutoff,
+    )
+    db_session.add(snapshot)
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+
+    scope = require_current_execution_scope(
+        db_session,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    )
+    identity = _mrp_snapshot_identity(db_session, 63, scope.id)
+
+    assert identity["current_identity"] == "mrp-run:63"
+    assert identity["source_revision"].startswith("accepted:g")
 
 
 def test_mrp_root_filter_uses_persisted_current_membership(db_session):
