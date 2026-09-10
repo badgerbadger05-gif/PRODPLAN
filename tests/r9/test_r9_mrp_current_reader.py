@@ -11,6 +11,7 @@ from app.services.mrp_result_snapshot import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )
+from app.routers.plan import get_planning_result_summary
 
 
 def _generation(db):
@@ -90,6 +91,17 @@ def test_mrp_reader_fails_closed_even_when_legacy_snapshot_exists(db_session):
 
     with pytest.raises(CurrentExecutionUnavailable):
         read_mrp_result_rows(db_session, 41, row_kind="production")
+
+
+def test_mrp_http_reader_maps_missing_current_to_503(db_session):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    db_session.commit()
+
+    with pytest.raises(Exception) as caught:
+        import asyncio
+        asyncio.run(get_planning_result_summary(41, db=db_session))
+    assert getattr(caught.value, "status_code", None) == 503
 
 
 def test_mrp_reader_rejects_unknown_run_and_keeps_date_to_inclusive(db_session):
