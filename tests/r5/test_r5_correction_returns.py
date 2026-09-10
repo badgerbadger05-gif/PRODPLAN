@@ -240,7 +240,32 @@ def test_addressed_receipt_precedes_fifo_and_aggregated_purchase_cap_is_respecte
         exact_allocation_caps={(10, "aggregate-order", "7"): {1: Decimal("2")} },
         history_mode="as_occurred",
     )
-    assert _basis(result) == [(1, 1, Decimal("4"), "pegged")]
+    # The exact export cap is only two; the remaining two use FIFO.  The
+    # stable pair is represented as mixed rather than overstating all four as
+    # addressed.
+    assert _basis(result) == [(1, 1, Decimal("4"), "mixed")]
+    assert result.allocations[0].match_rule == "mixed"
+
+
+def test_return_beyond_active_basis_is_exposed_as_unmatched_surplus():
+    reservations = {10: [_reservation(1, 101, "2")]}
+    result = replay_supplier_receipt_basis(
+        [
+            _fact(1, "2", at=datetime(2026, 9, 1), ref="original"),
+            _fact(
+                2,
+                "-5",
+                at=datetime(2026, 9, 2),
+                ref="over-return",
+                correction_ref="original",
+            ),
+        ],
+        reservations,
+        history_mode="as_occurred",
+    )
+    assert result.allocations == ()
+    assert result.unmatched_return_qty == Decimal("3")
+    assert result.surplus_qty == Decimal("0")
 
 
 def test_return_with_exact_original_reference_only_unwinds_that_receipt():

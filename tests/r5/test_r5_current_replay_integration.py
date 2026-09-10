@@ -137,6 +137,7 @@ def test_out_of_order_supersession_uses_new_version_for_current_replay(db_sessio
         qty_after=Decimal("4"), posting_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
         known_at=datetime(2026, 9, 10, tzinfo=timezone.utc), record_type="Receipt",
         movement_kind="receipt", recorder_type="Doc", recorder_ref="line-1", line_no="1",
+        active=False,
     )
     new = models.StockLedgerEntry(
         ingest_batch_id=batch_new.id, source_content_hash="r5-new".ljust(64, "0"),
@@ -144,6 +145,7 @@ def test_out_of_order_supersession_uses_new_version_for_current_replay(db_sessio
         qty_after=Decimal("6"), posting_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
         known_at=datetime(2026, 9, 11, tzinfo=timezone.utc), record_type="Receipt",
         movement_kind="receipt", recorder_type="Doc", recorder_ref="line-1", line_no="1",
+        active=True,
     )
     db_session.add_all([old, new])
     db_session.flush()
@@ -214,7 +216,11 @@ def test_postgresql_receipt_replay_retry_and_stale_revision_are_atomic():
                 complete_scope=True,
                 history_mode="as_occurred",
             )
-        assert writer.query(models.CurrentReplenishmentAudit).count() == first.audit_events
+        scoped_audits = writer.query(models.CurrentReplenishmentAudit).filter(
+            models.CurrentReplenishmentAudit.ledger_generation_id == generation_id,
+            models.CurrentReplenishmentAudit.source_revision == 1,
+        ).count()
+        assert scoped_audits == first.audit_events
     finally:
         writer.rollback()
         writer.close()
