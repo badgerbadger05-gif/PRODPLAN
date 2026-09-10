@@ -389,6 +389,55 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
     assert result["idempotency_key"].startswith("mrp-purchases:")
     assert called[0]["purchase_ids"] == [7001]
 
+    retry = asyncio.run(
+        export_planning_result_purchases_to_1c(
+            41,
+            PurchaseOrder1CExportRequest(
+                current_identities=[current_identity],
+                expected_source_revision=scope.source_revision,
+                purchase_ids=[7001],
+            ),
+            db=db_session,
+        )
+    )
+    assert retry["idempotency_key"] == result["idempotency_key"]
+
+
+def test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity(
+    db_session, monkeypatch
+):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+    scope = require_current_execution_scope(
+        db_session,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    )
+    called = []
+    import app.routers.plan as plan_router
+    monkeypatch.setattr(
+        plan_router,
+        "export_planned_purchases_to_1c",
+        lambda **kwargs: called.append(kwargs),
+    )
+    import asyncio
+    with pytest.raises(Exception) as caught:
+        asyncio.run(
+            export_planning_result_purchases_to_1c(
+                41,
+                PurchaseOrder1CExportRequest(
+                    current_identities=["mrp-run:999:purchase:1"],
+                    expected_source_revision=scope.source_revision,
+                ),
+                db=db_session,
+            )
+        )
+    assert getattr(caught.value, "status_code", None) == 409
+    assert called == []
+
 
 def test_mrp_root_filter_uses_persisted_current_membership(db_session):
     generation = _generation(db_session)
