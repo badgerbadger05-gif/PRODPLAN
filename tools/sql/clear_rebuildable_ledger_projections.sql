@@ -199,6 +199,8 @@ TRUNCATE
     production_material_custody_projection,
     production_material_custody_projection_manifest,
     production_material_custody_event,
+    current_replenishment_audit,
+    current_replenishment_state,
     ledger_build_batch,
     ledger_generation,
     physical_import_batch,
