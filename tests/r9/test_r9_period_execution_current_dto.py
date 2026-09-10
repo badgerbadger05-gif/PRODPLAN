@@ -6,9 +6,14 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app import models
 from app.routers.plan import period_plans_execution_journal
 from app.services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    _mrp_current_identity,
+    _mrp_current_payload,
     load_current_execution_rows,
     publish_current_obligation_views_from_generation,
     publish_current_execution_scope,
@@ -181,3 +186,95 @@ def test_period_current_get_returns_persisted_summary_without_business_recalcula
     assert response.facets == {"bom_levels": [0]}
     assert response.rows[0].status_label == "Не оформлено"
     assert response.rows[0].work_items[0].assigned_qty == 0.0
+
+
+def test_mrp_republish_technical_locators_do_not_leak_or_churn_current_owner(db_session):
+    first = {
+        "run_id": 41,
+        "row_kind": "purchase",
+        "source_mrp_requirement_id": 101,
+        "item_id": 501,
+        "source_mrp_allocation_key": "supplier:A",
+        "qty": 5,
+        "row_key": "purchase:701:0",
+        "sort_key": "2026-09-11|501|000000",
+        "purchase_id": 701,
+        "order_id": 801,
+    }
+    second = {
+        **first,
+        "row_key": "purchase:902:7",
+        "sort_key": "2026-09-11|501|000007",
+        "purchase_id": 902,
+        "order_id": 1002,
+    }
+    identity = _mrp_current_identity(first, run_id=41, row_kind="purchase")
+    assert identity == _mrp_current_identity(second, run_id=41, row_kind="purchase")
+
+    def publish(payload: dict[str, object], revision: str) -> None:
+        publish_current_execution_scope(
+            db_session,
+            source_revision=revision,
+            scope_key="mrp:republish-test",
+            entity_kinds=("mrp_result",),
+            rows=[{
+                "entity_kind": "mrp_result",
+                "business_identity": identity,
+                "scope_key": "mrp:republish-test",
+                "payload": _mrp_current_payload(payload, business_identity=identity),
+            }],
+        )
+
+    publish(first, "accepted:g1:mrp_result")
+    db_session.commit()
+    current = load_current_execution_rows(
+        db_session, entity_kind="mrp_result", scope_key="mrp:republish-test",
+    )[0]
+    first_id = int(current.id)
+    first_updated_at = current.updated_at
+    first_changes = db_session.query(models.CurrentExecutionChange).filter_by(
+        current_row_id=first_id,
+    ).count()
+    assert "purchase_id" not in current.payload
+    assert "order_id" not in current.payload
+
+    publish(second, "accepted:g2:mrp_result")
+    db_session.commit()
+    db_session.expire_all()
+    current = load_current_execution_rows(
+        db_session, entity_kind="mrp_result", scope_key="mrp:republish-test",
+    )[0]
+    assert int(current.id) == first_id
+    assert current.updated_at == first_updated_at
+    assert db_session.query(models.CurrentExecutionChange).filter_by(
+        current_row_id=first_id,
+    ).count() == first_changes
+    assert "purchase_id" not in current.payload
+    assert "order_id" not in current.payload
+
+
+def test_mrp_identity_fails_closed_without_semantic_owner_or_on_duplicate(db_session):
+    with pytest.raises(CurrentExecutionUnavailable):
+        _mrp_current_identity({"item_id": 501}, run_id=41, row_kind="purchase")
+
+    payload = {
+        "source_mrp_requirement_id": 101,
+        "item_id": 501,
+        "source_mrp_allocation_key": "supplier:A",
+    }
+    identity = _mrp_current_identity(payload, run_id=41, row_kind="purchase")
+    with pytest.raises(CurrentExecutionUnavailable):
+        publish_current_execution_scope(
+            db_session,
+            source_revision="accepted:g1:mrp_result",
+            scope_key="mrp:duplicate-test",
+            entity_kinds=("mrp_result",),
+            rows=[
+                {"entity_kind": "mrp_result", "business_identity": identity,
+                 "scope_key": "mrp:duplicate-test",
+                 "payload": _mrp_current_payload(payload, business_identity=identity)},
+                {"entity_kind": "mrp_result", "business_identity": identity,
+                 "scope_key": "mrp:duplicate-test",
+                 "payload": _mrp_current_payload(payload, business_identity=identity)},
+            ],
+        )
