@@ -3242,6 +3242,19 @@ def _execution_obligation_links(
             **_forecast_payload(rework.need_date, rework.need_date, reason="rework"),
         })
 
+    # Persist the semantic parent on every link.  Numeric order/purchase/
+    # rework IDs are locators only; current navigation resolves through this
+    # requirement+item+run anchor during publication.
+    for requirement_id, links in links_by_requirement.items():
+        item_id = next(
+            (int(item) for item, req in requirement_id_by_item.items() if int(req) == int(requirement_id)),
+            None,
+        )
+        for link in links:
+            link.setdefault("source_mrp_requirement_id", int(requirement_id))
+            if item_id is not None:
+                link.setdefault("item_id", item_id)
+            link.setdefault("run_id", int(run.run_id))
     return links_by_requirement, ordered_by_requirement
 
 

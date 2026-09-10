@@ -419,6 +419,11 @@ class ExecutionJournalWorkItem(BaseModel):
     forecast_shift_days: int | None = None
     forecast_reason: str | None = None
     forecast_status: Literal["early", "on_time", "delayed", "critical", "unavailable"] | None = None
+    assigned_qty: float | None = None
+    unassigned_qty: float | None = None
+    current_identity: str | None = None
+    navigation_href: str | None = None
+    navigation_reason: str | None = None
 
 
 class ExecutionJournalRow(BaseModel):
@@ -460,6 +465,9 @@ class ExecutionJournalRow(BaseModel):
     purchase_covered_qty: float | None = None
     purchase_to_order_qty: float | None = None
     unassigned_qty: float | None = None
+    current_identity: str | None = None
+    source_revision: str | None = None
+    explanations: list[str] = []
 
 
 class ExecutionJournalSummaryByFlow(BaseModel):
@@ -794,6 +802,54 @@ async def period_plans_repair_duplicate_snapshots(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _filter_current_period_rows(
+    rows: list[dict[str, Any]],
+    *,
+    root_item_id: Optional[int],
+    bom_level: Optional[int],
+    flow: Optional[str],
+    status: Optional[str],
+    include_net_zero: bool,
+    sort_by: str,
+    sort_dir: str,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Filter/page persisted period DTOs without recalculating business facts."""
+    selected = list(rows)
+    if root_item_id is not None:
+        selected = [row for row in selected if int(root_item_id) in {
+            int(value) for value in (row.get("root_item_ids") or [])
+        }]
+    if bom_level is not None:
+        selected = [row for row in selected if int(row.get("bom_level") or 0) == int(bom_level)]
+    if flow:
+        selected = [row for row in selected if str(row.get("flow") or "") == str(flow)]
+    if not include_net_zero:
+        selected = [row for row in selected if str(row.get("status") or "") != "net_zero"]
+    if status:
+        if status == "incomplete":
+            selected = [row for row in selected if str(row.get("status") or "") in {"partial", "ordered", "none"}]
+        else:
+            selected = [row for row in selected if str(row.get("status") or "") == str(status)]
+    key_name = str(sort_by or "bom_level")
+    descending = str(sort_dir or "asc").lower() == "desc"
+    selected.sort(
+        key=lambda row: (
+            row.get(key_name) is None,
+            str(row.get(key_name) or "").casefold() if isinstance(row.get(key_name), str) else row.get(key_name),
+            int(row.get("bom_level") or 0),
+            int(row.get("item_id") or 0),
+            int(row.get("req_id") or 0),
+        ),
+        reverse=descending,
+    )
+    total = len(selected)
+    page_limit = max(1, min(int(limit or 100), 500))
+    page_offset = max(0, int(offset or 0))
+    return selected[page_offset:page_offset + page_limit], total
+
+
 @router.get(
     "/period-plans/{plan_id}/execution-journal",
     response_model=ExecutionJournalResponse,
@@ -819,7 +875,6 @@ async def period_plans_execution_journal(
             require_current_execution_scope,
         )
         from ..services.period_plan_service import (
-            _finalize_execution_payload,
             _get_plan,
             _resolve_execution_run,
         )
@@ -846,28 +901,41 @@ async def period_plans_execution_journal(
             break
         if selected is None:
             raise CurrentExecutionUnavailable("period-plan execution is not published")
-        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+        rows = []
+        for current_row in load_current_execution_rows(
             db,
             entity_kind="period_plan_execution",
             scope_key="period-plan:all-live-plans",
-        ) if row.payload and int(row.payload.get("plan_id") or 0) == int(plan_id)
-        and int(row.payload.get("run_id") or 0) == int(resolved_run.run_id)]
-        current_payload = {
-            "plan": dict(selected.get("plan") or {}),
-            "run_id": int(selected.get("run_id") or 0),
-            "rows": rows,
-            "plan_output_rows": list(selected.get("plan_output_rows") or []),
-            "summary": dict(selected.get("summary") or {}),
-            "truth_status": selected.get("truth_status"),
-            "ledger_generation": manifest.source_generation_id,
-            "truth_generation_id": selected.get("truth_generation_id"),
-            "cutoff": selected.get("cutoff"),
-            "truth_cutoff": selected.get("truth_cutoff"),
-            "truth_reason": selected.get("truth_reason"),
-        }
-        return ExecutionJournalResponse.model_validate(_finalize_execution_payload(
-            db,
-            current_payload,
+        ):
+            if not current_row.payload:
+                continue
+            if int(current_row.payload.get("plan_id") or 0) != int(plan_id):
+                continue
+            if int(current_row.payload.get("run_id") or 0) != int(resolved_run.run_id):
+                continue
+            row_payload = dict(current_row.payload)
+            row_payload["source_revision"] = str(manifest.source_revision)
+            for internal_key in ("row_key", "run_id", "plan_id", "facets"):
+                row_payload.pop(internal_key, None)
+            row_payload["work_items"] = [
+                {
+                    key: value
+                    for key, value in dict(item).items()
+                    if key not in {"run_id", "item_id", "source_mrp_requirement_id"}
+                }
+                for item in list(row_payload.get("work_items") or [])
+                if isinstance(item, dict)
+            ]
+            rows.append(row_payload)
+        facets = selected.get("facets")
+        summary = selected.get("summary")
+        if not isinstance(facets, dict) or not isinstance(summary, dict):
+            raise CurrentExecutionUnavailable("period-plan current summary/facets are missing")
+        for row in rows:
+            if not row.get("current_identity") or not row.get("source_revision"):
+                raise CurrentExecutionUnavailable("period-plan current row identity/revision is missing")
+        page_rows, total = _filter_current_period_rows(
+            rows,
             root_item_id=root_item_id,
             bom_level=bom_level,
             flow=flow,
@@ -877,7 +945,24 @@ async def period_plans_execution_journal(
             sort_dir=sort_dir,
             limit=limit,
             offset=offset,
-        ))
+        )
+        return ExecutionJournalResponse.model_validate({
+            "plan": dict(selected.get("plan") or {}),
+            "run_id": int(selected.get("run_id") or 0),
+            "rows": page_rows,
+            "plan_output_rows": list(selected.get("plan_output_rows") or []),
+            "summary": summary,
+            "total": total,
+            "limit": max(1, min(int(limit or 100), 500)),
+            "offset": max(0, int(offset or 0)),
+            "truth_status": selected.get("truth_status"),
+            "ledger_generation": manifest.source_generation_id,
+            "truth_generation_id": selected.get("truth_generation_id"),
+            "cutoff": selected.get("cutoff"),
+            "truth_cutoff": selected.get("truth_cutoff"),
+            "truth_reason": selected.get("truth_reason"),
+            "facets": facets,
+        })
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "period_plan_execution_unavailable", "reason": str(e)}) from e
     except HTTPException:

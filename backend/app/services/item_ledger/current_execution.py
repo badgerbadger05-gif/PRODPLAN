@@ -14,6 +14,7 @@ from decimal import Decimal
 import hashlib
 import json
 from typing import Any, Iterable
+from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,108 @@ from app import models
 
 class CurrentExecutionUnavailable(ValueError):
     """The current execution result is absent, stale, incomplete or unsafe."""
+
+
+_PERIOD_EXECUTION_STATUS_LABELS = {
+    "net_zero": "Покрыто складом",
+    "covered": "Закрыто",
+    "partial": "Частично",
+    "ordered": "Оформлено",
+    "none": "Не оформлено",
+    "execution_unavailable": "Исполнение недоступно",
+}
+
+
+def _period_work_item_target(
+    item: dict[str, Any], *, run_id: int | None, requirement_id: int | None,
+    target_catalog: dict[tuple[Any, ...], list[str]],
+) -> tuple[str | None, str | None, str | None]:
+    """Return stable current target identity, href and an unavailable reason."""
+    kind = str(item.get("type") or "").strip()
+    run = int(run_id or item.get("run_id") or 0)
+    req = int(requirement_id or item.get("source_mrp_requirement_id") or 0)
+    current = str(item.get("current_identity") or "").strip()
+    href = str(item.get("navigation_href") or "").strip()
+    if current and href:
+        return current, href, None
+    keys: list[tuple[Any, ...]] = []
+    if kind == "production_order":
+        if item.get("order_id") is not None and item.get("product_id") is not None:
+            keys.append(("production", int(item["order_id"]), int(item["product_id"])))
+        if req and item.get("product_id") is not None:
+            keys.append(("production-requirement", req, int(item["product_id"])))
+    elif kind == "planned_purchase":
+        if item.get("one_c_opened") and item.get("order_ref1c"):
+            keys.append(("purchase-ref", str(item["order_ref1c"]).strip()))
+        if req and item.get("item_id") is not None:
+            keys.append(("mrp", int(run or 0), "purchase", req, int(item["item_id"])))
+    elif kind in {"planned_order", "planned_rework"} and run and req:
+        row_kind = "production" if kind == "planned_order" else "rework"
+        if item.get("item_id") is not None:
+            keys.append(("mrp", int(run), row_kind, req, int(item["item_id"])))
+    candidates: list[str] = []
+    for key in keys:
+        candidates.extend(target_catalog.get(key, []))
+    candidates = list(dict.fromkeys(candidates))
+    if len(candidates) == 1:
+        current = candidates[0]
+        tab = {"planned_order": "production", "planned_purchase": "purchases", "planned_rework": "rework"}.get(kind)
+        if kind == "production_order":
+            href = f"#/production-control?current_identity={quote(current, safe='')}"
+        elif kind == "planned_purchase" and item.get("one_c_opened"):
+            href = f"#/purchase-control?current_identity={quote(current, safe='')}"
+        elif tab:
+            href = f"#/mrp-runs/{int(run or 0)}?tab={tab}&current_identity={quote(current, safe='')}"
+    if current and href:
+        return current, href, None
+    return None, None, "Current target неоднозначен" if candidates else "Точный current target не опубликован"
+
+
+def _period_execution_work_item(
+    raw: dict[str, Any], *, run_id: int | None, requirement_id: int | None,
+    target_catalog: dict[tuple[Any, ...], list[str]],
+) -> dict[str, Any]:
+    item = dict(raw)
+    current_identity, href, reason = _period_work_item_target(
+        item, run_id=run_id, requirement_id=requirement_id,
+        target_catalog=target_catalog,
+    )
+    qty = float(item.get("qty") or 0.0)
+    opened = bool(item.get("one_c_opened"))
+    assigned = qty if str(item.get("type") or "") in {"production_order", "planned_rework"} or (
+        str(item.get("type") or "") == "planned_purchase" and opened
+    ) else 0.0
+    unassigned = qty - assigned if str(item.get("type") or "") in {"planned_order", "planned_purchase"} else 0.0
+    item.update({
+        "assigned_qty": assigned,
+        "unassigned_qty": max(0.0, unassigned),
+        "current_identity": current_identity,
+        "navigation_href": href,
+        "navigation_reason": reason,
+    })
+    return item
+
+
+def _period_execution_row_payload(
+    payload: dict[str, Any], *, business_identity: str,
+    target_catalog: dict[tuple[Any, ...], list[str]],
+) -> dict[str, Any]:
+    result = dict(payload)
+    result["current_identity"] = str(result.get("current_identity") or business_identity)
+    status = str(result.get("status") or "execution_unavailable")
+    result["status_label"] = str(result.get("status_label") or _PERIOD_EXECUTION_STATUS_LABELS.get(status, status))
+    result["explanations"] = list(result.get("explanations") or [])
+    result["work_items"] = [
+        _period_execution_work_item(
+            dict(item),
+            run_id=result.get("run_id"),
+            requirement_id=result.get("req_id"),
+            target_catalog=target_catalog,
+        )
+        for item in list(result.get("work_items") or [])
+        if isinstance(item, dict)
+    ]
+    return result
 
 
 @dataclass(frozen=True)
@@ -836,6 +939,51 @@ def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
     )
 
 
+def _mrp_current_identity(payload: dict[str, Any], *, run_id: int, row_kind: str) -> str:
+    """Build an MRP identity from obligation semantics, never technical row IDs."""
+    kind = str(row_kind).strip().lower()
+    if kind == "capacity":
+        area = payload.get("area_id") or payload.get("resource_id")
+        bucket = payload.get("bucket_date") or payload.get("date") or payload.get("need_date")
+        if area in (None, "") or bucket in (None, ""):
+            raise CurrentExecutionUnavailable("MRP capacity row lacks stable area/date identity")
+        return f"mrp-run:{int(run_id)}:capacity:area:{area}:bucket:{bucket}"
+    requirement = (
+        payload.get("source_mrp_requirement_id")
+        or payload.get("requirement_id")
+        or payload.get("req_id")
+    )
+    if requirement in (None, ""):
+        row_key = str(payload.get("row_key") or "")
+        if row_key.startswith("req:"):
+            tail = row_key.rsplit(":", 1)[-1]
+            if tail.isdigit():
+                requirement = int(tail)
+    # Aggregate/capacity-adjacent obligation rows may not have a numeric
+    # requirement.  Their persisted semantic aggregation key is the stable
+    # owner; technical row_key/index is deliberately excluded.
+    if requirement in (None, ""):
+        requirement = payload.get("agg_key") or payload.get("demand_ref")
+    if requirement in (None, "") and payload.get("item_id") not in (None, ""):
+        requirement = f"item-{int(payload['item_id'])}"
+    item_id = payload.get("item_id")
+    if requirement in (None, "") or item_id in (None, ""):
+        raise CurrentExecutionUnavailable(
+            f"MRP {row_kind} row lacks stable requirement/item identity"
+        )
+    discriminator = (
+        payload.get("source_mrp_allocation_key")
+        or payload.get("source_mrp_allocation_id")
+        or payload.get("supplier_ref1c")
+        or payload.get("bucket_date")
+        or "default"
+    )
+    return (
+        f"mrp-run:{int(run_id)}:{str(row_kind).strip().lower()}:"
+        f"requirement:{str(requirement)}:item:{int(item_id)}:allocation:{str(discriminator)}"
+    )
+
+
 def _production_snapshot_identity(payload: dict[str, Any]) -> str:
     """Resolve production journal identity without generation-local work IDs."""
 
@@ -1008,6 +1156,11 @@ def publish_current_obligation_views_from_generation(
             payload = dict(row.payload or {})
             payload.setdefault("run_id", int(run_marker) if run_marker.isdigit() else None)
             payload.setdefault("row_kind", str(row.row_kind))
+            # `req:<id>` is the persisted obligation key used by older
+            # snapshots; copy it only so the identity resolver can recover
+            # the business requirement.  Arbitrary row keys are never used
+            # as a current identity.
+            payload.setdefault("row_key", str(row.row_key or ""))
             payload.setdefault("sort_key", str(row.sort_key or ""))
             payload.setdefault(
                 "root_item_ids",
@@ -1019,9 +1172,14 @@ def publish_current_obligation_views_from_generation(
                     ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
                 ],
             )
+            stable_mrp_identity = _mrp_current_identity(
+                payload,
+                run_id=int(run_marker) if run_marker.isdigit() else 0,
+                row_kind=str(row.row_kind),
+            )
             mrp_rows.append({
                 "entity_kind": "mrp_result",
-                "business_identity": f"{snapshot.snapshot_key}:{row.row_kind}:{row.row_key}",
+                "business_identity": stable_mrp_identity,
                 "scope_key": "mrp:all-live-plans",
                 "payload": payload,
             })
@@ -1032,6 +1190,36 @@ def publish_current_obligation_views_from_generation(
         rows=mrp_rows,
         summary={"total_rows": len(mrp_rows), "runs": mrp_metadata},
     )
+
+    # Period work-item links resolve against the identities that this same
+    # publication is about to expose.  Technical product/order/purchase IDs
+    # are locators only; no identity is synthesized from them.
+    target_catalog: dict[tuple[Any, ...], list[str]] = {}
+
+    def _catalog(key: tuple[Any, ...], identity: str) -> None:
+        target_catalog.setdefault(key, []).append(str(identity))
+
+    for entry in production_rows:
+        payload = dict(entry.get("payload") or {})
+        identity = str(entry.get("business_identity") or "")
+        if payload.get("order_id") is not None and payload.get("product_id") is not None:
+            _catalog(("production", int(payload["order_id"]), int(payload["product_id"])), identity)
+        if payload.get("source_mrp_requirement_id") is not None and payload.get("product_id") is not None:
+            _catalog(("production-requirement", int(payload["source_mrp_requirement_id"]), int(payload["product_id"])), identity)
+    for entry in purchase_rows:
+        payload = dict(entry.get("payload") or {})
+        identity = str(entry.get("business_identity") or "")
+        if payload.get("order_ref1c"):
+            _catalog(("purchase-ref", str(payload["order_ref1c"]).strip()), identity)
+    for entry in mrp_rows:
+        payload = dict(entry.get("payload") or {})
+        identity = str(entry.get("business_identity") or "")
+        run_id = payload.get("run_id")
+        row_kind = str(payload.get("row_kind") or "")
+        req_id = payload.get("req_id") or payload.get("requirement_id") or payload.get("source_mrp_requirement_id")
+        item_id = payload.get("item_id")
+        if run_id is not None and req_id is not None and item_id is not None:
+            _catalog(("mrp", int(run_id), row_kind, int(req_id), int(item_id)), identity)
 
     execution_rows: list[dict[str, Any]] = []
     execution_metadata: dict[str, Any] = {}
@@ -1067,9 +1255,15 @@ def publish_current_obligation_views_from_generation(
             row_payload.setdefault("run_id", run_id)
             row_payload.setdefault("plan_id", plan.get("id"))
             identity = _snapshot_row_identity(row_payload, "period-plan")
+            business_identity = f"plan:{plan.get('id')}:{identity}"
+            row_payload = _period_execution_row_payload(
+                row_payload,
+                business_identity=business_identity,
+                target_catalog=target_catalog,
+            )
             execution_rows.append({
                 "entity_kind": "period_plan_execution",
-                "business_identity": f"plan:{plan.get('id')}:{identity}",
+                "business_identity": business_identity,
                 "scope_key": "period-plan:all-live-plans",
                 "payload": row_payload,
             })

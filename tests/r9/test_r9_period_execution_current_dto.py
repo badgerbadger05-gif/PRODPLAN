@@ -53,12 +53,13 @@ def _period_row():
         "status_label": "Не оформлено",
         "explanations": ["Требуется закупка"],
         "information_links": {"reservation_events": []},
-        "facets": {"bom_levels": [0], "flows": ["purchase"]},
+        "facets": {"bom_levels": [0]},
         "work_items": [{
             "type": "planned_purchase",
             "qty": 5.0,
             "purchase_id": 701,
             "source_mrp_requirement_id": 101,
+            "item_id": 501,
             "run_id": 41,
             "one_c_opened": False,
             "completed_qty": 0.0,
@@ -86,6 +87,22 @@ def test_period_publication_persists_stable_work_item_dto_and_navigation(db_sess
         truth_status="accepted", payload=payload, published_at=generation.cutoff,
     )
     db_session.add(snapshot)
+    db_session.add(models.PlanningReadSnapshot(
+        consumer="mrp_result", snapshot_key="run:41:v1",
+        ledger_generation_id=generation.id, cutoff=generation.cutoff,
+        truth_status="accepted", payload={
+            "summary": {"row_counts": {"purchase": 1}, "total_qty": {"purchase": 5}},
+        }, published_at=generation.cutoff,
+    ))
+    db_session.flush()
+    mrp_snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
+        consumer="mrp_result", snapshot_key="run:41:v1",
+    ).one()
+    db_session.add(models.PlanningReadRow(
+        snapshot_id=mrp_snapshot.id, row_key="req:101", row_kind="purchase",
+        sort_key="2026-09-11|501", item_id=501,
+        payload={"run_id": 41, "row_kind": "purchase", "req_id": 101, "item_id": 501, "qty": 5},
+    ))
     db_session.commit()
 
     publish_current_obligation_views_from_generation(db_session, generation.id)
@@ -96,10 +113,13 @@ def test_period_publication_persists_stable_work_item_dto_and_navigation(db_sess
     )
     work_item = current.payload["work_items"][0]
     assert current.payload["current_identity"] == current.business_identity
-    assert current.payload["source_revision"] == f"accepted:g{generation.id}:period_plan_execution"
+    assert "source_revision" not in current.payload
     assert work_item["assigned_qty"] == 0.0
     assert work_item["unassigned_qty"] == 5.0
-    assert work_item["current_identity"] == "mrp-run:41:requirement:101:planned-purchase:701"
+    [mrp_current] = load_current_execution_rows(
+        db_session, entity_kind="mrp_result", scope_key="mrp:all-live-plans",
+    )
+    assert work_item["current_identity"] == mrp_current.business_identity
     assert work_item["navigation_href"]
     assert work_item["navigation_reason"] is None
 
@@ -113,10 +133,22 @@ def test_period_current_get_returns_persisted_summary_without_business_recalcula
     }
     metadata = {
         "plan": {"id": 7, "name": "Plan 7"}, "run_id": 41,
-        "summary": summary, "facets": {"bom_levels": [0], "flows": ["purchase"]},
+        "summary": summary, "facets": {"bom_levels": [0]},
         "plan_output_rows": [], "truth_status": "accepted",
     }
     row = _period_row()
+    row.pop("row_key", None)
+    row.pop("facets", None)
+    row["work_items"][0].pop("run_id", None)
+    row["work_items"][0].pop("source_mrp_requirement_id", None)
+    row["work_items"][0].pop("item_id", None)
+    row["work_items"][0].update({
+        "assigned_qty": 0.0,
+        "unassigned_qty": 5.0,
+        "current_identity": "mrp-run:41:purchase:requirement:101:item:501:allocation:default",
+        "navigation_href": "#/mrp-runs/41?tab=purchases&current_identity=mrp-run%3A41%3Apurchase%3Arequirement%3A101%3Aitem%3A501%3Aallocation%3Adefault",
+        "navigation_reason": None,
+    })
     row["current_identity"] = "plan:7:req:101"
     row["source_revision"] = "accepted:g-current:period_plan_execution"
     publish_current_execution_scope(
@@ -146,6 +178,6 @@ def test_period_current_get_returns_persisted_summary_without_business_recalcula
 
     response = asyncio.run(period_plans_execution_journal(plan_id=7, db=db_session))
     assert response.summary.execution_pct == 0.0
-    assert response.facets == {"bom_levels": [0], "flows": ["purchase"]}
+    assert response.facets == {"bom_levels": [0]}
     assert response.rows[0].status_label == "Не оформлено"
     assert response.rows[0].work_items[0].assigned_qty == 0.0
