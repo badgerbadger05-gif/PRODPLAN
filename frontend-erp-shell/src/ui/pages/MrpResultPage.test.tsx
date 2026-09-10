@@ -321,6 +321,17 @@ describe('MrpResultPage characterization', () => {
     expect(screen.getByRole('button', { name: 'XLSX' })).toBeDisabled()
   })
 
+  it('fails closed for a purchase row without a current identity', async () => {
+    vi.mocked(getPlanningResultPurchases).mockResolvedValue(
+      paged([{ ...purchaseRows[0], current_identity: null, source_revision: null }]),
+    )
+    renderPage('/mrp-runs/41?tab=purchases')
+
+    await screen.findByText('Подшипник')
+    expect(screen.getByTitle('Текущая identity недоступна')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Выгрузить в 1С (0)' })).toBeDisabled()
+  })
+
   it('clears rows when a tab response does not match the pinned snapshot', async () => {
     vi.mocked(getPlanningResultProduction).mockResolvedValue({
       ...paged(productionRows),
