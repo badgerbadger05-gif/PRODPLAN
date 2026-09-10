@@ -2171,9 +2171,16 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
     if str(run.status or "") == "CLOSED":
         if existing_closed_snapshot is None:
             raise ValueError("closed plan snapshot is missing for this run")
+        # A retained/closed run remains anchored to its own immutable
+        # generation across fact-only refreshes.  Select that anchor rather
+        # than the latest technical generation; this also excludes stale
+        # pre-R10 carry-forward copies.
+        anchor_generation_id = run.ledger_generation_id
+        if anchor_generation_id is None:
+            raise ValueError("closed planning run has no immutable Ledger anchor")
         active_reservations = db.query(ReservationEntry.id).filter(
             ReservationEntry.run_id == int(run.run_id),
-            ReservationEntry.ledger_generation_id == parent_generation_id,
+            ReservationEntry.ledger_generation_id == int(anchor_generation_id),
             ReservationEntry.lifecycle_status == "active",
         ).count()
         if active_reservations:
@@ -3793,10 +3800,19 @@ def build_period_plan_execution_snapshot(
         .filter(MrpRunRoot.run_id == int(run.run_id))
         .scalar()
     )
+    # The run owns its persisted replenishment execution.  Use the run's
+    # immutable anchor rather than the current technical generation so a
+    # retained run is found after fact-only refreshes while stale carry-forward
+    # copies remain excluded.
+    reservation_generation_id = (
+        int(run.ledger_generation_id)
+        if run.ledger_generation_id is not None
+        else int(generation_id)
+    )
     has_replenishment_execution = (
         db.query(ReservationEntry.id)
         .filter(
-            ReservationEntry.ledger_generation_id == int(generation_id),
+            ReservationEntry.ledger_generation_id == reservation_generation_id,
             ReservationEntry.run_id == int(run.run_id),
             ReservationEntry.replenishment_received_qty > 0,
         )

@@ -384,18 +384,17 @@ def get_future_supply(
         capabilities=(CAPABILITY_FUTURE_SUPPLY,),
     )
     rows = (
-        db.query(models.LedgerFutureSupply)
+        db.query(models.LedgerFutureSupplyCurrent)
         .filter(
-            models.LedgerFutureSupply.item_id == int(item_id),
-            models.LedgerFutureSupply.is_current.is_(True),
-            models.LedgerFutureSupply.evidence_status == "exact",
-            models.LedgerFutureSupply.open_qty_at_cutoff > EPS,
+            models.LedgerFutureSupplyCurrent.item_id == int(item_id),
+            models.LedgerFutureSupplyCurrent.evidence_status == "exact",
+            models.LedgerFutureSupplyCurrent.open_qty_at_cutoff > EPS,
         )
         .order_by(
-            models.LedgerFutureSupply.eta_date.asc().nulls_last(),
-            models.LedgerFutureSupply.supply_kind.asc(),
-            models.LedgerFutureSupply.source_ref.asc().nulls_last(),
-            models.LedgerFutureSupply.id.asc(),
+            models.LedgerFutureSupplyCurrent.eta_date.asc().nulls_last(),
+            models.LedgerFutureSupplyCurrent.supply_kind.asc(),
+            models.LedgerFutureSupplyCurrent.source_ref.asc().nulls_last(),
+            models.LedgerFutureSupplyCurrent.id.asc(),
         )
         .all()
     )

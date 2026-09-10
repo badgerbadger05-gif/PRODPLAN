@@ -268,6 +268,99 @@ class LedgerFutureSupply(Base):
     capture_batch = relationship("LedgerBuildBatch")
 
 
+class LedgerFutureSupplyCurrent(Base):
+    """One stable current row per supplier/WIP source identity.
+
+    ``LedgerFutureSupply`` remains the immutable generation capture/staging
+    surface.  This compact table is the only current quantity owner; refreshes
+    update the same row and retain before/after evidence in the change table.
+    """
+
+    __tablename__ = "ledger_future_supply_current"
+    __table_args__ = (
+        UniqueConstraint("current_identity", name="ux_ledger_future_supply_current_identity_v2"),
+        CheckConstraint(
+            "supply_kind IN ('wip_order', 'supplier_order')",
+            name="ck_ledger_future_supply_current_kind",
+        ),
+        CheckConstraint(
+            "evidence_status IN ('exact', 'ambiguous', 'unmatched', 'rejected')",
+            name="ck_ledger_future_supply_current_evidence_status",
+        ),
+        CheckConstraint(
+            "ordered_qty_at_cutoff >= 0 AND realized_qty_at_cutoff >= 0 "
+            "AND open_qty_at_cutoff >= 0",
+            name="ck_ledger_future_supply_current_quantities_nonnegative",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    current_identity = Column(String(256), nullable=False)
+    source_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source_capture_batch_id = Column(
+        BigInteger,
+        ForeignKey("ledger_build_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    supply_kind = Column(String(32), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    planning_stock_pool = Column(String(128), nullable=False)
+    destination_warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    source_ref = Column(String(64), nullable=True)
+    source_line_ref = Column(String(64), nullable=True)
+    source_local_id = Column(String(128), nullable=True)
+    source_requirement_id = Column(
+        Integer,
+        ForeignKey("mrp_requirement.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    ordered_qty_at_cutoff = Column(DECIMAL(15, 3), nullable=False)
+    realized_qty_at_cutoff = Column(DECIMAL(15, 3), nullable=False)
+    open_qty_at_cutoff = Column(DECIMAL(15, 3), nullable=False)
+    eta_date = Column(Date, nullable=True)
+    source_state_key = Column(String(64), nullable=False)
+    source_updated_at = Column(DateTime(timezone=True), nullable=True)
+    capture_cutoff = Column(DateTime(timezone=True), nullable=False)
+    source_content_hash = Column(String(64), nullable=False)
+    evidence_status = Column(String(16), nullable=False)
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    source_generation = relationship("LedgerGeneration", foreign_keys=[source_generation_id])
+    source_capture_batch = relationship("LedgerBuildBatch", foreign_keys=[source_capture_batch_id])
+    item = relationship("Item")
+
+
+class LedgerFutureSupplyCurrentChange(Base):
+    """Append-only before/after audit for current future-supply changes."""
+
+    __tablename__ = "ledger_future_supply_current_change"
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    current_identity = Column(String(256), nullable=False, index=True)
+    current_row_id = Column(BigInteger, nullable=True, index=True)
+    source_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    operation = Column(String(16), nullable=False)
+    before_payload = Column(CrossPlatformJSON, nullable=True)
+    after_payload = Column(CrossPlatformJSON, nullable=True)
+    source_content_hash = Column(String(64), nullable=False)
+    changed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class PlanningTruthState(Base):
     """Singleton pointer to the generation exposed to dependent calculations."""
     __tablename__ = "planning_truth_state"

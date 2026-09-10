@@ -46,7 +46,6 @@ from app.services.item_ledger.r3_contract import (
     retire_live_pointer,
     set_live_pointer,
 )
-from app.services.planning_run_candidate import _resolve_parent_generation_id
 
 
 class ObligationRefreshPublishError(RuntimeError):
@@ -779,16 +778,11 @@ def _exact_retry(
         models.PlanningReadRow.row_kind == "production_order",
     ).count():
         return None
-    fixed_parents = _lock(db.query(models.PlanningRun)).filter(
-        models.PlanningRun.status == "FIXED_SNAPSHOT",
-        models.PlanningRun.source_plan_id.isnot(None),
-    ).all()
-    if any(
-        _resolve_parent_generation_id(
-            db, row, current_generation_id=int(parent.id)
-        ) == int(parent.id) for row in fixed_parents
-    ):
-        return None
+    # Retained runs intentionally remain anchored to ``parent``.  The
+    # manifest above is the complete plan scope; requiring every fixed run to
+    # resolve to the new generation would reintroduce the forbidden
+    # retargeting/copy semantics and make an exact retry fail after a valid
+    # no-copy publication.
     candidate_ids = [int(row.run_id) for row in candidates]
     try:
         _require_candidate_read_snapshots(
@@ -1074,11 +1068,9 @@ def publish_obligation_refresh_batch(
         raise ObligationRefreshPublishError(
             f"future supply current publication failed: {exc}"
         ) from exc
-    for retained_run in retained:
-        # The frozen obligation rows stay untouched; only the run's accepted
-        # truth projection advances to the new generation.
-        retained_run.ledger_generation_id = int(target.id)
-        retained_run.ledger_cutoff = target.cutoff
+    # Retained runs remain anchored to their original accepted generation.
+    # Stable live-scope/lineage readers expose them without retargeting or
+    # copying their obligations into the replacement generation.
     for candidate in [*additions, *replacements]:
         candidate.status = "FIXED_SNAPSHOT"
         candidate.pinned = True

@@ -11,6 +11,7 @@ from ..models import (
     DefaultSpecification,
     Item,
     LedgerFutureSupply,
+    LedgerFutureSupplyCurrent,
     MrpFreezeComponent,
     PaintWeldChainLink,
     PaintWeldPair,
@@ -248,26 +249,28 @@ def _future_supply_eta_by_item(
     if not ids or ledger_generation_id is None:
         return {}
 
-    query = (
-        db.query(
-            LedgerFutureSupply.item_id,
-            LedgerFutureSupply.eta_date,
-            LedgerFutureSupply.open_qty_at_cutoff,
-            LedgerFutureSupply.supply_kind,
-            LedgerFutureSupply.source_ref,
-        )
-        .filter(LedgerFutureSupply.ledger_generation_id == int(ledger_generation_id))
-        .filter(LedgerFutureSupply.item_id.in_(ids))
-        .filter(LedgerFutureSupply.evidence_status == "exact")
-        .filter(LedgerFutureSupply.open_qty_at_cutoff > 0)
-        .filter(LedgerFutureSupply.eta_date.isnot(None))
-        .filter(LedgerFutureSupply.supply_kind.in_(("supplier_order", "wip_order")))
-    )
+    source = LedgerFutureSupplyCurrent if current_only else LedgerFutureSupply
+    query = db.query(
+        source.item_id,
+        source.eta_date,
+        source.open_qty_at_cutoff,
+        source.supply_kind,
+        source.source_ref,
+    ).filter(source.item_id.in_(ids))
     if current_only:
-        query = query.filter(LedgerFutureSupply.is_current.is_(True))
+        query = query.filter(source.source_generation_id.isnot(None))
+    else:
+        query = query.filter(source.ledger_generation_id == int(ledger_generation_id))
+    query = (
+        query
+        .filter(source.evidence_status == "exact")
+        .filter(source.open_qty_at_cutoff > 0)
+        .filter(source.eta_date.isnot(None))
+        .filter(source.supply_kind.in_(("supplier_order", "wip_order")))
+    )
     rows = query.order_by(
-            LedgerFutureSupply.eta_date.asc().nulls_last(),
-            LedgerFutureSupply.source_ref.asc().nulls_last(),
+            source.eta_date.asc().nulls_last(),
+            source.source_ref.asc().nulls_last(),
         ).all()
 
     result: Dict[int, List[Dict[str, Any]]] = {}

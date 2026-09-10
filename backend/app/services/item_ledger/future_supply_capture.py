@@ -804,6 +804,22 @@ def carry_forward_future_supply(
     })
 
 
+_CURRENT_BUSINESS_FIELDS = (
+    "supply_kind", "item_id", "characteristic_ref", "organization_ref",
+    "planning_stock_pool", "destination_warehouse_ref1c", "source_ref",
+    "source_line_ref", "source_local_id", "source_requirement_id",
+    "ordered_qty_at_cutoff", "realized_qty_at_cutoff", "open_qty_at_cutoff",
+    "eta_date", "source_state_key", "evidence_status", "reason",
+)
+
+
+def _current_business_payload(row: Any) -> dict[str, Any]:
+    """Exclude technical cutoff/hash metadata from current-change equality."""
+    return _row_hash_payload({
+        field: getattr(row, field) for field in _CURRENT_BUSINESS_FIELDS
+    })
+
+
 def publish_current_future_supply(
     db: Session,
     generation_id: int,
@@ -834,14 +850,80 @@ def publish_current_future_supply(
     if len(set(identities)) != len(identities):
         raise FutureSupplyCaptureError("future supply current identities collide")
 
-    current_rows = db.query(models.LedgerFutureSupply).filter(
-        models.LedgerFutureSupply.is_current.is_(True),
-    ).all()
-    for row in current_rows:
-        row.is_current = False
-    db.flush()
-    for row in rows:
-        row.is_current = True
+    current_rows = db.query(models.LedgerFutureSupplyCurrent).all()
+    current_by_identity = {
+        str(row.current_identity): row for row in current_rows
+    }
+    # Rejected/ambiguous source evidence is retained in the immutable capture
+    # for audit, but it is not a current supply row.  It must not make an
+    # otherwise publishable contour fail, nor may it churn an existing exact
+    # identity; current readers simply have no usable row for that evidence.
+    target_by_identity = {
+        str(row.current_identity): row
+        for row in rows
+        if str(row.evidence_status) == "exact"
+    }
+    for identity, source in target_by_identity.items():
+        payload = _current_business_payload(source)
+        current = current_by_identity.get(identity)
+        if current is not None:
+            if _current_business_payload(current) == payload:
+                continue
+            db.add(models.LedgerFutureSupplyCurrentChange(
+                current_identity=identity,
+                current_row_id=int(current.id),
+                source_generation_id=int(target.id),
+                operation="update",
+                before_payload=_current_business_payload(current),
+                after_payload=payload,
+                source_content_hash=str(source.source_content_hash),
+            ))
+            for field in _CURRENT_BUSINESS_FIELDS:
+                value = getattr(source, field)
+                setattr(current, field, value)
+            current.source_updated_at = source.source_updated_at
+            current.capture_cutoff = source.capture_cutoff
+            current.source_content_hash = source.source_content_hash
+            current.source_generation_id = int(target.id)
+            current.source_capture_batch_id = int(source.capture_batch_id)
+            current.updated_at = datetime.now(timezone.utc)
+            continue
+        current = models.LedgerFutureSupplyCurrent(
+            current_identity=identity,
+            source_generation_id=int(target.id),
+            source_capture_batch_id=int(source.capture_batch_id),
+            source_updated_at=source.source_updated_at,
+            capture_cutoff=source.capture_cutoff,
+            source_content_hash=source.source_content_hash,
+            **{
+                field: getattr(source, field)
+                for field in _CURRENT_BUSINESS_FIELDS
+            },
+        )
+        db.add(current)
+        db.flush()
+        db.add(models.LedgerFutureSupplyCurrentChange(
+            current_identity=identity,
+            current_row_id=int(current.id),
+            source_generation_id=int(target.id),
+            operation="insert",
+            before_payload=None,
+            after_payload=payload,
+            source_content_hash=str(source.source_content_hash),
+        ))
+    for identity, current in current_by_identity.items():
+        if identity in target_by_identity:
+            continue
+        db.add(models.LedgerFutureSupplyCurrentChange(
+            current_identity=identity,
+            current_row_id=int(current.id),
+            source_generation_id=int(target.id),
+            operation="close",
+            before_payload=_current_business_payload(current),
+            after_payload=None,
+            source_content_hash=str(current.source_content_hash),
+        ))
+        db.delete(current)
     db.flush()
     return {
         "generation_id": int(target.id),

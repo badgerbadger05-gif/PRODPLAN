@@ -240,9 +240,18 @@ def rebase_fixed_plan_remaining_roots(
             raise ValueError("closed plan snapshot payload conflicts with current execution")
 
     old_remaining_by_item: dict[int, Decimal] = defaultdict(lambda: ZERO)
+    # A retained obligation is a stable business run.  Fact-only refreshes
+    # deliberately leave its reservation rows anchored to the generation that
+    # created them; selecting by the latest technical generation would make a
+    # later specification rebase silently lose the saved denominator.  The
+    # run identity plus its immutable anchor is the canonical scope here.  The
+    # anchor also excludes stale rows left by pre-R10 carry-forward history.
+    anchor_generation_id = predecessor.ledger_generation_id
+    if anchor_generation_id is None:
+        raise ValueError("planning run has no immutable Ledger anchor")
     old_reservations = db.query(models.ReservationEntry).filter(
-        models.ReservationEntry.ledger_generation_id == parent_generation_id,
         models.ReservationEntry.run_id == int(predecessor.run_id),
+        models.ReservationEntry.ledger_generation_id == int(anchor_generation_id),
         models.ReservationEntry.lifecycle_status == "active",
     ).all()
     for reservation in old_reservations:

@@ -441,16 +441,11 @@ def run_obligation_refresh(
         for entry in manifest.entries
         if entry.get("action") == "retain"
     ))
-    retained_reservation_count = carry_forward_retained_reservations(
-        db,
-        parent_generation_id=int(parent_generation_id),
-        target_generation_id=target_id,
-        retained_run_ids=retained_run_ids,
-        # Every obligation refresh below executes the canonical physical replay
-        # for both candidates and retained runs.  Pre-copying realization here
-        # would assign the same SLE to the same retained reservation twice.
-        preserve_realization=False,
-    )
+    # Retained obligations are stable business rows anchored to their original
+    # run/generation lineage.  A replacement refresh must not copy or retarget
+    # them into the candidate generation; live-scope readers resolve the sealed
+    # lineage explicitly when they need the retained plan.
+    retained_reservation_count = 0
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
     execution_batch = _single_stage(db, target_id, "execution_allocation", key)
