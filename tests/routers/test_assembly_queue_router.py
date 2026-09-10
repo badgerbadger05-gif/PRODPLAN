@@ -987,7 +987,7 @@ def test_current_drum_get_sorts_persisted_slots_by_date_resource_priority_and_or
                     "plan_line_id": 10,
                     "item_id": 100,
                     "resource_id": 7,
-                    "slot_date": "2026-09-12",
+                    "slot_date": "2026-09-11",
                     "slot_ordinal": 0,
                     "slot_qty": "1",
                     "original_priority": [2, 10],
