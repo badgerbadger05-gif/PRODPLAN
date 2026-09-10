@@ -1,6 +1,15 @@
 from pathlib import Path
 
 from app import models
+from app.routers.planning_rates import (
+    AssemblyRateUpsert,
+    AssemblyRateUpsertRequest,
+    ShelfPolicyUpdate,
+    update_shelf_policy,
+    upsert_assembly_rates,
+)
+from app.routers.resources import update_resource
+from app.schemas import ProductionResourceUpdate
 from app.services.item_ledger.current_execution import (
     get_current_execution_scope,
     invalidate_current_execution_for_calendar_change,
@@ -94,4 +103,106 @@ def test_r8_specification_revision_invalidates_only_on_semantic_change(db_sessio
     )
     assert get_current_execution_scope(
         db_session, entity_kind="assembly_queue", scope_key="assembly:all-live-plans"
+    ).result_ready is False
+
+
+def test_r8_reference_writers_are_idempotent_before_invalidating_on_real_change(db_session):
+    item = models.Item(item_code="R8-REF-ITEM", item_name="R8 reference item", optimal_batch="2")
+    resource = models.ProductionResource(resource_name="R8 reference resource", capacity="8")
+    db_session.add_all([item, resource])
+    db_session.flush()
+    rate = models.AssemblyRate(resource_id=resource.resource_id, item_id=item.item_id, qty_per_capacity="2")
+    policy = models.ShelfPolicy(
+        item_id=item.item_id,
+        warehouse_ref1c="R8-W",
+        replenishment_time_days=1,
+        review_cycle_days=1,
+        safety_days=1,
+        batch_multiple="1",
+    )
+    db_session.add_all([rate, policy])
+    db_session.flush()
+    for kind, scope in (
+        ("assembly_readiness", "assembly:all-live-plans"),
+        ("drum_schedule", "drum:all-live-plans"),
+        ("shelf_projection", "shelf:all-live-mrps"),
+    ):
+        publish_current_execution_scope(
+            db_session,
+            source_revision="accepted:r8-ref",
+            scope_key=scope,
+            entity_kinds=(kind,),
+            rows=[{
+                "entity_kind": kind,
+                "business_identity": f"{kind}:ref",
+                "scope_key": scope,
+                "payload": {"value": "1"},
+            }],
+        )
+    db_session.commit()
+
+    upsert_assembly_rates(
+        AssemblyRateUpsertRequest(rows=[AssemblyRateUpsert(
+            item_id=item.item_id, resource_id=resource.resource_id, qty_per_capacity="2"
+        )]),
+        db_session,
+    )
+    update_shelf_policy(
+        policy.id,
+        ShelfPolicyUpdate(replenishment_time_days=1),
+        db_session,
+    )
+    update_resource(
+        resource.resource_id,
+        ProductionResourceUpdate(
+            resource_name=resource.resource_name,
+            shift_offset=resource.shift_offset,
+            planning_range=resource.planning_range,
+            capacity=resource.capacity,
+            work_schedule=resource.work_schedule,
+            daily_work_hours=resource.daily_work_hours,
+            buffer_days=resource.buffer_days,
+            is_kitting=resource.is_kitting,
+        ),
+        db_session,
+    )
+    assert get_current_execution_scope(
+        db_session, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
+    ).result_ready is True
+    assert get_current_execution_scope(
+        db_session, entity_kind="drum_schedule", scope_key="drum:all-live-plans"
+    ).result_ready is True
+    assert get_current_execution_scope(
+        db_session, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps"
+    ).result_ready is True
+
+    upsert_assembly_rates(
+        AssemblyRateUpsertRequest(rows=[AssemblyRateUpsert(
+            item_id=item.item_id, resource_id=resource.resource_id, qty_per_capacity="3"
+        )]),
+        db_session,
+    )
+    update_shelf_policy(policy.id, ShelfPolicyUpdate(safety_days=2), db_session)
+    update_resource(
+        resource.resource_id,
+        ProductionResourceUpdate(
+            resource_name=resource.resource_name,
+            shift_offset=resource.shift_offset,
+            planning_range=resource.planning_range,
+            capacity="9",
+            work_schedule=resource.work_schedule,
+            daily_work_hours=resource.daily_work_hours,
+            buffer_days=resource.buffer_days,
+            is_kitting=resource.is_kitting,
+        ),
+        db_session,
+    )
+    assert get_current_execution_scope(
+        db_session, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
+    ).result_ready is False
+    assert get_current_execution_scope(
+        db_session, entity_kind="drum_schedule", scope_key="drum:all-live-plans"
+    ).result_ready is False
+    assert get_current_execution_scope(
+        db_session, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps"
     ).result_ready is False
