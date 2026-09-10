@@ -2264,7 +2264,11 @@ def post_open_paint_weld_chains(
             for product_id in sorted(output_ids):
                 output_rows.extend(output_by_product[product_id])
         if len(output_rows) != len(output_ids):
-            raise CurrentExecutionUnavailable("paint/weld counterpart lacks a current production anchor")
+            # The exact requirement anchor was verified before invoking the
+            # internally committing chain service.  Reaching this branch means
+            # that service violated its publication contract; this is an
+            # invariant assertion, not a rollback/transaction safety guard.
+            raise AssertionError("paint/weld chain produced an unanchored current product")
         result["current_identities"] = [str(row.business_identity) for row in output_rows]
         result["source_revision"] = str(payload.expected_source_revision)
         return result
