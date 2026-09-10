@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app import models
 from app.routers.production_control import (
@@ -119,3 +120,35 @@ def test_produce_rejects_stale_manifest_revision_before_service(monkeypatch, db_
         )
     assert getattr(caught.value, "status_code", None) == 409
     assert called == []
+
+
+def test_produce_uses_current_identity_before_fake_1c_steps(monkeypatch, db_session):
+    generation = _accepted_generation(db_session)
+    _current_production_scope(db_session, generation)
+    db_session.commit()
+    import app.routers.production_control as router
+    calls = []
+    monkeypatch.setattr(router, "produce_line", lambda *args, **kwargs: {"manufacture_id": 8, "order_id": 9})
+    monkeypatch.setattr(router, "export_manufactures_to_1c", lambda *args, **kwargs: calls.append("manufacture") or {"manufactures_error": 0, "entries": [{"target_ref_key": "m-1"}]})
+    monkeypatch.setattr(router, "export_piecework_to_1c", lambda *args, **kwargs: calls.append("piecework") or {"manufactures_error": 0, "entries": [{"target_ref_key": "p-1"}]})
+    import app.services.one_c_production_order_export as production_export
+    monkeypatch.setattr(production_export, "finalize_produced_orders_to_1c", lambda *args, **kwargs: {"message": "ok", "resume_required": False})
+
+    result = post_produce_line(
+        77,
+        ProduceLinePayload(
+            qty=1,
+            current_identity="order:77",
+            expected_source_revision="accepted:g1",
+        ),
+        db=db_session,
+    )
+    assert result["ledger_readback"] == "queued"
+    assert calls == ["manufacture", "piecework"]
+
+
+def test_export_piecework_openapi_keeps_all_request_fields():
+    from app.main import app
+    schema = TestClient(app).get("/openapi.json").json()
+    fields = schema["components"]["schemas"]["ExportPieceworkPayload"]["properties"]
+    assert {"manufacture_ids", "operation_ref", "time_norm", "price", "organization_ref", "structural_unit_ref", "business_operation_ref", "dry_run", "allow_production"} <= set(fields)
