@@ -7,6 +7,7 @@ generation just to make a changed assignment visible.
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -19,9 +20,10 @@ from app.services.item_ledger.current_replenishment import (
 )
 
 
-def _world(db):
+def _world(db, *, prefix=None):
+    token = f"{prefix}-{uuid4().hex[:12]}" if prefix else uuid4().hex[:12]
     physical = models.PhysicalImportBatch(
-        batch_key="r4-current-physical",
+        batch_key=f"r4-current-physical-{token}",
         status="completed",
         cutoff=datetime(2026, 9, 10, tzinfo=timezone.utc),
         source_watermarks={},
@@ -30,7 +32,7 @@ def _world(db):
     db.add(physical)
     db.flush()
     generation = models.LedgerGeneration(
-        generation_key="r4-current-generation",
+        generation_key=f"r4-current-generation-{token}",
         status="accepted",
         cutoff=physical.cutoff,
         accepted_at=physical.cutoff,
@@ -39,12 +41,12 @@ def _world(db):
         physical_import_batch=physical,
         algorithm_version="r4-tests",
     )
-    item = models.Item(item_code="R4-ITEM", item_name="R4 item")
+    item = models.Item(item_code=f"R4-ITEM-{token}", item_name="R4 item")
     db.add_all([generation, item])
     db.flush()
     requirements = []
     reservations = []
-    for requirement_id, quantity in ((101, "8"), (102, "7")):
+    for quantity in ("8", "7"):
         run = models.PlanningRun(
             status="BUILDING_SNAPSHOT",
             config_snapshot={},
@@ -58,7 +60,6 @@ def _world(db):
         db.add(run)
         db.flush()
         requirement = models.MrpRequirement(
-            id=requirement_id,
             run_id=run.run_id,
             item_id=item.item_id,
             total_required_qty=Decimal(quantity),
@@ -91,7 +92,7 @@ def _world(db):
         requirements.append(requirement)
         reservations.append(entry)
     facts = []
-    for ref, quantity, requirement_id in (("A", "8", None), ("B", "2", 102)):
+    for ref, quantity, requirement_id in (("A", "8", None), ("B", "2", requirements[1].id)):
         sle = models.StockLedgerEntry(
             ingest_batch_id=physical.id,
             source_content_hash=("r4-" + ref).ljust(64, "0"),
@@ -227,6 +228,7 @@ def test_failure_after_assignment_rolls_back_marker_execution_and_rows(db_sessio
     generation = db_session.get(models.LedgerGeneration, generation_id)
     assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
     assert "current_replenishment" not in (generation.source_watermarks or {})
+    assert db_session.query(models.CurrentReplenishmentState).count() == 0
 
 
 def test_new_revision_updates_only_changed_pair_and_old_revision_is_rejected(db_session):
@@ -286,3 +288,99 @@ def test_new_revision_updates_only_changed_pair_and_old_revision_is_rejected(db_
             reserves=reserves,
             complete_scope=True,
         )
+
+
+@pytest.mark.parametrize("failure", ["execution", "marker"])
+def test_each_late_boundary_rolls_back_all_current_state(db_session, failure):
+    generation_id, _item_id, reservations, facts = _world(db_session)
+    generation_before = dict(db_session.get(models.LedgerGeneration, generation_id).source_watermarks or {})
+    with pytest.raises(CurrentReplenishmentError, match="injected"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:r4",
+            source_revision=1,
+            facts=facts,
+            reserves=_reserves(reservations),
+            complete_scope=True,
+            fail_after=failure,
+        )
+    db_session.rollback()
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+    assert db_session.query(models.ReservationEvent).count() == 0
+    assert db_session.query(models.CurrentReplenishmentAudit).count() == 0
+    assert db_session.query(models.CurrentReplenishmentState).count() == 0
+    assert db_session.get(models.LedgerGeneration, generation_id).source_watermarks == generation_before
+
+
+def test_exact_retry_emits_no_assignment_execution_or_audit_dml(db_session):
+    generation_id, _item_id, reservations, facts = _world(db_session)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    statements = []
+    from sqlalchemy import event
+
+    def observe(_conn, _cursor, statement, _parameters, _context, _executemany):
+        upper = statement.upper()
+        if any(name in upper for name in ("RESERVATION_CONSUMPTION_ALLOCATION", "RESERVATION_EVENT", "RESERVATION_ENTRY")):
+            statements.append(upper.split()[0])
+
+    event.listen(db_session.bind, "before_cursor_execute", observe)
+    try:
+        result = apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:r4",
+            source_revision=1,
+            facts=facts,
+            reserves=reserves,
+            complete_scope=True,
+        )
+        db_session.commit()
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", observe)
+    assert result.idempotent is True
+    assert not {statement for statement in statements if statement in {"INSERT", "UPDATE", "DELETE"}}
+
+
+def test_legacy_current_writer_is_rejected_and_separate_reader_sees_one_state(db_session):
+    generation_id, item_id, reservations, facts = _world(db_session)
+    with pytest.raises(CurrentReplenishmentError, match="single current writer"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:r4",
+            source_revision=1,
+            facts=facts,
+            reserves=_reserves(reservations),
+            complete_scope=True,
+            writer="legacy",
+        )
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=1,
+        facts=facts,
+        reserves=_reserves(reservations),
+        complete_scope=True,
+    )
+    db_session.commit()
+    separate = db_session.connection().engine
+    from sqlalchemy.orm import Session
+
+    other = Session(separate)
+    try:
+        assert len(read_current_replenishment(other, generation_id=generation_id, item_id=item_id)) == 2
+        assert other.query(models.CurrentReplenishmentState).count() == 1
+    finally:
+        other.close()
