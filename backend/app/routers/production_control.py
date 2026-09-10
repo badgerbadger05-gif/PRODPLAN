@@ -712,9 +712,17 @@ def get_drum_schedule(
                 str(row.business_identity),
             ),
         )
+        excluded_rows = sorted(
+            load_current_execution_rows(db, entity_kind="drum_excluded", scope_key="drum:all-live-plans"),
+            key=lambda row: (
+                str((row.payload or {}).get("period_from") or ""),
+                _priority_key(row.payload or {}),
+                str(row.business_identity),
+            ),
+        )
         item_ids = {
             int(row.payload.get("item_id"))
-            for row in (*slots, *gaps)
+            for row in (*slots, *gaps, *excluded_rows)
             if row.payload.get("item_id") is not None
         }
         items = _items_by_id(db, item_ids)
@@ -798,6 +806,32 @@ def get_drum_schedule(
                 "blocking_manifest": list(payload.get("blocking_manifest") or []),
                 "original_priority": list(payload.get("original_priority") or []),
             })
+        excluded_response_rows = []
+        for row in excluded_rows[offset:offset + limit]:
+            payload = dict(row.payload or {})
+            item = items.get(int(payload.get("item_id")))
+            excluded_response_rows.append({
+                "queue_line_id": int(payload.get("queue_line_id") or 0),
+                "plan_id": int(payload.get("plan_id") or 0),
+                "plan_line_id": int(payload.get("plan_line_id") or 0),
+                "run_id": int(payload.get("run_id") or 0),
+                "item_id": int(payload.get("item_id") or 0),
+                "period_from": payload.get("period_from"),
+                "period_to": payload.get("period_to"),
+                "item_code": item.item_code if item else None,
+                "item_name": item.item_name if item else None,
+                "planned_output_qty": float(payload.get("planned_output_qty") or 0),
+                "accepted_plan_output_qty": float(payload.get("accepted_plan_output_qty") or 0),
+                "assembly_remaining_qty": float(payload.get("assembly_remaining_qty") or 0),
+                "reason": str(payload.get("reason") or "ASSEMBLY_RATE_MISSING"),
+                "readiness_status": str(payload.get("readiness_status") or "unavailable"),
+                "readiness_date": payload.get("readiness_date"),
+                "readiness_curve": list(payload.get("readiness_curve") or []),
+                "action_manifest": list(payload.get("action_manifest") or []),
+                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
+                "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                "original_priority": list(payload.get("original_priority") or []),
+            })
         return DrumScheduleResponse.model_validate({
             "schedule_from": schedule_payload.get("schedule_from"),
             "schedule_to": schedule_payload.get("schedule_to"),
@@ -808,14 +842,14 @@ def get_drum_schedule(
             ],
             "slots": slot_rows,
             "gaps": gap_rows,
-            "excluded": [],
+            "excluded": excluded_response_rows,
             "total_open_qty": float(schedule_payload.get("metrics", {}).get("total_open_qty") or 0),
             "total_slot_qty": float(schedule_payload.get("metrics", {}).get("total_slot_qty") or 0),
             "total_gap_qty": float(schedule_payload.get("metrics", {}).get("total_gap_qty") or 0),
             "total_slots": len(slots),
             "total_gaps": len(gaps),
-            "total_excluded": 0,
-            "total_excluded_open_qty": 0,
+            "total_excluded": int(schedule_payload.get("metrics", {}).get("excluded_lines") or len(excluded_rows)),
+            "total_excluded_open_qty": float(schedule_payload.get("metrics", {}).get("excluded_open_qty") or 0),
             "limit": limit,
             "offset": offset,
             "truth_meta": build_truth_meta(truth),

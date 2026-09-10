@@ -644,13 +644,60 @@ def publish_current_execution_from_generation(
                     "original_priority": list(gap.original_priority or []),
                 },
             })
+        excluded_item_ids = {
+            int(item_id)
+            for item_id in list((schedule.metrics or {}).get("excluded_item_ids") or [])
+        }
+        readiness_by_queue_id = {
+            int(row.assembly_queue_line_id): row
+            for row in db.query(models.AssemblyReadiness).filter(
+                models.AssemblyReadiness.ledger_generation_id == int(generation.id),
+                models.AssemblyReadiness.assembly_queue_line_id.in_(
+                    [int(row.id) for row in queue_rows]
+                ),
+            ).all()
+        }
+        for queue in queue_rows:
+            if int(queue.item_id) not in excluded_item_ids:
+                continue
+            readiness = readiness_by_queue_id.get(int(queue.id))
+            stable_queue_id = stable_queue_ids.get(int(queue.plan_line_id))
+            if readiness is None or stable_queue_id is None:
+                raise CurrentExecutionUnavailable(
+                    f"excluded drum row lacks saved readiness/current queue owner for plan line {int(queue.plan_line_id)}"
+                )
+            drum_rows.append({
+                "entity_kind": "drum_excluded",
+                "business_identity": f"excluded:plan-line:{int(queue.plan_line_id)}",
+                "scope_key": "drum:all-live-plans",
+                "payload": {
+                    "queue_line_id": stable_queue_id,
+                    "plan_id": int(queue.plan_id),
+                    "plan_line_id": int(queue.plan_line_id),
+                    "run_id": int(queue.planning_run_id),
+                    "item_id": int(queue.item_id),
+                    "period_from": queue.period_from.isoformat(),
+                    "period_to": queue.period_to.isoformat(),
+                    "planned_output_qty": str(queue.planned_output_qty),
+                    "accepted_plan_output_qty": str(queue.accepted_plan_output_qty),
+                    "assembly_remaining_qty": str(queue.assembly_remaining_qty),
+                    "reason": "ASSEMBLY_RATE_MISSING",
+                    "readiness_status": str(readiness.status),
+                    "readiness_date": readiness.readiness_date.isoformat() if readiness.readiness_date else None,
+                    "readiness_curve": list(readiness.readiness_curve or []),
+                    "action_manifest": list(readiness.action_manifest or []),
+                    "unavailable_reasons": list(readiness.unavailable_reasons or []),
+                    "blocking_manifest": list(readiness.blocking_manifest or []),
+                    "original_priority": list(queue.original_priority or []),
+                },
+            })
         drum_result = publish_current_execution_scope(
             db,
             source_revision=revision,
             source_generation_id=int(generation.id),
             scope_key="drum:all-live-plans",
             rows=drum_rows,
-            entity_kinds=("drum_schedule", "drum_slot", "drum_gap"),
+            entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
         )
     else:
         drum_result = publish_current_execution_scope(
@@ -659,7 +706,7 @@ def publish_current_execution_from_generation(
             source_generation_id=int(generation.id),
             scope_key="drum:all-live-plans",
             rows=[],
-            entity_kinds=("drum_schedule", "drum_slot", "drum_gap"),
+            entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
         )
 
     shelf_result = CurrentExecutionPublishResult(0, 0, True)
