@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 import sqlalchemy as sa
 import pytest
-from datetime import datetime, timezone
+from fastapi import HTTPException
 
 from app import models
 from app.services.item_ledger.current_execution import (
@@ -12,6 +14,29 @@ from app.services.item_ledger.current_execution import (
     load_current_execution_coherent,
     publish_current_execution_scope,
 )
+
+
+def _legacy_generation(db_session):
+    batch = models.PhysicalImportBatch(
+        batch_key="r9-get-matrix-legacy-batch", status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc), source_watermarks={},
+    )
+    generation = models.LedgerGeneration(
+        generation_key="r9-get-matrix-legacy-generation", status="accepted",
+        cutoff=batch.cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=batch, algorithm_version="r9-test",
+        replay_version="r9-test",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(models.PlanningReadSnapshot(
+        consumer="mrp_result", snapshot_key="r9-get-matrix-legacy",
+        ledger_generation_id=generation.id, cutoff=generation.cutoff,
+        truth_status="accepted", payload={"rows": []},
+        published_at=generation.cutoff,
+    ))
+    db_session.commit()
+    return generation
 
 
 # This is the runtime GET inventory for the five R9 contours.  The shared
@@ -136,4 +161,120 @@ def test_route_sheet_get_mark_printed_is_still_read_only(monkeypatch):
         db=object(),
     )
     assert response.body == b"<html>current</html>"
+    assert writes == []
+
+
+def test_mrp_route_get_export_matrix_fails_closed_before_snapshot_helpers(
+    db_session, monkeypatch,
+):
+    """All MRP GET/group/export adapters reject missing current before legacy IO."""
+    generation = _legacy_generation(db_session)
+    monkeypatch.setattr(
+        "app.services.mrp_result_snapshot._read_mrp_snapshot_rows",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy MRP snapshot row helper was called")
+        ),
+        raising=True,
+    )
+    monkeypatch.setattr(
+        "app.services.mrp_result_snapshot._resolve_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy MRP snapshot resolver was called")
+        ),
+        raising=True,
+    )
+    from app.routers.plan import (
+        export_planning_result_production,
+        export_planning_result_purchases,
+        export_planning_result_rework,
+        get_planning_result_production,
+        get_planning_result_production_grouped,
+        get_planning_result_purchases,
+        get_planning_result_purchases_grouped,
+        get_planning_result_purchases_grouped_by_category,
+        get_planning_result_rework,
+        get_planning_result_rework_grouped,
+        get_planning_result_rework_grouped_by_category,
+        get_planning_result_capacity,
+    )
+    endpoints = [
+        (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_production_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_purchases_grouped, {"date_from": None, "date_to": None, "limit": 100, "offset": 0}),
+        (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_rework_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_purchases_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_rework_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_capacity, {"area_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 200, "offset": 0, "snapshot_id": None}),
+        (export_planning_result_production, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (export_planning_result_purchases, {"format": "csv", "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (export_planning_result_rework, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+    ]
+    writes: list[str] = []
+    bind = db_session.get_bind()
+
+    def observe(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")):
+            writes.append(statement)
+
+    sa.event.listen(bind, "before_cursor_execute", observe)
+    try:
+        for endpoint, kwargs in endpoints:
+            with pytest.raises(Exception) as caught:
+                asyncio.run(endpoint(run_id=41, db=db_session, **kwargs))
+            assert getattr(caught.value, "status_code", None) == 503, endpoint.__name__
+    finally:
+        sa.event.remove(bind, "before_cursor_execute", observe)
+    assert writes == []
+
+
+def test_representative_current_routes_fail_closed_without_legacy_reads_or_dml(
+    db_session, monkeypatch,
+):
+    """Production, purchase, period and queue adapters share the same gate."""
+    generation = _legacy_generation(db_session)
+    generation.capabilities = {
+        "physical_ledger": True, "reservation_replay": True,
+        "assembly_queue": True, "assembly_readiness": True,
+    }
+    generation.accepted_at = generation.cutoff
+    db_session.commit()
+
+    import app.routers.plan as plan_router
+    import app.routers.production_control as production_router
+    import app.routers.purchase_control as purchase_router
+
+    # These are real legacy entry symbols.  Reaching one would prove a
+    # current request fell through before its current-manifest gate.
+    forbidden = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("legacy reader reached before current gate")
+    )
+    monkeypatch.setattr(production_router, "read_production_control_journal_snapshot", forbidden, raising=True)
+    monkeypatch.setattr(purchase_router, "list_journal", forbidden, raising=True)
+    monkeypatch.setattr(plan_router, "get_period_plan_execution_journal", forbidden, raising=True)
+    monkeypatch.setattr(production_router.planning_truth, "require_accepted_truth", lambda *a, **k: object())
+    monkeypatch.setattr(production_router, "build_truth_meta", lambda *_a, **_k: {})
+
+    writes: list[str] = []
+    bind = db_session.get_bind()
+
+    def observe(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")):
+            writes.append(statement)
+
+    sa.event.listen(bind, "before_cursor_execute", observe)
+    try:
+        calls = (
+            lambda: production_router.get_orders_journal(db=db_session),
+            lambda: production_router.get_assembly_queue(db=db_session),
+            lambda: purchase_router.get_orders(active_only=False, db=db_session),
+            lambda: asyncio.run(plan_router.period_plans_execution_journal(plan_id=1, db=db_session)),
+        )
+        for call in calls:
+            with pytest.raises(HTTPException) as caught:
+                call()
+            assert caught.value.status_code == 503
+    finally:
+        sa.event.remove(bind, "before_cursor_execute", observe)
     assert writes == []
