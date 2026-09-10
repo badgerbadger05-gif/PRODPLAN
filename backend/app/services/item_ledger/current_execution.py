@@ -303,6 +303,34 @@ def get_current_execution_scope(
     ).one_or_none()
 
 
+def invalidate_current_execution_scope(
+    db: Session,
+    *,
+    entity_kind: str,
+    scope_key: str,
+    source_revision: str,
+    reason: str,
+) -> bool:
+    """Mark a persisted result unavailable until the worker republishes it."""
+    manifest = db.query(models.CurrentExecutionScope).filter(
+        models.CurrentExecutionScope.entity_kind == str(entity_kind),
+        models.CurrentExecutionScope.scope_key == str(scope_key),
+    ).with_for_update().one_or_none()
+    if manifest is None:
+        return False
+    if not bool(manifest.result_ready):
+        return False
+    manifest.result_ready = False
+    manifest.source_revision = str(source_revision)
+    db.query(models.CurrentExecutionRow).filter(
+        models.CurrentExecutionRow.entity_kind == str(entity_kind),
+        models.CurrentExecutionRow.scope_key == str(scope_key),
+        models.CurrentExecutionRow.result_status == "accepted",
+    ).update({"result_ready": False}, synchronize_session=False)
+    db.flush()
+    return True
+
+
 def publish_current_execution_from_generation(
     db: Session,
     generation_id: int,
