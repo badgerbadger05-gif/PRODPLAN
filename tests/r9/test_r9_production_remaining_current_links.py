@@ -181,8 +181,7 @@ def test_open_paint_rejects_foreign_requirement_before_committing_chain(monkeypa
     foreign = _current_row(identity="production-mrp-requirement:999:alloc:X", product_id=0)
     foreign.payload.update({"item_id": 20, "source_run_id": 5, "source_mrp_requirement_id": 999})
     requirement_a = SimpleNamespace(id=101, run_id=5, item_id=20, freeze_version=1)
-    requirement_b = SimpleNamespace(id=102, run_id=5, item_id=20, freeze_version=1)
-    db = _AnchorDb(requirements=[requirement_a, requirement_b])
+    db = _AnchorDb(requirements=[requirement_a])
     monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
     monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [source, foreign])
     called = []
