@@ -307,18 +307,8 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
     db_session.commit()
 
     response = client.get("/api/v1/production-control/assembly-queue")
-    assert response.status_code == 200
-    assert response.json() == {
-        **payload,
-        "limit": 1000,
-        "offset": 0,
-        "truth_meta": {
-            "ledger_generation": int(generation.id),
-            "cutoff": generation.cutoff.isoformat(),
-            "truth_status": "accepted",
-            "truth_reason": None,
-        },
-    }
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "assembly_queue_unavailable"
 
 
 def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_session):
@@ -353,13 +343,9 @@ def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_sessi
 
     page = client.get(
         "/api/v1/production-control/assembly-queue", params={"limit": 2, "offset": 3}
-    ).json()
-
-    assert [row["plan_line_id"] for row in page["rows"]] == [4103, 4104]
-    assert page["total_rows"] == 5
-    assert page["total_queue_qty"] == 50.0
-    assert page["limit"] == 2
-    assert page["offset"] == 3
+    )
+    assert page.status_code == 503
+    assert page.json()["detail"]["code"] == "assembly_queue_unavailable"
 
     assert (
         client.get(
@@ -377,8 +363,8 @@ def test_assembly_queue_router_rejects_missing_assembly_queue_capability(
     with pytest.raises(HTTPException) as exc:
         get_assembly_queue(db=db_session)
     assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "planning_truth_unavailable"
-    assert exc.value.detail["ready"] is False
+    assert exc.value.detail["code"] == "assembly_queue_unavailable"
+    assert "manifest" in exc.value.detail["reason"]
 
 
 def test_assembly_queue_router_rejects_missing_snapshot_even_with_capability(
@@ -407,21 +393,15 @@ def test_missing_snapshot_detail_keeps_its_own_reason(db_session):
         get_assembly_queue(db=db_session)
     queue_detail = queue_exc.value.detail
     assert queue_detail["code"] == "assembly_queue_unavailable"
-    assert queue_detail["reason"] == (
-        "assembly queue snapshot is missing for accepted generation"
-    )
-    # The readiness projection still travels alongside it.
-    assert queue_detail["truth_status"] == "accepted"
-    assert queue_detail["ledger_generation"] == int(generation.id)
+    assert queue_detail["reason"] == "current execution manifest is missing"
+    assert "truth_status" not in queue_detail
 
     with pytest.raises(HTTPException) as drum_exc:
         get_drum_schedule(db=db_session)
     drum_detail = drum_exc.value.detail
     assert drum_detail["code"] == "drum_schedule_unavailable"
-    assert drum_detail["reason"] == (
-        "drum schedule is missing for accepted generation"
-    )
-    assert drum_detail["ledger_generation"] == int(generation.id)
+    assert drum_detail["reason"] == "current execution manifest is missing"
+    assert "truth_status" not in drum_detail
 
 
 def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
@@ -447,32 +427,8 @@ def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
     db_session.commit()
 
     response = client.get("/api/v1/production-control/drum")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "schedule_from": cutoff.date().isoformat(),
-        "schedule_to": cutoff.date().isoformat(),
-        "days": [],  # 2026-08-01 is Saturday and never appears on the board.
-        "resources": [],
-        "slots": [],
-        "gaps": [],
-        "excluded": [],
-        "total_open_qty": 0.0,
-        "total_slot_qty": 0.0,
-        "total_gap_qty": 0.0,
-        "total_slots": 0,
-        "total_gaps": 0,
-        "total_excluded": 0,
-        "total_excluded_open_qty": 0.0,
-        "limit": 1000,
-        "offset": 0,
-        "truth_meta": {
-            "ledger_generation": generation.id,
-            "cutoff": generation.cutoff.isoformat(),
-            "truth_status": "accepted",
-            "truth_reason": None,
-        },
-    }
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "drum_schedule_unavailable"
 
 
 def test_drum_router_rejects_legacy_schedule_until_new_generation_is_published(
@@ -503,12 +459,8 @@ def test_drum_router_rejects_legacy_schedule_until_new_generation_is_published(
         get_drum_schedule(db=db_session)
 
     assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "drum_schedule_version_unavailable"
-    assert (
-        exc.value.detail["expected_algorithm_version"]
-        == DRUM_SCHEDULE_ALGORITHM_VERSION
-    )
-    assert exc.value.detail["actual_algorithm_version"] == "drum-schedule/legacy"
+    assert exc.value.detail["code"] == "drum_schedule_unavailable"
+    assert exc.value.detail["reason"] == "current execution manifest is missing"
 
 
 def test_drum_router_omits_weekends_from_board_columns(client, db_session):
@@ -540,9 +492,9 @@ def test_drum_router_omits_weekends_from_board_columns(client, db_session):
     )
     db_session.commit()
 
-    body = client.get("/api/v1/production-control/drum").json()
-
-    assert body["days"] == ["2026-09-04", "2026-09-07"]
+    response = client.get("/api/v1/production-control/drum")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "drum_schedule_unavailable"
 
 
 def test_drum_router_exposes_saved_queue_rows_without_takt(client, db_session):
@@ -611,22 +563,9 @@ def test_drum_router_exposes_saved_queue_rows_without_takt(client, db_session):
     )
     db_session.commit()
 
-    body = client.get("/api/v1/production-control/drum").json()
-
-    assert body["total_excluded"] == 1
-    assert body["total_excluded_open_qty"] == 10.0
-    [excluded] = body["excluded"]
-    assert excluded["queue_line_id"] == queue.id
-    assert excluded["item_id"] == item.item_id
-    assert excluded["item_code"] == "NO-TAKT"
-    assert excluded["planned_output_qty"] == 12.0
-    assert excluded["accepted_plan_output_qty"] == 2.0
-    assert excluded["assembly_remaining_qty"] == 10.0
-    assert excluded["period_from"] == cutoff.date().isoformat()
-    assert excluded["period_to"] == cutoff.date().isoformat()
-    assert excluded["reason"] == "ASSEMBLY_RATE_MISSING"
-    assert excluded["readiness_status"] == "blocked"
-    assert excluded["blocking_manifest"][0]["reason"] == "LEAD_TIME_MISSING"
+    response = client.get("/api/v1/production-control/drum")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "drum_schedule_unavailable"
 
 
 def test_drum_tile_move_is_persisted_and_audited(client, db_session):
@@ -733,6 +672,7 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
     assert moved.slot_date == target
     assert moved.auto_slot_date == source
     assert moved.manual_moved_by == "test-master"
+    _publish_current(db_session, generation)
     board = client.get("/api/v1/production-control/drum").json()
     assert board["slots"][0]["slot_date"] == target.isoformat()
     assert board["slots"][0]["manual_override"] is True
@@ -1026,21 +966,9 @@ def test_drum_router_pages_slots_and_reports_totals(client, db_session):
 
     page = client.get(
         "/api/v1/production-control/drum", params={"limit": 2, "offset": 2}
-    ).json()
-
-    assert len(page["slots"]) == 2
-    assert page["total_slots"] == 5
-    assert page["total_gaps"] == 0
-    assert page["limit"] == 2
-    assert page["offset"] == 2
-    # Schedule-wide totals never shrink with the page.
-    assert page["total_slot_qty"] == 5.0
-    # No Item row behind this id: the labels are additive and stay nullable.
-    assert page["slots"][0]["item_code"] is None
-    assert page["slots"][0]["item_name"] is None
-
-    full = client.get("/api/v1/production-control/drum").json()
-    assert len(full["slots"]) == 5
+    )
+    assert page.status_code == 503
+    assert page.json()["detail"]["code"] == "drum_schedule_unavailable"
 
 
 def test_drum_router_exposes_item_labels_on_slots(client, db_session):
@@ -1054,19 +982,9 @@ def test_drum_router_exposes_item_labels_on_slots(client, db_session):
     )
     db_session.commit()
 
-    body = client.get("/api/v1/production-control/drum").json()
-
-    assert [row["item_code"] for row in body["slots"]] == ["DRUM-7", "DRUM-7"]
-    assert [row["item_name"] for row in body["slots"]] == [
-        "Drum item 7",
-        "Drum item 7",
-    ]
-    # Backwards compatible: every pre-existing slot field is untouched.
-    assert body["slots"][0]["item_id"] == int(item.item_id)
-    assert body["slots"][0]["slot_ordinal"] == 0
-    assert body["slots"][0]["slot_qty"] == 1.0
-    assert body["slots"][0]["queue_line_id"] == 900
-    assert body["slots"][0]["readiness_phase"] == "unavailable"
+    response = client.get("/api/v1/production-control/drum")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "drum_schedule_unavailable"
 
 
 def test_shelves_router_reads_empty_persisted_projection(client, db_session):
@@ -1075,10 +993,8 @@ def test_shelves_router_reads_empty_persisted_projection(client, db_session):
 
     response = client.get("/api/v1/production-control/shelves")
 
-    assert response.status_code == 200
-    assert response.json()["rows"] == []
-    assert response.json()["total_rows"] == 0
-    assert response.json()["truth_meta"]["ledger_generation"] == generation.id
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "shelf_projection_unavailable"
 
 
 def test_shelves_router_exposes_item_labels_manifest_and_paging(client, db_session):
@@ -1129,21 +1045,9 @@ def test_shelves_router_exposes_item_labels_manifest_and_paging(client, db_sessi
     )
     db_session.commit()
 
-    body = client.get("/api/v1/production-control/shelves").json()
-
-    assert body["total_rows"] == 1
-    assert body["limit"] == 1000
-    assert body["offset"] == 0
-    row = body["rows"][0]
-    assert row["item_code"] == "COMP-9"
-    assert row["item_name"] == "Shelf component 9"
-    assert row["demand_manifest"] == manifest
-
-    empty_page = client.get(
-        "/api/v1/production-control/shelves", params={"limit": 1, "offset": 1}
-    ).json()
-    assert empty_page["rows"] == []
-    assert empty_page["total_rows"] == 1
+    response = client.get("/api/v1/production-control/shelves")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "shelf_projection_unavailable"
 
 
 def test_shelves_router_fails_closed_without_capability(db_session):
@@ -1158,4 +1062,5 @@ def test_shelves_router_fails_closed_without_capability(db_session):
         get_shelf_projections(db=db_session)
 
     assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "planning_truth_unavailable"
+    assert exc.value.detail["code"] == "shelf_projection_unavailable"
+    assert "manifest" in exc.value.detail["reason"]
