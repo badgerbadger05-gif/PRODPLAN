@@ -67,6 +67,7 @@ from ..models import (
 from .mrp_stock_helpers import (
     WipSupplyLine,
     apply_planning_warehouse_scope,
+    historical_stock_by_item,
     planning_stock_by_item,
     planning_warehouse_scope,
 )
@@ -447,20 +448,7 @@ def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[in
     )
     if current == requested:
         return planning_stock_by_item(db, requested)
-    scope = planning_warehouse_scope(db)
-    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
-        StockBin.ledger_generation_id == requested
-    )
-    query = apply_planning_warehouse_scope(
-        query,
-        scope,
-        warehouse_column=StockBin.warehouse_ref1c,
-        organization_column=StockBin.organization_ref,
-    )
-    return {
-        int(item_id): _to_float(qty or 0)
-        for item_id, qty in query.group_by(StockBin.item_id).all()
-    }
+    return historical_stock_by_item(db, requested)
 
 
 def _ledger_stock_by_item_at(

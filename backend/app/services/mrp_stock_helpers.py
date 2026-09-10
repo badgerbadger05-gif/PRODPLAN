@@ -132,6 +132,11 @@ def planning_stock_by_item(
         int(generation_id)
         for (generation_id,) in db.query(StockBin.ledger_generation_id)
         .filter(StockBin.is_current.is_(True))
+        .filter(
+            StockBin.item_id.in_(sorted(item_ids))
+            if item_ids is not None
+            else True
+        )
         .distinct()
         .all()
     }
@@ -140,6 +145,39 @@ def planning_stock_by_item(
             "current StockBin provenance contains a stale or ambiguous generation"
         )
     return result
+
+
+def historical_stock_by_item(
+    db: Session,
+    ledger_generation_id: int,
+    *,
+    item_ids: Optional[Set[int]] = None,
+    organization_ref: Optional[str] = DEFAULT_ORGANIZATION_REF1C,
+) -> Dict[int, float]:
+    """Read an explicit generation candidate for historical/building work.
+
+    This is intentionally separate from ``planning_stock_by_item``: it is not
+    a current read and never participates in an accepted MRP/availability GET.
+    """
+    if item_ids is not None and not item_ids:
+        return {}
+    scope = planning_warehouse_scope(db)
+    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
+        StockBin.ledger_generation_id == int(ledger_generation_id)
+    )
+    if item_ids is not None:
+        query = query.filter(StockBin.item_id.in_(sorted(item_ids)))
+    query = apply_planning_warehouse_scope(
+        query,
+        scope,
+        warehouse_column=StockBin.warehouse_ref1c,
+        organization_column=StockBin.organization_ref,
+        organization_ref=organization_ref,
+    )
+    return {
+        int(item_id): float(quantity or 0)
+        for item_id, quantity in query.group_by(StockBin.item_id).all()
+    }
 
 
 def _production_supply_qty_expr():

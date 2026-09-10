@@ -104,8 +104,25 @@ def _ledger_on_hand_by_generation(
     ledger_generation_id: int,
     *,
     item_ids: Optional[Set[int]] = None,
+    allow_building_read: bool = False,
 ) -> Dict[int, float]:
-    from ..mrp_stock_helpers import planning_stock_by_item
+    from ..mrp_stock_helpers import historical_stock_by_item, planning_stock_by_item
+
+    pointer = db.get(models.PlanningTruthState, 1)
+    pointer_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    if allow_building_read and pointer_generation_id != int(ledger_generation_id):
+        generation = db.get(models.LedgerGeneration, int(ledger_generation_id))
+        if generation is not None and str(generation.status) in {"building", "accepted"}:
+            return historical_stock_by_item(
+                db,
+                int(ledger_generation_id),
+                item_ids=item_ids,
+                organization_ref=None,
+            )
 
     return planning_stock_by_item(
         db,
@@ -433,6 +450,7 @@ def item_ledger_position(
         db,
         generation_id,
         item_ids=want,
+        allow_building_read=allow_building_read,
     )
     incoming_all = _ledger_incoming_by_generation(
         db,
