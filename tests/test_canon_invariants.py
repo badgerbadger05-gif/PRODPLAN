@@ -841,7 +841,7 @@ def test_readiness_and_drum_get_have_no_second_planning_engine() -> None:
     assert "status_rank = case(" not in router
     assert "is_workday(db, day)" not in router
     assert "is_workday(" not in manual_move
-    assert "saved_working_days(schedule)" in router
+    assert "saved_working_days(schedule)" not in router
     assert "saved_working_days(schedule)" in manual_move
     assert "saved_resource_horizon_ends(schedule)" in manual_move
     assert "saved_resource_daily_capacities(schedule)" in manual_move
@@ -905,7 +905,7 @@ def test_assembly_output_read_model_uses_accumulated_plan_truth() -> None:
     ):
         assert field in router
     assert 'consumer="assembly_queue"' in router
-    assert "get_latest_read_snapshot(" in router
+    assert "get_latest_read_snapshot(" not in router
     assert period_plan.count("_attach_run_output_summary(db, {") == 1
     assert 'result["plan_output_rows"] = plan_output_rows' in period_plan
     assert '"planned_output_qty": float(plan_planned)' in period_plan
