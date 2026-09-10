@@ -228,7 +228,9 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
     assert execution_snapshot.payload["summary"]["execution_base_qty"] == 2
     assert queue_line.assembly_remaining_qty == Decimal("2")
     assert readiness.open_qty == Decimal("2")
-    assert preserve_flags == [False]
+    # Current refreshes must not invoke the legacy generation-copy writer;
+    # retained obligations stay anchored to their stable run identity.
+    assert preserve_flags == []
 
 
 def test_replacement_uses_saved_remainder_through_multiple_accepted_fact_forks(db_session):
