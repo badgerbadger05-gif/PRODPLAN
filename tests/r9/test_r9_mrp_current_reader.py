@@ -12,8 +12,15 @@ from app.services.mrp_result_snapshot import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )
-from app.routers.plan import get_planning_result_summary
-from app.routers.plan import _mrp_snapshot_identity
+from app.routers.plan import (
+    _mrp_snapshot_identity,
+    export_planning_result_production,
+    export_planning_result_purchases,
+    get_planning_result_production,
+    get_planning_result_production_grouped,
+    get_planning_result_purchases_grouped,
+    get_planning_result_summary,
+)
 
 
 def _generation(db):
@@ -103,6 +110,43 @@ def test_mrp_http_reader_maps_missing_current_to_503(db_session):
     with pytest.raises(Exception) as caught:
         import asyncio
         asyncio.run(get_planning_result_summary(41, db=db_session))
+    assert getattr(caught.value, "status_code", None) == 503
+
+
+@pytest.mark.parametrize(
+    "endpoint,kwargs",
+    [
+        (get_planning_result_production, {}),
+        (get_planning_result_production_grouped, {}),
+        (get_planning_result_purchases_grouped, {}),
+        (export_planning_result_production, {"format": "csv"}),
+        (export_planning_result_purchases, {"format": "csv"}),
+    ],
+)
+def test_mrp_detail_grouped_and_export_never_fall_back_to_legacy_snapshot(
+    db_session, endpoint, kwargs
+):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    db_session.commit()
+
+    call = {"run_id": 41, "db": db_session, **kwargs}
+    if endpoint is get_planning_result_production:
+        call.update(
+            snapshot_id=None,
+            item_id=None,
+            root_item_id=None,
+            bucket_type=None,
+            date_from=None,
+            date_to=None,
+            limit=100,
+            offset=0,
+            sort_by=None,
+            sort_dir=None,
+        )
+    with pytest.raises(Exception) as caught:
+        import asyncio
+        asyncio.run(endpoint(**call))
     assert getattr(caught.value, "status_code", None) == 503
 
 
@@ -198,6 +242,32 @@ def test_mrp_grouped_identity_uses_current_business_anchor(db_session):
 
     assert identity["current_identity"] == "mrp-run:63"
     assert identity["source_revision"].startswith("accepted:g")
+
+
+def test_mrp_export_returns_current_identity_and_revision(db_session):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+    scope = require_current_execution_scope(
+        db_session,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    )
+
+    import asyncio
+    result = asyncio.run(
+        export_planning_result_production(
+            41,
+            format="csv",
+            snapshot_id=scope.id,
+            db=db_session,
+        )
+    )
+
+    assert result["current_identity"] == "mrp-run:41"
+    assert result["source_revision"] == scope.source_revision
 
 
 def test_mrp_root_filter_uses_persisted_current_membership(db_session):
