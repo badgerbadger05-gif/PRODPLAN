@@ -126,6 +126,7 @@ def _auto_select_source_warehouse(
         db.query(StockBin.warehouse_ref1c, StockBin.item_id)
         .filter(
             StockBin.is_current.is_(True),
+            StockBin.ledger_generation_id == int(ledger_generation_id),
             StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
         )
         .all()
@@ -202,6 +203,7 @@ def _source_warehouse_options(
         )
         .filter(
             StockBin.is_current.is_(True),
+            StockBin.ledger_generation_id == int(ledger_generation_id),
             StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
         )
         .group_by(StockBin.item_id, StockBin.warehouse_ref1c)

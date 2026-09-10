@@ -146,12 +146,12 @@ def effective_free_stock_by_item_all(db: Session) -> Dict[int, float]:
     warehouses cannot reduce stock counted elsewhere.
     """
     from .planning_truth import require_accepted
-    from .production_material_custody_projection import load_current_accepted_material_custody
+    from .production_material_custody_projection import load_material_custody_projection
 
     truth = require_accepted(db)
     physical = planning_stock_by_item(db, int(truth.generation_id))
-    _custody_generation_id, custody = load_current_accepted_material_custody(
-        db, consumer="mrp_stock_helpers.effective_free_stock"
+    custody = load_material_custody_projection(
+        db, ledger_generation_id=int(truth.generation_id)
     )
     scope = planning_warehouse_scope(db)
     reserved: Dict[int, float] = {}
