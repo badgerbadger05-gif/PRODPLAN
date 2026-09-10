@@ -396,9 +396,9 @@ export function MrpResultPage() {
         <div className="mrpSummaryStrip">
           <Metric title="Старт" value={truthAccepted ? dateTimeRu(summary?.run?.started_at) || '—' : 'Недоступно'} />
           <Metric title="Горизонт" value={truthAccepted ? `${qty(summary?.run?.horizon_days)} дн.` : 'Недоступно'} />
-          <Metric title="Производство" value={truthAccepted ? qty(summary?.counts?.production_orders ?? productionTotal) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.production, 'шт.') : undefined} />
-          <Metric title="Закупки" value={truthAccepted ? qty(summary?.counts?.purchase_requests ?? purchaseTotal) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.purchase, 'шт.') : undefined} />
-          <Metric title="Переработка" value={truthAccepted ? qty(summary?.counts?.rework_requests ?? reworkTotal) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.rework, 'шт.') : undefined} />
+          <Metric title="Производство" value={truthAccepted && summary?.counts?.production_orders != null ? qty(summary.counts.production_orders) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.production, 'шт.') : undefined} />
+          <Metric title="Закупки" value={truthAccepted && summary?.counts?.purchase_requests != null ? qty(summary.counts.purchase_requests) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.purchase, 'шт.') : undefined} />
+          <Metric title="Переработка" value={truthAccepted && summary?.counts?.rework_requests != null ? qty(summary.counts.rework_requests) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.snapshot_total_qty?.rework, 'шт.') : undefined} />
           <Metric title="Перегрузы" value={truthAccepted ? qty(summary?.capacity?.overloaded_buckets) : 'Недоступно'} hint={truthAccepted ? metricQuantity(summary?.capacity?.overload_total, 'н/ч') : undefined} />
         </div>
 
