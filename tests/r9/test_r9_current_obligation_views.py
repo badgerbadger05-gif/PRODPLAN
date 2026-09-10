@@ -39,14 +39,14 @@ def _accepted_generation(db_session):
     return generation
 
 
-def _snapshot(db_session, generation, *, consumer, key, rows):
+def _snapshot(db_session, generation, *, consumer, key, rows, meta=None):
     snapshot = models.PlanningReadSnapshot(
         consumer=consumer,
         snapshot_key=key,
         ledger_generation_id=generation.id,
         cutoff=generation.cutoff,
         truth_status="accepted",
-        payload={"rows": rows},
+        payload={"rows": rows, **({"meta": meta} if meta is not None else {})},
         published_at=generation.cutoff,
     )
     db_session.add(snapshot)
@@ -172,6 +172,9 @@ def test_r9_root_products_read_current_production_rows(db_session):
             "journal_row_key": "order:root", "item_id": 10,
             "item_name": "Root", "item_article": "R-10", "item_code": "10",
         }}],
+        meta={"root_product_options": [{
+            "item_id": 10, "item_name": "Canonical Root", "item_article": "ROOT-10", "item_code": "ROOT",
+        }]},
     )
     snapshot = db_session.query(models.PlanningReadSnapshot).filter(
         models.PlanningReadSnapshot.consumer == "production_control_journal",
@@ -187,8 +190,12 @@ def test_r9_root_products_read_current_production_rows(db_session):
     db_session.commit()
 
     result = list_root_products(db=db_session)
-    assert result["total"] == 1
-    assert result["rows"][0]["item_id"] == 10
+    assert result == {
+        "rows": [{
+            "item_id": 10, "item_name": "Canonical Root", "item_article": "ROOT-10", "item_code": "ROOT",
+        }],
+        "total": 1,
+    }
 
 
 def test_r9_materials_read_current_payload_without_snapshot_fallback(db_session):
