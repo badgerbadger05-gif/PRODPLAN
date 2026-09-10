@@ -4084,6 +4084,7 @@ class CurrentReplenishmentState(Base):
         nullable=False, index=True,
     )
     source_revision = Column(BigInteger, nullable=False)
+    scope_checksum = Column(String(64), nullable=False)
     writer_key = Column(String(64), nullable=False, server_default="current_replenishment")
     status = Column(String(16), nullable=False, server_default="completed")
     changed_pairs = Column(Integer, nullable=False, default=0, server_default="0")
