@@ -47,6 +47,7 @@ from ..services.period_plan_service import (
     repair_duplicate_plan_snapshots,
     update_period_plan_header,
 )
+from ..services.item_ledger.current_execution import CurrentExecutionUnavailable
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -955,6 +956,8 @@ async def get_planning_result_summary(
         return read_mrp_result_manifest(
             db=db, run_id=int(run_id), snapshot_id=snapshot_id
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -989,6 +992,8 @@ async def get_planning_result_production(
             offset=offset,
             sort_dir=sort_dir,
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1072,6 +1077,8 @@ async def get_planning_result_purchases(
             offset=offset,
             sort_dir=sort_dir,
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1159,6 +1166,8 @@ async def get_planning_result_rework(
             offset=offset,
             sort_dir=sort_dir,
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1302,6 +1311,8 @@ async def get_planning_result_capacity(
             limit=limit,
             offset=offset,
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
