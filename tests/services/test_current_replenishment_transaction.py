@@ -695,6 +695,10 @@ def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_
     )
     db_session.commit()
     assert results and results[0].inserted == 2
+    assert {
+        row.allocation_role
+        for row in db_session.query(models.ReservationConsumptionAllocation).all()
+    } == {"replenishment_receipt"}
     assert db_session.query(models.ReservationEvent).count() == 0
     with pytest.raises(CurrentReplenishmentError, match="ReservationEvent writer"):
         reject_legacy_supplier_receipt_writer(
@@ -703,3 +707,24 @@ def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_
     assert read_current_replenishment(
         db_session, generation_id=generation_id, item_id=item_id
     )
+
+
+def test_material_consumption_role_is_excluded_from_current_replenishment_reader(
+    db_session,
+):
+    generation_id, item_id, reservations, facts = _world(db_session, prefix="roles")
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:roles",
+        source_revision=1,
+        facts=facts,
+        reserves=_reserves(reservations),
+        complete_scope=True,
+    )
+    db_session.flush()
+    material = db_session.query(models.ReservationConsumptionAllocation).first()
+    material.allocation_role = "material_consumption"
+    db_session.commit()
+    rows = read_current_replenishment(db_session, generation_id=generation_id, item_id=item_id)
+    assert all(row["id"] != material.id for row in rows)

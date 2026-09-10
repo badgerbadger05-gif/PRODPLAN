@@ -431,6 +431,34 @@ def test_reservations_status_and_run_filters(client, seeded):
     assert dr["rows"] == []
 
 
+def test_reservations_get_exposes_current_replenishment_basis(client, db_session, seeded):
+    generation_id = db_session.get(models.PlanningTruthState, 1).current_generation_id
+    reservation = db_session.get(models.ReservationEntry, seeded["r1"])
+    sle = db_session.query(models.StockLedgerEntry).filter_by(item_id=seeded["a"]).first()
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=generation_id,
+        reservation_id=reservation.id,
+        sle_id=sle.id,
+        requirement_id=reservation.requirement_id,
+        allocated_qty=Decimal("2.5"),
+        match_rule="pegged",
+        fact_ref=str(sle.id),
+        fact_line_ref="1",
+        item_id=seeded["a"],
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        idempotency_key="router-current-basis",
+        is_current=True,
+        allocation_role="replenishment_receipt",
+    ))
+    db_session.commit()
+    response = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations")
+    assert response.status_code == 200
+    row = next(item for item in response.json()["rows"] if item["reservation_id"] == seeded["r1"])
+    assert row["allocations"][0]["allocated_qty"] == pytest.approx(2.5)
+
+
 def test_reservations_unknown_item_404(client, seeded):
     assert client.get("/api/v1/item-ledger/999999/reservations").status_code == 404
 
