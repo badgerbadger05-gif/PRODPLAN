@@ -452,6 +452,19 @@ def publish_current_execution_from_generation(
             )),
         },
     )
+    # Readiness and drum are generation-scoped staging tables, but their
+    # current payload must never expose those staging row ids.  Resolve the
+    # stable current queue owner after the queue scope is published and use it
+    # consistently for every dependent contour.
+    stable_queue_ids = {
+        int(row.payload.get("plan_line_id")): int(row.id)
+        for row in load_current_execution_rows(
+            db,
+            entity_kind="assembly_queue",
+            scope_key="assembly:all-live-plans",
+        )
+        if row.payload.get("plan_line_id") is not None
+    }
 
     readiness_payload = []
     readiness_rows = db.query(models.AssemblyReadiness, models.AssemblyQueueLine).join(
@@ -461,12 +474,17 @@ def publish_current_execution_from_generation(
         models.AssemblyReadiness.ledger_generation_id == int(generation.id),
     ).all()
     for readiness, queue in readiness_rows:
+        stable_queue_id = stable_queue_ids.get(int(queue.plan_line_id))
+        if stable_queue_id is None:
+            raise CurrentExecutionUnavailable(
+                f"readiness has no current queue owner for plan line {int(queue.plan_line_id)}"
+            )
         readiness_payload.append({
             "entity_kind": "assembly_readiness",
             "business_identity": f"plan-line:{int(queue.plan_line_id)}",
             "scope_key": "assembly:all-live-plans",
             "payload": {
-                "queue_line_id": int(readiness.assembly_queue_line_id),
+                "queue_line_id": stable_queue_id,
                 "plan_id": int(queue.plan_id),
                 "plan_line_id": int(queue.plan_line_id),
                 "run_id": int(queue.planning_run_id),
@@ -534,9 +552,14 @@ def publish_current_execution_from_generation(
             models.DrumSlot.id.asc(),
         ).all():
             identity = drum_slot_identity(int(slot.plan_line_id), int(slot.slot_ordinal))
+            stable_queue_id = stable_queue_ids.get(int(slot.plan_line_id))
+            if stable_queue_id is None:
+                raise CurrentExecutionUnavailable(
+                    f"drum slot has no current queue owner for plan line {int(slot.plan_line_id)}"
+                )
             manual = prior_manual.get(identity)
             payload = {
-                "queue_line_id": int(slot.assembly_queue_line_id),
+                "queue_line_id": stable_queue_id,
                 "plan_id": int(slot.plan_id),
                 "plan_line_id": int(slot.plan_line_id),
                 "run_id": int(queue.planning_run_id),
@@ -593,12 +616,17 @@ def publish_current_execution_from_generation(
             models.DrumCapacityGap.id.asc(),
         ).all():
             identity = drum_gap_identity(int(gap.plan_line_id), gap.gap_date)
+            stable_queue_id = stable_queue_ids.get(int(gap.plan_line_id))
+            if stable_queue_id is None:
+                raise CurrentExecutionUnavailable(
+                    f"drum gap has no current queue owner for plan line {int(gap.plan_line_id)}"
+                )
             drum_rows.append({
                 "entity_kind": "drum_gap",
                 "business_identity": identity,
                 "scope_key": "drum:all-live-plans",
                 "payload": {
-                    "queue_line_id": int(gap.assembly_queue_line_id),
+                    "queue_line_id": stable_queue_id,
                     "plan_id": int(gap.plan_id),
                     "plan_line_id": int(gap.plan_line_id),
                     "item_id": int(gap.item_id),

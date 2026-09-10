@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Annotated, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -682,8 +683,35 @@ def get_drum_schedule(
             "working_days": [],
             "metrics": {},
         }
-        slots = load_current_execution_rows(db, entity_kind="drum_slot", scope_key="drum:all-live-plans")
-        gaps = load_current_execution_rows(db, entity_kind="drum_gap", scope_key="drum:all-live-plans")
+        def _typed_priority(value: object) -> tuple[int, object]:
+            if isinstance(value, bool):
+                return (0, int(value))
+            if isinstance(value, (int, float, Decimal)):
+                return (0, Decimal(str(value)))
+            return (1, str(value))
+
+        def _priority_key(payload: dict) -> tuple[tuple[int, object], ...]:
+            return tuple(_typed_priority(value) for value in (payload.get("original_priority") or []))
+
+        slots = sorted(
+            load_current_execution_rows(db, entity_kind="drum_slot", scope_key="drum:all-live-plans"),
+            key=lambda row: (
+                str((row.payload or {}).get("slot_date") or ""),
+                int((row.payload or {}).get("resource_id") or 0),
+                _priority_key(row.payload or {}),
+                int((row.payload or {}).get("slot_ordinal") or 0),
+                str(row.business_identity),
+            ),
+        )
+        gaps = sorted(
+            load_current_execution_rows(db, entity_kind="drum_gap", scope_key="drum:all-live-plans"),
+            key=lambda row: (
+                str((row.payload or {}).get("gap_date") or ""),
+                int((row.payload or {}).get("resource_id") or 0),
+                _priority_key(row.payload or {}),
+                str(row.business_identity),
+            ),
+        )
         item_ids = {
             int(row.payload.get("item_id"))
             for row in (*slots, *gaps)

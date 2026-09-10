@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import List, Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -102,15 +103,26 @@ def update_resource(
         raise HTTPException(status_code=404, detail="Resource not found")
     
     try:
-        db_resource.resource_name = resource.resource_name
-        db_resource.shift_offset = resource.shift_offset
-        db_resource.planning_range = resource.planning_range
-        db_resource.capacity = resource.capacity
-        db_resource.work_schedule = resource.work_schedule
-        db_resource.daily_work_hours = resource.daily_work_hours
-        db_resource.buffer_days = resource.buffer_days
-        db_resource.is_kitting = resource.is_kitting
-        _invalidate_resource_dependents(db, int(resource_id), "resource_capacity_changed")
+        changed = any((
+            db_resource.resource_name != resource.resource_name,
+            int(db_resource.shift_offset or 0) != int(resource.shift_offset or 0),
+            int(db_resource.planning_range or 0) != int(resource.planning_range or 0),
+            Decimal(str(db_resource.capacity or 0)) != Decimal(str(resource.capacity or 0)),
+            db_resource.work_schedule != resource.work_schedule,
+            Decimal(str(db_resource.daily_work_hours or 0)) != Decimal(str(resource.daily_work_hours or 0)),
+            int(db_resource.buffer_days or 0) != int(resource.buffer_days or 0),
+            bool(db_resource.is_kitting) != bool(resource.is_kitting),
+        ))
+        if changed:
+            db_resource.resource_name = resource.resource_name
+            db_resource.shift_offset = resource.shift_offset
+            db_resource.planning_range = resource.planning_range
+            db_resource.capacity = resource.capacity
+            db_resource.work_schedule = resource.work_schedule
+            db_resource.daily_work_hours = resource.daily_work_hours
+            db_resource.buffer_days = resource.buffer_days
+            db_resource.is_kitting = resource.is_kitting
+            _invalidate_resource_dependents(db, int(resource_id), "resource_capacity_changed")
         db.commit()
         db.refresh(db_resource)
         return db_resource

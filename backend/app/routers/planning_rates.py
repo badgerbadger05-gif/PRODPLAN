@@ -328,9 +328,9 @@ def upsert_assembly_rates(
     created = 0
     updated = 0
     touched: list[models.AssemblyRate] = []
+    changed = False
     for row in payload.rows:
         item = _require_item(db, int(row.item_id))
-        item.optimal_batch = row.qty_per_capacity
         _require_resource(db, int(row.resource_id))
         existing = (
             db.query(models.AssemblyRate)
@@ -348,25 +348,32 @@ def upsert_assembly_rates(
             )
             db.add(existing)
             created += 1
+            changed = True
         else:
-            existing.qty_per_capacity = row.qty_per_capacity
-            updated += 1
+            if Decimal(str(existing.qty_per_capacity)) != Decimal(str(row.qty_per_capacity)):
+                existing.qty_per_capacity = row.qty_per_capacity
+                updated += 1
+                changed = True
+        if Decimal(str(item.optimal_batch or "0")) != Decimal(str(row.qty_per_capacity)):
+            item.optimal_batch = row.qty_per_capacity
+            changed = True
         touched.append(existing)
     db.flush()
-    invalidate_current_execution_scope(
-        db,
-        entity_kind="assembly_readiness",
-        scope_key="assembly:all-live-plans",
-        source_revision="reference:assembly-rate",
-        reason="assembly_rate_changed",
-    )
-    invalidate_current_execution_scope(
-        db,
-        entity_kind="drum_schedule",
-        scope_key="drum:all-live-plans",
-        source_revision="reference:assembly-rate",
-        reason="assembly_rate_changed",
-    )
+    if changed:
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="assembly_readiness",
+            scope_key="assembly:all-live-plans",
+            source_revision="reference:assembly-rate",
+            reason="assembly_rate_changed",
+        )
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="drum_schedule",
+            scope_key="drum:all-live-plans",
+            source_revision="reference:assembly-rate",
+            reason="assembly_rate_changed",
+        )
     db.commit()
     for row in touched:
         db.refresh(row)
@@ -504,6 +511,7 @@ def update_shelf_policy(
     row = db.get(models.ShelfPolicy, int(policy_id))
     if row is None:
         raise HTTPException(status_code=404, detail=f"shelf policy {policy_id} not found")
+    changed = False
     if payload.warehouse_ref1c is not None and payload.warehouse_ref1c != row.warehouse_ref1c:
         duplicate = (
             db.query(models.ShelfPolicy)
@@ -523,23 +531,39 @@ def update_shelf_policy(
                 ),
             )
         row.warehouse_ref1c = payload.warehouse_ref1c
+        changed = True
     if payload.replenishment_time_days is not None:
-        row.replenishment_time_days = int(payload.replenishment_time_days)
+        value = int(payload.replenishment_time_days)
+        if int(row.replenishment_time_days) != value:
+            row.replenishment_time_days = value
+            changed = True
     if payload.review_cycle_days is not None:
-        row.review_cycle_days = int(payload.review_cycle_days)
+        value = int(payload.review_cycle_days)
+        if int(row.review_cycle_days) != value:
+            row.review_cycle_days = value
+            changed = True
     if payload.safety_days is not None:
-        row.safety_days = int(payload.safety_days)
+        value = int(payload.safety_days)
+        if int(row.safety_days) != value:
+            row.safety_days = value
+            changed = True
     if payload.batch_multiple is not None:
-        row.batch_multiple = payload.batch_multiple
+        if Decimal(str(row.batch_multiple)) != Decimal(str(payload.batch_multiple)):
+            row.batch_multiple = payload.batch_multiple
+            changed = True
     if payload.active is not None:
-        row.active = bool(payload.active)
-    invalidate_current_execution_scope(
-        db,
-        entity_kind="shelf_projection",
-        scope_key="shelf:all-live-mrps",
-        source_revision=f"reference:shelf-policy:{policy_id}",
-        reason="shelf_policy_changed",
-    )
+        value = bool(payload.active)
+        if bool(row.active) != value:
+            row.active = value
+            changed = True
+    if changed:
+        invalidate_current_execution_scope(
+            db,
+            entity_kind="shelf_projection",
+            scope_key="shelf:all-live-mrps",
+            source_revision=f"reference:shelf-policy:{policy_id}",
+            reason="shelf_policy_changed",
+        )
     db.commit()
     db.refresh(row)
     items = _item_labels(db, {int(row.item_id)})
