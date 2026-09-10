@@ -15,14 +15,18 @@ From the repository root, the single reproducible Windows command is:
 pwsh -NoProfile -File .\scripts\r2-postgres.ps1 -Runtime wsl -Action start-verify
 ```
 
-The WSL entrypoint checks `psql`, `pg_lsclusters`, `pg_createcluster`,
-`pg_ctlcluster` and non-interactive `sudo`; it never runs `apt install`. It
-idempotently starts/verifies PostgreSQL 16 on port `55441`, provisions only
-`r2_user`/`prodplan_r2` when necessary, and verifies the exact local identity.
-Stopping acts only on the verified cluster owning port `55441`. The Docker
-command remains available as `-Runtime docker` and retains its non-destructive
-`up`/`stop` behavior; it has no `down -v` path. When the service is available,
-set the explicit DSN for tests and migration:
+The WSL entrypoint runs all cluster/provision/stop commands as explicit WSL
+root, checks `psql`, `pg_lsclusters`, `pg_createcluster`, `pg_ctlcluster` and
+`runuser`, and never runs `apt install`. It idempotently starts/verifies
+PostgreSQL 16 on port `55441`, provisions only `r2_user`/`prodplan_r2` when
+necessary, and verifies the exact local identity. It also keeps WSL alive with
+a hidden `tail -f /dev/null` process; PID, start time, distro and command are
+stored only at `%LOCALAPPDATA%\PRODPLAN\r2-runtime\wsl-keeper.json`. Verify
+checks that exact PID/start identity, and stop acts only on the verified named
+cluster and keeper PID. The Docker command remains available as `-Runtime
+docker` and retains its non-destructive `up`/`stop` behavior; it has no
+`down -v` path. When the service is available, set the explicit DSN for tests
+and migration:
 
 ```powershell
 $env:PRODPLAN_R2_TEST_DSN = 'postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'
@@ -54,14 +58,16 @@ thresholds are tuned. A final repeated WSL run recorded:
 PostgreSQL 16.15 / Ubuntu / 127.0.0.1:55441
 seed=r2-fixed-20260910-v1, plans=2, movements=7
 sql_write_count=12, temp_table_bytes=32768
-api_sample_count=9, p50=3.705ms, p95=4.406ms, max=4.406ms
-elapsed_ms=1761.512
+api_sample_count=9, p50=3.680ms, p95=4.521ms, max=4.521ms
+elapsed_ms=1794.759
 ```
 
 ## Current environment result
 
 On 2026-09-10 Docker Desktop's Linux engine pipe was unavailable, but the
-supported WSL runtime was live and verified. Migration, two-session rollback,
-numeric baseline and API latency all passed against the explicit local DSN.
+supported WSL runtime was live and verified. The keeper survived a pause and a
+second verify retained the same PID/start identity. Migration, two-session
+rollback, numeric baseline and API latency all passed against the explicit
+local DSN.
 The probe refuses to run without a validated local DSN and migrated `items`
 table. No external or production connection was attempted.

@@ -110,6 +110,10 @@ R5; schema/persistence пока generation-bound; API/UI ещё не перед�
 * `d29196a4` — test-first WSL `psql` transport для существующего локального
   PostgreSQL rehearsal.
 * `c7962afa` — implementation WSL `psql` transport в `pg_rebuild_check.py`.
+* `d15a6f24` — test-first exact keeper PID/start identity and root-command
+  contract.
+* `e629dd63` — implementation root-owned WSL commands and hidden keeper state
+  outside the repository.
 * `tests/r2/test_r2_local_contract.py` и
   `tests/r2/test_r2_postgres_integration.py` — guard, migration, две сессии и
   rollback-проверки.
@@ -136,7 +140,7 @@ pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integrati
 
 ```text
 pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py tests/test_canon_invariants.py
-52 passed in 19.95s
+53 passed in 20.43s
 ```
 
 Красный API-latency test-first прогон до реализации probe:
@@ -144,6 +148,13 @@ pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integrati
 ```text
 pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py
 1 failed, 5 passed, 3 skipped
+```
+
+Красный keeper/root-ownership test-first прогон до hardening entrypoint:
+
+```text
+pytest -q tests/r2/test_r2_local_contract.py::test_r2_wsl_runtime_owns_root_commands_and_exact_keeper_state
+1 failed
 ```
 
 Проверка синтаксиса compose прошла:
@@ -164,6 +175,10 @@ R2 WSL PostgreSQL identity verified: 127.0.0.1:55441/prodplan_r2
 
 Docker Desktop остаётся недоступен, но это необязательный альтернативный
 runtime; WSL PostgreSQL 16.15 является поддержанным локальным contour.
+Keeper state хранится вне репозитория в
+`%LOCALAPPDATA%\PRODPLAN\r2-runtime\wsl-keeper.json`; после паузы повторный
+`verify` подтвердил тот же PID/start identity. Чужой orchestrator handle не
+останавливался.
 
 Migration/round-trip/rehearsal:
 
@@ -180,11 +195,11 @@ The clear skip is intentional protection for the named pre-existing local
 database; no destructive clear was executed.
 
 Обязательный полный gate с финального R2 implementation-состояния
-(`c7962afa`, поверх `3fba61af`; report-only docs commit следует отдельно):
+(`e629dd63`, поверх `c7962afa`; report-only docs commit следует отдельно):
 
 ```text
 pytest -q
-1930 passed, 35 warnings in 203.87s (0:03:23)
+1931 passed, 35 warnings in 204.37s (0:03:24)
 ```
 
 В полном gate skip отсутствуют: три прежних PostgreSQL проверки и три новых
@@ -202,7 +217,7 @@ temporary table bytes и server identity. После успешной мигра
 seed=r2-fixed-20260910-v1, plans=2, movements=7
 sql_write_count=12, temp_table_bytes=32768, elapsed_ms=1761.512
 api_endpoint=/api/v1/items/?skip=0&limit=100, api_sample_count=9
-api_latency_ms: min=3.483, p50=3.705, p95=4.406, max=4.406
+api_latency_ms: min=3.280, p50=3.680, p95=4.521, max=4.521
 database=prodplan_r2, user=r2_user, server_address=127.0.0.1/32
 ```
 
@@ -214,5 +229,5 @@ SSH/OData, live 1С, deploy или workers нет.
 
 Остаточные риски: destructive `clear` rehearsal намеренно не выполнялся на
 уже существующем локальном кластере; Docker runtime не проверен из-за
-неработающего Docker Desktop, но WSL runtime воспроизводим и зелёный. R3 не
-начиналась.
+неработающего Docker Desktop, но WSL runtime и keeper воспроизводимы и
+зелёные. R3 не начиналась.
