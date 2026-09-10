@@ -1334,8 +1334,43 @@ def list_root_products(
     db: Session = Depends(get_db),
 ):
     try:
-        options = list_root_product_options(db)
+        from ..services.item_ledger.current_execution import (
+            CurrentExecutionUnavailable,
+            load_current_execution_rows,
+            require_current_execution_scope,
+        )
+        require_current_execution_scope(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        options_by_id: dict[int, dict] = {}
+        for current in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        ):
+            payload = dict(current.payload or {})
+            roots = payload.get("root_item_ids") or payload.get("root_item_id")
+            if roots is None:
+                continue
+            if not isinstance(roots, list):
+                roots = [roots]
+            for root in roots:
+                try:
+                    root_id = int(root)
+                except (TypeError, ValueError):
+                    continue
+                options_by_id.setdefault(root_id, {
+                    "item_id": root_id,
+                    "item_name": str(payload.get("item_name") or ""),
+                    "item_article": payload.get("item_article"),
+                    "item_code": payload.get("item_code"),
+                })
+        options = [options_by_id[key] for key in sorted(options_by_id)]
         return {"rows": options, "total": len(options)}
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(exc)}) from exc
     except ProductionControlJournalSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except planning_truth.PlanningTruthUnavailable as exc:
