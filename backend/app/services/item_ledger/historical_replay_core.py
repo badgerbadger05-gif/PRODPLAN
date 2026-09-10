@@ -14,7 +14,7 @@ from typing import Iterable, Literal, Optional, Tuple
 
 
 Mode = Literal["make", "buy"]
-MatchRule = Literal["fifo", "pegged"]
+MatchRule = Literal["fifo", "pegged", "mixed"]
 
 
 @dataclass(frozen=True)

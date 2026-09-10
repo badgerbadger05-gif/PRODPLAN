@@ -7,8 +7,9 @@ does not read OData or legacy ``received_qty`` projections.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
-from typing import Iterable
+from typing import Iterable, Literal
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -100,6 +101,10 @@ class ReceiptFact:
     receipt_ref: str
     receipt_line_no: str
     correction_receipt_ref: str | None = None
+    # ``posting_at`` is when the source movement happened.  ``known_at`` is
+    # when PRODPLAN accepted the evidence; reports choose the axis explicitly.
+    known_at: datetime | None = None
+    planning_stock_pool: str = "default"
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,35 @@ class CoverageAllocation:
     fact: ReceiptFact
     reservation: models.ReservationEntry
     qty: Decimal
+    match_rule: str = "fifo"
+    # For a signed correction/return, the current positive basis remains the
+    # original receipt.  The event fact is retained by provenance/audit.
+    basis_fact: ReceiptFact | None = None
+    basis_events: tuple[tuple[ReceiptFact, Decimal], ...] = ()
+
+
+@dataclass(frozen=True)
+class SupplierReceiptReplayResult:
+    """Final positive basis after replaying every signed supplier event."""
+
+    allocations: tuple[CoverageAllocation, ...]
+    surplus_qty: Decimal
+    convergence_boundary: int
+    processed_fact_ids: tuple[int, ...]
+    unmatched_return_qty: Decimal = Decimal("0")
+
+
+HistoryMode = Literal["as_occurred", "as_known"]
+
+
+def _history_time(fact: ReceiptFact, history_mode: HistoryMode) -> datetime:
+    if history_mode == "as_occurred":
+        return fact.posting_at
+    if history_mode == "as_known":
+        if fact.known_at is None:
+            raise ValueError("history_mode as_known requires known_at")
+        return fact.known_at
+    raise ValueError("history_mode must be as_occurred or as_known")
 
 
 @dataclass(frozen=True)
@@ -163,6 +197,8 @@ def _entry_key(entry: models.ReservationEntry) -> int:
 
 
 def _entry_outstanding(entry: models.ReservationEntry) -> Decimal:
+    if not hasattr(entry, "replenishment_required_qty"):
+        return _decimal(entry.reserved_qty)
     return replenishment_remaining(
         entry.replenishment_required_qty,
         entry.replenishment_received_qty,
@@ -341,6 +377,7 @@ def allocate_supplier_receipts(
     reservations_by_item: dict[int, Iterable[models.ReservationEntry]],
     *,
     exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
+    history_mode: HistoryMode = "as_occurred",
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
 
@@ -349,7 +386,10 @@ def allocate_supplier_receipts(
     supplier-order-line first (newest-first), then global FIFO, then named
     original documents for explicit corrections.
     """
-    ordered = sorted(facts, key=lambda row: (row.posting_at, row.sle_id))
+    ordered = sorted(
+        tuple(facts),
+        key=lambda row: (_history_time(row, history_mode), row.sle_id),
+    )
     reservations = {
         item_id: tuple(
             sorted(
@@ -386,7 +426,12 @@ def allocate_supplier_receipts(
             exact_caps_for_key: dict[int, Decimal] = {}
             if exact_key is not None:
                 exact_caps_for_key = exact_caps.get(exact_key, {})
-            item_reservations = reservations.get(item_id, ())
+            item_reservations = tuple(
+                entry
+                for entry in reservations.get(item_id, ())
+                if _text(getattr(entry, "planning_stock_pool", "default"))
+                == _text(fact.planning_stock_pool)
+            )
 
             for reservation in item_reservations:
                 if left <= 0:
@@ -408,6 +453,8 @@ def allocate_supplier_receipts(
                     fact=fact,
                     reservation=reservation,
                     qty=exact_take,
+                    match_rule="pegged",
+                    basis_fact=fact,
                 )
                 result.append(allocation)
                 positive_by_receipt.setdefault(fact.receipt_ref, []).append(allocation)
@@ -426,7 +473,13 @@ def allocate_supplier_receipts(
                 take = min(left, outstanding)
                 if take <= 0:
                     continue
-                allocation = CoverageAllocation(fact=fact, reservation=reservation, qty=take)
+                allocation = CoverageAllocation(
+                    fact=fact,
+                    reservation=reservation,
+                    qty=take,
+                    match_rule="fifo",
+                    basis_fact=fact,
+                )
                 result.append(allocation)
                 positive_by_receipt.setdefault(fact.receipt_ref, []).append(allocation)
                 if exact_key is not None:
@@ -456,6 +509,7 @@ def allocate_supplier_receipts(
         )
         unwind_by_reservation: dict[int, Decimal] = {}
         unwind_samples: dict[int, models.ReservationEntry] = {}
+        unwind_basis: list[tuple[models.ReservationEntry, ReceiptFact, Decimal, str]] = []
         if fact.correction_receipt_ref:
             ordered_source = reversed(source)
         elif exact_key is not None:
@@ -478,20 +532,160 @@ def allocate_supplier_receipts(
                 unwind_by_reservation.get(reservation_key, Decimal("0")) + take
             )
             unwind_samples[reservation_key] = original.reservation
+            unwind_basis.append(
+                (
+                    original.reservation,
+                    original.basis_fact or original.fact,
+                    take,
+                    original.match_rule,
+                )
+            )
             active_qty[id(original)] = available - take
             left -= take
             if left == 0:
                 break
-        for reservation_key, take in unwind_by_reservation.items():
-            if take <= 0:
-                continue
+        unwind_by_reservation_basis: dict[
+            int, list[tuple[ReceiptFact, Decimal]]
+        ] = {}
+        unwind_match_rule: dict[int, str] = {}
+        for reservation, basis, take, match_rule in unwind_basis:
+            key = _entry_key(reservation)
+            unwind_by_reservation_basis.setdefault(key, []).append((basis, take))
+            unwind_match_rule[key] = match_rule
+        for reservation_key, basis_events in unwind_by_reservation_basis.items():
+            take = sum((qty for _basis, qty in basis_events), Decimal("0"))
+            reservation = unwind_samples[reservation_key]
             result.append(CoverageAllocation(
                 fact=fact,
-                reservation=unwind_samples[reservation_key],
+                reservation=reservation,
                 qty=-take,
+                match_rule=unwind_match_rule[reservation_key],
+                basis_fact=basis_events[0][0],
+                basis_events=tuple(basis_events),
             ))
 
     return tuple(result), surplus
+
+
+def replay_supplier_receipt_basis(
+    facts: Iterable[ReceiptFact],
+    reservations_by_item: dict[int, Iterable[models.ReservationEntry]],
+    *,
+    exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
+    history_mode: HistoryMode,
+) -> SupplierReceiptReplayResult:
+    """Replay the complete signed supplier stream into positive current basis.
+
+    ``allocate_supplier_receipts`` remains the sole attribution algorithm.  A
+    correction/return can unwind a prior positive allocation, but the current
+    table stores only the resulting positive original-receipt basis.  Every
+    input row is consumed; ``convergence_boundary`` is therefore a proof of
+    processing the complete supplied source scope, not an arbitrary row limit.
+    """
+
+    rows = tuple(facts)
+    if history_mode not in ("as_occurred", "as_known"):
+        raise ValueError("history_mode must be as_occurred or as_known")
+    if len({int(row.sle_id) for row in rows}) != len(rows):
+        raise ValueError("supplier receipt facts require unique sle_id")
+    active_reservations = {
+        int(item_id): tuple(
+            entry
+            for entry in values
+            if _text(getattr(entry, "lifecycle_status", "active")) == "active"
+        )
+        for item_id, values in reservations_by_item.items()
+    }
+    event_allocations, _event_surplus = allocate_supplier_receipts(
+        rows,
+        active_reservations,
+        exact_allocation_caps=exact_allocation_caps,
+        history_mode=history_mode,
+    )
+    reductions: dict[int, Decimal] = {}
+    for row in event_allocations:
+        if row.qty >= 0 or row.basis_fact is None:
+            continue
+        basis_events = row.basis_events or ((row.basis_fact, abs(_decimal(row.qty))),)
+        for basis, quantity in basis_events:
+            basis_id = int(basis.sle_id)
+            reductions[basis_id] = reductions.get(basis_id, Decimal("0")) + _decimal(
+                quantity
+            )
+    effective_facts: list[ReceiptFact] = []
+    for row in rows:
+        qty = _decimal(row.signed_qty)
+        if qty <= 0:
+            continue
+        qty = max(Decimal("0"), qty - reductions.get(int(row.sle_id), Decimal("0")))
+        if qty > 0:
+            effective_facts.append(
+                ReceiptFact(
+                    **{
+                        **row.__dict__,
+                        "signed_qty": qty,
+                    }
+                )
+            )
+    final_allocations, surplus_qty = allocate_supplier_receipts(
+        effective_facts,
+        active_reservations,
+        exact_allocation_caps=exact_allocation_caps,
+        history_mode=history_mode,
+    )
+    merged: dict[tuple[int, int], CoverageAllocation] = {}
+    for row in final_allocations:
+        key = (int(row.fact.sle_id), _entry_key(row.reservation))
+        current = merged.get(key)
+        if current is None:
+            merged[key] = row
+        else:
+            if current.match_rule == row.match_rule:
+                merged_rule = current.match_rule
+            else:
+                merged_rule = "mixed"
+            merged[key] = CoverageAllocation(
+                fact=current.fact,
+                reservation=current.reservation,
+                qty=current.qty + row.qty,
+                match_rule=merged_rule,
+                basis_fact=current.basis_fact or current.fact,
+            )
+    # The positive replay is already the final basis; no negative row is
+    # persisted and no arbitrary suffix is skipped.
+    final = tuple(
+        CoverageAllocation(
+            fact=row.fact,
+            reservation=row.reservation,
+            qty=row.qty,
+            match_rule=row.match_rule,
+            basis_fact=row.fact,
+        )
+        for row in merged.values()
+        if row.qty > 0
+    )
+    return SupplierReceiptReplayResult(
+        allocations=final,
+        surplus_qty=_decimal(surplus_qty),
+        convergence_boundary=len(rows),
+        processed_fact_ids=tuple(
+            int(row.sle_id)
+            for row in sorted(
+                rows,
+                key=lambda item: (_history_time(item, history_mode), item.sle_id),
+            )
+        ),
+        unmatched_return_qty=(
+            sum(
+                (-_decimal(row.signed_qty) for row in rows if _decimal(row.signed_qty) < 0),
+                Decimal("0"),
+            )
+            - sum(
+                (-_decimal(row.qty) for row in event_allocations if _decimal(row.qty) < 0),
+                Decimal("0"),
+            )
+        ),
+    )
 
 
 def _candidate_order_lines(

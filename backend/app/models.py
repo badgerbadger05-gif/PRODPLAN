@@ -3089,6 +3089,8 @@ class StockLedgerEntry(Base):
     # Running balance after this row within its ledger key (rebuild_running_balance).
     qty_after = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     posting_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    # Accepted/correction time is a separate axis from source posting time.
+    known_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
     # RecordType raw ∈ {Receipt, Expense} from 1С (sign source, kept for trace).
     record_type = Column(String(16), nullable=False, server_default="")
     # movement_kind ∈ {receipt, expense, assembly_in, assembly_out, transfer_in,
@@ -3991,7 +3993,7 @@ class ReservationConsumptionAllocation(Base):
             sqlite_where=text("is_current = 1"),
         ),
         CheckConstraint(
-            "match_rule IN ('pegged', 'fifo')",
+            "match_rule IN ('pegged', 'fifo', 'mixed')",
             name="ck_reservation_consumption_allocation_match_rule",
         ),
         CheckConstraint(
@@ -4130,6 +4132,8 @@ class CurrentReplenishmentAudit(Base):
     sle_id = Column(BigInteger, ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"), nullable=False)
     reservation_id = Column(BigInteger, ForeignKey("reservation_entry.id", ondelete="RESTRICT"), nullable=False)
     operation = Column(String(16), nullable=False)
+    reason = Column(String(128), nullable=False, server_default="current_replay")
+    basis_fact_ids = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
     before_qty = Column(DECIMAL(15, 3), nullable=True)
     after_qty = Column(DECIMAL(15, 3), nullable=True)
     before_match_rule = Column(String(16), nullable=True)

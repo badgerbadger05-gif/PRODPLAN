@@ -23,8 +23,12 @@ from app import models
 
 from .historical_replay_core import (
     Allocation,
+    AllocationChangePlan,
+    AllocationUpdate,
     Fact,
     Reserve,
+    ReplayResult,
+    ReserveRealization,
     plan_allocation_changes,
 )
 
@@ -127,6 +131,103 @@ def _input_checksum(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _receipt_input_checksum(
+    facts: tuple[object, ...],
+    reserves: tuple[Reserve, ...],
+    scope_key: str,
+    history_mode: str,
+) -> str:
+    """Checksum the complete signed source stream, including both time axes."""
+
+    payload = {
+        "distribution_scope": scope_key,
+        "history_mode": history_mode,
+        "facts": [
+            {
+                "id": int(row.sle_id),
+                "item": int(row.item_id),
+                "qty": str(row.signed_qty),
+                "posting_at": row.posting_at.isoformat(),
+                "known_at": row.known_at.isoformat() if row.known_at else None,
+                "order": _text(row.supplier_order_ref),
+                "line": _text(row.supplier_order_line_no),
+                "receipt": _text(row.receipt_ref),
+                "correction": _text(row.correction_receipt_ref),
+                "pool": _text(row.planning_stock_pool),
+            }
+            for row in sorted(facts, key=lambda item: int(item.sle_id))
+        ],
+        "reserves": [
+            {
+                "id": str(row.reserve_id),
+                "qty": str(row.reserved_qty),
+                "due": row.due_date.isoformat(),
+                "requirement": int(row.requirement_id),
+            }
+            for row in sorted(reserves, key=lambda item: str(item.reserve_id))
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _receipt_change_plan(
+    replay: object,
+    previous_allocations: tuple[Allocation, ...],
+    reserves: tuple[Reserve, ...],
+    receipt_facts: tuple[object, ...],
+) -> AllocationChangePlan:
+    """Adapt the canonical signed supplier replay to R4 persistence deltas."""
+
+    after = tuple(
+        Allocation(
+            fact_id=str(row.fact.sle_id),
+            reserve_id=str(row.reservation.id),
+            qty=_decimal(row.qty),
+            match_rule=(
+                row.match_rule
+                if row.match_rule in ("pegged", "fifo", "mixed")
+                else "fifo"
+            ),
+            is_addressed=row.match_rule == "pegged",
+        )
+        for row in replay.allocations
+    )
+    before_by_key = {(row.fact_id, row.reserve_id): row for row in previous_allocations}
+    after_by_key = {(row.fact_id, row.reserve_id): row for row in after}
+    reserve_qty = {
+        str(row.reserve_id): Decimal("0") for row in reserves
+    }
+    for row in after:
+        reserve_qty[row.reserve_id] = reserve_qty.get(row.reserve_id, Decimal("0")) + row.qty
+    realizations = tuple(
+        ReserveRealization(
+            reserve_id=row.reserve_id,
+            reserved_qty=row.reserved_qty,
+            realized_qty=reserve_qty.get(row.reserve_id, Decimal("0")),
+        )
+        for row in reserves
+    )
+    result = ReplayResult(
+        allocations=after,
+        surplus=(),
+        realizations=realizations,
+        fact_qty=sum((row.signed_qty for row in receipt_facts), Decimal("0")),
+        allocated_qty=sum((row.qty for row in after), Decimal("0")),
+        surplus_qty=_decimal(replay.surplus_qty),
+    )
+    return AllocationChangePlan(
+        result=result,
+        insertions=tuple(after_by_key[key] for key in sorted(after_by_key.keys() - before_by_key.keys())),
+        updates=tuple(
+            AllocationUpdate(before_by_key[key], after_by_key[key])
+            for key in sorted(after_by_key.keys() & before_by_key.keys())
+            if before_by_key[key] != after_by_key[key]
+        ),
+        deletions=tuple(before_by_key[key] for key in sorted(before_by_key.keys() - after_by_key.keys())),
+    )
+
+
 def _as_allocation(row: models.ReservationConsumptionAllocation) -> Allocation:
     return Allocation(
         fact_id=str(int(row.sle_id)),
@@ -184,6 +285,8 @@ def _audit_change(
     operation: str,
     before: Allocation | None,
     after: Allocation | None,
+    reason: str = "current_replay",
+    basis_fact_ids: tuple[int, ...] = (),
 ) -> None:
     """Audit one changed basis pair, never the unchanged assignment matrix."""
 
@@ -196,6 +299,8 @@ def _audit_change(
             sle_id=int(fact_id),
             reservation_id=int(entry.id),
             operation=str(operation),
+            reason=str(reason)[:128],
+            basis_fact_ids=[int(value) for value in basis_fact_ids],
             before_qty=before.qty if before is not None else None,
             after_qty=after.qty if after is not None else None,
             before_match_rule=before.match_rule if before is not None else None,
@@ -217,6 +322,10 @@ def apply_current_replenishment(
     allow_building: bool = False,
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     writer: str = WRITER_KEY,
+    receipt_replay: object | None = None,
+    receipt_facts: tuple[object, ...] = (),
+    history_mode: str = "as_occurred",
+    receipt_unmatched_return_qty: Decimal = Decimal("0"),
 ) -> CurrentReplenishmentResult:
     """Apply one complete accepted-fact scope atomically.
 
@@ -233,7 +342,20 @@ def apply_current_replenishment(
         fact_rows, reserve_rows, complete_scope, distribution_scope
     )
     canonical_scope_key = _scope_key(distribution_scope)
-    input_checksum = _input_checksum(fact_rows, reserve_rows, canonical_scope_key)
+    if receipt_replay is not None and history_mode not in ("as_occurred", "as_known"):
+        raise CurrentReplenishmentError(
+            "history_mode must be as_occurred or as_known"
+        )
+    input_checksum = (
+        _receipt_input_checksum(
+            receipt_facts,
+            reserve_rows,
+            canonical_scope_key,
+            history_mode,
+        )
+        if receipt_replay is not None
+        else _input_checksum(fact_rows, reserve_rows, canonical_scope_key)
+    )
     if _text(writer) != WRITER_KEY:
         raise CurrentReplenishmentError(
             "single current writer is current_replenishment; legacy writer is retired"
@@ -381,10 +503,19 @@ def apply_current_replenishment(
     )
     previous = tuple(_as_allocation(row) for row in scoped_allocations)
     try:
-        plan = plan_allocation_changes(
-            fact_rows,
-            reserve_rows,
-            previous_allocations=previous,
+        plan = (
+            _receipt_change_plan(
+                receipt_replay,
+                previous,
+                reserve_rows,
+                receipt_facts,
+            )
+            if receipt_replay is not None
+            else plan_allocation_changes(
+                fact_rows,
+                reserve_rows,
+                previous_allocations=previous,
+            )
         )
     except (TypeError, ValueError) as exc:
         raise CurrentReplenishmentError(str(exc)) from exc
@@ -393,6 +524,10 @@ def apply_current_replenishment(
     entry_by_id = {str(int(row.id)): row for row in entries}
     fact_by_id = {str(row.fact_id): row for row in fact_rows}
     reserve_by_id = {str(row.reserve_id): row for row in reserve_rows}
+    basis_fact_ids = tuple(sorted({int(row.sle_id) for row in receipt_facts}))
+    audit_reason = "r5_signed_replay" if receipt_replay is not None else "current_replay"
+    if receipt_replay is not None and receipt_unmatched_return_qty > 0:
+        audit_reason = "r5_signed_replay_unmatched_return"
     allocation_by_key = {
         (str(int(row.sle_id)), str(int(row.reservation_id))): row for row in allocations
         if row in scoped_allocations
@@ -422,6 +557,8 @@ def apply_current_replenishment(
             operation="delete",
             before=old,
             after=None,
+            reason=audit_reason,
+            basis_fact_ids=basis_fact_ids,
         )
         audit_events += 1
 
@@ -446,6 +583,8 @@ def apply_current_replenishment(
             operation="update",
             before=update.before,
             after=update.after,
+            reason=audit_reason,
+            basis_fact_ids=basis_fact_ids,
         )
         audit_events += 1
 
@@ -501,6 +640,8 @@ def apply_current_replenishment(
             operation="insert",
             before=None,
             after=insertion,
+            reason=audit_reason,
+            basis_fact_ids=basis_fact_ids,
         )
         audit_events += 1
 
@@ -544,6 +685,142 @@ def apply_current_replenishment(
         deleted=len(plan.deletions),
         changed_pairs=len(plan.insertions) + len(plan.updates) + len(plan.deletions),
         audit_events=audit_events,
+    )
+
+
+def apply_current_receipt_replay(
+    db: Session,
+    *,
+    generation_id: int,
+    source_key: str,
+    source_revision: int,
+    receipt_facts: Iterable[object],
+    reserves: Iterable[Reserve],
+    complete_scope: bool,
+    history_mode: str,
+    exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
+    distribution_scope: DistributionScope | None = None,
+    fail_after: Literal["assignments", "execution", "marker"] | None = None,
+    allow_building: bool = False,
+) -> CurrentReplenishmentResult:
+    """Publish signed correction/return replay through the R4 current writer."""
+
+    from .supplier_receipt_allocation import replay_supplier_receipt_basis
+    from .physical_visibility import visible_sles_for_generation
+
+    rows = tuple(receipt_facts)
+    if history_mode not in ("as_occurred", "as_known"):
+        raise CurrentReplenishmentError(
+            "history_mode must be as_occurred or as_known"
+        )
+    ids = [int(row.sle_id) for row in rows]
+    if len(ids) != len(set(ids)):
+        raise CurrentReplenishmentError("receipt correction source has duplicate sle_id")
+    visible_ids = {int(row.id) for row in visible_sles_for_generation(db, int(generation_id))}
+    missing = sorted(set(ids) - visible_ids)
+    if missing:
+        raise CurrentReplenishmentError(
+            f"receipt correction source is unavailable in accepted Ledger: {missing}"
+        )
+    reserve_rows = tuple(reserves)
+    active_reserves = tuple(
+        row
+        for row in reserve_rows
+        if _text(getattr(row, "lifecycle_status", "active")) == "active"
+    )
+    reservation_ids = [int(row.reserve_id) for row in active_reserves]
+    reservation_models = {
+        int(row.id): row
+        for row in db.query(models.ReservationEntry)
+        .filter(models.ReservationEntry.id.in_(reservation_ids))
+        .all()
+    } if reservation_ids else {}
+    if set(reservation_ids) != set(reservation_models):
+        raise CurrentReplenishmentError(
+            "receipt replay references an unavailable reservation"
+        )
+    # Use the caller's complete-scope values for attribution, while keeping
+    # the persisted reservation row as the execution target.  This avoids
+    # treating a database-default pool as a wildcard when the frozen DTO has
+    # already named the exact pool.
+    from types import SimpleNamespace
+
+    replay_reservations = {}
+    for pure in active_reserves:
+        persisted = reservation_models[int(pure.reserve_id)]
+        replay_reservations[int(pure.reserve_id)] = SimpleNamespace(
+            id=int(persisted.id),
+            item_id=int(persisted.item_id),
+            planning_stock_pool=_text(pure.planning_stock_pool),
+            characteristic_ref=_text(pure.characteristic_ref),
+            organization_ref=_text(pure.organization_ref),
+            realization_mode=_text(pure.mode),
+            run_id=int(pure.run_id),
+            requirement_id=int(pure.requirement_id),
+            priority_period_from=pure.plan_period_from,
+            priority_period_to=pure.plan_period_to,
+            lifecycle_status="active",
+            replenishment_required_qty=pure.reserved_qty,
+            replenishment_received_qty=Decimal("0"),
+        )
+    reservations_by_item: dict[int, tuple[object, ...]] = {}
+    for row in replay_reservations.values():
+        reservations_by_item.setdefault(int(row.item_id), ())
+        reservations_by_item[int(row.item_id)] = (
+            *reservations_by_item[int(row.item_id)],
+            row,
+        )
+    replay = replay_supplier_receipt_basis(
+        rows,
+        reservations_by_item,
+        exact_allocation_caps=exact_allocation_caps,
+        history_mode=history_mode,
+    )
+    scope = distribution_scope
+    if scope is None and reserve_rows:
+        first = reserve_rows[0]
+        scope = (
+            int(first.item_id),
+            _text(first.characteristic_ref),
+            _text(first.organization_ref),
+            _text(first.planning_stock_pool),
+            _text(first.mode),
+        )
+    if scope is None and rows:
+        scope = (
+            int(rows[0].item_id),
+            "",
+            "",
+            _text(rows[0].planning_stock_pool),
+            "buy",
+        )
+    fact_rows = tuple(
+        Fact(
+            fact_id=str(row.sle_id),
+            item_id=int(row.item_id),
+            mode="buy",
+            qty=_decimal(row.signed_qty),
+            posting_at=row.posting_at,
+            planning_stock_pool=_text(row.planning_stock_pool),
+        )
+        for row in rows
+        if _decimal(row.signed_qty) > 0
+    )
+    return apply_current_replenishment(
+        db,
+        generation_id=int(generation_id),
+        source_key=source_key,
+        source_revision=source_revision,
+        facts=fact_rows,
+        reserves=active_reserves,
+        complete_scope=complete_scope,
+        distribution_scope=scope,
+        allow_building=allow_building,
+        fail_after=fail_after,
+        receipt_replay=replay,
+        receipt_facts=rows,
+        history_mode=history_mode,
+        receipt_unmatched_return_qty=replay.unmatched_return_qty,
     )
 
 
@@ -669,7 +946,6 @@ def apply_current_replenishment_for_accepted_generation(
             raise CurrentReplenishmentError(
                 f"receipt facts for item {item_id} have ambiguous distribution pools"
             )
-    facts_by_item: dict[int, tuple[Fact, ...]] = {}
     # Use the complete visible physical prefix, then restrict it by persisted
     # typed supplier provenance.  A raw positive ``receipt`` movement is not
     # sufficient: internal transfers and other receipt-like rows are not BUY.
@@ -686,62 +962,53 @@ def apply_current_replenishment_for_accepted_generation(
             models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
             == int(generation_id),
             models.StockLedgerSupplierReceiptProvenance.operation_kind.in_(
-                ("supplier_receipt", "correction")
+                ("supplier_receipt", "correction", "supplier_return")
             ),
             models.StockLedgerSupplierReceiptProvenance.match_status != "excluded_non_supplier",
         )
         .order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.asc())
         .all()
     )
-    requirement_by_sle: dict[int, int | None] = {}
-    for row in provenance:
-        links = (
-            db.query(models.PurchaseExportObligationAllocation.reservation_id)
-            .filter(
-                models.PurchaseExportObligationAllocation.ledger_generation_id
-                == int(generation_id),
-                models.PurchaseExportObligationAllocation.supplier_order_ref
-                == _text(row.supplier_order_ref),
-                models.PurchaseExportObligationAllocation.supplier_order_line_no
-                == _text(row.supplier_order_line_no),
-            )
-            .all()
+    from .supplier_receipt_allocation import (
+        ReceiptFact,
+        _exact_allocation_caps_by_order_line,
+    )
+
+    exact_caps = _exact_allocation_caps_by_order_line(
+        db,
+        ledger_generation_id=int(generation_id),
+    )
+    exact_keys = {
+        (
+            int(row.evidence_payload.get("item_id") or visible[int(row.stock_ledger_entry_id)].item_id),
+            _text(row.supplier_order_ref),
+            _text(row.supplier_order_line_no),
         )
-        requirement_ids = {
-            int(entry.requirement_id)
-            for (reservation_id,) in links
-            for entry in [db.get(models.ReservationEntry, int(reservation_id))]
-            if entry is not None
-        }
-        requirement_by_sle[int(row.stock_ledger_entry_id)] = (
-            next(iter(requirement_ids))
-            if _text(row.match_status) == "exact" and len(requirement_ids) == 1
-            else None
-        )
-    typed_facts: list[Fact] = []
+        for row in provenance
+        if _text(row.match_status) == "exact"
+        and _text(row.supplier_order_ref)
+        and _text(row.supplier_order_line_no)
+        and int(row.stock_ledger_entry_id) in visible
+    }
+    exact_caps = {key: value for key, value in exact_caps.items() if key in exact_keys}
+    typed_facts: list[ReceiptFact] = []
     for row in provenance:
         sle = visible.get(int(row.stock_ledger_entry_id))
         if sle is None or _decimal(sle.qty) == 0:
             continue
         typed_facts.append(
-            Fact(
-                fact_id=str(sle.id),
+            ReceiptFact(
+                sle_id=int(sle.id),
                 item_id=int(sle.item_id),
-                mode="buy",
-                qty=_decimal(sle.qty),
+                signed_qty=_decimal(sle.qty),
                 posting_at=sle.posting_at,
-                requirement_id=requirement_by_sle.get(int(sle.id)),
-                order_ref=_text(row.supplier_order_ref) or None,
+                known_at=getattr(sle, "known_at", None) or getattr(sle, "created_at", None),
+                supplier_order_ref=_text(row.supplier_order_ref),
+                supplier_order_line_no=_text(row.supplier_order_line_no),
+                receipt_ref=_text(row.receipt_doc_ref),
+                receipt_line_no=_text(row.receipt_doc_line_no),
+                correction_receipt_ref=_text(row.correction_receipt_ref) or None,
             )
-        )
-    for item_id, scope_set in item_scopes.items():
-        scope = next(iter(scope_set))
-        facts_by_item[item_id] = tuple(
-            Fact(**{**fact.__dict__, "characteristic_ref": scope[1],
-                    "organization_ref": scope[2],
-                    "planning_stock_pool": scope[3]})
-            for fact in typed_facts
-            if int(fact.item_id) == item_id
         )
     revision = int(
         source_revision
@@ -769,21 +1036,28 @@ def apply_current_replenishment_for_accepted_generation(
             for row in reservations
             if int(row.item_id) == item_id
         )
-        facts = facts_by_item[item_id]
-        if not facts:
-            # An accepted complete scope with no physical receipt explicitly
-            # clears only this scope; it is not an unavailable empty import.
-            facts = ()
+        facts = tuple(
+            ReceiptFact(
+                **{
+                    **fact.__dict__,
+                    "planning_stock_pool": scope[3],
+                }
+            )
+            for fact in typed_facts
+            if int(fact.item_id) == item_id
+        )
         result.append(
-            apply_current_replenishment(
+            apply_current_receipt_replay(
                 db,
                 generation_id=int(generation_id),
                 source_key="accepted-physical-receipts",
                 source_revision=revision,
-                facts=facts,
+                receipt_facts=facts,
                 reserves=reserve_rows,
-                distribution_scope=scope,
                 complete_scope=True,
+                distribution_scope=scope,
+                exact_allocation_caps=exact_caps,
+                history_mode="as_occurred",
                 allow_building=allow_building,
             )
         )
