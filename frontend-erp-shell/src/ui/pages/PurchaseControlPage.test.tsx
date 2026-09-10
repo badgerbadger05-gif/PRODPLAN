@@ -34,6 +34,8 @@ vi.mock('../../services/itemLedger', () => ({
 
 const purchaseRow: PurchaseRow = {
   row_key: 'buy:9:default',
+  current_identity: 'purchase:req:9',
+  source_revision: 'accepted:g23',
   line_id: null,
   purchase_id: null,
   source_purchase_ids: [],
@@ -187,6 +189,7 @@ describe('PurchaseControlPage Doctype migration', () => {
       run_ids: [17],
       truth_status: 'accepted',
       ledger_generation_id: 23,
+      source_revision: 'accepted:g23',
       meta: {
         snapshot_id: 51,
         ledger_generation: 23,
@@ -339,15 +342,15 @@ describe('PurchaseControlPage Doctype migration', () => {
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Выбрать строку buy:9:default' }))
     await waitFor(() => expect(getPurchaseSelectionSummary).toHaveBeenCalledWith({
-      snapshot_id: 51,
-      row_keys: ['buy:9:default'],
+      current_identities: ['purchase:req:9'],
+      expected_source_revision: 'accepted:g23',
       horizon_period_to: null,
     }, expect.any(AbortSignal)))
     expect(await screen.findByText('Сумма: 1 200')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Сформировать заказы (1)' }))
 
-    await waitFor(() => expect(materializePurchaseControlRows).toHaveBeenCalledWith({ snapshot_id: 51, row_keys: ['buy:9:default'], dry_run: false }))
-    expect(await screen.findByText('Сформировано заказов по 1 строкам снапшота')).toBeInTheDocument()
+    await waitFor(() => expect(materializePurchaseControlRows).toHaveBeenCalledWith({ current_identities: ['purchase:req:9'], expected_source_revision: 'accepted:g23', dry_run: false }))
+    expect(await screen.findByText('Сформировано заказов по 1 строкам current-журнала')).toBeInTheDocument()
     await waitFor(() => expect(syncSupplierOrdersFrom1C).toHaveBeenCalled())
   })
 
@@ -360,7 +363,7 @@ describe('PurchaseControlPage Doctype migration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Сформировать заказы (1)' }))
 
     expect(await screen.findByText(/readback unavailable/)).toBeInTheDocument()
-    expect(screen.queryByText('Сформировано заказов по 1 строкам снапшота')).not.toBeInTheDocument()
+    expect(screen.queryByText('Сформировано заказов по 1 строкам current-журнала')).not.toBeInTheDocument()
   })
 
   it('delegates sorting and instant filters to the runtime data source', async () => {
@@ -386,7 +389,7 @@ describe('PurchaseControlPage Doctype migration', () => {
 
     expect(screen.getByText('Загрузка журнала закупок…')).toBeVisible()
     expect(screen.getByText('Ответ может занять несколько секунд. Данные ещё не получены.')).toBeVisible()
-    expect(screen.getByText('Снимок: загрузка… · Ledger: загрузка…')).toBeVisible()
+    expect(screen.getByText('Current закупок: загрузка… · Ledger: загрузка…')).toBeVisible()
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
 
     request.resolve({
@@ -428,14 +431,14 @@ describe('PurchaseControlPage Doctype migration', () => {
 
     expect(await screen.findByText('Не удалось загрузить данные')).toBeVisible()
     expect(screen.getByRole('alert')).toHaveTextContent('VPN timeout')
-    expect(screen.getByText(/Снимок: недоступен · Ledger: недоступен · Истина:/)).toBeVisible()
+    expect(screen.getByText(/Current закупок: недоступен · Ledger: недоступен · Истина:/)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Повторить' })).toBeEnabled()
   })
 
   it('keeps snapshot identity and scroll-safe geometry during a refresh', async () => {
     renderPage()
     await screen.findAllByText('Под заказ (MRP)')
-    expect(screen.getByText(/Снимок: 51/)).toBeVisible()
+    expect(screen.getByText(/Current: accepted:g23/)).toBeVisible()
     expect(document.querySelector('.split')).toHaveClass('purchaseJournalSplit')
 
     const refresh = deferred<Awaited<ReturnType<typeof listPurchaseJournal>>>()
@@ -443,7 +446,7 @@ describe('PurchaseControlPage Doctype migration', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Обновить' }))
 
     await waitFor(() => expect(listPurchaseJournal).toHaveBeenCalledTimes(2))
-    expect(screen.getByText(/Снимок: 51 · Ledger: 23 · Истина: accepted/)).toBeVisible()
+    expect(screen.getByText(/Current: accepted:g23 · Ledger: 23 · Истина: accepted/)).toBeVisible()
     expect(document.querySelector('.asyncStateContent')).toHaveAttribute('aria-busy', 'true')
   })
 

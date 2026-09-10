@@ -5895,10 +5895,16 @@ export interface components {
         };
         /** PurchaseControlMaterializeRequest */
         PurchaseControlMaterializeRequest: {
-            /** Snapshot Id */
-            snapshot_id: number;
+            /** Snapshot Id (legacy compatibility) */
+            snapshot_id?: number | null;
             /** Row Keys */
             row_keys?: string[];
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
             /**
              * Dry Run
              * @default true
@@ -5907,12 +5913,18 @@ export interface components {
         };
         /** PurchaseControlSelectionSummaryRequest */
         PurchaseControlSelectionSummaryRequest: {
-            /** Snapshot Id */
-            snapshot_id: number;
+            /** Snapshot Id (legacy compatibility) */
+            snapshot_id?: number | null;
             /** Row Keys */
-            row_keys: string[];
+            row_keys?: string[];
             /** Horizon Period To */
             horizon_period_to?: string | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** PurchaseControlSelectionSummaryResponse */
         PurchaseControlSelectionSummaryResponse: {
@@ -5933,6 +5945,9 @@ export interface components {
              * @enum {string}
              */
             amount_status: "complete" | "partial" | "unavailable";
+            current_identity?: string | null;
+            current_identities?: string[];
+            source_revision?: string | null;
         };
         /** PurchaseOrder1CExportRequest */
         PurchaseOrder1CExportRequest: {

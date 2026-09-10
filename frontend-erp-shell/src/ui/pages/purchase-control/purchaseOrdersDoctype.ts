@@ -153,24 +153,27 @@ export function createPurchaseOrdersDoctype(
           ? ''
           : 'Выберите MRP-строки к заказу',
         async run({ selection, listMeta }) {
-          const snapshotId = Number((listMeta.meta as { snapshot_id?: number } | undefined)?.snapshot_id ?? 0)
-          if (!snapshotId) return { error: 'Снимок закупок ещё не зафиксирован' }
-          const selectedRowKeys = [
-            ...new Set(selection.map((row) => row.row_key)),
+          const sourceRevision = String(listMeta.source_revision ?? '')
+          if (!sourceRevision) return { error: 'Current-ревизия закупок ещё не зафиксирована' }
+          if (selection.some((row) => !row.current_identity || row.source_revision !== sourceRevision)) {
+            return { error: 'Выбранная строка не подтверждена текущей ревизией закупок' }
+          }
+          const selectedIdentities = [
+            ...new Set(selection.map((row) => row.current_identity as string)),
           ]
-          if (!selectedRowKeys.length) return { error: 'В выбранных строках нет строк к заказу' }
+          if (!selectedIdentities.length) return { error: 'В выбранных строках нет current-идентичностей' }
           const result = await materializePurchaseControlRows({
-            snapshot_id: snapshotId,
-            row_keys: selectedRowKeys,
+            current_identities: selectedIdentities,
+            expected_source_revision: sourceRevision,
             dry_run: false,
           })
-          const rowsTotal = Number((result as { rows_total?: number }).rows_total ?? selectedRowKeys.length)
+          const rowsTotal = Number((result as { rows_total?: number }).rows_total ?? selectedIdentities.length)
           // Materialization creates the 1C command, but the journal is not
           // authoritative again until its readback succeeds.  Propagate a
           // failed sync instead of presenting a false completed state.
           await syncSupplierOrdersFrom1C()
           return {
-            message: `Сформировано заказов по ${rowsTotal} строкам снапшота`,
+            message: `Сформировано заказов по ${rowsTotal} строкам current-журнала`,
             clearSelection: true,
             reload: true,
           }
@@ -196,7 +199,10 @@ export function createPurchaseOrdersDoctype(
         sync_1c: 'purchase.sync_1c',
       },
     },
-    selectable: (row) => row.can_materialize,
-    selectionDisabledReason: (row) => row.materialize_disabled_reason || 'Строка недоступна для формирования заказа',
+    selectable: (row) => row.can_materialize && Boolean(row.current_identity && row.source_revision),
+    selectionDisabledReason: (row) => row.materialize_disabled_reason
+      || (!row.current_identity || !row.source_revision
+        ? 'Строка не подтверждена current-ревизией'
+        : 'Строка недоступна для формирования заказа'),
   }
 }

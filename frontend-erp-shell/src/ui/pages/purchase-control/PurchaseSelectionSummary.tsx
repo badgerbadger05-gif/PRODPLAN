@@ -4,18 +4,18 @@ import { qty } from '../../../lib/format'
 import { getPurchaseSelectionSummary } from '../../../services/purchaseControl'
 
 type Props = {
-  snapshotId: number
+  sourceRevision: string
   selectionKey: string
   horizonPeriodTo: string
 }
 
-export function PurchaseSelectionSummary({ snapshotId, selectionKey, horizonPeriodTo }: Props) {
+export function PurchaseSelectionSummary({ sourceRevision, selectionKey, horizonPeriodTo }: Props) {
   const [summary, setSummary] = useState<SelectionSummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
-    if (!snapshotId || !selectionKey) {
+    if (!sourceRevision || !selectionKey) {
       setSummary(null)
       setLoading(false)
       setError('')
@@ -27,8 +27,8 @@ export function PurchaseSelectionSummary({ snapshotId, selectionKey, horizonPeri
     setLoading(true)
     setError('')
     getPurchaseSelectionSummary({
-      snapshot_id: snapshotId,
-      row_keys: selectionKey.split('\u001f'),
+      current_identities: selectionKey.split('\u001f'),
+      expected_source_revision: sourceRevision,
       horizon_period_to: horizonPeriodTo || null,
     }, controller.signal)
       .then((data) => setSummary(data))
@@ -43,7 +43,7 @@ export function PurchaseSelectionSummary({ snapshotId, selectionKey, horizonPeri
       })
 
     return () => controller.abort()
-  }, [horizonPeriodTo, selectionKey, snapshotId])
+  }, [horizonPeriodTo, selectionKey, sourceRevision])
 
   if (!selectionKey) return null
   if (loading && !summary) return <span className="toolbarText">Итог выбранного: расчёт…</span>

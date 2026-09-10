@@ -32,15 +32,15 @@ export function getPurchaseSelectionSummary(
 }
 
 export function materializePurchaseControlRows(payload: {
-  snapshot_id: number
-  row_keys: string[]
+  current_identities: string[]
+  expected_source_revision: string
   dry_run?: boolean
 }) {
   return api<Record<string, unknown>>('/v1/purchase-control/materialize', {
     method: 'POST',
     body: JSON.stringify({
-      snapshot_id: payload.snapshot_id,
-      row_keys: payload.row_keys,
+      current_identities: payload.current_identities,
+      expected_source_revision: payload.expected_source_revision,
       dry_run: payload.dry_run ?? false,
     }),
   })

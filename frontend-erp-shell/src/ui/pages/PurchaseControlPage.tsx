@@ -71,29 +71,30 @@ export function PurchaseControlPage() {
         const meta = state.listMeta.meta as {
           ledger_generation?: number | null
           snapshot_id?: number | null
+          source_revision?: string | null
           truth_status?: string | null
           truth_reason?: string | null
           cutoff?: string | null
         } | undefined
-        const snapshot = Number(meta?.snapshot_id ?? 0)
+        const sourceRevision = String(state.listMeta.source_revision ?? meta?.source_revision ?? '')
         const ledger = Number(meta?.ledger_generation ?? state.listMeta.ledger_generation_id)
         const truthStatus = meta?.truth_status || 'unavailable'
         const cutoff = meta?.cutoff || 'н/д'
         const reason = meta?.truth_reason || null
-        if (state.listLoading && !snapshot && !ledger) {
-          return <>Снимок: загрузка… · Ledger: загрузка…</>
+        if (state.listLoading && !sourceRevision && !ledger) {
+          return <>Current закупок: загрузка… · Ledger: загрузка…</>
         }
-        if (state.error && !snapshot && !ledger) {
+        if (state.error && !sourceRevision && !ledger) {
           return (
             <>
-              Снимок: недоступен · Ledger: недоступен · Истина: {truthStatus}
+              Current закупок: недоступен · Ledger: недоступен · Истина: {truthStatus}
               {reason ? ` · ${reason}` : ' · Статус не подтверждён'}
             </>
           )
         }
         return (
           <>
-            Снимок: {snapshot || '—'}
+            Current: {sourceRevision || '—'}
             {' · '}
             Ledger: {ledger || '—'}
             {' · '}
@@ -135,8 +136,12 @@ export function PurchaseControlPage() {
       renderToolbarAfter={(state) => {
         const summary = state.listMeta.summary as PurchaseJournalSummary | undefined
         const eligibleCount = state.rows.filter((row) => doctype.selectable?.(row) !== false).length
-        const snapshotId = Number((state.listMeta.meta as { snapshot_id?: number } | undefined)?.snapshot_id ?? 0)
-        const selectionKey = state.selection.map((row) => row.row_key).sort().join('\u001f')
+        const sourceRevision = String(state.listMeta.source_revision ?? '')
+        const selectionKey = state.selection
+          .map((row) => row.current_identity)
+          .filter((identity): identity is string => Boolean(identity))
+          .sort()
+          .join('\u001f')
         return (
           <div className="commandBar purchaseSummaryBar">
             <button onClick={() => state.setVisibleSelection(true)} disabled={!eligibleCount}>
@@ -146,7 +151,7 @@ export function PurchaseControlPage() {
               Снять выбор
             </button>
             <PurchaseSelectionSummary
-              snapshotId={snapshotId}
+              sourceRevision={sourceRevision}
               selectionKey={selectionKey}
               horizonPeriodTo={state.filters.horizon_period_to}
             />

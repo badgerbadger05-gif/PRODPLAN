@@ -47,6 +47,8 @@ export type PurchaseHorizonBucket = {
 
 export type PurchaseRow = {
   row_key: string
+  current_identity?: string
+  source_revision?: string
   line_id: number | null
   purchase_id: number | null
   source_purchase_ids?: number[]
@@ -143,6 +145,7 @@ export type PurchaseOrdersResponse = {
   run_ids: number[]
   truth_status: string
   ledger_generation_id: number
+  source_revision?: string
   summary: PurchaseJournalSummary
   meta: PurchaseSnapshotMeta
 }

@@ -210,7 +210,10 @@ def get_orders(
         for current_row in current_rows:
             payload = dict(current_row.payload or {})
             payload["current_identity"] = str(current_row.business_identity)
-            payload["source_revision"] = str(current_row.source_revision)
+            # The manifest revision is the CAS token.  Current row provenance
+            # may intentionally remain unchanged across a technical no-op
+            # publication, so never expose it as the action revision.
+            payload["source_revision"] = str(current_manifest.source_revision)
             rows.append(payload)
         if horizon_period_to is not None:
             from ..services.purchase_control_journal import _reconcile_buy_row_for_horizon
@@ -252,6 +255,8 @@ def get_orders(
         effective_limit = max(1, min(int(limit or 100), 500))
         effective_offset = max(0, int(offset or 0))
         saved = dict(current_manifest.summary or {})
+        saved["source_revision"] = str(current_manifest.source_revision)
+        saved["current_execution_scope_id"] = int(current_manifest.id)
         saved_summary = saved.get("summary")
         if not isinstance(saved_summary, dict):
             raise CurrentExecutionUnavailable("purchase current summary is missing")
