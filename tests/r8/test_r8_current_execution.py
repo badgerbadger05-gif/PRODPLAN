@@ -7,6 +7,8 @@ from app import models
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     drum_slot_identity,
+    get_current_execution_scope,
+    invalidate_current_execution_scope,
     load_current_execution_rows,
     order_execution_queue,
     publish_current_execution_scope,
@@ -222,3 +224,25 @@ def test_r8_manual_tile_survives_new_generation_queue_ids(db_session):
     assert current.payload["queue_line_id"] == 202
     assert current.payload["slot_date"] == "2026-09-11"
     assert current.manual_input["slot_date"] == "2026-09-12"
+
+
+def test_r8_dependency_invalidation_makes_current_read_fail_closed(db_session):
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        rows=[_queue("queue:1", period="2026-09-10", plan_id=1, line_id=1)],
+    )
+    assert invalidate_current_execution_scope(
+        db_session,
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+        source_revision="dependency:capacity:v2",
+        reason="capacity_changed",
+    ) is True
+    assert get_current_execution_scope(
+        db_session,
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    ).result_ready is False
+    assert load_current_execution_rows(db_session, entity_kind="assembly_queue") == []
