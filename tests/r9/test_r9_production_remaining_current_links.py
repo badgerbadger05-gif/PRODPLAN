@@ -7,11 +7,13 @@ import pytest
 
 from app import models
 from app.routers.production_control import (
+    MaterialIssueCreatePayload,
     PrintRouteSheetsPayload,
     get_work_item_materials,
     post_open_paint_weld_chains,
     post_print_route_sheets,
     print_route_sheets,
+    post_material_issues,
 )
 
 
@@ -140,6 +142,86 @@ def test_open_paint_weld_fails_closed_when_counterpart_lacks_current_anchor(monk
             db=object(),
         )
     assert getattr(caught.value, "status_code", None) == 503
+
+
+class _ModelQuery:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+class _AnchorDb:
+    def __init__(self, *, requirements=(), product=None):
+        self.requirements = list(requirements)
+        self.product = product
+
+    def query(self, model):
+        if model is models.PaintWeldPair:
+            return _ModelQuery([SimpleNamespace(painted_item_id=10, welded_item_id=20, is_active=True)])
+        if model is models.MrpRequirement:
+            return _ModelQuery(self.requirements)
+        return _ModelQuery([])
+
+    def get(self, model, identifier):
+        if model is models.ProductionProduct and self.product is not None:
+            return self.product if int(identifier) == int(self.product.product_id) else None
+        return None
+
+
+def test_open_paint_rejects_foreign_requirement_before_committing_chain(monkeypatch):
+    import app.routers.production_control as router
+
+    source = _current_row(product_id=77)
+    source.payload.update({"item_id": 10, "source_run_id": 5, "source_mrp_requirement_id": 11})
+    foreign = _current_row(identity="production-mrp-requirement:999:alloc:X", product_id=0)
+    foreign.payload.update({"item_id": 20, "source_run_id": 5, "source_mrp_requirement_id": 999})
+    requirement_a = SimpleNamespace(id=101, run_id=5, item_id=20, freeze_version=1)
+    requirement_b = SimpleNamespace(id=102, run_id=5, item_id=20, freeze_version=1)
+    db = _AnchorDb(requirements=[requirement_a, requirement_b])
+    monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
+    monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [source, foreign])
+    called = []
+    monkeypatch.setattr(router, "open_paint_chains_for_products", lambda *args, **kwargs: called.append(True))
+
+    with pytest.raises(Exception) as caught:
+        post_open_paint_weld_chains(
+            router.OpenPaintWeldChainsPayload(
+                product_ids=[77],
+                current_identities=["production-mrp-requirement:900:alloc:A"],
+                expected_source_revision="accepted:g7",
+            ),
+            db=db,
+        )
+    assert getattr(caught.value, "status_code", None) == 503
+    assert called == []
+
+
+def test_material_issue_accepts_exact_proposal_anchor_for_new_product(monkeypatch):
+    import app.routers.production_control as router
+
+    identity = "production-mrp-requirement:101:alloc:A"
+    proposal = _current_row(identity=identity, product_id=0)
+    proposal.payload.update({"item_id": 20, "source_mrp_requirement_id": 101, "source_run_id": 5})
+    product = SimpleNamespace(product_id=88, item_id=20, source_mrp_requirement_id=101)
+    db = _AnchorDb(product=product)
+    monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
+    monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [proposal])
+    monkeypatch.setattr(router, "create_material_issues", lambda *args, **kwargs: {"status": "ok"})
+
+    result = post_material_issues(
+        MaterialIssueCreatePayload(
+            product_ids=[88],
+            current_identities=[identity],
+            expected_source_revision="accepted:g7",
+        ),
+        db=db,
+    )
+    assert result["status"] == "ok"
 
 
 def test_route_sheet_get_and_post_use_current_payload_not_snapshot_reader(monkeypatch):
