@@ -24,6 +24,7 @@ from app.models import (
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
     build_material_custody_projection,
+    publish_current_material_custody,
     _same_1c_timestamp,
     load_current_accepted_material_custody,
     load_material_custody_projection,
@@ -792,6 +793,66 @@ def test_projection_rewinds_to_an_older_baseline_for_a_late_event(db_session):
     assert state.for_product(int(product.product_id)).at_workshop[
         int(component.item_id)
     ] == pytest.approx(4.0)
+
+
+def test_published_custody_keeps_rewind_baseline_cells(db_session):
+    base = _generation(
+        db_session,
+        key="custody-retention-base",
+        cutoff=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+    product, _parent, component = _product(db_session, item_code="RETENTION")
+    base_manifest = _manifest(
+        db_session, generation_id=base.id, source_event_high_watermark_id=0
+    )
+    base_manifest.is_baseline = True
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        qty=5,
+        source_event_high_watermark_id=0,
+    )
+    target = _generation(
+        db_session,
+        key="custody-retention-target",
+        cutoff=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    target.status = "building"
+    db_session.flush()
+    build_material_custody_projection(db_session, ledger_generation_id=target.id)
+    assert publish_current_material_custody(db_session, ledger_generation_id=target.id) == 1
+    target.status = "accepted"
+    db_session.flush()
+
+    # This append is newer than target's watermark but dated after the retained
+    # baseline cutoff, so the next build must rewind to the baseline cells.
+    _event(
+        db_session,
+        source_kind="issue_created",
+        issue_id=0,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="workshop",
+        warehouse="WH-MAIN",
+        qty=2,
+        key="custody:retention:late",
+        effective_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    next_target = _generation(
+        db_session,
+        key="custody-retention-next",
+        cutoff=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    next_target.status = "building"
+    db_session.flush()
+    build_material_custody_projection(db_session, ledger_generation_id=next_target.id)
+
+    state = load_material_custody_projection(
+        db_session, ledger_generation_id=next_target.id
+    )
+    assert state.for_product(product.product_id).at_workshop[component.item_id] == pytest.approx(7)
 
 
 def test_projection_read_refolds_when_the_watermark_moved_under_it(db_session):
