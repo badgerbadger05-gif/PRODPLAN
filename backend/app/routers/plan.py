@@ -1,4 +1,6 @@
 from typing import List, Dict, Any, Literal, Optional
+import hashlib
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,7 +49,11 @@ from ..services.period_plan_service import (
     repair_duplicate_plan_snapshots,
     update_period_plan_header,
 )
-from ..services.item_ledger.current_execution import CurrentExecutionUnavailable
+from ..services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    load_current_execution_rows,
+    require_current_execution_scope,
+)
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -554,6 +560,8 @@ class PurchaseOrder1CExportRequest(BaseModel):
     date_from: Optional[str] = None
     date_to: Optional[str] = None
     purchase_ids: Optional[List[int]] = None
+    current_identities: Optional[List[str]] = None
+    expected_source_revision: Optional[str] = None
     dry_run: Optional[bool] = False
     # DEPRECATED: демо-гард записи в 1С удалён после go-live. Поле принимается
     # и игнорируется, чтобы существующие клиенты не получали 422.
@@ -1370,6 +1378,7 @@ async def export_planning_result_production(
             date_to=date_to,
             sort_dir=sort_dir,
         )
+        current_identity = _mrp_snapshot_identity(db, int(run_id), resolved_snapshot_id)
 
         headers = [
             "Наименование",
@@ -1519,6 +1528,8 @@ async def export_planning_result_production(
                 "filename": f"mrp_production_run_{run_id}.xlsx",
                 "total_rows": len(data_rows) if not groups else sum(len((g.get("orders") or [])) for g in groups),
                 "snapshot_id": resolved_snapshot_id,
+                "current_identity": current_identity["current_identity"],
+                "source_revision": current_identity["source_revision"],
             }
         else:
             import io, csv
@@ -1534,6 +1545,8 @@ async def export_planning_result_production(
                 "filename": f"mrp_production_run_{run_id}.csv",
                 "total_rows": len(data_rows),
                 "snapshot_id": resolved_snapshot_id,
+                "current_identity": current_identity["current_identity"],
+                "source_revision": current_identity["source_revision"],
             }
     except HTTPException:
         raise
@@ -1573,6 +1586,7 @@ async def export_planning_result_purchases(
             date_to=date_to,
             sort_dir=sort_dir,
         )
+        current_identity = _mrp_snapshot_identity(db, int(run_id), resolved_snapshot_id)
 
         headers = ["Наименование", "Артикул", "Поставщик", "Категория", "Количество", "ЕИ", "Пометка"]
         data_rows = []
@@ -1594,6 +1608,8 @@ async def export_planning_result_purchases(
                 groups=groups,
             )
             result["snapshot_id"] = resolved_snapshot_id
+            result["current_identity"] = current_identity["current_identity"]
+            result["source_revision"] = current_identity["source_revision"]
             return result
         else:
             import io, csv
@@ -1609,6 +1625,8 @@ async def export_planning_result_purchases(
                 "filename": f"mrp_purchases_run_{run_id}.csv",
                 "total_rows": len(data_rows),
                 "snapshot_id": resolved_snapshot_id,
+                "current_identity": current_identity["current_identity"],
+                "source_revision": current_identity["source_revision"],
             }
     except HTTPException:
         raise
@@ -1627,14 +1645,98 @@ async def export_planning_result_purchases_to_1c(
     Строки группируются по поставщику: один `Document_ЗаказПоставщику` на каждого поставщика.
     """
     try:
-        return export_planned_purchases_to_1c(
+        scope = require_current_execution_scope(
+            db,
+            entity_kind="mrp_result",
+            scope_key="mrp:all-live-plans",
+        )
+        if not req.expected_source_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "mrp_result_source_revision_required"},
+            )
+        if str(req.expected_source_revision) != str(scope.source_revision):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "mrp_result_source_revision_stale",
+                    "expected_source_revision": scope.source_revision,
+                },
+            )
+        identities = sorted({str(value).strip() for value in (req.current_identities or []) if str(value).strip()})
+        if not identities:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "mrp_result_current_identities_required"},
+            )
+        current_rows = [
+            row
+            for row in load_current_execution_rows(
+                db,
+                entity_kind="mrp_result",
+                scope_key="mrp:all-live-plans",
+            )
+            if int((row.payload or {}).get("run_id") or 0) == int(run_id)
+            and str((row.payload or {}).get("row_kind") or "").strip().lower() == "purchase"
+        ]
+        by_identity = {str(row.business_identity): row for row in current_rows}
+        if len(by_identity) != len(current_rows) or any(identity not in by_identity for identity in identities):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "mrp_result_current_identity_unknown"},
+            )
+        selected_rows = [by_identity[identity] for identity in identities]
+        selected_purchase_ids = []
+        for row in selected_rows:
+            payload = dict(row.payload or {})
+            purchase_id = payload.get("purchase_id") or payload.get("planned_purchase_id")
+            if purchase_id is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "mrp_result_purchase_identity_unresolved"},
+                )
+            selected_purchase_ids.append(int(purchase_id))
+        if req.purchase_ids is not None and sorted({int(value) for value in req.purchase_ids}) != sorted(selected_purchase_ids):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "mrp_result_purchase_locator_stale"},
+            )
+        canonical_request = {
+            "run_id": int(run_id),
+            "current_identities": identities,
+            "purchase_ids": sorted(selected_purchase_ids),
+            "date_from": req.date_from,
+            "date_to": req.date_to,
+        }
+        idempotency_key = "mrp-purchases:" + hashlib.sha256(
+            json.dumps(canonical_request, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        result = export_planned_purchases_to_1c(
             db=db,
             run_id=int(run_id),
             date_from=req.date_from,
             date_to=req.date_to,
-            purchase_ids=req.purchase_ids,
+            purchase_ids=selected_purchase_ids,
             dry_run=bool(req.dry_run),
         )
+        if not isinstance(result, dict):
+            result = {"result": result}
+        result.update(
+            {
+                "current_identity": f"mrp-run:{int(run_id)}",
+                "source_revision": scope.source_revision,
+                "current_identities": identities,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        return result
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "mrp_result_current_unavailable", "reason": str(e)},
+        ) from e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1752,6 +1854,7 @@ async def export_planning_result_rework(
             date_to=date_to,
             sort_dir=sort_dir,
         )
+        current_identity = _mrp_snapshot_identity(db, int(run_id), resolved_snapshot_id)
 
         headers = [
             "Наименование",
@@ -1798,6 +1901,8 @@ async def export_planning_result_rework(
                 groups=groups,
             )
             result["snapshot_id"] = resolved_snapshot_id
+            result["current_identity"] = current_identity["current_identity"]
+            result["source_revision"] = current_identity["source_revision"]
             return result
 
         import io, csv
@@ -1813,6 +1918,8 @@ async def export_planning_result_rework(
             "filename": f"mrp_rework_run_{run_id}.csv",
             "total_rows": len(data_rows),
             "snapshot_id": resolved_snapshot_id,
+            "current_identity": current_identity["current_identity"],
+            "source_revision": current_identity["source_revision"],
         }
     except HTTPException:
         raise
