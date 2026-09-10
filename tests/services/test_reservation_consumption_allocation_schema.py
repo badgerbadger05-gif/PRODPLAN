@@ -48,7 +48,9 @@ def test_reservation_consumption_allocation_metadata_contract():
         if constraint.__class__.__name__ == "UniqueConstraint"
     }
     assert ("ledger_generation_id", "idempotency_key") in unique
-    assert ("ledger_generation_id", "sle_id", "reservation_id") in unique
+    assert (
+        "ledger_generation_id", "allocation_role", "sle_id", "reservation_id"
+    ) in unique
 
     checks = {
         constraint.name
@@ -58,6 +60,7 @@ def test_reservation_consumption_allocation_metadata_contract():
     assert {
         "ck_reservation_consumption_allocation_match_rule",
         "ck_reservation_consumption_allocation_qty_positive",
+        "ck_reservation_consumption_allocation_role",
     } <= checks
 
     indexes = {index.name for index in table.indexes}
