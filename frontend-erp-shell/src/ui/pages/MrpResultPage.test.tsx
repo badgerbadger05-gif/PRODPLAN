@@ -362,6 +362,13 @@ describe('MrpResultPage characterization', () => {
     expect(getPlanningResultPurchases).toHaveBeenCalledTimes(1)
   })
 
+  it('highlights the exact current MRP row from a stable identity link', async () => {
+    renderPage('/mrp-runs/41?tab=purchases&current_identity=run%3A41%3Av1%3Apurchase%3Apurchase-b')
+
+    const row = await screen.findByText('Лист стальной')
+    expect(row.closest('tr')).toHaveClass('activeRow')
+  })
+
   it('invalidates tabs for date and root filters and pages with the active offset', async () => {
     const user = userEvent.setup()
     renderPage()

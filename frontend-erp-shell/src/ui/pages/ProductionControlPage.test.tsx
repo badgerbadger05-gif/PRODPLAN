@@ -539,6 +539,14 @@ describe('ProductionControlPage — characterization', () => {
     expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
   })
 
+  it('activates the exact current production row from a stable identity link', async () => {
+    renderPage(['/production-control?current_identity=production%3Aorder%3A102'])
+    await screen.findByText('MRP run: 77')
+
+    expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
+    expect(rowFor('Кронштейн')).toHaveAttribute('aria-selected', 'false')
+  })
+
   it('writes active detail to the URL without removing external focus params', async () => {
     const user = userEvent.setup()
     renderPage(['/production-control?product_id=101&order_id=5'])

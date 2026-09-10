@@ -450,6 +450,29 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(document.querySelector('.asyncStateContent')).toHaveAttribute('aria-busy', 'true')
   })
 
+  it('activates the exact current purchase row from a stable identity link', async () => {
+    vi.mocked(listPurchaseJournal).mockResolvedValueOnce({
+      rows: [
+        purchaseRow,
+        { ...purchaseRow, row_key: 'buy:10:default', current_identity: 'purchase:req:10', item_id: 10, item_name: 'Шестерня' },
+      ],
+      total: 2,
+      limit: 100,
+      offset: 0,
+      run_id: 17,
+      run_ids: [17],
+      truth_status: 'accepted',
+      ledger_generation_id: 23,
+      source_revision: 'accepted:g23',
+      summary: { total_rows: 2, by_status: { to_order: 2 }, by_phase: { no_goods: 2 }, to_order: 2, overdue: 0, expected_7d: 2, in_transit_amount: 1200, fact_status: 'available' },
+      meta: { snapshot_id: 51, ledger_generation: 23, ledger_generation_id: 23, cutoff: '2026-07-23T12:00:00+00:00', truth_status: 'accepted', truth_reason: null, fact_source: 'ledger', received_qty_status: 'available', read_only: true },
+    })
+    renderPage('/purchase-control?current_identity=purchase%3Areq%3A10')
+
+    const row = await screen.findByText('Шестерня')
+    expect(row.closest('tr')).toHaveClass('activeRow')
+  })
+
   it('renders an order-covered MRP aggregate without exposing it to materialization', async () => {
     vi.mocked(listPurchaseJournal).mockResolvedValueOnce({
       rows: [expectedMrpRow],
