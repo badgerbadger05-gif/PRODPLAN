@@ -1248,23 +1248,49 @@ def apply_local_custody_event_to_current(
         "terminal_release",
     }:
         return False
-    from .planning_truth import get_readiness
-
-    readiness = get_readiness(db)
-    generation_id = readiness.generation_id
-    if generation_id is None or not readiness.ready:
+    pointer = lock_current_custody_marker(db)
+    generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    if generation_id is None:
         return False
     generation = db.get(models.LedgerGeneration, int(generation_id))
-    if generation is None or generation.cutoff is None or event.effective_at is None:
+    if (
+        generation is None
+        or str(generation.status) != "accepted"
+        or generation.cutoff is None
+        or event.effective_at is None
+    ):
         return False
     if event.effective_at.replace(tzinfo=None) <= generation.cutoff.replace(tzinfo=None):
         return False
-    manifest = _read_manifest(db, generation_id=int(generation.id))
+    manifest = (
+        db.query(models.ProductionMaterialCustodyProjectionManifest)
+        .filter(
+            models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id
+            == int(generation.id)
+        )
+        .with_for_update()
+        .one_or_none()
+    )
     if manifest is None or str(manifest.status) != "complete":
+        return False
+    previous_watermark = int(manifest.source_event_high_watermark_id)
+    if int(event.id) <= previous_watermark:
+        return False
+    unseen_prior = db.query(models.ProductionMaterialCustodyEvent.id).filter(
+        models.ProductionMaterialCustodyEvent.id > previous_watermark,
+        models.ProductionMaterialCustodyEvent.id < int(event.id),
+    ).first()
+    if unseen_prior is not None:
+        # Never leap over an unaccepted physical/backdated event: doing so
+        # would make it look included in the compact watermark forever.
         return False
     rows = db.query(models.ProductionMaterialCustodyProjection).filter(
         models.ProductionMaterialCustodyProjection.is_current.is_(True)
-    ).all()
+    ).with_for_update().all()
     key = (
         int(event.product_id),
         int(event.component_item_id),
@@ -1317,6 +1343,16 @@ def apply_local_custody_event_to_current(
     manifest.source_event_high_watermark_id = watermark
     db.flush()
     return True
+
+
+def lock_current_custody_marker(db: Session) -> models.PlanningTruthState | None:
+    """Serialize local custody writers before they allocate event ids."""
+    return (
+        db.query(models.PlanningTruthState)
+        .filter(models.PlanningTruthState.id == 1)
+        .with_for_update()
+        .one_or_none()
+    )
 
 
 

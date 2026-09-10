@@ -106,6 +106,13 @@ def append_material_issue_custody_event(
     if not issue_id:
         raise ValueError("issue_id is required for custody events")
 
+    # Serialize before INSERT allocates the custody event id.  Otherwise a
+    # second transaction can publish N+1 while N is still uncommitted, causing
+    # the compact watermark to leap over the first event.
+    from .production_material_custody_projection import lock_current_custody_marker
+
+    lock_current_custody_marker(db)
+
     line_id = int(getattr(line, "line_id", 0) or 0)
     if not line_id:
         db.flush()
