@@ -913,7 +913,8 @@ snapshot не используется:
 | purchase journal selection/materialize | `CurrentExecutionRow(purchase_control_journal)` identities plus `CurrentExecutionScope.source_revision`; current export batch anchors to scope, legacy snapshot FK remains nullable for historical batches | `tests/r9/test_r9_current_obligation_views.py`, `tests/r9/test_r9_purchase_current_anchor.py`, `tests/services/test_purchase_export_materialization_schema.py` |
 | MRP summary/detail/grouped/category/capacity | compact `mrp_result` rows and per-run manifest; missing current scope is 503, with no legacy snapshot fallback | `tests/r9/test_r9_mrp_current_reader.py` |
 | MRP production/purchase/rework exports | current row/manifest identity and `source_revision` are returned for CSV/XLSX; rework export no longer references an undefined identity | `test_mrp_export_returns_current_identity_and_revision`, `test_mrp_rework_export_returns_current_identity_and_revision` |
-| MRP purchase export-to-1C | stable selected current identities + expected revision are required; identities resolve to current purchase rows, unknown/foreign rows fail closed; local fake retry proves one send/read-back | `test_mrp_purchases_to_1c_resolves_current_identity_and_revision`, `test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity` |
+| MRP purchase export-to-1C | stable selected current identities + expected revision are required; identities resolve to current purchase rows, unknown/foreign rows fail closed; router adapter emits a canonical idempotency key | `test_mrp_purchases_to_1c_resolves_current_identity_and_revision`, `test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity` |
+| MRP result UI export action | selection stores only `row.current_identity`; missing identity is non-selectable; POST carries `current_identities` and `expected_source_revision` | `MrpResultPage.test.tsx` — 12 passed; `c2e4e7aa`, `38b6c692` |
 | period execution | exact resolved current run; no all-run mixing | `backend/app/routers/plan.py`, commit `4b07347c` |
 
 Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
@@ -942,8 +943,9 @@ pytest -q tests/services/test_one_c_purchase_order_export.py \
 ```
 
 The service-level fake-1C read-back test keeps the external `post_count` at
-one after a local SyncLink loss; the router test additionally checks the
-stable current idempotency adapter contract.
+one after a local SyncLink loss. The router test checks only the stable
+current identity/idempotency adapter contract; it is not a second proof of
+external read-back.
 ```
 
 Frontend static gates on the current checkout:
