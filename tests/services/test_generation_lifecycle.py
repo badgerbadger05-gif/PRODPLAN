@@ -2017,3 +2017,77 @@ def test_mrp_quantity_gate_rejects_an_inherited_run_with_net_above_gross(db_sess
 
     with pytest.raises(GenerationValidationError, match="0 <= net <= gross"):
         _mrp_quantity_checkpoint(db_session, child)
+
+
+def test_stock_bin_publication_removes_old_accepted_copy_and_keeps_building_stage(
+    db_session,
+):
+    """Current StockBin is compact; only active BUILDING staging may remain."""
+    old = _generation(db_session, key="r6-bin-old")
+    old.status = "accepted"
+    target = _generation(db_session, key="r6-bin-target")
+    staged = _generation(db_session, key="r6-bin-staged")
+    item = models.Item(item_code="R6-BIN-1", item_name="R6 bin item")
+    stale_item = models.Item(item_code="R6-BIN-2", item_name="R6 stale item")
+    db_session.add_all((item, stale_item))
+    db_session.flush()
+    db_session.add_all(
+        (
+            models.StockLedgerEntry(
+                ingest_batch_id=target.physical_import_batch_id,
+                source_content_hash=sha256(b"r6-bin-target").hexdigest(),
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
+                warehouse_ref1c="WH",
+                qty=Decimal("7"),
+                qty_after=Decimal("7"),
+                posting_at=datetime(2026, 7, 20, 10),
+                record_type="Receipt",
+                movement_kind="receipt",
+                recorder_type="R6",
+                recorder_ref="R6-BIN-TARGET",
+                line_no="1",
+                ingest_source="test",
+                active=True,
+            ),
+            models.StockBin(
+                ledger_generation_id=old.id,
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
+                warehouse_ref1c="WH",
+                on_hand=Decimal("3"),
+                is_current=True,
+            ),
+            models.StockBin(
+                ledger_generation_id=old.id,
+                item_id=stale_item.item_id,
+                characteristic_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
+                warehouse_ref1c="WH",
+                on_hand=Decimal("2"),
+                is_current=True,
+            ),
+            models.StockBin(
+                ledger_generation_id=staged.id,
+                item_id=stale_item.item_id,
+                characteristic_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
+                warehouse_ref1c="WH",
+                on_hand=Decimal("4"),
+                is_current=False,
+            ),
+        )
+    )
+    db_session.flush()
+
+    materialize_generation_stock_bins(db_session, int(target.id), publish_current=True)
+    db_session.flush()
+
+    current = db_session.query(models.StockBin).filter_by(is_current=True).all()
+    assert [(row.item_id, row.ledger_generation_id) for row in current] == [
+        (item.item_id, target.id)
+    ]
+    assert db_session.query(models.StockBin).filter_by(ledger_generation_id=old.id).count() == 0
+    assert db_session.query(models.StockBin).filter_by(ledger_generation_id=staged.id).count() == 1
