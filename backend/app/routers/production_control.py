@@ -1590,7 +1590,33 @@ def get_work_item_materials(
         ]
         if len(current_rows) != 1:
             raise CurrentExecutionUnavailable("current work-item material row is missing or ambiguous")
-        persisted_material = (current_rows[0].payload or {}).get("material_coverage_snapshot")
+        current_payload = dict(current_rows[0].payload or {})
+        current_generation_id = int(current_manifest.source_generation_id or 0)
+        if ledger_generation_id is not None and int(ledger_generation_id) != current_generation_id:
+            raise HTTPException(status_code=409, detail="Требуется актуальное принятое поколение")
+        work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
+        if work is None or int(work.ledger_generation_id) != current_generation_id:
+            raise CurrentExecutionUnavailable("current work-item provenance is missing or stale")
+        requested_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
+        remaining_qty = float(work.replenishment_remaining_qty)
+        if requested_qty <= 0 or requested_qty > remaining_qty + 1e-6:
+            raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
+        persisted_material = current_payload.get("material_coverage_snapshot")
+        if qty is not None:
+            generated = preview_make_work_item_materials(
+                db,
+                work_item_id=int(work.id),
+                item_id=int(work.item_id),
+                quantity=requested_qty,
+                spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
+                ledger_generation_id=current_generation_id,
+                order_number=f"MRP-R-{int(work.requirement_id)}",
+                run_id=int(work.run_id),
+            )
+            generated["truth_status"] = "accepted"
+            generation = db.get(models.LedgerGeneration, current_generation_id)
+            generated["cutoff"] = generation.cutoff.isoformat() if generation and generation.cutoff else None
+            return generated
         if not isinstance(persisted_material, dict):
             raise CurrentExecutionUnavailable("current work-item material coverage is missing")
         persisted = dict(persisted_material)

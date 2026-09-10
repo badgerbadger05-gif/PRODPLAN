@@ -15,7 +15,7 @@ OData, боевые workers, deploy и push не использовались.
 | R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
 | R7 — выпуск плана, MRP и будущие поставки | принято локально (после correction gate) | test-first `acc7a505`, `f784882f`, `d82853a4`, `340c143d`; implementation `8580aa92`, `91491516`, `b4524df2`; focused/PG/migration/full gates зелёные |
 | R8 — барабан, полки и мехцех | принято локально | stable current owner, manifest/readiness handshake, invalidation hooks, PG/MVCC и full gate зелёные |
-| R9 — API, UI и обменные ссылки | не начато | UI/backend migration не выполнялась |
+| R9 — API, UI и обменные ссылки | в работе, не принято локально | current readers и fail-closed contract частично переведены; full/PG/Playwright gates не выполнены |
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
@@ -898,3 +898,46 @@ residual unsafe gap. Excluded drum rows теперь сохраняются ка
 rows и возвращаются прежним API-контрактом; их coverage проверена focused
 регрессией. R9 API/UI и R10 cleanup не начинались; production contour
 намеренно не проверялся.
+
+## R9 evidence — промежуточный test-first срез, локально не принят
+
+R9 ещё не прошёл exit gate. В этом срезе закрыты только следующие current
+reader slices; отсутствие persisted current manifest по ним даёт 503, а legacy
+snapshot не используется:
+
+| User path | Current owner / identity | Evidence |
+|---|---|---|
+| `production-control /orders` | `CurrentExecutionRow(production_control_journal)`; journal business identity | `tests/r9/test_r9_current_obligation_views.py`, `tests/r9/test_r9_production_sort.py` |
+| `production-control /orders/root-products` | persisted `root_product_options` in the current manifest | `test_r9_root_products_read_current_production_rows` |
+| production material/work-item reads | persisted `material_coverage_snapshot` on the current journal row | `test_r9_materials_read_current_payload_without_snapshot_fallback`, missing-manifest 503 regression |
+| MRP result rows/manifest/exports | compact `mrp_result` rows; top identity `mrp-run:{run_id}`, row identity remains business row key | `tests/r9/test_r9_mrp_current_reader.py` |
+| period execution | exact resolved current run; no all-run mixing | `backend/app/routers/plan.py`, commit `4b07347c` |
+
+Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
+(MRP current reader/fail-closed and metadata parity), `2610d9e7` (MRP HTTP
+503), `85a23cba`, `91549375`, `677b3115`, `d0c51a4f` (root/material current
+reader regressions). Implementation commits: `4b07347c`, `59b4880d`,
+`1e5d611b`, `3573a758`, `1a87817c`, `de1a9b89`, `288d2ce8`, `0698737f`,
+`d04f6d80`, `5271a50e`.
+
+Focused current-reader gate:
+
+```text
+pytest -q tests/r9
+17 passed in 2.70s
+```
+
+Frontend static gates on the current checkout:
+
+```text
+npm run build   # PASS
+npm run lint    # PASS
+```
+
+Не выполнены и не заявляются: complete purchase selection/materialize CAS
+path, all MRP grouped/detail route parity, production export/read-back fault
+gate, API OpenAPI regeneration, PostgreSQL MVCC gate, Playwright critical path,
+and full `pytest` from the final R9 implementation commit. `current-execution-
+full-pytest.log` сохранён и не изменён. Удалённые пути: **нет**; legacy
+runtime readers remain in untouched purchase actions and non-current planning
+surfaces, so R9 status remains `в работе, не принято локально`.
