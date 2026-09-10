@@ -191,6 +191,7 @@ def test_current_application_is_idempotent_and_keeps_assignment_ids(db_session):
     assert second.changed_pairs == 0
     assert after == before
     assert db_session.query(models.LedgerGeneration).count() == 1
+    assert db_session.query(models.PlanningReadSnapshot).count() == 0
     assert read_current_replenishment(db_session, generation_id=generation_id, item_id=item_id)
 
 
@@ -288,6 +289,140 @@ def test_new_revision_updates_only_changed_pair_and_old_revision_is_rejected(db_
             reserves=reserves,
             complete_scope=True,
         )
+
+
+def test_same_revision_with_changed_payload_fails_closed(db_session):
+    generation_id, _item_id, reservations, facts = _world(db_session)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    changed = list(facts)
+    changed[0] = Fact(
+        fact_id=facts[0].fact_id,
+        item_id=facts[0].item_id,
+        mode=facts[0].mode,
+        qty=Decimal("6"),
+        posting_at=facts[0].posting_at,
+        requirement_id=facts[0].requirement_id,
+    )
+    with pytest.raises(CurrentReplenishmentError, match="payload drift"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:r4",
+            source_revision=1,
+            facts=changed,
+            reserves=reserves,
+            complete_scope=True,
+        )
+
+
+def test_fact_only_generation_advance_keeps_current_assignment_ids(db_session):
+    generation_id, item_id, reservations, facts = _world(db_session)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    before = {
+        (row.sle_id, row.reservation_id): row.id
+        for row in db_session.query(models.ReservationConsumptionAllocation)
+        .filter(models.ReservationConsumptionAllocation.is_current.is_(True))
+    }
+    physical = models.PhysicalImportBatch(
+        batch_key="r4-fact-only-" + uuid4().hex[:12],
+        status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc),
+        source_watermarks={"fact_only": True},
+    )
+    next_generation = models.LedgerGeneration(
+        generation_key="r4-fact-only-" + uuid4().hex[:12],
+        status="accepted",
+        cutoff=physical.cutoff,
+        accepted_at=physical.cutoff,
+        source_watermarks={"fact_only": True},
+        capabilities={"physical_ledger": True, "reservation_replay": True},
+        physical_import_batch=physical,
+        algorithm_version="r4-tests",
+    )
+    db_session.add_all([physical, next_generation])
+    db_session.flush()
+    changed = list(facts)
+    changed[0] = Fact(
+        fact_id=facts[0].fact_id,
+        item_id=facts[0].item_id,
+        mode=facts[0].mode,
+        qty=Decimal("6"),
+        posting_at=facts[0].posting_at,
+        requirement_id=facts[0].requirement_id,
+    )
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=next_generation.id,
+        source_key="physical:r4",
+        source_revision=2,
+        facts=changed,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    after = {
+        (row.sle_id, row.reservation_id): row.id
+        for row in db_session.query(models.ReservationConsumptionAllocation)
+        .filter(models.ReservationConsumptionAllocation.is_current.is_(True))
+    }
+    assert result.updated == 1
+    assert after == before
+    assert len(read_current_replenishment(db_session, generation_id=next_generation.id, item_id=item_id)) == 2
+
+
+def test_complete_scope_locks_only_one_distribution_pool(db_session):
+    generation_id, _item_id, reservations, facts = _world(db_session)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:seed",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    foreign = db_session.get(models.ReservationEntry, reservations[1].id)
+    foreign.planning_stock_pool = "foreign"
+    foreign_allocation = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        reservation_id=reservations[1].id, is_current=True
+    ).one()
+    foreign_allocation.planning_stock_pool = "foreign"
+    db_session.commit()
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:default",
+        source_revision=1,
+        facts=facts[:1],
+        reserves=reserves[:1],
+        complete_scope=True,
+    )
+    db_session.commit()
+    assert result.changed_pairs == 0
+    assert db_session.get(models.ReservationConsumptionAllocation, foreign_allocation.id) is not None
+    assert db_session.get(models.ReservationConsumptionAllocation, foreign_allocation.id).planning_stock_pool == "foreign"
 
 
 @pytest.mark.parametrize("failure", ["execution", "marker"])
