@@ -1,13 +1,25 @@
 [CmdletBinding()]
 param(
     [ValidateSet("start", "verify", "start-verify", "stop")]
-    [string]$Action = "start-verify"
+    [string]$Action = "start-verify",
+    [ValidateSet("docker", "wsl")]
+    [string]$Runtime = "docker",
+    [string]$Distro = "Ubuntu"
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\")).Path
 $composeFile = Join-Path $repoRoot "docker-compose.r2.yml"
 $project = "prodplan-r2-local"
+
+if ($Runtime -eq "wsl") {
+    $wslScript = Join-Path $PSScriptRoot "r2-postgres-wsl.ps1"
+    & pwsh -NoProfile -File $wslScript -Action $Action -Distro $Distro
+    if ($LASTEXITCODE -ne 0) {
+        throw "R2 WSL runtime failed with exit code $LASTEXITCODE."
+    }
+    exit 0
+}
 
 function Invoke-R2Compose {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)

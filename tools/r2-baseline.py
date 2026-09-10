@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import math
 import os
@@ -20,6 +21,7 @@ from app.r2_local_contract import validate_r2_dsn
 FIXTURE = ROOT / "tests" / "r2" / "fixtures" / "r2_synthetic_seed.json"
 API_PATH = "/api/v1/items/?skip=0&limit=100"
 API_SAMPLE_COUNT = 9
+R2_SEED_TIMESTAMP = datetime(2026, 1, 1, 0, 0, 0)
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -105,14 +107,17 @@ def main() -> int:
                 "item_code": f"r2-{item['id']}",
                 "item_name": f"R2 synthetic {item['id']}",
                 "unit": item["unit"],
+                "created_at": R2_SEED_TIMESTAMP,
+                "updated_at": R2_SEED_TIMESTAMP,
             }
             for item in fixture["items"]
         ]
         connection.execute(
             sa.text(
-                "INSERT INTO items (item_code, item_name, unit, status) "
-                "VALUES (:item_code, :item_name, :unit, 'active') "
-                "ON CONFLICT (item_code) DO UPDATE SET item_name = EXCLUDED.item_name, unit = EXCLUDED.unit, status = 'active'"
+                "INSERT INTO items (item_code, item_name, unit, status, created_at, updated_at) "
+                "VALUES (:item_code, :item_name, :unit, 'active', :created_at, :updated_at) "
+                "ON CONFLICT (item_code) DO UPDATE SET item_name = EXCLUDED.item_name, unit = EXCLUDED.unit, "
+                "status = 'active', created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at"
             ),
             item_rows,
         )
