@@ -317,10 +317,15 @@ def require_current_execution_scope(
         raise CurrentExecutionUnavailable("current execution manifest is missing")
     if not bool(manifest.result_ready):
         raise CurrentExecutionUnavailable("current execution manifest is not ready")
-    if manifest.source_generation_id is not None:
-        truth_pointer = db.get(models.PlanningTruthState, 1)
-        if truth_pointer is None or int(truth_pointer.current_generation_id or 0) != int(manifest.source_generation_id):
+    truth_pointer = db.get(models.PlanningTruthState, 1)
+    expected_generation_id = int(truth_pointer.current_generation_id or 0) if truth_pointer else 0
+    if expected_generation_id:
+        if int(manifest.source_generation_id or 0) != expected_generation_id:
             raise CurrentExecutionUnavailable("current execution manifest is stale for accepted truth")
+        generation = db.get(models.LedgerGeneration, expected_generation_id)
+        if generation is None or str(generation.status or "") != "accepted":
+            raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    elif manifest.source_generation_id is not None:
         generation = db.get(models.LedgerGeneration, int(manifest.source_generation_id))
         if generation is None or str(generation.status or "") != "accepted":
             raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
