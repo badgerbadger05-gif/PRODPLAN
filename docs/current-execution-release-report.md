@@ -273,10 +273,15 @@ boundaries, focused PostgreSQL gate, migration round-trip и полного pyte
 * `dc3e4d28` — test-first regression proving the current journal selector uses
   the pointer when the run is anchored to an older physical generation.
 * `05188599` — implementation wiring for pointer-aware current journal scope;
-  historical generation filtering remains only the pre-R3 no-pointer fixture
-  compatibility path.
+  historical generation filtering is no longer a current-MRP selector.
 * `6e00c41a` — PostgreSQL current-journal reader now fails closed when a
   plan-bound active pointer is absent.
+* `59daccd6` — test-first regressions proving missing fixed-plan pointers fail
+  in both `current_live_run_ids` and the current journal after a fact-only
+  generation fork.
+* `9a647822` — implementation and fixture updates: current scope enumerates
+  every fixed business plan and resolves each through `current_live_run`; the
+  journal has no dialect-dependent or generation fallback.
 * `tests/r3/test_r3_contract.py` — deterministic identity, incomplete/reordered
   page rejection, pointer-only current read и frozen provenance checks.
 * `docs/r3-identity-acceptance-contract.md` — boundary/owner summary without
@@ -305,6 +310,9 @@ boundaries, focused PostgreSQL gate, migration round-trip и полного pyte
   R3 migration. Missing, retired, stale, non-fixed, or plan-mismatched active
   pointers fail closed; historical rebuild paths retain explicit generation
   lineage only where the read is semantically historical.
+* The current scope starts from expected fixed business plans, not from pointer
+  rows or current-generation `FIXED_SNAPSHOT` rows. A missing pointer therefore
+  cannot silently omit a plan.
 
 ### Commands and results
 
@@ -335,14 +343,14 @@ PASS verify; overall: PASS (smoke mode)
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3 tests/services/test_period_plan_obligation_refresh_contract.py tests/services/test_mrp_mutation_guard.py tests/services/test_journal_truth_selectors.py
 34 passed in 4.07s
 
-$env:PRODPLAN_R2_TEST_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3/test_r3_postgres_integration.py::test_r3_postgres_pointer_backfill_maps_existing_fixed_plan
-1 passed in 0.26s
-
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3 tests/services/test_period_plan_obligation_refresh_contract.py tests/services/test_mrp_mutation_guard.py tests/services/test_journal_truth_selectors.py tests/services/test_production_control.py tests/services/test_production_control_journal_shelf_pull.py tests/services/test_paint_weld_chain_close.py
-139 passed in 15.31s
+141 passed in 15.59s
+
+$env:PRODPLAN_R2_TEST_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q tests/r3/test_r3_postgres_integration.py::test_r3_postgres_pointer_backfill_maps_existing_fixed_plan
+3 passed in 0.77s
 
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'; pytest -q
-1949 passed, 35 warnings in 221.11s (0:03:41); 0 skipped
+1951 passed, 35 warnings in 211.83s (0:03:31); 0 skipped
 ```
 
 Удалённые пути: **нет**. Сохранён untracked `current-execution-full-pytest.log`;
