@@ -671,6 +671,25 @@ def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_
     db_session,
 ):
     generation_id, item_id, reservations, _facts = _world(db_session, prefix="adapter")
+    for fact in _facts:
+        db_session.add(
+            models.StockLedgerSupplierReceiptProvenance(
+                ledger_generation_id=generation_id,
+                stock_ledger_entry_id=int(fact.fact_id),
+                receipt_doc_type="Doc",
+                receipt_doc_ref=f"receipt-{fact.fact_id}",
+                receipt_doc_line_no="1",
+                supplier_order_ref="order-r4",
+                supplier_order_line_no="1",
+                operation_kind="supplier_receipt",
+                evidence_hash=("a" * 64),
+                evidence_payload={"supplier_order_ref": "order-r4"},
+                match_rule="exact",
+                match_status="exact",
+                ambiguity_count=0,
+            )
+        )
+    db_session.flush()
     results = apply_current_replenishment_for_accepted_generation(
         db_session, generation_id=generation_id, source_revision=9
     )
