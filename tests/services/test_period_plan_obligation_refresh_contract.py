@@ -127,6 +127,8 @@ def test_run_list_and_delete_guard_use_only_exact_current_published_truth(db_ses
         ledger_generation_id=current.id, config_snapshot={},
     )
     db_session.add_all([current_run, stale_run, legacy_success])
+    db_session.flush()
+    db_session.add(models.PlanningLivePointer(plan_id=plan.id, run_id=current_run.run_id))
     db_session.commit()
 
     assert [row["run_id"] for row in service.list_mrp_runs_for_plan(
@@ -151,6 +153,7 @@ def test_run_list_keeps_a_run_inherited_through_a_physical_refresh(db_session):
     )
     db_session.add(run)
     db_session.flush()
+    db_session.add(models.PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
     child = models.LedgerGeneration(
         generation_key="period-refresh-fact-fork",
         status="accepted",

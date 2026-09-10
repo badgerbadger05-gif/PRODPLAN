@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import importlib.util
+from pathlib import Path
 from datetime import date
 from decimal import Decimal
 
@@ -26,6 +28,15 @@ def _dsn():
 
     validate_r2_dsn(dsn)
     return dsn
+
+
+def _r3_migration_module():
+    path = Path(__file__).parents[2] / "backend" / "alembic" / "versions" / "20260910_01_r3_identity_acceptance.py"
+    spec = importlib.util.spec_from_file_location("r3_identity_acceptance", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.mark.integration
@@ -88,4 +99,42 @@ def test_r3_postgres_seed_repeat_preserves_mapping_and_id():
         assert rows[0].business_identity
         db.close()
         tx.rollback()
+    engine.dispose()
+
+
+@pytest.mark.integration
+def test_r3_postgres_pointer_backfill_maps_existing_fixed_plan():
+    engine = create_engine(_dsn(), poolclass=__import__("sqlalchemy").pool.NullPool)
+    migration = _r3_migration_module()
+    with engine.connect() as connection:
+        tx = connection.begin()
+        try:
+            plan_id = connection.execute(
+                text(
+                    "INSERT INTO production_plan_header "
+                    "(name, period_from, period_to, status) "
+                    "VALUES ('r3 backfill test', DATE '2026-09-01', DATE '2026-09-30', 'fixed') "
+                    "RETURNING id"
+                )
+            ).scalar_one()
+            run_id = connection.execute(
+                text(
+                    "INSERT INTO planning_run "
+                    "(status, config_snapshot, source_plan_id, period_from, period_to) "
+                    "VALUES ('FIXED_SNAPSHOT', '{}'::jsonb, :plan_id, DATE '2026-09-01', DATE '2026-09-30') "
+                    "RETURNING run_id"
+                ),
+                {"plan_id": int(plan_id)},
+            ).scalar_one()
+            migration.backfill_live_pointers(connection)
+            row = connection.execute(
+                text(
+                    "SELECT run_id FROM planning_live_pointer "
+                    "WHERE plan_id = :plan_id AND status = 'active'"
+                ),
+                {"plan_id": int(plan_id)},
+            ).scalar_one()
+            assert int(row) == int(run_id)
+        finally:
+            tx.rollback()
     engine.dispose()
