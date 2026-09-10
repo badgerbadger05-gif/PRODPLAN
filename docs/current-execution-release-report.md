@@ -917,6 +917,7 @@ snapshot не используется:
 | MRP result UI export action | selection stores only `row.current_identity`; missing identity is non-selectable; POST carries `current_identities` and `expected_source_revision` | `MrpResultPage.test.tsx` — 12 passed; `c2e4e7aa`, `38b6c692` |
 | period execution | exact resolved current run; no all-run mixing | `backend/app/routers/plan.py`, commit `4b07347c` |
 | production row actions | state/quantity/delete/return/material issue/export/from-work-items validate current identities and accepted manifest revision; UI forwards CAS fields and rejects incomplete context | `tests/r9/test_r9_production_action_contract.py`, `ProductionControlPage.test.tsx`, `productionControl.test.ts`; test-first `fb3f873e`, `d2da64d1`, implementation `756e1dfb` |
+| production work-item materials / paint-weld / route sheets | current identity + manifest revision; persisted material/route payload only; numeric work-item IDs are current-validated locators; counterpart anchors are exact current proposal identities; GET has no replay/DML and POST marks only current sheet members | `tests/r9/test_r9_production_remaining_current_links.py`, `tests/routers/test_route_sheet_print_read_only.py`, `test_production_remaining_links_openapi_require_current_cas_fields` |
 
 Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
 (MRP current reader/fail-closed and metadata parity), `2610d9e7` (MRP HTTP
@@ -929,6 +930,11 @@ Implementation commits: `4b07347c`, `59b4880d`,
 `1e5d611b`, `3573a758`, `1a87817c`, `de1a9b89`, `288d2ce8`, `0698737f`,
 `d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`, `6f91171d`,
 `03ffdbec`, `756e1dfb`.
+Current-link test-first commits are `b64126d5`, `a5509e9b`, `496f7e87`,
+`7499319e`, `5b9d3e17`, and `d6877dba`; implementation commits are `7a89adfa`
+and `c63e76b5`. The snapshot-only route characterization was updated in
+`dce15e8e` to assert a missing-current 503 rather than preserve the cancelled
+fallback.
 
 Focused current-reader gate:
 
@@ -938,7 +944,7 @@ pytest -q tests/r9 tests/services/test_purchase_control_materialization.py \
   tests/services/test_supplier_future_supply.py
 42 passed in 5.60s (MRP/current-reader focused rerun)
 
-```text
+```
 pytest -q tests/services/test_one_c_purchase_order_export.py \
   -k "recovers_exact_posted_batch_without_duplicate or retry"
 5 passed, 13 deselected in 0.82s
@@ -950,22 +956,36 @@ Production action focused gate:
 pytest -q tests/r9/test_r9_production_action_contract.py
 9 passed in 2.68s
 npx vitest run src/services/productionControl.test.ts src/ui/pages/ProductionControlPage.test.tsx --reporter=dot
-2 files passed, 54 tests passed
+2 files passed, 55 tests passed
 pytest -q tests/services/test_production_order_sync.py -k "fact_cache_keeps_cancellation_separate_from_physical_remaining"
 1 passed, 25 deselected in 0.62s
 ```
 
-The impacted legacy journal characterization test still expects a 200 response
-from a snapshot-only fixture and fails against the intentional R9 no-fallback
-boundary (`1 failed, 11 passed` in the combined production command); it was not
-weakened. This slice therefore remains intermediate and does not claim the full
-R9 gate.
+Current-link focused gate:
+
+```text
+pytest -q tests/r9/test_r9_production_remaining_current_links.py \
+  tests/routers/test_route_sheet_print_read_only.py \
+  tests/r9/test_r9_production_action_contract.py \
+  tests/routers/test_production_control_journal_contract.py \
+  tests/services/test_one_c_purchase_order_export.py::test_purchase_order_export_recovers_exact_posted_batch_without_duplicate \
+  tests/services/test_production_order_sync.py::test_production_fact_cache_keeps_cancellation_separate_from_physical_remaining
+25 passed, 2 warnings in 3.29s
+```
+
+The impacted snapshot-only route characterization was intentionally changed to
+prove a missing current manifest returns 503 even when legacy rows would exist;
+no snapshot fallback was restored. Work-item material GETs return only the
+persisted publication quantity and fail closed for another quantity rather than
+replaying BOM/ledger calculations. Paint/weld actions require the exact current
+MRP requirement+item anchor for the welded counterpart before invoking the
+internally committing chain service; material-issue CAS accepts that same exact
+proposal anchor.
 
 The service-level fake-1C read-back test keeps the external `post_count` at
 one after a local SyncLink loss. The router test checks only the stable
 current identity/idempotency adapter contract; it is not a second proof of
 external read-back.
-```
 
 Frontend static gates on the current checkout:
 
@@ -975,9 +995,13 @@ npm run lint    # PASS
 npx vitest run src/ui/pages/PurchaseControlPage.test.tsx --reporter=dot  # 9 passed
 ```
 
-Не выполнены и не заявляются: production export/read-back fault
-gate, API OpenAPI regeneration, PostgreSQL MVCC gate, Playwright critical path,
-and full `pytest` from the final R9 implementation commit. `current-execution-
-full-pytest.log` сохранён и не изменён. Удалённые пути: **нет**; remaining
-legacy runtime readers and unverified action/export paths keep R9 status
+Не выполнены и не заявляются: production export/read-back fault gate beyond the
+existing service proof, PostgreSQL MVCC gate, Playwright critical path, and full
+`pytest` from the final R9 implementation commit. OpenAPI was regenerated from
+the application schema and `npm run api:types` refreshed transport types; the
+focused canon/OpenAPI/link gate passed 43 tests. `current-execution-full-pytest.log`
+сохранён и не изменён.
+Удалённые runtime paths: route-sheet snapshot reader imports and the cancelled
+snapshot-only characterization; remaining legacy readers and unverified
+action/export paths keep R9 status
 `в работе, не принято локально`.

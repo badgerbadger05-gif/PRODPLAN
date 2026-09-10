@@ -789,10 +789,8 @@ def test_route_sheet_live_fallback_renderer_is_removed() -> None:
     production_routes = _read(REPO / "backend/app/routers/production_control.py")
     assert "def render_route_sheets_html" not in production_services
     assert "render_route_sheets_html(" not in production_services
-    assert (
-        "render_route_sheets_from_snapshots(" in production_routes
-        and "read_route_sheet_snapshot_rows(" in production_routes
-    )
+    assert "render_route_sheets_from_snapshots(" in production_routes
+    assert "read_route_sheet_snapshot_rows(" not in production_routes
 
 
 def test_production_control_journal_removes_legacy_capacity_scheduler_fallback() -> None:

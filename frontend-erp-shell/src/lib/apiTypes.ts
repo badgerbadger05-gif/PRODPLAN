@@ -1882,7 +1882,7 @@ export interface paths {
         };
         /**
          * Get Assembly Queue
-         * @description Read the immutable queue belonging to the exact accepted generation.
+         * @description Read the compact current queue; legacy snapshots serve only old data.
          */
         get: operations["get_assembly_queue_api_v1_production_control_assembly_queue_get"];
         put?: never;
@@ -2122,11 +2122,7 @@ export interface paths {
         };
         /**
          * Get Work Item Materials
-         * @description Preview BOM coverage for a saved MRP row without creating an order.
-         *
-         *     The journal row and its detail request must carry the current stable
-         *     identity and accepted execution revision. Historical snapshots are not
-         *     a runtime fallback.
+         * @description Read persisted current coverage for an MRP row without replaying BOM.
          */
         get: operations["get_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_get"];
         put?: never;
@@ -3692,6 +3688,10 @@ export interface components {
              * @default true
              */
             dry_run: boolean;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** DeleteResponse */
         DeleteResponse: {
@@ -3808,6 +3808,10 @@ export interface components {
             blocking_manifest?: components["schemas"]["ReadinessBlockerResponse"][];
             /** Original Priority */
             original_priority: (string | number)[];
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
         };
         /** DrumResourceRow */
         DrumResourceRow: {
@@ -3860,6 +3864,10 @@ export interface components {
             new_resource_id?: number | null;
             /** Moved By */
             moved_by?: string | null;
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
+            /** Current Identity */
+            current_identity?: string | null;
         };
         /** DrumSlotMoveResponse */
         DrumSlotMoveResponse: {
@@ -3944,6 +3952,10 @@ export interface components {
             manual_moved_by?: string | null;
             /** Original Priority */
             original_priority: (string | number)[];
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
         };
         /** ExecutionJournalInformationLinkEvent */
         ExecutionJournalInformationLinkEvent: {
@@ -4323,6 +4335,10 @@ export interface components {
              * @default true
              */
             dry_run: boolean;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
             /**
              * Allow Production
              * @default false
@@ -4621,6 +4637,17 @@ export interface components {
             /** Qty Negative */
             qty_negative: boolean;
         };
+        /** ItemLedgerReservationAllocation */
+        ItemLedgerReservationAllocation: {
+            /** Id */
+            id: number;
+            /** Sle Id */
+            sle_id: number;
+            /** Allocated Qty */
+            allocated_qty: number;
+            /** Match Rule */
+            match_rule: string;
+        };
         /** ItemLedgerReservationEventRow */
         ItemLedgerReservationEventRow: {
             /** Id */
@@ -4686,6 +4713,8 @@ export interface components {
             replenishment_remaining_qty: number;
             /** Lifecycle Status */
             lifecycle_status: string;
+            /** Allocations */
+            allocations: components["schemas"]["ItemLedgerReservationAllocation"][];
         };
         /** ItemLedgerReservationsResponse */
         ItemLedgerReservationsResponse: {
@@ -4777,6 +4806,10 @@ export interface components {
             planned_finish_date?: string | null;
             /** Comment */
             comment?: string | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** MakeWorkItemLaunchPayload */
         MakeWorkItemLaunchPayload: {
@@ -4807,9 +4840,9 @@ export interface components {
             warehouse_ref1c?: string | null;
             /** Source Warehouse Ref1C */
             source_warehouse_ref1c?: string | null;
-            /** Stable current row identities */
+            /** Current Identities */
             current_identities?: string[];
-            /** Accepted current publication revision */
+            /** Expected Source Revision */
             expected_source_revision?: string | null;
         };
         /** MoveRequest */
@@ -4948,6 +4981,10 @@ export interface components {
             quantity: number;
             /** Initiated By */
             initiated_by?: string | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** OrdersFromWorkItemsPayload */
         OrdersFromWorkItemsPayload: {
@@ -4957,6 +4994,10 @@ export interface components {
             work_items?: components["schemas"]["MakeWorkItemLaunchPayload"][];
             /** Initiated By */
             initiated_by?: string | null;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** PaintWeldChainResponse */
         PaintWeldChainResponse: {
@@ -5191,7 +5232,7 @@ export interface components {
         /** PrintRouteSheetsPayload */
         PrintRouteSheetsPayload: {
             /** Product Ids */
-            product_ids: number[];
+            product_ids?: number[];
             /** Current Identities */
             current_identities?: string[];
             /** Expected Source Revision */
@@ -5226,9 +5267,9 @@ export interface components {
             }[] | null;
             /** Comment */
             comment?: string | null;
-            /** Stable current row identity */
+            /** Current Identity */
             current_identity?: string | null;
-            /** Accepted current publication revision */
+            /** Expected Source Revision */
             expected_source_revision?: string | null;
         };
         /** ProductionControlRootProductOption */
@@ -5581,11 +5622,11 @@ export interface components {
              * @default []
              */
             available_actions: string[];
-            /** Stable current business identity */
+            /** Current Identity */
             current_identity?: string | null;
-            /** Accepted current publication revision */
+            /** Source Revision */
             source_revision?: string | null;
-            /** Backend-provided execution explanations */
+            /** Explanations */
             explanations?: string[];
             /** Selection Disabled Reason */
             selection_disabled_reason?: string | null;
@@ -5910,25 +5951,25 @@ export interface components {
         };
         /** PurchaseControlMaterializeRequest */
         PurchaseControlMaterializeRequest: {
-            /** Snapshot Id (legacy compatibility) */
+            /** Snapshot Id */
             snapshot_id?: number | null;
             /** Row Keys */
             row_keys?: string[];
+            /**
+             * Dry Run
+             * @default true
+             */
+            dry_run: boolean;
             /** Current Identity */
             current_identity?: string | null;
             /** Current Identities */
             current_identities?: string[];
             /** Expected Source Revision */
             expected_source_revision?: string | null;
-            /**
-             * Dry Run
-             * @default true
-             */
-            dry_run: boolean;
         };
         /** PurchaseControlSelectionSummaryRequest */
         PurchaseControlSelectionSummaryRequest: {
-            /** Snapshot Id (legacy compatibility) */
+            /** Snapshot Id */
             snapshot_id?: number | null;
             /** Row Keys */
             row_keys?: string[];
@@ -5960,8 +6001,11 @@ export interface components {
              * @enum {string}
              */
             amount_status: "complete" | "partial" | "unavailable";
+            /** Current Identity */
             current_identity?: string | null;
+            /** Current Identities */
             current_identities?: string[];
+            /** Source Revision */
             source_revision?: string | null;
         };
         /** PurchaseOrder1CExportRequest */
@@ -5970,12 +6014,12 @@ export interface components {
             date_from?: string | null;
             /** Date To */
             date_to?: string | null;
-            /** Stable current row identities */
-            current_identities: string[];
-            /** Accepted current publication revision */
-            expected_source_revision: string;
             /** Purchase Ids */
             purchase_ids?: number[] | null;
+            /** Current Identities */
+            current_identities?: string[] | null;
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
             /**
              * Dry Run
              * @default false
@@ -10704,7 +10748,10 @@ export interface operations {
     };
     delete_local_order_api_v1_production_control_orders__product_id__delete: {
         parameters: {
-            query?: never;
+            query?: {
+                current_identity?: string | null;
+                expected_source_revision?: string | null;
+            };
             header?: never;
             path: {
                 product_id: number;
@@ -10880,6 +10927,8 @@ export interface operations {
         parameters: {
             query?: {
                 initiated_by?: string | null;
+                current_identity?: string | null;
+                expected_source_revision?: string | null;
             };
             header?: never;
             path: {
