@@ -16,6 +16,8 @@ from app.services.item_ledger.historical_replay_core import Fact, Reserve
 from app.services.item_ledger.current_replenishment import (
     CurrentReplenishmentError,
     apply_current_replenishment,
+    apply_current_replenishment_for_accepted_generation,
+    reject_legacy_supplier_receipt_writer,
     read_current_replenishment,
 )
 
@@ -426,8 +428,8 @@ def test_complete_scope_locks_only_one_distribution_pool(db_session):
     result = apply_current_replenishment(
         db_session,
         generation_id=generation_id,
-        source_key="physical:default",
-        source_revision=1,
+        source_key="physical:seed",
+        source_revision=2,
         facts=facts[:1],
         reserves=reserves[:1],
         complete_scope=True,
@@ -658,3 +660,22 @@ def test_postgresql_visibility_is_atomic_across_current_state_and_execution():
         writer.close()
         reader.close()
         engine.dispose()
+
+
+def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_events(
+    db_session,
+):
+    generation_id, item_id, reservations, _facts = _world(db_session, prefix="adapter")
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id, source_revision=9
+    )
+    db_session.commit()
+    assert results and results[0].inserted == 2
+    assert db_session.query(models.ReservationEvent).count() == 0
+    with pytest.raises(CurrentReplenishmentError, match="ReservationEvent writer"):
+        reject_legacy_supplier_receipt_writer(
+            db_session, db_session.get(models.ReservationEntry, reservations[0].id)
+        )
+    assert read_current_replenishment(
+        db_session, generation_id=generation_id, item_id=item_id
+    )
