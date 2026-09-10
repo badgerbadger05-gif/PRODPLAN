@@ -84,6 +84,20 @@ class ReplayResult:
     surplus_qty: Decimal
 
 
+@dataclass(frozen=True)
+class AllocationUpdate:
+    before: Allocation
+    after: Allocation
+
+
+@dataclass(frozen=True)
+class AllocationChangePlan:
+    result: ReplayResult
+    insertions: Tuple[Allocation, ...]
+    updates: Tuple[AllocationUpdate, ...]
+    deletions: Tuple[Allocation, ...]
+
+
 def _pool_key(value: Fact | Reserve) -> tuple[int, str, str, Mode]:
     return (
         int(value.item_id),
@@ -243,4 +257,48 @@ def allocate_historical_facts(
         fact_qty=fact_qty,
         allocated_qty=allocated_qty,
         surplus_qty=surplus_qty,
+    )
+
+
+def plan_allocation_changes(
+    facts: Iterable[Fact],
+    reserves: Iterable[Reserve],
+    *,
+    previous_allocations: Iterable[Allocation],
+) -> AllocationChangePlan:
+    """Describe changed assignments using the existing canonical allocator.
+
+    All three inputs must cover the same complete reconciliation scope.
+    Facts must already be accepted and normalized by the caller. In particular,
+    an empty fact set must never stand for an unavailable/partial import.
+
+    A fact/reserve pair retains its identity when quantity or evidence changes.
+    Replacing a fact revision instead removes the old pair and adds a new one.
+    Persistence must atomically apply this plan with derived execution totals,
+    preserve an audit of changed grounds, and reject an obsolete source revision.
+    This pure helper performs no database writes and does not authorize deletion.
+    """
+    def index(rows: Iterable[Allocation]) -> dict[tuple[str, str], Allocation]:
+        indexed: dict[tuple[str, str], Allocation] = {}
+        for row in rows:
+            key = (row.fact_id, row.reserve_id)
+            if key in indexed:
+                raise ValueError(f"duplicate allocation pair: {key}")
+            if not row.qty.is_finite() or row.qty <= 0:
+                raise ValueError("allocation quantity must be finite and positive")
+            indexed[key] = row
+        return indexed
+
+    before = index(previous_allocations)
+    result = allocate_historical_facts(facts, reserves)
+    after = index(result.allocations)
+    return AllocationChangePlan(
+        result=result,
+        insertions=tuple(after[key] for key in sorted(after.keys() - before.keys())),
+        updates=tuple(
+            AllocationUpdate(before[key], after[key])
+            for key in sorted(before.keys() & after.keys())
+            if before[key] != after[key]
+        ),
+        deletions=tuple(before[key] for key in sorted(before.keys() - after.keys())),
     )
