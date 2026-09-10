@@ -89,66 +89,8 @@ def test_orders_journal_exposes_strict_typed_canonical_envelope():
 
 
 def test_orders_journal_does_not_leak_internal_material_snapshot(monkeypatch):
-    payload = {
-        "product_id": 1,
-        "order_id": 2,
-        "order_number": "PP-1",
-        "order_prodplan_number": None,
-        "order_date": None,
-        "order_source": "mrp",
-        "source": "mrp",
-        "order_ref1c": None,
-        "order_one_c_number": None,
-        "line_number": 1,
-        "item_id": 3,
-        "item_code": "ITEM",
-        "item_name": "Item",
-        "item_article": "ART",
-        "optimal_batch": None,
-        "unit": "шт",
-        "quantity": 1.0,
-        "produced_qty": 0.0,
-        "remaining_qty": 1.0,
-        "status": "shortage",
-        "coverage_status": "shortage",
-        "coverage_label": "Дефицит",
-        "issue_status": "not_requested",
-        "material_coverage_status": "shortage",
-        "material_coverage_label": "Дефицит",
-        "material_coverage_calculated_at": None,
-        "material_coverage_snapshot": {"components": [{"secret": "internal"}]},
-        "planned_start_date": None,
-        "planned_finish_date": None,
-        "forecast_date": None,
-        "forecast_shift_days": None,
-        "forecast_reason": None,
-        "opened_at": None,
-        "workshop_id": None,
-        "workshop_name": None,
-        "stage_id": None,
-        "stage_name": None,
-        "spec_id": None,
-        "issue_count": 0,
-        "route_sheet_printed_at": None,
-        "comment": "",
-        "source_run_id": None,
-        "source_plan_id": None,
-        "source_plan_name": None,
-        "source_plan_period_from": None,
-        "source_plan_period_to": None,
-        "source_planned_order_id": None,
-        "source_mrp_requirement_id": None,
-        "source_mrp_allocation_key": None,
-        "mrp_req_net_qty": None,
-        "mrp_req_covered_qty": None,
-        "mrp_req_remaining_qty": None,
-        "launch_source": "mrp_remaining",
-        "shelf_warehouse_ref1c": None,
-        "shelf_pull_qty": None,
-        "shelf_materialized_qty": None,
-        "shelf_latest_start_date": None,
-        "paint_weld_chain": None,
-    }
+    from app.services.item_ledger.current_execution import CurrentExecutionUnavailable
+
     app = FastAPI()
     app.include_router(router, prefix="/api")
     app.dependency_overrides[get_db] = lambda: object()
@@ -167,22 +109,17 @@ def test_orders_journal_does_not_leak_internal_material_snapshot(monkeypatch):
         )(),
     )
     monkeypatch.setattr(
-        "app.routers.production_control.read_production_control_journal_snapshot",
-        lambda *_args, **_kwargs: {
-            "rows": [{key: value for key, value in payload.items() if key != "material_coverage_snapshot"}],
-            "total": 1,
-            "limit": 100,
-            "offset": 0,
-            "latest_run_id": None,
-            "latest_source_plan_id": None,
-        },
+        "app.services.item_ledger.current_execution.require_current_execution_scope",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            CurrentExecutionUnavailable("current execution manifest is missing")
+        ),
     )
 
     with TestClient(app) as client:
         response = client.get("/api/v1/production-control/orders")
 
-    assert response.status_code == 200
-    assert "material_coverage_snapshot" not in response.json()["rows"][0]
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "production_control_current_unavailable"
 
 
 def test_get_order_line_materials_returns_503_when_future_supply_capability_missing(monkeypatch):
