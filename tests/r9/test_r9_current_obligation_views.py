@@ -12,6 +12,10 @@ from app.services.item_ledger.current_execution import (
     require_current_execution_scope,
 )
 from app.routers.production_control import get_orders_journal, list_root_products, get_order_line_materials
+from app.routers.purchase_control import (
+    PurchaseControlSelectionSummaryRequest,
+    summarize_purchase_control_selection,
+)
 
 
 def _accepted_generation(db_session):
@@ -261,6 +265,8 @@ def test_r9_production_proposal_identity_survives_new_technical_generation(db_se
         db_session, entity_kind="production_control_journal",
         scope_key="production:all-live-orders",
     )[0]
+    first_row_id = first_row.id
+    first_updated_at = first_row.updated_at
     changes_before = db_session.query(models.CurrentExecutionChange).count()
 
     second_batch = models.PhysicalImportBatch(
@@ -298,11 +304,81 @@ def test_r9_production_proposal_identity_survives_new_technical_generation(db_se
         db_session, entity_kind="production_control_journal",
         scope_key="production:all-live-orders",
     )[0]
-    assert current.id == first_row.id
+    assert current.id == first_row_id
     assert current.business_identity == "production-mrp-requirement:900:alloc:A"
-    first_updated_at = first_row.updated_at
     assert current.updated_at == first_updated_at
+    assert "work_item_id" not in (current.payload or {})
     assert db_session.query(models.CurrentExecutionChange).count() == changes_before
+
+
+def test_r9_purchase_selection_uses_current_manifest_revision_and_identity(db_session):
+    generation = _accepted_generation(db_session)
+    _snapshot(
+        db_session,
+        generation,
+        consumer="purchase_control_journal",
+        key="journal:v1",
+        rows=[],
+    )
+    snapshot = db_session.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+    ).one()
+    snapshot.payload = {
+        "rows": [{
+            "row_key": "buy:1", "item_id": 10, "line_status": "to_order",
+            "to_order_qty": 3, "amount": 12, "price": 4,
+            "row_generator": "mrp_reservation",
+        }, {
+            "row_key": "buy:2", "item_id": 11, "line_status": "to_order",
+            "to_order_qty": 2, "amount": 10, "price": 5,
+            "row_generator": "mrp_reservation",
+        }],
+        "meta": {"summary": {"total": 1}},
+    }
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+    manifest = require_current_execution_scope(
+        db_session,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    identities = [row.business_identity for row in load_current_execution_rows(
+        db_session,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )]
+
+    result = summarize_purchase_control_selection(
+        PurchaseControlSelectionSummaryRequest(
+            current_identities=identities,
+            expected_source_revision=manifest.source_revision,
+        ),
+        db=db_session,
+    )
+    assert result["selected_rows"] == 2
+    assert result["current_identities"] == identities
+    assert result["source_revision"] == manifest.source_revision
+
+    with pytest.raises(Exception) as stale:
+        summarize_purchase_control_selection(
+            PurchaseControlSelectionSummaryRequest(
+                current_identities=identities,
+                expected_source_revision="accepted:stale",
+            ),
+            db=db_session,
+        )
+    assert getattr(stale.value, "status_code", None) == 409
+
+    with pytest.raises(Exception) as legacy:
+        summarize_purchase_control_selection(
+            PurchaseControlSelectionSummaryRequest(
+                snapshot_id=999999,
+                row_keys=["buy:1"],
+            ),
+            db=db_session,
+        )
+    assert getattr(legacy.value, "status_code", None) == 409
 
 
 def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
