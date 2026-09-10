@@ -3107,6 +3107,29 @@ class StockLedgerEntry(Base):
     ingest_batch = relationship("PhysicalImportBatch")
 
 
+class StockLedgerBusinessIdentityMap(Base):
+    """Explicit migration edges for every historical copy of a movement."""
+
+    __tablename__ = "stock_ledger_business_identity_map"
+    __table_args__ = (
+        UniqueConstraint(
+            "business_identity", "stock_ledger_entry_id",
+            name="uq_stock_ledger_identity_map_edge",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    business_identity = Column(String(256), nullable=False, index=True)
+    stock_ledger_entry_id = Column(
+        BigInteger, ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    mapping_reason = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    stock_ledger_entry = relationship("StockLedgerEntry")
+
+
 class StockLedgerSupplierReceiptProvenance(Base):
     """Generation-scoped, immutable business match for a supplier receipt.
 

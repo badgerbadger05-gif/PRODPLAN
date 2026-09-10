@@ -187,6 +187,8 @@ SET current_generation_id = NULL;
 -- transaction fail instead of silently deleting an unreviewed table.
 TRUNCATE
     production_plan_execution_fact,
+    physical_import_page,
+    stock_ledger_business_identity_map,
     stock_ledger_entry,
     stock_ledger_anchor,
     stock_ledger_fact_supersession,
@@ -231,6 +233,8 @@ TRUNCATE
     planning_read_root_member,
     planning_read_row,
     planning_read_snapshot,
+    planning_live_pointer,
+    planning_run_successor,
     closed_plan_snapshot,
     shelf_projection,
     purchase_export_obligation_allocation,
