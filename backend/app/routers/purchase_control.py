@@ -172,14 +172,7 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
         cards = saved.get("cards")
         if isinstance(cards, dict) and str(int(order_id)) in cards:
             return {**dict(cards[str(int(order_id))]), "meta": saved}
-        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
-            db,
-            entity_kind="purchase_control_journal",
-            scope_key="purchase:all-live-plans",
-        ) if row.payload and row.payload.get("order_id") == int(order_id)]
-        if not rows:
-            raise ValueError(f"Supplier order {order_id} not found in current purchase journal")
-        return {"order_id": int(order_id), "lines": rows, "meta": saved}
+        raise ValueError(f"Supplier order {order_id} card is not published in current purchase journal")
     except PurchaseJournalSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except CurrentExecutionUnavailable as e:

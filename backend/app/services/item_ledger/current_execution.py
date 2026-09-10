@@ -816,7 +816,16 @@ def publish_current_obligation_views_from_generation(
                 "entity_kind": "production_control_journal",
                 "business_identity": _snapshot_row_identity(dict(row.payload or {}), "production"),
                 "scope_key": "production:all-live-orders",
-                "payload": dict(row.payload or {}),
+                "payload": {
+                    **dict(row.payload or {}),
+                    "root_item_ids": [
+                        int(member.root_item_id)
+                        for member in db.query(models.PlanningReadRootMember).filter(
+                            models.PlanningReadRootMember.row_id == int(row.id),
+                            models.PlanningReadRootMember.snapshot_id == int(production.id),
+                        ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
+                    ],
+                },
             }
             for row in db.query(models.PlanningReadRow).filter(
                 models.PlanningReadRow.snapshot_id == int(production.id),

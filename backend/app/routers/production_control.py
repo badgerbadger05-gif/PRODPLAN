@@ -32,6 +32,7 @@ from ..services.production_control_material_issues import (
     list_material_issues,
 )
 from ..services.production_control_journal import (
+    STATUS_FILTER_GROUPS,
     materialize_make_work_items,
     cancel_local_order,
     update_line_state,
@@ -45,6 +46,7 @@ from ..services.production_control_journal_snapshot import (
     ProductionControlJournalSnapshotUnavailable,
     list_root_product_options,
     read_snapshot as read_production_control_journal_snapshot,
+    _public_journal_row,
     read_route_sheet_snapshot_rows,
 )
 from ..services.production_control_material_availability import (
@@ -52,6 +54,7 @@ from ..services.production_control_material_availability import (
     get_materials_snapshot,
     preview_make_work_item_materials,
 )
+from ..services.production_control_live_launch import overlay_execution_state, overlay_launch_facts
 from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
     mark_route_sheets_printed_by_snapshot_members,
@@ -1245,6 +1248,9 @@ class ProductionOrderJournalRowResponse(BaseModel):
     mrp_req_covered_qty: Optional[float] = None
     mrp_req_remaining_qty: Optional[float] = None
     available_actions: list[str] = []
+    current_identity: Optional[str] = None
+    source_revision: Optional[str] = None
+    explanations: list[str] = Field(default_factory=list)
     selection_disabled_reason: Optional[str] = None
     # DBR shelf pull: what drives this launch, how much and onto which shelf.
     launch_source: str = "mrp_remaining"
@@ -1346,42 +1352,68 @@ def get_orders_journal(
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
         )
-        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+        current_records = load_current_execution_rows(
             db,
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
-        )]
+        )
+        rows = []
+        for current_row in current_records:
+            payload = dict(current_row.payload or {})
+            payload["__r9_root_item_ids"] = list(payload.get("root_item_ids") or [])
+            payload.pop("root_item_ids", None)
+            payload["current_identity"] = str(current_row.business_identity)
+            payload["source_revision"] = str(current_row.source_revision)
+            rows.append(_public_journal_row(payload))
+        source_generation = db.get(models.LedgerGeneration, int(current_manifest.source_generation_id or 0))
+        if source_generation is None or source_generation.cutoff is None:
+            raise CurrentExecutionUnavailable("production current source cutoff is missing")
+        overlay_launch_facts(db, rows, cutoff=source_generation.cutoff)
+        overlay_execution_state(db, rows)
         if product_id is not None:
             rows = [row for row in rows if row.get("product_id") == int(product_id)]
         if order_id is not None:
             rows = [row for row in rows if row.get("order_id") == int(order_id)]
         if root_item_id is not None:
-            rows = [row for row in rows if row.get("root_item_id") == int(root_item_id)]
+            rows = [row for row in rows if int(root_item_id) in {
+                int(value) for value in row.get("__r9_root_item_ids") or []
+            }]
         if workshop_id is not None:
             rows = [row for row in rows if row.get("workshop_id") == int(workshop_id)]
         if status:
-            rows = [row for row in rows if str(row.get("status") or "") == str(status)]
+            values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
+            rows = [row for row in rows if str(row.get("status") or "") in values]
         if coverage_status:
             rows = [row for row in rows if str(row.get("coverage_status") or "") == str(coverage_status)]
         if planning_contour:
-            rows = [row for row in rows if str(row.get("planning_contour") or "") == str(planning_contour)]
+            contour = str(planning_contour).strip().lower()
+            if contour not in {"mrp", "1c"}:
+                raise ValueError("unknown planning_contour")
+            rows = [row for row in rows if str(row.get("order_source") or "") == contour]
         if launch_source:
             rows = [row for row in rows if str(row.get("launch_source") or "") == str(launch_source)]
         if date_from:
-            rows = [row for row in rows if row.get("planned_start_date") is not None and str(row["planned_start_date"]) >= str(date_from)]
+            rows = [row for row in rows if row.get("order_date") is not None and str(row["order_date"]) >= str(date_from)]
         if date_to:
-            rows = [row for row in rows if row.get("planned_finish_date") is not None and str(row["planned_finish_date"]) <= str(date_to)]
+            rows = [row for row in rows if row.get("order_date") is not None and str(row["order_date"]) <= str(date_to)]
         if search:
             needle = str(search).casefold()
             rows = [row for row in rows if needle in " ".join(
                 str(row.get(key) or "") for key in ("order_number", "item_name", "item_code", "item_article")
             ).casefold()]
-        rows.sort(key=lambda row: (
-            row.get(sort_by or "planned_start_date") is None,
-            str(row.get(sort_by or "planned_start_date") or ""),
-        ), reverse=str(sort_dir or "asc").lower() == "desc")
+        sort_field = str(sort_by or "").strip().lower()
+        descending = str(sort_dir or "").strip().lower() == "desc"
+        if sort_field in {"planned_start_date", "planned_finish_date", "readiness_need_date", "readiness_action_date", "readiness_priority_key"}:
+            rows.sort(key=lambda row: (row.get(sort_field) is None, str(row.get(sort_field) or ""), str(row.get("order_number") or ""), int(row.get("line_number") or 0)), reverse=descending)
+        else:
+            rows.sort(key=lambda row: (str(row.get("order_number") or ""), int(row.get("line_number") or 0)))
+            rows.sort(key=lambda row: (str(row.get("order_date") or "") == "", str(row.get("order_date") or "")), reverse=True)
+        for row in rows:
+            row.pop("__r9_root_item_ids", None)
         effective_limit = max(1, min(int(limit or 100), 500))
-        effective_offset = max(0, int(offset or 0))
+        requested_offset = max(0, int(offset or 0))
+        max_offset = max(0, ((len(rows) - 1) // effective_limit) * effective_limit) if rows else 0
+        effective_offset = min(requested_offset, max_offset)
         saved = dict(current_manifest.summary or {})
         return ProductionOrderJournalResponse.model_validate({
             "rows": rows[effective_offset:effective_offset + effective_limit],

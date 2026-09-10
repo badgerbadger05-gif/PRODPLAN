@@ -5566,6 +5566,12 @@ export interface components {
              * @default []
              */
             available_actions: string[];
+            /** Stable current business identity */
+            current_identity?: string | null;
+            /** Accepted current publication revision */
+            source_revision?: string | null;
+            /** Backend-provided execution explanations */
+            explanations?: string[];
             /** Selection Disabled Reason */
             selection_disabled_reason?: string | null;
             /**

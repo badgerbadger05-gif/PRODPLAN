@@ -130,6 +130,8 @@ export type PurchaseSnapshotMeta = {
   fact_source: string
   received_qty_status: PurchaseFactStatus
   read_only: boolean
+  current_identity?: string
+  source_revision?: string
 }
 
 export type PurchaseOrdersResponse = {
