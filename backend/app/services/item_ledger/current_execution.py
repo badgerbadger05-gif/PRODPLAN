@@ -841,9 +841,12 @@ def publish_current_obligation_views_from_generation(
         purchase_rows = [
             {
                 "entity_kind": "purchase_control_journal",
-                "business_identity": _snapshot_row_identity(dict(row), str(index)),
+                "business_identity": _snapshot_row_identity(
+                    dict(row.get("payload") or row) if isinstance(row, dict) else {},
+                    str(index),
+                ),
                 "scope_key": "purchase:all-live-plans",
-                "payload": dict(row),
+                "payload": dict(row.get("payload") or row) if isinstance(row, dict) else {},
             }
             for index, row in enumerate(purchase_source_rows)
             if isinstance(row, dict)
