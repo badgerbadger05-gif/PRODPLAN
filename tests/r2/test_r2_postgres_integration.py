@@ -66,3 +66,27 @@ def test_two_connections_observe_rollback_and_commit_isolation():
         conn_a.close()
         conn_b.close()
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_real_fastapi_read_endpoint_returns_measured_latency():
+    dsn = _r2_dsn()
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PRODPLAN_R2_TEST_DSN"] = dsn
+    result = subprocess.run(
+        [sys.executable, "tools/r2-baseline.py", "--dsn", dsn],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"R2 API baseline failed:\n{result.stdout}\n{result.stderr}"
+    import json
+
+    payload = json.loads(result.stdout)
+    latency = payload["api_latency_ms"]
+    assert payload["api_endpoint"] == "/api/v1/items/?skip=0&limit=100"
+    assert payload["api_sample_count"] >= 5
+    assert latency["p50"] >= 0
+    assert latency["p95"] >= latency["p50"]

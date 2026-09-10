@@ -69,3 +69,14 @@ def test_r2_guard_accepts_only_explicit_local_identity():
     assert parsed.host == "127.0.0.1"
     assert parsed.database == "prodplan_r2"
 
+
+def test_baseline_declares_a_real_db_backed_fastapi_latency_probe():
+    source = (ROOT / "tools" / "r2-baseline.py").read_text(encoding="utf-8")
+    assert "TestClient" in source
+    assert "/api/v1/items/" in source
+    assert "validate_r2_dsn" in source
+    assert "api_sample_count" in source
+    assert '"p50"' in source
+    assert '"p95"' in source
+    assert '"api_latency_ms": None' not in source
+
