@@ -27,6 +27,7 @@ def _accepted_generation(db_session):
         source_watermarks={},
         capabilities={},
         physical_import_batch=batch,
+        algorithm_version="r9-test",
     )
     db_session.add(generation)
     db_session.flush()
@@ -100,6 +101,7 @@ def test_r9_publishes_obligation_and_fact_views_to_stable_current_owner(db_sessi
     )
     assert production[0].business_identity == "order:1"
     assert production[0].payload["available_actions"] == ["produce"]
+    assert purchase[0].business_identity == "buy:1"
     assert purchase[0].payload["to_order_qty"] == 2
 
 
