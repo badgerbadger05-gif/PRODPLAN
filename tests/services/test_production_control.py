@@ -42,6 +42,7 @@ from app.models import (
     WorkshopWarehouseBinding,
     LedgerBuildBatch,
     LedgerFutureSupply,
+    LedgerFutureSupplyCurrent,
     LedgerGeneration,
     PhysicalImportBatch,
     StockBin,
@@ -204,6 +205,37 @@ def _ledger_future_supply(
         evidence_status="exact",
     )
     db_session.add(row)
+    db_session.flush()
+    current = db_session.query(LedgerFutureSupplyCurrent).filter_by(
+        current_identity=row.current_identity,
+    ).one_or_none()
+    if current is None:
+        current = LedgerFutureSupplyCurrent(
+            current_identity=row.current_identity,
+            source_generation_id=generation_id,
+            source_capture_batch_id=int(batch.id),
+            supply_kind=kind,
+            item_id=int(item_id),
+            planning_stock_pool=planning_pool,
+            destination_warehouse_ref1c=destination,
+            source_ref=source_ref,
+            source_line_ref=source_line_ref,
+            ordered_qty_at_cutoff=float(open_qty),
+            realized_qty_at_cutoff=0,
+            open_qty_at_cutoff=float(open_qty),
+            eta_date=eta_date,
+            source_state_key="test",
+            capture_cutoff=generation.cutoff,
+            source_content_hash="test-hash",
+            evidence_status="exact",
+        )
+        db_session.add(current)
+    else:
+        current.source_generation_id = generation_id
+        current.source_capture_batch_id = int(batch.id)
+        current.open_qty_at_cutoff = float(open_qty)
+        current.ordered_qty_at_cutoff = float(open_qty)
+        current.eta_date = eta_date
     db_session.flush()
     return row
 

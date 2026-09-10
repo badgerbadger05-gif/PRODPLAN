@@ -194,6 +194,8 @@ TRUNCATE
     stock_ledger_fact_supersession,
     stock_ledger_supplier_receipt_provenance,
     reservation_consumption_allocation,
+    ledger_future_supply_current_change,
+    ledger_future_supply_current,
     stock_bin,
     ledger_future_supply,
     production_material_custody_projection,
