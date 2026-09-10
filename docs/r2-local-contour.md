@@ -33,16 +33,21 @@ synthetic IDs and quantities; they contain no credentials or external URLs.
 The baseline seed is `r2-fixed-20260910-v1` from
 `tests/r2/fixtures/r2_synthetic_seed.json`: 2 plans, 3 items, 2 pools and 7
 movements. `tools/r2-baseline.py` reports elapsed time, inserted rows, the
-temporary table size, SQL write count and server identity. API latency is
-explicitly `null` because R2 starts PostgreSQL only; an API baseline belongs to
-the later API wave and is not fabricated here. The output and environment must
-be stored with the run before any thresholds are tuned.
+temporary table size, SQL write count and server identity. It also seeds the
+three deterministic item rows and probes the real FastAPI read route
+`GET /api/v1/items/?skip=0&limit=100` through `TestClient`, with a warm-up and
+9 measured samples. The output contains numeric `api_latency_ms.min`, `p50`,
+`p95` and `max` values plus `api_sample_count`; it never fabricates `null`.
+The route is representative of the DB-backed item-list read path and performs
+no mutation. The output and environment must be stored with the run before any
+thresholds are tuned.
 
 ## Current environment result
 
 On 2026-09-10 the safe checks found Docker CLI installed but its Linux engine
 pipe unavailable; no local PostgreSQL service, `psql` or `pg_isready` executable
 was available. WSL also could not reach its local service. Therefore the
-PostgreSQL migration, two-session rollback test and numeric baseline remain
-blocked and are not reported as green. No external or production connection
-was attempted.
+PostgreSQL migration, two-session rollback test and numeric baseline (including
+the API latency samples) remain blocked and are not reported as green. The
+probe refuses to run without a validated local DSN and a migrated `items`
+table. No external or production connection was attempted.

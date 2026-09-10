@@ -8,7 +8,7 @@ OData, боевые workers, deploy и push не использовались.
 | Волна | Статус на срезе | Доказательство/граница |
 |---|---|---|
 | R1 — контракт данных, границы и предметные решения | принято локально | test-first `fd57f8fd`, документный gate `48cbd509`, implementation/docs `299ae84b` + follow-up решения; focused gate ниже |
-| R2 — локальный PostgreSQL и baseline | проверка заблокирована инфраструктурой | test-first `3f5f2914`, implementation `ca885897`; static gate зелёный, Docker/PostgreSQL runtime недоступен |
+| R2 — локальный PostgreSQL и baseline | проверка заблокирована инфраструктурой | test-first `3f5f2914` + API probe `4eba5cfc`, implementation `ca885897` + `80fe4721`; static gate зелёный, Docker/PostgreSQL runtime недоступен |
 | R3 — устойчивые идентичности и принятие физики | не начато | production persistence не менялась |
 | R4 — транзакционные основания и текущее исполнение | не начато | runtime writers не переносились |
 | R5 — исправления, отмены и backdate | не начато | incremental persistence scope отложен в зависимую волну |
@@ -98,6 +98,11 @@ R5; schema/persistence пока generation-bound; API/UI ещё не перед�
 * `ca885897` — implementation: PG-only compose, explicit local DSN guard,
   start/verify scripts, baseline runner, integration migration/rollback tests
   и регистрация integration marker.
+* `4eba5cfc` — test-first проверка реального DB-backed FastAPI latency probe
+  с sample count/p50/p95.
+* `80fe4721` — implementation API probe: детерминированный seed items,
+  реальный `GET /api/v1/items/` через FastAPI `TestClient`, warm-up и 9
+  измеренных samples.
 * `tests/r2/test_r2_local_contract.py` и
   `tests/r2/test_r2_postgres_integration.py` — guard, migration, две сессии и
   rollback-проверки.
@@ -123,7 +128,14 @@ pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integrati
 
 ```text
 pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py tests/test_canon_invariants.py
-37 passed, 2 skipped in 5.49s
+38 passed, 3 skipped in 5.52s
+```
+
+Красный API-latency test-first прогон до реализации probe:
+
+```text
+pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py
+1 failed, 5 passed, 3 skipped
 ```
 
 Проверка синтаксиса compose прошла:
@@ -141,30 +153,34 @@ exit 0
 двухсессионный rollback и численный baseline не выдаются за выполненные.
 
 Обязательный полный gate с финального R2 implementation-состояния
-(`ca885897`; последующие commits меняют только report):
+(`80fe4721`; report-only docs commit следует отдельно):
 
 ```text
 pytest -q
-1920 passed, 5 skipped, 35 warnings in 184.38s (0:03:04)
+1921 passed, 6 skipped, 35 warnings in 191.64s (0:03:11)
 ```
 
-Пять skip распределены так: три существующих opt-in PostgreSQL теста
+Шесть skip распределены так: три существующих opt-in PostgreSQL теста
 (`test_material_issue_locking.py`, `test_pg_rebuild_check.py`,
-`test_reservation_replenishment_core_migration.py`) и два новых R2
-integration-теста при отсутствии `PRODPLAN_R2_TEST_DSN`. Все три старых skip
+`test_reservation_replenishment_core_migration.py`) и три новых R2
+integration-теста (migration, rollback, API latency) при отсутствии
+`PRODPLAN_R2_TEST_DSN`. Все три старых skip
 относятся к новому R2 контракту; после появления именно локального R2 DSN их
 нужно перевести в обязательный gate, а не оставлять скрытым skip. Ни один skip
 не переключался на production/default DSN.
 
 `tools/r2-baseline.py` фиксирует seed/объёмы, elapsed time, SQL writes,
-temporary table bytes и server identity; API latency явно `null`, поскольку
-R2 намеренно поднимает только PostgreSQL. Запуск baseline отложен тем же
+temporary table bytes и server identity. После успешной миграции он также
+возвращает числовые `api_sample_count`, `api_latency_ms.min`, `p50`, `p95` и
+`max` для DB-backed `GET /api/v1/items/?skip=0&limit=100`; `null` fallback
+удалён. Запуск baseline и получение численных latency отложены тем же
 инфраструктурным blocker, измерения и пороги не выдумывались.
 
 Удалённые пути: **нет**. Изменений production persistence, внешних адресов,
 SSH/OData, live 1С, deploy или workers нет.
 
 Остаточные риски: локальная PostgreSQL migration/concurrency и baseline ещё
-не доказаны; API latency отсутствует до API-волны; три прежних PG skip требуют
-обязательного повторного прогона в доступном локальном контуре. Поэтому R2 не
-помечена `принято локально` и R3 не начиналась.
+не доказаны; численная API latency пока не снята из-за отсутствующего
+runtime; три прежних PG skip требуют обязательного повторного прогона в
+доступном локальном контуре. Поэтому R2 не помечена `принято локально` и R3
+не начиналась.
