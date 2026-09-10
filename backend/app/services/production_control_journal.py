@@ -16,6 +16,7 @@ from ..models import (
     PaintWeldPair,
     PlannedOrder,
     PlanningRun,
+    PlanningLivePointer,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionMaterialIssue,
@@ -52,6 +53,7 @@ from .item_ledger.production_output_cache import (
     accepted_product_output,
     update_accepted_product_output_cache,
 )
+from .item_ledger.r3_contract import current_live_run
 from .production_material_custody_events import append_material_issue_custody_event
 
 
@@ -280,6 +282,9 @@ def _accepted_plan_snapshot_run_ids_for_root(
     No ``max(run_id)`` is used here.  Publication owns the generation pointer;
     a fixed run from another (including newer) generation is not UI truth.
     """
+    accepted_run_ids = _accepted_fixed_run_ids(
+        db, ledger_generation_id=int(ledger_generation_id)
+    )
     rows = (
         db.query(PlanningRun.run_id)
         .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
@@ -287,7 +292,7 @@ def _accepted_plan_snapshot_run_ids_for_root(
         .filter(ProductionPlanHeader.status == "fixed")
         .filter(ProductionPlanLine.item_id == int(root_item_id))
         .filter(PlanningRun.status == "FIXED_SNAPSHOT")
-        .filter(PlanningRun.ledger_generation_id == int(ledger_generation_id))
+        .filter(PlanningRun.run_id.in_(accepted_run_ids or [-1]))
         .all()
     )
     return {int(row[0]) for row in rows if row[0] is not None}
@@ -327,7 +332,7 @@ def _plan_scoped_run_ids(db: Session, accepted_run_ids: Sequence[int]) -> List[i
 
 
 def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[int]:
-    rows = (
+    legacy_rows = (
         db.query(PlanningRun.run_id)
         .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
         .filter(PlanningRun.status == "FIXED_SNAPSHOT")
@@ -336,7 +341,43 @@ def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[i
         .order_by(PlanningRun.run_id.asc())
         .all()
     )
-    return [int(row[0]) for row in rows]
+    legacy_run_ids = [int(row[0]) for row in legacy_rows]
+    plan_ids = {
+        int(row[0])
+        for row in db.query(PlanningRun.source_plan_id)
+        .filter(PlanningRun.run_id.in_(legacy_run_ids or (-1,)))
+        .all()
+        if row[0] is not None
+    }
+    plan_ids.update(
+        int(row[0])
+        for row in db.query(PlanningLivePointer.plan_id)
+        .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningLivePointer.plan_id)
+        .filter(
+            PlanningLivePointer.status == "active",
+            ProductionPlanHeader.status == "fixed",
+        )
+        .all()
+    )
+    if not plan_ids:
+        return []
+
+    # Current journal scope prefers the explicit business pointer.  A pointer
+    # may name a run anchored to an older generation after a fact-only fork;
+    # generation lineage is not a current-MRP selector in that case.  The
+    # legacy branch is retained only for pre-R3 fixtures with no pointer row at
+    # all; migrated production databases backfill every fixed plan.
+    selected: set[int] = set()
+    for plan_id in sorted(plan_ids):
+        pointer = db.get(PlanningLivePointer, int(plan_id))
+        if pointer is None:
+            selected.update(
+                int(row[0]) for row in legacy_rows
+                if int(db.get(PlanningRun, int(row[0])).source_plan_id or -1) == plan_id
+            )
+            continue
+        selected.add(int(current_live_run(db, int(plan_id)).run_id))
+    return sorted(selected)
 
 
 def _default_spec_ids_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, int]:
