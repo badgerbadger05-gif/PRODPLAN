@@ -50,7 +50,7 @@ def _current_row(identity="production-mrp-requirement:900:alloc:A", product_id=7
             "route_sheet_payload": {
                 "version": 1,
                 "anchor_product_id": product_id,
-                "sheet": {"order_number": "ORD-77", "components": [], "operations": []},
+                "sheet": {"product_id": product_id, "order_number": "ORD-77", "components": [], "operations": []},
             },
             "material_coverage_snapshot": {
                 "ledger_generation_id": 7,
@@ -63,6 +63,7 @@ def _current_row(identity="production-mrp-requirement:900:alloc:A", product_id=7
 
 def test_work_item_materials_uses_current_identity_and_never_replays(monkeypatch):
     import app.routers.production_control as router
+    import app.services.item_ledger.current_execution as current_execution
 
     db = _FakeDb(work_id=702)
     monkeypatch.setattr(current_execution, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
@@ -149,10 +150,9 @@ def test_route_sheet_get_and_post_use_current_payload_not_snapshot_reader(monkey
     row = _current_row(product_id=77)
     monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
     monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [row])
-    monkeypatch.setattr(router, "read_route_sheet_snapshot_rows", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("snapshot route reader used")))
     monkeypatch.setattr(router, "render_route_sheets_from_snapshots", lambda payloads, **kwargs: "<html>current</html>")
     printed = []
-    monkeypatch.setattr(router, "mark_route_sheets_printed", lambda *args, **kwargs: printed.append(True))
+    monkeypatch.setattr(router, "mark_route_sheets_printed_by_members", lambda *args, **kwargs: printed.append(True))
 
     html = print_route_sheets(
         product_ids="77",
