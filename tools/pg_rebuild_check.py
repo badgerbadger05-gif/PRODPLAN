@@ -208,6 +208,12 @@ def _docker_available() -> bool:
     return _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=60).returncode == 0
 
 
+def _wsl_available() -> bool:
+    """Whether Windows can invoke the supported local WSL PostgreSQL client."""
+
+    return shutil.which("wsl.exe") is not None or shutil.which("wsl") is not None
+
+
 # --------------------------------------------------------------------------- #
 # psql execution
 # --------------------------------------------------------------------------- #
@@ -226,10 +232,13 @@ class Psql:
         self.image = image
         self.binary = binary
         self.container = container or target.container
+        self.wsl = False
         if self.container is None and self.binary is None:
             self.binary = shutil.which("psql")
-        if self.container is None and self.binary is None and not _docker_available():
-            raise CheckError("no psql transport: neither a container nor a psql binary is available")
+        if self.container is None and self.binary is None and _wsl_available() and target.host in {"localhost", "127.0.0.1", "::1"}:
+            self.wsl = True
+        if self.container is None and self.binary is None and not self.wsl and not _docker_available():
+            raise CheckError("no psql transport: neither a container, WSL psql, nor a psql binary is available")
 
     def _command(self, args: Sequence[str], database: str) -> list[str]:
         env = ["-e", f"PGPASSWORD={self.target.password}", "-e", "PGCLIENTENCODING=UTF8"]
@@ -248,6 +257,23 @@ class Psql:
             return ["docker", "exec", "-i", *env, self.container, *psql]
         if self.binary is not None:
             return [self.binary, "-h", self.target.host, "-p", str(self.target.port), *psql]
+        if self.wsl:
+            distro = os.getenv("PRODPLAN_PG_CHECK_WSL_DISTRO", "Ubuntu")
+            wsl = shutil.which("wsl.exe") or shutil.which("wsl") or "wsl.exe"
+            return [
+                wsl,
+                "-d",
+                distro,
+                "--",
+                "env",
+                f"PGPASSWORD={self.target.password}",
+                "PGCLIENTENCODING=UTF8",
+                *psql,
+                "-h",
+                self.target.host,
+                "-p",
+                str(self.target.port),
+            ]
         host = self.target.host
         if host in {"localhost", "127.0.0.1", "::1"}:
             host = "host.docker.internal"
