@@ -52,14 +52,15 @@ three deterministic item rows and probes the real FastAPI read route
 `p95` and `max` values plus `api_sample_count`; it never fabricates `null`.
 The route is representative of the DB-backed item-list read path and performs
 no mutation. The output and environment must be stored with the run before any
-thresholds are tuned. A final repeated WSL run recorded:
+thresholds are tuned. Two consecutive WSL runs recorded:
 
 ```text
 PostgreSQL 16.15 / Ubuntu / 127.0.0.1:55441
 seed=r2-fixed-20260910-v1, plans=2, movements=7
 sql_write_count=12, temp_table_bytes=32768
-api_sample_count=9, p50=3.680ms, p95=4.521ms, max=4.521ms
-elapsed_ms=1794.759
+run-1: api_sample_count=9, p50=3.863ms, p95=4.881ms
+run-2: api_sample_count=9, p50=3.802ms, p95=4.421ms
+seed_rows=3|true (rows|timestamps_nonnull)
 ```
 
 ## Current environment result

@@ -136,11 +136,13 @@ pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integrati
 4 failed, 1 passed, 2 skipped
 ```
 
-После реализации focused R2/canon/WSL rehearsal gate на живом DSN:
+После реализации focused R2/canon/WSL rehearsal gate на живом DSN
+оркестратора:
 
 ```text
-pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py tests/test_canon_invariants.py
-53 passed in 20.43s
+$env:PRODPLAN_R2_TEST_DSN = $env:PRODPLAN_TEST_PG_URL = $env:PRODPLAN_PG_CHECK_DSN = 'postgresql://r2_user:r2_local_only@127.0.0.1:55441/prodplan_r2'
+pytest -q tests/r2/test_r2_local_contract.py tests/r2/test_r2_postgres_integration.py tests/test_canon_invariants.py tests/test_pg_rebuild_check.py tests/test_material_issue_locking.py tests/services/test_reservation_replenishment_core_migration.py
+57 passed in 20.61s
 ```
 
 Красный API-latency test-first прогон до реализации probe:
@@ -178,7 +180,12 @@ runtime; WSL PostgreSQL 16.15 является поддержанным лока
 Keeper state хранится вне репозитория в
 `%LOCALAPPDATA%\PRODPLAN\r2-runtime\wsl-keeper.json`; после паузы повторный
 `verify` подтвердил тот же PID/start identity. Чужой orchestrator handle не
-останавливался.
+останавливался. В независимой проверке старый orchestrator WSL session был
+остановлен; keeper PID `23396` с сохранённым `start_utc` остался жив, после
+чего `verify` и прямое PostgreSQL-соединение на том же DSN прошли.
+
+Environment: локально в WSL Ubuntu установлен PostgreSQL `16.15` как R2
+dependency; это не production и не внешний contour.
 
 Migration/round-trip/rehearsal:
 
@@ -211,14 +218,13 @@ production/default DSN.
 temporary table bytes и server identity. После успешной миграции он также
 возвращает числовые `api_sample_count`, `api_latency_ms.min`, `p50`, `p95` и
 `max` для DB-backed `GET /api/v1/items/?skip=0&limit=100`; `null` fallback
-удалён. Фактический повторный baseline на WSL PostgreSQL 16.15:
+удалён. Два последовательных baseline на WSL PostgreSQL 16.15:
 
 ```text
-seed=r2-fixed-20260910-v1, plans=2, movements=7
-sql_write_count=12, temp_table_bytes=32768, elapsed_ms=1761.512
-api_endpoint=/api/v1/items/?skip=0&limit=100, api_sample_count=9
-api_latency_ms: min=3.280, p50=3.680, p95=4.521, max=4.521
-database=prodplan_r2, user=r2_user, server_address=127.0.0.1/32
+run-1: api_latency_ms.p50=3.863, p95=4.881
+run-2: api_latency_ms.p50=3.802, p95=4.421
+seed_rows=3|true (rows|timestamps_nonnull)
+seed=r2-fixed-20260910-v1, database=prodplan_r2, user=r2_user
 ```
 
 Повтор idempotent seed сохранил ровно 3 synthetic item rows с ненулевыми
