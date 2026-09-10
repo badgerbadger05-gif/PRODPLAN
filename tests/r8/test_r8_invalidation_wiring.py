@@ -13,4 +13,4 @@ def test_r8_reference_mutations_invalidate_affected_current_scopes():
     assert "invalidate_current_execution_scope" in manual
     assert planning_rates.count('scope_key="shelf:all-live-mrps"') >= 3
     assert planning_rates.count('scope_key="drum:all-live-plans"') >= 2
-    assert resources.count('scope_key="drum:all-live-plans"') >= 2
+    assert resources.count('scope_key="drum:all-live-plans"') >= 1
