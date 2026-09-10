@@ -172,6 +172,27 @@ Custody остаётся event-sourced: события неизменяемы, b
 единственный `PlanningTruthState` marker, затем получают event id и обновляют
 projection; перескок через unseen physical/backdated event запрещён.
 
+## R7. Выпуск плана, rebase и future supply
+
+Накопленный выпуск строки плана читается из сохранённых
+`accepted_output_qty/remaining_output_qty`; stable execution fact
+`(stock_ledger_entry_id, plan_line_id)` защищает повторный read-back. Раскладка
+использует общий `document_net_output.py` и один exact-then-FIFO allocator.
+`AssemblyOutputAllocation` generation-scoped только как audit/provenance и не
+является вторым владельцем количества.
+
+Future supply разделяет immutable generation capture и compact current read.
+`current_identity` обязан следовать внешней identity заказа/строки, а
+`is_current` переключается только вместе с accepted truth pointer; BUILDING и
+исторические копии current reader не видит. Исторические readers могут явно
+запрашивать generation evidence для сборки candidate.
+
+Specification import сначала приводит payload к семантическому canonical form
+(включая Decimal и порядок строк), затем сравнивает единственный revision hash.
+Equivalent import не создаёт successor; genuine change закрывает старый MRP и
+создаёт ровно один successor на сохранённый remaining basis. Read-model не
+пересчитывает накопленный output и не выводит execution из статуса заказа.
+
 ## Транзакционное текущее пополнение (R4)
 
 Текущая supplier-receipt replenishment assignment является одной

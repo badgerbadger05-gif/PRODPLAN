@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальные волны R1–R6. Продовые БД, SSH,
+Дата среза: 2026-09-10. Область: локальные волны R1–R7. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 ## Сводка волн
@@ -13,14 +13,15 @@ OData, боевые workers, deploy и push не использовались.
 | R4 — транзакционные основания и текущее исполнение | принято локально | current writer, typed provenance, role separation, rebuild closure, PG atomicity и полный gate зелёные |
 | R5 — исправления, отмены и backdate | принято локально | signed replay, explicit history mode, mixed provenance, correction audit, migration and full local gate зелёные |
 | R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
-| R7 — выпуск плана, MRP и будущие поставки | не начато | только зафиксированы границы successor MRP |
+| R7 — выпуск плана, MRP и будущие поставки | в работе, не принято | implementation `13d546e4`; focused evidence ниже; full 0-skip gate ещё не снят |
 | R8 — барабан, полки и мехцех | не начато | только owner/identity contract |
 | R9 — API, UI и обменные ссылки | не начато | UI/backend migration не выполнялась |
 | R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R6 приняты локально; R7–R11 намеренно не продвигаются.
+волны. R1–R6 приняты локально; R7 остаётся не принятым до полного exit gate;
+R8–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -655,4 +656,72 @@ migration/promotion; active BUILDING rows и explicit custody rewind baselines
 остаются bounded staging/provenance. Локальные issue/terminal custody events
 сериализуются до INSERT через planning-truth marker; physical/backdated gaps
 fail closed до следующей accepted publication. Live/prod contour намеренно не
-проверялся. R7–R11 не начинались.
+проверялся. R8–R11 не начинались.
+
+## R7 evidence — test-first implementation в работе
+
+R7 не объявляется `принято локально`: focused и migration gates зелёные, но
+после implementation требуется полный pytest на финальном commit с нулём
+skip. Production/SSH/OData/live 1С/боевые workers/deploy/push не
+использовались.
+
+### Commits, files and contract
+
+* `1a7d7151` — test-first stable `LedgerFutureSupply.current_identity` и
+  staged `is_current` contract.
+* `a1c0af7d` — test-first semantic specification import: порядок строк,
+  Decimal formatting и display noise не создают новую revision/rebase.
+* `13d546e4` — implementation: stable future-supply identity/current
+  publication, migration `20260910_10`, current GET/material-availability
+  guards, numeric specification canonicalization и publication integration.
+
+Существующий canonical output path сохранён: `document_net_output.py` →
+`assembly_output_core.py` → `assembly_output_persistence.py`; stable
+`ProductionPlanExecutionFact` и persisted line accepted/remaining являются
+единственным current owner. Existing specification rebase сохраняет matrix и
+remaining roots; R7 не создаёт второй output/FIFO engine. Future supply
+разделён на immutable generation evidence и pointer-bound compact current rows.
+Удалённые пути: **нет**.
+
+### Red, focused and migration evidence
+
+Красный test-first прогон до соответствующих реализаций:
+
+```text
+pytest -q tests/services/test_ledger_future_supply_schema.py tests/services/test_future_supply_capture.py::test_capture_assigns_stable_current_identity_and_stays_staged_until_publish
+2 failed, 2 passed — current_identity/is_current отсутствовали
+
+pytest -q tests/services/test_spec_component_child_spec_sync.py::test_semantically_equivalent_spec_import_is_idempotent
+1 failed — числовые `1.000` и `1` давали разные revision hashes
+```
+
+Focused R7/affected suites после implementation:
+
+```text
+pytest -q tests/services/test_future_supply_capture.py tests/services/test_ledger_future_supply_schema.py tests/services/test_spec_component_child_spec_sync.py tests/services/test_specification_revision.py tests/routers/test_item_ledger_router.py::test_future_supply_lists_only_open_exact_orders tests/services/test_item_ledger_position_generation_truth.py tests/services/test_assembly_output_persistence.py tests/services/test_assembly_queue_snapshot.py tests/services/test_candidate_future_supply.py tests/services/test_carry_forward_retained_reservations.py
+90 passed in 9.97s
+
+pytest -q tests/services/test_obligation_refresh_publish.py tests/services/test_obligation_refresh_orchestrator.py tests/services/test_specification_mrp_rebase.py tests/services/test_physical_refresh_future_supply.py
+67 passed in 8.92s
+
+pytest -q tests/services/test_assembly_output_core.py tests/services/test_assembly_output_persistence.py tests/services/test_production_output_cache.py tests/services/test_specification_mrp_rebase.py tests/services/test_rebase_output_repair_audit.py tests/services/test_candidate_future_supply.py tests/services/test_physical_refresh_future_supply.py tests/services/test_supplier_future_supply.py tests/services/test_wip_future_supply.py
+84 passed in 8.36s
+```
+
+Local PostgreSQL migration/round-trip/verify on the named R2 contour:
+
+```text
+python tools/pg_rebuild_check.py --dsn postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2 --stages migrate,round-trip,verify --no-seed
+PASS migrate 20260910_10 (head)
+PASS round-trip head -> 20260726_14 -> head
+PASS verify; overall: PASS (smoke mode)
+```
+
+### Residual R7 gate
+
+`current-execution-full-pytest.log` — чужой untracked файл, сохранён без
+изменений. Full pytest с финального `13d546e4` и 0 skipped ещё должен быть
+снят; до этого R7 остаётся `не принято`. Остаточный риск — полная
+orchestration/PG evidence проверяет existing output/rebase paths и новый
+future-supply publication boundary раздельно; production contour намеренно не
+проверялся.

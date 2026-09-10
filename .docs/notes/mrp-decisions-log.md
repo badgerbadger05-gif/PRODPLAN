@@ -783,3 +783,21 @@ reference, supplier-order line и без ссылки применяет соо�
 addressed basis. `CurrentReplenishmentAudit.reason` и `basis_fact_ids` фиксируют
 только реальные basis changes с exactly-once source revision. Generation/snapshot
 не становятся идентичностью результата.
+
+## 36. Выпуск плана и stable future supply R7 (10.09.2026)
+
+Принят единственный current-контур выпуска: `ProductionPlanExecutionFact` и
+сохранённые `ProductionPlanLine.accepted_output_qty/remaining_output_qty`.
+Generation allocation rows остаются только provenance/audit. Specification
+rebase сохраняет исходную матрицу и уже принятый выпуск, закрывает старый MRP
+и создаёт один successor на remaining basis; повтор команды не создаёт второй
+successor, а foreign retained plan/run не становится частью replacement.
+
+Future supply разделён на immutable generation capture и compact current read.
+`current_identity` exact evidence строится из stable order/proposal identity,
+`is_current` переключается только при принятии truth pointer; BUILDING rows и
+исторические копии не видны текущему GET. Semantic specification hash
+нормализует Decimal/order/display noise: equivalent import — no-op, genuine
+change — одна revision/rebase request. Предметные формулы остаются в
+канонических модулях, этот журнал фиксирует только решение о владельце и
+границе публикации.

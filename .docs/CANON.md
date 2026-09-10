@@ -80,6 +80,8 @@ PRODPLAN состоит из четырёх последовательно св�
 | Живая область планов и привязка run к поколению | `backend/app/services/item_ledger/live_plan_scope.py`; обход sealed-цепочки существует только здесь |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
 | Очередь сборки, комплектность и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/assembly_readiness_persistence.py`, `drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
+| Накопленный выпуск плана и future supply | `assembly_output_persistence.py` сохраняет stable `ProductionPlanExecutionFact` и `ProductionPlanLine.accepted_output_qty/remaining_output_qty`; `future_supply_capture.py` сохраняет generation evidence, а `is_current/current_identity` — единственная compact current projection после принятия pointer |
+| Семантическая идентичность спецификации | `specification_revision.py` canonicalizes numeric/order/display noise; `SpecificationRevision.content_hash` — единственная граница rebase, эквивалентный импорт идемпотентен |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
 | Read-model | `PlanningReadSnapshot` и специализированные `*_snapshot.py`; публичный GET не пересчитывает и не обновляет снимок |
 | Frontend | OpenAPI + `src/services`; UI только отображает read-model |
@@ -149,6 +151,31 @@ MRP-заказа является подвижной проекцией: obligat
 Динамическое удержание старшего резерва для экранирования S0 также меняется
 только принятым назначенным расходом. Это проекция Ledger, а не изменение
 `reserved_qty`, покрытия на cutoff или исходной потребности пополнения (§16).
+
+## R7. Стабильный выпуск плана и future supply
+
+Накопленный выпуск является бизнес-состоянием строки плана: accepted output и
+remaining output сохраняются, а `ProductionPlanExecutionFact` имеет stable
+идентичность `(stock_ledger_entry_id, plan_line_id)`. Generation-scoped
+`AssemblyOutputAllocation` — только provenance/audit распределения; GET не
+пересчитывает выпуск и не выводит его из статуса заказа. Чистый выпуск
+документа берётся только из `document_net_output.py`, затем применяется
+адресный матч и детерминированный FIFO через `assembly_output_core.py`.
+
+`LedgerFutureSupply` хранит immutable capture под generation для воспроизводимой
+истории, но текущий читатель использует только rows с `is_current=true`,
+переключённых атомарно вместе с accepted `PlanningTruthState` pointer. Каждая
+exact строка обязана иметь `current_identity` из `(supply_kind, source_ref,
+source_line_ref, source_local_id)`; generation и `source_content_hash` не
+заменяют бизнес-идентичность. BUILDING capture остаётся невидимым до
+publication; старые rows не выбираются current read.
+
+Specification rebase закрывает прежний MRP и создаёт successor только на
+сохранённый remaining basis; исходная матрица и уже принятый выпуск не
+копируются/не засчитываются повторно. Канонизация revision hash отбрасывает
+транспортный порядок, формат Decimal и display noise; настоящий semantic
+change создаёт ровно одну новую revision/rebase request, повтор идентичного
+импорта — no-op. Формулы и предметные решения остаются в decisions log.
 
 ## Запрещено
 
