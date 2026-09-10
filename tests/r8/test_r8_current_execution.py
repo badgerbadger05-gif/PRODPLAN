@@ -262,9 +262,9 @@ def test_r8_scope_pointer_drift_fails_closed_even_when_manifest_is_ready(db_sess
         entity_kind="assembly_queue",
         scope_key="assembly:all-live-plans",
     )
-    manifest.content_hash = "0" * 64
+    manifest.source_generation_id = 999999
     db_session.flush()
-    with pytest.raises(CurrentExecutionUnavailable, match="drift"):
+    with pytest.raises(CurrentExecutionUnavailable, match="stale"):
         require_current_execution_scope(
             db_session,
             entity_kind="assembly_queue",
