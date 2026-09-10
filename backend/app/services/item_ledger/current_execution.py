@@ -96,6 +96,7 @@ def publish_current_execution_scope(
     source_generation_id: int | None = None,
     result_ready: bool = True,
     complete_scope: bool = True,
+    entity_kinds: Iterable[str] | None = None,
 ) -> CurrentExecutionPublishResult:
     """Publish one complete current scope with stable IDs and no-op semantics."""
 
@@ -109,6 +110,9 @@ def publish_current_execution_scope(
         raise CurrentExecutionUnavailable("execution result is not ready")
     _source_generation(db, source_generation_id)
 
+    expected_kinds = {
+        str(value).strip() for value in (entity_kinds or ()) if str(value).strip()
+    }
     incoming: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any], str]] = {}
     for raw in rows:
         row = dict(raw)
@@ -117,6 +121,8 @@ def publish_current_execution_scope(
         row_scope = str(row.get("scope_key") or scope).strip()
         if not entity_kind or not identity:
             raise CurrentExecutionUnavailable("current execution row lacks stable identity")
+        if expected_kinds and entity_kind not in expected_kinds:
+            raise CurrentExecutionUnavailable("current execution row has unexpected entity kind")
         if row_scope != scope:
             raise CurrentExecutionUnavailable("current execution row is outside complete scope")
         payload, manual = _semantic_payload(row)
@@ -125,12 +131,17 @@ def publish_current_execution_scope(
             raise CurrentExecutionUnavailable(f"duplicate current execution identity {entity_kind}:{identity}")
         incoming[key] = (payload, manual, _hash({"payload": payload, "manual_input": manual}))
 
-    entity_kinds = {kind for kind, _identity in incoming}
+    actual_kinds = {kind for kind, _identity in incoming}
+    if not expected_kinds:
+        expected_kinds = set(actual_kinds)
+    if not expected_kinds:
+        raise CurrentExecutionUnavailable("empty complete scope requires explicit entity kinds")
     existing_query = db.query(models.CurrentExecutionRow).filter(
         models.CurrentExecutionRow.scope_key == scope,
     )
-    if entity_kinds:
-        existing_query = existing_query.filter(models.CurrentExecutionRow.entity_kind.in_(sorted(entity_kinds)))
+    existing_query = existing_query.filter(
+        models.CurrentExecutionRow.entity_kind.in_(sorted(expected_kinds))
+    )
     existing = existing_query.with_for_update().all()
     existing_by_key = {(str(row.entity_kind), str(row.business_identity)): row for row in existing}
 
@@ -280,6 +291,7 @@ def publish_current_execution_from_generation(
         source_generation_id=int(generation.id),
         scope_key="assembly:all-live-plans",
         rows=queue_payload,
+        entity_kinds=("assembly_queue",),
     )
 
     readiness_payload = []
@@ -322,6 +334,7 @@ def publish_current_execution_from_generation(
         source_generation_id=int(generation.id),
         scope_key="assembly:all-live-plans",
         rows=readiness_payload,
+        entity_kinds=("assembly_readiness",),
     )
 
     drum_result = CurrentExecutionPublishResult(0, 0, True)
@@ -342,12 +355,105 @@ def publish_current_execution_from_generation(
                 "metrics": dict(schedule.metrics or {}),
             },
         }]
+        prior_manual = {
+            str(row.business_identity): dict(row.manual_input or {})
+            for row in db.query(models.CurrentExecutionRow).filter(
+                models.CurrentExecutionRow.entity_kind == "drum_slot",
+                models.CurrentExecutionRow.result_status == "accepted",
+            ).all()
+            if row.manual_input
+        }
+        for slot in db.query(models.DrumSlot).filter(
+            models.DrumSlot.drum_schedule_id == int(schedule.id),
+        ).order_by(
+            models.DrumSlot.slot_date.asc(),
+            models.DrumSlot.resource_id.asc(),
+            models.DrumSlot.slot_ordinal.asc(),
+            models.DrumSlot.id.asc(),
+        ).all():
+            identity = f"slot:{int(slot.assembly_queue_line_id)}:{int(slot.slot_ordinal)}"
+            manual = prior_manual.get(identity)
+            payload = {
+                "queue_line_id": int(slot.assembly_queue_line_id),
+                "plan_id": int(slot.plan_id),
+                "plan_line_id": int(slot.plan_line_id),
+                "item_id": int(slot.item_id),
+                "resource_id": int(slot.resource_id),
+                "slot_date": slot.slot_date.isoformat(),
+                "auto_slot_date": slot.auto_slot_date.isoformat() if slot.auto_slot_date else None,
+                "slot_qty": str(slot.slot_qty),
+                "capacity_load": str(slot.capacity_load) if slot.capacity_load is not None else None,
+                "slot_ordinal": int(slot.slot_ordinal),
+                "readiness_phase": str(slot.readiness_phase),
+                "readiness_date": slot.readiness_date.isoformat() if slot.readiness_date else None,
+                "readiness_curve": list(slot.readiness_curve or []),
+                "action_manifest": list(slot.action_manifest or []),
+                "unavailable_reasons": list(slot.unavailable_reasons or []),
+                "blocking_manifest": list(slot.blocking_manifest or []),
+                "original_priority": list(slot.original_priority or []),
+            }
+            if manual:
+                if manual.get("slot_date"):
+                    payload["slot_date"] = str(manual["slot_date"])
+                if manual.get("resource_id") is not None:
+                    payload["resource_id"] = int(manual["resource_id"])
+            drum_rows.append({
+                "entity_kind": "drum_slot",
+                "business_identity": identity,
+                "scope_key": "drum:all-live-plans",
+                "payload": payload,
+                **({"manual_input": manual} if manual else {}),
+            })
+        for gap in db.query(models.DrumCapacityGap).filter(
+            models.DrumCapacityGap.drum_schedule_id == int(schedule.id),
+        ).order_by(
+            models.DrumCapacityGap.gap_date.asc(),
+            models.DrumCapacityGap.resource_id.asc(),
+            models.DrumCapacityGap.id.asc(),
+        ).all():
+            identity = (
+                f"gap:{int(gap.assembly_queue_line_id)}:"
+                f"{gap.gap_date.isoformat()}"
+            )
+            drum_rows.append({
+                "entity_kind": "drum_gap",
+                "business_identity": identity,
+                "scope_key": "drum:all-live-plans",
+                "payload": {
+                    "queue_line_id": int(gap.assembly_queue_line_id),
+                    "plan_id": int(gap.plan_id),
+                    "plan_line_id": int(gap.plan_line_id),
+                    "item_id": int(gap.item_id),
+                    "resource_id": int(gap.resource_id),
+                    "gap_date": gap.gap_date.isoformat(),
+                    "required_qty": str(gap.required_qty),
+                    "available_capacity": str(gap.available_capacity),
+                    "gap_qty": str(gap.gap_qty),
+                    "readiness_phase": str(gap.readiness_phase),
+                    "readiness_date": gap.readiness_date.isoformat() if gap.readiness_date else None,
+                    "readiness_curve": list(gap.readiness_curve or []),
+                    "action_manifest": list(gap.action_manifest or []),
+                    "unavailable_reasons": list(gap.unavailable_reasons or []),
+                    "blocking_manifest": list(gap.blocking_manifest or []),
+                    "original_priority": list(gap.original_priority or []),
+                },
+            })
         drum_result = publish_current_execution_scope(
             db,
             source_revision=revision,
             source_generation_id=int(generation.id),
             scope_key="drum:all-live-plans",
             rows=drum_rows,
+            entity_kinds=("drum_schedule", "drum_slot", "drum_gap"),
+        )
+    else:
+        drum_result = publish_current_execution_scope(
+            db,
+            source_revision=revision,
+            source_generation_id=int(generation.id),
+            scope_key="drum:all-live-plans",
+            rows=[],
+            entity_kinds=("drum_schedule", "drum_slot", "drum_gap"),
         )
 
     shelf_result = CurrentExecutionPublishResult(0, 0, True)
@@ -385,6 +491,7 @@ def publish_current_execution_from_generation(
         source_generation_id=int(generation.id),
         scope_key="shelf:all-live-mrps",
         rows=shelf_rows,
+        entity_kinds=("shelf_projection",),
     )
     return {
         "assembly_queue": queue_result,
