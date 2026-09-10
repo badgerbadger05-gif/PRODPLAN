@@ -86,8 +86,8 @@ pytest -q tests/contracts/test_r1_semantic_contract.py tests/test_canon_invarian
 
 Остаточные риски: backdate требует доказать минимальный incremental scope в
 R5; schema/persistence пока generation-bound; API/UI ещё не передают новый
-`history_mode`; миграция и PostgreSQL concurrency не проверялись. Эти риски не
-разрешают объявлять R2–R11 выполненными.
+`history_mode`; persistence и downstream API/UI migration ещё не проверялись.
+Эти риски не разрешают объявлять R3–R11 выполненными.
 
 ## R2 evidence
 
