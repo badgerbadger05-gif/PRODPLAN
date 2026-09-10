@@ -101,6 +101,24 @@ def test_real_defects_are_never_treated_as_emptiness(message):
     assert pg_rebuild_check.classify_verify_failure(message) is None
 
 
+def test_local_existing_server_can_use_wsl_psql_transport(monkeypatch):
+    target = pg_rebuild_check.Target(
+        host="127.0.0.1",
+        port=55441,
+        user="r2_user",
+        password="r2_local_only",
+        database="prodplan_r2",
+    )
+    monkeypatch.setattr(pg_rebuild_check.shutil, "which", lambda name: None)
+    monkeypatch.setattr(pg_rebuild_check, "_docker_available", lambda: False)
+    monkeypatch.setattr(pg_rebuild_check, "_wsl_available", lambda: True)
+    client = pg_rebuild_check.Psql(target, image="postgres:15", binary=None, container=None)
+    command = client._command([], target.database)
+    assert command[:5] == ["wsl.exe", "-d", "Ubuntu", "--", "env"]
+    assert "psql" in command
+    assert "-p" in command and "55441" in command
+
+
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
 def test_ledger_rebuild_sql_executes_on_postgresql():
     """Smoke rehearsal: migrations round trip, clear COMMITs, verifier runs."""
