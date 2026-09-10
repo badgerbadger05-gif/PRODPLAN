@@ -23,6 +23,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    LedgerGeneration,
     PlanningTruthState,
     StockBin,
     StockWarehouse,
@@ -132,11 +133,6 @@ def planning_stock_by_item(
         int(generation_id)
         for (generation_id,) in db.query(StockBin.ledger_generation_id)
         .filter(StockBin.is_current.is_(True))
-        .filter(
-            StockBin.item_id.in_(sorted(item_ids))
-            if item_ids is not None
-            else True
-        )
         .distinct()
         .all()
     }
@@ -161,6 +157,11 @@ def historical_stock_by_item(
     """
     if item_ids is not None and not item_ids:
         return {}
+    generation = db.get(LedgerGeneration, int(ledger_generation_id))
+    if generation is None or str(generation.status) not in {"building", "accepted"}:
+        raise ValueError(
+            "historical StockBin provenance requires an existing building or accepted generation"
+        )
     scope = planning_warehouse_scope(db)
     query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
         StockBin.ledger_generation_id == int(ledger_generation_id)
