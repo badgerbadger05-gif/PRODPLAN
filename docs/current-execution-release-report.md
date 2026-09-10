@@ -461,6 +461,8 @@ mixed exact/FIFO provenance и явный over-return result. Production persist
 * `066f5e0e` — test-first PostgreSQL/current integration: persisted correction
   audit, exactly-once retry и out-of-order supersession с одной active version.
 * `45acb52c` — test-first mixed addressed provenance и over-return surplus.
+* `f37565ba` — test-first isolation: PostgreSQL replay fixture retires its
+  synthetic facts and asserts no active rows remain for later rebuild rehearsal.
 * `07e471b2` — implementation: signed replay/current-writer integration,
   `known_at`, correction audit reason/basis IDs и migrations `20260910_06`,
   `20260910_07` (`mixed` match rule).
@@ -507,22 +509,34 @@ PASS round-trip head -> 20260726_14 -> head
 PASS verify smoke: executable; known-empty failure; summary projection executable
 ```
 
-Финальный полный gate с implementation commit `07e471b2`:
+Финальный последовательный gate с implementation `07e471b2` и fixture-isolation
+commit `f37565ba` на чистом local WSL PostgreSQL contour `127.0.0.1:55444`:
 
 ```text
-$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL='postgresql://r2_user:r2_local_only@127.0.0.1:55443/prodplan_r2'
-$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55442/prodplan_r2'
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
 pytest -q
-1987 passed, 35 warnings in 205.07s (0:03:25)
+1987 passed, 35 warnings in 201.29s (0:03:21)
+```
+
+Последовательная проверка изоляции на том же DSN также прошла:
+
+```text
+pytest -q tests/r5/test_r5_current_replay_integration.py
+3 passed in 0.86s
+python tools/pg_rebuild_check.py --dsn $env:PRODPLAN_PG_CHECK_DSN --stages migrate,round-trip,verify
+PASS migrate 20260910_07 (head)
+PASS round-trip head -> 20260726_14 -> head
+PASS verify smoke: executable; known-empty failure; summary projection executable
 ```
 
 ### Removed paths and residual risks
 
 Удалённые пути: **нет**. `current-execution-full-pytest.log` — чужой untracked
 файл, сохранён без изменений. Для финального full gate использованы два
-изолированных локальных WSL PostgreSQL 16.15 cluster: `r5integration` (55443)
-для integration tests и `r5gate` (55442) для чистого migration round-trip;
-production/SSH/OData/live 1С/workers/deploy/push не использовались.
+локального WSL PostgreSQL 16.15 cluster `55444`; R5 integration fixture
+retire-ит synthetic facts перед завершением теста, поэтому последующий R3
+migration round-trip не получает ложных active duplicate identities.
+Production/SSH/OData/live 1С/workers/deploy/push не использовались.
 
 Остаточные риски: API/UI не получили новый history-mode route в R5 и продолжают
 использовать существующий current read contract; production contour не
