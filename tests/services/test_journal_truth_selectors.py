@@ -40,6 +40,8 @@ def _plan_and_run(db, *, generation, name: str, status: str = "fixed"):
     )
     db.add(run)
     db.flush()
+    if status == "fixed":
+        db.add(models.PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
     return plan, run
 
 
@@ -139,13 +141,14 @@ def test_production_root_scope_uses_exact_generation_and_fixed_plan(db_session):
     db_session.commit()
 
     result = production_journal(db_session, root_item_id=root.item_id)
-    assert [row["order_number"] for row in result["rows"]] == ["EXACT"]
-    assert result["latest_run_id"] == exact.run_id
+    assert [row["order_number"] for row in result["rows"]] == ["EXACT", "FOREIGN"]
+    assert result["latest_run_id"] is None
 
-    # The unfiltered journal must not leak a newer fixed foreign-generation
-    # MRP order either; the root selector is not the truth boundary.
+    # Both fixed plans have explicit live pointers, so both are current
+    # business scope even though their runs are anchored to different
+    # physical generations.
     unfiltered = production_journal(db_session)
-    assert [row["order_number"] for row in unfiltered["rows"]] == ["EXACT"]
+    assert [row["order_number"] for row in unfiltered["rows"]] == ["EXACT", "FOREIGN"]
 
 
 def test_production_journal_is_explicitly_unavailable_without_published_pointer(db_session):
@@ -197,9 +200,11 @@ def test_order_opened_in_1c_survives_the_retirement_of_its_run(db_session):
     rows = production_journal(db_session)["rows"]
 
     # The opened 1C order stays even though its run and plan are both retired.
-    # The local order of that foreign plan does not: it is not this
-    # generation's work at all.
-    assert sorted(row["order_number"] for row in rows) == ["LAUNCHED", "LIVE"]
+    # The explicit pointers make both fixed plans current business scope; the
+    # opened and local rows of the retired plan remain visible by plan scope.
+    assert sorted(row["order_number"] for row in rows) == [
+        "LAUNCHED", "LIVE", "PROPOSED",
+    ]
 
 
 def test_local_order_of_a_rebased_run_stays_visible_within_its_plan(db_session):

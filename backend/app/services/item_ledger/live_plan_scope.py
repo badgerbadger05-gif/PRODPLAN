@@ -124,18 +124,19 @@ def current_live_run_ids(
     available for historical generation rebuilds and publication manifests,
     where sealed generation scope is the intended semantic.
     """
-    query = db.query(models.PlanningLivePointer).filter(
-        models.PlanningLivePointer.status == "active"
-    )
-    if plan_ids is not None:
+    if plan_ids is None:
+        normalized = tuple(
+            int(value)
+            for (value,) in db.query(models.ProductionPlanHeader.id)
+            .filter(models.ProductionPlanHeader.status == "fixed")
+            .order_by(models.ProductionPlanHeader.id.asc())
+            .all()
+        )
+    else:
         normalized = tuple(sorted({int(value) for value in plan_ids}))
-        query = query.filter(models.PlanningLivePointer.plan_id.in_(normalized or (-1,)))
     run_ids = []
-    for pointer in query.order_by(models.PlanningLivePointer.plan_id.asc()).all():
-        try:
-            run_ids.append(int(current_live_run(db, int(pointer.plan_id)).run_id))
-        except CurrentMrpResolutionError:
-            raise
+    for plan_id in normalized:
+        run_ids.append(int(current_live_run(db, int(plan_id)).run_id))
     return tuple(run_ids)
 
 

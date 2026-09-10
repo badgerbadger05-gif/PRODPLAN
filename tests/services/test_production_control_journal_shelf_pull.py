@@ -70,6 +70,7 @@ def _scope(db, *, key: str, optimal_batch: str = "4", remaining: str = "8"):
     )
     db.add(run)
     db.flush()
+    db.add(models.PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
     requirement = models.MrpRequirement(
         run_id=run.run_id,
         item_id=item.item_id,

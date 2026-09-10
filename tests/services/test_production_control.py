@@ -20,6 +20,7 @@ from app.models import (
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
+    PlanningLivePointer,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionMaterialIssue,
@@ -229,6 +230,7 @@ def _journal_mrp_run(db_session, *, period_from=None, period_to=None):
     )
     db_session.add(run)
     db_session.flush()
+    db_session.add(PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
     return run
 
 
@@ -1170,6 +1172,10 @@ def test_journal_root_filter_uses_all_active_plan_snapshot_scopes(db_session):
     closed_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=closed_plan.id, ledger_generation_id=current_generation_id)
     db_session.add_all([old_run, latest_run_a, latest_run_b, closed_run])
     db_session.flush()
+    db_session.add_all([
+        PlanningLivePointer(plan_id=plan_a.id, run_id=latest_run_a.run_id),
+        PlanningLivePointer(plan_id=plan_b.id, run_id=latest_run_b.run_id),
+    ])
 
     for run, number in [
         (old_run, "OLD-RUN"),
