@@ -817,6 +817,8 @@ Implementation/fix commits:
 * `bb324555` — fixed transfer-custody invalidation revision propagation.
 * `40f228c3` — persisted `drum_excluded` current rows and current GET mapping;
   exclusions remain part of the supported DrumSchedule response.
+* `e2a8b2cf` — correction evidence: actual generation publisher creates and
+  republishes excluded rows; calendar contract names the out-of-band unsafe gap.
 
 Relevant implementation is in
 `backend/app/services/item_ledger/current_execution.py`,
@@ -840,6 +842,12 @@ pytest -q tests/routers/test_assembly_queue_router.py::test_current_drum_get_sor
 
 pytest -q tests/r8/test_r8_invalidation_wiring.py::test_r8_reference_writers_are_idempotent_before_invalidating_on_real_change
 1 failed — semantic no-op reference writes invalidated readiness
+
+pytest -q tests/routers/test_assembly_queue_router.py::test_current_drum_get_returns_persisted_excluded_rows
+1 failed — current GET returned an empty excluded list before persisted promotion
+
+pytest -q tests/r8/test_r8_invalidation_wiring.py::test_r8_calendar_contract_names_missing_writer_as_explicit_unsafe_gap
+1 failed — contract still described automatic fail-closed behavior for an absent writer
 ```
 
 Focused current/canon/custody/affected gate with the local DSN:
@@ -848,6 +856,14 @@ Focused current/canon/custody/affected gate with the local DSN:
 $env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
 pytest -q tests/r8 tests/routers/test_assembly_queue_router.py tests/test_canon_invariants.py tests/test_openapi_contract_sync.py tests/test_ledger_rebuild_operations.py tests/services/test_production_material_custody_projection.py tests/services/test_one_c_posted_transfer_sync.py
 116 passed in 22.65s
+
+Final R8 focused/canon route gate after excluded-row correction:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
+pytest -q tests/r8 tests/routers/test_assembly_queue_router.py tests/test_canon_invariants.py tests/test_openapi_contract_sync.py
+76 passed in 13.53s
+```
 ```
 
 Migration and seeded round-trip/verify:
@@ -866,7 +882,7 @@ PASS verify ... summary projection executable
 
 ```text
 pytest -q
-2038 passed, 35 warnings in 216.65s (0:03:36)
+2040 passed, 35 warnings in 216.14s (0:03:36)
 ```
 
 Skip отсутствуют. Удалённые пути: **нет**. Production/SSH/OData/live 1С,
