@@ -300,3 +300,38 @@ def test_r8_manifest_without_accepted_generation_provenance_is_stale(db_session,
             entity_kind="assembly_queue",
             scope_key="assembly:all-live-plans",
         )
+
+
+def test_r8_truth_pointer_move_without_atomic_scope_publication_is_stale(db_session, building_ledger_generation):
+    generation = building_ledger_generation
+    generation.status = "accepted"
+    generation.cutoff = generation.physical_import_batch.cutoff
+    generation.accepted_at = generation.cutoff
+    db_session.flush()
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        rows=[_queue("queue:1", period="2026-09-10", plan_id=1, line_id=1)],
+        entity_kinds=("assembly_queue",),
+    )
+    replacement = models.LedgerGeneration(
+        generation_key="r8-unpublished-pointer-target",
+        status="accepted",
+        cutoff=generation.cutoff,
+        accepted_at=generation.accepted_at,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch_id=generation.physical_import_batch_id,
+        algorithm_version="tests/r8",
+    )
+    db_session.add(replacement)
+    db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(replacement.id)
+    with pytest.raises(CurrentExecutionUnavailable, match="stale"):
+        require_current_execution_scope(
+            db_session,
+            entity_kind="assembly_queue",
+            scope_key="assembly:all-live-plans",
+        )
