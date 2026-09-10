@@ -152,6 +152,26 @@ GET, открытие страницы, фильтрация и экспорт �
 9. Количества назначений используют точный `Decimal(15,3)` контракт; округление
    и замена неизвестного значения нулём запрещены.
 
+## R6. Компактная физика и custody
+
+Текущий `StockBin` — одна строка на полный physical key
+`(item, characteristic, organization, warehouse)`. `ledger_generation_id`
+обязателен только как provenance принятого Ledger; `is_current` отделяет
+подготовленный BUILDING candidate от принятого результата. Candidate не виден
+другой сессии до acceptance commit, а superseded current rows удаляются при
+публикации. Отрицательный on-hand сохраняется; свободный S0 не может получить
+его как положительный ресурс.
+
+Custody остаётся event-sourced: события неизменяемы, baseline задаёт
+минимальную доказанную точку rewind, а compact current projection публикуется
+отдельно после успешной проверки candidate. Позднее событие за всеми
+восстановимыми baseline даёт `unavailable`; удаление baseline или projection
+допустимо только если остаётся доказуемый путь воспроизведения. Отсутствующий
+или рассогласованный current marker не заменяется старым поколением.
+Локальные `issue_created`/`terminal_release` writers сначала блокируют
+единственный `PlanningTruthState` marker, затем получают event id и обновляют
+projection; перескок через unseen physical/backdated event запрещён.
+
 ## Транзакционное текущее пополнение (R4)
 
 Текущая supplier-receipt replenishment assignment является одной

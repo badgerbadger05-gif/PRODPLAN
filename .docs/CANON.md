@@ -66,14 +66,14 @@ PRODPLAN состоит из четырёх последовательно св�
 | Домен | Канонический владелец |
 |---|---|
 | Физический Ledger | `backend/app/services/item_ledger/ingest.py`, `physical.py`, `physical_visibility.py` |
-| Остаток принятого поколения | `backend/app/services/item_ledger/physical_visibility.py` |
+| Остаток принятого поколения | compact current `StockBin` по полному physical key, построенный только из принятого Item Ledger; `ledger_generation_id` — обязательный provenance, не current identity |
 | Формулы резерва и выполнения | `backend/app/services/item_ledger/reservation.py` |
 | События и fold резервов | `backend/app/services/item_ledger/reservation_ledger.py` |
 | Чистый выпуск документа сборки (`max(sum(assembly_in) - sum(assembly_out), 0)` в пределах одного документа) | `backend/app/services/item_ledger/document_net_output.py`; читатели — реплей пополнения и аллокация выпуска плана, собственного отбора фактов у них нет |
 | Атрибуция фактов (пополнение: точный живой резерв первым, излишек и безадресные факты FIFO; расход: адресное удержание первым, иначе FIFO; агрегированная закупка и возвраты по §§14–15) | `backend/app/services/item_ledger/historical_replay_core.py`, `historical_replay_persistence.py`, `supplier_receipt_allocation.py` |
 | Выпуск производственной строки (`produced`, `remaining`) | `backend/app/services/production_output_truth.py`; `remaining_qty` в таблице — только compatibility cache и никогда не читается как факт |
 | Обеспеченность производственной строки материалами | чистый расчёт `production_control_material_availability.py`, сохранённый только внутри generation-scoped `production_control_journal_snapshot.py`; operational `ProductionOrderLineState` не владеет coverage |
-| Custody материалов производства | generation-scoped `production_material_custody_projection.py`; live fold текущих документов и статусов не является источником чтения или fallback |
+| Custody материалов производства | append-only `ProductionMaterialCustodyEvent` + явные rewind baselines и compact `ProductionMaterialCustodyProjection.is_current`; live fold статусов не является источником чтения или fallback |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py`; пул строится ОДИН раз, базис — исторический SLE-баланс, net после заморозки неизменяем; единственная точка расширения пулов — `pool_key_for` |
 | Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
 | Единая спецификация сборки: узлы и комплектовки со складов | контракт `unified-assembly-specification.md` (§26); развёртка — существующие `backend/app/services/mrp_freeze.py`, `planning_service.py`, `bom_specification_resolver.py`, без второго движка |

@@ -741,6 +741,23 @@ Typed current adapter принимает только persisted supplier provena
 scope — полный accepted physical prefix, а default source revision — его
 `physical_import_batch_id`.
 
+## R6. Компактная физика и custody (10.09.2026)
+
+`StockBin` — compact current projection единственного Item Ledger writer по
+полному ключу item/characteristic/organization/warehouse. BUILDING fold
+сохраняется как staged candidate с provenance, но не переключает current
+чтение; promotion выполняется только внутри acceptance-транзакции и удаляет
+superseded current rows. Migration не угадывает newest generation: при
+неоднозначном историческом дубликате требуется явный accepted
+`PlanningTruthState.current_generation_id`, иначе она останавливается.
+
+Custody владеет один event/baseline/current projection контур. Current marker
+переключается после успешной проверки candidate; события и минимальная
+восстановимая baseline остаются provenance. Receipt allocation не освобождает
+S0 hold, а только назначенный `material_consumption` физический расход может
+его уменьшить. Missing/stale/ambiguous marker и позднее событие за последней
+восстановимой baseline закрывают чтение (`unavailable`), без legacy fallback.
+
 ## 35. Исправления, возвраты и backdate R5 (10.09.2026)
 
 R5 не создаёт второй FIFO/quantity owner: current publication повторно

@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальные волны R1–R5. Продовые БД, SSH,
+Дата среза: 2026-09-10. Область: локальные волны R1–R6. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 ## Сводка волн
@@ -12,7 +12,7 @@ OData, боевые workers, deploy и push не использовались.
 | R3 — устойчивые идентичности и принятие физики | принято локально | runtime writers, completeness/publish guards, live-MRP pointer, successor/frozen provenance и migration mapping проверены; focused PG и full gate зелёные |
 | R4 — транзакционные основания и текущее исполнение | принято локально | current writer, typed provenance, role separation, rebuild closure, PG atomicity и полный gate зелёные |
 | R5 — исправления, отмены и backdate | принято локально | signed replay, explicit history mode, mixed provenance, correction audit, migration and full local gate зелёные |
-| R6 — физический Ledger и custody | не начато | только контрактные границы R1 |
+| R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
 | R7 — выпуск плана, MRP и будущие поставки | не начато | только зафиксированы границы successor MRP |
 | R8 — барабан, полки и мехцех | не начато | только owner/identity contract |
 | R9 — API, UI и обменные ссылки | не начато | UI/backend migration не выполнялась |
@@ -20,7 +20,7 @@ OData, боевые workers, deploy и push не использовались.
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R5 приняты локально; R6–R11 намеренно не продвигаются.
+волны. R1–R6 приняты локально; R7–R11 намеренно не продвигаются.
 
 ## R1 evidence
 
@@ -543,3 +543,116 @@ Production/SSH/OData/live 1С/workers/deploy/push не использовали�
 проверялся. Основной orchestrator contour 55441 ранее содержал накопленные
 integration rows, поэтому rebuild round-trip был доказан на отдельном named
 local contour, без очистки или остановки orchestrator DB.
+
+## R6 evidence — локальная приёмка
+
+R6 имеет статус `принято локально` после focused R6/canon/PG gate, migration
+round-trip и полного pytest на локальном WSL PostgreSQL 16.15. Реализованы
+компактный физический `StockBin` (одна current-строка на полный physical key),
+явная accepted-publication boundary, role-separated custody/holds и strict
+compact current custody reader. `LedgerGeneration.id` остаётся обязательной
+provenance, но не является current identity. GET/read paths только читают
+сохранённые current/accepted projection и не запускают rebuild.
+
+### Commits, files and fixtures
+
+* `481f5412` — test-first red gate: physical fold, negative stock, receipt vs
+  assigned consumption, transfer/return/organization and custody baseline.
+* `e12579b6` — расширенный R6 gate: MVCC publication boundary, current-reader
+  no-generation-fallback, late custody baseline, foreign organization.
+* `30c1ec12` — implementation: `StockBin.is_current`, migrations
+  `20260910_08`/`20260910_09`, candidate/publication writer split, compact
+  custody projection, physical writer flags and R6 PostgreSQL test.
+* `a012b4f3` — accepted-generation source scope, role-aware material hold and
+  custody compatibility correction.
+* `eb98e580` — test-first correction gate: stale/mixed current provenance,
+  explicit allocation default and no-rebuild compact custody reader.
+* `27e6f38f` — implementation: `load_compact_current_material_custody`,
+  fail-closed `StockBin` provenance, explicit material allocation default and
+  historical freeze scope.
+* `2a1fbfa7` — separate historical/building StockBin reader for explicit
+  candidate/pinned reads; current readers remain pointer-bound.
+* `25ea9914` — global compact-provenance validation and generation/status guard
+  for historical reads.
+* `52339341` — test-first rewind-baseline retention regression through an
+  intermediate accepted projection.
+* `ff42ae55` — test-first local post-cutoff custody tail publication regression.
+* `0e3b14d7` — implementation of bounded custody baselines, local compact tail
+  publication and strict event watermark handling.
+* `b9454665` — test-first fail-closed regression for an unseen physical event
+  before a later local custody event.
+* `45928f50` — test-first real two-session PostgreSQL marker-lock regression.
+* `bde23bed` — implementation of pre-INSERT marker serialization, monotonic
+  custody watermark and row locking.
+* `c04f80e6` — test-first compact StockBin publication regression (old current,
+  stale key and active BUILDING staging).
+* `7270bb8a` — test-first custody history-compaction regression.
+* `d2fd3918` — test-first migration case for a BUILDING-only new physical key.
+* `0a8b03e0` — implementation of compact accepted StockBin/custody migration
+  pruning and publication cleanup.
+
+Relevant files: `backend/app/models.py`, `backend/app/services/item_ledger/
+{physical.py,ingest.py,generation_lifecycle.py}`,
+`backend/app/services/{mrp_stock_helpers.py,mrp_freeze.py,
+production_material_custody_projection.py,release_feasibility.py}`,
+`backend/alembic/versions/20260910_08_r6_compact_stock_bin.py`,
+`20260910_09_r6_compact_custody.py`, `tests/r6/`, and affected historical
+reader tests. No second stock or custody quantity owner was introduced.
+
+### Commands and results
+
+Красный test-first прогон:
+
+```text
+pytest -q tests/r6/test_r6_physical_custody_contract.py
+ERROR during collection: ModuleNotFoundError: app.services.item_ledger.current_physical
+```
+
+Красный correction gate (`eb98e580`):
+
+```text
+pytest -q tests/r6/test_r6_physical_custody_contract.py tests/services/test_release_feasibility.py::test_material_custody_is_not_free_for_a_new_release
+4 failed, 6 passed — stale provenance, allocation default and compact loader were not implemented
+```
+
+Focused R6/affected gate after final implementation:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
+pytest -q tests/r6 tests/r2/test_r2_local_contract.py tests/test_canon_invariants.py tests/services/test_generation_lifecycle.py::test_stock_bin_publication_removes_old_accepted_copy_and_keeps_building_stage tests/services/test_production_material_custody_projection.py tests/services/test_item_ledger_position_generation_truth.py tests/services/test_production_control_journal_snapshot.py::test_work_item_materials_remain_readable_from_the_published_row_generation tests/services/test_release_feasibility.py::test_material_custody_is_not_free_for_a_new_release
+94 passed in 11.69s
+```
+
+Focused PG/canon gate:
+
+```text
+$env:PRODPLAN_R2_TEST_DSN=$env:PRODPLAN_TEST_PG_URL=$env:PRODPLAN_PG_CHECK_DSN='postgresql://r2_user:r2_local_only@127.0.0.1:55444/prodplan_r2'
+pytest -q tests/r6/test_r6_postgres_integration.py tests/r2/test_r2_local_contract.py tests/test_canon_invariants.py
+42 passed in 7.18s
+```
+
+Migration/round-trip/verify:
+
+```text
+python tools/pg_rebuild_check.py --dsn $env:PRODPLAN_PG_CHECK_DSN --stages migrate,round-trip,verify
+PASS migrate 20260910_09 (head)
+PASS round-trip head -> 20260726_14 -> head
+PASS verify; overall: PASS (smoke mode)
+```
+
+Финальный full pytest на DSN `127.0.0.1:55444` после implementation:
+
+```text
+2004 passed, 35 warnings in 204.26s (0:03:24)
+```
+
+Удалённые пути: **нет**. `current-execution-full-pytest.log` — чужой untracked
+файл, сохранён без изменений. Production/SSH/OData/live 1С/боевые workers/
+deploy/push не использовались.
+
+Остаточные риски: accepted/failed StockBin и custody copies удаляются при
+migration/promotion; active BUILDING rows и explicit custody rewind baselines
+остаются bounded staging/provenance. Локальные issue/terminal custody events
+сериализуются до INSERT через planning-truth marker; physical/backdated gaps
+fail closed до следующей accepted publication. Live/prod contour намеренно не
+проверялся. R7–R11 не начинались.
