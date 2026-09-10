@@ -14,8 +14,10 @@ from sqlalchemy.orm import sessionmaker
 from app import models
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
+    load_current_execution_rows,
     load_current_execution_coherent,
     publish_current_execution_scope,
+    require_current_execution_scope,
 )
 
 
@@ -134,3 +136,82 @@ def test_empty_scope_is_valid_only_with_ready_manifest(db_session):
         load_current_execution_coherent(
             db_session, entity_kind="r9_empty_scope", scope_key="r9:empty",
         )
+
+
+@pytest.mark.integration
+def test_postgresql_reader_holds_old_boundary_while_writer_waits():
+    dsn = _dsn()
+    pytest.importorskip("psycopg2")
+    engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    scope = "r9-pg-coherent-reader-first"
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("DELETE FROM current_execution_change WHERE scope_key=:scope"), {"scope": scope})
+            conn.execute(sa.text("DELETE FROM current_execution_row WHERE scope_key=:scope"), {"scope": scope})
+            conn.execute(sa.text("DELETE FROM current_execution_scope WHERE scope_key=:scope"), {"scope": scope})
+        seed = Session()
+        try:
+            publish_current_execution_scope(
+                seed, source_revision="reader-old", scope_key=scope,
+                rows=_rows(scope, "old"), entity_kinds=("r9_coherent_execution",),
+            )
+            seed.commit()
+        finally:
+            seed.close()
+
+        reader = Session()
+        started = threading.Event()
+        writer_errors: Queue = Queue()
+        try:
+            manifest = require_current_execution_scope(
+                reader, entity_kind="r9_coherent_execution", scope_key=scope,
+            )
+            assert manifest.source_revision == "reader-old"
+            rows = load_current_execution_rows(
+                reader, entity_kind="r9_coherent_execution", scope_key=scope,
+            )
+            assert rows[0].payload["qty"] == "old"
+
+            def publish_after_reader_boundary():
+                writer = Session()
+                try:
+                    started.set()
+                    publish_current_execution_scope(
+                        writer, source_revision="reader-new", scope_key=scope,
+                        rows=_rows(scope, "new"), entity_kinds=("r9_coherent_execution",),
+                    )
+                    writer.commit()
+                except Exception as exc:  # pragma: no cover - surfaced below
+                    writer_errors.put(exc)
+                    writer.rollback()
+                finally:
+                    writer.close()
+
+            thread = threading.Thread(target=publish_after_reader_boundary, daemon=True)
+            thread.start()
+            assert started.wait(timeout=2)
+            time.sleep(0.2)
+            assert thread.is_alive(), "writer crossed the reader publication boundary"
+            reader.commit()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            if not writer_errors.empty():
+                raise writer_errors.get()
+        finally:
+            reader.close()
+
+        check = Session()
+        try:
+            manifest, rows = load_current_execution_coherent(
+                check, entity_kind="r9_coherent_execution", scope_key=scope,
+            )
+            assert (manifest.source_revision, rows[0].payload["qty"]) == ("reader-new", "new")
+        finally:
+            check.close()
+    finally:
+        with engine.begin() as conn:
+            conn.execute(sa.text("DELETE FROM current_execution_change WHERE scope_key=:scope"), {"scope": scope})
+            conn.execute(sa.text("DELETE FROM current_execution_row WHERE scope_key=:scope"), {"scope": scope})
+            conn.execute(sa.text("DELETE FROM current_execution_scope WHERE scope_key=:scope"), {"scope": scope})
+        engine.dispose()
