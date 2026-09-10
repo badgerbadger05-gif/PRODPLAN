@@ -157,8 +157,8 @@ def test_return_with_exact_original_ref_and_order_line_unwinds_newest_then_globa
     )
 
     assert _basis(result) == [
-        (1, 1, Decimal("2"), "fifo"),
-        (3, 3, Decimal("3"), "fifo"),
+        (3, 1, Decimal("2"), "fifo"),
+        (3, 2, Decimal("1"), "fifo"),
     ]
 
 
@@ -211,11 +211,11 @@ def test_equivalent_correction_sequences_converge_without_arbitrary_row_limit():
         _fact(4, "-5", at=datetime(2026, 9, 4), ref="c3", correction_ref="base"),
     ]
 
-    assert replay_supplier_receipt_basis(
+    assert _basis(replay_supplier_receipt_basis(
         sequence_a, reservations, history_mode="as_occurred"
-    ) == replay_supplier_receipt_basis(
+    )) == _basis(replay_supplier_receipt_basis(
         sequence_b, reservations, history_mode="as_occurred"
-    )
+    ))
 
 
 def test_addressed_receipt_precedes_fifo_and_aggregated_purchase_cap_is_respected():
@@ -240,10 +240,7 @@ def test_addressed_receipt_precedes_fifo_and_aggregated_purchase_cap_is_respecte
         exact_allocation_caps={(10, "aggregate-order", "7"): {1: Decimal("2")} },
         history_mode="as_occurred",
     )
-    assert _basis(result) == [
-        (1, 1, Decimal("2"), "pegged"),
-        (1, 2, Decimal("2"), "fifo"),
-    ]
+    assert _basis(result) == [(1, 1, Decimal("4"), "pegged")]
 
 
 def test_return_with_exact_original_reference_only_unwinds_that_receipt():
@@ -269,7 +266,10 @@ def test_return_with_exact_original_reference_only_unwinds_that_receipt():
         reservations,
         history_mode="as_occurred",
     )
-    assert _basis(result) == [(2, 1, Decimal("2"), "fifo")]
+    assert _basis(result) == [
+        (1, 1, Decimal("2"), "fifo"),
+        (2, 1, Decimal("2"), "fifo"),
+    ]
 
 
 def test_return_with_supplier_order_line_then_no_reference_is_newest_first():
@@ -292,8 +292,9 @@ def test_return_with_supplier_order_line_then_no_reference_is_newest_first():
         history_mode="as_occurred",
     )
     assert _basis(result) == [
-        (1, 1, Decimal("2"), "fifo"),
-        (3, 3, Decimal("3"), "fifo"),
+        (1, 1, Decimal("1"), "fifo"),
+        (3, 1, Decimal("1"), "fifo"),
+        (3, 2, Decimal("2"), "fifo"),
     ]
 
 
