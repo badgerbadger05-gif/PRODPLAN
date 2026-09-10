@@ -138,6 +138,119 @@ def test_repeated_current_publication_keeps_row_id_and_has_no_change_audit(db_se
     assert db_session.query(models.LedgerFutureSupplyCurrentChange).count() == changes
 
 
+def test_one_current_row_survives_100_new_generation_noop_imports_and_close(db_session):
+    generation, batch, item = _context(db_session, "stable-distinct-0")
+    replace_future_supply_capture(
+        db_session, generation.id, batch.id,
+        [_evidence(generation, item, kind="supplier_order", ref="SO-D", line="1")],
+    )
+    batch.status = "completed"
+    generation.status = "accepted"
+    pointer = models.PlanningTruthState(id=1, current_generation_id=generation.id)
+    db_session.add(pointer)
+    db_session.flush()
+    publish_current_future_supply(db_session, generation.id)
+    row_id = int(db_session.query(models.LedgerFutureSupplyCurrent).one().id)
+    updated_at = db_session.query(models.LedgerFutureSupplyCurrent).one().updated_at
+
+    for ordinal in range(1, 101):
+        cutoff = datetime(2026, 8, 1 + (ordinal % 20), 23, 59)
+        physical = models.PhysicalImportBatch(
+            batch_key=f"future-physical-stable-distinct-{ordinal}",
+            status="completed", cutoff=cutoff, source_watermarks={},
+        )
+        target = models.LedgerGeneration(
+            generation_key=f"future-generation-stable-distinct-{ordinal}",
+            status="building", cutoff=cutoff, source_watermarks={}, capabilities={},
+            physical_import_batch=physical, algorithm_version="test",
+        )
+        db_session.add_all([physical, target])
+        db_session.flush()
+        target_batch = models.LedgerBuildBatch(
+            ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+            batch_key=f"future-snapshot-stable-distinct-{ordinal}",
+            algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+        )
+        db_session.add(target_batch)
+        db_session.flush()
+        replace_future_supply_capture(
+            db_session, target.id, target_batch.id,
+            [_evidence(target, item, kind="supplier_order", ref="SO-D", line="1")],
+        )
+        target_batch.status = "completed"
+        target.status = "accepted"
+        pointer.current_generation_id = target.id
+        db_session.flush()
+        publish_current_future_supply(db_session, target.id)
+
+    current = db_session.query(models.LedgerFutureSupplyCurrent).one()
+    assert int(current.id) == row_id
+    assert current.updated_at == updated_at
+    assert db_session.query(models.LedgerFutureSupplyCurrent).count() == 1
+    assert db_session.query(models.LedgerFutureSupplyCurrentChange).count() == 1
+
+    # A changed remaining quantity is one business correction, and an empty
+    # accepted capture closes it exactly once with an auditable change.
+    cutoff = datetime(2026, 9, 1, 23, 59)
+    physical = models.PhysicalImportBatch(
+        batch_key="future-physical-stable-close", status="completed",
+        cutoff=cutoff, source_watermarks={},
+    )
+    target = models.LedgerGeneration(
+        generation_key="future-generation-stable-close", status="building",
+        cutoff=cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical, algorithm_version="test",
+    )
+    db_session.add_all([physical, target])
+    db_session.flush()
+    target_batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+        batch_key="future-snapshot-stable-close",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+    )
+    db_session.add(target_batch)
+    db_session.flush()
+    replace_future_supply_capture(
+        db_session, target.id, target_batch.id,
+        [_evidence(target, item, kind="supplier_order", ref="SO-D", line="1", realized="8")],
+    )
+    target_batch.status = "completed"
+    target.status = "accepted"
+    pointer.current_generation_id = target.id
+    db_session.flush()
+    publish_current_future_supply(db_session, target.id)
+    assert db_session.query(models.LedgerFutureSupplyCurrent).one().open_qty_at_cutoff == Decimal("2")
+    assert db_session.query(models.LedgerFutureSupplyCurrentChange).count() == 2
+
+    cutoff = datetime(2026, 9, 2, 23, 59)
+    physical = models.PhysicalImportBatch(
+        batch_key="future-physical-stable-close-empty", status="completed",
+        cutoff=cutoff, source_watermarks={},
+    )
+    target = models.LedgerGeneration(
+        generation_key="future-generation-stable-close-empty", status="building",
+        cutoff=cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical, algorithm_version="test",
+    )
+    db_session.add_all([physical, target])
+    db_session.flush()
+    target_batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+        batch_key="future-snapshot-stable-close-empty",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+    )
+    db_session.add(target_batch)
+    db_session.flush()
+    replace_future_supply_capture(db_session, target.id, target_batch.id, [])
+    target_batch.status = "completed"
+    target.status = "accepted"
+    pointer.current_generation_id = target.id
+    db_session.flush()
+    publish_current_future_supply(db_session, target.id)
+    assert db_session.query(models.LedgerFutureSupplyCurrent).count() == 0
+    assert db_session.query(models.LedgerFutureSupplyCurrentChange).count() == 3
+
+
 def test_current_future_supply_correction_reuses_row_and_audits_once(db_session):
     generation, batch, item = _context(db_session, "stable-correction-a")
     replace_future_supply_capture(
@@ -188,6 +301,51 @@ def test_current_future_supply_correction_reuses_row_and_audits_once(db_session)
     assert db_session.query(models.LedgerFutureSupplyCurrentChange).filter_by(
         current_identity="supplier_order:SO-C:1:local-1"
     ).count() == 2
+
+
+def test_building_future_supply_correction_cannot_mutate_current_without_publish(db_session):
+    generation, batch, item = _context(db_session, "building-current-boundary")
+    replace_future_supply_capture(
+        db_session, generation.id, batch.id,
+        [_evidence(generation, item, kind="supplier_order", ref="SO-B", line="1", realized="4")],
+    )
+    batch.status = "completed"
+    generation.status = "accepted"
+    pointer = models.PlanningTruthState(id=1, current_generation_id=generation.id)
+    db_session.add(pointer)
+    db_session.flush()
+    publish_current_future_supply(db_session, generation.id)
+    before = db_session.query(models.LedgerFutureSupplyCurrent).one()
+    before_qty = before.open_qty_at_cutoff
+    before_id = int(before.id)
+
+    physical = models.PhysicalImportBatch(
+        batch_key="future-physical-building-current", status="completed",
+        cutoff=datetime(2026, 8, 15, 23, 59), source_watermarks={},
+    )
+    target = models.LedgerGeneration(
+        generation_key="future-generation-building-current", status="building",
+        cutoff=physical.cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical, algorithm_version="test",
+    )
+    db_session.add_all([physical, target])
+    db_session.flush()
+    target_batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage="future_supply_capture", status="building",
+        batch_key="future-snapshot-building-current",
+        algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION, metrics={},
+    )
+    db_session.add(target_batch)
+    db_session.flush()
+    replace_future_supply_capture(
+        db_session, target.id, target_batch.id,
+        [_evidence(target, item, kind="supplier_order", ref="SO-B", line="1", realized="9")],
+    )
+
+    current = db_session.query(models.LedgerFutureSupplyCurrent).one()
+    assert int(current.id) == before_id
+    assert current.open_qty_at_cutoff == before_qty
+    assert db_session.query(models.LedgerFutureSupplyCurrentChange).count() == 1
 
 
 def test_exact_evidence_carries_source_requirement_id_into_persisted_row(db_session):
