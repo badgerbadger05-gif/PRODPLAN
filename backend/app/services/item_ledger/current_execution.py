@@ -9,6 +9,7 @@ business change when the saved result is unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 import hashlib
 import json
@@ -28,6 +29,15 @@ class CurrentExecutionPublishResult:
     changed_rows: int
     closed_rows: int
     idempotent: bool
+
+
+def drum_slot_identity(plan_line_id: int, slot_ordinal: int) -> str:
+    return f"slot:plan-line:{int(plan_line_id)}:ordinal:{int(slot_ordinal)}"
+
+
+def drum_gap_identity(plan_line_id: int, gap_date: date | str) -> str:
+    value = gap_date.isoformat() if isinstance(gap_date, date) else str(gap_date)
+    return f"gap:plan-line:{int(plan_line_id)}:date:{value}"
 
 
 def _jsonable(value: Any) -> Any:
@@ -113,7 +123,7 @@ def publish_current_execution_scope(
     expected_kinds = {
         str(value).strip() for value in (entity_kinds or ()) if str(value).strip()
     }
-    incoming: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any], str]] = {}
+    incoming: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any], str, bool]] = {}
     for raw in rows:
         row = dict(raw)
         entity_kind = str(row.get("entity_kind") or "").strip()
@@ -129,7 +139,12 @@ def publish_current_execution_scope(
         key = (entity_kind, identity)
         if key in incoming:
             raise CurrentExecutionUnavailable(f"duplicate current execution identity {entity_kind}:{identity}")
-        incoming[key] = (payload, manual, _hash({"payload": payload, "manual_input": manual}))
+        incoming[key] = (
+            payload,
+            manual,
+            _hash({"payload": payload, "manual_input": manual}),
+            "manual_input" in row,
+        )
 
     actual_kinds = {kind for kind, _identity in incoming}
     if not expected_kinds:
@@ -147,8 +162,11 @@ def publish_current_execution_scope(
 
     changed = 0
     closed = 0
-    for key, (payload, manual, content_hash) in incoming.items():
+    for key, (payload, manual, content_hash, manual_supplied) in incoming.items():
         row = existing_by_key.get(key)
+        if row is not None and not manual_supplied:
+            manual = dict(row.manual_input or {})
+            content_hash = _hash({"payload": payload, "manual_input": manual})
         if row is not None and (
             str(row.result_status) == "accepted"
             and bool(row.result_ready)
@@ -371,7 +389,7 @@ def publish_current_execution_from_generation(
             models.DrumSlot.slot_ordinal.asc(),
             models.DrumSlot.id.asc(),
         ).all():
-            identity = f"slot:{int(slot.assembly_queue_line_id)}:{int(slot.slot_ordinal)}"
+            identity = drum_slot_identity(int(slot.plan_line_id), int(slot.slot_ordinal))
             manual = prior_manual.get(identity)
             payload = {
                 "queue_line_id": int(slot.assembly_queue_line_id),
@@ -397,12 +415,25 @@ def publish_current_execution_from_generation(
                     payload["slot_date"] = str(manual["slot_date"])
                 if manual.get("resource_id") is not None:
                     payload["resource_id"] = int(manual["resource_id"])
+            legacy_manual = manual
+            if not legacy_manual and slot.manual_moved_at is not None:
+                legacy_manual = {
+                    "slot_date": slot.slot_date.isoformat(),
+                    "resource_id": int(slot.resource_id),
+                    "moved_at": slot.manual_moved_at.isoformat(),
+                    "moved_by": str(slot.manual_moved_by or "operator"),
+                }
+            if legacy_manual:
+                if legacy_manual.get("slot_date"):
+                    payload["slot_date"] = str(legacy_manual["slot_date"])
+                if legacy_manual.get("resource_id") is not None:
+                    payload["resource_id"] = int(legacy_manual["resource_id"])
             drum_rows.append({
                 "entity_kind": "drum_slot",
                 "business_identity": identity,
                 "scope_key": "drum:all-live-plans",
                 "payload": payload,
-                **({"manual_input": manual} if manual else {}),
+                **({"manual_input": legacy_manual} if legacy_manual else {}),
             })
         for gap in db.query(models.DrumCapacityGap).filter(
             models.DrumCapacityGap.drum_schedule_id == int(schedule.id),
@@ -411,10 +442,7 @@ def publish_current_execution_from_generation(
             models.DrumCapacityGap.resource_id.asc(),
             models.DrumCapacityGap.id.asc(),
         ).all():
-            identity = (
-                f"gap:{int(gap.assembly_queue_line_id)}:"
-                f"{gap.gap_date.isoformat()}"
-            )
+            identity = drum_gap_identity(int(gap.plan_line_id), gap.gap_date)
             drum_rows.append({
                 "entity_kind": "drum_gap",
                 "business_identity": identity,

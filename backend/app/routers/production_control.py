@@ -313,6 +313,8 @@ class DrumSlotMoveRequest(BaseModel):
     new_date: str
     new_resource_id: int | None = None
     moved_by: str | None = None
+    expected_source_revision: str | None = None
+    current_identity: str | None = None
 
 
 class DrumSlotMoveResponse(BaseModel):
@@ -472,7 +474,64 @@ def get_assembly_queue(
     offset: Annotated[int, Query(ge=0)] = 0,
     db: Session = Depends(get_db),
 ) -> AssemblyQueueResponse:
-    """Read the immutable queue belonging to the exact accepted generation."""
+    """Read the compact current queue; legacy snapshots serve only old data."""
+    from ..services.item_ledger.current_execution import load_current_execution_rows
+    current_rows = load_current_execution_rows(db, entity_kind="assembly_queue")
+    if current_rows:
+        try:
+            truth = planning_truth.require_accepted_truth(
+                db,
+                "assembly_queue",
+                required_capabilities=(
+                    planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                    planning_truth.CAPABILITY_RESERVATION_REPLAY,
+                    planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+                ),
+            )
+        except planning_truth.PlanningTruthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+        item_ids = {int(row.payload.get("item_id")) for row in current_rows if row.payload.get("item_id") is not None}
+        items = _items_by_id(db, item_ids)
+        ordered = sorted(
+            current_rows,
+            key=lambda row: (
+                str(row.payload.get("period_from") or ""),
+                str(row.payload.get("period_to") or ""),
+                int(row.payload.get("plan_id") or 0),
+                int(row.payload.get("plan_line_id") or 0),
+                str(row.business_identity),
+            ),
+        )
+        payload_rows = []
+        for row in ordered:
+            payload = dict(row.payload or {})
+            item = items.get(int(payload.get("item_id")))
+            payload_rows.append({
+                "plan_id": int(payload["plan_id"]),
+                "plan_line_id": int(payload["plan_line_id"]),
+                "run_id": int(payload.get("run_id") or 0),
+                "item_id": int(payload["item_id"]),
+                "item_code": str(item.item_code or "") if item is not None else "",
+                "item_name": str(item.item_name or "") if item is not None else "",
+                "bucket_date": payload.get("bucket_date"),
+                "period_from": str(payload["period_from"]),
+                "period_to": str(payload["period_to"]),
+                "planned_output_qty": float(payload["planned_output_qty"]),
+                "accepted_plan_output_qty": float(payload["accepted_plan_output_qty"]),
+                "assembly_remaining_qty": float(payload["assembly_remaining_qty"]),
+                "eligible_from": payload.get("eligible_from"),
+                "priority_key": list(payload.get("original_priority") or []),
+                "sort_key": str(payload.get("sort_key") or ""),
+            })
+        total_qty = sum(float(row.get("assembly_remaining_qty") or 0) for row in payload_rows)
+        return AssemblyQueueResponse.model_validate({
+            "rows": payload_rows[offset:offset + limit],
+            "total_rows": len(payload_rows),
+            "total_queue_qty": total_qty,
+            "limit": limit,
+            "offset": offset,
+            "truth_meta": build_truth_meta(truth),
+        })
     try:
         snapshot = planning_truth.get_latest_read_snapshot(
             db,
@@ -523,6 +582,72 @@ def get_assembly_readiness(
     db: Session = Depends(get_db),
 ) -> AssemblyReadinessListResponse:
     """Read the persisted release recommendation; never calculate readiness in GET."""
+    from ..services.item_ledger.current_execution import load_current_execution_rows
+    current_rows = load_current_execution_rows(db, entity_kind="assembly_readiness")
+    if current_rows:
+        try:
+            truth = planning_truth.require_accepted_truth(
+                db,
+                "assembly_readiness",
+                required_capabilities=(
+                    planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                    planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+                    planning_truth.CAPABILITY_ASSEMBLY_READINESS,
+                ),
+            )
+        except planning_truth.PlanningTruthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+        item_ids = {int(row.payload.get("item_id")) for row in current_rows if row.payload.get("item_id") is not None}
+        items = _items_by_id(db, item_ids)
+        rates = {
+            int(row.item_id): int(row.resource_id)
+            for row in db.query(models.AssemblyRate).filter(models.AssemblyRate.item_id.in_(item_ids or {0})).all()
+        }
+        ordered = sorted(
+            current_rows,
+            key=lambda row: (
+                str(row.payload.get("original_priority") or ""),
+                int(row.payload.get("plan_id") or 0),
+                int(row.payload.get("plan_line_id") or 0),
+            ),
+        )
+        if resource_id is not None:
+            ordered = [row for row in ordered if rates.get(int(row.payload.get("item_id") or 0)) == int(resource_id)]
+        result_rows = []
+        for row in ordered[offset:offset + limit]:
+            payload = dict(row.payload or {})
+            item = items.get(int(payload.get("item_id")))
+            result_rows.append({
+                "queue_line_id": int(payload.get("queue_line_id") or 0),
+                "plan_id": int(payload["plan_id"]),
+                "plan_line_id": int(payload["plan_line_id"]),
+                "run_id": int(payload.get("run_id") or 0),
+                "item_id": int(payload["item_id"]),
+                "item_code": str(item.item_code or "") if item is not None else "",
+                "item_name": str(item.item_name or "") if item is not None else "",
+                "resource_id": rates.get(int(payload["item_id"])),
+                "status": str(payload["status"]),
+                "open_qty": float(payload["open_qty"]),
+                "ready_qty": float(payload["ready_qty"]),
+                "transferable_qty": float(payload.get("transferable_qty") or 0),
+                "kitting_qty": float(payload.get("kitting_qty") or 0),
+                "committed_qty": float(payload.get("committed_qty") or 0),
+                "launchable_qty": float(payload.get("launchable_qty") or 0),
+                "readiness_date": payload.get("readiness_date"),
+                "readiness_curve": list(payload.get("readiness_curve") or []),
+                "action_manifest": list(payload.get("action_manifest") or []),
+                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
+                "blocker_count": int(payload.get("blocker_count") or 0),
+                "blockers": list(payload.get("blocking_manifest") or []),
+                "original_priority": list(payload.get("original_priority") or []),
+            })
+        return AssemblyReadinessListResponse.model_validate({
+            "rows": result_rows,
+            "total": len(ordered),
+            "limit": limit,
+            "offset": offset,
+            "truth_meta": build_truth_meta(truth),
+        })
     try:
         truth = planning_truth.require_accepted_truth(
             db,
@@ -614,6 +739,128 @@ def get_drum_schedule(
     db: Session = Depends(get_db),
 ) -> DrumScheduleResponse:
     """Read the persisted drum of the exact accepted generation."""
+    from ..services.item_ledger.current_execution import load_current_execution_rows
+    current_schedule = load_current_execution_rows(db, entity_kind="drum_schedule", scope_key="drum:all-live-plans")
+    if current_schedule:
+        try:
+            truth = planning_truth.require_accepted_truth(
+                db,
+                "drum_schedule",
+                required_capabilities=(
+                    planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                    planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+                    planning_truth.CAPABILITY_DRUM_SCHEDULE,
+                ),
+            )
+        except planning_truth.PlanningTruthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+        schedule_payload = dict(current_schedule[0].payload or {})
+        slots = load_current_execution_rows(db, entity_kind="drum_slot", scope_key="drum:all-live-plans")
+        gaps = load_current_execution_rows(db, entity_kind="drum_gap", scope_key="drum:all-live-plans")
+        item_ids = {
+            int(row.payload.get("item_id"))
+            for row in (*slots, *gaps)
+            if row.payload.get("item_id") is not None
+        }
+        items = _items_by_id(db, item_ids)
+        resource_ids = {
+            int(row.payload.get("resource_id"))
+            for row in (*slots, *gaps)
+            if row.payload.get("resource_id") is not None
+        }
+        resources = {
+            int(row.resource_id): row
+            for row in db.query(models.ProductionResource).filter(
+                models.ProductionResource.resource_id.in_(resource_ids or {0})
+            ).all()
+        }
+        slot_rows = []
+        for row in slots[offset:offset + limit]:
+            payload = dict(row.payload or {})
+            item = items.get(int(payload.get("item_id")))
+            slot_rows.append({
+                "slot_id": int(row.id),
+                "queue_line_id": int(payload.get("queue_line_id") or 0),
+                "run_id": None,
+                "period_from": None,
+                "period_to": None,
+                "plan_id": int(payload.get("plan_id") or 0),
+                "plan_line_id": int(payload.get("plan_line_id") or 0),
+                "item_id": int(payload.get("item_id") or 0),
+                "item_code": item.item_code if item else None,
+                "item_name": item.item_name if item else None,
+                "resource_id": int(payload.get("resource_id") or 0),
+                "slot_date": payload.get("slot_date"),
+                "auto_slot_date": payload.get("auto_slot_date"),
+                "slot_qty": float(payload.get("slot_qty") or 0),
+                "planned_output_qty": None,
+                "accepted_plan_output_qty": None,
+                "assembly_remaining_qty": None,
+                "slot_ordinal": int(payload.get("slot_ordinal") or 0),
+                "readiness_phase": str(payload.get("readiness_phase") or "unavailable"),
+                "readiness_date": payload.get("readiness_date"),
+                "readiness_curve": list(payload.get("readiness_curve") or []),
+                "action_manifest": list(payload.get("action_manifest") or []),
+                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
+                "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                "manual_override": bool(row.manual_input),
+                "manual_moved_at": row.manual_input.get("moved_at") if row.manual_input else None,
+                "manual_moved_by": row.manual_input.get("moved_by") if row.manual_input else None,
+                "original_priority": list(payload.get("original_priority") or []),
+            })
+        gap_rows = []
+        for row in gaps[offset:offset + limit]:
+            payload = dict(row.payload or {})
+            item = items.get(int(payload.get("item_id")))
+            gap_rows.append({
+                "gap_id": int(row.id),
+                "queue_line_id": int(payload.get("queue_line_id") or 0),
+                "run_id": None,
+                "period_from": None,
+                "period_to": None,
+                "plan_id": int(payload.get("plan_id") or 0),
+                "plan_line_id": int(payload.get("plan_line_id") or 0),
+                "item_id": int(payload.get("item_id") or 0),
+                "item_code": item.item_code if item else None,
+                "item_name": item.item_name if item else None,
+                "resource_id": int(payload.get("resource_id") or 0),
+                "gap_date": payload.get("gap_date"),
+                "required_qty": float(payload.get("required_qty") or 0),
+                "available_capacity": float(payload.get("available_capacity") or 0),
+                "gap_qty": float(payload.get("gap_qty") or 0),
+                "planned_output_qty": None,
+                "accepted_plan_output_qty": None,
+                "assembly_remaining_qty": None,
+                "readiness_phase": str(payload.get("readiness_phase") or "unavailable"),
+                "readiness_date": payload.get("readiness_date"),
+                "readiness_curve": list(payload.get("readiness_curve") or []),
+                "action_manifest": list(payload.get("action_manifest") or []),
+                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
+                "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                "original_priority": list(payload.get("original_priority") or []),
+            })
+        return DrumScheduleResponse.model_validate({
+            "schedule_from": schedule_payload.get("schedule_from"),
+            "schedule_to": schedule_payload.get("schedule_to"),
+            "days": list(schedule_payload.get("working_days") or []),
+            "resources": [
+                {"resource_id": int(resource_id), "resource_name": str(row.resource_name or f"Участок #{resource_id}")}
+                for resource_id, row in sorted(resources.items())
+            ],
+            "slots": slot_rows,
+            "gaps": gap_rows,
+            "excluded": [],
+            "total_open_qty": float(schedule_payload.get("metrics", {}).get("total_open_qty") or 0),
+            "total_slot_qty": float(schedule_payload.get("metrics", {}).get("total_slot_qty") or 0),
+            "total_gap_qty": float(schedule_payload.get("metrics", {}).get("total_gap_qty") or 0),
+            "total_slots": len(slots),
+            "total_gaps": len(gaps),
+            "total_excluded": 0,
+            "total_excluded_open_qty": 0,
+            "limit": limit,
+            "offset": offset,
+            "truth_meta": build_truth_meta(truth),
+        })
     try:
         truth = planning_truth.require_accepted_truth(
             db,
@@ -957,6 +1204,29 @@ def post_move_drum_slot(
 ) -> DrumSlotMoveResponse:
     try:
         target_date = date.fromisoformat(payload.new_date)
+        if payload.current_identity:
+            if not payload.expected_source_revision:
+                raise ValueError("current drum move requires expected_source_revision")
+            from ..services.item_ledger.drum_manual_move import move_current_drum_slot
+            moved = move_current_drum_slot(
+                db,
+                business_identity=str(payload.current_identity),
+                expected_source_revision=str(payload.expected_source_revision),
+                new_date=target_date,
+                new_resource_id=payload.new_resource_id,
+                moved_by=payload.moved_by,
+            )
+            db.commit()
+            return DrumSlotMoveResponse.model_validate({
+                "ok": True,
+                "moved": bool(moved.get("moved")),
+                "slot_id": int(moved.get("slot_id") or slot_id),
+                "from_date": str(moved.get("from_date") or moved.get("to_date") or target_date.isoformat()),
+                "to_date": str(moved.get("to_date") or target_date.isoformat()),
+                "resource_id": int(moved.get("resource_id") or payload.new_resource_id or 0),
+                "manual_moved_at": None,
+                "manual_moved_by": payload.moved_by,
+            })
         result = move_drum_slot(
             db,
             int(slot_id),
@@ -980,6 +1250,62 @@ def get_shelf_projections(
     db: Session = Depends(get_db),
 ) -> ShelfProjectionResponse:
     """Read persisted shelf pull priorities of the accepted generation."""
+    from ..services.item_ledger.current_execution import load_current_execution_rows
+    current_rows = load_current_execution_rows(db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps")
+    if current_rows:
+        try:
+            truth = planning_truth.require_accepted_truth(
+                db,
+                "shelf_projection",
+                required_capabilities=(
+                    planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                    planning_truth.CAPABILITY_DRUM_SCHEDULE,
+                    planning_truth.CAPABILITY_SHELF_PROJECTION,
+                ),
+            )
+        except planning_truth.PlanningTruthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+        ordered = sorted(
+            current_rows,
+            key=lambda row: (
+                str((row.payload or {}).get("latest_start_date") or "9999-12-31"),
+                int((row.payload or {}).get("item_id") or 0),
+                str(row.business_identity),
+            ),
+        )
+        item_ids = {int((row.payload or {}).get("item_id")) for row in ordered if (row.payload or {}).get("item_id") is not None}
+        items = _items_by_id(db, item_ids)
+        payload = []
+        for row in ordered[offset:offset + limit]:
+            value = dict(row.payload or {})
+            item = items.get(int(value.get("item_id") or 0))
+            payload.append({
+                "policy_id": int(value.get("policy_id") or 0),
+                "item_id": int(value.get("item_id") or 0),
+                "item_code": item.item_code if item else None,
+                "item_name": item.item_name if item else None,
+                "warehouse_ref1c": str(value.get("warehouse_ref1c") or ""),
+                "protection_until": str(value.get("protection_until") or ""),
+                "target_qty": float(value.get("target_qty") or 0),
+                "shelf_physical_qty": float(value.get("shelf_physical_qty") or 0),
+                "other_stock_qty": float(value.get("other_stock_qty") or 0),
+                "projected_qty": float(value.get("projected_qty") or 0),
+                "gap_qty": float(value.get("gap_qty") or 0),
+                "transfer_qty": float(value.get("transfer_qty") or 0),
+                "unlaunched_mrp_qty": float(value.get("unlaunched_mrp_qty") or 0),
+                "pull_qty": float(value.get("pull_qty") or 0),
+                "materialized_qty": float(value.get("materialized_qty") or 0),
+                "first_shortage_date": value.get("first_shortage_date"),
+                "latest_start_date": value.get("latest_start_date"),
+                "demand_manifest": list(value.get("demand_manifest") or []),
+            })
+        return ShelfProjectionResponse.model_validate({
+            "rows": payload,
+            "total_rows": len(ordered),
+            "limit": limit,
+            "offset": offset,
+            "truth_meta": build_truth_meta(truth),
+        })
     try:
         truth = planning_truth.require_accepted_truth(
             db,

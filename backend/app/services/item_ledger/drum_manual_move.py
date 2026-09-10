@@ -218,3 +218,75 @@ def move_drum_slot(
         "manual_moved_at": slot.manual_moved_at.isoformat(),
         "manual_moved_by": slot.manual_moved_by,
     }
+
+
+def move_current_drum_slot(
+    db: Session,
+    *,
+    business_identity: str,
+    expected_source_revision: str,
+    new_date: date,
+    new_resource_id: int | None = None,
+    moved_by: str | None = None,
+) -> dict[str, Any]:
+    """Apply the existing validated move algorithm to a stable current tile.
+
+    The compact current row is an identity/read boundary only.  Capacity,
+    calendar, readiness and tail repacking remain owned by ``move_drum_slot``;
+    this adapter resolves the stable plan-line identity to the accepted staged
+    slot, executes that one canonical algorithm, and republishes all affected
+    stable rows atomically.
+    """
+    current = db.query(models.CurrentExecutionRow).filter(
+        models.CurrentExecutionRow.entity_kind == "drum_slot",
+        models.CurrentExecutionRow.business_identity == str(business_identity),
+        models.CurrentExecutionRow.result_status == "accepted",
+        models.CurrentExecutionRow.result_ready.is_(True),
+    ).with_for_update().one_or_none()
+    if current is None:
+        raise ValueError("current drum slot is unavailable")
+    if str(current.source_revision) != str(expected_source_revision):
+        raise ValueError("stale drum revision")
+    payload = dict(current.payload or {})
+    try:
+        plan_line_id = int(payload["plan_line_id"])
+        slot_ordinal = int(payload["slot_ordinal"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("current drum slot identity is incomplete") from exc
+    truth = planning_truth.require_accepted_truth(
+        db,
+        "drum_manual_move",
+        required_capabilities=(
+            planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+            planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+            planning_truth.CAPABILITY_DRUM_SCHEDULE,
+        ),
+    )
+    slot = (
+        db.query(models.DrumSlot)
+        .join(models.DrumSchedule, models.DrumSchedule.id == models.DrumSlot.drum_schedule_id)
+        .join(models.AssemblyQueueLine, models.AssemblyQueueLine.id == models.DrumSlot.assembly_queue_line_id)
+        .filter(
+            models.DrumSchedule.ledger_generation_id == int(truth.generation_id),
+            models.AssemblyQueueLine.plan_line_id == plan_line_id,
+            models.DrumSlot.slot_ordinal == slot_ordinal,
+        )
+        .one_or_none()
+    )
+    if slot is None:
+        raise ValueError("stable current drum slot is absent from accepted schedule")
+    result = move_drum_slot(
+        db,
+        int(slot.id),
+        new_date,
+        new_resource_id=new_resource_id,
+        moved_by=moved_by,
+    )
+    from .current_execution import publish_current_execution_from_generation
+    publish_current_execution_from_generation(db, generation_id=int(truth.generation_id))
+    db.commit()
+    return {
+        **result,
+        "slot_id": int(current.id),
+        "business_identity": str(business_identity),
+    }
