@@ -1428,7 +1428,9 @@ def get_orders_journal(
             payload["__r9_root_item_ids"] = list(payload.get("root_item_ids") or [])
             payload.pop("root_item_ids", None)
             payload["current_identity"] = str(current_row.business_identity)
-            payload["source_revision"] = str(current_row.source_revision)
+            # The accepted scope revision is the CAS token.  A technical
+            # no-op may retain the row's provenance revision by design.
+            payload["source_revision"] = str(current_manifest.source_revision)
             rows.append(_public_journal_row(payload))
         source_generation = db.get(models.LedgerGeneration, int(current_manifest.source_generation_id or 0))
         if source_generation is None or source_generation.cutoff is None:

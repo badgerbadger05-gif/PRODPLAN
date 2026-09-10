@@ -439,9 +439,11 @@ export function ProductionControlPage() {
       if (workItemIds.length) {
         const materialized = await materializeMakeWorkItems(workItemIds.map((workItemId) => {
           const row = selectedRows.find((item) => item.work_item_id === workItemId)
+          const launchQty = launchQtyByWorkItem[workItemId] ?? row?.launchable_qty
+          if (launchQty == null) throw new Error('Текущая допустимая величина запуска недоступна')
           return {
             work_item_id: workItemId,
-            launch_qty: launchQtyByWorkItem[workItemId] ?? row?.launchable_qty ?? row?.quantity ?? 0,
+            launch_qty: launchQty,
             expected_materialized_qty: row?.materialized_order_qty ?? 0,
           }
         }))
@@ -581,7 +583,11 @@ export function ProductionControlPage() {
     setPieceworkOnly(laborOnly)
     setPieceworkRow(null)
     setProduceError('')
-    setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
+    if (row.remaining_qty == null) {
+      setProduceError('Текущий остаток выпуска недоступен')
+      return
+    }
+    setProduceQty(String(row.remaining_qty))
     setProducePartial(false)
     setProduceRequestKey(crypto.randomUUID())
     setProduceOperationEmployees({})
@@ -614,7 +620,7 @@ export function ProductionControlPage() {
           title: chain.role === 'welded' ? 'Сварка' : 'Окраска',
           productId,
           itemName: row.item_name,
-          qty: row.remaining_qty ?? row.quantity ?? 0,
+          qty: row.remaining_qty,
           unit: row.unit,
           operations: ownOperations,
         }
@@ -623,7 +629,7 @@ export function ProductionControlPage() {
           title: chain.role === 'welded' ? 'Окраска' : 'Сварка',
           productId: counterpartProductId,
           itemName: chain.counterpart_item_name,
-          qty: chain.counterpart_remaining_qty ?? chain.counterpart_quantity ?? 0,
+          qty: chain.counterpart_remaining_qty ?? 0,
           unit: chain.counterpart_unit,
           operations: counterpartOperations?.rows ?? [],
         }
@@ -841,9 +847,11 @@ export function ProductionControlPage() {
     if (productId) {
       void loadMaterials(productId)
     } else if (workItemId && truthMeta?.ledger_generation) {
-      const launchQty = launchQtyByWorkItem[workItemId]
-        ?? activeRow.launchable_qty
-        ?? activeRow.quantity
+      const launchQty = launchQtyByWorkItem[workItemId] ?? activeRow.launchable_qty
+      if (launchQty == null) {
+        setMaterialsError('Текущая допустимая величина запуска недоступна')
+        return
+      }
       const timer = window.setTimeout(() => void loadWorkItemMaterials(
         workItemId,
         launchQty,
@@ -998,15 +1006,20 @@ export function ProductionControlPage() {
               onLoadMaterials={() => {
                 if (activeRow?.product_id != null) void loadMaterials(activeRow.product_id)
                 else if (activeRow?.work_item_id != null && truthMeta?.ledger_generation != null) {
+                  const launchQty = launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty
+                  if (launchQty == null) {
+                    setMaterialsError('Текущая допустимая величина запуска недоступна')
+                    return
+                  }
                   void loadWorkItemMaterials(
                     activeRow.work_item_id,
-                    launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty ?? activeRow.quantity,
+                    launchQty,
                     truthMeta.ledger_generation,
                   )
                 }
               }}
               launchQuantity={activeRow?.work_item_id != null
-                ? launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty ?? activeRow.quantity
+                ? launchQtyByWorkItem[activeRow.work_item_id] ?? activeRow.launchable_qty ?? null
                 : null}
               onLaunchQuantityChange={(value) => {
                 if (activeRow?.work_item_id == null) return
