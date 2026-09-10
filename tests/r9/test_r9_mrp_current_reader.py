@@ -153,7 +153,48 @@ def test_mrp_reader_uses_per_run_summary_and_keeps_identity_tie_ascending(db_ses
 
     manifest = read_mrp_result_manifest(db_session, 62)
     rows = read_mrp_result_rows(db_session, 62, row_kind="production", sort_dir="desc")
-    assert manifest["total_qty"] == {"production": 9}
+    assert manifest["snapshot_total_qty"] == {"production": 9}
     assert [row["current_identity"] for row in rows["rows"]] == [
-        "mrp-run:62", "mrp-run:62"
+        "run:62:v1:production:a", "run:62:v1:production:b"
     ]
+
+
+def test_mrp_root_filter_uses_persisted_current_membership(db_session):
+    generation = _generation(db_session)
+    snapshot = models.PlanningReadSnapshot(
+        consumer="mrp_result",
+        snapshot_key="run:71:v1",
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload={"summary": {"row_counts": {"production": 1}, "total_qty": {"production": 4}}},
+        published_at=generation.cutoff,
+    )
+    db_session.add(snapshot)
+    db_session.flush()
+    row = models.PlanningReadRow(
+        snapshot_id=snapshot.id,
+        row_key="req:71:1",
+        row_kind="production",
+        item_id=10,
+        sort_key="2026-09-10|0001",
+        payload={"item_id": 10, "qty": 4, "run_id": 71, "row_kind": "production"},
+    )
+    db_session.add(row)
+    db_session.flush()
+    db_session.add(models.PlanningReadRootMember(
+        snapshot_id=snapshot.id,
+        row_id=row.id,
+        root_key="root:99",
+        root_item_id=99,
+    ))
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+
+    assert read_mrp_result_rows(
+        db_session, 71, row_kind="production", root_item_id=99
+    )["total"] == 1
+    assert read_mrp_result_rows(
+        db_session, 71, row_kind="production", root_item_id=100
+    )["total"] == 0

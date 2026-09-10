@@ -948,7 +948,7 @@ def _read_current_mrp_rows(
     response_rows = []
     for current, payload in page:
         row_payload = dict(payload)
-        row_payload.setdefault("current_identity", f"mrp-run:{int(run_id)}")
+        row_payload.setdefault("current_identity", str(current.business_identity))
         row_payload.setdefault("source_revision", source_revision)
         response_rows.append(row_payload)
     unfiltered = not any((item_id, root_item_id, area_id, date_from, date_to, supplier_ref1c, category_id, category_ref1c))
@@ -986,10 +986,14 @@ def read_mrp_result_manifest(
     if generation is None or generation.cutoff is None:
         raise CurrentExecutionUnavailable("current MRP source cutoff is missing")
     summary = dict(run_meta.get("summary") or {})
+    row_counts = dict(run_meta.get("row_counts") or {})
+    total_qty = dict(run_meta.get("total_qty") or {})
     if run_meta.get("row_counts") is not None:
-        summary["row_counts"] = dict(run_meta.get("row_counts") or {})
+        summary["row_counts"] = row_counts
     if run_meta.get("total_qty") is not None:
-        summary["total_qty"] = dict(run_meta.get("total_qty") or {})
+        summary["total_qty"] = total_qty
+    summary["snapshot_counts"] = row_counts
+    summary["snapshot_total_qty"] = total_qty
     return {
         "snapshot_id": int(scope.id),
         "current_identity": f"mrp-run:{int(run_id)}",

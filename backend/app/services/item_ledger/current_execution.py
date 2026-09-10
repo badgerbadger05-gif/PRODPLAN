@@ -902,6 +902,16 @@ def publish_current_obligation_views_from_generation(
             payload.setdefault("run_id", int(run_marker) if run_marker.isdigit() else None)
             payload.setdefault("row_kind", str(row.row_kind))
             payload.setdefault("sort_key", str(row.sort_key or ""))
+            payload.setdefault(
+                "root_item_ids",
+                [
+                    int(member.root_item_id)
+                    for member in db.query(models.PlanningReadRootMember).filter(
+                        models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
+                        models.PlanningReadRootMember.row_id == int(row.id),
+                    ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
+                ],
+            )
             mrp_rows.append({
                 "entity_kind": "mrp_result",
                 "business_identity": f"{snapshot.snapshot_key}:{row.row_kind}:{row.row_key}",
