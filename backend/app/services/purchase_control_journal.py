@@ -134,11 +134,28 @@ def get_selection_summary(
     row_keys: List[str],
     horizon_period_to: Optional[date] = None,
 ) -> Dict[str, Any]:
-    """Aggregate a selected set using only the immutable purchase snapshot."""
+    """Aggregate a selected set using the canonical purchase-row rules."""
     snapshot = read_snapshot(db)
     meta = dict(snapshot.get("meta") or {})
     if int(meta.get("snapshot_id") or 0) != int(snapshot_id):
         raise ValueError("Снимок журнала изменился; обновите страницу и повторите выбор")
+
+    return _selection_summary_from_rows(
+        rows=snapshot.get("rows") or [],
+        snapshot_id=int(snapshot_id),
+        row_keys=row_keys,
+        horizon_period_to=horizon_period_to,
+    )
+
+
+def _selection_summary_from_rows(
+    *,
+    rows: Sequence[Dict[str, Any]],
+    snapshot_id: int,
+    row_keys: Sequence[str],
+    horizon_period_to: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Shared selection summary for snapshot compatibility and current rows."""
 
     unique_keys = list(dict.fromkeys(str(key or "").strip() for key in row_keys))
     if not unique_keys or any(not key for key in unique_keys):
@@ -146,7 +163,7 @@ def get_selection_summary(
 
     rows_by_key = {
         str(row.get("row_key")): dict(row)
-        for row in snapshot.get("rows") or []
+        for row in rows
         if row.get("row_key") is not None
     }
     unknown = [key for key in unique_keys if key not in rows_by_key]

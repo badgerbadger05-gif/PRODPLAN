@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,24 +18,36 @@ from ..services.purchase_control_materialization import (
 from ..services.purchase_control_journal import (
     get_order_card,
     get_selection_summary,
+    _selection_summary_from_rows,
     list_filters,
     list_journal,
 )
 from ..services.purchase_control_snapshot import PurchaseJournalSnapshotUnavailable
+from ..services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    load_current_execution_rows,
+    require_current_execution_scope,
+)
 
 router = APIRouter(prefix="/v1/purchase-control", tags=["purchase-control"])
 
 
 class PurchaseControlMaterializeRequest(BaseModel):
-    snapshot_id: int = Field(..., ge=1)
+    snapshot_id: Optional[int] = Field(default=None, ge=1)
     row_keys: list[str] = Field(default_factory=list)
     dry_run: bool = True
+    current_identity: Optional[str] = None
+    current_identities: list[str] = Field(default_factory=list, max_length=500)
+    expected_source_revision: Optional[str] = None
 
 
 class PurchaseControlSelectionSummaryRequest(BaseModel):
-    snapshot_id: int = Field(..., ge=1)
-    row_keys: list[str] = Field(..., min_length=1, max_length=500)
+    snapshot_id: Optional[int] = Field(default=None, ge=1)
+    row_keys: list[str] = Field(default_factory=list, max_length=500)
     horizon_period_to: Optional[date] = None
+    current_identity: Optional[str] = None
+    current_identities: list[str] = Field(default_factory=list, max_length=500)
+    expected_source_revision: Optional[str] = None
 
 
 class PurchaseControlSelectionSummaryResponse(BaseModel):
@@ -45,6 +58,106 @@ class PurchaseControlSelectionSummaryResponse(BaseModel):
     known_amount: float
     total_amount: Optional[float] = None
     amount_status: Literal["complete", "partial", "unavailable"]
+    current_identity: Optional[str] = None
+    current_identities: list[str] = Field(default_factory=list)
+    source_revision: Optional[str] = None
+
+
+def _resolve_current_purchase_selection(
+    db: Session,
+    *,
+    snapshot_id: int | None,
+    row_keys: list[str],
+    current_identity: str | None,
+    current_identities: list[str],
+    expected_source_revision: str | None,
+) -> tuple[object, list[dict], list[str]]:
+    manifest = require_current_execution_scope(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    if snapshot_id is not None and int(snapshot_id) != int(manifest.id):
+        raise ValueError("Текущий manifest изменился; обновите страницу и повторите выбор")
+    if expected_source_revision is not None and str(expected_source_revision) != str(manifest.source_revision):
+        raise ValueError("Текущая ревизия закупок устарела; обновите страницу и повторите выбор")
+    if not expected_source_revision:
+        raise ValueError("expected_source_revision обязателен для current selection")
+    current = load_current_execution_rows(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    by_identity = {str(row.business_identity): row for row in current}
+    selected = list(dict.fromkeys(str(key or "").strip() for key in row_keys if str(key or "").strip()))
+    if current_identity:
+        selected.append(str(current_identity))
+    selected.extend(str(identity or "").strip() for identity in current_identities if str(identity or "").strip())
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        raise ValueError("Не выбраны строки журнала закупок")
+    rows: list[dict] = []
+    resolved_keys: list[str] = []
+    for key in selected:
+        row = by_identity.get(key)
+        if row is None:
+            row = next(
+                (
+                    candidate for candidate in current
+                    if str((candidate.payload or {}).get("row_key") or "") == key
+                ),
+                None,
+            )
+        if row is None:
+            raise ValueError("Выбранная строка отсутствует в current purchase journal")
+        payload = dict(row.payload or {})
+        payload["row_key"] = str(row.business_identity)
+        rows.append(payload)
+        resolved_keys.append(str(row.business_identity))
+    return manifest, rows, resolved_keys
+
+
+def _canonical_purchase_sort(rows: list[dict], *, field: str, descending: bool) -> None:
+    """Sort purchase rows with typed ties and NULLS LAST."""
+
+    def _typed(value: object, key: str) -> tuple[int, object]:
+        if value in (None, ""):
+            return (9, "")
+        if key in {"delivery_date", "order_date"}:
+            # ISO dates sort chronologically and preserve date/datetime inputs.
+            return (0, value.isoformat() if hasattr(value, "isoformat") else str(value))
+        if key in {"remaining_qty", "to_order_qty", "quantity", "amount"}:
+            try:
+                return (0, Decimal(str(value)))
+            except (InvalidOperation, TypeError, ValueError):
+                return (1, str(value))
+        if key == "order_number":
+            try:
+                return (0, int(str(value)))
+            except (TypeError, ValueError):
+                return (1, str(value))
+        return (0, str(value))
+
+    def _tie(row: dict) -> tuple[int, object, str, str]:
+        raw_order = row.get("order_number")
+        try:
+            order_key: object = int(raw_order)
+            numeric = 0
+        except (TypeError, ValueError):
+            order_key = str(raw_order or "")
+            numeric = 1
+        return (
+            numeric,
+            order_key,
+            str(row.get("line_number") or ""),
+            str(row.get("row_key") or ""),
+        )
+
+    rows.sort(key=_tie)
+    present = [row for row in rows if row.get(field) not in (None, "")]
+    missing = [row for row in rows if row.get(field) in (None, "")]
+    present.sort(key=lambda row: _typed(row.get(field), field), reverse=descending)
+    rows[:] = present + missing
 
 
 @router.get("/orders", response_model=dict)
@@ -88,11 +201,17 @@ def get_orders(
             entity_kind="purchase_control_journal",
             scope_key="purchase:all-live-plans",
         )
-        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+        current_rows = load_current_execution_rows(
             db,
             entity_kind="purchase_control_journal",
             scope_key="purchase:all-live-plans",
-        )]
+        )
+        rows = []
+        for current_row in current_rows:
+            payload = dict(current_row.payload or {})
+            payload["current_identity"] = str(current_row.business_identity)
+            payload["source_revision"] = str(current_row.source_revision)
+            rows.append(payload)
         if horizon_period_to is not None:
             from ..services.purchase_control_journal import _reconcile_buy_row_for_horizon
             rows = [
@@ -125,9 +244,11 @@ def get_orders(
         if date_to:
             rows = [row for row in rows if row.get("delivery_date") is not None and str(row["delivery_date"]) <= str(date_to)]
         sort_key = sort_by if sort_by in {"delivery_date", "order_date", "order_number", "item_code", "remaining_qty"} else "delivery_date"
-        rows.sort(key=lambda row: (row.get(sort_key) is None, row.get(sort_key) if row.get(sort_key) is not None else "", row.get("row_key")))
-        if str(sort_dir or "asc").casefold() == "desc":
-            rows.reverse()
+        _canonical_purchase_sort(
+            rows,
+            field=sort_key,
+            descending=str(sort_dir or "asc").casefold() == "desc",
+        )
         effective_limit = max(1, min(int(limit or 100), 500))
         effective_offset = max(0, int(offset or 0))
         saved = dict(current_manifest.summary or {})
@@ -143,6 +264,8 @@ def get_orders(
                 "run_ids": list(saved.get("run_ids") or []),
                 "truth_status": saved.get("truth_status"),
                 "ledger_generation_id": current_manifest.source_generation_id,
+                "source_revision": str(current_manifest.source_revision),
+                "current_identity": None,
                 "summary": saved_summary,
                 "meta": saved,
         }
@@ -191,11 +314,6 @@ def get_filters(db: Session = Depends(get_db)):
             CurrentExecutionUnavailable,
             load_current_execution_rows,
             require_current_execution_scope,
-        )
-        require_current_execution_scope(
-            db,
-            entity_kind="purchase_control_journal",
-            scope_key="purchase:all-live-plans",
         )
         manifest = require_current_execution_scope(
             db,
@@ -246,12 +364,24 @@ def summarize_purchase_control_selection(
 ):
     """Backend-owned totals for the selected immutable purchase rows."""
     try:
-        return get_selection_summary(
+        manifest, rows, identities = _resolve_current_purchase_selection(
             db,
             snapshot_id=payload.snapshot_id,
             row_keys=payload.row_keys,
+            current_identity=payload.current_identity,
+            current_identities=payload.current_identities,
+            expected_source_revision=payload.expected_source_revision,
+        )
+        result = _selection_summary_from_rows(
+            rows=rows,
+            snapshot_id=int(manifest.id),
+            row_keys=[str(row.get("row_key")) for row in rows],
             horizon_period_to=payload.horizon_period_to,
         )
+        result["current_identity"] = payload.current_identity
+        result["current_identities"] = identities
+        result["source_revision"] = str(manifest.source_revision)
+        return result
     except PurchaseJournalSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except ValueError as e:
@@ -267,11 +397,21 @@ def materialize_purchase_control_rows(
 ):
     """Materialize selected neutral MRP purchase rows from the accepted snapshot."""
     try:
-        return materialize_rows(
+        manifest, rows, identities = _resolve_current_purchase_selection(
             db,
             snapshot_id=payload.snapshot_id,
             row_keys=payload.row_keys,
+            current_identity=payload.current_identity,
+            current_identities=payload.current_identities,
+            expected_source_revision=payload.expected_source_revision,
+        )
+        return materialize_rows(
+            db,
+            snapshot_id=int(manifest.id),
+            row_keys=identities,
             dry_run=payload.dry_run,
+            current_manifest=manifest,
+            current_rows=rows,
         )
     except PurchaseControlSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail)

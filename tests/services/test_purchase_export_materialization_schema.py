@@ -78,11 +78,14 @@ def test_purchase_export_batch_metadata_contract():
     table = models.PurchaseExportBatch.__table__
     assert table.name == "purchase_export_batch"
 
-    assert set(("ledger_generation_id", "planning_read_snapshot_id", "idempotency_key", "status")) <= set(
+    assert set(("ledger_generation_id", "idempotency_key", "status")) <= set(
         col.name
         for col in table.columns
         if not col.nullable
     )
+    assert table.c.planning_read_snapshot_id.nullable is True
+    assert table.c.current_execution_scope_id.nullable is True
+    assert table.c.current_execution_source_revision.nullable is True
     assert "payload_hash" in table.c
     assert table.c.request_payload is not None and table.c.result_payload is not None
 
@@ -104,12 +107,16 @@ def test_purchase_export_batch_metadata_contract():
         for constraint in table.constraints
         if constraint.__class__.__name__ == "CheckConstraint"
     }
-    assert "ck_purchase_export_batch_status" in checks
+    assert {
+        "ck_purchase_export_batch_status",
+        "ck_purchase_export_batch_exactly_one_source_anchor",
+    } <= checks
 
     indexes = {index.name for index in table.indexes}
     assert {
         "ix_purchase_export_batch_ledger_generation_id",
         "ix_purchase_export_batch_planning_read_snapshot_id",
+        "ix_purchase_export_batch_current_execution_scope_id",
     } <= indexes
 
 
