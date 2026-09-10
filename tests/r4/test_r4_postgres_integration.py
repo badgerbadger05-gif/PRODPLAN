@@ -39,10 +39,11 @@ def test_two_postgresql_sessions_serialize_current_replenishment_without_double_
     try:
         generation_id, _item_id, reservations, facts = _world(seed, prefix="pg-lock")
         reserves = _reserves(reservations)
+        source_key = f"physical:r4-pg-{generation_id}"
         apply_current_replenishment(
             seed,
             generation_id=generation_id,
-            source_key="physical:r4-pg",
+            source_key=source_key,
             source_revision=1,
             facts=facts,
             reserves=reserves,
@@ -63,7 +64,7 @@ def test_two_postgresql_sessions_serialize_current_replenishment_without_double_
             result["one"] = apply_current_replenishment(
                 first,
                 generation_id=generation_id,
-                source_key="physical:r4-pg",
+                source_key=source_key,
                 source_revision=2,
                 facts=facts,
                 reserves=reserves,
@@ -81,7 +82,7 @@ def test_two_postgresql_sessions_serialize_current_replenishment_without_double_
             result["two"] = apply_current_replenishment(
                 second,
                 generation_id=generation_id,
-                source_key="physical:r4-pg",
+                source_key=source_key,
                 source_revision=2,
                 facts=facts,
                 reserves=reserves,
