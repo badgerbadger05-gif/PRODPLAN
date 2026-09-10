@@ -1529,7 +1529,7 @@ describe('ProductionControlPage — characterization', () => {
     })
     expect(await screen.findByText('В журнале производства нет заказов')).toBeVisible()
   })
-  it('opens bright pink standalone labor dialog and sends only selected operations', async () => {
+  it('opens muted pink standalone labor dialog and sends only selected operations', async () => {
     vi.mocked(getStandalonePieceworkOptions).mockResolvedValue({
       product_id: 501, item_name: 'Сварная деталь', quantity: 10,
       operations: [
@@ -1543,7 +1543,7 @@ describe('ProductionControlPage — characterization', () => {
     await screen.findByText('Вал')
     await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
     const button = screen.getByRole('button', { name: 'Сдельный наряд' })
-    expect(button).toHaveStyle({ background: '#ff38a4' })
+    expect(button).toHaveStyle({ background: '#e8c7d6' })
     await user.click(button)
     const dialog = await screen.findByRole('dialog')
     await within(dialog).findByText(/Сдельный наряд - Сварная деталь/)

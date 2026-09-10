@@ -48,9 +48,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from .item_ledger.reservation import replenishment_remaining
+from .item_ledger.live_plan_scope import sealed_generation_lineage_ids
 
 from ..models import (
     Item,
+    LedgerGeneration,
     MrpRequirement,
     PaintWeldChainLink,
     PaintWeldPair,
@@ -297,7 +299,9 @@ def _resolve_weld_obligation(
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .filter(
             ProductionProduct.source_mrp_requirement_id == int(requirement.id),
-            ProductionProduct.ledger_generation_id == int(ctx.generation_id),
+            ProductionProduct.ledger_generation_id.in_(sealed_generation_lineage_ids(
+                db, db.get(LedgerGeneration, int(ctx.generation_id))
+            )),
             ProductionOrder.source_run_id == int(ctx.run.run_id),
             ProductionOrder.deletion_mark.is_(False),
         )
@@ -392,11 +396,15 @@ def _ensure_weld_order(
             if (
                 product is None
                 or int(order.source_run_id or -1) != int(ctx.run.run_id)
-                or int(product.ledger_generation_id or -1) != int(ctx.generation_id)
+                or order.deletion_mark
+                or int(product.item_id) != int(welded_item_id)
+                or int(product.ledger_generation_id or -1) not in sealed_generation_lineage_ids(
+                    db, db.get(LedgerGeneration, int(ctx.generation_id))
+                )
                 or int(product.source_mrp_requirement_id or -1)
                 != int(obligation.requirement.id)
             ):
-                raise ValueError("existing paint/weld chain has stale Ledger lineage")
+                raise ValueError("Существующая цепочка сварки и окраски не относится к действующему обязательству Ledger. Требуется проверка связи заказов.")
             return order, True
 
     if weld_qty <= 1e-9 or weld_qty > obligation.available_qty + 1e-9:

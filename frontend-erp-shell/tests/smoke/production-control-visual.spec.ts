@@ -424,7 +424,7 @@ test('standalone piecework selects welding operations without production', async
   await page.goto('/#/production-control')
   await page.getByRole('row').filter({ hasText: 'Кронштейн опорный' }).first().getByRole('checkbox').check()
   const button = page.getByRole('button', { name: 'Сдельный наряд', exact: true })
-  await expect(button).toHaveCSS('background-color', 'rgb(255, 56, 164)')
+  await expect(button).toHaveCSS('background-color', 'rgb(232, 199, 214)')
   await button.click()
   const dialog = page.getByRole('dialog')
   await expect(dialog).toContainText('Опора, после сварки')

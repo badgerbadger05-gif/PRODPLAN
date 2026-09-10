@@ -1024,3 +1024,51 @@ def test_welded_material_issues_use_frozen_bom_after_default_spec_change(
     assert issue_line is not None
     assert int(issue_line.component_item_id) == int(old_component.item_id)
     assert int(issue_line.source_spec_id or 0) == int(old_weld_spec.spec_id)
+
+@pytest.mark.parametrize("foreign_weld", [False, True])
+def test_existing_chain_survives_physical_refresh_but_rejects_foreign_lineage(db_session, monkeypatch, foreign_weld):
+    from app.services import paint_weld_chain as chain
+    db = db_session
+    _, welded, painted_product = _setup_pair(db, weld_outstanding=10)
+    _stub_demo(monkeypatch)
+    fake = _FakeClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+    first = open_paint_chain(db, painted_product_id=painted_product.product_id, dry_run=False)
+    weld_order = db.get(ProductionOrder, first['welded']['order_id'])
+    weld_product = db.query(ProductionProduct).filter_by(order_id=weld_order.order_id).one()
+    parent = db.query(models.LedgerGeneration).one()
+    child = models.LedgerGeneration(
+        generation_key='chain-physical-refresh', status='accepted', cutoff=parent.cutoff,
+        accepted_at=parent.accepted_at, capabilities=dict(parent.capabilities),
+        source_watermarks={'generation_kind': 'physical_refresh', 'parent_generation_id': parent.id},
+        physical_import_batch_id=parent.physical_import_batch_id, algorithm_version='test/1')
+    db.add(child)
+    db.flush()
+    db.get(models.PlanningTruthState, 1).current_generation_id = child.id
+    reservation = db.query(models.ReservationEntry).one()
+    reservation.ledger_generation_id = child.id
+    if foreign_weld:
+        foreign = models.LedgerGeneration(generation_key='foreign-chain', status='accepted',
+            cutoff=parent.cutoff, source_watermarks={}, capabilities=dict(parent.capabilities),
+            physical_import_batch_id=parent.physical_import_batch_id, algorithm_version='test/1')
+        db.add(foreign)
+        db.flush()
+        weld_product.ledger_generation_id = foreign.id
+    db.commit()
+    ctx = chain._resolve_painted_context(db, painted_product_id=painted_product.product_id,
+        painted_item_id=None, qty=None, planned_start=None, planned_finish=None)
+    obligation = chain._resolve_weld_obligation(db, ctx=ctx, welded_item_id=welded.item_id)
+    pair = db.query(PaintWeldPair).one()
+    kwargs = dict(ctx=ctx, obligation=obligation, pair=pair, painted_order=painted_product.order,
+        welded_item_id=welded.item_id, weld_qty=10, weld_start=None, weld_finish=None, basis_comment='')
+    if foreign_weld:
+        with pytest.raises(ValueError, match='не относится к действующему обязательству'):
+            chain._ensure_weld_order(db, **kwargs)
+    else:
+        assert obligation.allocated_qty == 10
+        assert obligation.available_qty == 0
+        reused, existed = chain._ensure_weld_order(db, **kwargs)
+        assert reused.order_id == weld_order.order_id and existed
+        assert weld_product.ledger_generation_id == parent.id
+    assert db.query(ProductionOrder).count() == 2
+    assert len(fake.posts) == 2

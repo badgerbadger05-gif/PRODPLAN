@@ -44,7 +44,7 @@ export function ProductionCommandBar({
       <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
       <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный; завершить заказ или оставить частичный выпуск">Произвести</button>
       <button onClick={onPiecework} disabled={!canProduce || loading}
-        style={{ background: '#ff38a4', borderColor: '#c21874', color: '#111', fontWeight: 700 }}
+        style={{ background: '#e8c7d6', borderColor: '#bc91a5', color: '#111', fontWeight: 700 }}
         title="Оформить работу сварщика отдельно от производства и окраски">Сдельный наряд</button>
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <div className="barSeparator" />

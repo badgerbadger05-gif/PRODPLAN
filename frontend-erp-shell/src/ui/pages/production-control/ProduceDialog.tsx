@@ -210,7 +210,7 @@ export function ProduceDialog({
           <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
           <button
             className="primary"
-            style={pieceworkOnly ? { background: '#ff38a4', borderColor: '#c21874', color: '#111' } : undefined}
+            style={pieceworkOnly ? { background: '#e8c7d6', borderColor: '#bc91a5', color: '#111' } : undefined}
             onClick={() => void submitProduce()}
             disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || executorsIncomplete}
           >
