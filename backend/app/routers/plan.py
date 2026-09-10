@@ -73,23 +73,29 @@ def _read_all_mrp_snapshot_rows(
     offset = 0
     pinned_snapshot_id = snapshot_id
     while True:
-        result = read_mrp_result_rows(
-            db=db,
-            run_id=int(run_id),
-            row_kind=row_kind,
-            snapshot_id=pinned_snapshot_id,
-            item_id=item_id,
-            root_item_id=root_item_id,
-            supplier_ref1c=supplier_ref1c,
-            category_id=category_id,
-            category_ref1c=category_ref1c,
-            area_id=area_id,
-            date_from=date_from,
-            date_to=date_to,
-            limit=5000,
-            offset=offset,
-            sort_dir=sort_dir or "asc",
-        )
+        try:
+            result = read_mrp_result_rows(
+                db=db,
+                run_id=int(run_id),
+                row_kind=row_kind,
+                snapshot_id=pinned_snapshot_id,
+                item_id=item_id,
+                root_item_id=root_item_id,
+                supplier_ref1c=supplier_ref1c,
+                category_id=category_id,
+                category_ref1c=category_ref1c,
+                area_id=area_id,
+                date_from=date_from,
+                date_to=date_to,
+                limit=5000,
+                offset=offset,
+                sort_dir=sort_dir or "asc",
+            )
+        except CurrentExecutionUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "mrp_result_current_unavailable", "reason": str(exc)},
+            ) from exc
         resolved_id = result.get("snapshot_id")
         if resolved_id is None:
             raise HTTPException(
@@ -139,9 +145,15 @@ def _page_groups(
 def _mrp_snapshot_identity(
     db: Session, run_id: int, snapshot_id: int
 ) -> dict[str, Any]:
-    manifest = read_mrp_result_manifest(
-        db=db, run_id=int(run_id), snapshot_id=int(snapshot_id)
-    )
+    try:
+        manifest = read_mrp_result_manifest(
+            db=db, run_id=int(run_id), snapshot_id=int(snapshot_id)
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "mrp_result_current_unavailable", "reason": str(exc)},
+        ) from exc
     if manifest.get("snapshot_id") is None:
         raise HTTPException(
             status_code=503,
