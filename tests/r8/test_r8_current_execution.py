@@ -335,3 +335,20 @@ def test_r8_truth_pointer_move_without_atomic_scope_publication_is_stale(db_sess
             entity_kind="assembly_queue",
             scope_key="assembly:all-live-plans",
         )
+
+
+def test_r8_scope_manifest_persists_read_summary_for_current_get(db_session):
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        rows=[_queue("queue:1", period="2026-09-10", plan_id=1, line_id=1, qty="2")],
+        entity_kinds=("assembly_queue",),
+        summary={"total_rows": 1, "total_queue_qty": "2"},
+    )
+    manifest = get_current_execution_scope(
+        db_session,
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    )
+    assert manifest.summary == {"total_rows": 1, "total_queue_qty": "2"}
