@@ -56,6 +56,8 @@ def _fact(
     order_ref: str = "order-1",
     order_line: str = "1",
     correction_ref: str | None = None,
+    known_at: datetime | None = None,
+    pool: str = "default",
 ):
     return ReceiptFact(
         sle_id=sle_id,
@@ -67,6 +69,8 @@ def _fact(
         receipt_ref=ref,
         receipt_line_no="1",
         correction_receipt_ref=correction_ref,
+        known_at=known_at or at,
+        planning_stock_pool=pool,
     )
 
 
@@ -96,7 +100,9 @@ def test_decreasing_m1_replays_shared_pool_and_changes_m2_assignment():
         ),
     ]
 
-    result = replay_supplier_receipt_basis(facts, reservations)
+    result = replay_supplier_receipt_basis(
+        facts, reservations, history_mode="as_occurred"
+    )
 
     assert _basis(result) == [
         (1, 1, Decimal("2"), "fifo"),
@@ -119,8 +125,12 @@ def test_full_cancel_and_repeated_cancel_are_idempotent_and_do_not_leave_negativ
         ),
     ]
 
-    first = replay_supplier_receipt_basis(facts, reservations)
-    second = replay_supplier_receipt_basis(facts, reservations)
+    first = replay_supplier_receipt_basis(
+        facts, reservations, history_mode="as_occurred"
+    )
+    second = replay_supplier_receipt_basis(
+        facts, reservations, history_mode="as_occurred"
+    )
 
     assert first.allocations == ()
     assert first.surplus_qty == Decimal("0")
@@ -142,7 +152,9 @@ def test_return_with_exact_original_ref_and_order_line_unwinds_newest_then_globa
         _fact(4, "-6", at=datetime(2026, 9, 4), ref="return", order_ref="order-1"),
     ]
 
-    result = replay_supplier_receipt_basis(facts, reservations)
+    result = replay_supplier_receipt_basis(
+        facts, reservations, history_mode="as_occurred"
+    )
 
     assert _basis(result) == [
         (1, 1, Decimal("2"), "fifo"),
@@ -161,7 +173,9 @@ def test_closed_reservation_is_not_reopened_by_later_fact_and_decimal_is_exact()
         _fact(1, "1.125", at=datetime(2026, 9, 1), ref="late"),
     ]
 
-    result = replay_supplier_receipt_basis(facts, reservations)
+    result = replay_supplier_receipt_basis(
+        facts, reservations, history_mode="as_occurred"
+    )
 
     assert _basis(result) == [(1, 2, Decimal("1.125"), "fifo")]
     assert all(row.qty >= 0 for row in result.allocations)
@@ -177,8 +191,10 @@ def test_equal_posting_times_and_delivery_order_have_deterministic_equivalent_re
     ]
     second = list(reversed(first))
 
-    assert replay_supplier_receipt_basis(first, reservations) == replay_supplier_receipt_basis(
-        second, reservations
+    assert replay_supplier_receipt_basis(
+        first, reservations, history_mode="as_occurred"
+    ) == replay_supplier_receipt_basis(
+        second, reservations, history_mode="as_occurred"
     )
 
 
@@ -195,6 +211,141 @@ def test_equivalent_correction_sequences_converge_without_arbitrary_row_limit():
         _fact(4, "-5", at=datetime(2026, 9, 4), ref="c3", correction_ref="base"),
     ]
 
-    assert replay_supplier_receipt_basis(sequence_a, reservations) == replay_supplier_receipt_basis(
-        sequence_b, reservations
+    assert replay_supplier_receipt_basis(
+        sequence_a, reservations, history_mode="as_occurred"
+    ) == replay_supplier_receipt_basis(
+        sequence_b, reservations, history_mode="as_occurred"
     )
+
+
+def test_addressed_receipt_precedes_fifo_and_aggregated_purchase_cap_is_respected():
+    reservations = {
+        10: [
+            _reservation(1, 101, "5", due=1),
+            _reservation(2, 102, "5", due=2),
+        ]
+    }
+    result = replay_supplier_receipt_basis(
+        [
+            _fact(
+                1,
+                "4",
+                at=datetime(2026, 9, 1),
+                ref="aggregated",
+                order_ref="aggregate-order",
+                order_line="7",
+            )
+        ],
+        reservations,
+        exact_allocation_caps={(10, "aggregate-order", "7"): {1: Decimal("2")} },
+        history_mode="as_occurred",
+    )
+    assert _basis(result) == [
+        (1, 1, Decimal("2"), "pegged"),
+        (1, 2, Decimal("2"), "fifo"),
+    ]
+
+
+def test_return_with_exact_original_reference_only_unwinds_that_receipt():
+    reservations = {10: [_reservation(1, 101, "5")]}
+    result = replay_supplier_receipt_basis(
+        [
+            _fact(1, "5", at=datetime(2026, 9, 1), ref="original"),
+            _fact(
+                2,
+                "2",
+                at=datetime(2026, 9, 2),
+                ref="other",
+                order_ref="order-2",
+            ),
+            _fact(
+                3,
+                "-3",
+                at=datetime(2026, 9, 3),
+                ref="return-original",
+                correction_ref="original",
+            ),
+        ],
+        reservations,
+        history_mode="as_occurred",
+    )
+    assert _basis(result) == [(2, 1, Decimal("2"), "fifo")]
+
+
+def test_return_with_supplier_order_line_then_no_reference_is_newest_first():
+    reservations = {
+        10: [
+            _reservation(1, 101, "2", due=1),
+            _reservation(2, 102, "2", due=2),
+            _reservation(3, 103, "4", due=3),
+        ]
+    }
+    result = replay_supplier_receipt_basis(
+        [
+            _fact(1, "2", at=datetime(2026, 9, 1), ref="line-old", order_ref="order-1", order_line="4"),
+            _fact(2, "2", at=datetime(2026, 9, 2), ref="line-new", order_ref="order-1", order_line="4"),
+            _fact(3, "4", at=datetime(2026, 9, 3), ref="free", order_ref="order-2", order_line="9"),
+            _fact(4, "-3", at=datetime(2026, 9, 4), ref="line-return", order_ref="order-1", order_line="4"),
+            _fact(5, "-1", at=datetime(2026, 9, 5), ref="free-return", order_ref="", order_line=""),
+        ],
+        reservations,
+        history_mode="as_occurred",
+    )
+    assert _basis(result) == [
+        (1, 1, Decimal("2"), "fifo"),
+        (3, 3, Decimal("3"), "fifo"),
+    ]
+
+
+def test_backdate_requires_explicit_history_mode_and_keeps_both_times():
+    reservations = {10: [_reservation(1, 101, "2"), _reservation(2, 102, "2", due=2)]}
+    facts = [
+        _fact(
+            1,
+            "2",
+            at=datetime(2026, 9, 10),
+            known_at=datetime(2026, 9, 10),
+            ref="late-known-first",
+        ),
+        _fact(
+            2,
+            "2",
+            at=datetime(2026, 9, 1),
+            known_at=datetime(2026, 9, 11),
+            ref="backdated",
+        ),
+    ]
+    occurred = replay_supplier_receipt_basis(
+        facts, reservations, history_mode="as_occurred"
+    )
+    known = replay_supplier_receipt_basis(facts, reservations, history_mode="as_known")
+    assert _basis(occurred) != _basis(known)
+    with pytest.raises(ValueError, match="history_mode"):
+        replay_supplier_receipt_basis(facts, reservations, history_mode="")
+
+
+def test_unknown_reservation_is_surplus_when_no_live_obligation_exists():
+    reservations = {10: []}
+    result = replay_supplier_receipt_basis(
+        [_fact(1, "5", at=datetime(2026, 9, 1), ref="unknown", order_ref="missing")],
+        reservations,
+        history_mode="as_occurred",
+    )
+    assert result.allocations == ()
+    assert result.surplus_qty == Decimal("5")
+
+
+def test_foreign_pool_is_not_touched_by_default_pool_replay():
+    reservations = {
+        10: [
+            _reservation(1, 101, "2", due=1),
+            _reservation(2, 102, "2", due=2),
+        ]
+    }
+    reservations[10][1].planning_stock_pool = "foreign"
+    result = replay_supplier_receipt_basis(
+        [_fact(1, "2", at=datetime(2026, 9, 1), ref="default", pool="default")],
+        reservations,
+        history_mode="as_occurred",
+    )
+    assert _basis(result) == [(1, 1, Decimal("2"), "fifo")]
