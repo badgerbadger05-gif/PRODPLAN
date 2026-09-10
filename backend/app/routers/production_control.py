@@ -55,6 +55,7 @@ from ..services.production_control_material_availability import (
     preview_make_work_item_materials,
 )
 from ..services.production_control_live_launch import overlay_execution_state, overlay_launch_facts
+from ..services.item_ledger.current_execution import CurrentExecutionUnavailable
 from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
     mark_route_sheets_printed_by_snapshot_members,
@@ -1543,6 +1544,11 @@ def get_order_line_materials(
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except MaterialCoverageSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "production_control_current_unavailable", "reason": str(e)},
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -1564,59 +1570,42 @@ def get_work_item_materials(
     remains readable.
     """
     try:
-        truth = planning_truth.require_accepted_truth(
-            db, "production_control.work_item_materials"
+        from ..services.item_ledger.current_execution import (
+            CurrentExecutionUnavailable,
+            load_current_execution_rows,
+            require_current_execution_scope,
         )
-        work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
-        requested_generation_id = int(
-            ledger_generation_id
-            if ledger_generation_id is not None
-            else truth.generation_id
-        )
-        if work is None or int(work.ledger_generation_id) != requested_generation_id:
-            raise HTTPException(status_code=404, detail="Актуальная расчётная строка не найдена")
-        journal_snapshot = (
-            db.query(models.PlanningReadSnapshot)
-            .filter(
-                models.PlanningReadSnapshot.consumer == PRODUCTION_JOURNAL_CONSUMER,
-                models.PlanningReadSnapshot.snapshot_key == PRODUCTION_JOURNAL_SNAPSHOT_KEY,
-                models.PlanningReadSnapshot.ledger_generation_id == requested_generation_id,
-                models.PlanningReadSnapshot.truth_status == "accepted",
-            )
-            .one_or_none()
-        )
-        published_row = None if journal_snapshot is None else (
-            db.query(models.PlanningReadRow)
-            .filter(
-                models.PlanningReadRow.snapshot_id == int(journal_snapshot.id),
-                models.PlanningReadRow.row_kind == PRODUCTION_JOURNAL_PROPOSAL_ROW_KIND,
-                models.PlanningReadRow.row_key == f"work-item:{int(work.id)}",
-            )
-            .one_or_none()
-        )
-        if journal_snapshot is None or published_row is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Опубликованный снимок строки расчёта не найден",
-            )
-        launch_qty = float(qty if qty is not None else work.replenishment_remaining_qty)
-        if launch_qty <= 0 or launch_qty > float(work.replenishment_remaining_qty) + 1e-6:
-            raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
-        payload = preview_make_work_item_materials(
+        current_manifest = require_current_execution_scope(
             db,
-            work_item_id=int(work.id),
-            item_id=int(work.item_id),
-            quantity=launch_qty,
-            spec_id=BomSpecificationResolver(db).default_spec_id(int(work.item_id)),
-            ledger_generation_id=requested_generation_id,
-            order_number=f"MRP-R-{int(work.requirement_id)}",
-            run_id=int(work.run_id),
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
         )
-        payload["truth_status"] = "accepted"
-        payload["cutoff"] = journal_snapshot.cutoff.isoformat()
-        return payload
+        current_rows = [
+            row for row in load_current_execution_rows(
+                db,
+                entity_kind="production_control_journal",
+                scope_key="production:all-live-orders",
+            )
+            if int((row.payload or {}).get("work_item_id") or 0) == int(work_item_id)
+        ]
+        if len(current_rows) != 1:
+            raise CurrentExecutionUnavailable("current work-item material row is missing or ambiguous")
+        persisted_material = (current_rows[0].payload or {}).get("material_coverage_snapshot")
+        if not isinstance(persisted_material, dict):
+            raise CurrentExecutionUnavailable("current work-item material coverage is missing")
+        persisted = dict(persisted_material)
+        persisted["truth_status"] = "accepted"
+        generation = db.get(models.LedgerGeneration, int(current_manifest.source_generation_id or 0))
+        persisted["cutoff"] = generation.cutoff.isoformat() if generation and generation.cutoff else None
+        return persisted
+
     except HTTPException:
         raise
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "production_control_current_unavailable", "reason": str(exc)},
+        ) from exc
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except Exception as exc:
