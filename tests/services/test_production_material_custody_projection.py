@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -980,6 +981,76 @@ def test_published_custody_keeps_rewind_baseline_cells(db_session):
         db_session, ledger_generation_id=next_target.id
     )
     assert state.for_product(product.product_id).at_workshop[component.item_id] == pytest.approx(7)
+
+
+def test_publish_compacts_nonbaseline_accepted_custody_but_keeps_building_stage(
+    db_session,
+):
+    base = _generation(
+        db_session,
+        key="custody-compact-old",
+        cutoff=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+    product, _parent, component = _product(db_session, item_code="COMPACT")
+    old_manifest = _manifest(
+        db_session, generation_id=base.id, source_event_high_watermark_id=0
+    )
+    old_manifest.is_baseline = False
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        qty=5,
+        source_event_high_watermark_id=0,
+    )
+    staged = _generation(
+        db_session,
+        key="custody-compact-staged",
+        cutoff=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    staged.status = "building"
+    staged_row = ProductionMaterialCustodyProjection(
+        ledger_generation_id=staged.id,
+        product_id=product.product_id,
+        component_item_id=component.item_id,
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        reserved_qty=Decimal("2"),
+        source_event_high_watermark_id=0,
+        is_current=False,
+    )
+    db_session.add(staged_row)
+    target = _generation(
+        db_session,
+        key="custody-compact-target",
+        cutoff=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    target_row = ProductionMaterialCustodyProjection(
+        ledger_generation_id=target.id,
+        product_id=product.product_id,
+        component_item_id=component.item_id,
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        reserved_qty=Decimal("6"),
+        source_event_high_watermark_id=0,
+        is_current=False,
+    )
+    db_session.add(target_row)
+    db_session.flush()
+
+    assert publish_current_material_custody(db_session, ledger_generation_id=target.id) == 1
+    db_session.flush()
+    assert db_session.get(ProductionMaterialCustodyProjectionManifest, base.id) is not None
+    assert db_session.query(ProductionMaterialCustodyProjection).filter_by(
+        ledger_generation_id=base.id
+    ).count() == 0
+    assert db_session.query(ProductionMaterialCustodyProjection).filter_by(
+        ledger_generation_id=staged.id
+    ).count() == 1
+    assert db_session.query(ProductionMaterialCustodyProjection).filter_by(
+        ledger_generation_id=target.id, is_current=True
+    ).count() == 1
 
 
 def test_projection_read_refolds_when_the_watermark_moved_under_it(db_session):
