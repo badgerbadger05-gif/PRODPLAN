@@ -6,6 +6,7 @@ import pytest
 
 from app import models
 from app.services import period_plan_service
+from app.services.production_control_journal import _accepted_fixed_run_ids
 from app.services.item_ledger.r3_contract import (
     CurrentMrpResolutionError,
     current_live_run,
@@ -89,3 +90,27 @@ def test_current_pointer_rejects_retired_or_mismatched_run(db_session):
     with pytest.raises(CurrentMrpResolutionError, match="not FIXED_SNAPSHOT"):
         current_live_run(db_session, plan.id)
 
+
+def test_current_journal_selector_uses_pointer_when_run_is_on_old_generation(db_session):
+    plan, run = _current_plan(db_session)
+    old = models.LedgerGeneration(
+        generation_key="r3-current-reader-old-generation",
+        status="accepted",
+        cutoff=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        accepted_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        algorithm_version="r3-current-reader-old",
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch_id=run.ledger_generation.physical_import_batch_id,
+    )
+    db_session.add(old)
+    db_session.flush()
+    run.ledger_generation_id = old.id
+    run.ledger_cutoff = old.cutoff
+    db_session.add(models.PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
+    db_session.commit()
+
+    current_generation_id = db_session.get(models.PlanningTruthState, 1).current_generation_id
+    assert _accepted_fixed_run_ids(
+        db_session, ledger_generation_id=int(current_generation_id)
+    ) == [int(run.run_id)]
