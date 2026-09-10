@@ -125,6 +125,10 @@ const journalResponse: ExecutionJournalResponse = {
       covered_qty: 2,
       remaining_qty: 8,
       unassigned_qty: 0,
+      status_label: 'Частично',
+      explanations: [],
+      current_identity: 'period-plan:123:requirement:1:item:501',
+      source_revision: 'period-plan:123:accepted:7',
       coverage_pct: 20,
       status: 'partial',
       need_date: '2026-05-15',
@@ -189,6 +193,11 @@ const journalResponseWithLedgerLinks: ExecutionJournalResponse = {
           type: 'planned_order',
           order_id: 77,
           qty: 1,
+          assigned_qty: 0,
+          unassigned_qty: 1,
+          current_identity: 'mrp-run:900:production:requirement:1:item:501:allocation:default',
+          navigation_href: '#/mrp-runs/900?tab=production&current_identity=mrp-run%3A900%3Aproduction%3Arequirement%3A1%3Aitem%3A501%3Aallocation%3Adefault',
+          navigation_reason: null,
           remaining_qty: 1,
           need_date: '2026-05-20',
           forecast_date: null,
@@ -667,7 +676,7 @@ describe('PeriodPlanPage — detail view', () => {
     )
     expect(screen.getByRole('link', { name: 'Задание #77' })).toHaveAttribute(
       'href',
-      '#/mrp-runs/900?tab=production&planned_order_id=77',
+      '#/mrp-runs/900?tab=production&current_identity=mrp-run%3A900%3Aproduction%3Arequirement%3A1%3Aitem%3A501%3Aallocation%3Adefault',
     )
   })
 
@@ -693,6 +702,9 @@ describe('PeriodPlanPage — detail view', () => {
         gross_qty: 10,
         net_qty: 12,
         status: 'execution_unavailable',
+        status_label: null,
+        current_identity: null,
+        source_revision: null,
         execution_available: false,
         execution_unavailable_reason: 'net exceeds gross',
       }],
@@ -707,7 +719,7 @@ describe('PeriodPlanPage — detail view', () => {
     renderAt('/period-plan/123')
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
 
-    expect(await screen.findByText('Исполнение недоступно')).toBeInTheDocument()
+    expect(await screen.findByText('Недоступно')).toBeInTheDocument()
     expect(screen.getByTitle(/Потребность с припусками: 10/)).toBeInTheDocument()
     expect(screen.queryByText(/Общее выполнение:/)).not.toBeInTheDocument()
   })

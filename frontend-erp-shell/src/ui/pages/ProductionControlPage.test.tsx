@@ -342,6 +342,7 @@ beforeEach(() => {
       replenishment_received_qty: 2,
       replenishment_remaining_qty: 7,
       lifecycle_status: 'active',
+      allocations: [],
     }],
     truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
   })

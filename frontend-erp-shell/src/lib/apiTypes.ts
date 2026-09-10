@@ -4138,6 +4138,12 @@ export interface components {
             purchase_to_order_qty?: number | null;
             /** Unassigned Qty */
             unassigned_qty?: number | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
+            /** Explanations */
+            explanations?: string[];
         };
         /** ExecutionJournalSummary */
         ExecutionJournalSummary: {
@@ -4262,6 +4268,16 @@ export interface components {
             forecast_reason?: string | null;
             /** Forecast Status */
             forecast_status?: ("early" | "on_time" | "delayed" | "critical" | "unavailable") | null;
+            /** Assigned Qty */
+            assigned_qty?: number | null;
+            /** Unassigned Qty */
+            unassigned_qty?: number | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Navigation Href */
+            navigation_href?: string | null;
+            /** Navigation Reason */
+            navigation_reason?: string | null;
         };
         /** ExportManufacturesPayload */
         ExportManufacturesPayload: {

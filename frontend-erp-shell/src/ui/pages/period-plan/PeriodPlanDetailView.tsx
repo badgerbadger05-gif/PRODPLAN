@@ -3,7 +3,6 @@ import type {
   ExecutionJournalLedgerLinkEvent,
   ExecutionJournalRow,
   ExecutionJournalResponse,
-  ExecutionWorkItem,
   PeriodPlan,
   PeriodPlanMatrix,
   PeriodPlanRun,
@@ -11,9 +10,7 @@ import type {
 import {
   flowClass,
   flowLabel,
-  journalRowStatus,
   journalRowStatusClass,
-  journalRowStatusLabel,
   isPlanningTruthAccepted,
   periodPlanStatusClass,
   periodPlanStatusLabel,
@@ -40,6 +37,7 @@ import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../../
 import { bucketLabel, type SortDir } from './helpers'
 import { ForecastShift } from './ForecastShift'
 import { OutputFactSummary } from '../production-control/OutputFactSummary'
+import { executionJournalRowPresentation, executionWorkItemPresentation } from './periodPlanExecutionPresentation'
 
 type Tab = 'matrix' | 'journal'
 
@@ -609,7 +607,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
-    const body = journalRows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 0, r.completed_qty, r.remaining_qty, r.need_date ?? '', r.status_label || journalRowStatusLabel(journalRowStatus(r)), r.coverage_pct, r.work_items.length].map(esc).join(';'))
+    const body = journalRows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 'н/д', r.completed_qty, r.remaining_qty, r.need_date ?? '', r.status_label ?? 'Недоступно', r.coverage_pct, r.work_items.length].map(esc).join(';'))
     const csv = '﻿' + [headers.join(';'), ...body].join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -620,44 +618,6 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     URL.revokeObjectURL(url)
   }
 
-  function workItemHref(wi: { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number; one_c_opened?: boolean; order_number?: string }) {
-    if (wi.type === 'production_order') {
-      if (wi.product_id) return `#/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
-      if (wi.order_id) return `#/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
-      return null as string | null
-    }
-    if (wi.type === 'planned_purchase' && wi.one_c_opened && wi.order_number) {
-      return `#/purchase-control?search=${encodeURIComponent(wi.order_number)}`
-    }
-    const runId = wi.run_id ?? activeRunId ?? journal?.run_id
-    if (!runId) return null as string | null
-    const search = new URLSearchParams()
-    if (wi.type === 'planned_order') {
-      search.set('tab', 'production')
-      if (wi.order_id) search.set('planned_order_id', String(wi.order_id))
-    } else if (wi.type === 'planned_purchase') {
-      search.set('tab', 'purchases')
-      if (wi.purchase_id) search.set('purchase_id', String(wi.purchase_id))
-    } else if (wi.type === 'planned_rework') {
-      search.set('tab', 'rework')
-      if (wi.rework_id) search.set('rework_id', String(wi.rework_id))
-    } else {
-      return null as string | null
-    }
-    return `#/mrp-runs/${encodeURIComponent(String(runId))}?${search.toString()}`
-  }
-
-  function workItemAssignedQty(wi: ExecutionWorkItem) {
-    return wi.type === 'production_order' || wi.type === 'planned_rework' || (wi.type === 'planned_purchase' && wi.one_c_opened)
-      ? wi.qty
-      : null
-  }
-
-  function workItemUnassignedQty(wi: ExecutionWorkItem) {
-    return wi.type === 'planned_order' || (wi.type === 'planned_purchase' && !wi.one_c_opened)
-      ? wi.qty
-      : null
-  }
 
   function ledgerItemLink(row: Pick<ExecutionJournalRow, 'item_id' | 'item_code'>) {
     const itemId = Number(row.item_id) || null
@@ -1327,10 +1287,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           </td>
                           <td
                             className="numCell"
-                            style={{ color: (row.unassigned_qty ?? 0) > 0 ? 'var(--red)' : undefined }}
-                            title={(row.unassigned_qty ?? 0) > 0 ? `Не оформлено в заказы: ${qty(row.unassigned_qty ?? 0)}` : undefined}
+                            style={{ color: row.unassigned_qty != null && row.unassigned_qty > 0 ? 'var(--red)' : undefined }}
+                            title={row.unassigned_qty != null && row.unassigned_qty > 0 ? `Не оформлено в заказы: ${qty(row.unassigned_qty)}` : undefined}
                           >
-                            {row.ordered_qty > 0 || (row.unassigned_qty ?? 0) > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}
+                            {row.unassigned_qty == null ? <span className="muted">н/д</span> : row.ordered_qty > 0 || row.unassigned_qty > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}
                           </td>
                           <td className="numCell">
                             {journalTruthAccepted && row.execution_available === false
@@ -1347,15 +1307,16 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                             <ForecastShift forecast={row} />
                           </td>
                           <td style={{ textAlign: 'center' }}>
-                            {journalTruthAccepted
-                              ? <span className={`miniPill ${journalRowStatusClass(journalRowStatus(row))}`}>
-                                  {journalRowStatusLabel(journalRowStatus(row))}
-                                </span>
-                              : <span className="muted">Недоступно</span>}
+                            {(() => {
+                              const presentation = executionJournalRowPresentation(row)
+                              return !presentation.unavailable && presentation.statusLabel
+                                ? <span className={`miniPill ${journalRowStatusClass(row.status ?? 'execution_unavailable')}`} title={presentation.explanations.join('; ') || undefined} data-current-identity={presentation.currentIdentity ?? undefined} data-source-revision={presentation.sourceRevision ?? undefined}>{presentation.statusLabel}</span>
+                                : <span className="muted">Недоступно</span>
+                            })()}
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {journalTruthAccepted && row.coverage_pct !== null
-                              ? <span className={`miniPill ${journalRowStatusClass(journalRowStatus(row))}`}>{row.coverage_pct}%</span>
+                              ? <span className={`miniPill ${journalRowStatusClass(row.status ?? 'execution_unavailable')}`}>{row.coverage_pct}%</span>
                               : <span className="muted">—</span>}
                           </td>
                           <td style={{ textAlign: 'center' }}>
@@ -1365,9 +1326,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           </td>
                         </tr>
                         {expandedReq === row.req_id && row.work_items.map((wi, i) => {
-                          const href = workItemHref(wi as unknown as { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number })
-                          const assignedQty = workItemAssignedQty(wi)
-                          const unassignedQty = workItemUnassignedQty(wi)
+                          const presentation = executionWorkItemPresentation(wi)
+                          const href = presentation.href
+                          const assignedQty = presentation.assignedQty
+                          const unassignedQty = presentation.unassignedQty
                           const label = wi.type === 'production_order'
                             ? `Заказ ${wi.order_number || '#' + wi.order_id}`
                             : wi.type === 'planned_order'
@@ -1383,7 +1345,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                   {href ? (
                                     <a href={href} title="Открыть источник">{label}</a>
                                   ) : (
-                                    <span>{label}</span>
+                                    <span title={presentation.unavailableReason ?? undefined}>{label}</span>
                                   )}
                                   {wi.type === 'production_order' && (
                                     <span
@@ -1409,7 +1371,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                     <span className="miniPill to_move" title="Плановое задание MRP, заказ ещё не создан">План MRP</span>
                                   )}
                                   <span className="muted">
-                                    оформлено: <strong>{assignedQty !== null ? qty(assignedQty) : '—'}</strong>
+                                    оформлено: <strong>{assignedQty !== null ? qty(assignedQty) : 'н/д'}</strong>
                                     {unassignedQty !== null && unassignedQty > 0 && (
                                       <> · не оформлено: <strong style={{ color: 'var(--red)' }}>{qty(unassignedQty)}</strong></>
                                     )}

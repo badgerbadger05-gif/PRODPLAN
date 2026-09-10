@@ -105,6 +105,7 @@ const reservations: ItemLedgerReservationsResponse['rows'] = [
     replenishment_received_qty: 79.57,
     replenishment_remaining_qty: 71.07,
     lifecycle_status: 'active',
+    allocations: [],
   },
   {
     reservation_id: 102,
@@ -120,6 +121,7 @@ const reservations: ItemLedgerReservationsResponse['rows'] = [
     replenishment_received_qty: 20,
     replenishment_remaining_qty: 50,
     lifecycle_status: 'released',
+    allocations: [],
   },
 ]
 
