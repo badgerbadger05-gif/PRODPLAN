@@ -312,10 +312,14 @@ export function ProductionControlPage() {
 
   async function changeStatus(row: OrderRow, status: string) {
     if (row.product_id == null) return
+    if (!row.current_identity || !row.source_revision) {
+      setError('Текущая строка заказа недоступна для изменения: отсутствует identity/revision')
+      return
+    }
     const previous = row.status
     setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status } : item))
     try {
-      await updateOrderStatus(row.product_id, status)
+      await updateOrderStatus(row.product_id, status, row.current_identity, row.source_revision)
     } catch (e) {
       setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status: previous } : item))
       setError(e instanceof Error ? e.message : String(e))
@@ -323,7 +327,19 @@ export function ProductionControlPage() {
   }
 
   function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
-    return postMaterialIssues(productIds, 'erp-shell', sourceWarehouseRef)
+    const requested = Array.from(new Set(productIds))
+    const actionRows = rows.filter((row) => row.product_id != null && requested.includes(row.product_id))
+    const identities = actionRows.map((row) => row.current_identity)
+    const revisions = new Set(actionRows.map((row) => row.source_revision).filter(Boolean))
+    if (
+      actionRows.length !== requested.length
+      || identities.length !== requested.length
+      || identities.some((identity) => !identity)
+      || revisions.size !== 1
+    ) {
+      throw new Error('Текущие строки материалов недоступны: требуется полный identity и единая revision')
+    }
+    return postMaterialIssues(requested, 'erp-shell', sourceWarehouseRef, identities as string[], Array.from(revisions)[0])
   }
 
   function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export', productIds?: number[]) {
@@ -437,6 +453,16 @@ export function ProductionControlPage() {
     let printWindow: Window | null = null
     try {
       if (workItemIds.length) {
+        const proposalRows = selectedRows.filter((row) => row.work_item_id != null && workItemIds.includes(row.work_item_id))
+        const proposalIdentities = proposalRows.map((row) => row.current_identity)
+        const proposalRevisions = new Set(proposalRows.map((row) => row.source_revision).filter(Boolean))
+        if (
+          proposalRows.length !== workItemIds.length
+          || proposalIdentities.some((identity) => !identity)
+          || proposalRevisions.size !== 1
+        ) {
+          throw new Error('Текущие MRP-строки недоступны: требуется полный identity и единая revision')
+        }
         const materialized = await materializeMakeWorkItems(workItemIds.map((workItemId) => {
           const row = selectedRows.find((item) => item.work_item_id === workItemId)
           const launchQty = launchQtyByWorkItem[workItemId] ?? row?.launchable_qty
@@ -446,7 +472,7 @@ export function ProductionControlPage() {
             launch_qty: launchQty,
             expected_materialized_qty: row?.materialized_order_qty ?? 0,
           }
-        }))
+        }), proposalIdentities as string[], Array.from(proposalRevisions)[0])
         ids = Array.from(new Set([
           ...ids,
           ...(materialized.created ?? []).map((row) => row.product_id),
@@ -551,7 +577,17 @@ export function ProductionControlPage() {
   async function saveOrderQuantity(productId: number, value: number) {
     setError('')
     setMessage('')
-    const result = await updateOrderQuantity(productId, value)
+    const row = rows.find((item) => item.product_id === productId)
+    if (!row?.current_identity || !row.source_revision) {
+      setError('Текущая строка заказа недоступна для изменения: отсутствует identity/revision')
+      return
+    }
+    const result = await updateOrderQuantity(
+      productId,
+      value,
+      row.current_identity,
+      row.source_revision,
+    )
     setRows((list) => list.map((row) => row.product_id === productId
       ? { ...row, quantity: result.quantity, remaining_qty: result.remaining_qty }
       : row))
@@ -732,6 +768,8 @@ export function ProductionControlPage() {
       const result = await produceOrderLine(productId, {
         partial: producePartial,
         request_key: produceRequestKey,
+        current_identity: activeRow?.current_identity ?? undefined,
+        expected_source_revision: activeRow?.source_revision ?? undefined,
         ...(qty > 0 ? { qty } : {}),
         ...(headerExecutor ? { executor: headerExecutor } : {}),
         ...(operationExecutors.length ? { operation_executors: operationExecutors } : {}),
@@ -775,7 +813,16 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      const result = await returnLeftoverComponents(productId, 'erp-shell')
+      const row = rows.find((item) => item.product_id === productId)
+      if (!row?.current_identity || !row.source_revision) {
+        throw new Error('Текущая строка заказа недоступна для изменения: отсутствует identity/revision')
+      }
+      const result = await returnLeftoverComponents(
+        productId,
+        'erp-shell',
+        row.current_identity,
+        row.source_revision,
+      )
       const created = Number(result.created_issues ?? 0)
       const skipped = (result.skipped_rows ?? []).length
       setMessage(`Возврат остатков: создано заявок ${created}${skipped ? `, пропущено ${skipped}` : ''}`)
@@ -805,7 +852,12 @@ export function ProductionControlPage() {
     setMessage('')
     try {
       for (const row of selected) {
-        if (row.product_id != null) await deleteProductionOrder(row.product_id)
+        if (row.product_id != null) {
+          if (!row.current_identity || !row.source_revision) {
+            throw new Error('Выбранная строка заказа недоступна для удаления: отсутствует identity/revision')
+          }
+          await deleteProductionOrder(row.product_id, row.current_identity, row.source_revision)
+        }
       }
       setSelectedIds(new Set())
       setMessage(`Удалено локальных заказов: ${selected.length}`)

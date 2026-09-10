@@ -179,6 +179,8 @@ export type MaterialIssueCreatePayload = {
   initiated_by?: string | null
   warehouse_ref1c?: string | null
   source_warehouse_ref1c?: string | null
+  current_identities?: string[]
+  expected_source_revision?: string | null
 }
 
 // Исполнитель одной операции спецификации. Бэкенд ищет его по ссылке

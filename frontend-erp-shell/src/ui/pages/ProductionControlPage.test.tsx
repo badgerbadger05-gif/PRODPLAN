@@ -988,7 +988,9 @@ describe('ProductionControlPage — characterization', () => {
 
     await user.click(exportBtn)
 
-    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101], 'erp-shell', undefined))
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
+      [101], 'erp-shell', undefined, ['production:order:101'], 'rev-7',
+    ))
     // issue_id 1 from postMaterialIssues result flows into the 1C export.
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
   })
@@ -1053,8 +1055,9 @@ describe('ProductionControlPage — characterization', () => {
       work_item_id: 701,
       launch_qty: 6,
       expected_materialized_qty: 0,
-    }]))
-    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([901], 'erp-shell', undefined))
+    }], ['production:order:101'], 'rev-7'))
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/текущие строки материалов недоступны/i))
+    expect(postMaterialIssues).not.toHaveBeenCalled()
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })
 
@@ -1118,6 +1121,7 @@ describe('ProductionControlPage — characterization', () => {
       status: 'created',
       issue_status: 'not_requested',
       available_actions: ['edit_quantity'],
+      current_identity: 'production:order:901',
     } as OrderRow
     vi.mocked(listProductionOrders).mockResolvedValue({
       rows: [editable], total: 1, limit: 100, offset: 0, latest_run_id: 77,
@@ -1213,6 +1217,8 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(submit)
     await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(101, {
       partial,
+      current_identity: 'production:order:101',
+      expected_source_revision: 'rev-7',
       request_key: expect.any(String),
       qty: partial ? 7 : 11,
       operation_executors: [
@@ -1233,7 +1239,7 @@ describe('ProductionControlPage — characterization', () => {
       },
     } as OrderRow
     vi.mocked(listProductionOrders).mockResolvedValue({
-      rows: [paint], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      rows: [paint, { ...fakeRows()[1] }], total: 2, limit: 100, offset: 0, latest_run_id: 77,
       truth_meta: fakeTruthMeta,
     })
     vi.mocked(openPaintWeldChains).mockResolvedValue({
@@ -1243,7 +1249,7 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
 
     await screen.findByText(/^Сварная деталь: Кронштейн после сварки/)
-    expect(within(ordersTable(document.body)).getAllByRole('row')).toHaveLength(2)
+    expect(within(ordersTable(document.body)).getAllByRole('row')).toHaveLength(3)
     await user.click(within(rowFor('Кронштейн после окраски')).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
 
@@ -1251,7 +1257,9 @@ describe('ProductionControlPage — characterization', () => {
       'Будет открыта цепочка сварка → окраска. Сначала будет запущена сварная деталь: Кронштейн после сварки. Продолжить?',
     )
     await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([101]))
-    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101, 102], 'erp-shell', undefined))
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
+      [101, 102], 'erp-shell', undefined, ['production:order:101', 'production:order:102'], 'rev-7',
+    ))
   })
 
   it('shows a welded row as a disabled chain member and identifies the welded materials basis', async () => {

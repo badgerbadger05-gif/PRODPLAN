@@ -72,13 +72,19 @@ export type MakeLaunchRequest = {
   expected_materialized_qty: number
 }
 
-export function materializeMakeWorkItems(workItems: number[] | MakeLaunchRequest[]) {
+export function materializeMakeWorkItems(
+  workItems: number[] | MakeLaunchRequest[],
+  currentIdentities: string[] = [],
+  expectedSourceRevision?: string | null,
+) {
   const legacyIds = workItems.filter((row): row is number => typeof row === 'number')
   const requests = workItems.filter((row): row is MakeLaunchRequest => typeof row !== 'number')
   const body = {
     work_item_ids: legacyIds,
     work_items: requests,
     initiated_by: 'erp-shell',
+    current_identities: currentIdentities,
+    expected_source_revision: expectedSourceRevision,
   }
   return api<MaterializeMakeWorkItemsResponse>('/v1/production-control/orders/from-work-items', {
     method: 'POST',
@@ -99,10 +105,20 @@ export type OrderQuantityUpdateResult = {
 
 // Количество уже созданного, но ещё не открытого в 1С заказа. Потребность
 // компонентов пересчитывается на бэкенде от нового количества.
-export function updateOrderQuantity(productId: number, quantity: number) {
+export function updateOrderQuantity(
+  productId: number,
+  quantity: number,
+  currentIdentity?: string,
+  expectedSourceRevision?: string | null,
+) {
   return api<OrderQuantityUpdateResult>(`/v1/production-control/orders/${productId}/quantity`, {
     method: 'PATCH',
-    body: JSON.stringify({ quantity, initiated_by: 'erp-shell' }),
+    body: JSON.stringify({
+      quantity,
+      initiated_by: 'erp-shell',
+      current_identity: currentIdentity,
+      expected_source_revision: expectedSourceRevision,
+    }),
   })
 }
 
@@ -142,18 +158,29 @@ export function getWorkItemMaterials(workItemId: number, quantity: number, ledge
   return api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
 }
 
-export function updateOrderStatus(productId: number, status: string) {
+export function updateOrderStatus(
+  productId: number,
+  status: string,
+  currentIdentity?: string,
+  expectedSourceRevision?: string | null,
+) {
   return api(`/v1/production-control/orders/${productId}/state`, {
     method: 'PATCH',
-    body: JSON.stringify({ status }),
+    body: JSON.stringify({
+      status,
+      current_identity: currentIdentity,
+      expected_source_revision: expectedSourceRevision,
+    }),
   })
 }
 
-export function postMaterialIssues(productIds: number[], initiatedBy: string, sourceWarehouseRef?: string) {
+export function postMaterialIssues(productIds: number[], initiatedBy: string, sourceWarehouseRef?: string, currentIdentities: string[] = [], expectedSourceRevision?: string | null) {
   const body: ApiSchemas['MaterialIssueCreatePayload'] = {
     product_ids: productIds,
     initiated_by: initiatedBy,
     ...(sourceWarehouseRef ? { source_warehouse_ref1c: sourceWarehouseRef } : {}),
+    current_identities: currentIdentities,
+    expected_source_revision: expectedSourceRevision,
   }
   return api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
     method: 'POST',
@@ -254,8 +281,17 @@ export function closePaintWeldChain(productId: number, payload: PaintWeldChainCl
   })
 }
 
-export function returnLeftoverComponents(productId: number, initiatedBy?: string | null) {
-  const query = initiatedBy ? `?initiated_by=${encodeURIComponent(initiatedBy)}` : ''
+export function returnLeftoverComponents(
+  productId: number,
+  initiatedBy?: string | null,
+  currentIdentity?: string,
+  expectedSourceRevision?: string | null,
+) {
+  const params = new URLSearchParams()
+  if (initiatedBy) params.set('initiated_by', initiatedBy)
+  if (currentIdentity) params.set('current_identity', currentIdentity)
+  if (expectedSourceRevision) params.set('expected_source_revision', expectedSourceRevision)
+  const query = params.toString() ? `?${params.toString()}` : ''
   return api<ReturnLeftoversResult>(`/v1/production-control/orders/${productId}/return-leftovers${query}`, {
     method: 'POST',
   })
@@ -279,8 +315,16 @@ export function createMaterialIssues(payload: MaterialIssueCreatePayload) {
   })
 }
 
-export function deleteProductionOrder(productId: number) {
-  return api(`/v1/production-control/orders/${productId}`, { method: 'DELETE' })
+export function deleteProductionOrder(
+  productId: number,
+  currentIdentity?: string,
+  expectedSourceRevision?: string | null,
+) {
+  const params = new URLSearchParams()
+  if (currentIdentity) params.set('current_identity', currentIdentity)
+  if (expectedSourceRevision) params.set('expected_source_revision', expectedSourceRevision)
+  const query = params.toString() ? `?${params.toString()}` : ''
+  return api(`/v1/production-control/orders/${productId}${query}`, { method: 'DELETE' })
 }
 
 export type CloseProductionOrderResult = {

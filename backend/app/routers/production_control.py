@@ -1082,11 +1082,15 @@ class OrdersFromWorkItemsPayload(BaseModel):
     work_item_ids: List[int] = Field(default_factory=list)
     work_items: List[MakeWorkItemLaunchPayload] = Field(default_factory=list)
     initiated_by: Optional[str] = None
+    current_identities: List[str] = Field(default_factory=list)
+    expected_source_revision: Optional[str] = None
 
 
 class OrderLineQuantityPayload(BaseModel):
     quantity: float = Field(gt=0)
     initiated_by: Optional[str] = None
+    current_identity: Optional[str] = None
+    expected_source_revision: Optional[str] = None
 
 
 class OpenPaintWeldChainsPayload(BaseModel):
@@ -1097,6 +1101,8 @@ class OpenPaintWeldChainsPayload(BaseModel):
 class ExportProductionOrdersPayload(BaseModel):
     order_ids: List[int]
     dry_run: bool = True
+    current_identities: List[str] = Field(default_factory=list)
+    expected_source_revision: Optional[str] = None
     # DEPRECATED: демо-гард записи удалён после go-live. Поле принимается и
     # игнорируется, чтобы существующие клиенты не получали 422.
     allow_production: bool = False
@@ -1188,6 +1194,54 @@ def _require_current_production_action(
     if len(rows) != 1:
         raise CurrentExecutionUnavailable("current production action identity is missing or ambiguous")
     return manifest, rows[0]
+
+
+def _require_current_production_identities(
+    db: Session,
+    *,
+    identities: list[str],
+    expected_source_revision: Optional[str],
+    locator_key: str | None = None,
+    locator_values: set[int] | None = None,
+):
+    if not identities or not expected_source_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "production_current_identity_and_revision_required"},
+        )
+    manifest = require_current_execution_scope(
+        db,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
+    if str(expected_source_revision) != str(manifest.source_revision):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "production_current_revision_stale",
+                "expected_source_revision": manifest.source_revision,
+            },
+        )
+    wanted = sorted({str(identity).strip() for identity in identities if str(identity).strip()})
+    rows = [
+        row for row in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        if str(row.business_identity) in wanted
+    ]
+    if len(rows) != len(wanted):
+        raise CurrentExecutionUnavailable("current production identities are missing or ambiguous")
+    if locator_key is not None and locator_values is not None:
+        resolved = {
+            int((row.payload or {}).get(locator_key) or 0)
+            for row in rows
+            if (row.payload or {}).get(locator_key) is not None
+        }
+        if resolved != {int(value) for value in locator_values}:
+            raise HTTPException(status_code=409, detail={"code": "production_current_locator_stale"})
+    return manifest, rows
 
 
 class AssembleMaterialIssuePayload(BaseModel):
@@ -1557,7 +1611,20 @@ def get_orders_journal(
 @router.patch("/orders/{product_id}/state", response_model=dict)
 def patch_order_line_state(product_id: int, payload: LineStatePayload, db: Session = Depends(get_db)):
     try:
-        return update_line_state(db, int(product_id), payload.dict(exclude_unset=True))
+        _require_current_production_action(
+            db,
+            product_id=int(product_id),
+            current_identity=payload.current_identity,
+            expected_source_revision=payload.expected_source_revision,
+        )
+        changes = payload.dict(exclude_unset=True)
+        changes.pop("current_identity", None)
+        changes.pop("expected_source_revision", None)
+        return update_line_state(db, int(product_id), changes)
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -1577,6 +1644,12 @@ def patch_order_line_quantity(
     как заблокированные, их правит отдельная корректировка.
     """
     try:
+        _require_current_production_action(
+            db,
+            product_id=int(product_id),
+            current_identity=payload.current_identity,
+            expected_source_revision=payload.expected_source_revision,
+        )
         return update_local_order_quantity(
             db,
             int(product_id),
@@ -1585,6 +1658,10 @@ def patch_order_line_quantity(
         )
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1592,9 +1669,24 @@ def patch_order_line_quantity(
 
 
 @router.delete("/orders/{product_id}", response_model=dict)
-def delete_local_order(product_id: int, db: Session = Depends(get_db)):
+def delete_local_order(
+    product_id: int,
+    current_identity: Optional[str] = None,
+    expected_source_revision: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     try:
+        _require_current_production_action(
+            db,
+            product_id=int(product_id),
+            current_identity=current_identity,
+            expected_source_revision=expected_source_revision,
+        )
         return cancel_local_order(db, int(product_id))
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1608,15 +1700,14 @@ def get_order_line_materials(
 ):
     try:
         return get_materials_snapshot(db, int(product_id))
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except MaterialCoverageSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
-    except CurrentExecutionUnavailable as e:
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "production_control_current_unavailable", "reason": str(e)},
-        ) from e
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -1867,6 +1958,8 @@ def post_close_production_order(
 def post_return_leftovers(
     product_id: int,
     initiated_by: Optional[str] = None,
+    current_identity: Optional[str] = None,
+    expected_source_revision: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1874,7 +1967,17 @@ def post_return_leftovers(
     Export remains in /material-issues/export-to-1c.
     """
     try:
+        _require_current_production_action(
+            db,
+            product_id=int(product_id),
+            current_identity=current_identity,
+            expected_source_revision=expected_source_revision,
+        )
         return return_leftover_components(db, int(product_id), initiated_by=initiated_by)
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1967,12 +2070,40 @@ def post_orders_from_work_items(
     if not selected_ids:
         raise HTTPException(status_code=400, detail="Не выбраны рабочие строки")
     try:
+        manifest, current_rows = _require_current_production_identities(
+            db,
+            identities=[str(identity) for identity in payload.current_identities],
+            expected_source_revision=payload.expected_source_revision,
+        )
+        if len(current_rows) != len(set(selected_ids)):
+            raise CurrentExecutionUnavailable("current MRP proposal identities are incomplete")
+        current_work_ids: set[int] = set()
+        for current_row in current_rows:
+            row_payload = current_row.payload or {}
+            requirement_id = row_payload.get("source_mrp_requirement_id")
+            item_id = row_payload.get("item_id")
+            if requirement_id in (None, "") or item_id in (None, ""):
+                raise CurrentExecutionUnavailable("current MRP proposal provenance is missing")
+            matches = db.query(models.ReplenishmentWorkItem).filter(
+                models.ReplenishmentWorkItem.ledger_generation_id == int(manifest.source_generation_id or 0),
+                models.ReplenishmentWorkItem.requirement_id == int(requirement_id),
+                models.ReplenishmentWorkItem.item_id == int(item_id),
+            ).all()
+            if len(matches) != 1:
+                raise CurrentExecutionUnavailable("current MRP proposal locator is missing or ambiguous")
+            current_work_ids.add(int(matches[0].id))
+        if current_work_ids != set(selected_ids):
+            raise HTTPException(status_code=409, detail={"code": "production_current_locator_stale"})
         return materialize_make_work_items(
             db,
             selected_ids,
             initiated_by=payload.initiated_by,
             launch_requests=launch_requests or None,
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -2020,11 +2151,22 @@ def post_export_production_orders_to_1c(
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы для экспорта")
     try:
+        _require_current_production_identities(
+            db,
+            identities=[str(identity) for identity in payload.current_identities],
+            expected_source_revision=payload.expected_source_revision,
+            locator_key="order_id",
+            locator_values={int(value) for value in payload.order_ids},
+        )
         return export_production_orders_to_1c(
             db,
             [int(x) for x in payload.order_ids],
             dry_run=bool(payload.dry_run),
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -2036,6 +2178,13 @@ def post_material_issues(payload: MaterialIssueCreatePayload, db: Session = Depe
     if not payload.product_ids:
         raise HTTPException(status_code=400, detail="Не выбраны строки заказа")
     try:
+        _require_current_production_identities(
+            db,
+            identities=[str(identity) for identity in payload.current_identities],
+            expected_source_revision=payload.expected_source_revision,
+            locator_key="product_id",
+            locator_values={int(value) for value in payload.product_ids},
+        )
         return create_material_issues(
             db,
             [int(x) for x in payload.product_ids],
@@ -2043,6 +2192,10 @@ def post_material_issues(payload: MaterialIssueCreatePayload, db: Session = Depe
             warehouse_ref1c=payload.warehouse_ref1c,
             source_warehouse_ref1c=payload.source_warehouse_ref1c,
         )
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

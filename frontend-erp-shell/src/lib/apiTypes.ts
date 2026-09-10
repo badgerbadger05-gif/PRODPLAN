@@ -4808,6 +4808,10 @@ export interface components {
             warehouse_ref1c?: string | null;
             /** Source Warehouse Ref1C */
             source_warehouse_ref1c?: string | null;
+            /** Stable current row identities */
+            current_identities?: string[];
+            /** Accepted current publication revision */
+            expected_source_revision?: string | null;
         };
         /** MoveRequest */
         MoveRequest: {
@@ -5215,6 +5219,10 @@ export interface components {
             }[] | null;
             /** Comment */
             comment?: string | null;
+            /** Stable current row identity */
+            current_identity?: string | null;
+            /** Accepted current publication revision */
+            expected_source_revision?: string | null;
         };
         /** ProductionControlRootProductOption */
         ProductionControlRootProductOption: {

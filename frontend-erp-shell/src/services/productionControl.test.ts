@@ -165,7 +165,7 @@ describe('production-control current action transport', () => {
   })
 
   it('sends identity and revision for state changes', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    const fetchMock = vi.fn().mockImplementation(() => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
     await updateOrderStatus(901, 'done', 'production:order:901', 'rev-7')
@@ -178,7 +178,7 @@ describe('production-control current action transport', () => {
   })
 
   it('sends identity and revision for delete and leftover return', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    const fetchMock = vi.fn().mockImplementation(() => new Response('{}', { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
     await deleteProductionOrder(901, 'production:order:901', 'rev-7')
