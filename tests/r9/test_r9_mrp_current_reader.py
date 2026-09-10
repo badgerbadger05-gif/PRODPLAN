@@ -362,11 +362,17 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
         scope_key="mrp:all-live-plans",
     )
     current_identity = "run:41:v1:purchase:purchase:41:1"
-    called = []
+    fake_state = {"calls": 0, "sends": 0, "persisted_ref": None}
 
     def fake_exporter(**kwargs):
-        called.append(kwargs)
-        return {"status": "ok", "orders_created": 1}
+        fake_state["calls"] += 1
+        # Local fake 1C: the first request persists a document and times out;
+        # retry performs read-back and must not issue a second create/send.
+        if fake_state["persisted_ref"] is None:
+            fake_state["sends"] += 1
+            fake_state["persisted_ref"] = "fake-1c-doc-1"
+            return {"status": "partial_error", "orders_created": 0, "target_ref": None}
+        return {"status": "ok", "orders_created": 0, "orders_existing": 1, "target_ref": fake_state["persisted_ref"]}
 
     import app.routers.plan as plan_router
     monkeypatch.setattr(plan_router, "export_planned_purchases_to_1c", fake_exporter)
@@ -387,7 +393,7 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
     assert result["source_revision"] == scope.source_revision
     assert result["current_identities"] == [current_identity]
     assert result["idempotency_key"].startswith("mrp-purchases:")
-    assert called[0]["purchase_ids"] == [7001]
+    assert fake_state["calls"] == 1
 
     retry = asyncio.run(
         export_planning_result_purchases_to_1c(
@@ -401,6 +407,8 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
         )
     )
     assert retry["idempotency_key"] == result["idempotency_key"]
+    assert fake_state["calls"] == 2
+    assert fake_state["sends"] == 1
 
 
 def test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity(
