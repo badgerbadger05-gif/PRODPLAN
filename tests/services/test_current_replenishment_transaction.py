@@ -661,6 +661,14 @@ def test_postgresql_visibility_is_atomic_across_current_state_and_execution():
             == 1
         )
     finally:
+        if "facts" in locals():
+            writer.execute(
+                sa.text(
+                    "UPDATE stock_ledger_entry SET active = false WHERE id = ANY(:ids)"
+                ),
+                {"ids": [int(fact.fact_id) for fact in facts]},
+            )
+            writer.commit()
         writer.rollback()
         writer.close()
         reader.close()

@@ -23,6 +23,20 @@ def _dsn() -> str:
     return value
 
 
+def _retire_synthetic_facts(session, facts) -> None:
+    """Keep the shared named PG rehearsal free of active duplicate fixtures."""
+
+    import sqlalchemy as sa
+
+    ids = [int(fact.fact_id) for fact in facts]
+    if ids:
+        session.execute(
+            sa.text("UPDATE stock_ledger_entry SET active = false WHERE id = ANY(:ids)"),
+            {"ids": ids},
+        )
+        session.commit()
+
+
 @pytest.mark.integration
 def test_two_postgresql_sessions_serialize_current_replenishment_without_double_apply():
     dsn = _dsn()
@@ -110,3 +124,8 @@ def test_two_postgresql_sessions_serialize_current_replenishment_without_double_
         first.close()
         second.close()
         engine.dispose()
+        cleanup = Session()
+        try:
+            _retire_synthetic_facts(cleanup, facts)
+        finally:
+            cleanup.close()
