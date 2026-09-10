@@ -7,7 +7,15 @@ from fastapi.testclient import TestClient
 from app import models
 from app.routers.production_control import (
     CloseProductionOrderPayload,
+    ExportProductionOrdersPayload,
+    LineStatePayload,
+    MaterialIssueCreatePayload,
+    OrderLineQuantityPayload,
     ProduceLinePayload,
+    post_export_production_orders_to_1c,
+    post_material_issues,
+    patch_order_line_quantity,
+    patch_order_line_state,
     post_close_production_order,
     post_produce_line,
 )
@@ -152,3 +160,70 @@ def test_export_piecework_openapi_keeps_all_request_fields():
     schema = TestClient(app).get("/openapi.json").json()
     fields = schema["components"]["schemas"]["ExportPieceworkPayload"]["properties"]
     assert {"manufacture_ids", "operation_ref", "time_norm", "price", "organization_ref", "structural_unit_ref", "business_operation_ref", "dry_run", "allow_production"} <= set(fields)
+
+
+@pytest.mark.parametrize(
+    ("handler", "payload"),
+    [
+        (
+            patch_order_line_state,
+            LineStatePayload(status="done", current_identity="order:77", expected_source_revision="accepted:g1"),
+        ),
+        (
+            patch_order_line_quantity,
+            OrderLineQuantityPayload(quantity=2, current_identity="order:77", expected_source_revision="accepted:g1"),
+        ),
+    ],
+)
+def test_row_mutations_fail_closed_without_current_scope(monkeypatch, db_session, handler, payload):
+    called = []
+    import app.routers.production_control as router
+    monkeypatch.setattr(router, "update_line_state", lambda *args, **kwargs: called.append("state"))
+    monkeypatch.setattr(router, "update_local_order_quantity", lambda *args, **kwargs: called.append("quantity"))
+
+    with pytest.raises(Exception) as caught:
+        handler(77, payload, db=db_session)
+
+    assert getattr(caught.value, "status_code", None) == 503
+    assert called == []
+
+
+def test_material_issue_requires_current_identity_set_before_service(monkeypatch, db_session):
+    called = []
+    import app.routers.production_control as router
+    monkeypatch.setattr(router, "create_material_issues", lambda *args, **kwargs: called.append(True))
+
+    with pytest.raises(Exception) as caught:
+        post_material_issues(
+            MaterialIssueCreatePayload(
+                product_ids=[77],
+                current_identities=[],
+                expected_source_revision="accepted:g1",
+            ),
+            db=db_session,
+        )
+
+    assert getattr(caught.value, "status_code", None) == 409
+    assert called == []
+
+
+def test_production_export_rejects_unknown_current_identity_before_service(monkeypatch, db_session):
+    generation = _accepted_generation(db_session)
+    _current_production_scope(db_session, generation)
+    db_session.commit()
+    called = []
+    import app.routers.production_control as router
+    monkeypatch.setattr(router, "export_production_orders_to_1c", lambda *args, **kwargs: called.append(True))
+
+    with pytest.raises(Exception) as caught:
+        post_export_production_orders_to_1c(
+            ExportProductionOrdersPayload(
+                order_ids=[77],
+                current_identities=["missing"],
+                expected_source_revision="accepted:g1",
+            ),
+            db=db_session,
+        )
+
+    assert getattr(caught.value, "status_code", None) == 503
+    assert called == []
