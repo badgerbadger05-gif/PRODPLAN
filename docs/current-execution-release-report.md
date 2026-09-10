@@ -910,21 +910,26 @@ snapshot не используется:
 | `production-control /orders` | `CurrentExecutionRow(production_control_journal)`; journal business identity | `tests/r9/test_r9_current_obligation_views.py`, `tests/r9/test_r9_production_sort.py` |
 | `production-control /orders/root-products` | persisted `root_product_options` in the current manifest | `test_r9_root_products_read_current_production_rows` |
 | production material/work-item reads | persisted `material_coverage_snapshot` on the current journal row | `test_r9_materials_read_current_payload_without_snapshot_fallback`, missing-manifest 503 regression |
+| purchase journal selection/materialize | `CurrentExecutionRow(purchase_control_journal)` identities plus `CurrentExecutionScope.source_revision`; current export batch anchors to scope, legacy snapshot FK remains nullable for historical batches | `tests/r9/test_r9_current_obligation_views.py`, `tests/r9/test_r9_purchase_current_anchor.py`, `tests/services/test_purchase_export_materialization_schema.py` |
 | MRP result rows/manifest/exports | compact `mrp_result` rows; top identity `mrp-run:{run_id}`, row identity remains business row key | `tests/r9/test_r9_mrp_current_reader.py` |
 | period execution | exact resolved current run; no all-run mixing | `backend/app/routers/plan.py`, commit `4b07347c` |
 
 Test-first commits: `d7742fef` (production sort), `492f160f` and `8af02554`
 (MRP current reader/fail-closed and metadata parity), `2610d9e7` (MRP HTTP
 503), `85a23cba`, `91549375`, `677b3115`, `d0c51a4f` (root/material current
-reader regressions). Implementation commits: `4b07347c`, `59b4880d`,
+reader regressions), `0bcc5635`, `2d6e8d11` (purchase current anchor/sort/schema
+and row transport red
+contract). Implementation commits: `4b07347c`, `59b4880d`,
 `1e5d611b`, `3573a758`, `1a87817c`, `de1a9b89`, `288d2ce8`, `0698737f`,
-`d04f6d80`, `5271a50e`.
+`d04f6d80`, `5271a50e`, `7ee23783`, `715f51bc`, `5c1eca3d`.
 
 Focused current-reader gate:
 
 ```text
-pytest -q tests/r9
-17 passed in 2.70s
+pytest -q tests/r9 tests/services/test_purchase_control_materialization.py \
+  tests/services/test_purchase_export_materialization_schema.py \
+  tests/services/test_supplier_future_supply.py
+64 passed in 8.1s
 ```
 
 Frontend static gates on the current checkout:
@@ -932,12 +937,13 @@ Frontend static gates on the current checkout:
 ```text
 npm run build   # PASS
 npm run lint    # PASS
+npx vitest run src/ui/pages/PurchaseControlPage.test.tsx --reporter=dot  # 9 passed
 ```
 
-Не выполнены и не заявляются: complete purchase selection/materialize CAS
-path, all MRP grouped/detail route parity, production export/read-back fault
+Не выполнены и не заявляются: all MRP grouped/detail route parity, production
+export/read-back fault
 gate, API OpenAPI regeneration, PostgreSQL MVCC gate, Playwright critical path,
 and full `pytest` from the final R9 implementation commit. `current-execution-
-full-pytest.log` сохранён и не изменён. Удалённые пути: **нет**; legacy
-runtime readers remain in untouched purchase actions and non-current planning
-surfaces, so R9 status remains `в работе, не принято локально`.
+full-pytest.log` сохранён и не изменён. Удалённые пути: **нет**; remaining
+legacy runtime readers and unverified action/export paths keep R9 status
+`в работе, не принято локально`.
