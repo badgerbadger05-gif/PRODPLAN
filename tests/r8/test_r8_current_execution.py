@@ -279,3 +279,24 @@ def test_r8_missing_manifest_fails_closed_instead_of_using_legacy_snapshot(db_se
             entity_kind="assembly_queue",
             scope_key="assembly:all-live-plans",
         )
+
+
+def test_r8_manifest_without_accepted_generation_provenance_is_stale(db_session, building_ledger_generation):
+    generation = building_ledger_generation
+    generation.status = "accepted"
+    generation.cutoff = generation.physical_import_batch.cutoff
+    generation.accepted_at = generation.cutoff
+    db_session.flush()
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        rows=[_queue("queue:1", period="2026-09-10", plan_id=1, line_id=1)],
+        entity_kinds=("assembly_queue",),
+    )
+    with pytest.raises(CurrentExecutionUnavailable, match="stale"):
+        require_current_execution_scope(
+            db_session,
+            entity_kind="assembly_queue",
+            scope_key="assembly:all-live-plans",
+        )
