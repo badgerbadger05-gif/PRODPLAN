@@ -264,7 +264,7 @@ def test_r8_scope_pointer_drift_fails_closed_even_when_manifest_is_ready(db_sess
     )
     manifest.source_generation_id = 999999
     db_session.flush()
-    with pytest.raises(CurrentExecutionUnavailable, match="stale"):
+    with pytest.raises(CurrentExecutionUnavailable, match="not accepted"):
         require_current_execution_scope(
             db_session,
             entity_kind="assembly_queue",
