@@ -1663,6 +1663,10 @@ def accept_generation_build(
         if generation.accepted_at is None:
             generation.accepted_at = datetime.now(timezone.utc)
         generation.reason = None
+        from .current_execution import publish_current_execution_from_generation
+        current_execution = publish_current_execution_from_generation(
+            db, generation_id=int(generation.id)
+        )
         from ..production_material_custody_projection import publish_current_material_custody
         publish_current_material_custody(
             db, ledger_generation_id=int(generation.id)
@@ -1715,4 +1719,12 @@ def accept_generation_build(
             }
             for result in current_replenishment
         ],
+        "current_execution": {
+            key: {
+                "changed_rows": int(value.changed_rows),
+                "closed_rows": int(value.closed_rows),
+                "idempotent": bool(value.idempotent),
+            }
+            for key, value in current_execution.items()
+        },
     }

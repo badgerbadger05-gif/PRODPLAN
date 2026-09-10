@@ -2816,6 +2816,83 @@ class ShelfProjection(Base):
     item = relationship("Item")
 
 
+class CurrentExecutionRow(Base):
+    """Compact current execution owner shared by queue, readiness, drum and shelf.
+
+    Generation rows are build evidence only.  This table owns the one visible
+    business row for each execution identity; a source generation is retained
+    as provenance and never participates in current identity or read selection.
+    """
+
+    __tablename__ = "current_execution_row"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_kind", "scope_key", "business_identity",
+            name="uq_current_execution_row_identity",
+        ),
+        Index(
+            "ix_current_execution_row_scope_status",
+            "entity_kind", "scope_key", "result_status",
+        ),
+        Index(
+            "ix_current_execution_row_revision",
+            "entity_kind", "source_revision",
+        ),
+        CheckConstraint(
+            "result_status IN ('accepted', 'closed')",
+            name="ck_current_execution_row_status",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
+    entity_kind = Column(String(40), nullable=False)
+    business_identity = Column(String(256), nullable=False)
+    scope_key = Column(String(256), nullable=False)
+    source_revision = Column(String(256), nullable=False)
+    source_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    result_status = Column(String(16), nullable=False, server_default="accepted")
+    result_ready = Column(Boolean, nullable=False, server_default=text("true"))
+    content_hash = Column(String(64), nullable=False)
+    payload = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    manual_input = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP, nullable=False, server_default=func.now(), onupdate=func.now())
+
+    source_generation = relationship("LedgerGeneration")
+
+
+class CurrentExecutionChange(Base):
+    """Bounded append-only audit of real current execution changes only."""
+
+    __tablename__ = "current_execution_change"
+    __table_args__ = (
+        Index("ix_current_execution_change_identity", "entity_kind", "business_identity", "id"),
+        Index("ix_current_execution_change_scope", "scope_key", "id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
+    current_row_id = Column(
+        BigInteger,
+        ForeignKey("current_execution_row.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    entity_kind = Column(String(40), nullable=False)
+    business_identity = Column(String(256), nullable=False)
+    scope_key = Column(String(256), nullable=False)
+    source_revision = Column(String(256), nullable=False)
+    operation = Column(String(16), nullable=False)
+    reason = Column(String(128), nullable=False, server_default="recalculation")
+    before_payload = Column(CrossPlatformJSON, nullable=True)
+    after_payload = Column(CrossPlatformJSON, nullable=True)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+
+
 class PaintWeldPair(Base):
     """
     Связка «окрашенная ↔ сварная (неокрашенная)» деталь для семейства

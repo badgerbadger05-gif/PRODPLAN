@@ -1059,6 +1059,10 @@ def publish_obligation_refresh_batch(
     target.accepted_at = accepted_at
     target.capabilities = capability_snapshot
     pointer.current_generation_id = int(target.id)
+    from .item_ledger.current_execution import publish_current_execution_from_generation
+    current_execution = publish_current_execution_from_generation(
+        db, generation_id=int(target.id)
+    )
     # Future supply is captured as immutable generation evidence but exposed
     # through one compact current projection, alongside the truth-pointer
     # switch.  No reader should select a historical generation copy.
