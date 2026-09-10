@@ -100,9 +100,9 @@ def test_r8_complete_scope_cannot_clear_a_foreign_mrp_shelf(db_session):
         scope_key="shelf:mrp:2",
         rows=[{
             "entity_kind": "shelf_projection",
-            "business_identity": "shelf:item:20:warehouse:W1",
+            "business_identity": "shelf:item:10:warehouse:W1",
             "scope_key": "shelf:mrp:2",
-            "payload": {"item_id": 20, "gap_qty": "3"},
+            "payload": {"item_id": 10, "gap_qty": "3"},
         }],
     )
     publish_current_execution_scope(
@@ -115,7 +115,9 @@ def test_r8_complete_scope_cannot_clear_a_foreign_mrp_shelf(db_session):
     current = load_current_execution_rows(
         db_session, entity_kind="shelf_projection", scope_key="shelf:mrp:2"
     )
-    assert [row.business_identity for row in current] == ["shelf:item:20:warehouse:W1"]
+    assert [row.business_identity for row in current] == ["shelf:item:10:warehouse:W1"]
+    assert current[0].scope_key == "shelf:mrp:2"
+    assert current[0].payload["gap_qty"] == "3"
 
 
 def test_r8_manual_input_is_part_of_current_business_state(db_session):
@@ -129,3 +131,24 @@ def test_r8_manual_input_is_part_of_current_business_state(db_session):
     )
     current = load_current_execution_rows(db_session, entity_kind="assembly_queue")
     assert current[0].manual_input["moved_by"] == "master"
+
+
+def test_r8_closure_hides_current_row_but_preserves_bounded_change_history(db_session):
+    row = _queue("queue:closed", period="2026-09-10", plan_id=1, line_id=1)
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g1",
+        scope_key="assembly:all-live-plans",
+        rows=[row],
+    )
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g2",
+        scope_key="assembly:all-live-plans",
+        rows=[],
+        complete_scope=True,
+    )
+    assert load_current_execution_rows(db_session, entity_kind="assembly_queue") == []
+    current = db_session.query(models.CurrentExecutionRow).one()
+    assert current.result_status == "closed"
+    assert db_session.query(models.CurrentExecutionChange).count() == 2
