@@ -13,10 +13,18 @@ from app import models
 
 
 def _json_value(value: Any) -> Any:
-    if isinstance(value, Decimal):
-        if value == 0:
-            return "0"
-        return format(value.normalize(), "f")
+    # OData adapters may hand the same quantity to us as ``1``, ``1.000`` or
+    # a Decimal depending on the transport/parser.  Canonical revisions must
+    # not treat those equivalent representations as a semantic change.
+    if isinstance(value, (Decimal, int, float, str)):
+        try:
+            number = Decimal(str(value))
+        except Exception:
+            return value
+        if number.is_finite():
+            if number == 0:
+                return "0"
+            return format(number.normalize(), "f")
     return value
 
 

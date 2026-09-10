@@ -236,6 +236,7 @@ def _future_supply_eta_by_item(
     item_ids: Sequence[int],
     *,
     ledger_generation_id: Optional[int],
+    current_only: bool = False,
 ) -> Dict[int, List[Dict[str, Any]]]:
     """
     Per-item future ETA from one Ledger generation's ``ledger_future_supply``
@@ -247,7 +248,7 @@ def _future_supply_eta_by_item(
     if not ids or ledger_generation_id is None:
         return {}
 
-    rows = (
+    query = (
         db.query(
             LedgerFutureSupply.item_id,
             LedgerFutureSupply.eta_date,
@@ -261,12 +262,13 @@ def _future_supply_eta_by_item(
         .filter(LedgerFutureSupply.open_qty_at_cutoff > 0)
         .filter(LedgerFutureSupply.eta_date.isnot(None))
         .filter(LedgerFutureSupply.supply_kind.in_(("supplier_order", "wip_order")))
-        .order_by(
+    )
+    if current_only:
+        query = query.filter(LedgerFutureSupply.is_current.is_(True))
+    rows = query.order_by(
             LedgerFutureSupply.eta_date.asc().nulls_last(),
             LedgerFutureSupply.source_ref.asc().nulls_last(),
-        )
-        .all()
-    )
+        ).all()
 
     result: Dict[int, List[Dict[str, Any]]] = {}
     for iid, eta_date, open_qty, supply_kind, source_ref in rows:
@@ -488,6 +490,7 @@ def preview_materials(
         db,
         comp_ids,
         ledger_generation_id=ledger_generation_id,
+        current_only=not allow_building_read,
     )
     use_projection_coverage = bool(comp_ids)
     live_require_reserved_at_workshop = False

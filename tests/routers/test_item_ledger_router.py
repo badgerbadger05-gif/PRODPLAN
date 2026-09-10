@@ -282,6 +282,8 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
         models.LedgerFutureSupply(
             **common,
             supply_kind="supplier_order",
+            current_identity="supplier_order:SUP-42:1:",
+            is_current=True,
             source_ref="SUP-42",
             source_line_ref="1",
             ordered_qty_at_cutoff=Decimal("12"),
@@ -293,6 +295,8 @@ def test_future_supply_lists_only_open_exact_orders(client, db_session, seeded):
         models.LedgerFutureSupply(
             **common,
             supply_kind="wip_order",
+            current_identity="wip_order:WIP-CLOSED:1:",
+            is_current=True,
             source_ref="WIP-CLOSED",
             source_line_ref="1",
             ordered_qty_at_cutoff=Decimal("3"),

@@ -36,7 +36,11 @@ from app.services.obligation_refresh_manifest import (
     ObligationRefreshManifestError,
     _current_parents,
 )
-from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
+from app.services.item_ledger.future_supply_capture import (
+    FutureSupplyCaptureError,
+    publish_current_future_supply,
+    verify_future_supply_capture,
+)
 from app.services.item_ledger.r3_contract import (
     record_successor,
     retire_live_pointer,
@@ -1061,6 +1065,15 @@ def publish_obligation_refresh_batch(
     target.accepted_at = accepted_at
     target.capabilities = capability_snapshot
     pointer.current_generation_id = int(target.id)
+    # Future supply is captured as immutable generation evidence but exposed
+    # through one compact current projection, alongside the truth-pointer
+    # switch.  No reader should select a historical generation copy.
+    try:
+        publish_current_future_supply(db, int(target.id))
+    except FutureSupplyCaptureError as exc:
+        raise ObligationRefreshPublishError(
+            f"future supply current publication failed: {exc}"
+        ) from exc
     for retained_run in retained:
         # The frozen obligation rows stay untouched; only the run's accepted
         # truth projection advances to the new generation.

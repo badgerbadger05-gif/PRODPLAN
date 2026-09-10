@@ -204,6 +204,17 @@ class LedgerFutureSupply(Base):
             "ix_ledger_future_supply_source_requirement_id",
             "source_requirement_id",
         ),
+        # A future-supply row is captured under a generation, but its source
+        # document identity is stable across refreshes.  Empty legacy/manual
+        # identities are deliberately excluded until a canonical capture has
+        # supplied the required source identity.
+        Index(
+            "ux_ledger_future_supply_current_identity",
+            "current_identity",
+            unique=True,
+            postgresql_where=text("is_current = true AND current_identity <> ''"),
+            sqlite_where=text("is_current = 1 AND current_identity <> ''"),
+        ),
     )
 
     id = Column(BigIntPK, primary_key=True, autoincrement=True)
@@ -244,6 +255,8 @@ class LedgerFutureSupply(Base):
         nullable=False,
         index=True,
     )
+    current_identity = Column(String(256), nullable=False, server_default="")
+    is_current = Column(Boolean, nullable=False, default=False, server_default="false")
     evidence_status = Column(String(16), nullable=False)
     reason = Column(TEXT, nullable=True)
     created_at = Column(

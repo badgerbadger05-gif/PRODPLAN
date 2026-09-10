@@ -192,6 +192,8 @@ def _ledger_future_supply(
         destination_warehouse_ref1c=destination,
         source_ref=source_ref,
         source_line_ref=source_line_ref,
+        current_identity=f"{kind}:{source_ref}:{source_line_ref}:",
+        is_current=True,
         ordered_qty_at_cutoff=float(open_qty),
         realized_qty_at_cutoff=0,
         open_qty_at_cutoff=float(open_qty),

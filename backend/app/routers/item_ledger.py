@@ -387,7 +387,7 @@ def get_future_supply(
         db.query(models.LedgerFutureSupply)
         .filter(
             models.LedgerFutureSupply.item_id == int(item_id),
-            models.LedgerFutureSupply.ledger_generation_id == int(truth.generation_id),
+            models.LedgerFutureSupply.is_current.is_(True),
             models.LedgerFutureSupply.evidence_status == "exact",
             models.LedgerFutureSupply.open_qty_at_cutoff > EPS,
         )

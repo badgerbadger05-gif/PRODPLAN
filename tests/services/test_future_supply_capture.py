@@ -11,6 +11,7 @@ from app.services.item_ledger.future_supply_capture import (
     FutureSupplyCaptureError,
     FutureSupplyEvidence,
     future_supply_evidence_hash,
+    publish_current_future_supply,
     verify_future_supply_capture,
     replace_future_supply_capture,
 )
@@ -86,6 +87,27 @@ def test_capture_assigns_stable_current_identity_and_stays_staged_until_publish(
     row = db_session.query(models.LedgerFutureSupply).one()
     assert row.current_identity == "supplier_order:SO-7:004:local-1"
     assert row.is_current is False
+
+
+def test_publish_future_supply_promotes_only_truth_pointer_rows(db_session):
+    generation, batch, item = _context(db_session, "publish-current")
+    replace_future_supply_capture(
+        db_session,
+        generation.id,
+        batch.id,
+        [_evidence(generation, item, kind="supplier_order", ref="SO-P", line="1")],
+    )
+    batch.status = "completed"
+    generation.status = "accepted"
+    pointer = models.PlanningTruthState(id=1, current_generation_id=generation.id)
+    db_session.add(pointer)
+    db_session.flush()
+
+    result = publish_current_future_supply(db_session, generation.id)
+
+    row = db_session.query(models.LedgerFutureSupply).one()
+    assert result["rows"] == 1
+    assert row.is_current is True
 
 
 def test_exact_evidence_carries_source_requirement_id_into_persisted_row(db_session):

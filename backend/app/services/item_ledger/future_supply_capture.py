@@ -162,6 +162,31 @@ def future_supply_evidence_hash(evidence: FutureSupplyEvidence) -> str:
     return canonical_content_hash(_canonical_payload(evidence))
 
 
+def _future_supply_identity(
+    *,
+    supply_kind: str,
+    source_ref: str | None,
+    source_line_ref: str | None,
+    source_local_id: str | None,
+    source_content_hash: str,
+    evidence_status: str,
+) -> str:
+    """Return the stable source-document identity for current projection.
+
+    Exact rows use the complete source identity.  Non-exact evidence remains
+    auditable but cannot claim a business document identity, so its canonical
+    content hash supplies a collision-resistant technical identity instead.
+    """
+    if evidence_status == "exact":
+        return ":".join((
+            _norm(supply_kind),
+            _norm(source_ref),
+            _norm(source_line_ref),
+            _norm(source_local_id),
+        ))
+    return f"{_norm(supply_kind)}:rejected:{_norm(source_content_hash)}"
+
+
 def _row_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
     """One stable ordering for hashing, comparison, and persistence."""
     return (
@@ -200,6 +225,7 @@ def _row_hash_payload(row: Mapping[str, Any]) -> dict[str, Any]:
             _normalize_value(key, value)
         )
         for key, value in row.items()
+        if key not in {"current_identity", "is_current"}
     }
 
 
@@ -305,6 +331,14 @@ def _validated_rows(
             "source_updated_at": item.source_updated_at,
             "capture_cutoff": item.capture_cutoff,
             "source_content_hash": expected_hash,
+            "current_identity": _future_supply_identity(
+                supply_kind=kind,
+                source_ref=source_ref,
+                source_line_ref=source_line_ref,
+                source_local_id=_norm(item.source_local_id) or None,
+                source_content_hash=expected_hash,
+                evidence_status=status,
+            ),
             "evidence_status": status,
             "reason": item.reason,
         })
@@ -338,6 +372,7 @@ _CARRY_FORWARD_FIELDS = (
     "source_updated_at",
     "capture_cutoff",
     "source_content_hash",
+    "current_identity",
     "evidence_status",
     "reason",
 )
@@ -767,6 +802,52 @@ def carry_forward_future_supply(
         "created": True,
         "source_generation_id": int(parent.id),
     })
+
+
+def publish_current_future_supply(
+    db: Session,
+    generation_id: int,
+) -> Mapping[str, Any]:
+    """Promote one accepted capture into the compact current projection.
+
+    The generation remains immutable evidence; ``is_current`` is only the
+    accepted pointer's materialized read state.  Old rows are retained as
+    history but are never selected by current readers.
+    """
+    target = db.get(models.LedgerGeneration, int(generation_id))
+    pointer = db.query(models.PlanningTruthState).filter_by(id=1).one_or_none()
+    if (
+        target is None
+        or str(target.status) != "accepted"
+        or pointer is None
+        or int(pointer.current_generation_id or -1) != int(target.id)
+    ):
+        raise FutureSupplyCaptureError(
+            "future supply current publication requires the accepted truth pointer"
+        )
+    rows = _generation_rows(db, int(target.id))
+    identities = [str(row.current_identity or "") for row in rows]
+    if any(not identity for identity in identities):
+        raise FutureSupplyCaptureError(
+            "future supply current publication requires stable source identities"
+        )
+    if len(set(identities)) != len(identities):
+        raise FutureSupplyCaptureError("future supply current identities collide")
+
+    current_rows = db.query(models.LedgerFutureSupply).filter(
+        models.LedgerFutureSupply.is_current.is_(True),
+    ).all()
+    for row in current_rows:
+        row.is_current = False
+    db.flush()
+    for row in rows:
+        row.is_current = True
+    db.flush()
+    return {
+        "generation_id": int(target.id),
+        "rows": len(rows),
+        "current_identities": tuple(sorted(identities)),
+    }
 
 
 def replace_future_supply_capture(
