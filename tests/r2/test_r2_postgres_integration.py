@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -23,8 +26,20 @@ def test_empty_postgresql_database_can_be_migrated():
     pytest.importorskip("psycopg2")
     import sqlalchemy as sa
 
+    env = os.environ.copy()
+    env["DATABASE_URL"] = dsn
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+        cwd=repo_root / "backend",
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"empty PostgreSQL migration failed:\n{result.stdout}\n{result.stderr}"
     with sa.create_engine(dsn).connect() as connection:
-        assert connection.execute(sa.text("SELECT current_database()")) .scalar_one() == "prodplan_r2"
+        assert connection.execute(sa.text("SELECT current_database()" )).scalar_one() == "prodplan_r2"
+        assert connection.execute(sa.text("SELECT count(*) FROM alembic_version")).scalar_one() == 1
 
 
 @pytest.mark.integration
@@ -51,4 +66,3 @@ def test_two_connections_observe_rollback_and_commit_isolation():
         conn_a.close()
         conn_b.close()
         engine.dispose()
-

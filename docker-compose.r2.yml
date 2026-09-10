@@ -1,0 +1,20 @@
+services:
+  r2-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: prodplan_r2
+      POSTGRES_USER: r2_user
+      POSTGRES_PASSWORD: r2_local_only
+    ports:
+      - "127.0.0.1:55441:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U r2_user -d prodplan_r2"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - r2_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  r2_postgres_data:
+    name: prodplan_r2_local_data
