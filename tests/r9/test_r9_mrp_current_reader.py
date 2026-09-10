@@ -16,10 +16,19 @@ from app.routers.plan import (
     _mrp_snapshot_identity,
     export_planning_result_production,
     export_planning_result_purchases,
+    export_planning_result_purchases_to_1c,
+    export_planning_result_rework,
     get_planning_result_production,
     get_planning_result_production_grouped,
+    get_planning_result_purchases,
     get_planning_result_purchases_grouped,
+    get_planning_result_purchases_grouped_by_category,
+    get_planning_result_rework,
+    get_planning_result_rework_grouped,
+    get_planning_result_rework_grouped_by_category,
+    get_planning_result_capacity,
     get_planning_result_summary,
+    PurchaseOrder1CExportRequest,
 )
 
 
@@ -116,11 +125,18 @@ def test_mrp_http_reader_maps_missing_current_to_503(db_session):
 @pytest.mark.parametrize(
     "endpoint,kwargs",
     [
-        (get_planning_result_production, {}),
-        (get_planning_result_production_grouped, {}),
-        (get_planning_result_purchases_grouped, {}),
-        (export_planning_result_production, {"format": "csv"}),
-        (export_planning_result_purchases, {"format": "csv"}),
+        (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_production_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_purchases_grouped, {"date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_rework_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_purchases_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_rework_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_capacity, {"area_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 200, "offset": 0, "snapshot_id": None}),
+        (export_planning_result_production, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (export_planning_result_purchases, {"format": "csv", "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (export_planning_result_rework, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
     ],
 )
 def test_mrp_detail_grouped_and_export_never_fall_back_to_legacy_snapshot(
@@ -131,23 +147,42 @@ def test_mrp_detail_grouped_and_export_never_fall_back_to_legacy_snapshot(
     db_session.commit()
 
     call = {"run_id": 41, "db": db_session, **kwargs}
-    if endpoint is get_planning_result_production:
-        call.update(
-            snapshot_id=None,
-            item_id=None,
-            root_item_id=None,
-            bucket_type=None,
-            date_from=None,
-            date_to=None,
-            limit=100,
-            offset=0,
-            sort_by=None,
-            sort_dir=None,
-        )
     with pytest.raises(Exception) as caught:
         import asyncio
         asyncio.run(endpoint(**call))
     assert getattr(caught.value, "status_code", None) == 503
+
+
+def test_mrp_purchases_to_1c_requires_current_identity_and_never_calls_external_exporter(
+    db_session, monkeypatch
+):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    db_session.commit()
+    called = []
+
+    def fake_exporter(**kwargs):
+        called.append(kwargs)
+        return {"status": "ok"}
+
+    import app.routers.plan as plan_router
+    monkeypatch.setattr(plan_router, "export_planned_purchases_to_1c", fake_exporter)
+
+    import asyncio
+    with pytest.raises(Exception) as caught:
+        asyncio.run(
+            export_planning_result_purchases_to_1c(
+                41,
+                PurchaseOrder1CExportRequest(
+                    current_identities=["mrp-run:41"],
+                    expected_source_revision="accepted:g1",
+                    purchase_ids=[1],
+                ),
+                db=db_session,
+            )
+        )
+    assert getattr(caught.value, "status_code", None) == 503
+    assert called == []
 
 
 def test_mrp_reader_rejects_unknown_run_and_keeps_date_to_inclusive(db_session):
