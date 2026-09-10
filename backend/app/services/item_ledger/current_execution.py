@@ -964,8 +964,6 @@ def _mrp_current_identity(payload: dict[str, Any], *, run_id: int, row_kind: str
     # owner; technical row_key/index is deliberately excluded.
     if requirement in (None, ""):
         requirement = payload.get("agg_key") or payload.get("demand_ref")
-    if requirement in (None, "") and payload.get("item_id") not in (None, ""):
-        requirement = f"item-{int(payload['item_id'])}"
     item_id = payload.get("item_id")
     if requirement in (None, "") or item_id in (None, ""):
         raise CurrentExecutionUnavailable(
@@ -982,6 +980,29 @@ def _mrp_current_identity(payload: dict[str, Any], *, run_id: int, row_kind: str
         f"mrp-run:{int(run_id)}:{str(row_kind).strip().lower()}:"
         f"requirement:{str(requirement)}:item:{int(item_id)}:allocation:{str(discriminator)}"
     )
+
+
+def _mrp_current_payload(payload: dict[str, Any], *, business_identity: str) -> dict[str, Any]:
+    """Keep only current MRP business data in the compact row.
+
+    Snapshot row keys, ordinal sort indexes and proposal primary keys are
+    generation-local locators.  They must not leak into the current DTO or
+    churn its owner when an equivalent accepted generation is republished.
+    The persisted sort key is rebuilt from the semantic date/item/identity.
+    """
+    result = dict(payload)
+    for key in (
+        "row_key", "journal_row_key", "sort_key", "purchase_id",
+        "planned_purchase_id", "order_id", "rework_id", "work_item_id",
+    ):
+        result.pop(key, None)
+    bucket = (
+        result.get("bucket_date") or result.get("need_date")
+        or result.get("start_date") or result.get("date") or ""
+    )
+    item_id = result.get("item_id")
+    result["sort_key"] = f"{bucket}|{int(item_id) if item_id is not None else 0:012d}|{business_identity}"
+    return result
 
 
 def _production_snapshot_identity(payload: dict[str, Any]) -> str:
@@ -1176,6 +1197,10 @@ def publish_current_obligation_views_from_generation(
                 payload,
                 run_id=int(run_marker) if run_marker.isdigit() else 0,
                 row_kind=str(row.row_kind),
+            )
+            payload = _mrp_current_payload(
+                payload,
+                business_identity=stable_mrp_identity,
             )
             mrp_rows.append({
                 "entity_kind": "mrp_result",

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..database import get_db
+from .. import models
 from ..services.stage_directory import fetch_stages
 
 from ..services.work_calendar_service import get_planning_anchor_date
@@ -467,7 +468,7 @@ class ExecutionJournalRow(BaseModel):
     unassigned_qty: float | None = None
     current_identity: str | None = None
     source_revision: str | None = None
-    explanations: list[str] = []
+    explanations: list[str] = Field(default_factory=list)
 
 
 class ExecutionJournalSummaryByFlow(BaseModel):
@@ -1791,13 +1792,30 @@ async def export_planning_result_purchases_to_1c(
         selected_purchase_ids = []
         for row in selected_rows:
             payload = dict(row.payload or {})
-            purchase_id = payload.get("purchase_id") or payload.get("planned_purchase_id")
-            if purchase_id is None:
+            requirement_id = payload.get("source_mrp_requirement_id") or payload.get("requirement_id")
+            item_id = payload.get("item_id")
+            if requirement_id is None or item_id is None:
                 raise HTTPException(
                     status_code=503,
                     detail={"code": "mrp_result_purchase_identity_unresolved"},
                 )
-            selected_purchase_ids.append(int(purchase_id))
+            purchase_query = db.query(models.PlannedPurchase).filter(
+                models.PlannedPurchase.run_id == int(run_id),
+                models.PlannedPurchase.item_id == int(item_id),
+                models.PlannedPurchase.source_mrp_requirement_id == int(requirement_id),
+            )
+            supplier_ref = payload.get("supplier_ref1c")
+            if supplier_ref:
+                purchase_query = purchase_query.filter(
+                    models.PlannedPurchase.supplier_ref1c == str(supplier_ref)
+                )
+            matches = purchase_query.all()
+            if len(matches) != 1:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "mrp_result_purchase_identity_unresolved"},
+                )
+            selected_purchase_ids.append(int(matches[0].purchase_id))
         if req.purchase_ids is not None and sorted({int(value) for value in req.purchase_ids}) != sorted(selected_purchase_ids):
             raise HTTPException(
                 status_code=409,
