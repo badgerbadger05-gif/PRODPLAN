@@ -35,9 +35,9 @@ def test_r8_reference_mutations_invalidate_affected_current_scopes():
 
 def test_r8_calendar_hook_invalidates_only_calendar_dependents(db_session):
     for kind, scope in (
+        ("assembly_queue", "assembly:all-live-plans"),
         ("assembly_readiness", "assembly:all-live-plans"),
         ("drum_schedule", "drum:all-live-plans"),
-        ("assembly_queue", "assembly:all-live-plans"),
     ):
         publish_current_execution_scope(
             db_session,
@@ -123,6 +123,7 @@ def test_r8_reference_writers_are_idempotent_before_invalidating_on_real_change(
     db_session.add_all([rate, policy])
     db_session.flush()
     for kind, scope in (
+        ("assembly_queue", "assembly:all-live-plans"),
         ("assembly_readiness", "assembly:all-live-plans"),
         ("drum_schedule", "drum:all-live-plans"),
         ("shelf_projection", "shelf:all-live-mrps"),
@@ -167,6 +168,9 @@ def test_r8_reference_writers_are_idempotent_before_invalidating_on_real_change(
         db_session,
     )
     assert get_current_execution_scope(
+        db_session, entity_kind="assembly_queue", scope_key="assembly:all-live-plans"
+    ).result_ready is True
+    assert get_current_execution_scope(
         db_session, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
     ).result_ready is True
     assert get_current_execution_scope(
@@ -197,6 +201,9 @@ def test_r8_reference_writers_are_idempotent_before_invalidating_on_real_change(
         ),
         db_session,
     )
+    assert get_current_execution_scope(
+        db_session, entity_kind="assembly_queue", scope_key="assembly:all-live-plans"
+    ).result_ready is True
     assert get_current_execution_scope(
         db_session, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
     ).result_ready is False
