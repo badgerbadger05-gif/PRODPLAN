@@ -959,6 +959,65 @@ def test_current_drum_get_sorts_persisted_slots_by_date_resource_priority_and_or
     assert [slot.plan_line_id for slot in response.slots] == [20, 10]
 
 
+def test_current_drum_get_returns_persisted_excluded_rows(db_session):
+    generation, _ = _accepted_generation(db_session)
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    scope = "drum:all-live-plans"
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:r8-excluded",
+        source_generation_id=int(generation.id),
+        scope_key=scope,
+        entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
+        rows=[
+            {
+                "entity_kind": "drum_schedule",
+                "business_identity": scope,
+                "scope_key": scope,
+                "payload": {
+                    "schedule_from": "2026-09-10",
+                    "schedule_to": "2026-09-10",
+                    "working_days": ["2026-09-10"],
+                    "metrics": {"total_open_qty": "10", "total_slot_qty": "0", "total_gap_qty": "0", "excluded_lines": 1, "excluded_open_qty": "10"},
+                },
+            },
+            {
+                "entity_kind": "drum_excluded",
+                "business_identity": "excluded:plan-line:10",
+                "scope_key": scope,
+                "payload": {
+                    "queue_line_id": 701,
+                    "plan_id": 1,
+                    "plan_line_id": 10,
+                    "run_id": 11,
+                    "item_id": 12,
+                    "period_from": "2026-09-10",
+                    "period_to": "2026-09-10",
+                    "planned_output_qty": "12",
+                    "accepted_plan_output_qty": "2",
+                    "assembly_remaining_qty": "10",
+                    "reason": "ASSEMBLY_RATE_MISSING",
+                    "readiness_status": "blocked",
+                    "readiness_date": None,
+                    "readiness_curve": [],
+                    "action_manifest": [],
+                    "unavailable_reasons": ["ASSEMBLY_RATE_MISSING"],
+                    "blocking_manifest": [{"reason": "LEAD_TIME_MISSING"}],
+                    "original_priority": ["2026-09-10", 1, 10],
+                },
+            },
+        ],
+    )
+    db_session.flush()
+
+    response = get_drum_schedule(limit=10, offset=0, db=db_session)
+    assert response.total_excluded == 1
+    assert response.total_excluded_open_qty == 10.0
+    assert len(response.excluded) == 1
+    assert response.excluded[0].plan_line_id == 10
+
+
 def test_drum_router_pages_slots_and_reports_totals(client, db_session):
     generation, cutoff = _accepted_generation(db_session)
     _drum_schedule_with_slots(db_session, generation, cutoff, slot_count=5)

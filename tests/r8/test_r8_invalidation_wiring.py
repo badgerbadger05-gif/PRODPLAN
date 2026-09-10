@@ -33,6 +33,13 @@ def test_r8_reference_mutations_invalidate_affected_current_scopes():
     assert resources.count('scope_key="drum:all-live-plans"') >= 1
 
 
+def test_r8_calendar_contract_names_missing_writer_as_explicit_unsafe_gap():
+    canon = (ROOT / ".docs/CANON.md").read_text(encoding="utf-8")
+    report = (ROOT / "docs/current-execution-release-report.md").read_text(encoding="utf-8")
+    assert "нет текущего WorkCalendarDay writer/API" in canon
+    assert "явный residual unsafe gap" in report
+
+
 def test_r8_calendar_hook_invalidates_only_calendar_dependents(db_session):
     for kind, scope in (
         ("assembly_queue", "assembly:all-live-plans"),
