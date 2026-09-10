@@ -90,6 +90,39 @@ def _seed_generation_execution_rows(db, *, generation_id: int, queue_line_id: in
         original_priority=["2026-09-10", 201, 301],
         readiness_phase="now",
     ))
+    policy = db.get(models.ShelfPolicy, 601)
+    if policy is None:
+        policy = models.ShelfPolicy(
+            id=601,
+            item_id=401,
+            warehouse_ref1c="r8-warehouse",
+            replenishment_time_days=1,
+            review_cycle_days=1,
+            safety_days=1,
+            batch_multiple=Decimal("1"),
+            active=True,
+        )
+        db.add(policy)
+        db.flush()
+    db.add(models.ShelfProjection(
+        ledger_generation_id=generation_id,
+        shelf_policy_id=601,
+        item_id=401,
+        warehouse_ref1c="r8-warehouse",
+        as_of_date=date(2026, 9, 10),
+        protection_until=date(2026, 9, 11),
+        target_qty=Decimal("10"),
+        shelf_physical_qty=Decimal("2"),
+        other_stock_qty=Decimal("0"),
+        confirmed_open_production_qty=Decimal("0"),
+        projected_qty=Decimal("2"),
+        gap_qty=Decimal("8"),
+        transfer_qty=Decimal("0"),
+        unlaunched_mrp_qty=Decimal("0"),
+        pull_qty=Decimal("8"),
+        materialized_qty=Decimal("0"),
+        demand_manifest=["r8"],
+    ))
     db.flush()
 
 
@@ -142,8 +175,12 @@ def test_r8_generation_local_queue_ids_do_not_churn_current_readiness_or_drum(
     queue = next(row for row in current if row.entity_kind == "assembly_queue")
     assert readiness.payload["queue_line_id"] == queue.id
     assert drum_slot.payload["queue_line_id"] == queue.id
-    assert readiness.source_generation_id == generation2.id
-    assert drum_slot.source_generation_id == generation2.id
+    assert get_current_execution_scope(
+        db_session, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
+    ).source_generation_id == generation2.id
+    assert get_current_execution_scope(
+        db_session, entity_kind="drum_slot", scope_key="drum:all-live-plans"
+    ).source_generation_id == generation2.id
 
 
 def _queue(identity: str, *, period: str, plan_id: int, line_id: int, qty: str = "1"):

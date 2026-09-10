@@ -954,6 +954,71 @@ def _drum_schedule_with_slots(
     return schedule
 
 
+def test_current_drum_get_sorts_persisted_slots_by_date_resource_priority_and_ordinal(db_session):
+    generation, _ = _accepted_generation(db_session)
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    scope = "drum:all-live-plans"
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:r8-order",
+        source_generation_id=int(generation.id),
+        scope_key=scope,
+        entity_kinds=("drum_schedule", "drum_slot", "drum_gap"),
+        rows=[
+            {
+                "entity_kind": "drum_schedule",
+                "business_identity": scope,
+                "scope_key": scope,
+                "payload": {
+                    "schedule_from": "2026-09-10",
+                    "schedule_to": "2026-09-12",
+                    "working_days": ["2026-09-10", "2026-09-11", "2026-09-12"],
+                    "metrics": {"total_open_qty": "2", "total_slot_qty": "2", "total_gap_qty": "0"},
+                },
+            },
+            {
+                "entity_kind": "drum_slot",
+                "business_identity": "slot:plan-line:10:ordinal:0",
+                "scope_key": scope,
+                "payload": {
+                    "queue_line_id": 9001,
+                    "plan_id": 1,
+                    "plan_line_id": 10,
+                    "item_id": 100,
+                    "resource_id": 7,
+                    "slot_date": "2026-09-12",
+                    "slot_ordinal": 0,
+                    "slot_qty": "1",
+                    "original_priority": [2, 10],
+                    "readiness_phase": "now",
+                },
+            },
+            {
+                "entity_kind": "drum_slot",
+                "business_identity": "slot:plan-line:20:ordinal:0",
+                "scope_key": scope,
+                "payload": {
+                    "queue_line_id": 9002,
+                    "plan_id": 2,
+                    "plan_line_id": 20,
+                    "item_id": 200,
+                    "resource_id": 7,
+                    "slot_date": "2026-09-11",
+                    "slot_ordinal": 0,
+                    "slot_qty": "1",
+                    "original_priority": [1, 20],
+                    "readiness_phase": "now",
+                },
+            },
+        ],
+    )
+    db_session.flush()
+
+    response = get_drum_schedule(limit=10, offset=0, db=db_session)
+    assert [slot.plan_line_id for slot in response.slots] == [20, 10]
+
+
 def test_drum_router_pages_slots_and_reports_totals(client, db_session):
     generation, cutoff = _accepted_generation(db_session)
     _drum_schedule_with_slots(db_session, generation, cutoff, slot_count=5)
