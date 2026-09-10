@@ -38,6 +38,9 @@ from app.services.item_ledger.output_repair_gate import (
 from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
 )
+from app.services.item_ledger.current_replenishment import (
+    apply_current_replenishment_for_accepted_generation,
+)
 from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
 from app.services.production_control_journal_snapshot import (
     build_candidate_snapshot as build_production_journal_candidate,
@@ -511,12 +514,19 @@ def run_obligation_refresh(
         db,
         ledger_generation_id=target_id,
         cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
+        writer_mode="current",
+    )
+    current_replenishment = apply_current_replenishment_for_accepted_generation(
+        db, generation_id=target_id, allow_building=True
     )
     supplier_summary = {
         "provenance_count": supplier.provenance_count,
         "exact_fact_count": supplier.exact_fact_count,
         "allocation_count": supplier.allocation_count,
         "surplus_qty": supplier.surplus_qty,
+        "current_replenishment_changed_pairs": sum(
+            int(result.changed_pairs) for result in current_replenishment
+        ),
     }
     # Work items are a persisted projection of the reservation fold.  Both
     # make and supplier realizations must therefore be applied first; building

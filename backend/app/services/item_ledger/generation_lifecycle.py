@@ -423,7 +423,9 @@ def _execution_allocation_checkpoint(
         for row in db.query(models.ReservationConsumptionAllocation)
         .filter(
             models.ReservationConsumptionAllocation.ledger_generation_id
-            == int(generation.id)
+            == int(generation.id),
+            models.ReservationConsumptionAllocation.allocation_role
+            == "material_consumption",
         )
         .order_by(models.ReservationConsumptionAllocation.id.asc())
         .all()

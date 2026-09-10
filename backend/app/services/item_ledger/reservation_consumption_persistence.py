@@ -198,7 +198,10 @@ def materialize_reservation_consumption_allocations(db: Session, generation_id: 
         sle = sle_by_id[allocation.fact_id]
         expected.append({"sle_id": int(sle.id), "reservation_id": int(entry.id), "requirement_id": int(entry.requirement_id), "qty": _qty_text(allocation.qty), "match_rule": allocation.match_rule, "idempotency_key": f"g{generation.id}:sle{sle.id}:r{entry.id}"})
     expected.sort(key=lambda row: (row["sle_id"], row["reservation_id"]))
-    existing = db.query(models.ReservationConsumptionAllocation).filter(models.ReservationConsumptionAllocation.ledger_generation_id == int(generation.id)).all()
+    existing = db.query(models.ReservationConsumptionAllocation).filter(
+        models.ReservationConsumptionAllocation.ledger_generation_id == int(generation.id),
+        models.ReservationConsumptionAllocation.allocation_role == "material_consumption",
+    ).all()
     if existing:
         if _signature(existing) != expected:
             raise ValueError("reservation consumption allocation drift")

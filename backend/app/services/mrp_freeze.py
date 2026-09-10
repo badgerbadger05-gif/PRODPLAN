@@ -1285,6 +1285,7 @@ def freeze_candidate_snapshots(
                 )
                 .filter(
                     ReservationConsumptionAllocation.ledger_generation_id == target_id,
+                    ReservationConsumptionAllocation.allocation_role == "material_consumption",
                     ReservationConsumptionAllocation.reservation_id.in_(
                         [int(row.id) for row in retained_reservations]
                     ),

@@ -3976,12 +3976,14 @@ class ReservationConsumptionAllocation(Base):
         ),
         UniqueConstraint(
             "ledger_generation_id",
+            "allocation_role",
             "sle_id",
             "reservation_id",
-            name="uq_res_consumption_generation_sle_reservation",
+            name="uq_res_consumption_generation_role_sle_reservation",
         ),
         Index(
             "uq_res_consumption_current_sle_reservation",
+            "allocation_role",
             "sle_id",
             "reservation_id",
             unique=True,
@@ -3995,6 +3997,10 @@ class ReservationConsumptionAllocation(Base):
         CheckConstraint(
             "allocated_qty > 0",
             name="ck_reservation_consumption_allocation_qty_positive",
+        ),
+        CheckConstraint(
+            "allocation_role IN ('material_consumption', 'replenishment_receipt')",
+            name="ck_reservation_consumption_allocation_role",
         ),
         Index(
             "ix_reservation_consumption_allocation_generation",
@@ -4045,6 +4051,10 @@ class ReservationConsumptionAllocation(Base):
     organization_ref = Column(String(36), nullable=False, server_default="")
     planning_stock_pool = Column(String(64), nullable=False, server_default="default")
     idempotency_key = Column(String(160), nullable=False)
+    allocation_role = Column(
+        String(32), nullable=False, default="material_consumption",
+        server_default="material_consumption",
+    )
     # Current R4 assignments reuse this canonical table while historical
     # generations remain immutable rows.  The partial unique index makes the
     # current fact/recipient identity stable without colliding with history.

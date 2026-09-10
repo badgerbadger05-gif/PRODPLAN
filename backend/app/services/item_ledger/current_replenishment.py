@@ -321,6 +321,8 @@ def apply_current_replenishment(
         )
         .filter(
             models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.allocation_role
+            == "replenishment_receipt",
             models.ReservationConsumptionAllocation.item_id == distribution_scope[0],
             models.ReservationConsumptionAllocation.characteristic_ref == distribution_scope[1],
             models.ReservationConsumptionAllocation.organization_ref == distribution_scope[2],
@@ -342,6 +344,8 @@ def apply_current_replenishment(
             models.ReservationConsumptionAllocation.ledger_generation_id
             == int(generation.id),
             models.ReservationConsumptionAllocation.is_current.is_(False),
+            models.ReservationConsumptionAllocation.allocation_role
+            == "replenishment_receipt",
             models.ReservationConsumptionAllocation.item_id == distribution_scope[0],
             models.ReservationConsumptionAllocation.characteristic_ref == distribution_scope[1],
             models.ReservationConsumptionAllocation.organization_ref == distribution_scope[2],
@@ -470,6 +474,7 @@ def apply_current_replenishment(
                 idempotency_key=(
                     f"r4:{source_key}:{revision}:{insertion.fact_id}:{insertion.reserve_id}"
                 ),
+                allocation_role="replenishment_receipt",
                 is_current=True,
                 event_at=fact.posting_at,
             )
@@ -556,6 +561,8 @@ def read_current_replenishment(
         )
         .filter(
             models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.allocation_role
+            == "replenishment_receipt",
         )
         .order_by(
             models.ReservationConsumptionAllocation.sle_id.asc(),
@@ -707,7 +714,9 @@ def apply_current_replenishment_for_accepted_generation(
             if entry is not None
         }
         requirement_by_sle[int(row.stock_ledger_entry_id)] = (
-            next(iter(requirement_ids)) if len(requirement_ids) == 1 else None
+            next(iter(requirement_ids))
+            if _text(row.match_status) == "exact" and len(requirement_ids) == 1
+            else None
         )
     typed_facts: list[Fact] = []
     for row in provenance:
@@ -734,7 +743,11 @@ def apply_current_replenishment_for_accepted_generation(
             for fact in typed_facts
             if int(fact.item_id) == item_id
         )
-    revision = int(source_revision if source_revision is not None else generation.id)
+    revision = int(
+        source_revision
+        if source_revision is not None
+        else generation.physical_import_batch_id
+    )
     result: list[CurrentReplenishmentResult] = []
     for item_id, scope_set in sorted(item_scopes.items()):
         scope = next(iter(scope_set))

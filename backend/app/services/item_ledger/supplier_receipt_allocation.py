@@ -784,6 +784,7 @@ def rebuild_supplier_receipt_coverage_from_persisted_provenance(
     *,
     ledger_generation_id: int,
     cycle_id: str,
+    writer_mode: str = "historical",
 ) -> SupplierReceiptBuildResult:
     """Replay BUY realization from the generation's immutable receipt evidence.
 
@@ -840,4 +841,5 @@ def rebuild_supplier_receipt_coverage_from_persisted_provenance(
         ledger_generation_id=int(ledger_generation_id),
         evidence=evidence,
         cycle_id=cycle_id,
+        writer_mode=writer_mode,
     )
