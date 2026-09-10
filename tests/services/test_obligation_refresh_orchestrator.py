@@ -761,12 +761,48 @@ def test_add_retains_existing_fixed_obligation_without_refreeze(db_session):
     accepted, plan, _line, _item, old, _cutoff = _world(db_session)
     old_run_id = int(old.run_id)
     old_freeze_version = old.active_freeze_version
+    requirement = models.MrpRequirement(
+        run_id=int(old.run_id), item_id=int(_item.item_id),
+        total_required_qty=Decimal("5"), net_required_qty=Decimal("5"),
+        period_from=plan.period_from, period_to=plan.period_to,
+        bom_level=0, status="open",
+    )
+    db_session.add(requirement)
+    db_session.flush()
     old_requirements = [
         (int(row.id), Decimal(row.net_required_qty))
         for row in db_session.query(models.MrpRequirement)
         .filter_by(run_id=old_run_id)
         .order_by(models.MrpRequirement.id)
     ]
+    db_session.add(models.MrpFreezeBaseline(
+        run_id=int(old.run_id), freeze_version=1, item_id=int(_item.item_id),
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        frozen_at=_cutoff, baseline_at=_cutoff,
+        physical_import_batch_id=int(accepted.physical_import_batch_id),
+        frozen_basis_generation_id=int(accepted.id), stock_qty=Decimal("0"),
+        produced_total=Decimal("0"), received_total=Decimal("0"), unit_coef=Decimal("1"),
+    ))
+    db_session.flush()
+    retained_reservation = models.ReservationEntry(
+        ledger_generation_id=int(accepted.id), item_id=int(_item.item_id),
+        run_id=int(old.run_id), requirement_id=int(requirement.id),
+        freeze_version=1, reserved_qty=Decimal("5"),
+        replenishment_required_qty=Decimal("5"),
+        replenishment_received_qty=Decimal("1"), realized_qty=Decimal("1"),
+        lifecycle_status="active", realization_mode="buy",
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        opened_at=_cutoff,
+    )
+    db_session.add(retained_reservation)
+    db_session.flush()
+    retained_before = {
+        "id": int(retained_reservation.id),
+        "generation_id": int(retained_reservation.ledger_generation_id),
+        "run_id": int(retained_reservation.run_id),
+        "reserved": retained_reservation.reserved_qty,
+        "received": retained_reservation.replenishment_received_qty,
+    }
     extra = models.ProductionPlanHeader(name="new", status="fixed",
         period_from=date(2026, 9, 1), period_to=date(2026, 9, 30), fixed_at=_cutoff)
     db_session.add(extra); db_session.flush()
@@ -789,6 +825,19 @@ def test_add_retains_existing_fixed_obligation_without_refreeze(db_session):
     ] == old_requirements
     assert {row.source_plan_id for row in rows} == {extra.id}
     assert all(row.status == "FIXED_SNAPSHOT" and row.pinned for row in rows)
+    db_session.refresh(old)
+    db_session.refresh(retained_reservation)
+    assert {
+        "id": int(retained_reservation.id),
+        "generation_id": int(retained_reservation.ledger_generation_id),
+        "run_id": int(retained_reservation.run_id),
+        "reserved": retained_reservation.reserved_qty,
+        "received": retained_reservation.replenishment_received_qty,
+    } == retained_before
+    assert db_session.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == int(result.target_generation_id),
+        models.ReservationEntry.run_id == int(old.run_id),
+    ).count() == 0
 
 
 def test_failure_after_freeze_is_reversible_by_outer_transaction(db_session, monkeypatch):
