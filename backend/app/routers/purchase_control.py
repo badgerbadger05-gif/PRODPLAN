@@ -158,9 +158,32 @@ def get_orders(
 def get_order(order_id: int, db: Session = Depends(get_db)):
     """Карточка заказа поставщику со всеми строками (для detail pane)."""
     try:
-        return get_order_card(db, int(order_id))
+        from ..services.item_ledger.current_execution import (
+            CurrentExecutionUnavailable,
+            load_current_execution_rows,
+            require_current_execution_scope,
+        )
+        manifest = require_current_execution_scope(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        saved = dict(manifest.summary or {})
+        cards = saved.get("cards")
+        if isinstance(cards, dict) and str(int(order_id)) in cards:
+            return {**dict(cards[str(int(order_id))]), "meta": saved}
+        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        ) if row.payload and row.payload.get("order_id") == int(order_id)]
+        if not rows:
+            raise ValueError(f"Supplier order {order_id} not found in current purchase journal")
+        return {"order_id": int(order_id), "lines": rows, "meta": saved}
     except PurchaseJournalSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "purchase_control_current_unavailable", "reason": str(e)})
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -171,9 +194,51 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
 def get_filters(db: Session = Depends(get_db)):
     """Справочники для фильтров журнала: поставщики и состояния заказов 1С."""
     try:
-        return list_filters(db)
+        from ..services.item_ledger.current_execution import (
+            CurrentExecutionUnavailable,
+            load_current_execution_rows,
+            require_current_execution_scope,
+        )
+        require_current_execution_scope(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        manifest = require_current_execution_scope(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        rows = [dict(row.payload or {}) for row in load_current_execution_rows(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )]
+        saved = dict(manifest.summary or {})
+        card_rows = [
+            line
+            for card in (saved.get("cards") or {}).values()
+            if isinstance(card, dict)
+            for line in (card.get("lines") or [])
+            if isinstance(line, dict)
+        ]
+        all_rows = [*rows, *card_rows]
+        suppliers = sorted({
+            (int(row["supplier_id"]), str(row.get("supplier_name") or ""))
+            for row in all_rows if row.get("supplier_id") is not None
+        }, key=lambda value: (value[1].casefold(), value[0]))
+        states = sorted({
+            str(row["order_state_name"])
+            for row in all_rows if row.get("order_state_name")
+        })
+        return {
+            "suppliers": [{"supplier_id": value, "supplier_name": name} for value, name in suppliers],
+            "states": states,
+        }
     except PurchaseJournalSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "purchase_control_current_unavailable", "reason": str(e)})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

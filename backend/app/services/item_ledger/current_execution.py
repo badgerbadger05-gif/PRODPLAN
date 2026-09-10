@@ -858,6 +858,8 @@ def publish_current_obligation_views_from_generation(
     purchase_summary = dict(purchase_payload.get("meta") or {})
     if isinstance(purchase_payload.get("summary"), dict):
         purchase_summary["summary"] = dict(purchase_payload["summary"])
+    if isinstance(purchase_payload.get("cards"), dict):
+        purchase_summary["cards"] = dict(purchase_payload["cards"])
     purchase_summary["total_rows"] = len(purchase_rows)
     _publish(
         consumer="purchase_control_journal",
@@ -896,6 +898,7 @@ def publish_current_obligation_views_from_generation(
     )
 
     execution_rows: list[dict[str, Any]] = []
+    execution_metadata: dict[str, Any] = {}
     execution_snapshots = db.query(models.PlanningReadSnapshot).filter(
         models.PlanningReadSnapshot.consumer == "period_plan_execution",
         models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
@@ -905,6 +908,18 @@ def publish_current_obligation_views_from_generation(
         payload = dict(snapshot.payload or {})
         plan = dict(payload.get("plan") or {})
         run_id = payload.get("run_id")
+        execution_metadata[str(snapshot.snapshot_key)] = {
+            "plan": plan,
+            "run_id": run_id,
+            "summary": dict(payload.get("summary") or {}),
+            "plan_output_rows": list(payload.get("plan_output_rows") or []),
+            "truth_status": payload.get("truth_status"),
+            "truth_generation_id": payload.get("truth_generation_id"),
+            "cutoff": payload.get("cutoff"),
+            "truth_cutoff": payload.get("truth_cutoff"),
+            "truth_reason": payload.get("truth_reason"),
+            "facets": dict(payload.get("facets") or {}),
+        }
         source_rows = payload.get("rows")
         if not isinstance(source_rows, list):
             continue
@@ -926,6 +941,6 @@ def publish_current_obligation_views_from_generation(
         entity_kind="period_plan_execution",
         scope_key="period-plan:all-live-plans",
         rows=execution_rows,
-        summary={"total_rows": len(execution_rows)},
+        summary={"total_rows": len(execution_rows), "snapshots": execution_metadata},
     )
     return results
