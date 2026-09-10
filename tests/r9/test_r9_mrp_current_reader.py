@@ -128,7 +128,7 @@ def test_mrp_http_reader_maps_missing_current_to_503(db_session):
         (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
         (get_planning_result_production_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
         (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
-        (get_planning_result_purchases_grouped, {"date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
+        (get_planning_result_purchases_grouped, {"date_from": None, "date_to": None, "limit": 100, "offset": 0}),
         (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
         (get_planning_result_rework_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
         (get_planning_result_purchases_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
@@ -303,6 +303,91 @@ def test_mrp_export_returns_current_identity_and_revision(db_session):
 
     assert result["current_identity"] == "mrp-run:41"
     assert result["source_revision"] == scope.source_revision
+
+
+def test_mrp_rework_export_returns_current_identity_and_revision(db_session):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+    scope = require_current_execution_scope(
+        db_session,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    )
+
+    import asyncio
+    result = asyncio.run(
+        export_planning_result_rework(
+            41,
+            format="csv",
+            snapshot_id=scope.id,
+            db=db_session,
+        )
+    )
+
+    assert result["current_identity"] == "mrp-run:41"
+    assert result["source_revision"] == scope.source_revision
+
+
+def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
+    db_session, monkeypatch
+):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
+        snapshot_key="run:41:v1"
+    ).one()
+    db_session.add(models.PlanningReadRow(
+        snapshot_id=snapshot.id,
+        row_key="purchase:41:1",
+        row_kind="purchase",
+        item_id=10,
+        sort_key="2026-09-10|0002",
+        payload={
+            "item_id": 10,
+            "purchase_id": 7001,
+            "qty": 2,
+            "run_id": 41,
+            "row_kind": "purchase",
+        },
+    ))
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+    scope = require_current_execution_scope(
+        db_session,
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    )
+    current_identity = "run:41:v1:purchase:purchase:41:1"
+    called = []
+
+    def fake_exporter(**kwargs):
+        called.append(kwargs)
+        return {"status": "ok", "orders_created": 1}
+
+    import app.routers.plan as plan_router
+    monkeypatch.setattr(plan_router, "export_planned_purchases_to_1c", fake_exporter)
+    import asyncio
+    result = asyncio.run(
+        export_planning_result_purchases_to_1c(
+            41,
+            PurchaseOrder1CExportRequest(
+                current_identities=[current_identity],
+                expected_source_revision=scope.source_revision,
+                purchase_ids=[7001],
+            ),
+            db=db_session,
+        )
+    )
+
+    assert result["current_identity"] == "mrp-run:41"
+    assert result["source_revision"] == scope.source_revision
+    assert result["current_identities"] == [current_identity]
+    assert result["idempotency_key"].startswith("mrp-purchases:")
+    assert called[0]["purchase_ids"] == [7001]
 
 
 def test_mrp_root_filter_uses_persisted_current_membership(db_session):
