@@ -11,6 +11,7 @@ from app.services.item_ledger.current_execution import (
     publish_current_obligation_views_from_generation,
     require_current_execution_scope,
 )
+from app.routers.production_control import get_orders_journal
 
 
 def _accepted_generation(db_session):
@@ -25,9 +26,11 @@ def _accepted_generation(db_session):
         status="accepted",
         cutoff=batch.cutoff,
         source_watermarks={},
-        capabilities={},
+        capabilities={"physical_ledger": True, "reservation_replay": True, "assembly_queue": True},
         physical_import_batch=batch,
         algorithm_version="r9-test",
+        replay_version="r9-test",
+        accepted_at=batch.cutoff,
     )
     db_session.add(generation)
     db_session.flush()
@@ -140,3 +143,19 @@ def test_r9_current_obligation_scope_is_fail_closed_when_not_published(db_sessio
             entity_kind="purchase_control_journal",
             scope_key="purchase:all-live-plans",
         )
+
+
+def test_r9_production_route_does_not_fallback_to_legacy_snapshot(db_session):
+    generation = _accepted_generation(db_session)
+    _snapshot(
+        db_session,
+        generation,
+        consumer="production_control_journal",
+        key="journal:v1",
+        rows=[{"row_key": "order:legacy", "payload": {"journal_row_key": "order:legacy"}}],
+    )
+    db_session.commit()
+    with pytest.raises(Exception) as caught:
+        get_orders_journal(db=db_session)
+    assert getattr(caught.value, "status_code", None) == 503
+    assert "current" in str(getattr(caught.value, "detail", "")).lower()
