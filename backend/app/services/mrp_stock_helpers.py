@@ -26,6 +26,7 @@ from ..models import (
     LedgerGeneration,
     PlanningTruthState,
     StockBin,
+    StockLedgerEntry,
     StockWarehouse,
 )
 from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
@@ -158,9 +159,9 @@ def historical_stock_by_item(
     if item_ids is not None and not item_ids:
         return {}
     generation = db.get(LedgerGeneration, int(ledger_generation_id))
-    if generation is None or str(generation.status) not in {"building", "accepted"}:
+    if generation is None or str(generation.status) != "building":
         raise ValueError(
-            "historical StockBin provenance requires an existing building or accepted generation"
+            "historical StockBin staging requires an existing building generation"
         )
     scope = planning_warehouse_scope(db)
     query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
@@ -178,6 +179,49 @@ def historical_stock_by_item(
     return {
         int(item_id): float(quantity or 0)
         for item_id, quantity in query.group_by(StockBin.item_id).all()
+    }
+
+
+def historical_ledger_stock_by_item(
+    db: Session,
+    ledger_generation_id: int,
+    *,
+    item_ids: Optional[Set[int]] = None,
+    organization_ref: Optional[str] = DEFAULT_ORGANIZATION_REF1C,
+) -> Dict[int, float]:
+    """Fold immutable SLEs for an explicitly pinned accepted history read."""
+    generation = db.get(LedgerGeneration, int(ledger_generation_id))
+    if generation is None or str(generation.status) != "accepted":
+        raise ValueError(
+            "historical Ledger read requires an existing accepted generation"
+        )
+    if generation.physical_import_batch_id is None or generation.cutoff is None:
+        raise ValueError("historical accepted generation lacks physical provenance")
+    if item_ids is not None and not item_ids:
+        return {}
+    from .item_ledger.physical_visibility import visible_sle_query
+
+    scope = planning_warehouse_scope(db)
+    query = visible_sle_query(
+        db,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        cutoff=generation.cutoff,
+    ).with_entities(
+        StockLedgerEntry.item_id,
+        func.sum(StockLedgerEntry.qty),
+    )
+    if item_ids is not None:
+        query = query.filter(StockLedgerEntry.item_id.in_(sorted(item_ids)))
+    query = apply_planning_warehouse_scope(
+        query,
+        scope,
+        warehouse_column=StockLedgerEntry.warehouse_ref1c,
+        organization_column=StockLedgerEntry.organization_ref,
+        organization_ref=organization_ref,
+    )
+    return {
+        int(item_id): float(quantity or 0)
+        for item_id, quantity in query.group_by(StockLedgerEntry.item_id).all()
     }
 
 

@@ -136,7 +136,9 @@ def _require_manifest_cutoff(
     manifest: models.ProductionMaterialCustodyProjectionManifest,
     generation: models.LedgerGeneration,
 ) -> None:
-    if manifest.cutoff != generation.cutoff:
+    if manifest.cutoff is None or generation.cutoff is None or not _same_1c_timestamp(
+        manifest.cutoff, generation.cutoff
+    ):
         raise MaterialCustodySnapshotUnavailable(
             manifest_generation_id=int(manifest.ledger_generation_id),
             expected_generation_id=int(generation.id),
@@ -151,7 +153,12 @@ def _projection_baseline_candidates(
     cutoff: datetime,
     current_generation_id: int,
 ) -> list[int]:
-    """Completed manifests a fold could start from, newest first."""
+    """Retained completed manifests a fold could start from, newest first.
+
+    Intermediate manifests whose projection cells were compacted away are not
+    baselines.  Keep explicit cutover baselines, manifests with retained cells,
+    and the live accepted pointer even when that current scope is valid-empty.
+    """
     rows = (
         db.query(models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id)
         .join(
@@ -171,7 +178,29 @@ def _projection_baseline_candidates(
         )
         .all()
     )
-    return [int(row[0]) for row in rows]
+    pointer = db.get(models.PlanningTruthState, 1)
+    live_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    retained: list[int] = []
+    for (generation_id,) in rows:
+        generation_id = int(generation_id)
+        manifest = _read_manifest(db, generation_id=generation_id)
+        has_cells = db.query(
+            models.ProductionMaterialCustodyProjection.id
+        ).filter_by(ledger_generation_id=generation_id).first() is not None
+        if (
+            (
+                manifest is not None
+                and (bool(manifest.is_baseline) or manifest.baseline_generation_id is None)
+            )
+            or has_cells
+            or generation_id == live_generation_id
+        ):
+            retained.append(generation_id)
+    return retained
 
 
 def _latest_projection_manifest(
@@ -1165,8 +1194,9 @@ def publish_current_material_custody(
 
     Candidate rows stay ``is_current=false`` while a generation is building.
     The acceptance transaction calls this only after all gates pass; obsolete
-    current rows are then deleted so accepted custody remains compact while
-    immutable events and the selected rewind baseline retain provenance.
+    intermediate rows are deleted so accepted custody remains compact. Explicit
+    baseline cells are retained as non-current rewind bases because immutable
+    events alone cannot reconstruct a deleted baseline projection.
     """
     generation_id = int(ledger_generation_id)
     candidate = db.query(models.ProductionMaterialCustodyProjection).filter_by(
@@ -1186,11 +1216,107 @@ def publish_current_material_custody(
         models.ProductionMaterialCustodyProjection.ledger_generation_id != generation_id,
     ).all()
     for row in old:
-        db.delete(row)
+        manifest = _read_manifest(db, generation_id=int(row.ledger_generation_id))
+        if manifest is not None and bool(manifest.is_baseline):
+            row.is_current = False
+        else:
+            db.delete(row)
+    # Clear retained baseline markers before promoting the candidate so the
+    # partial unique current-cell index is valid on SQLite as well as PG.
+    db.flush()
     for row in candidate:
         row.is_current = True
     db.flush()
     return len(candidate)
+
+
+def apply_local_custody_event_to_current(
+    db: Session,
+    *,
+    event: models.ProductionMaterialCustodyEvent,
+) -> bool:
+    """Advance compact accepted custody for one local post-cutoff event.
+
+    Material-issue events are operational state, not physical Ledger facts.
+    The writer updates the compact cell and its event watermark in the same
+    transaction, so synchronous readers never need to replay a live tail.
+    Physical events and backdated events deliberately return ``False`` and
+    remain the responsibility of the next accepted physical projection.
+    """
+    if event.source_sle_id is not None or str(event.source_kind) not in {
+        "issue_created",
+        "terminal_release",
+    }:
+        return False
+    from .planning_truth import get_readiness
+
+    readiness = get_readiness(db)
+    generation_id = readiness.generation_id
+    if generation_id is None or not readiness.ready:
+        return False
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or generation.cutoff is None or event.effective_at is None:
+        return False
+    if event.effective_at.replace(tzinfo=None) <= generation.cutoff.replace(tzinfo=None):
+        return False
+    manifest = _read_manifest(db, generation_id=int(generation.id))
+    if manifest is None or str(manifest.status) != "complete":
+        return False
+    rows = db.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True)
+    ).all()
+    key = (
+        int(event.product_id),
+        int(event.component_item_id),
+        str(event.location_kind),
+        str(event.warehouse_ref1c or ""),
+    )
+    row = next(
+        (
+            candidate
+            for candidate in rows
+            if (
+                int(candidate.product_id),
+                int(candidate.component_item_id),
+                str(candidate.location_kind),
+                str(candidate.warehouse_ref1c or ""),
+            ) == key
+        ),
+        None,
+    )
+    current_qty = _to_float(row.reserved_qty) if row is not None else 0.0
+    next_qty = current_qty + _to_float(event.delta_qty)
+    if next_qty < -_EPSILON:
+        raise MaterialCustodySnapshotUnavailable(
+            product_id=int(event.product_id),
+            component_item_id=int(event.component_item_id),
+            expected_generation_id=int(generation.id),
+            stored_generation_id=int(generation.id),
+            reason="local custody event would make compact current state negative",
+        )
+    watermark = int(event.id)
+    for candidate in rows:
+        candidate.source_event_high_watermark_id = watermark
+    if row is not None and next_qty <= _EPSILON:
+        db.delete(row)
+    elif row is not None:
+        row.reserved_qty = next_qty
+    elif next_qty > _EPSILON:
+        db.add(
+            models.ProductionMaterialCustodyProjection(
+                ledger_generation_id=int(generation.id),
+                product_id=int(event.product_id),
+                component_item_id=int(event.component_item_id),
+                location_kind=str(event.location_kind),
+                warehouse_ref1c=str(event.warehouse_ref1c or ""),
+                reserved_qty=next_qty,
+                source_event_high_watermark_id=watermark,
+                is_current=True,
+            )
+        )
+    manifest.source_event_high_watermark_id = watermark
+    db.flush()
+    return True
 
 
 

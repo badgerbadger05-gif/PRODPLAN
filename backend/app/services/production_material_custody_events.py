@@ -139,8 +139,7 @@ def append_material_issue_custody_event(
         return False
 
     line.custody_event_revision = revision
-    db.add(
-        ProductionMaterialCustodyEvent(
+    event = ProductionMaterialCustodyEvent(
             issue_id=issue_id,
             product_id=int(issue.product_id),
             component_item_id=int(line.component_item_id),
@@ -156,7 +155,11 @@ def append_material_issue_custody_event(
             document_number=str(issue.document_number or ""),
             document_line_no=str(line.line_id) if int(getattr(line, "line_id", 0) or 0) else None,
         )
-    )
+    db.add(event)
+    db.flush()
+    from .production_material_custody_projection import apply_local_custody_event_to_current
+
+    apply_local_custody_event_to_current(db, event=event)
     return True
 
 
