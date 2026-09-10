@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from ..database import get_db
+from ..services.item_ledger.current_execution import invalidate_current_execution_scope
 from ..models import ProductionResource, ResourceStage, ProductionStage, ResourceProductionKind, ProductionKind
 from ..schemas import (
     ProductionResource as ProductionResourceSchema,
@@ -17,6 +18,24 @@ from ..schemas import (
 )
 
 router = APIRouter(prefix="/v1/resources", tags=["resources"])
+
+
+def _invalidate_resource_dependents(db: Session, resource_id: int, reason: str) -> None:
+    revision = f"reference:resource:{int(resource_id)}"
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="assembly_readiness",
+        scope_key="assembly:all-live-plans",
+        source_revision=revision,
+        reason=reason,
+    )
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="drum_schedule",
+        scope_key="drum:all-live-plans",
+        source_revision=revision,
+        reason=reason,
+    )
 
 @router.get("/", response_model=List[ProductionResourceSchema])
 def get_resources(
@@ -61,6 +80,8 @@ def create_resource(resource: ProductionResourceCreate, db: Session = Depends(ge
             is_kitting=resource.is_kitting,
         )
         db.add(db_resource)
+        db.flush()
+        _invalidate_resource_dependents(db, int(db_resource.resource_id), "resource_created")
         db.commit()
         db.refresh(db_resource)
         return db_resource
@@ -89,7 +110,7 @@ def update_resource(
         db_resource.daily_work_hours = resource.daily_work_hours
         db_resource.buffer_days = resource.buffer_days
         db_resource.is_kitting = resource.is_kitting
-        
+        _invalidate_resource_dependents(db, int(resource_id), "resource_capacity_changed")
         db.commit()
         db.refresh(db_resource)
         return db_resource
@@ -107,7 +128,7 @@ def delete_resource(resource_id: int, db: Session = Depends(get_db)):
     
     # Удаляем связанные этапы
     db.query(ResourceStage).filter(ResourceStage.resource_id == resource_id).delete()
-    
+    _invalidate_resource_dependents(db, int(resource_id), "resource_deleted")
     db.delete(db_resource)
     db.commit()
     return {"status": "success"}

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..database import get_db
+from ..services.item_ledger.current_execution import invalidate_current_execution_scope
 
 
 router = APIRouter(prefix="/v1/planning-rates", tags=["planning-rates"])
@@ -352,6 +353,20 @@ def upsert_assembly_rates(
             updated += 1
         touched.append(existing)
     db.flush()
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="assembly_readiness",
+        scope_key="assembly:all-live-plans",
+        source_revision="reference:assembly-rate",
+        reason="assembly_rate_changed",
+    )
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="drum_schedule",
+        scope_key="drum:all-live-plans",
+        source_revision="reference:assembly-rate",
+        reason="assembly_rate_changed",
+    )
     db.commit()
     for row in touched:
         db.refresh(row)
@@ -376,6 +391,20 @@ def delete_assembly_rate(
     if row is None:
         raise HTTPException(status_code=404, detail=f"assembly rate {rate_id} not found")
     db.delete(row)
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="assembly_readiness",
+        scope_key="assembly:all-live-plans",
+        source_revision=f"reference:assembly-rate:{rate_id}",
+        reason="assembly_rate_deleted",
+    )
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="drum_schedule",
+        scope_key="drum:all-live-plans",
+        source_revision=f"reference:assembly-rate:{rate_id}",
+        reason="assembly_rate_deleted",
+    )
     db.commit()
     return DeleteResponse(deleted=True, id=int(rate_id))
 
@@ -452,6 +481,13 @@ def create_shelf_policy(
         active=bool(payload.active),
     )
     db.add(row)
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="shelf_projection",
+        scope_key="shelf:all-live-mrps",
+        source_revision="reference:shelf-policy:create",
+        reason="shelf_policy_changed",
+    )
     db.commit()
     db.refresh(row)
     items = _item_labels(db, {int(row.item_id)})
@@ -497,6 +533,13 @@ def update_shelf_policy(
         row.batch_multiple = payload.batch_multiple
     if payload.active is not None:
         row.active = bool(payload.active)
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="shelf_projection",
+        scope_key="shelf:all-live-mrps",
+        source_revision=f"reference:shelf-policy:{policy_id}",
+        reason="shelf_policy_changed",
+    )
     db.commit()
     db.refresh(row)
     items = _item_labels(db, {int(row.item_id)})
@@ -526,6 +569,13 @@ def delete_shelf_policy(
             ),
         )
     db.delete(row)
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="shelf_projection",
+        scope_key="shelf:all-live-mrps",
+        source_revision=f"reference:shelf-policy:{policy_id}",
+        reason="shelf_policy_deleted",
+    )
     db.commit()
     return DeleteResponse(deleted=True, id=int(policy_id))
 
@@ -600,6 +650,20 @@ def patch_planning_resource(
         row.capacity = payload.capacity
     if payload.planning_range is not None:
         row.planning_range = int(payload.planning_range)
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="assembly_readiness",
+        scope_key="assembly:all-live-plans",
+        source_revision=f"reference:resource:{resource_id}",
+        reason="resource_capacity_changed",
+    )
+    invalidate_current_execution_scope(
+        db,
+        entity_kind="drum_schedule",
+        scope_key="drum:all-live-plans",
+        source_revision=f"reference:resource:{resource_id}",
+        reason="resource_capacity_changed",
+    )
     db.commit()
     db.refresh(row)
     rate_count = (
