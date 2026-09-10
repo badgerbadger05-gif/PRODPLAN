@@ -815,6 +815,8 @@ Implementation/fix commits:
   current drum sort, and semantic no-op guards for rates/resources/shelf
   policies.
 * `bb324555` — fixed transfer-custody invalidation revision propagation.
+* `40f228c3` — persisted `drum_excluded` current rows and current GET mapping;
+  exclusions remain part of the supported DrumSchedule response.
 
 Relevant implementation is in
 `backend/app/services/item_ledger/current_execution.py`,
@@ -872,11 +874,11 @@ Skip отсутствуют. Удалённые пути: **нет**. Production
 
 ### Остаточные риски
 
-Реальный WorkCalendarDay writer/API в R8-контуре отсутствует: для него
-зафиксирован обязательный transactional hook
-`invalidate_current_execution_for_calendar_change`; до его вызова календарь
-не считается применённым и current GET остаётся stale/fail-closed. Excluded
-drum detail требует дальнейшего расширения persisted current payload, если
-потребуется отдельный построчный список, хотя schedule metrics уже сохраняются
-в current summary. R9 API/UI и R10 cleanup не начинались; production contour
+Реальный WorkCalendarDay writer/API в R8-контуре отсутствует. Для будущего
+writer зафиксирован обязательный transactional hook
+`invalidate_current_execution_for_calendar_change`; out-of-band изменение без
+него оставляет ready manifest и не обнаруживается автоматически — это явный
+residual unsafe gap. Excluded drum rows теперь сохраняются как `drum_excluded` current
+rows и возвращаются прежним API-контрактом; их coverage проверена focused
+регрессией. R9 API/UI и R10 cleanup не начинались; production contour
 намеренно не проверялся.

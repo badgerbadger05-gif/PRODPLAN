@@ -337,10 +337,10 @@ technical generation с тем же результатом не создаёт r
 Писатели reference data, custody events и manual commands инвалидируют только
 затронутые manifests в той же транзакционной границе; семантический no-op не
 инвалидирует результат. Accepted current scope не считается применённым, пока
-worker не опубликовал новый persisted result. Для будущего WorkCalendarDay
-writer обязательна транзакционная граница
-`invalidate_current_execution_for_calendar_change`; без неё календарное
-изменение остаётся stale/fail-closed.
+worker не опубликовал новый persisted result. Сейчас нет текущего WorkCalendarDay writer/API. Любой будущий writer обязан вызвать
+`invalidate_current_execution_for_calendar_change` атомарно; out-of-band
+изменение без hook оставляет manifest ready и не обнаруживается автоматически,
+что является явным unsafe gap, а не fail-closed поведением.
 
 ## R5. Исправления, возвраты и backdate
 

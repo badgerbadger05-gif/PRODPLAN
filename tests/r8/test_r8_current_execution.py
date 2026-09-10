@@ -68,7 +68,14 @@ def _seed_generation_execution_rows(db, *, generation_id: int, queue_line_id: in
         total_open_qty=Decimal("10"),
         total_slot_qty=Decimal("10"),
         total_gap_qty=Decimal("0"),
-        metrics={"total_open_qty": "10", "total_slot_qty": "10", "total_gap_qty": "0"},
+        metrics={
+            "total_open_qty": "10",
+            "total_slot_qty": "10",
+            "total_gap_qty": "0",
+            "excluded_lines": 1,
+            "excluded_open_qty": "10",
+            "excluded_item_ids": [401],
+        },
     )
     db.add(schedule)
     db.flush()
@@ -172,9 +179,11 @@ def test_r8_generation_local_queue_ids_do_not_churn_current_readiness_or_drum(
     assert db_session.query(models.CurrentExecutionChange).count() == first_changes
     readiness = next(row for row in current if row.entity_kind == "assembly_readiness")
     drum_slot = next(row for row in current if row.entity_kind == "drum_slot")
+    excluded = next(row for row in current if row.entity_kind == "drum_excluded")
     queue = next(row for row in current if row.entity_kind == "assembly_queue")
     assert readiness.payload["queue_line_id"] == queue.id
     assert drum_slot.payload["queue_line_id"] == queue.id
+    assert excluded.payload["queue_line_id"] == queue.id
     assert get_current_execution_scope(
         db_session, entity_kind="assembly_readiness", scope_key="assembly:all-live-plans"
     ).source_generation_id == generation2.id

@@ -246,6 +246,8 @@ date/resource/priority/ordinal tie-break.
 
 Reference, custody и manual mutation writers инвалидируют только свои
 зависимые manifests и делают это на фактическом semantic change; no-op update
-не инвалидирует готовый результат. Calendar writers обязаны вызвать
-`invalidate_current_execution_for_calendar_change` в той же транзакции; без
-этого current execution остаётся unavailable до следующей публикации worker.
+не инвалидирует готовый результат. Текущего Calendar writer/API нет. Любой
+будущий writer обязан вызвать
+`invalidate_current_execution_for_calendar_change` в той же транзакции;
+out-of-band изменение без hook оставляет manifest ready и не обнаруживается
+автоматически — это явный unsafe gap до появления writer.

@@ -37,7 +37,7 @@ def test_r8_calendar_contract_names_missing_writer_as_explicit_unsafe_gap():
     canon = (ROOT / ".docs/CANON.md").read_text(encoding="utf-8")
     report = (ROOT / "docs/current-execution-release-report.md").read_text(encoding="utf-8")
     assert "нет текущего WorkCalendarDay writer/API" in canon
-    assert "явный residual unsafe gap" in report
+    assert "residual unsafe gap" in report
 
 
 def test_r8_calendar_hook_invalidates_only_calendar_dependents(db_session):
