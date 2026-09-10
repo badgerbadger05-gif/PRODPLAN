@@ -1792,9 +1792,8 @@ async def export_planning_result_purchases_to_1c(
         selected_purchase_ids = []
         for row in selected_rows:
             payload = dict(row.payload or {})
-            requirement_id = payload.get("source_mrp_requirement_id") or payload.get("requirement_id")
             item_id = payload.get("item_id")
-            if requirement_id is None or item_id is None:
+            if item_id is None:
                 raise HTTPException(
                     status_code=503,
                     detail={"code": "mrp_result_purchase_identity_unresolved"},
@@ -1802,20 +1801,25 @@ async def export_planning_result_purchases_to_1c(
             purchase_query = db.query(models.PlannedPurchase).filter(
                 models.PlannedPurchase.run_id == int(run_id),
                 models.PlannedPurchase.item_id == int(item_id),
-                models.PlannedPurchase.source_mrp_requirement_id == int(requirement_id),
             )
+            requirement_id = payload.get("source_mrp_requirement_id") or payload.get("requirement_id")
+            if requirement_id is not None:
+                purchase_query = purchase_query.filter(
+                    models.PlannedPurchase.source_mrp_requirement_id == int(requirement_id)
+                )
             supplier_ref = payload.get("supplier_ref1c")
             if supplier_ref:
                 purchase_query = purchase_query.filter(
                     models.PlannedPurchase.supplier_ref1c == str(supplier_ref)
                 )
             matches = purchase_query.all()
-            if len(matches) != 1:
+            if not matches:
                 raise HTTPException(
                     status_code=503,
                     detail={"code": "mrp_result_purchase_identity_unresolved"},
                 )
-            selected_purchase_ids.append(int(matches[0].purchase_id))
+            selected_purchase_ids.extend(int(match.purchase_id) for match in matches)
+        selected_purchase_ids = sorted(set(selected_purchase_ids))
         if req.purchase_ids is not None and sorted({int(value) for value in req.purchase_ids}) != sorted(selected_purchase_ids):
             raise HTTPException(
                 status_code=409,

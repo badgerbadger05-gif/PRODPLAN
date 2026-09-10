@@ -940,46 +940,58 @@ def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
 
 
 def _mrp_current_identity(payload: dict[str, Any], *, run_id: int, row_kind: str) -> str:
-    """Build an MRP identity from obligation semantics, never technical row IDs."""
+    """Build an MRP identity from the actual aggregate's semantic key."""
     kind = str(row_kind).strip().lower()
+    item_id = payload.get("item_id")
+    unit = str(payload.get("unit") or "").strip()
+    bucket = (
+        payload.get("bucket_date") or payload.get("need_date")
+        or payload.get("start_date") or payload.get("date")
+        or str(payload.get("sort_key") or "").split("|", 1)[0]
+    )
     if kind == "capacity":
         area = payload.get("area_id") or payload.get("resource_id")
-        bucket = payload.get("bucket_date") or payload.get("date") or payload.get("need_date")
         if area in (None, "") or bucket in (None, ""):
             raise CurrentExecutionUnavailable("MRP capacity row lacks stable area/date identity")
         return f"mrp-run:{int(run_id)}:capacity:area:{area}:bucket:{bucket}"
-    requirement = (
+    explicit_requirement = (
         payload.get("source_mrp_requirement_id")
         or payload.get("requirement_id")
         or payload.get("req_id")
     )
-    if requirement in (None, ""):
-        row_key = str(payload.get("row_key") or "")
-        if row_key.startswith("req:"):
-            tail = row_key.rsplit(":", 1)[-1]
-            if tail.isdigit():
-                requirement = int(tail)
-    # Aggregate/capacity-adjacent obligation rows may not have a numeric
-    # requirement.  Their persisted semantic aggregation key is the stable
-    # owner; technical row_key/index is deliberately excluded.
-    if requirement in (None, ""):
-        requirement = payload.get("agg_key") or payload.get("demand_ref")
-    item_id = payload.get("item_id")
-    if requirement in (None, "") or item_id in (None, ""):
-        raise CurrentExecutionUnavailable(
-            f"MRP {row_kind} row lacks stable requirement/item identity"
+    if explicit_requirement not in (None, "") and item_id not in (None, ""):
+        discriminator = (
+            payload.get("source_mrp_allocation_key")
+            or payload.get("source_mrp_allocation_id")
+            or payload.get("supplier_ref1c")
+            or payload.get("bucket_date")
+            or "default"
         )
-    discriminator = (
-        payload.get("source_mrp_allocation_key")
-        or payload.get("source_mrp_allocation_id")
-        or payload.get("supplier_ref1c")
-        or payload.get("bucket_date")
-        or "default"
-    )
-    return (
-        f"mrp-run:{int(run_id)}:{str(row_kind).strip().lower()}:"
-        f"requirement:{str(requirement)}:item:{int(item_id)}:allocation:{str(discriminator)}"
-    )
+        return (
+            f"mrp-run:{int(run_id)}:{kind}:requirement:{explicit_requirement}:"
+            f"item:{int(item_id)}:allocation:{str(discriminator)}"
+        )
+    if item_id not in (None, ""):
+        if kind == "production":
+            semantic = payload.get("agg_key") or payload.get("demand_ref")
+            if semantic in (None, "") and bucket in (None, ""):
+                raise CurrentExecutionUnavailable("MRP production row lacks start-date aggregate identity")
+            semantic = semantic or f"item:{int(item_id)}|start:{bucket or ''}|unit:{unit}"
+        elif kind == "purchase":
+            semantic = payload.get("agg_key")
+            if semantic in (None, "") and not unit:
+                raise CurrentExecutionUnavailable("MRP purchase row lacks unit aggregate identity")
+            semantic = semantic or f"item:{int(item_id)}|unit:{unit}"
+        elif kind == "rework":
+            semantic = payload.get("agg_key") or (
+                f"item:{int(item_id)}|bucket:{bucket or ''}|unit:{unit}|"
+                f"spec:{payload.get('spec_id') or ''}"
+            )
+        else:
+            semantic = payload.get("agg_key") or payload.get("demand_ref")
+        if semantic not in (None, ""):
+            return f"mrp-run:{int(run_id)}:{kind}:{str(semantic)}"
+    raise CurrentExecutionUnavailable(f"MRP {row_kind} row lacks stable aggregate identity")
 
 
 def _mrp_current_payload(payload: dict[str, Any], *, business_identity: str) -> dict[str, Any]:
@@ -996,12 +1008,14 @@ def _mrp_current_payload(payload: dict[str, Any], *, business_identity: str) -> 
         "planned_purchase_id", "order_id", "rework_id", "work_item_id",
     ):
         result.pop(key, None)
+    original_sort_key = str(payload.get("sort_key") or "")
     bucket = (
         result.get("bucket_date") or result.get("need_date")
-        or result.get("start_date") or result.get("date") or ""
+        or result.get("start_date") or result.get("date")
+        or original_sort_key.split("|", 1)[0] or ""
     )
     item_id = result.get("item_id")
-    result["sort_key"] = f"{bucket}|{int(item_id) if item_id is not None else 0:012d}|{business_identity}"
+    result["sort_key"] = f"{bucket}|{int(item_id) if item_id is not None else 0:012d}"
     return result
 
 
