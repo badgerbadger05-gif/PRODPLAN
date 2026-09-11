@@ -44,7 +44,16 @@ def test_purchase_sort_uses_typed_numeric_primary_and_tie_ascending():
 
 def test_purchase_row_transport_contract_exposes_current_identity_and_revision():
     schema = TestClient(app).app.openapi()["components"]["schemas"]
+    materialize_request = schema["PurchaseControlMaterializeRequest"]["properties"]
+    selection_request = schema["PurchaseControlSelectionSummaryRequest"]["properties"]
     response = schema["PurchaseControlSelectionSummaryResponse"]["properties"]
+
+    assert "current_scope_id" in materialize_request
+    assert "current_scope_id" in selection_request
+    assert "snapshot_id" not in materialize_request
+    assert "snapshot_id" not in selection_request
+    assert "current_scope_id" in response
+    assert "snapshot_id" not in response
 
     assert "current_identity" in response
     assert "current_identities" in response
