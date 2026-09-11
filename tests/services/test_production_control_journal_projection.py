@@ -11,17 +11,18 @@ from app.services.production_control_material_availability import get_materials_
 from app.services.production_material_custody_projection import (
     initialize_material_custody_baseline,
 )
-from app.services.production_control_journal_snapshot import (
+from types import SimpleNamespace
+
+from app.services.production_control_journal_projection import (
     ProductionControlJournalPromotionError,
-    ProductionControlJournalSnapshotUnavailable,
+    ProductionControlJournalUnavailable,
     RouteSheetSnapshotUnavailable,
     list_root_product_options,
     _public_journal_row,
     _drum_readiness_pull_by_run_item,
-    build_candidate_snapshot,
+    build_candidate_payload,
     read_route_sheet_snapshot_rows,
-    promote_candidate_snapshot,
-    validate_candidate_snapshot,
+    validate_candidate_payload,
     read_snapshot,
 )
 from app.services.item_ledger.future_supply_capture import (
@@ -417,45 +418,58 @@ def _make_proposal(db, generation):
     return run, work
 
 
-def _accept(db, generation, snapshot):
+class _CandidatePayload:
+    """Test boundary for an unpersisted candidate payload."""
+
+    def __init__(self, generation, payload):
+        self.id = int(generation.id)
+        self.cutoff = generation.cutoff
+        self.truth_status = str(payload["meta"].get("truth_status"))
+        self.payload = payload
+        self.rows = [
+            SimpleNamespace(
+                row_key=str(row.get("journal_row_key") or row.get("current_identity")),
+                row_kind=(
+                    "production_proposal"
+                    if row.get("product_id") is None
+                    else "production_order"
+                ),
+                payload=row,
+            )
+            for row in payload.get("rows", [])
+        ]
+
+
+def _build_candidate(db, generation_id, *, accepted_run_ids):
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    payload = build_candidate_payload(
+        db,
+        int(generation_id),
+        accepted_run_ids=accepted_run_ids,
+    )
+    return _CandidatePayload(generation, payload)
+
+
+def _candidate_rows(candidate):
+    return {str(row.row_key): row.payload for row in candidate.rows}
+
+
+def _accept(db, generation, candidate):
     accepted_at = datetime(2026, 7, 29, 13, tzinfo=timezone.utc)
     generation.status = "accepted"
     generation.accepted_at = accepted_at
     generation.capabilities = dict(CAPABILITIES)
-    promoted = promote_candidate_snapshot(
-        db,
-        generation=generation,
-        accepted_at=accepted_at,
-    )
-    assert promoted is snapshot
     publish_generation(db, generation)
-    db.commit()
+    db.flush()
 
 
-def _publish_current(db, generation):
-    snapshot = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "production_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one()
-    rows = []
-    for persisted in db.query(models.PlanningReadRow).filter(
-        models.PlanningReadRow.snapshot_id == int(snapshot.id),
-    ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
-        row = dict(persisted.payload or {})
-        row["root_item_ids"] = [
-            int(member.root_item_id)
-            for member in db.query(models.PlanningReadRootMember).filter(
-                models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-                models.PlanningReadRootMember.row_id == int(persisted.id),
-            ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
-        ]
-        rows.append(row)
-    payload = dict(snapshot.payload or {})
-    payload["rows"] = rows
-    publish_current_production_control_from_payload(db, int(generation.id), payload)
-    db.commit()
+def _publish_current(db, generation, candidate):
+    publish_current_production_control_from_payload(
+        db,
+        int(generation.id),
+        candidate.payload,
+    )
+    db.flush()
 
 
 def _setup_chain_journal_rows(db):
@@ -528,53 +542,46 @@ def _setup_chain_journal_rows(db):
     return paint_product, weld_product
 
 
-def test_candidate_snapshot_row_contains_route_sheet_snapshot(db_session):
+def test_candidate_payload_row_contains_route_sheet_payload(db_session):
     generation = _building_generation(db_session, "production-journal-row-route")
     item, order, product = _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
     )
     db_session.flush()
 
-    row = db_session.query(models.PlanningReadRow).filter_by(
-        snapshot_id=snapshot.id,
-        row_key=f"product:{product.product_id}",
-    ).one()
-    route_payload = row.payload["_route_sheet_snapshot"]
+    row = _candidate_rows(snapshot)[f"product:{product.product_id}"]
+    route_payload = row["_route_sheet_snapshot"]
     assert int(route_payload["version"]) == 1
     assert int(route_payload["sheet"]["product_id"]) == product.product_id
     assert int(route_payload["sheet"]["remaining_qty"]) == 7
-    assert "_route_sheet_snapshot" in row.payload
+    assert "_route_sheet_snapshot" in row
 
 
-def test_candidate_snapshot_contains_unmaterialized_make_proposal(db_session):
+def test_candidate_payload_contains_unmaterialized_make_proposal(db_session):
     generation = _building_generation(db_session, "production-journal-make-proposal")
     run, work = _make_proposal(db_session, generation)
 
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
-    row = db_session.query(models.PlanningReadRow).filter_by(
-        snapshot_id=snapshot.id,
-        row_key=f"work-item:{work.id}",
-    ).one()
+    row = _candidate_rows(snapshot)[f"work-item:{work.id}"]
 
-    assert row.row_kind == "production_proposal"
-    assert row.payload["journal_row_key"] == f"work-item:{work.id}"
-    assert row.payload["work_item_id"] == work.id
-    assert row.payload["product_id"] is None
-    assert row.payload["order_id"] is None
-    assert row.payload["remaining_qty"] == 10
-    assert row.payload["status"] == "not_created"
-    assert row.payload["coverage_status"] == "shortage"
-    assert row.payload["coverage_label"] == "Дефицит"
-    assert row.payload["material_coverage_status"] == "shortage"
-    assert row.payload["available_actions"] == ["materialize"]
-    assert "_route_sheet_snapshot" not in row.payload
+    assert row["journal_row_key"] == f"work-item:{work.id}"
+    assert row["work_item_id"] == work.id
+    assert row["product_id"] is None
+    assert row["order_id"] is None
+    assert row["remaining_qty"] == 10
+    assert row["status"] == "not_created"
+    assert row["coverage_status"] == "shortage"
+    assert row["coverage_label"] == "Дефицит"
+    assert row["material_coverage_status"] == "shortage"
+    assert row["available_actions"] == ["materialize"]
+    assert "_route_sheet_snapshot" not in row
     assert db_session.query(models.ProductionOrder).count() == 0
 
 
@@ -729,15 +736,12 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
         assert [row["component_item_id"] for row in materials["components"]] == [raw_item.item_id]
         assert materials["components"][0]["required_qty"] == 20
 
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
-    rows = {
-        row.row_key: row.payload
-        for row in db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).all()
-    }
+    rows = _candidate_rows(snapshot)
     painted_row = rows[f"work-item:{painted_work.id}"]
     welded_row = rows[f"work-item:{welded_work.id}"]
     assert painted_row["coverage_status"] == ("unavailable" if ambiguous else "ready")
@@ -754,16 +758,12 @@ def test_paint_weld_proposals_use_welded_frozen_bom_and_block_welded_row(db_sess
     # production-control journal candidate — and therefore every generation
     # acceptance that contained a weld→paint chain.
     _accept(db_session, generation, snapshot)
-    promoted_welded = (
-        db_session.query(models.PlanningReadRow)
-        .filter_by(snapshot_id=snapshot.id, row_key=f"work-item:{welded_work.id}")
-        .one()
-    )
-    assert promoted_welded.payload["available_actions"] == []
-    assert snapshot.truth_status == "accepted"
+    promoted_welded = _candidate_rows(snapshot)[f"work-item:{welded_work.id}"]
+    assert promoted_welded["available_actions"] == []
+    assert generation.status == "accepted"
 
 
-def test_route_sheet_snapshot_builder_uses_candidate_generation_for_stock_bins(
+def test_route_sheet_builder_uses_candidate_generation_for_stock_bins(
     db_session,
     monkeypatch,
 ):
@@ -887,16 +887,13 @@ def test_route_sheet_snapshot_builder_uses_candidate_generation_for_stock_bins(
             ),
         ]
     )
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         building_generation.id,
         accepted_run_ids=[],
     )
 
-    route_payload = db_session.query(models.PlanningReadRow).filter_by(
-        snapshot_id=snapshot.id,
-        row_key=f"product:{product.product_id}",
-    ).one().payload["_route_sheet_snapshot"]
+    route_payload = _candidate_rows(snapshot)[f"product:{product.product_id}"]["_route_sheet_snapshot"]
 
     components = route_payload["sheet"]["components"]
     assert len(components) == 1
@@ -906,13 +903,13 @@ def test_route_sheet_snapshot_builder_uses_candidate_generation_for_stock_bins(
 def test_route_sheet_snapshot_rows_use_anchor_dedup_and_are_immutable(db_session):
     generation = _building_generation(db_session, "production-journal-route-chain")
     painted_product, welded_product = _setup_chain_journal_rows(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     first = read_route_sheet_snapshot_rows(
         db_session,
@@ -932,29 +929,23 @@ def test_route_sheet_snapshot_rows_use_anchor_dedup_and_are_immutable(db_session
     assert second[0]["sheet"]["remaining_qty"] == original_qty
 
 
-def test_validate_candidate_snapshot_rejects_missing_route_sheet_payload(db_session):
+def test_validate_candidate_payload_rejects_missing_route_sheet_payload(db_session):
     generation = _building_generation(db_session, "production-journal-route-invalid")
     _, _, product = _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
     )
-    row = db_session.query(models.PlanningReadRow).filter_by(
-        snapshot_id=snapshot.id,
-        row_key=f"product:{product.product_id}",
-    ).one()
-    payload = dict(row.payload)
+    payload = dict(_candidate_rows(snapshot)[f"product:{product.product_id}"])
     payload.pop("_route_sheet_snapshot", None)
-    row.payload = payload
-    db_session.flush()
+    snapshot.payload["rows"] = [
+        payload if row.get("product_id") == product.product_id else row
+        for row in snapshot.payload["rows"]
+    ]
 
     with pytest.raises(ProductionControlJournalPromotionError):
-        validate_candidate_snapshot(
-            db_session,
-            snapshot,
-            generation,
-        )
+        validate_candidate_payload(snapshot.payload, generation)
 
 
 def test_route_sheet_snapshot_rows_fail_closed_without_snapshot(db_session):
@@ -970,26 +961,26 @@ def test_route_sheet_snapshot_rows_fail_closed_without_snapshot(db_session):
     assert caught.value.as_dict()["code"] == "route_sheet_snapshot_unavailable"
 
 
-def test_public_read_is_persisted_paged_and_stable_after_live_mutation(db_session):
+def test_public_current_read_is_paged_and_stable_after_live_mutation(db_session):
     generation = _building_generation(db_session, "production-journal-snapshot")
     item, order, product = _journal_line(db_session)
 
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
     )
-    assert build_candidate_snapshot(
+    assert _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
-    ) is snapshot
+    ).payload == snapshot.payload
     assert snapshot.truth_status == "building"
     assert snapshot.payload["meta"]["row_count"] == 1
     assert len(snapshot.rows) == 1
     assert snapshot.rows[0].payload["remaining_qty"] == 7
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     first = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert first["total"] == 1
@@ -1023,11 +1014,11 @@ def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session
     """
     generation = _building_generation(db_session, "production-journal-live-qty")
     item, order, product = _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session, generation.id, accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert before["rows"][0]["quantity"] == 10
@@ -1047,14 +1038,14 @@ def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session
     assert after["rows"][0]["remaining_qty"] == 1, "остаток считается от снимочного выпуска"
 
 
-def test_completed_1c_order_is_hidden_immediately_from_accepted_snapshot(db_session):
+def test_completed_1c_order_is_hidden_immediately_from_current_read(db_session):
     generation = _building_generation(db_session, "production-journal-live-completion")
     _item, order, _product = _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session, generation.id, accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert before["total"] == 1
@@ -1071,7 +1062,7 @@ def test_completed_1c_order_is_hidden_immediately_from_accepted_snapshot(db_sess
     assert after["offset"] == 0
 
 
-def test_missing_snapshot_fails_closed_and_router_maps_it_to_503(db_session):
+def test_missing_current_publication_fails_closed_and_router_maps_it_to_503(db_session):
     generation = _building_generation(db_session, "production-journal-missing")
     generation.status = "accepted"
     generation.accepted_at = datetime(2026, 7, 29, 13, tzinfo=timezone.utc)
@@ -1079,7 +1070,7 @@ def test_missing_snapshot_fails_closed_and_router_maps_it_to_503(db_session):
     publish_generation(db_session, generation)
     db_session.commit()
 
-    with pytest.raises(ProductionControlJournalSnapshotUnavailable) as caught:
+    with pytest.raises(ProductionControlJournalUnavailable) as caught:
         read_snapshot(db_session)
     assert caught.value.as_dict()["status"] == "unavailable"
     assert "missing" in caught.value.as_dict()["reason"]
@@ -1093,10 +1084,10 @@ def test_missing_snapshot_fails_closed_and_router_maps_it_to_503(db_session):
     )
 
 
-def test_stale_truth_fails_before_snapshot_lookup(db_session):
+def test_stale_truth_fails_before_current_lookup(db_session):
     generation = _building_generation(db_session, "production-journal-stale")
     _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
@@ -1106,17 +1097,17 @@ def test_stale_truth_fails_before_snapshot_lookup(db_session):
     generation.reason = "refresh overdue"
     db_session.commit()
 
-    with pytest.raises(ProductionControlJournalSnapshotUnavailable) as caught:
+    with pytest.raises(ProductionControlJournalUnavailable) as caught:
         read_snapshot(db_session)
     detail = caught.value.as_dict()
     assert detail["truth_status"] == "stale"
     assert detail["status"] == "unavailable"
 
 
-def test_list_root_product_options_reads_only_frozen_snapshot_labels(db_session):
+def test_list_root_product_options_reads_only_frozen_current_labels(db_session):
     generation = _building_generation(db_session, "journal-root-options")
     _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[],
@@ -1147,7 +1138,7 @@ def test_list_root_product_options_reads_only_frozen_snapshot_labels(db_session)
     }
     snapshot.payload = payload
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     root_a.item_name = "Renamed after acceptance"
     root_b.item_article = "ZZ-LIVE"
@@ -1193,13 +1184,13 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
     1С — это потеря заказа для оператора, а не корректная заморозка плана."""
     generation = _building_generation(db_session, "production-journal-live-launch")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     before = read_snapshot(db_session, limit=100)
     proposal = before["rows"][0]
@@ -1233,13 +1224,13 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
 def test_journal_overlays_print_and_transfer_state_after_cutoff(db_session):
     generation = _building_generation(db_session, "production-journal-live-state")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
     _order, product = _launch_after_cutoff(
         db_session,
         generation,
@@ -1271,13 +1262,13 @@ def test_journal_overlays_print_and_transfer_state_after_cutoff(db_session):
 def test_materials_are_available_for_order_opened_after_cutoff(db_session):
     generation = _building_generation(db_session, "production-journal-live-materials")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
     _order, product = _launch_after_cutoff(
         db_session,
         generation,
@@ -1304,11 +1295,11 @@ def test_materials_endpoint_answers_through_its_strict_response_model(db_session
 
     generation = _building_generation(db_session, "production-journal-materials-api")
     _item, _order, product = _journal_line(db_session)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session, generation.id, accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     app = FastAPI()
     app.include_router(production_router, prefix="/api")
@@ -1339,11 +1330,11 @@ def test_work_item_materials_fail_closed_without_persisted_coverage(db_session):
 
     generation = _building_generation(db_session, "production-journal-wi-materials-api")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session, generation.id, accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     from app.services.item_ledger.current_execution import (
         get_current_execution_scope,
@@ -1397,18 +1388,18 @@ def test_work_item_materials_remain_readable_from_the_published_row_generation(d
 
     row_generation = _building_generation(db_session, "production-journal-wi-pinned")
     run, work = _make_proposal(db_session, row_generation)
-    row_snapshot = build_candidate_snapshot(
+    row_snapshot = _build_candidate(
         db_session, row_generation.id, accepted_run_ids=[run.run_id],
     )
     _accept(db_session, row_generation, row_snapshot)
-    _publish_current(db_session, row_generation)
+    _publish_current(db_session, row_generation, row_snapshot)
 
     current_generation = _building_generation(db_session, "production-journal-wi-current")
-    current_snapshot = build_candidate_snapshot(
+    current_snapshot = _build_candidate(
         db_session, current_generation.id, accepted_run_ids=[],
     )
     _accept(db_session, current_generation, current_snapshot)
-    _publish_current(db_session, current_generation)
+    _publish_current(db_session, current_generation, current_snapshot)
 
     app = FastAPI()
     app.include_router(production_router, prefix="/api")
@@ -1449,13 +1440,13 @@ def test_materials_survive_a_generation_flip_right_after_launch(db_session):
     """
     generation = _building_generation(db_session, "production-journal-gen-flip")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
     _order, product = _launch_after_cutoff(
         db_session,
         generation,
@@ -1475,13 +1466,13 @@ def test_route_sheet_prints_for_order_opened_after_cutoff(db_session):
     гипотеза: он обязан печататься сразу после запуска."""
     generation = _building_generation(db_session, "production-journal-live-route")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     _, product = _launch_after_cutoff(
         db_session,
@@ -1500,13 +1491,13 @@ def test_route_sheet_still_fails_closed_for_unknown_product(db_session):
     среди созданных после cutoff, по-прежнему нет."""
     generation = _building_generation(db_session, "production-journal-live-unknown")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     with pytest.raises(RouteSheetSnapshotUnavailable) as caught:
         read_route_sheet_snapshot_rows(db_session, [987654])
@@ -1517,13 +1508,13 @@ def test_order_deleted_in_1c_does_not_resurrect_journal_row(db_session):
     """Снятый пометкой удаления заказ не должен подменять строку-предложение."""
     generation = _building_generation(db_session, "production-journal-live-deleted")
     run, work = _make_proposal(db_session, generation)
-    snapshot = build_candidate_snapshot(
+    snapshot = _build_candidate(
         db_session,
         generation.id,
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
-    _publish_current(db_session, generation)
+    _publish_current(db_session, generation, snapshot)
 
     order, _product = _launch_after_cutoff(
         db_session,

@@ -223,7 +223,7 @@ def test_chain_route_sheet_is_single_with_two_operation_blocks(db_session):
 
 @pytest.mark.parametrize("produced", [0, 4, 14])
 def test_chain_material_panel_and_print_use_same_weld_quantity(db_session, produced):
-    from tests.services.test_production_control_journal_snapshot import _building_generation
+    from tests.services.test_production_control_journal_projection import _building_generation
     from app.services.production_control_material_availability import preview_materials
 
     paint, weld, *_ = _setup_chain(db_session)
