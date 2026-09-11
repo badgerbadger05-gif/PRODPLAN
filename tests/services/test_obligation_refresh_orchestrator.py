@@ -229,6 +229,20 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
     assert execution_snapshot["summary"]["execution_base_qty"] == 2
     assert queue_line.assembly_remaining_qty == Decimal("2")
     assert readiness.open_qty == Decimal("2")
+    assembly_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    ).one()
+    assert int(assembly_scope.source_generation_id) == int(result.target_generation_id)
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        consumer="assembly_queue",
+    ).count() == 0
+    snapshot_batch = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        stage="snapshot_build",
+    ).one()
+    assert "assembly_queue_snapshot_id" not in dict(snapshot_batch.metrics or {})
     # Current refreshes must not invoke the legacy generation-copy writer;
     # retained obligations stay anchored to their stable run identity.
     assert preserve_flags == []
