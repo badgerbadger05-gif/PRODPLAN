@@ -57,12 +57,18 @@ def test_runtime_consumers_use_projection_owner_modules_only():
         BACKEND / "routers",
         BACKEND / "services",
     ]
+    legacy_import_tokens = {
+        name.removesuffix(".py") for name in old_modules
+    }
     stale_imports = {
         path.relative_to(REPO).as_posix()
         for root in runtime_sources
         for path in root.rglob("*.py")
-        if "_snapshot" in path.read_text(encoding="utf-8")
-        and path.name not in {"models.py"}
+        if path.name not in old_modules
+        and any(
+            token in path.read_text(encoding="utf-8")
+            for token in legacy_import_tokens
+        )
     }
     assert stale_imports == set()
 
@@ -79,8 +85,8 @@ def test_truth_and_material_availability_export_no_legacy_reader_apis():
 
 
 def test_legacy_converter_is_tools_only_and_does_not_import_orm_models():
-    adapter = REPO / "backend" / "tools" / "current_execution_legacy_adapter.py"
-    migration = REPO / "backend" / "tools" / "current_execution_migration.py"
+    adapter = REPO / "tools" / "current_execution_legacy_adapter.py"
+    migration = REPO / "tools" / "current_execution_migration.py"
     assert adapter.exists()
     adapter_source = adapter.read_text(encoding="utf-8")
     assert "PlanningReadSnapshot" not in adapter_source
