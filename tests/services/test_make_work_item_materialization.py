@@ -267,3 +267,65 @@ def test_materialize_reuses_exact_requirement_after_physical_generation_advances
     assert second["created"] == []
     assert [row["product_id"] for row in second["reused"]] == first_product_ids
     assert {row["work_item_id"] for row in second["reused"]} == {next_work.id}
+
+
+def test_materialize_counts_previous_mrp_run_of_same_plan_and_retries(db_session):
+    from app.services.production_control_journal import _active_open_qty_by_requirement
+
+    work, requirement, _reservation = _scope(db_session)
+    first = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 3, "expected_materialized_qty": 0},
+    })
+    current_run = db_session.get(models.PlanningRun, requirement.run_id)
+    older_run = models.PlanningRun(status="SUPERSEDED", config_snapshot={},
+                                   source_plan_id=current_run.source_plan_id)
+    db_session.add(older_run)
+    db_session.flush()
+    older_requirement = models.MrpRequirement(
+        run_id=older_run.run_id, item_id=requirement.item_id,
+        total_required_qty=10, net_required_qty=10, bom_level=0, freeze_version=1,
+        period_from=requirement.period_from, period_to=requirement.period_to,
+    )
+    db_session.add(older_requirement)
+    db_session.flush()
+    old_product = db_session.get(models.ProductionProduct, first["created"][0]["product_id"])
+    old_product.source_mrp_requirement_id = older_requirement.id
+    db_session.commit()
+    scope = {(current_run.source_plan_id, requirement.item_id): requirement.id}
+    assert _active_open_qty_by_requirement(db_session, scope)[requirement.id] == 3
+    request = {work.id: {"launch_qty": 5, "expected_materialized_qty": 3}}
+    result = materialize_make_work_items(db_session, [work.id], launch_requests=request)
+    assert result["errors"] == []
+    assert sum(row["qty"] for row in result["created"]) == 5
+    retry = materialize_make_work_items(db_session, [work.id], launch_requests=request)
+    assert retry["errors"] == []
+    assert retry["created"] == []
+    assert _active_open_qty_by_requirement(db_session, scope)[requirement.id] == 8
+    assert old_product.source_mrp_requirement_id == older_requirement.id
+
+
+def test_materialize_does_not_count_orders_of_another_plan(db_session):
+    work, requirement, _reservation = _scope(db_session)
+    first = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 3, "expected_materialized_qty": 0},
+    })
+    plan = models.ProductionPlanHeader(name="Other plan", status="fixed",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30))
+    db_session.add(plan)
+    db_session.flush()
+    other_run = models.PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan.id)
+    db_session.add(other_run)
+    db_session.flush()
+    other_req = models.MrpRequirement(run_id=other_run.run_id, item_id=requirement.item_id,
+        total_required_qty=10, net_required_qty=10, bom_level=0, freeze_version=1,
+        period_from=plan.period_from, period_to=plan.period_to)
+    db_session.add(other_req)
+    db_session.flush()
+    product = db_session.get(models.ProductionProduct, first["created"][0]["product_id"])
+    product.source_mrp_requirement_id = other_req.id
+    db_session.commit()
+    result = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 8, "expected_materialized_qty": 0},
+    })
+    assert result["errors"] == []
+    assert sum(row["qty"] for row in result["created"]) == 8

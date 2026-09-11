@@ -4826,6 +4826,23 @@ export interface components {
             /** Source Warehouse Ref1C */
             source_warehouse_ref1c?: string | null;
         };
+        /** MaterializedMakeProductResponse */
+        MaterializedMakeProductResponse: {
+            /** Work Item Id */
+            work_item_id: number;
+            /** Product Id */
+            product_id: number;
+            /** Order Id */
+            order_id: number;
+            /** Order Number */
+            order_number?: string | null;
+            /** Requirement Id */
+            requirement_id: number;
+            /** Qty */
+            qty: number;
+        } & {
+            [key: string]: unknown;
+        };
         /** MoveRequest */
         MoveRequest: {
             /** Component Id */
@@ -4965,6 +4982,23 @@ export interface components {
             work_item_ids?: number[];
             /** Work Items */
             work_items?: components["schemas"]["MakeWorkItemLaunchPayload"][];
+            /** Initiated By */
+            initiated_by?: string | null;
+        };
+        /** OrdersFromWorkItemsResponse */
+        OrdersFromWorkItemsResponse: {
+            /** Status */
+            status: string;
+            /** Created */
+            created?: components["schemas"]["MaterializedMakeProductResponse"][];
+            /** Reused */
+            reused?: components["schemas"]["MaterializedMakeProductResponse"][];
+            /** Skipped */
+            skipped?: {
+                [key: string]: unknown;
+            }[];
+            /** Errors */
+            errors?: string[];
             /** Initiated By */
             initiated_by?: string | null;
         };
@@ -11014,9 +11048,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["OrdersFromWorkItemsResponse"];
                 };
             };
             /** @description Validation Error */

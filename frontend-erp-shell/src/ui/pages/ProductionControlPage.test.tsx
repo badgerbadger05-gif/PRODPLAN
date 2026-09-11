@@ -1057,6 +1057,33 @@ describe('ProductionControlPage — characterization', () => {
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })
 
+  it('shows materialization refusal and does not continue a partially created selection', async () => {
+    const proposal = {
+      ...fakeRows()[0], journal_row_key: 'work-item:701', work_item_id: 701,
+      product_id: null, order_id: null, order_number: 'MRP-R-701',
+      order_prodplan_number: 'MRP-R-701', status: 'not_created',
+      available_actions: ['materialize'], materialized_order_qty: 0, launchable_qty: 10,
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(materializeMakeWorkItems).mockResolvedValue({
+      status: 'ok', reused: [],
+      created: [{ work_item_id: 701, product_id: 901, order_id: 801,
+        order_number: 'MRP-R-701-1', requirement_id: 701, qty: 10 }],
+      errors: ['Количество ранее созданных заказов изменилось. Обновите журнал и повторите запуск.'],
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Расчёт MRP · заказ ещё не создан')
+    await user.click(screen.getByRole('checkbox', { name: /MRP-R-701/ }))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    expect(await screen.findByText('Количество ранее созданных заказов изменилось. Обновите журнал и повторите запуск.')).toBeInTheDocument()
+    expect(openPaintWeldChains).not.toHaveBeenCalled()
+    expect(postMaterialIssues).not.toHaveBeenCalled()
+  })
+
   it('retries proposal materials with the journal generation after refresh', async () => {
     const proposal = {
       ...fakeRows()[0],
