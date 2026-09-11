@@ -5418,6 +5418,10 @@ export interface components {
             display_norm_hours_total?: number | null;
             /** Overload */
             overload?: boolean | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
         };
         /** ProductionGroupedResponse */
         ProductionGroupedResponse: {
@@ -5441,6 +5445,10 @@ export interface components {
             limit: number;
             /** Offset */
             offset: number;
+            /** Current Identity */
+            current_identity: string;
+            /** Source Revision */
+            source_revision: string;
         };
         /** ProductionKind */
         ProductionKind: {
@@ -5911,7 +5919,7 @@ export interface components {
         /** PurchaseCategoryGroupOrder */
         PurchaseCategoryGroupOrder: {
             /** Purchase Id */
-            purchase_id: number;
+            purchase_id?: number | null;
             /** Item Id */
             item_id: number;
             /** Item Name */
@@ -5975,6 +5983,10 @@ export interface components {
              * @default []
              */
             source_purchase_ids: number[];
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
         };
         /** PurchaseCategoryGroupedResponse */
         PurchaseCategoryGroupedResponse: {
@@ -5998,6 +6010,10 @@ export interface components {
             limit: number;
             /** Offset */
             offset: number;
+            /** Current Identity */
+            current_identity: string;
+            /** Source Revision */
+            source_revision: string;
         };
         /** PurchaseControlMaterializeRequest */
         PurchaseControlMaterializeRequest: {
@@ -6403,7 +6419,7 @@ export interface components {
         /** ReworkGroupOrder */
         ReworkGroupOrder: {
             /** Rework Id */
-            rework_id: number;
+            rework_id?: number | null;
             /** Item Id */
             item_id: number;
             /** Item Name */
@@ -6458,6 +6474,10 @@ export interface components {
             shortage?: {
                 [key: string]: unknown;
             } | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
         };
         /** ReworkGroupedResponse */
         ReworkGroupedResponse: {
@@ -6481,6 +6501,10 @@ export interface components {
             limit: number;
             /** Offset */
             offset: number;
+            /** Current Identity */
+            current_identity: string;
+            /** Source Revision */
+            source_revision: string;
         };
         /** SeedReseedStats */
         SeedReseedStats: {
