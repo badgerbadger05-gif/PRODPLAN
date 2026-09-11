@@ -1321,7 +1321,11 @@ describe('ProductionControlPage — characterization', () => {
     vi.mocked(getPendingChainCommand).mockResolvedValueOnce({
       command: { product_id: 101, request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40, dry_run: false, allow_production: false },
       message: 'Сварка проведена. Окраска: конфликт блокировок. Исполнители сохранены.',
+    }).mockResolvedValueOnce({
+      command: { product_id: 101, request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40, dry_run: false, allow_production: false },
+      message: 'Сварка и окраска проведены. Исполнители сохранены.',
     })
+    vi.mocked(closePaintWeldChain).mockResolvedValueOnce({ status: 'partial', resume_required: true, message: 'Не завершено оформление сдельного наряда.' })
     const user = userEvent.setup()
     renderPage()
     await screen.findAllByText('Кронштейн')
@@ -1335,6 +1339,8 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101, {
       request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40,
     }))
+    await within(dialog).findByText('Сварка и окраска проведены. Исполнители сохранены.')
+    expect(within(dialog).queryByText(/конфликт блокировок/)).toBeNull()
   })
 
   it('asks for an executor on every operation of both chain sides before closing the chain', async () => {

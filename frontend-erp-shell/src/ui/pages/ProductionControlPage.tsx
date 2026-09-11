@@ -1070,6 +1070,7 @@ export function ProductionControlPage() {
                     paint_qty: command.paint_qty,
                   })
                   if (result.resume_required) {
+                    setPendingProduction(await getPendingChainCommand(command.product_id))
                     setProduceError(result.message || 'Оформление пока не завершено. Повторите попытку позже.')
                   } else {
                     setPendingProduction(null)
