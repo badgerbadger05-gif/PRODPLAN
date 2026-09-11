@@ -7,7 +7,6 @@ from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
     publish_current_obligation_views_from_generation as _publish_current_obligation_views_from_generation,
-    _mrp_current_identity,
     require_current_execution_scope,
 )
 from app.services.mrp_result_projection import (
@@ -61,69 +60,26 @@ def _generation(db):
 
 
 def _mrp_snapshot(db, generation):
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key="run:41:v1",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={"summary": {"planned": 7}},
-        published_at=generation.cutoff,
-    )
-    db.add(snapshot)
-    db.flush()
-    db.add(models.PlanningReadRow(
-        snapshot_id=snapshot.id,
-        row_key="req:41:1",
-        row_kind="production",
-        item_id=10,
-        sort_key="2026-09-10|0001",
-        payload={"item_id": 10, "qty": 7, "run_id": 41, "row_kind": "production"},
-    ))
-    db.flush()
+    db.info["r9_mrp_payloads"] = {
+        "41": {
+            "run_id": 41,
+            "summary": {"planned": 7},
+            "row_counts": {"production": 1, "purchase": 0, "rework": 0, "capacity": 0},
+            "total_qty": {"production": 7},
+            "rows": [{
+                "current_identity": "mrp-run:41:production:item:10|start:2026-09-10|unit:",
+                "payload": {
+                    "item_id": 10, "qty": 7, "run_id": 41,
+                    "row_kind": "production", "sort_key": "2026-09-10|0001",
+                },
+            }],
+        }
+    }
 
 
 def publish_current_obligation_views_from_generation(db, generation_id):
-    """Structural fixture adapter: legacy evidence -> explicit current MRP payload."""
-    snapshots = db.query(models.PlanningReadSnapshot).filter_by(
-        consumer="mrp_result", ledger_generation_id=int(generation_id)
-    ).all()
-    payloads = {}
-    for snapshot in snapshots:
-        marker = str(snapshot.snapshot_key).removeprefix("run:").split(":", 1)[0]
-        rows = []
-        for stored in db.query(models.PlanningReadRow).filter_by(snapshot_id=int(snapshot.id)).all():
-            payload = dict(stored.payload or {})
-            payload.setdefault("run_id", int(marker))
-            payload.setdefault("row_kind", str(stored.row_kind))
-            payload.setdefault("sort_key", str(stored.sort_key or ""))
-            payload["root_item_ids"] = [
-                int(member.root_item_id)
-                for member in db.query(models.PlanningReadRootMember).filter(
-                    models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-                    models.PlanningReadRootMember.row_id == int(stored.id),
-                ).all()
-            ]
-            identity = _mrp_current_identity(
-                payload, run_id=int(marker), row_kind=str(stored.row_kind)
-            )
-            rows.append({"current_identity": identity, "payload": payload})
-        manifest = dict(snapshot.payload or {})
-        manifest["run_id"] = int(marker)
-        nested = dict(manifest.get("summary") or {})
-        declared_counts = dict(nested.get("row_counts") or manifest.get("row_counts") or {})
-        declared_totals = dict(nested.get("total_qty") or manifest.get("total_qty") or {})
-        actual_counts = {str(row["payload"].get("row_kind")): 0 for row in rows}
-        for row in rows:
-            actual_counts[str(row["payload"].get("row_kind"))] += 1
-        declared_counts = actual_counts
-        manifest["row_counts"] = {
-            kind: int(declared_counts.get(kind, 0))
-            for kind in ("production", "purchase", "rework", "capacity")
-        }
-        manifest["total_qty"] = {kind: float(value) for kind, value in declared_totals.items()}
-        manifest["rows"] = rows
-        payloads[marker] = manifest
+    """Publish the direct MRP candidates registered by this fixture."""
+    payloads = dict(db.info.get("r9_mrp_payloads") or {})
     empty = {"rows": [], "meta": {"row_count": 0}}
     return _publish_current_obligation_views_from_generation(
         db, int(generation_id), purchase_payload=empty,
@@ -153,17 +109,14 @@ def test_mrp_reader_uses_persisted_current_rows_and_manifest(db_session):
 def test_mrp_current_identity_filters_before_pagination(db_session):
     generation = _generation(db_session)
     _mrp_snapshot(db_session, generation)
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "mrp_result",
-    ).one()
-    db_session.add(models.PlanningReadRow(
-        snapshot_id=snapshot.id,
-        row_key="req:41:2",
-        row_kind="production",
-        item_id=11,
-        sort_key="2026-09-10|0002",
-        payload={"item_id": 11, "qty": 8, "run_id": 41, "row_kind": "production"},
-    ))
+    payload = db_session.info["r9_mrp_payloads"]["41"]
+    payload["row_counts"]["production"] = 2
+    payload["rows"].append({
+        "payload": {
+            "item_id": 11, "qty": 8, "run_id": 41,
+            "row_kind": "production", "sort_key": "2026-09-10|0002",
+        },
+    })
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, generation.id)
     db_session.commit()
@@ -274,25 +227,16 @@ def test_mrp_purchases_to_1c_requires_current_identity_and_never_calls_external_
 
 def test_mrp_reader_rejects_unknown_run_and_keeps_date_to_inclusive(db_session):
     generation = _generation(db_session)
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key="run:51:v1",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={"summary": {"row_counts": {"production": 1}, "total_qty": {"production": 3}}},
-        published_at=generation.cutoff,
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-    db_session.add(models.PlanningReadRow(
-        snapshot_id=snapshot.id,
-        row_key="req:51:1",
-        row_kind="production",
-        item_id=10,
-        sort_key="2026-09-10|0001",
-        payload={"item_id": 10, "qty": 3, "run_id": 51, "row_kind": "production"},
-    ))
+    db_session.info["r9_mrp_payloads"] = {"51": {
+        "run_id": 51,
+        "summary": {"row_counts": {"production": 1}, "total_qty": {"production": 3}},
+        "row_counts": {"production": 1, "purchase": 0, "rework": 0, "capacity": 0},
+        "total_qty": {"production": 3},
+        "rows": [{
+            "payload": {"item_id": 10, "qty": 3, "run_id": 51,
+                        "row_kind": "production", "sort_key": "2026-09-10|0001"},
+        }],
+    }}
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, generation.id)
     db_session.commit()
@@ -306,27 +250,23 @@ def test_mrp_reader_rejects_unknown_run_and_keeps_date_to_inclusive(db_session):
 
 def test_mrp_reader_uses_per_run_summary_and_keeps_identity_tie_ascending(db_session):
     generation = _generation(db_session)
+    payloads = {}
     for run_id, total in ((61, 2), (62, 9)):
-        snapshot = models.PlanningReadSnapshot(
-            consumer="mrp_result",
-            snapshot_key=f"run:{run_id}:v1",
-            ledger_generation_id=generation.id,
-            cutoff=generation.cutoff,
-            truth_status="accepted",
-            payload={"summary": {"row_counts": {"production": 1}, "total_qty": {"production": total}}},
-            published_at=generation.cutoff,
-        )
-        db_session.add(snapshot)
-        db_session.flush()
+        rows = []
         for key in ("b", "a"):
-            db_session.add(models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key=key,
-                row_kind="production",
-                item_id=10,
-                sort_key="2026-09-10|same",
-                payload={"item_id": 10, "qty": 1, "run_id": run_id, "row_kind": "production", "agg_key": key},
-            ))
+            rows.append({"payload": {
+                "item_id": 10, "qty": 1, "run_id": run_id,
+                "row_kind": "production", "agg_key": key,
+                "sort_key": "2026-09-10|same",
+            }})
+        payloads[str(run_id)] = {
+            "run_id": run_id,
+            "summary": {"row_counts": {"production": 2}, "total_qty": {"production": total}},
+            "row_counts": {"production": 2, "purchase": 0, "rework": 0, "capacity": 0},
+            "total_qty": {"production": total},
+            "rows": rows,
+        }
+    db_session.info["r9_mrp_payloads"] = payloads
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, generation.id)
     db_session.commit()
@@ -341,17 +281,13 @@ def test_mrp_reader_uses_per_run_summary_and_keeps_identity_tie_ascending(db_ses
 
 def test_mrp_grouped_identity_uses_current_business_anchor(db_session):
     generation = _generation(db_session)
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key="run:63:v1",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={"summary": {"row_counts": {"production": 0}, "total_qty": {"production": 0}}},
-        published_at=generation.cutoff,
-    )
-    db_session.add(snapshot)
-    db_session.commit()
+    db_session.info["r9_mrp_payloads"] = {"63": {
+        "run_id": 63,
+        "summary": {"row_counts": {"production": 0}, "total_qty": {"production": 0}},
+        "row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0},
+        "total_qty": {"production": 0},
+        "rows": [],
+    }}
     publish_current_obligation_views_from_generation(db_session, generation.id)
     db_session.commit()
 
@@ -423,25 +359,14 @@ def test_mrp_purchases_to_1c_resolves_current_identity_and_revision(
 ):
     generation = _generation(db_session)
     _mrp_snapshot(db_session, generation)
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
-        snapshot_key="run:41:v1"
-    ).one()
-    db_session.add(models.PlanningReadRow(
-        snapshot_id=snapshot.id,
-        row_key="purchase:41:1",
-        row_kind="purchase",
-        item_id=10,
-        sort_key="2026-09-10|0002",
-        payload={
-            "item_id": 10,
-            "purchase_id": 7001,
-            "qty": 2,
-            "run_id": 41,
-            "row_kind": "purchase",
-            "unit": "шт",
+    db_session.info["r9_mrp_payloads"]["41"]["row_counts"]["purchase"] = 1
+    db_session.info["r9_mrp_payloads"]["41"]["rows"].append({
+        "payload": {
+            "item_id": 10, "purchase_id": 7001, "qty": 2,
+            "run_id": 41, "row_kind": "purchase", "unit": "шт",
             "bucket_date": "2026-09-10",
         },
-    ))
+    })
     db_session.add(models.PlannedPurchase(
         purchase_id=7001,
         run_id=41,
@@ -550,33 +475,17 @@ def test_mrp_purchases_to_1c_rejects_unknown_or_foreign_current_identity(
 
 def test_mrp_root_filter_uses_persisted_current_membership(db_session):
     generation = _generation(db_session)
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key="run:71:v1",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={"summary": {"row_counts": {"production": 1}, "total_qty": {"production": 4}}},
-        published_at=generation.cutoff,
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-    row = models.PlanningReadRow(
-        snapshot_id=snapshot.id,
-        row_key="req:71:1",
-        row_kind="production",
-        item_id=10,
-        sort_key="2026-09-10|0001",
-        payload={"item_id": 10, "qty": 4, "run_id": 71, "row_kind": "production"},
-    )
-    db_session.add(row)
-    db_session.flush()
-    db_session.add(models.PlanningReadRootMember(
-        snapshot_id=snapshot.id,
-        row_id=row.id,
-        root_key="root:99",
-        root_item_id=99,
-    ))
+    db_session.info["r9_mrp_payloads"] = {"71": {
+        "run_id": 71,
+        "summary": {"row_counts": {"production": 1}, "total_qty": {"production": 4}},
+        "row_counts": {"production": 1, "purchase": 0, "rework": 0, "capacity": 0},
+        "total_qty": {"production": 4},
+        "rows": [{"payload": {
+            "item_id": 10, "qty": 4, "run_id": 71,
+            "row_kind": "production", "root_item_ids": [99],
+            "sort_key": "2026-09-10|0001",
+        }}],
+    }}
     db_session.commit()
     publish_current_obligation_views_from_generation(db_session, generation.id)
     db_session.commit()

@@ -575,10 +575,7 @@ def test_assembly_queue_materialization_is_idempotent_for_same_inputs(db_session
     second = materialize_assembly_queue_lines(db_session, generation.id)
 
     assert [row.id for row in second] == [row.id for row in first]
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=generation.id, consumer="assembly_queue"
-    ).count() == 0
-    assert db_session.query(models.PlanningReadRow).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_assembly_queue_materialization_retains_frozen_rows_after_live_plan_changes(db_session):

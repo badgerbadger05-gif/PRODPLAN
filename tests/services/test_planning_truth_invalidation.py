@@ -4,6 +4,12 @@ import pytest
 
 from app import models
 from app.services import planning_truth
+from app.services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    get_current_execution_scope,
+    publish_current_execution_scope,
+    require_current_execution_scope,
+)
 
 
 def _generation(key: str, *, cutoff_hour: int = 9) -> models.LedgerGeneration:
@@ -26,22 +32,26 @@ def _generation(key: str, *, cutoff_hour: int = 9) -> models.LedgerGeneration:
 def _published_truth(db):
     generation = _generation("accepted-one")
     planning_truth.publish_generation(db, generation)
-    snapshot = planning_truth.publish_read_snapshot(
+    scope = publish_current_execution_scope(
         db,
-        consumer="truth-invalidation-test",
-        snapshot_key="saved:v1",
-        payload={"rows": [{"id": 1, "qty": 7}], "meta": {"frozen": True}},
-        required_capabilities=(planning_truth.CAPABILITY_PLANNING_SNAPSHOTS,),
-        reason="immutable accepted read",
+        source_revision=f"accepted:g{generation.id}:truth-invalidation-test",
+        source_generation_id=generation.id,
+        scope_key="truth-invalidation-test",
+        entity_kinds=("truth-invalidation-test",),
+        rows=[{
+            "entity_kind": "truth-invalidation-test",
+            "business_identity": "truth:1",
+            "scope_key": "truth-invalidation-test",
+            "payload": {"id": 1, "qty": 7},
+        }],
     )
     db.commit()
-    return generation, snapshot
+    return generation, scope
 
 
 @pytest.mark.parametrize("target_status", ["stale", "rejected"])
 def test_invalidation_keeps_pointer_and_all_reads_fail_closed(db_session, target_status):
-    generation, snapshot = _published_truth(db_session)
-    original_payload = {"rows": [{"id": 1, "qty": 7}], "meta": {"frozen": True}}
+    generation, _scope = _published_truth(db_session)
     original_cutoff = generation.cutoff
     reason = f"operator invalidated as {target_status}"
 
@@ -69,24 +79,29 @@ def test_invalidation_keeps_pointer_and_all_reads_fail_closed(db_session, target
     assert required.value.as_dict()["ledger_generation"] == generation.id
     assert required.value.as_dict()["cutoff"] == original_cutoff
     assert required.value.as_dict()["reason"] == reason
-    with pytest.raises(planning_truth.PlanningTruthUnavailable) as latest:
-        planning_truth.get_latest_read_snapshot(
-            db_session, consumer="truth-invalidation-test", snapshot_key="saved:v1",
+    with pytest.raises(CurrentExecutionUnavailable) as latest:
+        require_current_execution_scope(
+            db_session, entity_kind="truth-invalidation-test",
+            scope_key="truth-invalidation-test",
         )
-    assert latest.value.as_dict()["ledger_generation"] == generation.id
+    assert "not accepted" in str(latest.value).lower()
 
-    with pytest.raises(planning_truth.PlanningTruthUnavailable):
-        planning_truth.publish_read_snapshot(
+    with pytest.raises(CurrentExecutionUnavailable):
+        publish_current_execution_scope(
             db_session,
-            consumer="truth-invalidation-test",
-            snapshot_key="forbidden-after-invalidation",
-            payload={"rows": []},
+            source_revision=f"accepted:g{generation.id}:truth-invalidation-test",
+            source_generation_id=generation.id,
+            scope_key="truth-invalidation-test",
+            entity_kinds=("truth-invalidation-test",),
+            rows=[],
         )
     db_session.rollback()
-    persisted = db_session.get(models.PlanningReadSnapshot, snapshot.id)
-    assert persisted.payload == original_payload
-    assert persisted.truth_status == "accepted"
-    assert db_session.query(models.PlanningReadSnapshot).count() == 1
+    persisted = get_current_execution_scope(
+        db_session, entity_kind="truth-invalidation-test",
+        scope_key="truth-invalidation-test",
+    )
+    assert persisted.source_generation_id == generation.id
+    assert persisted.result_ready is True
 
 
 def test_exact_repeat_is_idempotent_but_conflicting_repeat_is_rejected(db_session):

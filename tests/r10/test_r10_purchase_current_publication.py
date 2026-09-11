@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 
 from app import models
 from app.services.item_ledger.current_execution import (
@@ -62,6 +63,16 @@ def _row(identity="buy:req:101"):
     }
 
 
+def _legacy_purchase_count(db_session, generation_id):
+    return db_session.execute(
+        sa.text(
+            "SELECT count(*) FROM planning_read_snapshot "
+            "WHERE consumer = :consumer AND ledger_generation_id = :generation_id"
+        ),
+        {"consumer": "purchase_control_journal", "generation_id": generation_id},
+    ).scalar_one()
+
+
 def test_purchase_current_publisher_uses_candidate_payload_without_snapshot_rows(db_session):
     generation = _accepted_generation(db_session)
 
@@ -88,10 +99,7 @@ def test_purchase_current_publisher_uses_candidate_payload_without_snapshot_rows
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
     )[0].business_identity == "buy:req:101"
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer="purchase_control_journal",
-        ledger_generation_id=generation.id,
-    ).count() == 0
+    assert _legacy_purchase_count(db_session, generation.id) == 0
 
 
 def test_purchase_current_publisher_supports_empty_scope_and_exact_retry_without_audit(
@@ -119,10 +127,7 @@ def test_purchase_current_publisher_supports_empty_scope_and_exact_retry_without
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
     ).summary["total_rows"] == 0
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer="purchase_control_journal",
-        ledger_generation_id=generation.id,
-    ).count() == 0
+    assert _legacy_purchase_count(db_session, generation.id) == 0
 
 
 def test_purchase_current_publisher_rejects_duplicate_identity_before_dml(db_session):
@@ -142,7 +147,7 @@ def test_purchase_current_publisher_rejects_duplicate_identity_before_dml(db_ses
         scope_key="purchase:all-live-plans",
     ) is None
     assert db_session.query(models.CurrentExecutionRow).count() == 0
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_runtime_purchase_publication_has_no_snapshot_fallback_or_lifecycle_writer():
@@ -154,7 +159,9 @@ def test_runtime_purchase_publication_has_no_snapshot_fallback_or_lifecycle_writ
         repo / "backend/app/services/item_ledger/current_execution.py"
     ).read_text(encoding="utf-8")
     assert "build_purchase_journal_candidate" not in lifecycle
-    assert "publish_current_obligation_views_from_snapshots" in current
+    adapter = (repo / "tools/current_execution_legacy_adapter.py").read_text(encoding="utf-8")
+    assert "publish_current_obligation_views_from_snapshots" not in current
+    assert "publish_current_obligation_views_from_snapshots" in adapter
 
 
 def test_runtime_obligation_publisher_requires_direct_purchase_payload(db_session):

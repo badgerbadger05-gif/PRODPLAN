@@ -158,8 +158,7 @@ def test_direct_mrp_publisher_owns_scope_rows_and_retry_is_audit_free(db_session
     assert rows[0].payload["root_item_ids"] == [1]
     assert first.changed_rows == 1
     assert second.changed_rows == 0
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(consumer="mrp_result").count() == 0
-    assert db_session.query(models.PlanningReadRow).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 1
     assert before == db_session.query(models.CurrentExecutionChange).count()
     assert scope.summary["runs"]["42"]["row_counts"]["production"] == 0
 

@@ -31,6 +31,7 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
             "physical_ledger": True,
             "reservation_replay": True,
             "execution_allocations": True,
+            "planning_snapshots": True,
         },
         physical_import_batch=physical, algorithm_version="test", accepted_at=cutoff,
     )

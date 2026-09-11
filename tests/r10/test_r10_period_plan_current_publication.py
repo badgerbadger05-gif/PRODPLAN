@@ -109,7 +109,7 @@ def test_period_current_publisher_requires_explicit_payload_and_never_reads_snap
             mrp_payloads={str(run.run_id): _mrp_empty_payload(run.run_id)},
         )
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
     assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
@@ -166,6 +166,7 @@ def test_period_current_publisher_persists_direct_payload_and_retry_is_noop(db_s
     assert result["period_plan_execution"].idempotent is False
 
     before_changes = db_session.query(models.CurrentExecutionChange).count()
+    before_scopes = db_session.query(models.CurrentExecutionScope).count()
     retry = publish_current_obligation_views_from_generation(
         db_session,
         generation.id,
@@ -177,7 +178,7 @@ def test_period_current_publisher_persists_direct_payload_and_retry_is_noop(db_s
     db_session.commit()
     assert retry["period_plan_execution"].idempotent is True
     assert db_session.query(models.CurrentExecutionChange).count() == before_changes
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == before_scopes
 
 
 def test_period_runtime_source_has_no_legacy_snapshot_lookup():

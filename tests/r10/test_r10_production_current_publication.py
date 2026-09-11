@@ -95,12 +95,7 @@ def test_production_current_publisher_uses_structured_payload_without_snapshot_r
     )
     assert current[0].business_identity == "production-order-line:42:501"
     assert current[0].payload["root_item_ids"] == [900]
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer="production_control_journal",
-        ledger_generation_id=generation.id,
-    ).count() == 0
-    assert db_session.query(models.PlanningReadRow).count() == 0
-    assert db_session.query(models.PlanningReadRootMember).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 1
 
 
 def test_production_current_publisher_empty_retry_is_exact_and_audit_free(db_session):

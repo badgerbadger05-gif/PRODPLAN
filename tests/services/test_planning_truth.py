@@ -4,6 +4,12 @@ import pytest
 
 from app import models
 from app.services import planning_truth
+from app.services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    load_current_execution_rows,
+    publish_current_execution_scope,
+    require_current_execution_scope,
+)
 
 
 def _generation(**overrides):
@@ -144,102 +150,83 @@ def test_required_capabilities_allow_only_declared_layers(db_session):
     assert state.ready is True
 
 
-def test_read_snapshot_publish_is_idempotent_and_latest_is_generation_bound(db_session):
+def _publish_current(db_session, generation, rows):
+    return publish_current_execution_scope(
+        db_session,
+        source_revision=f"accepted:g{generation.id}:period_plan_execution",
+        source_generation_id=generation.id,
+        scope_key="period-plan:all-live-plans",
+        entity_kinds=("period_plan_execution",),
+        rows=[
+            {
+                "entity_kind": "period_plan_execution",
+                "business_identity": identity,
+                "scope_key": "period-plan:all-live-plans",
+                "payload": payload,
+            }
+            for identity, payload in rows
+        ],
+    )
+
+
+def test_current_scope_publication_is_idempotent_and_generation_bound(db_session):
     generation = _generation(status="accepted")
-    planning_truth.publish_generation(db_session, generation)
-    first = planning_truth.publish_read_snapshot(
+    first = _publish_current(db_session, generation, [("plan:1:req:1", {"qty": "1.000"})])
+    again = _publish_current(db_session, generation, [("plan:1:req:1", {"qty": "1.000"})])
+
+    scope = require_current_execution_scope(
         db_session,
-        consumer="period-plan",
-        snapshot_key="plan-1-v1",
-        payload={"rows": [{"item": "A", "executed": "1.000"}]},
-        required_capabilities=("physical_ledger",),
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
     )
-    again = planning_truth.publish_read_snapshot(
+    assert first.changed_rows == 1
+    assert again.idempotent is True
+    assert scope.source_generation_id == generation.id
+    assert len(load_current_execution_rows(
         db_session,
-        consumer="period-plan",
-        snapshot_key="plan-1-v1",
-        payload={"rows": [{"item": "A", "executed": "1.000"}]},
-        required_capabilities=("physical_ledger",),
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
+    )) == 1
+
+
+def test_current_scope_replaces_content_and_keeps_one_business_identity(db_session):
+    generation = _generation(status="accepted")
+    _publish_current(db_session, generation, [("plan:1:req:1", {"qty": "1.000"})])
+    result = _publish_current(db_session, generation, [("plan:1:req:1", {"qty": "2.000"})])
+
+    rows = load_current_execution_rows(
+        db_session,
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
     )
-    db_session.commit()
-
-    latest = planning_truth.get_latest_read_snapshot(
-        db_session,
-        consumer="period-plan",
-        snapshot_key="plan-1-v1",
-        required_capabilities=("physical_ledger",),
-    )
-
-    assert again.id == first.id
-    assert latest.id == first.id
-    assert latest.ledger_generation_id == generation.id
-    assert latest.truth_status == "accepted"
-    assert planning_truth.get_latest_read_snapshot(
-        db_session,
-        consumer="period-plan",
-        snapshot_key="another-filter",
-    ) is None
+    assert result.changed_rows == 1
+    assert len(rows) == 1
+    assert rows[0].payload["qty"] == "2.000"
 
 
-def test_read_snapshot_identity_cannot_be_overwritten(db_session):
-    planning_truth.publish_generation(db_session, _generation(status="accepted"))
-    planning_truth.publish_read_snapshot(
-        db_session,
-        consumer="period-plan",
-        snapshot_key="plan-1-v1",
-        payload={"total": 1},
-    )
-
-    with pytest.raises(planning_truth.PlanningSnapshotConflict):
-        planning_truth.publish_read_snapshot(
-            db_session,
-            consumer="period-plan",
-            snapshot_key="plan-1-v1",
-            payload={"total": 2},
-        )
-
-
-def test_latest_snapshot_does_not_fall_back_to_previous_generation(db_session):
+def test_current_scope_does_not_fallback_after_truth_pointer_moves(db_session):
     first_generation = _generation(status="accepted")
-    planning_truth.publish_generation(db_session, first_generation)
-    planning_truth.publish_read_snapshot(
-        db_session,
-        consumer="period-plan",
-        snapshot_key="generation-one",
-        payload={"total": 1},
-    )
+    _publish_current(db_session, first_generation, [("plan:1:req:1", {"qty": "1.000"})])
     second_generation = _generation(
-        generation_key="replay-20260723-v2",
-        status="accepted",
+        generation_key="replay-20260723-v2", status="accepted"
     )
-    switched = planning_truth.publish_generation(db_session, second_generation)
-    assert switched.generation_id == second_generation.id
-    db_session.commit()
+    planning_truth.publish_generation(db_session, second_generation)
 
-    latest = planning_truth.get_latest_read_snapshot(
-        db_session,
-        consumer="period-plan",
-    )
-
-    assert latest is None
-
-
-def test_snapshot_publish_and_read_require_capabilities(db_session):
-    planning_truth.publish_generation(db_session, _generation(status="accepted"))
-
-    with pytest.raises(planning_truth.PlanningTruthUnavailable) as publish_error:
-        planning_truth.publish_read_snapshot(
+    with pytest.raises(CurrentExecutionUnavailable, match="stale"):
+        require_current_execution_scope(
             db_session,
-            consumer="period-plan",
-            snapshot_key="blocked",
-            payload={},
-            required_capabilities=("planning_snapshots",),
+            entity_kind="period_plan_execution",
+            scope_key="period-plan:all-live-plans",
         )
-    assert "planning_snapshots" in publish_error.value.state.reason
 
-    with pytest.raises(planning_truth.PlanningTruthUnavailable):
-        planning_truth.get_latest_read_snapshot(
+
+def test_current_scope_requires_explicit_entity_kind_for_empty_publication(db_session):
+    generation = _generation(status="accepted")
+    with pytest.raises(CurrentExecutionUnavailable, match="entity kinds"):
+        publish_current_execution_scope(
             db_session,
-            consumer="period-plan",
-            required_capabilities=("planning_snapshots",),
+            source_revision=f"accepted:g{generation.id}:period_plan_execution",
+            source_generation_id=generation.id,
+            scope_key="period-plan:all-live-plans",
+            rows=[],
         )

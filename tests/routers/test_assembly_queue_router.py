@@ -88,22 +88,6 @@ def _accepted_generation(db, *, with_assembly_queue_capability: bool = True):
     return generation, cutoff
 
 
-def _publish_snapshot(db, payload):
-    planning_truth.publish_read_snapshot(
-        db,
-        consumer="assembly_queue",
-        snapshot_key="current:v1",
-        payload=payload,
-        required_capabilities=(
-            planning_truth.CAPABILITY_PHYSICAL_LEDGER,
-            planning_truth.CAPABILITY_RESERVATION_REPLAY,
-            planning_truth.CAPABILITY_PLANNING_SNAPSHOTS,
-            planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
-        ),
-    )
-    db.flush()
-
-
 def _publish_current(db, generation):
     from app.services.item_ledger.current_execution import publish_current_execution_from_generation
 
@@ -303,7 +287,6 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
         "total_rows": 2,
         "total_queue_qty": 22.0,
     }
-    _publish_snapshot(db_session, payload)
     db_session.commit()
 
     response = client.get("/api/v1/production-control/assembly-queue")
@@ -413,10 +396,6 @@ def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_sessi
         }
         for index in range(5)
     ]
-    _publish_snapshot(
-        db_session,
-        {"rows": rows, "total_rows": len(rows), "total_queue_qty": 50.0},
-    )
     db_session.commit()
 
     page = client.get(

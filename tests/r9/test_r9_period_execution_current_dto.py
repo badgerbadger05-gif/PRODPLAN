@@ -127,28 +127,6 @@ def test_period_publication_persists_stable_work_item_dto_and_navigation(db_sess
             "execution_pct": 0.0, "execution_available_base_qty": 5.0,
         },
     }
-    snapshot = models.PlanningReadSnapshot(
-        consumer="period_plan_execution", snapshot_key="plan:7:run:41",
-        ledger_generation_id=generation.id, cutoff=generation.cutoff,
-        truth_status="accepted", payload=payload, published_at=generation.cutoff,
-    )
-    db_session.add(snapshot)
-    db_session.add(models.PlanningReadSnapshot(
-        consumer="mrp_result", snapshot_key="run:41:v1",
-        ledger_generation_id=generation.id, cutoff=generation.cutoff,
-        truth_status="accepted", payload={
-            "summary": {"row_counts": {"purchase": 1}, "total_qty": {"purchase": 5}},
-        }, published_at=generation.cutoff,
-    ))
-    db_session.flush()
-    mrp_snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer="mrp_result", snapshot_key="run:41:v1",
-    ).one()
-    db_session.add(models.PlanningReadRow(
-        snapshot_id=mrp_snapshot.id, row_key="req:101", row_kind="purchase",
-        sort_key="2026-09-11|501", item_id=501,
-        payload={"run_id": 41, "row_kind": "purchase", "req_id": 101, "item_id": 501, "qty": 5},
-    ))
     db_session.commit()
 
     publish_current_execution_scope(

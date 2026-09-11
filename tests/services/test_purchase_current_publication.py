@@ -66,8 +66,7 @@ def test_direct_payload_publishes_current_rows_without_legacy_model(db_session):
     assert scope.source_generation_id == generation.id
     assert result.changed_rows == 1
     assert rows[0].business_identity == "purchase:1"
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
-    assert db_session.query(models.PlanningReadRow).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 1
 
 
 def test_empty_purchase_payload_is_a_valid_current_scope(db_session):

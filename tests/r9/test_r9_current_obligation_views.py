@@ -9,7 +9,6 @@ from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
     publish_current_obligation_views_from_generation,
-    publish_current_obligation_views_from_snapshots,
     require_current_execution_scope,
 )
 from app.routers.production_control import get_orders_journal, list_root_products, get_order_line_materials
@@ -45,81 +44,32 @@ def _accepted_generation(db_session):
 
 
 def _snapshot(db_session, generation, *, consumer, key, rows, meta=None):
-    snapshot = models.PlanningReadSnapshot(
-        consumer=consumer,
-        snapshot_key=key,
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={"rows": rows, **({"meta": meta} if meta is not None else {})},
-        published_at=generation.cutoff,
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-    for index, row in enumerate(rows):
-        db_session.add(models.PlanningReadRow(
-            snapshot_id=snapshot.id,
-            row_key=str(row["row_key"]),
-            row_kind=str(row.get("row_kind") or "result"),
-            item_id=row.get("item_id"),
-            sort_key=f"{index:08d}",
-            payload=dict(row["payload"]),
-        ))
-    db_session.flush()
-    return snapshot
+    """Register a direct candidate payload for the current publisher."""
+    payload = {
+        "rows": [
+            ({"current_identity": str(row["row_key"])} if consumer != "production_control_journal" else {})
+            | {"payload": dict(row["payload"])}
+            for row in rows
+        ],
+        "meta": dict(meta or {}),
+    }
+    db_session.info.setdefault("r9_current_payloads", {})[consumer] = payload
+    from types import SimpleNamespace
+
+    return SimpleNamespace(consumer=consumer, payload=payload)
 
 
 def _publish_current(db_session, generation):
-    """Use direct payloads, adapting only immutable fixture evidence."""
-    def _payload(snapshot):
-        if snapshot is None:
-            return {
-                "rows": [],
-                "meta": {
-                    "ledger_generation_id": generation.id,
-                    "truth_status": "accepted",
-                    "read_only": True,
-                    "fact_source": "ledger",
-                },
-            }
-        payload = dict(snapshot.payload or {})
-        rows = list(payload.get("rows") or [])
-        if snapshot.consumer == "production_control_journal":
-            rows = []
-        for persisted in db_session.query(models.PlanningReadRow).filter(
-            models.PlanningReadRow.snapshot_id == int(snapshot.id),
-        ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
-            row = dict(persisted.payload or {})
-            if snapshot.consumer == "production_control_journal":
-                row["root_item_ids"] = [
-                    int(member.root_item_id)
-                    for member in db_session.query(models.PlanningReadRootMember).filter(
-                        models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-                        models.PlanningReadRootMember.row_id == int(persisted.id),
-                    ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
-                ]
-            if snapshot.consumer == "production_control_journal":
-                rows.append(row)
-        payload["rows"] = rows
-        return payload
-
-    purchase = db_session.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == generation.id,
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one_or_none()
-    production = db_session.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "production_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == generation.id,
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one_or_none()
+    """Publish fixture candidates directly through the canonical owner."""
+    payloads = db_session.info.get("r9_current_payloads", {})
+    empty = {"rows": [], "meta": {"read_only": True, "fact_source": "ledger"}}
+    purchase = payloads.get("purchase_control_journal", empty)
+    production = payloads.get("production_control_journal", empty)
     return publish_current_obligation_views_from_generation(
         db_session,
         generation.id,
-        purchase_payload=_payload(purchase),
-        production_payload=_payload(production),
+        purchase_payload=purchase,
+        production_payload=production,
         mrp_payloads={},
         period_payloads={},
     )
@@ -284,15 +234,6 @@ def test_r9_root_products_read_current_production_rows(db_session):
             "item_id": 10, "item_name": "Canonical Root", "item_article": "ROOT-10", "item_code": "ROOT",
         }]},
     )
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "production_control_journal",
-    ).one()
-    row = db_session.query(models.PlanningReadRow).filter(
-        models.PlanningReadRow.snapshot_id == snapshot.id,
-    ).one()
-    db_session.add(models.PlanningReadRootMember(
-        snapshot_id=snapshot.id, row_id=row.id, root_key="root:10", root_item_id=10,
-    ))
     db_session.commit()
     _publish_current(db_session, generation)
     db_session.commit()
@@ -424,21 +365,20 @@ def test_r9_purchase_selection_uses_current_manifest_revision_and_identity(db_se
         key="journal:v1",
         rows=[],
     )
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-    ).one()
-    snapshot.payload = {
-        "rows": [{
+    payload = db_session.info["r9_current_payloads"]["purchase_control_journal"]
+    payload["rows"] = [
+        {"current_identity": "buy:1", "payload": {
             "row_key": "buy:1", "item_id": 10, "line_status": "to_order",
             "to_order_qty": 3, "amount": 12, "price": 4,
             "row_generator": "mrp_reservation",
-        }, {
+        }},
+        {"current_identity": "buy:2", "payload": {
             "row_key": "buy:2", "item_id": 11, "line_status": "to_order",
             "to_order_qty": 2, "amount": 10, "price": 5,
             "row_generator": "mrp_reservation",
-        }],
-        "meta": {"summary": {"total": 1}},
-    }
+        }},
+    ]
+    payload["meta"] = {"summary": {"total": 1}}
     db_session.commit()
     _publish_current(db_session, generation)
     db_session.commit()

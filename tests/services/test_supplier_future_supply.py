@@ -91,15 +91,6 @@ def _buy_context(db):
         replenishment_received_qty=Decimal("0"),
         lifecycle_status="active",
     )
-    snapshot = models.PlanningReadSnapshot(
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1-buy",
-        ledger_generation_id=generation.id,
-        cutoff=cutoff,
-        truth_status="building",
-        payload={},
-        published_at=cutoff,
-    )
     manifest = models.CurrentExecutionScope(
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
@@ -109,7 +100,7 @@ def _buy_context(db):
         content_hash="f" * 64,
         summary={},
     )
-    db.add_all((reservation, snapshot, manifest))
+    db.add_all((reservation, manifest))
     db.flush()
     batch = models.PurchaseExportBatch(
         ledger_generation_id=generation.id,

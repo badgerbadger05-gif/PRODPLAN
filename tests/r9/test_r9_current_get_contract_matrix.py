@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import json
 import sqlalchemy as sa
 import pytest
 from fastapi import HTTPException
@@ -29,12 +30,22 @@ def _legacy_generation(db_session):
     )
     db_session.add(generation)
     db_session.flush()
-    db_session.add(models.PlanningReadSnapshot(
-        consumer="mrp_result", snapshot_key="r9-get-matrix-legacy",
-        ledger_generation_id=generation.id, cutoff=generation.cutoff,
-        truth_status="accepted", payload={"rows": []},
-        published_at=generation.cutoff,
-    ))
+    db_session.execute(
+        sa.text(
+            "INSERT INTO planning_read_snapshot "
+            "(consumer, snapshot_key, ledger_generation_id, cutoff, truth_status, payload, published_at) "
+            "VALUES (:consumer, :snapshot_key, :generation_id, :cutoff, :truth_status, :payload, :published_at)"
+        ),
+        {
+            "consumer": "mrp_result",
+            "snapshot_key": "r9-get-matrix-legacy",
+            "generation_id": generation.id,
+            "cutoff": generation.cutoff,
+            "truth_status": "accepted",
+            "payload": json.dumps({"rows": []}),
+            "published_at": generation.cutoff,
+        },
+    )
     db_session.commit()
     return generation
 
@@ -109,16 +120,22 @@ def test_missing_current_does_not_fallback_to_legacy_snapshot_or_heavy_replay(db
     )
     db_session.add(generation)
     db_session.flush()
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key="r9-legacy-only",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        published_at=generation.cutoff,
-        truth_status="accepted",
-        payload={"rows": [{"row_key": "legacy", "qty": 99}]},
+    db_session.execute(
+        sa.text(
+            "INSERT INTO planning_read_snapshot "
+            "(consumer, snapshot_key, ledger_generation_id, cutoff, truth_status, payload, published_at) "
+            "VALUES (:consumer, :snapshot_key, :generation_id, :cutoff, :truth_status, :payload, :published_at)"
+        ),
+        {
+            "consumer": "mrp_result",
+            "snapshot_key": "r9-legacy-only",
+            "generation_id": generation.id,
+            "cutoff": generation.cutoff,
+            "truth_status": "accepted",
+            "payload": json.dumps({"rows": [{"row_key": "legacy", "qty": 99}]}),
+            "published_at": generation.cutoff,
+        },
     )
-    db_session.add(snapshot)
     db_session.commit()
 
     def forbidden(*_args, **_kwargs):

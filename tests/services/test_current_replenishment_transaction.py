@@ -193,7 +193,7 @@ def test_current_application_is_idempotent_and_keeps_assignment_ids(db_session):
     assert second.changed_pairs == 0
     assert after == before
     assert db_session.query(models.LedgerGeneration).count() == 1
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
     assert read_current_replenishment(db_session, generation_id=generation_id, item_id=item_id)
 
 
