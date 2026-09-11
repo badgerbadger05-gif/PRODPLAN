@@ -159,16 +159,22 @@ def _table_digest(connection, inspector, table_name: str) -> tuple[int, str]:
     digest = hashlib.sha256()
     count = 0
     result = connection.execution_options(stream_results=True).execute(statement)
-    while True:
-        batch = result.fetchmany(512)
-        if not batch:
-            break
-        for row in batch:
-            values = [row._mapping[column] for column in columns]
-            encoded = json.dumps(values, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":")).encode("utf-8")
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-            count += 1
+    try:
+        while True:
+            batch = result.fetchmany(512)
+            if not batch:
+                break
+            for row in batch:
+                values = [row._mapping[column] for column in columns]
+                encoded = json.dumps(values, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":")).encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+                count += 1
+    finally:
+        # PostgreSQL stream_results uses a server-side cursor.  Explicitly
+        # close it so a read-only manifest cannot leave an idle transaction or
+        # block cleanup of an isolated rehearsal schema.
+        result.close()
     return count, digest.hexdigest()
 
 
