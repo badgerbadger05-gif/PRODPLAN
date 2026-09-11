@@ -7,6 +7,7 @@ rows.  A non-ready manifest is a hard stop for the eventual migration runner.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -75,6 +76,8 @@ _MIGRATE_REASONS = {
     "drum_slot": "generation drum slots map to stable current slots/manual input",
     "drum_capacity_gap": "generation drum gaps map to stable current gaps",
     "shelf_projection": "generation shelf evidence maps to compact current shelf",
+    "planning_run_bucket_modes": "historical bucket-mode evidence maps to canonical run semantics",
+    "mrp_bucket_type_legacy": "historical bucket-type evidence maps to canonical bucket semantics",
 }
 
 _DELETE_REASONS = {
@@ -104,16 +107,45 @@ def _known_schema_tables() -> set[str]:
     return names
 
 
-def _row_count(connection, table_name: str) -> int:
-    # table_name comes from SQLAlchemy Inspector, never user input.
-    return int(connection.execute(text(f'SELECT COUNT(*) FROM "{table_name}"')).scalar() or 0)
+def _quote_identifier(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _table_digest(connection, inspector, table_name: str) -> tuple[int, str]:
+    """Hash a table in bounded batches, with deterministic key ordering."""
+
+    columns = [str(column["name"]) for column in inspector.get_columns(table_name)]
+    if not columns:
+        return 0, hashlib.sha256(b"").hexdigest()
+    primary_key = [str(value) for value in (inspector.get_pk_constraint(table_name).get("constrained_columns") or [])]
+    ordering = primary_key or columns
+    select_list = ", ".join(_quote_identifier(column) for column in columns)
+    order_by = ", ".join(_quote_identifier(column) for column in ordering)
+    statement = text(
+        f"SELECT {select_list} FROM {_quote_identifier(table_name)} "
+        f"ORDER BY {order_by}"
+    )
+    digest = hashlib.sha256()
+    count = 0
+    result = connection.execution_options(stream_results=True).execute(statement)
+    while True:
+        batch = result.fetchmany(512)
+        if not batch:
+            break
+        for row in batch:
+            values = [row._mapping[column] for column in columns]
+            encoded = json.dumps(values, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":")).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            count += 1
+    return count, digest.hexdigest()
 
 
 def _entry(table_name: str, row_count: int, reason: str) -> dict[str, Any]:
     return {"table": table_name, "row_count": int(row_count), "reason": reason}
 
 
-def _json_payload(value: Any) -> dict[str, Any] | None:
+def _json_payload(value: Any) -> dict[str, Any] | list[Any] | None:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -121,8 +153,19 @@ def _json_payload(value: Any) -> dict[str, Any] | None:
             decoded = json.loads(value)
         except (TypeError, ValueError):
             return None
-        return decoded if isinstance(decoded, dict) else None
+        return decoded if isinstance(decoded, (dict, list)) else None
     return None
+
+
+def _walk_json(value: Any, path: str = ""):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            yield str(key), child, child_path
+            yield from _walk_json(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_json(child, f"{path}[{index}]")
 
 
 def _current_dependencies(connection, table_names: set[str]) -> list[dict[str, Any]]:
@@ -153,7 +196,7 @@ def _current_dependencies(connection, table_names: set[str]) -> list[dict[str, A
             })
             continue
         identity = identity_key[2]
-        for key, value in payload.items():
+        for key, value, path in _walk_json(payload):
             if key in _LEGACY_ID_KEYS and value not in (None, ""):
                 legacy_map[f"{key}:{value}"].add(identity)
             if key in _LEGACY_REFERENCE_KEYS and value not in (None, ""):
@@ -161,6 +204,7 @@ def _current_dependencies(connection, table_names: set[str]) -> list[dict[str, A
                     "kind": "unknown",
                     "table": "current_execution_row",
                     "key": key,
+                    "path": path,
                     "legacy_id": str(value),
                     "identity": identity,
                     "reason": "current payload retains a generation/snapshot reference without an explicit stable mapping",
@@ -204,7 +248,7 @@ def build_manifest(engine: Engine) -> dict[str, Any]:
     known_schema_tables = _known_schema_tables()
     with engine.connect() as connection:
         for table_name in sorted(table_names):
-            count = _row_count(connection, table_name)
+            count, checksum = _table_digest(connection, inspector, table_name)
             if table_name in _PRESERVE_REASONS:
                 category, reason = "preserve", _PRESERVE_REASONS[table_name]
             elif table_name in _MIGRATE_REASONS:
@@ -215,7 +259,10 @@ def build_manifest(engine: Engine) -> dict[str, Any]:
                 category, reason = "preserve", "known application table; retain until a later explicit R10 dependency rule"
             else:
                 category, reason = "unknown", "table is not classified by the R10 inventory"
-            categories[category][table_name] = _entry(table_name, count, reason)
+            entry = _entry(table_name, count, reason)
+            entry["checksum"] = checksum
+            entry["checksum_algorithm"] = "sha256-row-json-v1"
+            categories[category][table_name] = entry
 
         dependencies_unknown = _current_dependencies(connection, table_names)
         fk_unknown: list[dict[str, Any]] = []
