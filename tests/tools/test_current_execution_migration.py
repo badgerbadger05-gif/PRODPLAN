@@ -1,4 +1,8 @@
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from sqlalchemy import create_engine, text
 
@@ -117,3 +121,32 @@ def test_unmapped_snapshot_reference_is_unknown_and_fail_closed():
         finding["key"] == "planning_read_snapshot_id"
         for finding in manifest["dependencies"]["unknown"]
     )
+
+
+def test_repo_root_cli_loads_application_model_inventory(tmp_path):
+    database = tmp_path / "model-inventory.db"
+    engine = create_engine(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE items (item_id INTEGER PRIMARY KEY)"))
+
+    repo = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tools/current_execution_migration.py",
+            "--database-url",
+            f"sqlite:///{database}",
+        ],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads(result.stdout)
+    assert manifest["categories"]["preserve"]["items"]["row_count"] == 0
+    assert "items" not in manifest["categories"]["unknown"]
