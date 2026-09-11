@@ -64,6 +64,21 @@ def test_mrp_current_publisher_rejects_duplicate_identity_before_dml():
         _require_mrp_current_payloads(payload, required_run_ids=[42])
 
 
+def test_mrp_current_payloads_reject_foreign_run_before_publication():
+    empty = {
+        "run_id": 42,
+        "row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0},
+        "rows": [],
+    }
+    foreign = {**empty, "run_id": 99}
+
+    with pytest.raises(ObligationRefreshPublishError, match="extra.*99"):
+        _require_mrp_current_payloads(
+            {"42": empty, "99": foreign},
+            required_run_ids=[42],
+        )
+
+
 def test_runtime_obligation_publisher_requires_explicit_mrp_payloads():
     with pytest.raises(current_execution.CurrentExecutionUnavailable, match="mrp_payloads"):
         current_execution.publish_current_obligation_views_from_generation(

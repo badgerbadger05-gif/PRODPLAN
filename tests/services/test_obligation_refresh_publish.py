@@ -441,6 +441,27 @@ def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
         _publish(db_session, parent, target, cutoff)
 
 
+def test_exact_retry_rejects_foreign_mrp_run_payload(db_session):
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    _publish(db_session, parent, target, cutoff)
+    db_session.commit()
+
+    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id, stage="snapshot_build"
+    ).one()
+    payloads = dict(checkpoint.metrics["mrp_result_payloads"])
+    payloads["999"] = {
+        "run_id": 999,
+        "row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0},
+        "rows": [],
+    }
+    checkpoint.metrics = {**checkpoint.metrics, "mrp_result_payloads": payloads}
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
+        _publish(db_session, parent, target, cutoff)
+
+
 def test_legacy_parent_without_direct_generation_id_fails_closed_before_publish(db_session):
     cutoff, parent, target, parents, candidates = _batch(db_session, count=1)
     legacy_parent = parents[0]
