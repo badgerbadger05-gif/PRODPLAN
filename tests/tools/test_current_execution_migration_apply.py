@@ -79,14 +79,17 @@ def _publish_all(session, generation_id: int, *, duplicate=False):
             "id": index, "kind": entity_kind, "scope": scope_key,
             "generation": generation_id, "revision": revision,
         })
-        for suffix in ("a", "b") if duplicate and index == 1 else ("a",):
+        for row_offset, suffix in enumerate(
+            ("a", "a") if duplicate and index == 1 else ("a",),
+            start=1,
+        ):
             session.execute(text(
                 "INSERT INTO current_execution_row "
                 "(id, entity_kind, scope_key, business_identity, source_revision, source_generation_id, "
                 "result_status, result_ready, content_hash, payload) "
                 "VALUES (:id, :kind, :scope, :identity, :revision, :generation, 'accepted', 1, 'row-hash', :payload)"
             ), {
-                "id": index * 10 + (1 if suffix == "a" else 2),
+                "id": index * 10 + row_offset,
                 "kind": entity_kind, "scope": scope_key,
                 "identity": f"{entity_kind}:identity:{suffix}",
                 "revision": revision, "generation": generation_id,
