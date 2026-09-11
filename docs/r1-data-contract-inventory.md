@@ -88,7 +88,7 @@ fact_id)`. Возврат поставщику следует решению §1
 | `ledger_build_batch.ledger_generation_id` | техническая стадия/метрика | lifecycle/build workers | publish gates, diagnostics, SQL verify |
 | `planning_truth_state.current_generation_id` | указатель принятой истины | `planning_truth.py`, accepted publish | физическая visibility, routers/services как fail-closed gate |
 | `current_execution_scope.source_generation_id` | immutable current read-model truth | `mrp_result_projection.py`, `*_projection.py` | routers, exports, materialization, frontend DTO |
-| `planning_read_row.snapshot_id`, `planning_read_root_member.snapshot_id` | дочерняя принадлежность snapshot | snapshot builders | snapshot readers/filter/export |
+| `current_execution_row.business_identity`, `current_execution_scope.summary` | принадлежность принятого current projection | current projection publisher | current readers/filter/export |
 | `closed_plan_snapshot.ledger_generation_id` | audit факта закрытия | period-plan close/rebase | resume/rebase validation |
 | `planning_run.ledger_generation_id` | происхождение frozen obligation | run candidate/obligation refresh | `live_plan_scope.py`, MRP snapshot and guards |
 | `planned_order`, `planned_purchase`, `planned_rework.ledger_generation_id` | происхождение obligation row | MRP freeze/obligation refresh | journals, exporters, coverage |

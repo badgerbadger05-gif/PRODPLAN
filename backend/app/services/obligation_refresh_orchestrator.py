@@ -392,6 +392,9 @@ def _retry_published(
         raise ObligationRefreshOrchestratorError(
             "published refresh manifest entries are malformed"
         ) from exc
+    # ``snapshot_build`` is the compact publication/checkpoint stage.  It is
+    # deliberately not a persisted legacy payload or historical read
+    # model; retry validation only consumes its sealed scope manifest.
     snapshot_batch = db.query(models.LedgerBuildBatch).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
         models.LedgerBuildBatch.stage == "snapshot_build",

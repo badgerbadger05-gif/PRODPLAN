@@ -126,7 +126,6 @@ def test_clear_script_is_guarded_and_preserves_non_rebuildable_inputs():
         "reservation_event",
         "mrp_requirement",
         "planning_run",
-        "planning_read_snapshot",
         "production_material_custody_event",
         "production_material_custody_projection_manifest",
         "production_material_custody_projection",
@@ -249,9 +248,9 @@ def test_verifier_is_read_only_fail_closed_and_covers_publication_invariants():
         "assembly_queue",
     ):
         assert evidence in source
-    assert "WITH RECURSIVE accepted_lineage" in source
-    assert "snapshot_generation.status = 'accepted'" in source
-    assert "'production_proposal'" in source
+    assert "current_execution_scope" in source
+    assert "scope.result_ready" in source
+    assert "'production_control_journal'" in source
 
 
 def test_verifier_accepts_fifo_split_but_rejects_overallocation_and_duplicate_pair():
@@ -313,15 +312,15 @@ def test_verifier_accepts_fifo_split_but_rejects_overallocation_and_duplicate_pa
         connection.close()
 
 
-def test_verifier_requires_exactly_all_five_planning_snapshot_consumers():
+def test_verifier_requires_exactly_all_five_current_execution_scopes():
     source = VERIFY_SQL.read_text(encoding="utf-8")
     block = re.search(
-        r"VALUES\s+(.*?)\)\s+AS\s+required_consumer\(consumer\)",
+        r"VALUES\s+(.*?)\)\s+AS\s+required_scope\(entity_kind,\s*scope_key\)",
         source,
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert block is not None
-    consumers = set(re.findall(r"\('([^']+)'\)", block.group(1)))
+    consumers = set(re.findall(r"\('([^']+)'\s*,", block.group(1)))
     assert consumers == {
         "mrp_result",
         "period_plan_execution",
@@ -329,10 +328,8 @@ def test_verifier_requires_exactly_all_five_planning_snapshot_consumers():
         "purchase_control_journal",
         "production_control_journal",
     }
-    assert "snapshot.snapshot_key = 'run:' || run.run_id::text" in source
-    assert "'plan=' || run.source_plan_id::text" in source
-    assert "snapshot_key = 'current:v1'" in source
-    assert "snapshot.consumer = 'production_control_journal'" in source
-    assert "'production_order'" in source
-    assert "'production_proposal'" in source
+    assert "scope.summary::jsonb -> 'runs'" in source
+    assert "scope.summary::jsonb -> 'snapshots'" in source
+    assert "scope_key = 'assembly:all-live-plans'" in source
+    assert "scope.entity_kind = 'production_control_journal'" in source
     assert "current drum has neither slots nor declared exclusions" in source

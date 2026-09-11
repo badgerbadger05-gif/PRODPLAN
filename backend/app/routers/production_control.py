@@ -44,7 +44,7 @@ from ..services.production_control_journal_projection import (
     SNAPSHOT_KEY as PRODUCTION_JOURNAL_SNAPSHOT_KEY,
     ProductionControlJournalUnavailable,
     list_root_product_options,
-    read_snapshot as read_production_control_journal_current,
+    read_current_projection as read_production_control_journal_current,
     _public_journal_row,
 )
 from ..services.production_control_material_availability import (

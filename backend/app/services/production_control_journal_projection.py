@@ -235,8 +235,7 @@ def _route_sheet_payload_value(row: Mapping[str, Any], *, product_id: int) -> di
 def list_root_product_options(
     db: Session,
 ) -> list[dict[str, Any]]:
-    # Runtime reads use the compact accepted current owner.  The immutable
-    # snapshot path remains below only for explicit migration/archive tools.
+    # Runtime reads use the compact accepted current owner.
     from app.services.item_ledger.current_execution import (
         CurrentExecutionUnavailable,
         require_current_execution_scope,
@@ -864,7 +863,7 @@ def read_route_sheet_snapshot_rows(
 
 
 
-def read_snapshot(
+def read_current_projection(
     db: Session,
     *,
     product_id: int | None = None,

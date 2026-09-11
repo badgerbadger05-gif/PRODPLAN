@@ -1300,7 +1300,7 @@ def _zero_future_supply_capture(db: Session, generation: models.LedgerGeneration
     return dict(metrics, created=True)
 
 
-def _promote_accepted_generation_read_snapshots(
+def _publish_accepted_generation_current_state(
     db: Session,
     *,
     generation: models.LedgerGeneration,
@@ -1329,8 +1329,8 @@ def _promote_accepted_generation_read_snapshots(
             )
 
     # MRP result payloads are built directly by the caller and published into
-    # CurrentExecutionScope.  Runtime lifecycle publication must not create
-    # Historical read-model rows are not written for this consumer.
+    # CurrentExecutionScope. Runtime lifecycle publication does not create
+    # historical read-model rows for this consumer.
 
 
 def accept_generation_build(
@@ -1589,6 +1589,9 @@ def accept_generation_build(
                 int(generation.id),
                 run_ids=fixed_run_ids,
             )
+            # Keep this result as bounded publication metadata only.  The
+            # actual period rows are published to CurrentExecutionScope below;
+            # no historical read-model payload is materialized here.
             planning_snapshots = {
                 "ledger_generation_id": int(generation.id),
                 "snapshots": len(period_payloads),
@@ -1618,7 +1621,7 @@ def accept_generation_build(
         publish_current_material_custody(
             db, ledger_generation_id=int(generation.id)
         )
-        _promote_accepted_generation_read_snapshots(
+        _publish_accepted_generation_current_state(
             db,
             generation=generation,
             accepted_at=generation.accepted_at,

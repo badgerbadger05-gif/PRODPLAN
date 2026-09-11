@@ -237,9 +237,6 @@ TRUNCATE
     drum_capacity_gap,
     drum_slot,
     drum_schedule,
-    planning_read_root_member,
-    planning_read_row,
-    planning_read_snapshot,
     planning_live_pointer,
     planning_run_successor,
     closed_plan_snapshot,
@@ -359,7 +356,6 @@ BEGIN
       + (SELECT count(*) FROM reservation_event)
       + (SELECT count(*) FROM mrp_requirement)
       + (SELECT count(*) FROM assembly_readiness)
-      + (SELECT count(*) FROM planning_read_snapshot)
     INTO remaining_count;
 
     IF remaining_count <> 0 THEN

@@ -23,7 +23,7 @@ from app.services.production_control_journal_projection import (
     build_candidate_payload,
     read_route_sheet_snapshot_rows,
     validate_candidate_payload,
-    read_snapshot,
+    read_current_projection,
 )
 from app.services.item_ledger.future_supply_capture import (
     FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
@@ -124,12 +124,12 @@ def test_current_journal_sort_keeps_nulls_last_and_tie_breakers_ascending(db_ses
     )
     db_session.flush()
 
-    asc = read_snapshot(
+    asc = read_current_projection(
         db_session,
         sort_by="planned_start_date",
         sort_dir="asc",
     )
-    desc = read_snapshot(
+    desc = read_current_projection(
         db_session,
         sort_by="planned_start_date",
         sort_dir="desc",
@@ -982,7 +982,7 @@ def test_public_current_read_is_paged_and_stable_after_live_mutation(db_session)
     _accept(db_session, generation, snapshot)
     _publish_current(db_session, generation, snapshot)
 
-    first = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    first = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert first["total"] == 1
     assert first["rows"][0]["product_id"] == product.product_id
     assert first["rows"][0]["remaining_qty"] == 7
@@ -1000,7 +1000,7 @@ def test_public_current_read_is_paged_and_stable_after_live_mutation(db_session)
     product.remaining_qty = 0
     db_session.commit()
 
-    second = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    second = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert second == first
     assert get_materials_snapshot(db_session, product.product_id) == material_first
 
@@ -1020,7 +1020,7 @@ def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session
     _accept(db_session, generation, snapshot)
     _publish_current(db_session, generation, snapshot)
 
-    before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    before = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert before["rows"][0]["quantity"] == 10
     assert before["rows"][0]["produced_qty"] == 3
     assert before["rows"][0]["remaining_qty"] == 7
@@ -1032,7 +1032,7 @@ def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session
     product.produced_qty = 9
     db_session.commit()
 
-    after = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    after = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert after["rows"][0]["quantity"] == 4, "команда оператора обязана быть видна сразу"
     assert after["rows"][0]["produced_qty"] == 3, "принятый выпуск остаётся снимочным"
     assert after["rows"][0]["remaining_qty"] == 1, "остаток считается от снимочного выпуска"
@@ -1047,7 +1047,7 @@ def test_completed_1c_order_is_hidden_immediately_from_current_read(db_session):
     _accept(db_session, generation, snapshot)
     _publish_current(db_session, generation, snapshot)
 
-    before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    before = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert before["total"] == 1
 
     # The order was completed in 1C and its state was read back. Completion is
@@ -1056,7 +1056,7 @@ def test_completed_1c_order_is_hidden_immediately_from_current_read(db_session):
     order.order_state_key = DONE_STATE_KEY
     db_session.commit()
 
-    after = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
+    after = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert after["rows"] == []
     assert after["total"] == 0
     assert after["offset"] == 0
@@ -1071,7 +1071,7 @@ def test_missing_current_publication_fails_closed_and_router_maps_it_to_503(db_s
     db_session.commit()
 
     with pytest.raises(ProductionControlJournalUnavailable) as caught:
-        read_snapshot(db_session)
+        read_current_projection(db_session)
     assert caught.value.as_dict()["status"] == "unavailable"
     assert "missing" in caught.value.as_dict()["reason"]
 
@@ -1098,7 +1098,7 @@ def test_stale_truth_fails_before_current_lookup(db_session):
     db_session.commit()
 
     with pytest.raises(ProductionControlJournalUnavailable) as caught:
-        read_snapshot(db_session)
+        read_current_projection(db_session)
     detail = caught.value.as_dict()
     assert detail["truth_status"] == "stale"
     assert detail["status"] == "unavailable"
@@ -1192,7 +1192,7 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
     _accept(db_session, generation, snapshot)
     _publish_current(db_session, generation, snapshot)
 
-    before = read_snapshot(db_session, limit=100)
+    before = read_current_projection(db_session, limit=100)
     proposal = before["rows"][0]
     assert proposal["status"] == "not_created"
     assert proposal["product_id"] is None
@@ -1204,7 +1204,7 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
         created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
     )
 
-    after = read_snapshot(db_session, limit=100)
+    after = read_current_projection(db_session, limit=100)
     row = next(
         item for item in after["rows"]
         if item.get("source_mrp_requirement_id") == int(work.requirement_id)
@@ -1250,7 +1250,7 @@ def test_journal_overlays_print_and_transfer_state_after_cutoff(db_session):
 
     row = next(
         item
-        for item in read_snapshot(db_session, limit=100)["rows"]
+        for item in read_current_projection(db_session, limit=100)["rows"]
         if item.get("source_mrp_requirement_id") == int(work.requirement_id)
     )
 
@@ -1525,7 +1525,7 @@ def test_order_deleted_in_1c_does_not_resurrect_journal_row(db_session):
     order.deletion_mark = True
     db_session.commit()
 
-    rows = read_snapshot(db_session, limit=100)["rows"]
+    rows = read_current_projection(db_session, limit=100)["rows"]
     row = rows[0]
     assert row["status"] == "not_created"
     assert row["product_id"] is None

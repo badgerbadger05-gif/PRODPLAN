@@ -336,23 +336,25 @@ BEGIN
       INTO v_count
       FROM (
           VALUES
-              ('mrp_result'),
-              ('period_plan_execution'),
-              ('assembly_queue'),
-              ('purchase_control_journal'),
-              ('production_control_journal')
-      ) AS required_consumer(consumer)
+              ('mrp_result', 'mrp:all-live-plans'),
+              ('period_plan_execution', 'period-plan:all-live-plans'),
+              ('assembly_queue', 'assembly:all-live-plans'),
+              ('purchase_control_journal', 'purchase:all-live-plans'),
+              ('production_control_journal', 'production:all-live-orders')
+      ) AS required_scope(entity_kind, scope_key)
      WHERE NOT EXISTS (
          SELECT 1
-           FROM planning_read_snapshot AS snapshot
-          WHERE snapshot.consumer = required_consumer.consumer
-            AND snapshot.ledger_generation_id = v_generation_id
-            AND snapshot.cutoff = v_generation_cutoff
-            AND snapshot.truth_status = 'accepted'
+           FROM current_execution_scope AS scope
+          WHERE scope.entity_kind = required_scope.entity_kind
+            AND scope.scope_key = required_scope.scope_key
+            AND scope.source_generation_id = v_generation_id
+            AND scope.source_revision =
+                'accepted:g' || v_generation_id || ':' || required_scope.entity_kind
+            AND scope.result_ready
      );
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            '% required planning read snapshot consumers are missing',
+            '% required current execution scopes are missing',
             v_count;
     END IF;
 
@@ -362,30 +364,16 @@ BEGIN
      WHERE run.status = 'FIXED_SNAPSHOT'
        AND NOT EXISTS (
            SELECT 1
-             FROM planning_read_snapshot AS snapshot
-             JOIN ledger_generation AS snapshot_generation
-               ON snapshot_generation.id = snapshot.ledger_generation_id
-            WHERE snapshot.consumer = 'mrp_result'
-              AND snapshot.snapshot_key = 'run:' || run.run_id::text
-              AND snapshot.ledger_generation_id IN (
-                  WITH RECURSIVE accepted_lineage(id) AS (
-                      SELECT v_generation_id
-                      UNION
-                      SELECT (generation.source_watermarks->>'parent_generation_id')::bigint
-                        FROM ledger_generation AS generation
-                        JOIN accepted_lineage AS lineage
-                          ON generation.id = lineage.id
-                       WHERE generation.source_watermarks->>'parent_generation_id' IS NOT NULL
-                  )
-                  SELECT id FROM accepted_lineage
-              )
-              AND snapshot_generation.status = 'accepted'
-              AND snapshot.cutoff = snapshot_generation.cutoff
-              AND snapshot.truth_status = 'accepted'
+             FROM current_execution_scope AS scope
+            WHERE scope.entity_kind = 'mrp_result'
+              AND scope.scope_key = 'mrp:all-live-plans'
+              AND scope.source_generation_id = v_generation_id
+              AND scope.result_ready
+              AND (scope.summary::jsonb -> 'runs') ? run.run_id::text
        );
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            '% fixed runs have no accepted MRP result snapshot in sealed lineage',
+            '% fixed runs have no accepted MRP result in current scope',
             v_count;
     END IF;
 
@@ -395,185 +383,92 @@ BEGIN
      WHERE run.status = 'FIXED_SNAPSHOT'
        AND NOT EXISTS (
            SELECT 1
-             FROM planning_read_snapshot AS snapshot
-            WHERE snapshot.consumer = 'period_plan_execution'
-              AND snapshot.snapshot_key = (
-                  'plan=' || run.source_plan_id::text
-                  || ';run=' || run.run_id::text
-              )
-              AND snapshot.ledger_generation_id = v_generation_id
-              AND snapshot.cutoff = v_generation_cutoff
-              AND snapshot.truth_status = 'accepted'
-       );
-    IF v_count <> 0 THEN
-        RAISE EXCEPTION
-            '% fixed runs have no accepted period-plan execution snapshot',
-            v_count;
-    END IF;
-
-    SELECT count(*)
-      INTO v_count
-      FROM planning_read_snapshot
-     WHERE consumer = 'assembly_queue'
-       AND snapshot_key = 'current:v1'
-       AND ledger_generation_id = v_generation_id
-       AND cutoff = v_generation_cutoff
-       AND truth_status = 'accepted'
-       AND jsonb_typeof(payload::jsonb) = 'object';
-    IF v_count <> 1 THEN
-        RAISE EXCEPTION
-            'current accepted assembly queue snapshot count is %, expected 1',
-            v_count;
-    END IF;
-
-    SELECT count(*)
-      INTO v_count
-      FROM planning_read_snapshot AS snapshot
-     WHERE snapshot.consumer = 'production_control_journal'
-       AND snapshot.snapshot_key = 'journal:v1'
-       AND snapshot.ledger_generation_id = v_generation_id
-       AND snapshot.cutoff = v_generation_cutoff
-       AND snapshot.truth_status = 'accepted'
-       AND jsonb_typeof(snapshot.payload::jsonb) = 'object'
-       AND jsonb_typeof(snapshot.payload::jsonb -> 'meta') = 'object'
-       AND (snapshot.payload::jsonb -> 'meta' ->> 'read_only')::boolean
-       AND (snapshot.payload::jsonb -> 'meta' ->> 'ledger_generation_id')::bigint
-           = v_generation_id;
-    IF v_count <> 1 THEN
-        RAISE EXCEPTION
-            'current accepted production journal snapshot count is %, expected 1',
-            v_count;
-    END IF;
-
-    SELECT count(*)
-      INTO v_count
-      FROM planning_read_snapshot AS snapshot
-     WHERE snapshot.consumer = 'production_control_journal'
-       AND snapshot.snapshot_key = 'journal:v1'
-       AND snapshot.ledger_generation_id = v_generation_id
-       AND snapshot.truth_status = 'accepted'
-       AND (
-           NOT (snapshot.payload::jsonb -> 'meta' ? 'row_count')
-           OR jsonb_typeof(
-               snapshot.payload::jsonb -> 'meta' -> 'row_count'
-           ) <> 'number'
-           OR (snapshot.payload::jsonb -> 'meta' ->> 'row_count')::bigint <= 0
-           OR (snapshot.payload::jsonb -> 'meta' ->> 'row_count')::bigint
-              <> (
-                  SELECT count(*)
-                   FROM planning_read_row AS row
-                   WHERE row.snapshot_id = snapshot.id
-                     AND row.row_kind IN (
-                         'production_order',
-                         'production_proposal'
-                     )
+             FROM current_execution_scope AS scope
+            WHERE scope.entity_kind = 'period_plan_execution'
+              AND scope.scope_key = 'period-plan:all-live-plans'
+              AND scope.source_generation_id = v_generation_id
+              AND scope.result_ready
+              AND (scope.summary::jsonb -> 'snapshots') ? (
+                  'plan=' || run.source_plan_id::text || ';run=' || run.run_id::text
               )
        );
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            'current production journal is empty or its row count is inconsistent';
-    END IF;
-
-    SELECT count(*)
-      INTO v_count
-      FROM planning_read_snapshot
-     WHERE consumer = 'purchase_control_journal'
-       AND snapshot_key = 'journal:v1'
-       AND ledger_generation_id = v_generation_id
-       AND cutoff = v_generation_cutoff
-       AND truth_status = 'accepted'
-       AND jsonb_typeof(payload::jsonb) = 'object'
-       AND jsonb_typeof(payload::jsonb -> 'rows') = 'array';
-    IF v_count <> 1 THEN
-        RAISE EXCEPTION
-            'current accepted purchase journal snapshot count is %, expected 1',
+            '% fixed runs have no accepted period-plan execution in current scope',
             v_count;
     END IF;
 
     SELECT count(*)
       INTO v_count
-      FROM planning_read_snapshot AS snapshot
-      CROSS JOIN LATERAL
-          jsonb_array_elements(snapshot.payload::jsonb -> 'rows') AS buy(row)
-     WHERE snapshot.consumer = 'purchase_control_journal'
-       AND snapshot.snapshot_key = 'journal:v1'
-       AND snapshot.ledger_generation_id = v_generation_id
-       AND snapshot.truth_status = 'accepted';
-    IF v_count = 0 THEN
+      FROM current_execution_scope
+     WHERE entity_kind = 'assembly_queue'
+       AND scope_key = 'assembly:all-live-plans'
+       AND source_generation_id = v_generation_id
+       AND result_ready;
+    IF v_count <> 1 THEN
         RAISE EXCEPTION
-            'current purchase journal has no BUY rows to verify';
+            'current accepted assembly queue scope count is %, expected 1',
+            v_count;
     END IF;
 
     SELECT count(*)
       INTO v_count
-      FROM planning_read_snapshot AS snapshot
-      CROSS JOIN LATERAL
-          jsonb_array_elements(snapshot.payload::jsonb -> 'rows') AS buy(row)
-     WHERE snapshot.consumer = 'purchase_control_journal'
-       AND snapshot.snapshot_key = 'journal:v1'
-       AND snapshot.ledger_generation_id = v_generation_id
-       AND snapshot.truth_status = 'accepted'
+      FROM current_execution_scope AS scope
+     WHERE scope.entity_kind = 'production_control_journal'
+       AND scope.scope_key = 'production:all-live-orders'
+       AND scope.source_generation_id = v_generation_id
+       AND scope.result_ready
+       AND jsonb_typeof(scope.summary::jsonb) = 'object';
+    IF v_count <> 1 THEN
+        RAISE EXCEPTION
+            'current accepted production journal scope count is %, expected 1',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM current_execution_row AS row
+     WHERE row.entity_kind = 'production_control_journal'
+       AND row.scope_key = 'production:all-live-orders'
+       AND row.source_generation_id = v_generation_id
        AND (
-           NOT (buy.row ?& ARRAY[
-               'row_key',
-               'row_generator',
-               'required_qty',
-               'realized_qty',
-               'open_order_covered_qty',
-               'to_order_qty',
-               'quantity',
-               'received_qty',
-               'remaining_qty'
-           ])
-           OR buy.row ->> 'row_generator' <> 'mrp_reservation'
-           OR buy.row ->> 'row_key' NOT LIKE 'buy:%'
-           OR (buy.row ->> 'required_qty')::numeric < 0
-           OR (buy.row ->> 'realized_qty')::numeric < 0
-           OR (buy.row ->> 'open_order_covered_qty')::numeric < 0
-           OR (buy.row ->> 'to_order_qty')::numeric < 0
-           OR abs(
-               (buy.row ->> 'required_qty')::numeric
-               - (
-                   (buy.row ->> 'realized_qty')::numeric
-                   + (buy.row ->> 'open_order_covered_qty')::numeric
-                   + (buy.row ->> 'to_order_qty')::numeric
-               )
-           ) > 0.000001
-           OR abs(
-               (buy.row ->> 'quantity')::numeric
-               - (buy.row ->> 'required_qty')::numeric
-           ) > 0.000001
-           OR abs(
-               (buy.row ->> 'received_qty')::numeric
-               - (buy.row ->> 'realized_qty')::numeric
-           ) > 0.000001
-           OR abs(
-               (buy.row ->> 'remaining_qty')::numeric
-               - (buy.row ->> 'to_order_qty')::numeric
-           ) > 0.000001
+           row.business_identity IS NULL
+           OR row.business_identity = ''
+           OR jsonb_typeof(row.payload::jsonb) <> 'object'
        );
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            '% purchase journal BUY rows violate equation or aliases', v_count;
+            'current production journal has malformed current rows';
     END IF;
 
     SELECT count(*)
       INTO v_count
-      FROM (
-          SELECT buy.row ->> 'row_key' AS row_key
-            FROM planning_read_snapshot AS snapshot
-            CROSS JOIN LATERAL
-                jsonb_array_elements(snapshot.payload::jsonb -> 'rows') AS buy(row)
-           WHERE snapshot.consumer = 'purchase_control_journal'
-             AND snapshot.snapshot_key = 'journal:v1'
-             AND snapshot.ledger_generation_id = v_generation_id
-             AND snapshot.truth_status = 'accepted'
-           GROUP BY buy.row ->> 'row_key'
-          HAVING count(*) > 1
-      ) AS duplicate_buy_key;
+      FROM current_execution_scope AS scope
+     WHERE scope.entity_kind = 'purchase_control_journal'
+       AND scope.scope_key = 'purchase:all-live-plans'
+       AND scope.source_generation_id = v_generation_id
+       AND scope.result_ready
+       AND jsonb_typeof(scope.summary::jsonb) = 'object';
+    IF v_count <> 1 THEN
+        RAISE EXCEPTION
+            'current accepted purchase journal scope count is %, expected 1',
+            v_count;
+    END IF;
+
+    SELECT count(*)
+      INTO v_count
+      FROM current_execution_row AS row
+     WHERE row.entity_kind = 'purchase_control_journal'
+       AND row.scope_key = 'purchase:all-live-plans'
+       AND row.source_generation_id = v_generation_id
+       AND (
+           row.business_identity IS NULL
+           OR row.business_identity = ''
+           OR jsonb_typeof(row.payload::jsonb) <> 'object'
+       );
     IF v_count <> 0 THEN
         RAISE EXCEPTION
-            '% purchase journal BUY row keys are duplicated', v_count;
+            'current purchase journal has malformed current rows';
     END IF;
 
     SELECT count(*), coalesce(sum(assembly_remaining_qty), 0)
@@ -838,17 +733,19 @@ purchase AS (
     SELECT
         count(*) AS buy_row_count,
         coalesce(
-            sum((buy.row ->> 'open_order_covered_qty')::numeric),
+            sum((row.payload::jsonb ->> 'open_order_covered_qty')::numeric),
             0
         ) AS open_order_covered_qty
-      FROM planning_read_snapshot AS snapshot
+      FROM current_execution_row AS row
+      JOIN current_execution_scope AS scope
+        ON scope.entity_kind = row.entity_kind
+       AND scope.scope_key = row.scope_key
       CROSS JOIN current_generation AS generation
-      CROSS JOIN LATERAL
-          jsonb_array_elements(snapshot.payload::jsonb -> 'rows') AS buy(row)
-     WHERE snapshot.consumer = 'purchase_control_journal'
-       AND snapshot.snapshot_key = 'journal:v1'
-       AND snapshot.ledger_generation_id = generation.id
-       AND snapshot.truth_status = 'accepted'
+     WHERE row.entity_kind = 'purchase_control_journal'
+       AND row.scope_key = 'purchase:all-live-plans'
+       AND row.source_generation_id = generation.id
+       AND scope.source_generation_id = generation.id
+       AND scope.result_ready
 ),
 queue AS (
     SELECT
