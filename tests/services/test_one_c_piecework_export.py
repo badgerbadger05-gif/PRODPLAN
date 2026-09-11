@@ -637,6 +637,12 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     db.commit()
 
     fake = _FakeClient(ref_key="new-ref-should-not-be-used")
+    fake.docs["existing-ref"] = {
+        "Ref_Key": "existing-ref", "Posted": False, "DeletionMark": False,
+        "ЗаказНаПроизводство_Key": m.order.order_ref1c,
+        "ДокументОснование": m.exported_ref1c,
+        "Операции": [],
+    }
     _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
     monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
 

@@ -396,6 +396,33 @@ def test_combined_accepts_separate_weld_piecework_from_live_1c(db_session, monke
     assert weld_link.target_ref_key == "manual-weld-ref"
 
 
+@pytest.mark.parametrize("same_order,posted", [(False, True), (True, True), (False, False)])
+def test_reused_local_id_does_not_recover_another_manufactures_piecework(db_session, monkeypatch, same_order, posted):
+    ctx = _setup_chain(db_session)
+    fake = _FakeClient(ref_key="new-current-chain")
+    _stub_live(monkeypatch, fake)
+    paint = ctx["paint"]["m"]
+    foreign = {
+        "Ref_Key": "old-foreign", "Posted": posted, "DeletionMark": False,
+        "Комментарий": f"PRODPLAN source=piecework/{paint.manufacture_id}; old database",
+        "ЗаказНаПроизводство_Key": paint.order.order_ref1c if same_order else "old-order",
+        "ДокументОснование": "old-manufacture", "Операции": [],
+    }
+    fake.docs["old-foreign"] = dict(foreign)
+    result = exporter.export_chain_piecework_to_1c(db_session,
+        weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
+        paint_manufacture_id=paint.manufacture_id, dry_run=False)
+    assert result["status"] == "ok"
+    assert len(fake.posts) == 1
+    assert fake.docs["old-foreign"] == foreign
+    assert all("old-foreign" not in path for path, _ in fake.patches)
+    second = exporter.export_chain_piecework_to_1c(db_session,
+        weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
+        paint_manufacture_id=paint.manufacture_id, dry_run=False)
+    assert second["status"] == "existing"
+    assert len(fake.posts) == 1
+
+
 # ---------------------------------------------------------------------------
 # close_paint_chain (сервис закрытия из окна журнала)
 # ---------------------------------------------------------------------------

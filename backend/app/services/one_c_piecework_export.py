@@ -1081,14 +1081,37 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
         # Recover POST-after-timeout by stable identity, including unposted headers.
         marker = f"PRODPLAN source={source_doctype}/{target.manufacture_id};"
         found = client._make_request(PIECEWORK_ENTITY, params={
-            "$filter": f"substringof('{marker}', Комментарий)", "$top": 2,
+            "$filter": f"substringof('{marker}', Комментарий)", "$top": 100,
         })
         if not isinstance(found, dict) or not isinstance(found.get("value"), list):
             raise ValueError("1С не подтвердила поиск ранее созданного сдельного наряда")
-        candidates = [doc for doc in found["value"] if doc.get("DeletionMark") is not True]
+        if len(found["value"]) >= 100:
+            raise ValueError("Поиск ранее созданного наряда усечён; оформление остановлено")
+
+        def belongs_to_command(doc):
+            # Local ids are reused across PRODPLAN databases. The 1C order
+            # and manufacture basis must also match before recovering a doc.
+            return (
+                _clean_ref1c(doc.get("ЗаказНаПроизводство_Key")) == _clean_ref1c(target.order_ref1c)
+                and _clean_ref1c(doc.get("ДокументОснование")) == _clean_ref1c(target.basis_ref1c)
+            )
+
+        if retry_ref:
+            linked_doc = client._make_request(f"{PIECEWORK_ENTITY}(guid'{retry_ref}')")
+            if not belongs_to_command(linked_doc):
+                if link.status == "success":
+                    # A successful coverage link may refer to a manual labor
+                    # document. Re-read its rows, but never recover/PATCH it.
+                    retry_ref = ""
+                else:
+                    raise ValueError("Связанный сдельный наряд относится к другому заказу или выпуску; требуется проверка связи")
+        candidates = [doc for doc in found["value"]
+                      if doc.get("DeletionMark") is not True and belongs_to_command(doc)]
         if len(candidates) > 1:
             raise ValueError("В 1С несколько нарядов одной команды; требуется проверка")
         if candidates:
+            if retry_ref and retry_ref != _clean_ref1c(candidates[0].get("Ref_Key")):
+                raise ValueError("Найдены разные ссылки на наряд одной команды; требуется проверка связи")
             retry_ref = _clean_ref1c(candidates[0].get("Ref_Key"))
         live = _read_piecework_rows(client, [e.order_ref1c for e in entries], retry_ref=retry_ref)
         for entry in entries:
