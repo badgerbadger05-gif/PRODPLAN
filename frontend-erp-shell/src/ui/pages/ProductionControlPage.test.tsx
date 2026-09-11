@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { act, fireEvent, render, screen, within, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, useLocation } from 'react-router-dom'
@@ -7,6 +7,8 @@ import { ProductionControlPage } from './ProductionControlPage'
 import { ApiError } from '../../lib/api'
 import type { MaterialsResponse, OrderRow } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
+
+afterEach(() => vi.unstubAllGlobals())
 
 // --- Service layer mocks: no real network is allowed. Every named export the
 // page imports is replaced with a vi.fn() so we can both feed fake data and
@@ -1158,7 +1160,15 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByRole('spinbutton', { name: 'Количество запуска' })).toBeNull()
   })
 
-  it.each([false, true])('asks for executors and sends explicit partial=%s', async (partial) => {
+  it.each([
+    { partial: false, http: false },
+    { partial: true, http: false },
+    { partial: false, http: true },
+    { partial: true, http: true },
+  ])('asks for executors and sends explicit partial=$partial over HTTP=$http', async ({ partial, http }) => {
+    if (http) {
+      vi.stubGlobal('crypto', { getRandomValues: globalThis.crypto.getRandomValues.bind(globalThis.crypto) })
+    }
     // 1С не проводит сдельный наряд с пустой строкой регистра «Сдельные наряды»,
     // поэтому исполнители выбираются до записи, а не подставляются заглушкой.
     vi.mocked(listProductionOperations).mockResolvedValue({
@@ -1207,7 +1217,7 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(submit)
     await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(101, {
       partial,
-      request_key: expect.any(String),
+      request_key: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
       qty: partial ? 7 : 11,
       operation_executors: [
         { spec_operation_id: 51, operation_id: 61, line_number: 1, employee_ref1c: 'E1' },

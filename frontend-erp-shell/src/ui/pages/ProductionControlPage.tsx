@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { createRequestKey } from '../../lib/requestKey'
 import {
   coverageLabels,
   type ControlWarehouse,
@@ -583,7 +584,7 @@ export function ProductionControlPage() {
     setProduceError('')
     setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
     setProducePartial(false)
-    setProduceRequestKey(crypto.randomUUID())
+    setProduceRequestKey(createRequestKey())
     setProduceOperationEmployees({})
     setProduceEmployeeRef('')
     setProduceOperations([])
