@@ -1201,6 +1201,26 @@ class MakeWorkItemLaunchPayload(BaseModel):
     expected_materialized_qty: float = Field(default=0, ge=0)
 
 
+class MaterializedMakeProductResponse(BaseModel):
+    work_item_id: int
+    product_id: int
+    order_id: int
+    order_number: Optional[str] = None
+    requirement_id: int
+    qty: float
+
+    model_config = ConfigDict(extra="allow")
+
+
+class OrdersFromWorkItemsResponse(BaseModel):
+    status: str
+    created: List[MaterializedMakeProductResponse] = Field(default_factory=list)
+    reused: List[MaterializedMakeProductResponse] = Field(default_factory=list)
+    skipped: List[dict] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+    initiated_by: Optional[str] = None
+
+
 class OrdersFromWorkItemsPayload(BaseModel):
     work_item_ids: List[int] = Field(default_factory=list)
     work_items: List[MakeWorkItemLaunchPayload] = Field(default_factory=list)
@@ -1845,7 +1865,7 @@ def post_export_piecework_to_1c(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/orders/from-work-items", response_model=dict)
+@router.post("/orders/from-work-items", response_model=OrdersFromWorkItemsResponse)
 def post_orders_from_work_items(
     payload: OrdersFromWorkItemsPayload,
     db: Session = Depends(get_db),

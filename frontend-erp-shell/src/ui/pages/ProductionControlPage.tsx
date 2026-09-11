@@ -448,6 +448,9 @@ export function ProductionControlPage() {
             expected_materialized_qty: row?.materialized_order_qty ?? 0,
           }
         }))
+        if (materialized.errors?.length) {
+          throw new Error(materialized.errors.join('\n'))
+        }
         ids = Array.from(new Set([
           ...ids,
           ...(materialized.created ?? []).map((row) => row.product_id),

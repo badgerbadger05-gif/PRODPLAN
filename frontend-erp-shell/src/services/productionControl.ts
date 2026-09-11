@@ -57,20 +57,8 @@ export function listProductionOrders(params: URLSearchParams) {
   return api<ApiSchemas['ProductionOrderJournalResponse']>(`/v1/production-control/orders?${params.toString()}`)
 }
 
-export type MaterializedMakeProduct = {
-  work_item_id: number
-  product_id: number
-  order_id: number
-  order_number: string
-  requirement_id: number
-  qty: number
-}
-
-export type MaterializeMakeWorkItemsResponse = {
-  status: string
-  created: MaterializedMakeProduct[]
-  reused: MaterializedMakeProduct[]
-}
+export type MaterializedMakeProduct = ApiSchemas['MaterializedMakeProductResponse']
+export type MaterializeMakeWorkItemsResponse = ApiSchemas['OrdersFromWorkItemsResponse']
 
 export type MakeLaunchRequest = {
   work_item_id: number
