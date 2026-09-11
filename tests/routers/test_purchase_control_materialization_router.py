@@ -274,7 +274,7 @@ def test_materialize_endpoint_dry_run_preview(client, db_session):
     assert response.status_code == 200, response.json()
     body = response.json()
     assert body["dry_run"] is True
-    assert body["snapshot_id"] == manifest.id
+    assert body["current_scope_id"] == manifest.id
     assert body["rows_total"] == 1
     assert db_session.query(models.PurchaseExportBatch).count() == 0
     assert db_session.query(models.PurchaseExportObligationAllocation).count() == 0
@@ -294,7 +294,7 @@ def test_selection_summary_endpoint_reports_missing_accounting_price(client, db_
 
     assert response.status_code == 200, response.json()
     assert response.json() == {
-        "snapshot_id": manifest.id,
+        "current_scope_id": manifest.id,
         "selected_rows": 1,
         "priced_rows": 0,
         "unpriced_rows": 1,

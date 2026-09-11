@@ -123,7 +123,7 @@ def test_purchase_current_identity_filters_before_pagination(monkeypatch):
 
 def test_purchase_materialize_rejects_snapshot_only_anchor():
     with pytest.raises(PurchaseControlSnapshotUnavailable, match="current purchase-control execution scope"):
-        materialize_rows(db=object(), snapshot_id=7, row_keys=["legacy-row"], dry_run=True)
+        materialize_rows(db=object(), current_scope_id=7, row_keys=["legacy-row"], dry_run=True)
 
 
 def test_purchase_materialization_has_no_legacy_anchor_reader_or_writer():

@@ -33,7 +33,7 @@ router = APIRouter(prefix="/v1/purchase-control", tags=["purchase-control"])
 
 
 class PurchaseControlMaterializeRequest(BaseModel):
-    snapshot_id: Optional[int] = Field(default=None, ge=1)
+    current_scope_id: Optional[int] = Field(default=None, ge=1)
     row_keys: list[str] = Field(default_factory=list)
     dry_run: bool = True
     current_identity: Optional[str] = None
@@ -42,7 +42,7 @@ class PurchaseControlMaterializeRequest(BaseModel):
 
 
 class PurchaseControlSelectionSummaryRequest(BaseModel):
-    snapshot_id: Optional[int] = Field(default=None, ge=1)
+    current_scope_id: Optional[int] = Field(default=None, ge=1)
     row_keys: list[str] = Field(default_factory=list, max_length=500)
     horizon_period_to: Optional[date] = None
     current_identity: Optional[str] = None
@@ -51,7 +51,7 @@ class PurchaseControlSelectionSummaryRequest(BaseModel):
 
 
 class PurchaseControlSelectionSummaryResponse(BaseModel):
-    snapshot_id: int
+    current_scope_id: int
     selected_rows: int
     priced_rows: int
     unpriced_rows: int
@@ -66,7 +66,7 @@ class PurchaseControlSelectionSummaryResponse(BaseModel):
 def _resolve_current_purchase_selection(
     db: Session,
     *,
-    snapshot_id: int | None,
+    current_scope_id: int | None,
     row_keys: list[str],
     current_identity: str | None,
     current_identities: list[str],
@@ -77,7 +77,7 @@ def _resolve_current_purchase_selection(
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
     )
-    if snapshot_id is not None and int(snapshot_id) != int(manifest.id):
+    if current_scope_id is not None and int(current_scope_id) != int(manifest.id):
         raise ValueError("Текущий manifest изменился; обновите страницу и повторите выбор")
     if expected_source_revision is not None and str(expected_source_revision) != str(manifest.source_revision):
         raise ValueError("Текущая ревизия закупок устарела; обновите страницу и повторите выбор")
@@ -392,7 +392,7 @@ def summarize_purchase_control_selection(
     try:
         manifest, rows, identities = _resolve_current_purchase_selection(
             db,
-            snapshot_id=payload.snapshot_id,
+            current_scope_id=payload.current_scope_id,
             row_keys=payload.row_keys,
             current_identity=payload.current_identity,
             current_identities=payload.current_identities,
@@ -400,7 +400,7 @@ def summarize_purchase_control_selection(
         )
         result = _selection_summary_from_rows(
             rows=rows,
-            snapshot_id=int(manifest.id),
+            current_scope_id=int(manifest.id),
             row_keys=[str(row.get("row_key")) for row in rows],
             horizon_period_to=payload.horizon_period_to,
         )
@@ -425,7 +425,7 @@ def materialize_purchase_control_rows(
     try:
         manifest, rows, identities = _resolve_current_purchase_selection(
             db,
-            snapshot_id=payload.snapshot_id,
+            current_scope_id=payload.current_scope_id,
             row_keys=payload.row_keys,
             current_identity=payload.current_identity,
             current_identities=payload.current_identities,
@@ -433,7 +433,7 @@ def materialize_purchase_control_rows(
         )
         return materialize_rows(
             db,
-            snapshot_id=int(manifest.id),
+            current_scope_id=int(manifest.id),
             row_keys=identities,
             dry_run=payload.dry_run,
             current_manifest=manifest,

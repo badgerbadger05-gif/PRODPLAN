@@ -861,11 +861,11 @@ def _build_request_payload(
 ) -> dict[str, Any]:
     return {
         "source": "purchase_control_snapshot",
-        "snapshot_id": int(snapshot.get("meta", {}).get("snapshot_id") or 0),
+        "current_scope_id": int(snapshot.get("meta", {}).get("current_scope_id") or 0),
         "snapshot_ledger_generation": int(ledger_generation_id),
         "request_hash": _payload_hash(
             {
-                "snapshot_id": int(snapshot.get("meta", {}).get("snapshot_id") or 0),
+                "current_scope_id": int(snapshot.get("meta", {}).get("current_scope_id") or 0),
                 "rows": _line_signature(selected_rows),
             }
         ),
@@ -1386,7 +1386,7 @@ def _fail_group_claims(
 def materialize_rows(
     db: Session,
     *,
-    snapshot_id: int,
+    current_scope_id: int,
     row_keys: Sequence[str],
     dry_run: bool = False,
     materializer: Optional[MaterializerCallable] = None,
@@ -1400,10 +1400,10 @@ def materialize_rows(
             )
         summary = dict(current_manifest.summary or {})
         snapshot = {
-            "rows": [dict(row) for row in current_rows],
-            "meta": {
-                **summary,
-                "snapshot_id": int(current_manifest.id),
+                "rows": [dict(row) for row in current_rows],
+                "meta": {
+                    **summary,
+                    "current_scope_id": int(current_manifest.id),
                 "ledger_generation": int(current_manifest.source_generation_id or 0),
                 "source_revision": str(current_manifest.source_revision),
             },
@@ -1414,10 +1414,10 @@ def materialize_rows(
     meta = snapshot.get("meta")
     if not isinstance(meta, dict):
         raise PurchaseControlMaterializationError("snapshot metadata is malformed")
-    current_snapshot_id = int(_to_int(meta.get("snapshot_id"), field="snapshot_id"))
-    if int(snapshot_id) != current_snapshot_id:
+    resolved_scope_id = int(_to_int(meta.get("current_scope_id"), field="current_scope_id"))
+    if int(current_scope_id) != resolved_scope_id:
         raise PurchaseControlMaterializationError(
-            "requested snapshot_id does not match current accepted purchase-control snapshot"
+            "requested current_scope_id does not match current accepted purchase-control scope"
         )
 
     groups, selected_rows, ledger_generation_id = _load_groups_and_lineages(
@@ -1437,7 +1437,7 @@ def materialize_rows(
     snapshot_rows = [_flatten_row(row) for row in selected_rows]
 
     preview = {
-        "snapshot_id": current_snapshot_id,
+        "current_scope_id": resolved_scope_id,
         "ledger_generation_id": int(meta.get("ledger_generation") or ledger_generation_id),
         "dry_run": bool(dry_run),
         "idempotency_key": key,

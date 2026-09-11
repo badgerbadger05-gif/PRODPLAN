@@ -249,7 +249,7 @@ def materialize_rows(
     rows = list((snapshot.payload or {}).get("rows") or []) if snapshot is not None else []
     return _materialize_rows_impl(
         db,
-        snapshot_id=int(snapshot_id),
+        current_scope_id=int(snapshot_id),
         row_keys=row_keys,
         dry_run=dry_run,
         materializer=materializer,
@@ -517,11 +517,11 @@ def test_materialization_row_from_slice_over_coverage_is_capped():
     assert row["open_order_covered_pct"] == 100.0
 
 
-def test_materialize_rows_rejects_stale_snapshot_id(db_session):
+def test_materialize_rows_rejects_stale_current_scope_id(db_session):
     generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
 
-    with pytest.raises(PurchaseControlMaterializationError, match="requested snapshot_id does not match"):
+    with pytest.raises(PurchaseControlMaterializationError, match="requested current_scope_id does not match"):
         materialize_rows(
             db_session,
             snapshot_id=snapshot.id + 1,
@@ -544,7 +544,7 @@ def test_materialize_rows_dry_run_writes_nothing(db_session):
     )
 
     assert preview["dry_run"] is True
-    assert preview["snapshot_id"] == snapshot.id
+    assert preview["current_scope_id"] == snapshot.id
     assert preview["rows_total"] == 1
     assert db_session.query(models.PurchaseExportBatch).count() == 0
     assert db_session.query(models.PurchaseExportObligationAllocation).count() == 0

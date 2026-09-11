@@ -142,7 +142,7 @@ def get_selection_summary(
 
     return _selection_summary_from_rows(
         rows=snapshot.get("rows") or [],
-        snapshot_id=int(snapshot_id),
+        current_scope_id=int(snapshot_id),
         row_keys=row_keys,
         horizon_period_to=horizon_period_to,
     )
@@ -151,7 +151,7 @@ def get_selection_summary(
 def _selection_summary_from_rows(
     *,
     rows: Sequence[Dict[str, Any]],
-    snapshot_id: int,
+    current_scope_id: int,
     row_keys: Sequence[str],
     horizon_period_to: Optional[date] = None,
 ) -> Dict[str, Any]:
@@ -192,7 +192,7 @@ def _selection_summary_from_rows(
         else "partial"
     )
     return {
-        "snapshot_id": int(snapshot_id),
+        "current_scope_id": int(current_scope_id),
         "selected_rows": len(rows),
         "priced_rows": len(priced_rows),
         "unpriced_rows": unpriced_rows,
