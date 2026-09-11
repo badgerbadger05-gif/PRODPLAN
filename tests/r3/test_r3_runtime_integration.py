@@ -12,11 +12,53 @@ from app.services.item_ledger.physical_visibility import (
 )
 from app.services.item_ledger.r3_contract import (
     ImportCompletenessError,
+    _r3_identity_before_flush,
     current_live_run,
     record_successor,
     set_live_pointer,
     validate_legacy_identity_mapping,
 )
+
+
+def test_identity_mapping_is_idempotent_when_before_flush_runs_twice(db_session):
+    """Duplicate event registration must not add two pending map edges."""
+    item = models.Item(item_code="R3-DOUBLE-FLUSH", item_name="R3 double flush", item_ref1c="r3-double")
+    batch = models.PhysicalImportBatch(
+        batch_key="r3-double-flush-batch",
+        status="completed",
+        source_watermarks={},
+    )
+    db_session.add_all([item, batch])
+    db_session.flush()
+    entry = models.StockLedgerEntry(
+        ingest_batch_id=batch.id,
+        source_content_hash="r3-double-flush-content",
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="r3-double-org",
+        warehouse_ref1c="r3-double-wh",
+        qty=1,
+        qty_after=1,
+        posting_at=datetime(2026, 9, 10),
+        known_at=datetime(2026, 9, 10),
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Document_R3",
+        recorder_ref="r3-double-doc",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(entry)
+    with db_session.no_autoflush:
+        _r3_identity_before_flush(db_session, None, None)
+        _r3_identity_before_flush(db_session, None, None)
+        pending = [
+            row for row in db_session.new
+            if isinstance(row, models.StockLedgerBusinessIdentityMap)
+        ]
+    assert len(pending) == 1
+    db_session.commit()
+    assert db_session.query(models.StockLedgerBusinessIdentityMap).count() == 1
 from app.services.mrp_freeze import _write_freeze_baseline
 
 
