@@ -504,7 +504,19 @@ def test_r8_truth_pointer_move_without_atomic_scope_publication_is_stale(db_sess
     )
     db_session.add(replacement)
     db_session.flush()
-    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(replacement.id)
+    truth_pointer = db_session.get(models.PlanningTruthState, 1)
+    truth_pointer.current_generation_id = int(replacement.id)
+    # The contract is about an accepted truth pointer moving independently of
+    # the already-published scope.  Keep the two persisted values explicit so
+    # a reader regression cannot pass by silently observing the same target.
+    manifest = get_current_execution_scope(
+        db_session,
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    )
+    assert truth_pointer.current_generation_id == int(replacement.id)
+    assert manifest is not None
+    assert manifest.source_generation_id == int(generation.id)
     with pytest.raises(CurrentExecutionUnavailable, match="stale"):
         require_current_execution_scope(
             db_session,
