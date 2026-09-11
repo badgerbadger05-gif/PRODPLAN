@@ -6,7 +6,6 @@ prefix or frozen planning obligation.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -15,7 +14,7 @@ import logging
 import re
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import func, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -66,9 +65,7 @@ from app.services.purchase_control_snapshot import (
     build_candidate_payload as build_purchase_journal_payload,
 )
 from app.services.production_control_journal_snapshot import (
-    ProductionControlJournalPromotionError,
-    build_candidate_snapshot as build_production_journal_candidate,
-    promote_candidate_snapshot as promote_production_journal_candidate,
+    build_candidate_payload as build_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (
     build_material_custody_projection,
@@ -1311,31 +1308,6 @@ def _promote_accepted_generation_read_snapshots(
     fixed_run_ids: tuple[int, ...],
     expected_parent_id: int | None,
 ) -> None:
-    capabilities = dict(generation.capabilities or {})
-
-    try:
-        if capabilities.get("production_control_journal"):
-            production_snapshot = promote_production_journal_candidate(
-                db,
-                generation=generation,
-                accepted_at=accepted_at,
-            )
-            if production_snapshot is None:
-                raise GenerationValidationError(
-                    f"generation {generation.id} claims the production_control_journal "
-                    "capability but has no journal candidate to publish"
-                )
-        else:
-            promote_production_journal_candidate(
-                db,
-                generation=generation,
-                accepted_at=accepted_at,
-            )
-    except ProductionControlJournalPromotionError as exc:
-        raise GenerationValidationError(
-            f"generation {generation.id} cannot publish read snapshots: {exc}"
-        ) from exc
-
     publish_generation(
         db,
         generation,
@@ -1627,7 +1599,7 @@ def accept_generation_build(
                 .order_by(models.PlanningRun.run_id.asc())
                 .all()
             ]
-            production_journal_snapshot = build_production_journal_candidate(
+            production_journal_payload = build_production_journal_payload(
                 db,
                 int(generation.id),
                 accepted_run_ids=fixed_run_ids,
@@ -1669,6 +1641,7 @@ def accept_generation_build(
             db,
             generation_id=int(generation.id),
             purchase_payload=purchase_journal_payload,
+            production_payload=production_journal_payload,
         )
     return {
         **validation,
@@ -1686,7 +1659,7 @@ def accept_generation_build(
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
         "replenishment_work_items": replenishment_work_items,
         "purchase_journal_payload": purchase_journal_payload,
-        "production_journal_snapshot_id": int(production_journal_snapshot.id),
+        "production_journal_payload": production_journal_payload,
         "supplier_receipts": {
             "documents_fetched": (
                 extraction.fetched_document_count if extraction is not None else 0

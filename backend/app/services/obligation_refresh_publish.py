@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import InvalidOperation
 from hashlib import sha256
 import json
 from typing import Any, Mapping
@@ -22,9 +22,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.purchase_control_snapshot import validate_purchase_control_journal_row
 from app.services.production_control_journal_snapshot import (
-    CONSUMER as _PRODUCTION_JOURNAL_CONSUMER,
-    SNAPSHOT_KEY as _PRODUCTION_JOURNAL_SNAPSHOT_KEY,
-    validate_candidate_snapshot as validate_production_journal_candidate,
+    validate_candidate_payload as validate_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (
     validate_material_custody_projection,
@@ -769,52 +767,9 @@ def _exact_retry(
             return None
         seen_journal_rows.add(key)
     try:
-        production_journal_id = int(
-            dict(snapshot_batch.metrics or {})[
-                "production_control_journal_snapshot_id"
-            ]
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    production_journal = db.get(
-        models.PlanningReadSnapshot,
-        production_journal_id,
-    )
-    if (
-        production_journal is None
-        or production_journal.consumer != _PRODUCTION_JOURNAL_CONSUMER
-        or production_journal.snapshot_key != _PRODUCTION_JOURNAL_SNAPSHOT_KEY
-        or production_journal.ledger_generation_id != target.id
-        or production_journal.truth_status != "accepted"
-        or production_journal.reason is not None
-        or _utc(
-            production_journal.published_at,
-            "production journal published_at",
-        )
-        != accepted_at
-    ):
-        return None
-    production_payload = (
-        production_journal.payload
-        if isinstance(production_journal.payload, dict)
-        else None
-    )
-    production_meta = production_payload.get("meta") if production_payload else None
-    if (
-        not isinstance(production_meta, dict)
-        or production_meta.get("read_only") is not True
-        or int(production_meta.get("ledger_generation_id") or -1)
-        != int(target.id)
-    ):
-        return None
-    try:
-        production_row_count = int(production_meta["row_count"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if production_row_count != db.query(models.PlanningReadRow.id).filter(
-        models.PlanningReadRow.snapshot_id == int(production_journal.id),
-        models.PlanningReadRow.row_kind == "production_order",
-    ).count():
+        production_payload = snapshot_metrics.get("production_control_journal_payload")
+        validate_production_journal_payload(production_payload, target)
+    except (TypeError, ValueError, RuntimeError):
         return None
     # Retained runs intentionally remain anchored to ``parent``.  The
     # manifest above is the complete plan scope; requiring every fixed run to
@@ -875,6 +830,7 @@ def publish_obligation_refresh_batch(
     accepted_at: datetime,
     capabilities: Mapping[str, Any],
     purchase_payload: Mapping[str, Any] | None = None,
+    production_payload: Mapping[str, Any] | None = None,
 ) -> ObligationRefreshPublishResult:
     """Publish every active source plan together, using only ``flush``.
 
@@ -885,6 +841,14 @@ def publish_obligation_refresh_batch(
     accepted_at = _utc(accepted_at, "accepted_at")
     if not isinstance(capabilities, Mapping):
         raise TypeError("capabilities must be a mapping")
+    if not isinstance(purchase_payload, Mapping):
+        raise ObligationRefreshPublishError(
+            "obligation refresh publication requires an explicit purchase payload"
+        )
+    if not isinstance(production_payload, Mapping):
+        raise ObligationRefreshPublishError(
+            "obligation refresh publication requires an explicit production payload"
+        )
     capability_snapshot = dict(capabilities)
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
@@ -944,11 +908,7 @@ def publish_obligation_refresh_batch(
         truth_status="building",
         accepted_at=None,
     )
-    direct_purchase_payload = (
-        purchase_payload
-        if purchase_payload is not None
-        else dict(snapshot_batch.metrics or {}).get("purchase_control_journal_payload")
-    )
+    direct_purchase_payload = purchase_payload
     journal_payload = _validate_purchase_candidate_payload(
         target,
         direct_purchase_payload,
@@ -968,40 +928,12 @@ def publish_obligation_refresh_batch(
         if key in seen_supply_rows:
             raise ObligationRefreshPublishError("purchase control journal row violates Ledger fact contract")
         seen_supply_rows.add(key)
-    try:
-        production_journal_id = int(
-            dict(snapshot_batch.metrics or {})[
-                "production_control_journal_snapshot_id"
-            ]
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ObligationRefreshPublishError(
-            "snapshot_build lacks production control journal snapshot"
-        ) from exc
-    candidate_production_journal = _lock(
-        db.query(models.PlanningReadSnapshot)
-    ).filter(
-        models.PlanningReadSnapshot.id == production_journal_id,
-        models.PlanningReadSnapshot.consumer == _PRODUCTION_JOURNAL_CONSUMER,
-        models.PlanningReadSnapshot.snapshot_key
-        == _PRODUCTION_JOURNAL_SNAPSHOT_KEY,
-        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
-        models.PlanningReadSnapshot.truth_status == "building",
-        models.PlanningReadSnapshot.cutoff == target.cutoff,
-    ).one_or_none()
-    if candidate_production_journal is None:
-        raise ObligationRefreshPublishError(
-            "production control journal candidate is missing or stale"
-        )
+    direct_production_payload = production_payload
     try:
         validate_material_custody_projection(
             db, ledger_generation_id=int(target.id)
         )
-        validate_production_journal_candidate(
-            db,
-            candidate_production_journal,
-            target,
-        )
+        validate_production_journal_payload(direct_production_payload, target)
     except RuntimeError as exc:
         raise ObligationRefreshPublishError(str(exc)) from exc
     if _source_export_links_exist(db, candidate_ids):
@@ -1088,7 +1020,7 @@ def publish_obligation_refresh_batch(
     target.capabilities = capability_snapshot
     pointer.current_generation_id = int(target.id)
     from .item_ledger.current_execution import publish_current_execution_from_generation
-    current_execution = publish_current_execution_from_generation(
+    publish_current_execution_from_generation(
         db, generation_id=int(target.id)
     )
     # Future supply is captured as immutable generation evidence but exposed
@@ -1117,10 +1049,7 @@ def publish_obligation_refresh_batch(
         db, additions=additions, replacements=replacements,
         retained=retained, retired=retired,
     )
-    for snapshot in [
-        *candidate_read_snapshots,
-        candidate_production_journal,
-    ]:
+    for snapshot in candidate_read_snapshots:
         snapshot.truth_status = "accepted"
         snapshot.reason = None
         snapshot.published_at = accepted_at
@@ -1133,6 +1062,7 @@ def publish_obligation_refresh_batch(
         db,
         int(target.id),
         purchase_payload=journal_payload,
+        production_payload=direct_production_payload,
     )
     try:
         db.flush()

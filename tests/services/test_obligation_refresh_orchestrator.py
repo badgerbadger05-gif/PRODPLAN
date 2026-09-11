@@ -453,16 +453,12 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert by_stage["future_supply_capture"].metrics["rows"] == 0
     snapshot_id = by_stage["snapshot_build"].metrics["candidate_read_snapshot_ids"][str(candidate.run_id)]
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
-    production_journal_id = by_stage["snapshot_build"].metrics[
-        "production_control_journal_snapshot_id"
-    ]
-    production_journal = db_session.get(
-        models.PlanningReadSnapshot,
-        production_journal_id,
-    )
-    assert production_journal.consumer == "production_control_journal"
-    assert production_journal.truth_status == "accepted"
-    # This public read function consumes the stored snapshot; it does not run MRP.
+    production_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    ).one()
+    assert production_scope.source_generation_id == target.id
+    # This public read function consumes the stored current row; it does not run MRP.
     assert read_mrp_result_manifest(db_session, candidate.run_id)["run_id"] == candidate.run_id
     # Journals must not go dark after a refresh: every published generation
     # carries its own period-plan execution snapshots (decisions-log /).

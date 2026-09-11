@@ -338,9 +338,8 @@ def _batch(db, count=2, add_count=0, replace_count=0):
 
 
 def _publish(db, parent, target, cutoff, capabilities=None):
-    # Purchase current publication consumes the canonical payload directly;
-    # this fixture keeps the immutable snapshot only as worker evidence and
-    # passes its payload explicitly through the production seam.
+    # Current publication consumes canonical payloads directly; immutable
+    # snapshots remain worker evidence only.
     purchase_snapshot = db.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id,
         consumer="purchase_control_journal",
@@ -348,18 +347,27 @@ def _publish(db, parent, target, cutoff, capabilities=None):
     ).one_or_none()
     assert purchase_snapshot is not None
     purchase_payload = dict(purchase_snapshot.payload or {})
+    production_snapshot = db.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id,
+        consumer="production_control_journal",
+        snapshot_key="journal:v1",
+    ).one_or_none()
+    production_payload = dict(production_snapshot.payload or {}) if production_snapshot else {}
+    production_payload.setdefault("rows", [])
     snapshot_batch = db.query(models.LedgerBuildBatch).filter_by(
         ledger_generation_id=target.id,
         stage="snapshot_build",
     ).one()
     metrics = dict(snapshot_batch.metrics or {})
     metrics["purchase_control_journal_payload"] = purchase_payload
+    metrics["production_control_journal_payload"] = production_payload
     snapshot_batch.metrics = metrics
     db.flush()
     return publish_obligation_refresh_batch(
         db, parent_generation_id=parent.id, target_generation_id=target.id,
         accepted_at=cutoff, capabilities=capabilities or _capabilities(),
         purchase_payload=purchase_payload,
+        production_payload=production_payload,
     )
 
 
@@ -595,7 +603,7 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, truth_status="accepted"
-    ).count() == 2
+    ).count() == 1
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id,
         consumer="purchase_control_journal",
@@ -622,7 +630,7 @@ def test_publish_requires_complete_production_control_journal_snapshot(
 
     with pytest.raises(
         ObligationRefreshPublishError,
-        match="production.control journal",
+        match="production-control journal",
     ):
         _publish(db_session, parent, target, cutoff)
 

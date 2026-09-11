@@ -70,27 +70,56 @@ def _snapshot(db_session, generation, *, consumer, key, rows, meta=None):
 
 
 def _publish_current(db_session, generation):
-    """Use the runtime direct payload seam, adapting old fixture evidence only when present."""
+    """Use direct payloads, adapting only immutable fixture evidence."""
+    def _payload(snapshot):
+        if snapshot is None:
+            return {
+                "rows": [],
+                "meta": {
+                    "ledger_generation_id": generation.id,
+                    "truth_status": "accepted",
+                    "read_only": True,
+                    "fact_source": "ledger",
+                },
+            }
+        payload = dict(snapshot.payload or {})
+        rows = list(payload.get("rows") or [])
+        if snapshot.consumer == "production_control_journal":
+            rows = []
+        for persisted in db_session.query(models.PlanningReadRow).filter(
+            models.PlanningReadRow.snapshot_id == int(snapshot.id),
+        ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
+            row = dict(persisted.payload or {})
+            if snapshot.consumer == "production_control_journal":
+                row["root_item_ids"] = [
+                    int(member.root_item_id)
+                    for member in db_session.query(models.PlanningReadRootMember).filter(
+                        models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
+                        models.PlanningReadRootMember.row_id == int(persisted.id),
+                    ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
+                ]
+            if snapshot.consumer == "production_control_journal":
+                rows.append(row)
+        payload["rows"] = rows
+        return payload
+
     purchase = db_session.query(models.PlanningReadSnapshot).filter(
         models.PlanningReadSnapshot.consumer == "purchase_control_journal",
         models.PlanningReadSnapshot.snapshot_key == "journal:v1",
         models.PlanningReadSnapshot.ledger_generation_id == generation.id,
         models.PlanningReadSnapshot.truth_status == "accepted",
     ).one_or_none()
-    if purchase is not None:
-        return publish_current_obligation_views_from_snapshots(db_session, generation.id)
+    production = db_session.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "production_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == generation.id,
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one_or_none()
     return publish_current_obligation_views_from_generation(
         db_session,
         generation.id,
-        purchase_payload={
-            "rows": [],
-            "meta": {
-                "ledger_generation_id": generation.id,
-                "truth_status": "accepted",
-                "read_only": True,
-                "fact_source": "ledger",
-            },
-        },
+        purchase_payload=_payload(purchase),
+        production_payload=_payload(production),
     )
 
 

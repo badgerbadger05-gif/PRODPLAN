@@ -31,7 +31,7 @@ from app.services.item_ledger.future_supply_capture import (
 from app.services.production_control_common import DONE_STATE_KEY
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
-    publish_current_obligation_views_from_generation,
+    publish_current_production_control_from_payload,
 )
 
 
@@ -348,7 +348,28 @@ def _accept(db, generation, snapshot):
 
 
 def _publish_current(db, generation):
-    publish_current_obligation_views_from_generation(db, int(generation.id))
+    snapshot = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "production_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one()
+    rows = []
+    for persisted in db.query(models.PlanningReadRow).filter(
+        models.PlanningReadRow.snapshot_id == int(snapshot.id),
+    ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
+        row = dict(persisted.payload or {})
+        row["root_item_ids"] = [
+            int(member.root_item_id)
+            for member in db.query(models.PlanningReadRootMember).filter(
+                models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
+                models.PlanningReadRootMember.row_id == int(persisted.id),
+            ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
+        ]
+        rows.append(row)
+    payload = dict(snapshot.payload or {})
+    payload["rows"] = rows
+    publish_current_production_control_from_payload(db, int(generation.id), payload)
     db.commit()
 
 
@@ -806,6 +827,7 @@ def test_route_sheet_snapshot_rows_use_anchor_dedup_and_are_immutable(db_session
         accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     first = read_route_sheet_snapshot_rows(
         db_session,
@@ -920,6 +942,7 @@ def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session
         db_session, generation.id, accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert before["rows"][0]["quantity"] == 10
@@ -946,6 +969,7 @@ def test_completed_1c_order_is_hidden_immediately_from_accepted_snapshot(db_sess
         db_session, generation.id, accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     before = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert before["total"] == 1
@@ -1038,6 +1062,7 @@ def test_list_root_product_options_reads_only_frozen_snapshot_labels(db_session)
     }
     snapshot.payload = payload
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     root_a.item_name = "Renamed after acceptance"
     root_b.item_article = "ZZ-LIVE"
@@ -1089,11 +1114,10 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     before = read_snapshot(db_session, limit=100)
-    proposal = next(
-        row for row in before["rows"] if row["journal_row_key"] == f"work-item:{work.id}"
-    )
+    proposal = before["rows"][0]
     assert proposal["status"] == "not_created"
     assert proposal["product_id"] is None
 
@@ -1106,7 +1130,8 @@ def test_journal_shows_order_opened_after_cutoff_without_new_generation(db_sessi
 
     after = read_snapshot(db_session, limit=100)
     row = next(
-        item for item in after["rows"] if item["journal_row_key"] == f"work-item:{work.id}"
+        item for item in after["rows"]
+        if item.get("source_mrp_requirement_id") == int(work.requirement_id)
     )
     assert row["status"] == "created"
     assert row["product_id"] == product.product_id
@@ -1129,6 +1154,7 @@ def test_journal_overlays_print_and_transfer_state_after_cutoff(db_session):
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
     _order, product = _launch_after_cutoff(
         db_session,
         generation,
@@ -1149,7 +1175,7 @@ def test_journal_overlays_print_and_transfer_state_after_cutoff(db_session):
     row = next(
         item
         for item in read_snapshot(db_session, limit=100)["rows"]
-        if item["journal_row_key"] == f"work-item:{work.id}"
+        if item.get("source_mrp_requirement_id") == int(work.requirement_id)
     )
 
     assert row["status"] == "to_move"
@@ -1370,6 +1396,7 @@ def test_route_sheet_prints_for_order_opened_after_cutoff(db_session):
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     _, product = _launch_after_cutoff(
         db_session,
@@ -1394,6 +1421,7 @@ def test_route_sheet_still_fails_closed_for_unknown_product(db_session):
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     with pytest.raises(RouteSheetSnapshotUnavailable) as caught:
         read_route_sheet_snapshot_rows(db_session, [987654])
@@ -1410,6 +1438,7 @@ def test_order_deleted_in_1c_does_not_resurrect_journal_row(db_session):
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     order, _product = _launch_after_cutoff(
         db_session,
@@ -1421,6 +1450,6 @@ def test_order_deleted_in_1c_does_not_resurrect_journal_row(db_session):
     db_session.commit()
 
     rows = read_snapshot(db_session, limit=100)["rows"]
-    row = next(item for item in rows if item["journal_row_key"] == f"work-item:{work.id}")
+    row = rows[0]
     assert row["status"] == "not_created"
     assert row["product_id"] is None

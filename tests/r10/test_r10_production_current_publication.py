@@ -153,6 +153,7 @@ def test_runtime_production_publication_has_no_snapshot_fallback_or_builder_writ
     assert "build_production_journal_candidate" not in lifecycle
     assert "build_production_journal_candidate" not in refresh
     assert "production_payload" in current
-    assert "PlanningReadRootMember" not in current.split(
-        "def publish_current_obligation_views_from_generation", 1
-    )[1]
+    runtime = current.split("def publish_current_obligation_views_from_generation", 1)[0]
+    runtime = runtime.split("def _publish_current_obligation_views", 1)[1]
+    assert 'consumer == "production_control_journal"' not in runtime
+    assert "production.id" not in runtime

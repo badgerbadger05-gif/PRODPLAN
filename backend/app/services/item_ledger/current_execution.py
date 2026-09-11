@@ -1158,6 +1158,91 @@ def publish_current_purchase_control_from_payload(
     )
 
 
+def publish_current_production_control_from_payload(
+    db: Session,
+    generation_id: int,
+    payload: Mapping[str, Any],
+) -> CurrentExecutionPublishResult:
+    """Publish the production journal directly into its compact current owner."""
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise CurrentExecutionUnavailable(
+            "production current publication requires an accepted generation"
+        )
+    if not isinstance(payload, Mapping):
+        raise CurrentExecutionUnavailable("production candidate payload is malformed")
+    raw_rows = payload.get("rows")
+    if not isinstance(raw_rows, list):
+        raise CurrentExecutionUnavailable("production candidate rows are missing")
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    expected_count = meta.get("row_count")
+    if expected_count is not None:
+        try:
+            if int(expected_count) != len(raw_rows):
+                raise CurrentExecutionUnavailable(
+                    "production candidate row count is malformed"
+                )
+        except (TypeError, ValueError) as exc:
+            raise CurrentExecutionUnavailable(
+                "production candidate row count is malformed"
+            ) from exc
+    current_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            raise CurrentExecutionUnavailable("production candidate row is malformed")
+        candidate = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
+        row = dict(candidate)
+        identity = str(
+            raw.get("current_identity")
+            or row.get("current_identity")
+            or ""
+        ).strip()
+        if not identity:
+            identity = _production_snapshot_identity(row)
+        if not identity:
+            raise CurrentExecutionUnavailable(
+                "production candidate row lacks stable business identity"
+            )
+        if identity in seen:
+            raise CurrentExecutionUnavailable(
+                "production candidate contains duplicate identity"
+            )
+        seen.add(identity)
+        roots = row.get("root_item_ids")
+        if roots is not None:
+            if not isinstance(roots, (list, tuple)):
+                raise CurrentExecutionUnavailable(
+                    "production candidate root membership is malformed"
+                )
+            try:
+                row["root_item_ids"] = sorted({int(value) for value in roots})
+            except (TypeError, ValueError) as exc:
+                raise CurrentExecutionUnavailable(
+                    "production candidate root membership is malformed"
+                ) from exc
+        row = _production_semantic_payload(row)
+        current_rows.append({
+            "entity_kind": "production_control_journal",
+            "business_identity": identity,
+            "scope_key": "production:all-live-orders",
+            "payload": row,
+        })
+    summary = dict(meta)
+    if isinstance(payload.get("summary"), Mapping):
+        summary["summary"] = dict(payload["summary"])
+    summary["total_rows"] = len(current_rows)
+    return publish_current_execution_scope(
+        db,
+        source_revision=f"accepted:g{int(generation.id)}:production_control_journal",
+        source_generation_id=int(generation.id),
+        scope_key="production:all-live-orders",
+        rows=current_rows,
+        entity_kinds=("production_control_journal",),
+        summary=summary,
+    )
+
+
 def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
     """Resolve a required business key; technical row ids are never valid."""
     for key in (
@@ -1296,6 +1381,7 @@ def _publish_current_obligation_views(
     generation_id: int,
     *,
     purchase_payload: Mapping[str, Any],
+    production_payload: Mapping[str, Any],
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Promote accepted obligation/read-model snapshots to compact current rows.
 
@@ -1328,42 +1414,10 @@ def _publish_current_obligation_views(
             summary=summary,
         )
 
-    production = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "production_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one_or_none()
-    production_rows: list[dict[str, Any]] = []
-    if production is not None:
-        production_rows = [
-            {
-                "entity_kind": "production_control_journal",
-                "business_identity": _production_snapshot_identity(dict(row.payload or {})),
-                "scope_key": "production:all-live-orders",
-                "payload": {
-                    **_production_semantic_payload(dict(row.payload or {})),
-                    "root_item_ids": [
-                        int(member.root_item_id)
-                        for member in db.query(models.PlanningReadRootMember).filter(
-                            models.PlanningReadRootMember.row_id == int(row.id),
-                            models.PlanningReadRootMember.snapshot_id == int(production.id),
-                        ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
-                    ],
-                },
-            }
-            for row in db.query(models.PlanningReadRow).filter(
-                models.PlanningReadRow.snapshot_id == int(production.id),
-            ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all()
-        ]
-    production_summary = dict((production.payload or {}).get("meta") or {}) if production is not None else {}
-    production_summary["total_rows"] = len(production_rows)
-    _publish(
-        consumer="production_control_journal",
-        entity_kind="production_control_journal",
-        scope_key="production:all-live-orders",
-        rows=production_rows,
-        summary=production_summary,
+    results["production_control_journal"] = publish_current_production_control_from_payload(
+        db,
+        int(generation.id),
+        production_payload,
     )
 
     results["purchase_control_journal"] = publish_current_purchase_control_from_payload(
@@ -1455,9 +1509,14 @@ def _publish_current_obligation_views(
     def _catalog(key: tuple[Any, ...], identity: str) -> None:
         target_catalog.setdefault(key, []).append(str(identity))
 
+    production_rows = load_current_execution_rows(
+        db,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
     for entry in production_rows:
-        payload = dict(entry.get("payload") or {})
-        identity = str(entry.get("business_identity") or "")
+        payload = dict(entry.payload or {})
+        identity = str(entry.business_identity or "")
         if payload.get("order_id") is not None and payload.get("product_id") is not None:
             _catalog(("production", int(payload["order_id"]), int(payload["product_id"])), identity)
         if payload.get("source_mrp_requirement_id") is not None and payload.get("product_id") is not None:
@@ -1559,20 +1618,27 @@ def publish_current_obligation_views_from_generation(
     generation_id: int,
     *,
     purchase_payload: Mapping[str, Any] | None = None,
+    production_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, CurrentExecutionPublishResult]:
-    """Publish runtime current views with an explicit purchase candidate.
+    """Publish runtime current views with explicit obligation candidates.
 
-    The purchase payload is mandatory by design.  Runtime publication cannot
-    discover or synthesize it from a historical ``PlanningReadSnapshot``.
+    Purchase and production payloads are mandatory by design.  Runtime
+    publication cannot discover or synthesize them from historical
+    ``PlanningReadSnapshot`` rows.
     """
     if not isinstance(purchase_payload, Mapping):
         raise CurrentExecutionUnavailable(
             "runtime purchase publication requires an explicit purchase payload"
         )
+    if not isinstance(production_payload, Mapping):
+        raise CurrentExecutionUnavailable(
+            "runtime production publication requires an explicit production payload"
+        )
     return _publish_current_obligation_views(
         db,
         generation_id,
         purchase_payload=purchase_payload,
+        production_payload=production_payload,
     )
 
 
@@ -1600,8 +1666,34 @@ def publish_current_obligation_views_from_snapshots(
         raise CurrentExecutionUnavailable(
             "migration purchase snapshot evidence is missing"
         )
+    production = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "production_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one_or_none()
+    if production is None or not isinstance(production.payload, Mapping):
+        raise CurrentExecutionUnavailable(
+            "migration production snapshot evidence is missing"
+        )
+    production_rows: list[dict[str, Any]] = []
+    for row in db.query(models.PlanningReadRow).filter(
+        models.PlanningReadRow.snapshot_id == int(production.id),
+    ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
+        row_payload = dict(row.payload or {})
+        row_payload["root_item_ids"] = [
+            int(member.root_item_id)
+            for member in db.query(models.PlanningReadRootMember).filter(
+                models.PlanningReadRootMember.snapshot_id == int(production.id),
+                models.PlanningReadRootMember.row_id == int(row.id),
+            ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
+        ]
+        production_rows.append(row_payload)
+    production_payload = dict(production.payload)
+    production_payload["rows"] = production_rows
     return _publish_current_obligation_views(
         db,
         generation_id,
         purchase_payload=dict(snapshot.payload),
+        production_payload=production_payload,
     )

@@ -139,6 +139,11 @@ def overlay_launch_facts(
         row["materialized_order_qty"] = _to_float(product.quantity)
         row["opened_at"] = _iso(order.created_at)
         row["status"] = "created"
+        # Current production payloads intentionally drop generation-local
+        # ``work_item_id``. Keep an internal marker so this overlay remains
+        # distinguishable from an ordinary persisted production row without
+        # leaking a technical locator into the public DTO.
+        row["_launched_from_proposal"] = True
         # Повторный запуск той же потребности запрещён: заказ уже есть.
         # Закрытие в 1С доступно ровно на тех же условиях, что и у строк,
         # попавших в снимок штатно.
@@ -214,7 +219,7 @@ def overlay_execution_state(
             continue
         # Строка-предложение с наложенным фактом запуска количество документа не
         # перенимает: её «количество» — остаток к запуску по расчёту.
-        if row.get("work_item_id") is None:
+        if row.get("work_item_id") is None and not row.get("_launched_from_proposal"):
             planned_qty = max(_to_float(product.quantity), 0.0)
             produced_qty = _to_float(row.get("produced_qty"))
             row["quantity"] = planned_qty
@@ -231,6 +236,7 @@ def overlay_execution_state(
                 for action in row["available_actions"]
                 if action != "edit_quantity"
             ]
+        row.pop("_launched_from_proposal", None)
 
 
 def route_sheets_after_cutoff(

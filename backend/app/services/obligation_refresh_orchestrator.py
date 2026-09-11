@@ -28,10 +28,7 @@ from app.services.item_ledger.generation_lifecycle import (
     validate_obligation_refresh_build,
 )
 from app.services.item_ledger.future_supply_capture import _as_utc
-from app.services.item_ledger.obligation_generation import (
-    carry_forward_retained_reservations,
-    fork_obligation_generation,
-)
+from app.services.item_ledger import obligation_generation as _obligation_generation
 from app.services.item_ledger.output_repair_gate import (
     assert_output_repair_allows,
 )
@@ -43,7 +40,7 @@ from app.services.item_ledger.current_replenishment import (
 )
 from app.services.purchase_control_snapshot import build_candidate_payload as build_purchase_journal_payload
 from app.services.production_control_journal_snapshot import (
-    build_candidate_snapshot as build_production_journal_candidate,
+    build_candidate_payload as build_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (
     build_material_custody_projection,
@@ -82,6 +79,15 @@ from app.services.item_ledger.shelf_projection_persistence import (
     materialize_shelf_projections,
 )
 from app.services.local_mrp_order_reconciliation import reconcile_local_mrp_orders
+
+
+# Kept as a module-level compatibility seam for replacement tests and callers
+# that instrument the retained-realization boundary. The refresh workflow
+# itself delegates that operation through the generation helpers.
+carry_forward_retained_reservations = (
+    _obligation_generation.carry_forward_retained_reservations
+)
+fork_obligation_generation = _obligation_generation.fork_obligation_generation
 
 
 _VERSION = "obligation-refresh-orchestrator/4"
@@ -281,9 +287,22 @@ def _retry_published(
         raise ObligationRefreshOrchestratorError("published generation belongs to another parent")
     if target.accepted_at is None:
         raise ObligationRefreshOrchestratorError("published generation lacks accepted_at")
+    snapshot_batch = db.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+        models.LedgerBuildBatch.stage == "snapshot_build",
+    ).one_or_none()
+    metrics = dict(snapshot_batch.metrics or {}) if snapshot_batch is not None else {}
+    purchase_payload = metrics.get("purchase_control_journal_payload")
+    production_payload = metrics.get("production_control_journal_payload")
+    if not isinstance(purchase_payload, Mapping) or not isinstance(production_payload, Mapping):
+        raise ObligationRefreshOrchestratorError(
+            "published generation lacks canonical obligation journal payloads"
+        )
     result = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         accepted_at=target.accepted_at, capabilities=dict(target.capabilities or {}),
+        purchase_payload=purchase_payload,
+        production_payload=production_payload,
     )
     _publish_execution_snapshots(db, int(target.id))
     manifest = marks.get(MANIFEST_KEY)
@@ -553,7 +572,7 @@ def run_obligation_refresh(
         ledger_generation_id=target_id,
         live_run_ids=(*candidate_ids, *retained_run_ids),
     )
-    production_journal_snapshot = build_production_journal_candidate(
+    production_journal_payload = build_production_journal_payload(
         db,
         target_id,
         accepted_run_ids=(*candidate_ids, *retained_run_ids),
@@ -586,7 +605,7 @@ def run_obligation_refresh(
         "supplier_receipt_summary": _json_value(supplier_summary),
         "local_order_reconciliation": _json_value(local_order_reconciliation),
         "purchase_control_journal_payload": purchase_journal_payload,
-        "production_control_journal_snapshot_id": int(production_journal_snapshot.id),
+        "production_control_journal_payload": production_journal_payload,
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
     }
     _complete(snapshot_batch, snapshot_metrics)
@@ -608,6 +627,7 @@ def run_obligation_refresh(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
         purchase_payload=purchase_journal_payload,
+        production_payload=production_journal_payload,
     )
     _publish_execution_snapshots(db, target_id)
     _publish_retained_mrp_snapshots(

@@ -236,34 +236,27 @@ def _route_sheet_payload_value(row: Mapping[str, Any], *, product_id: int) -> di
 def list_root_product_options(
     db: Session,
 ) -> list[dict[str, Any]]:
+    # Runtime reads use the compact accepted current owner.  The immutable
+    # snapshot path remains below only for explicit migration/archive tools.
+    from app.services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
+        require_current_execution_scope,
+    )
     try:
-        snapshot = get_latest_read_snapshot(
+        manifest = require_current_execution_scope(
             db,
-            consumer=CONSUMER,
-            snapshot_key=SNAPSHOT_KEY,
-            required_capabilities=REQUIRED,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
         )
-    except PlanningTruthUnavailable as exc:
-        raise _unavailable(db, str(exc), exc.as_dict()) from exc
-    if snapshot is None:
-        raise _unavailable(db, "accepted production-control journal snapshot is missing")
+    except CurrentExecutionUnavailable as exc:
+        raise _unavailable(db, str(exc)) from exc
+    options = (manifest.summary or {}).get("root_product_options")
+    if options is not None:
+        if not isinstance(options, list) or any(not isinstance(row, dict) for row in options):
+            raise _unavailable(db, "accepted production-control root options are malformed")
+        return [dict(row) for row in options]
+    raise _unavailable(db, "accepted production-control root options are missing")
 
-    payload = snapshot.payload if isinstance(snapshot.payload, dict) else None
-    meta = payload.get("meta") if payload else None
-    if (
-        not isinstance(meta, dict)
-        or meta.get("read_only") is not True
-        or int(meta.get("ledger_generation_id") or -1) != int(snapshot.ledger_generation_id)
-    ):
-        raise _unavailable(
-            db,
-            "accepted production-control journal snapshot is malformed",
-        )
-
-    options = meta.get("root_product_options")
-    if not isinstance(options, list) or any(not isinstance(row, dict) for row in options):
-        raise _unavailable(db, "accepted production-control root options are malformed")
-    return [dict(row) for row in options]
 
 
 def _root_product_options(
@@ -577,12 +570,36 @@ def _persisted_candidate_matches(
     return True
 
 
-def build_candidate_snapshot(
+def _candidate_business_identity(payload: Mapping[str, Any]) -> str:
+    requirement_id = payload.get("source_mrp_requirement_id") or payload.get("requirement_id")
+    if requirement_id not in (None, ""):
+        discriminator = (
+            payload.get("source_mrp_allocation_key")
+            or payload.get("source_mrp_allocation_id")
+            or payload.get("item_id")
+            or "default"
+        )
+        return f"production-mrp-requirement:{int(requirement_id)}:{discriminator}"
+    order_id = payload.get("order_id")
+    if order_id not in (None, ""):
+        line = payload.get("line_number") or payload.get("product_id") or payload.get("item_id")
+        if line in (None, ""):
+            raise ValueError("production order row lacks stable line identity")
+        return f"production-order-line:{int(order_id)}:{line}"
+    journal_key = str(payload.get("journal_row_key") or payload.get("row_key") or "")
+    if journal_key.startswith("work-item:"):
+        raise ValueError("production proposal lacks stable MRP requirement identity")
+    if not journal_key:
+        raise ValueError("production row lacks stable identity")
+    return journal_key
+
+
+def _build_candidate_components(
     db: Session,
     generation_id: int,
     *,
     accepted_run_ids: Sequence[int],
-) -> models.PlanningReadSnapshot:
+) -> tuple[models.LedgerGeneration, dict[str, Any], list[dict[str, Any]], dict[str, set[int]]]:
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if (
         generation is None
@@ -616,6 +633,53 @@ def build_candidate_snapshot(
             **journal_meta,
         }
     }
+    return generation, payload, rows, roots_by_row
+
+
+def build_candidate_payload(
+    db: Session,
+    generation_id: int,
+    *,
+    accepted_run_ids: Sequence[int],
+) -> dict[str, Any]:
+    """Build the production journal candidate without persisting snapshot rows.
+
+    The returned structure is the direct input to the compact current owner.
+    Each row carries its exact root membership so runtime publication does not
+    need ``PlanningReadSnapshot``/``PlanningReadRootMember`` as an
+    intermediate owner.
+    """
+    _generation, payload, rows, roots_by_row = _build_candidate_components(
+        db,
+        generation_id,
+        accepted_run_ids=accepted_run_ids,
+    )
+    direct_rows: list[dict[str, Any]] = []
+    for row in rows:
+        direct = dict(row)
+        direct["current_identity"] = _candidate_business_identity(direct)
+        direct["root_item_ids"] = sorted(
+            int(value) for value in roots_by_row.get(str(row["journal_row_key"]), set())
+        )
+        direct_rows.append(direct)
+    return {
+        **payload,
+        "rows": direct_rows,
+        "summary": {"total_rows": len(direct_rows)},
+    }
+
+
+def build_candidate_snapshot(
+    db: Session,
+    generation_id: int,
+    *,
+    accepted_run_ids: Sequence[int],
+) -> models.PlanningReadSnapshot:
+    generation, payload, rows, roots_by_row = _build_candidate_components(
+        db,
+        generation_id,
+        accepted_run_ids=accepted_run_ids,
+    )
     existing = (
         db.query(models.PlanningReadSnapshot)
         .filter_by(
@@ -675,6 +739,97 @@ def build_candidate_snapshot(
             )
     db.flush()
     return snapshot
+
+
+def validate_candidate_payload(
+    payload: Mapping[str, Any],
+    generation: models.LedgerGeneration,
+) -> None:
+    """Validate a direct production candidate without querying snapshot rows."""
+    meta = payload.get("meta") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(meta, Mapping)
+        or meta.get("read_only") is not True
+        or int(meta.get("ledger_generation_id") or -1) != int(generation.id)
+        or meta.get("truth_status") not in {"building", "accepted"}
+    ):
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate is missing or stale"
+        )
+    rows = payload.get("rows") if isinstance(payload, Mapping) else None
+    if not isinstance(rows, list):
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate rows are missing"
+        )
+    try:
+        expected_count = int(meta.get("row_count", len(rows)))
+    except (TypeError, ValueError) as exc:
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate row count is malformed"
+        ) from exc
+    if expected_count < 0 or expected_count != len(rows):
+        raise ProductionControlJournalPromotionError(
+            "production-control journal candidate rows are incomplete"
+        )
+    product_ids: set[int] = set()
+    work_item_ids: set[int] = set()
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is malformed"
+            )
+        row = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
+        try:
+            item_id = int(row["item_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is malformed"
+            ) from exc
+        if item_id <= 0:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is malformed"
+            )
+        root_ids = row.get("root_item_ids", [])
+        if not isinstance(root_ids, (list, tuple)):
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate root membership is malformed"
+            )
+        try:
+            if any(int(root_id) <= 0 for root_id in root_ids):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate root membership is malformed"
+            ) from exc
+        if row.get("product_id") is None:
+            try:
+                work_item_id = int(row["work_item_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ProductionControlJournalPromotionError(
+                    "production-control journal proposal row is malformed"
+                ) from exc
+            if work_item_id <= 0 or work_item_id in work_item_ids:
+                raise ProductionControlJournalPromotionError(
+                    "production-control journal proposal row is malformed"
+                )
+            work_item_ids.add(work_item_id)
+            continue
+        try:
+            product_id = int(row["product_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is malformed"
+            ) from exc
+        if product_id <= 0 or product_id in product_ids:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is malformed"
+            )
+        if "_route_sheet_snapshot" not in row:
+            raise ProductionControlJournalPromotionError(
+                "production-control journal candidate row is missing route-sheet snapshot"
+            )
+        _route_sheet_payload_value(row, product_id=product_id)
+        product_ids.add(product_id)
 
 
 def validate_candidate_snapshot(
@@ -815,45 +970,29 @@ def read_route_sheet_snapshot_rows(
     if not ids:
         return []
 
+    from app.services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
+        load_current_execution_rows,
+        require_current_execution_scope,
+    )
     try:
-        snapshot = get_latest_read_snapshot(
+        manifest = require_current_execution_scope(
             db,
-            consumer=CONSUMER,
-            snapshot_key=SNAPSHOT_KEY,
-            required_capabilities=REQUIRED,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
         )
-    except PlanningTruthUnavailable as exc:
-        raise _route_sheet_unavailable(db, str(exc), exc.as_dict()) from exc
-
-    if snapshot is None:
-        raise _route_sheet_unavailable(
-            db,
-            "accepted production-control route-sheets snapshot is missing",
-        )
-
-    payload = snapshot.payload if isinstance(snapshot.payload, dict) else None
-    meta = payload.get("meta") if payload else None
-    if (
-        not isinstance(meta, dict)
-        or meta.get("read_only") is not True
-        or int(meta.get("ledger_generation_id") or -1) != int(snapshot.ledger_generation_id)
-    ):
-        raise _route_sheet_unavailable(
-            db,
-            "accepted production-control route-sheets snapshot is malformed",
-        )
+    except CurrentExecutionUnavailable as exc:
+        raise _route_sheet_unavailable(db, str(exc)) from exc
 
     product_ids_sorted = sorted(set(ids))
-    row_keys = [f"product:{product_id}" for product_id in product_ids_sorted]
-    rows = (
-        db.query(models.PlanningReadRow)
-        .filter(
-            models.PlanningReadRow.snapshot_id == int(snapshot.id),
-            models.PlanningReadRow.row_kind == ROW_KIND,
-            models.PlanningReadRow.row_key.in_(row_keys),
+    rows = [
+        row for row in load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
         )
-        .all()
-    )
+        if int((row.payload or {}).get("product_id") or -1) in product_ids_sorted
+    ]
 
     route_snapshot_by_product_id: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -893,14 +1032,7 @@ def read_route_sheet_snapshot_rows(
         # the painted anchor. Resolve a requested welded product from that
         # same immutable snapshot instead of requiring a duplicate row.
         missing_set = set(missing_ids)
-        anchor_rows = (
-            db.query(models.PlanningReadRow)
-            .filter(
-                models.PlanningReadRow.snapshot_id == int(snapshot.id),
-                models.PlanningReadRow.row_kind == ROW_KIND,
-            )
-            .all()
-        )
+        anchor_rows = rows
         for row in anchor_rows:
             row_payload = row.payload if isinstance(row.payload, dict) else None
             if not isinstance(row_payload, dict) or "_route_sheet_snapshot" not in row_payload:
@@ -928,8 +1060,8 @@ def read_route_sheet_snapshot_rows(
         live_payloads = route_sheets_after_cutoff(
             db,
             missing_ids,
-            cutoff=_generation_cutoff(db, snapshot.ledger_generation_id),
-            ledger_generation_id=int(snapshot.ledger_generation_id),
+            cutoff=_generation_cutoff(db, manifest.source_generation_id),
+            ledger_generation_id=int(manifest.source_generation_id),
         )
         for product_id, payload in live_payloads.items():
             route_snapshot_by_product_id[int(product_id)] = dict(payload)
@@ -961,7 +1093,7 @@ def read_route_sheet_snapshot_rows(
     return ordered
 
 
-def read_snapshot(
+def _read_snapshot_from_snapshots(
     db: Session,
     *,
     product_id: int | None = None,
@@ -1126,4 +1258,150 @@ def read_snapshot(
         "offset": effective_offset,
         "latest_run_id": meta.get("latest_run_id"),
         "latest_source_plan_id": meta.get("latest_source_plan_id"),
+    }
+
+
+def read_snapshot(
+    db: Session,
+    *,
+    product_id: int | None = None,
+    order_id: int | None = None,
+    root_item_id: int | None = None,
+    workshop_id: int | None = None,
+    status: str | None = None,
+    coverage_status: str | None = None,
+    planning_contour: str | None = None,
+    launch_source: str | None = None,
+    search: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sort_by: str | None = None,
+    sort_dir: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Read the accepted production journal from compact current rows only."""
+    from app.services.item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
+        load_current_execution_rows,
+        require_current_execution_scope,
+    )
+    try:
+        manifest = require_current_execution_scope(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        records = load_current_execution_rows(
+            db,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise _unavailable(db, str(exc)) from exc
+
+    def _matches(row: Any) -> bool:
+        payload = dict(row.payload or {})
+        if product_id is not None and int(payload.get("product_id") or -1) != int(product_id):
+            return False
+        if order_id is not None and int(payload.get("order_id") or -1) != int(order_id):
+            return False
+        roots = {int(value) for value in payload.get("root_item_ids") or []}
+        if root_item_id is not None and int(root_item_id) not in roots:
+            return False
+        if workshop_id is not None and int(payload.get("workshop_id") or -1) != int(workshop_id):
+            return False
+        if status:
+            values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
+            if str(payload.get("status") or "") not in values:
+                return False
+        if coverage_status and str(payload.get("coverage_status") or "") != str(coverage_status):
+            return False
+        if planning_contour:
+            contour = str(planning_contour).strip().lower()
+            if contour not in {"mrp", "1c"}:
+                raise ValueError("unknown planning_contour")
+            if str(payload.get("order_source") or "").lower() != contour:
+                return False
+        if launch_source and str(payload.get("launch_source") or "") != str(launch_source).strip():
+            return False
+        if search and search.strip():
+            needle = search.strip().lower()
+            if not any(needle in str(payload.get(key) or "").lower() for key in (
+                "order_number", "item_name", "item_article", "item_code",
+            )):
+                return False
+        row_date = str(payload.get("order_date") or "")
+        if date_from and row_date < str(date_from):
+            return False
+        if date_to and row_date > str(date_to):
+            return False
+        return True
+
+    completed_order_ids = {
+        int(order_id)
+        for order_id in db.execute(
+            select(models.ProductionOrder.order_id).where(
+                func.lower(func.coalesce(models.ProductionOrder.order_state_key, ""))
+                == DONE_STATE_KEY
+            )
+        ).scalars().all()
+    }
+    filtered = [
+        row
+        for row in records
+        if _matches(row)
+        and int((dict(row.payload or {}).get("order_id") or 0)) not in completed_order_ids
+    ]
+    descending = str(sort_dir or "").strip().lower() == "desc"
+    sort_key = str(sort_by or "").strip().lower()
+    if sort_key in {
+        "planned_start_date", "planned_finish_date", "readiness_need_date",
+        "readiness_action_date", "readiness_priority_key",
+    }:
+        filtered.sort(key=lambda row: (
+            (dict(row.payload or {}).get(sort_key) is None),
+            str(dict(row.payload or {}).get(sort_key) or ""),
+            str(dict(row.payload or {}).get("order_number") or ""),
+            int(dict(row.payload or {}).get("line_number") or 0),
+        ), reverse=descending)
+    else:
+        filtered.sort(key=lambda row: (
+            dict(row.payload or {}).get("order_date") is None,
+            str(dict(row.payload or {}).get("order_date") or ""),
+            str(dict(row.payload or {}).get("order_number") or ""),
+            int(dict(row.payload or {}).get("line_number") or 0),
+        ), reverse=True)
+        if not descending and sort_key:
+            filtered.reverse()
+    total = len(filtered)
+    effective_limit = max(1, min(int(limit or 100), 500))
+    requested_offset = max(0, int(offset or 0))
+    max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
+    effective_offset = min(requested_offset, max_offset)
+    page = filtered[effective_offset:effective_offset + effective_limit]
+    public_rows = []
+    for row in page:
+        public = _public_journal_row(dict(row.payload or {}))
+        public["current_identity"] = str(row.business_identity)
+        public["source_revision"] = str(manifest.source_revision)
+        public_rows.append(public)
+    # Execution overlays are mutable operational facts, not a second planning
+    # snapshot.  Apply them to the persisted current projection while keeping
+    # the accepted planning quantities and coverage unchanged.
+    overlay_launch_facts(
+        db,
+        public_rows,
+        cutoff=_generation_cutoff(db, manifest.source_generation_id),
+    )
+    overlay_execution_state(db, public_rows)
+    summary = dict(manifest.summary or {})
+    return {
+        "rows": public_rows,
+        "total": total,
+        "limit": effective_limit,
+        "offset": effective_offset,
+        "latest_run_id": summary.get("latest_run_id"),
+        "latest_source_plan_id": summary.get("latest_source_plan_id"),
+        "source_revision": str(manifest.source_revision),
     }
