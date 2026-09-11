@@ -578,15 +578,31 @@ def load_current_execution_coherent(
     if not bool(manifest.result_ready):
         raise CurrentExecutionUnavailable("current execution manifest is not ready")
 
-    # Refresh the accepted-truth pointer after acquiring the publication lock;
-    # a generation publisher cannot advance the pointer and this manifest in
-    # between these reads within the same transaction.
-    truth_pointer = (
-        db.query(models.PlanningTruthState)
-        .populate_existing()
-        .filter(models.PlanningTruthState.id == 1)
-        .one_or_none()
+    # Read the accepted-truth pointer after acquiring the publication lock.
+    # Sessions in this repository intentionally use autoflush=False.  If the
+    # caller has already moved the pointer in this same transaction, a
+    # populate_existing query would reload the old committed value and discard
+    # that pending move, allowing a stale scope to pass.  Preserve a pending
+    # identity-map value; otherwise refresh the committed pointer for the
+    # concurrent-session publication boundary.
+    pending_truth = next(
+        (
+            value
+            for value in tuple(db.new) + tuple(db.dirty)
+            if isinstance(value, models.PlanningTruthState)
+            and int(value.id or 0) == 1
+        ),
+        None,
     )
+    if pending_truth is not None:
+        truth_pointer = pending_truth
+    else:
+        truth_pointer = (
+            db.query(models.PlanningTruthState)
+            .populate_existing()
+            .filter(models.PlanningTruthState.id == 1)
+            .one_or_none()
+        )
     expected_generation_id = int(truth_pointer.current_generation_id or 0) if truth_pointer else 0
     if expected_generation_id:
         if int(manifest.source_generation_id or 0) != expected_generation_id:
