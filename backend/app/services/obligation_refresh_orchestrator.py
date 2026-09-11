@@ -47,8 +47,7 @@ from app.services.production_material_custody_projection import (
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import (
-    build_mrp_result_candidate_snapshot,
-    build_mrp_result_snapshot,
+    build_mrp_result_current_payload,
 )
 from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
@@ -254,19 +253,6 @@ def _publish_execution_snapshots(db: Session, generation_id: int) -> None:
         ) from exc
 
 
-def _publish_retained_mrp_snapshots(
-    db: Session,
-    generation_id: int,
-    retained_run_ids: Iterable[int],
-    *,
-    allow_stale_truth: bool = False,
-) -> None:
-    for run_id in sorted({int(value) for value in retained_run_ids}):
-        build_mrp_result_snapshot(
-            db, run_id, allow_stale_truth=bool(allow_stale_truth)
-        )
-
-
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
@@ -294,7 +280,12 @@ def _retry_published(
     metrics = dict(snapshot_batch.metrics or {}) if snapshot_batch is not None else {}
     purchase_payload = metrics.get("purchase_control_journal_payload")
     production_payload = metrics.get("production_control_journal_payload")
-    if not isinstance(purchase_payload, Mapping) or not isinstance(production_payload, Mapping):
+    mrp_payloads = metrics.get("mrp_result_payloads")
+    if (
+        not isinstance(purchase_payload, Mapping)
+        or not isinstance(production_payload, Mapping)
+        or not isinstance(mrp_payloads, Mapping)
+    ):
         raise ObligationRefreshOrchestratorError(
             "published generation lacks canonical obligation journal payloads"
         )
@@ -303,24 +294,9 @@ def _retry_published(
         accepted_at=target.accepted_at, capabilities=dict(target.capabilities or {}),
         purchase_payload=purchase_payload,
         production_payload=production_payload,
+        mrp_payloads=mrp_payloads,
     )
     _publish_execution_snapshots(db, int(target.id))
-    manifest = marks.get(MANIFEST_KEY)
-    retained_ids = (
-        [
-            int(entry["parent_run_id"])
-            for entry in manifest.get("entries", [])
-            if isinstance(entry, dict) and entry.get("action") == "retain"
-        ]
-        if isinstance(manifest, dict)
-        else []
-    )
-    _publish_retained_mrp_snapshots(
-        db,
-        int(target.id),
-        retained_ids,
-        allow_stale_truth=bool(allow_stale_parent),
-    )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
@@ -558,7 +534,10 @@ def run_obligation_refresh(
     )
     drum_schedule = materialize_drum_schedule(db, target_id)
     shelf_projection = materialize_shelf_projections(db, target_id)
-    snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
+    mrp_payloads = {
+        str(run_id): build_mrp_result_current_payload(db, int(run_id))
+        for run_id in sorted({int(value) for value in (*candidate_ids, *retained_run_ids)})
+    }
     # Purchase current state is published directly from the canonical payload;
     # unlike MRP/production evidence it does not need a PlanningReadSnapshot
     # row as an intermediate runtime owner.
@@ -591,7 +570,7 @@ def run_obligation_refresh(
     capabilities = dict(_CORE_CAPABILITIES)
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),
-        "candidate_read_snapshot_ids": snapshots,
+        "mrp_result_payloads": mrp_payloads,
         "future_supply_captured": True,
         "future_supply_capture_batch_id": int(future_supply_capture_batch.id),
         "future_supply_capture": future_supply_capture,
@@ -611,7 +590,7 @@ def run_obligation_refresh(
     _complete(snapshot_batch, snapshot_metrics)
     target.capabilities = dict(capabilities)
     db.flush()
-    # The publisher audits lineage, manifests and read snapshots, but nothing
+    # The publisher audits lineage, manifests and direct MRP payloads, but nothing
     # ever proved the *structure* of the candidate itself: that is what the
     # genesis path gets from validate_generation_build.  Run its applicable
     # subset here so an obligation refresh cannot become truth with a broken
@@ -628,14 +607,9 @@ def run_obligation_refresh(
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
         purchase_payload=purchase_journal_payload,
         production_payload=production_journal_payload,
+        mrp_payloads=mrp_payloads,
     )
     _publish_execution_snapshots(db, target_id)
-    _publish_retained_mrp_snapshots(
-        db,
-        target_id,
-        retained_run_ids,
-        allow_stale_truth=bool(allow_stale_parent),
-    )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,

@@ -70,7 +70,7 @@ from app.services.production_control_journal_snapshot import (
 from app.services.production_material_custody_projection import (
     build_material_custody_projection,
 )
-from app.services.mrp_result_snapshot import build_mrp_result_snapshot
+from app.services.mrp_result_snapshot import build_mrp_result_current_payload
 
 
 logger = logging.getLogger(__name__)
@@ -1328,27 +1328,9 @@ def _promote_accepted_generation_read_snapshots(
                 int(run.run_id), reason="mrp-publish",
             )
 
-    # Only the live obligations of this generation get a result snapshot, and
-    # "live" is the sealed lineage scope — a fact-only fork inherits its runs
-    # instead of re-anchoring them, so comparing the run's anchor with this
-    # generation's id skipped all ten real runs on every refresh.  The builder
-    # reuses an existing snapshot from anywhere in that lineage, so a refresh
-    # that changed no obligation writes no rows here.
-    try:
-        live_run_ids = set(live_plan_run_ids(db, generation))
-    except ValueError as exc:
-        raise GenerationValidationError(
-            f"generation {int(generation.id)} cannot resolve its live-plan scope: {exc}"
-        ) from exc
-    for run_id in fixed_run_ids:
-        if int(run_id) not in live_run_ids:
-            continue
-        try:
-            build_mrp_result_snapshot(db, int(run_id))
-        except ValueError as exc:
-            raise GenerationValidationError(
-                f"MRP result snapshot for run {run_id} could not be published: {exc}"
-            ) from exc
+    # MRP result payloads are built directly by the caller and published into
+    # CurrentExecutionScope.  Runtime lifecycle publication must not create
+    # PlanningReadSnapshot/Row/RootMember rows for this consumer.
 
 
 def accept_generation_build(
@@ -1604,6 +1586,10 @@ def accept_generation_build(
                 int(generation.id),
                 accepted_run_ids=fixed_run_ids,
             )
+            mrp_payloads = {
+                str(run_id): build_mrp_result_current_payload(db, int(run_id))
+                for run_id in sorted({int(value) for value in fixed_run_ids})
+            }
         except ValueError as exc:
             raise GenerationValidationError(
                 f"replenishment work item / purchase journal build failed: {exc}"
@@ -1642,6 +1628,7 @@ def accept_generation_build(
             generation_id=int(generation.id),
             purchase_payload=purchase_journal_payload,
             production_payload=production_journal_payload,
+            mrp_payloads=mrp_payloads,
         )
     return {
         **validation,

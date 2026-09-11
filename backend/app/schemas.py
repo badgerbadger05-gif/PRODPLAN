@@ -540,7 +540,7 @@ class ProductionGroup(BaseModel):
 
 
 class ProductionGroupedResponse(BaseModel):
-    snapshot_id: int
+    current_scope_id: int
     ledger_generation: int
     cutoff: str
     truth_status: str
@@ -592,7 +592,7 @@ class ReworkGroup(BaseModel):
 
 
 class ReworkGroupedResponse(BaseModel):
-    snapshot_id: int
+    current_scope_id: int
     ledger_generation: int
     cutoff: str
     truth_status: str
@@ -644,7 +644,7 @@ class PurchaseCategoryGroup(BaseModel):
 
 
 class PurchaseCategoryGroupedResponse(BaseModel):
-    snapshot_id: int
+    current_scope_id: int
     ledger_generation: int
     cutoff: str
     truth_status: str

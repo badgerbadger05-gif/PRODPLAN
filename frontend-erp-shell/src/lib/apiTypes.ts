@@ -5425,8 +5425,8 @@ export interface components {
         };
         /** ProductionGroupedResponse */
         ProductionGroupedResponse: {
-            /** Snapshot Id */
-            snapshot_id: number;
+            /** Current Scope Id */
+            current_scope_id: number;
             /** Ledger Generation */
             ledger_generation: number;
             /** Cutoff */
@@ -5990,8 +5990,8 @@ export interface components {
         };
         /** PurchaseCategoryGroupedResponse */
         PurchaseCategoryGroupedResponse: {
-            /** Snapshot Id */
-            snapshot_id: number;
+            /** Current Scope Id */
+            current_scope_id: number;
             /** Ledger Generation */
             ledger_generation: number;
             /** Cutoff */
@@ -6481,8 +6481,8 @@ export interface components {
         };
         /** ReworkGroupedResponse */
         ReworkGroupedResponse: {
-            /** Snapshot Id */
-            snapshot_id: number;
+            /** Current Scope Id */
+            current_scope_id: number;
             /** Ledger Generation */
             ledger_generation: number;
             /** Cutoff */
@@ -8781,7 +8781,7 @@ export interface operations {
     get_planning_result_summary_api_v1_plan_results__run_id__get: {
         parameters: {
             query?: {
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
             };
             header?: never;
             path: {
@@ -8823,7 +8823,7 @@ export interface operations {
                 offset?: number;
                 sort_by?: string | null;
                 sort_dir?: string | null;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
                 current_identity?: string | null;
             };
             header?: never;
@@ -8909,7 +8909,7 @@ export interface operations {
                 offset?: number;
                 sort_by?: string | null;
                 sort_dir?: string | null;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
                 current_identity?: string | null;
             };
             header?: never;
@@ -8988,7 +8988,7 @@ export interface operations {
                 offset?: number;
                 sort_by?: string | null;
                 sort_dir?: string | null;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
                 current_identity?: string | null;
             };
             header?: never;
@@ -9145,7 +9145,7 @@ export interface operations {
                 date_to?: string | null;
                 limit?: number;
                 offset?: number;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
                 current_identity?: string | null;
             };
             header?: never;
@@ -9206,7 +9206,7 @@ export interface operations {
                 date_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
             };
             header?: never;
             path: {
@@ -9249,7 +9249,7 @@ export interface operations {
                 date_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
             };
             header?: never;
             path: {
@@ -9427,7 +9427,7 @@ export interface operations {
                 date_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
-                snapshot_id?: number | null;
+                current_scope_id?: number | null;
             };
             header?: never;
             path: {

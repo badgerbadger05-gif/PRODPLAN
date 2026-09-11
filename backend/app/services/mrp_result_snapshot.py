@@ -62,7 +62,7 @@ def _unavailable(
 ) -> dict[str, Any]:
     truth = get_readiness(db)
     return {
-        "snapshot_id": None,
+        "current_scope_id": None,
         "run_id": int(run_id),
         "ledger_generation": truth.generation_id,
         "cutoff": truth.cutoff.isoformat() if truth.cutoff else None,
@@ -244,6 +244,75 @@ def _row_specs(
                 )
             )
     return specs
+
+
+def build_mrp_result_current_payload(
+    db: Session,
+    run_id: int,
+) -> dict[str, Any]:
+    """Build the direct current-owner payload for one MRP run.
+
+    This is deliberately a pure candidate builder: it reads the canonical
+    planning projection and returns a validated manifest/row payload without
+    creating any ``PlanningRead*`` rows.  Runtime publishers persist the
+    payload in ``CurrentExecutionRow``; the old snapshot builders below are
+    retained only for migration evidence and historical tests.
+    """
+    run = db.get(models.PlanningRun, int(run_id))
+    if run is None:
+        raise ValueError(f"planning run {run_id} not found")
+    status = str(run.status or "")
+    if status == "BUILDING_SNAPSHOT":
+        if run.ledger_generation_id is None:
+            raise ValueError("candidate run has no Ledger generation")
+        generation = db.get(models.LedgerGeneration, int(run.ledger_generation_id))
+        if generation is None or str(generation.status or "") != "building":
+            raise ValueError("candidate run is not bound to a BUILDING Ledger generation")
+        if (generation.source_watermarks or {}).get("generation_kind") != "obligation_refresh":
+            raise ValueError("candidate Ledger generation is not an obligation_refresh")
+        if run.ledger_cutoff != generation.cutoff:
+            raise ValueError("candidate run cutoff differs from the BUILDING Ledger cutoff")
+        _require_sealed_candidate_manifest(db, generation, run)
+        _validate_obligation_lineage(db, int(run.run_id), int(generation.id))
+    elif status != "FIXED_SNAPSHOT":
+        raise ValueError("MRP current payload requires a fixed or building run")
+
+    rows_by_kind, manifest = _collect_snapshot_payload(db, run)
+    specs = _row_specs(rows_by_kind)
+    membership = _frozen_root_membership(
+        db, run, {item_id for _, _, item_id, _, _ in specs if item_id is not None}
+    )
+    # Import lazily: current_execution imports this module for the migration
+    # adapter, while the direct builder itself remains dependency-light.
+    from app.services.item_ledger.current_execution import (
+        _mrp_current_identity,
+        _mrp_current_payload,
+    )
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row_key, kind, item_id, sort_key, source in specs:
+        payload = dict(source)
+        payload.update({
+            "run_id": int(run.run_id),
+            "row_kind": kind,
+            "sort_key": sort_key,
+            "root_item_ids": sorted(membership.get(int(item_id), ())) if item_id is not None else [],
+        })
+        identity = _mrp_current_identity(
+            payload, run_id=int(run.run_id), row_kind=kind
+        )
+        if identity in seen:
+            raise ValueError("MRP current payload contains duplicate identity")
+        seen.add(identity)
+        rows.append({
+            "current_identity": identity,
+            "payload": _mrp_current_payload(payload, business_identity=identity),
+        })
+    manifest = dict(manifest)
+    manifest["rows"] = rows
+    manifest["meta"] = {"row_count": len(rows), "run_id": int(run.run_id)}
+    return manifest
 
 
 def _candidate_snapshot_matches(
@@ -960,7 +1029,7 @@ def _read_current_mrp_rows(
         float((payload or {}).get("qty") or 0) for _, payload in filtered
     )
     return {
-        "snapshot_id": int(scope.id),
+        "current_scope_id": int(scope.id),
         "current_identity": f"mrp-run:{int(run_id)}",
         "source_revision": source_revision,
         "run_id": int(run_id),
@@ -977,10 +1046,10 @@ def _read_current_mrp_rows(
 
 
 def read_mrp_result_manifest(
-    db: Session, run_id: int, *, snapshot_id: int | None = None
+    db: Session, run_id: int, *, current_scope_id: int | None = None
 ) -> dict[str, Any]:
     scope = _current_mrp_scope(db)
-    if snapshot_id is not None and int(snapshot_id) != int(scope.id):
+    if current_scope_id is not None and int(current_scope_id) != int(scope.id):
         raise CurrentExecutionUnavailable("current MRP manifest identity does not match")
     run_meta = dict((scope.summary or {}).get("runs") or {}).get(str(int(run_id)))
     if not isinstance(run_meta, dict):
@@ -998,7 +1067,7 @@ def read_mrp_result_manifest(
     summary["snapshot_counts"] = row_counts
     summary["snapshot_total_qty"] = total_qty
     return {
-        "snapshot_id": int(scope.id),
+        "current_scope_id": int(scope.id),
         "current_identity": f"mrp-run:{int(run_id)}",
         "source_revision": str(scope.source_revision),
         "run_id": int(run_id),
@@ -1015,7 +1084,7 @@ def read_mrp_result_rows(
     run_id: int,
     *,
     row_kind: str,
-    snapshot_id: int | None = None,
+    current_scope_id: int | None = None,
     item_id: int | None = None,
     root_item_id: int | None = None,
     area_id: int | None = None,
@@ -1030,7 +1099,7 @@ def read_mrp_result_rows(
     current_identity: str | None = None,
 ) -> dict[str, Any]:
     scope = _current_mrp_scope(db)
-    if snapshot_id is not None and int(snapshot_id) != int(scope.id):
+    if current_scope_id is not None and int(current_scope_id) != int(scope.id):
         raise CurrentExecutionUnavailable("current MRP manifest identity does not match")
     return _read_current_mrp_rows(
         db,

@@ -148,7 +148,7 @@ function journalResponse() {
 
 function mrpSummary() {
   return {
-    snapshot_id: 901,
+    current_scope_id: 901,
     current_identity: 'mrp-run:900',
     source_revision: 'accepted:g77',
     ledger_generation: 77,

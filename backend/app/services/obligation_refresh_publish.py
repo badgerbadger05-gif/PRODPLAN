@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import InvalidOperation
 from hashlib import sha256
 import json
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError
@@ -72,8 +72,6 @@ _REQUIRED_BUILD_STAGES = (
     "snapshot_build",
 )
 
-_MRP_RESULT_CONSUMER = "mrp_result"
-_MRP_ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
 _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
     "reservation_replay",
@@ -524,97 +522,68 @@ def _require_sealed_build(
         target=target,
         snapshot_metrics=snapshot_metrics,
     )
-    _require_candidate_read_snapshots(
-        db,
-        target=target,
-        candidate_ids=candidate_ids,
-        snapshot_metrics=snapshot_metrics,
-        truth_status="building",
-        accepted_at=None,
+    _require_mrp_current_payloads(
+        snapshot_metrics.get("mrp_result_payloads"),
+        required_run_ids=candidate_ids,
     )
 
 
-def _require_candidate_read_snapshots(
-    db: Session,
+def _require_mrp_current_payloads(
+    raw_payloads: Any,
     *,
-    target: models.LedgerGeneration,
-    candidate_ids: list[int],
-    snapshot_metrics: Mapping[str, Any],
-    truth_status: str,
-    accepted_at: datetime | None,
-) -> list[models.PlanningReadSnapshot]:
-    """Validate the sealed MRP read side before making a generation visible.
-
-    The snapshot builder is deliberately separate from publication, so its
-    persisted output is part of the publication manifest.  A candidate run
-    without an exact persisted read snapshot is not a usable MRP result.
-    """
-    raw_ids = snapshot_metrics.get("candidate_read_snapshot_ids")
-    if not isinstance(raw_ids, Mapping):
+    required_run_ids: Iterable[int],
+) -> dict[str, Mapping[str, Any]]:
+    """Validate the direct MRP boundary before any publication DML."""
+    if not isinstance(raw_payloads, Mapping):
         raise ObligationRefreshPublishError(
-            "snapshot_build lacks candidate_read_snapshot_ids"
+            "snapshot_build lacks direct mrp_result_payloads"
         )
-    try:
-        declared = {int(run_id): int(snapshot_id) for run_id, snapshot_id in raw_ids.items()}
-    except (TypeError, ValueError) as exc:
-        raise ObligationRefreshPublishError(
-            "snapshot_build candidate_read_snapshot_ids is malformed"
-        ) from exc
-    if set(declared) != set(candidate_ids) or len(set(declared.values())) != len(declared):
-        raise ObligationRefreshPublishError(
-            "snapshot_build candidate read snapshots conflict with candidates"
-        )
-
-    snapshots = _lock(db.query(models.PlanningReadSnapshot)).filter(
-        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
-        models.PlanningReadSnapshot.consumer == _MRP_RESULT_CONSUMER,
-    ).all()
-    by_id = {int(row.id): row for row in snapshots}
-    if set(by_id) != set(declared.values()):
-        raise ObligationRefreshPublishError(
-            "target has foreign or extra mrp_result snapshots"
-        )
-    expected_cutoff = _utc(target.cutoff, "target cutoff")
-    for run_id, snapshot_id in declared.items():
-        snapshot = by_id.get(snapshot_id)
-        if (
-            snapshot is None
-            or snapshot.snapshot_key != f"run:{run_id}"
-            or str(snapshot.truth_status) != truth_status
-            or _utc(snapshot.cutoff, "candidate snapshot cutoff") != expected_cutoff
-        ):
-            raise ObligationRefreshPublishError(
-                "candidate read snapshot identity or truth state conflicts"
-            )
-        if accepted_at is None:
-            if snapshot.reason is None:
-                raise ObligationRefreshPublishError("building candidate snapshot lacks unpublished reason")
-        elif snapshot.reason is not None or _utc(snapshot.published_at, "candidate snapshot published_at") != accepted_at:
-            raise ObligationRefreshPublishError(
-                "accepted candidate read snapshot publication conflicts"
-            )
-        row_counts = dict(snapshot.payload or {}).get("row_counts")
-        if not isinstance(row_counts, Mapping) or set(row_counts) != _MRP_ROW_KINDS:
-            raise ObligationRefreshPublishError("candidate read snapshot row_counts are incomplete")
+    result: dict[str, Mapping[str, Any]] = {}
+    seen: set[str] = set()
+    for marker, raw in raw_payloads.items():
+        if not isinstance(raw, Mapping):
+            raise ObligationRefreshPublishError("MRP current payload is malformed")
         try:
-            expected_counts = {kind: int(row_counts[kind]) for kind in _MRP_ROW_KINDS}
+            run_id = int(raw.get("run_id", marker))
         except (TypeError, ValueError) as exc:
-            raise ObligationRefreshPublishError("candidate read snapshot row_counts are malformed") from exc
-        if any(count < 0 for count in expected_counts.values()):
-            raise ObligationRefreshPublishError("candidate read snapshot row_counts are malformed")
-        actual_counts = {kind: 0 for kind in _MRP_ROW_KINDS}
-        rows = db.query(models.PlanningReadRow.row_kind).filter(
-            models.PlanningReadRow.snapshot_id == int(snapshot.id)
-        ).all()
-        for (kind,) in rows:
-            if kind not in _MRP_ROW_KINDS:
-                raise ObligationRefreshPublishError("candidate read snapshot has unsupported row kind")
-            actual_counts[str(kind)] += 1
-        if actual_counts != expected_counts:
-            raise ObligationRefreshPublishError(
-                "candidate read snapshot persisted rows conflict with row_counts"
-            )
-    return [by_id[declared[run_id]] for run_id in sorted(declared)]
+            raise ObligationRefreshPublishError("MRP current payload run identity is malformed") from exc
+        key = str(run_id)
+        if key in result:
+            raise ObligationRefreshPublishError("MRP current payload has duplicate run")
+        rows = raw.get("rows")
+        if not isinstance(rows, list):
+            raise ObligationRefreshPublishError("MRP current payload rows are missing")
+        identities: set[str] = set()
+        counts = {kind: 0 for kind in ("production", "purchase", "rework", "capacity")}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ObligationRefreshPublishError("MRP current payload row is malformed")
+            payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else row
+            kind = str(payload.get("row_kind") or row.get("row_kind") or "").strip().lower()
+            if kind not in counts:
+                raise ObligationRefreshPublishError("MRP current payload row kind is malformed")
+            identity = str(row.get("current_identity") or payload.get("current_identity") or "").strip()
+            if not identity or identity in identities:
+                raise ObligationRefreshPublishError("MRP current payload contains duplicate identity")
+            identities.add(identity)
+            counts[kind] += 1
+            roots = payload.get("root_item_ids")
+            if roots is not None and (not isinstance(roots, (list, tuple)) or any(
+                not isinstance(value, int) for value in roots
+            )):
+                raise ObligationRefreshPublishError("MRP current payload root membership is malformed")
+        declared_counts = raw.get("row_counts")
+        if declared_counts is None or (
+            not isinstance(declared_counts, Mapping)
+            or set(declared_counts) != set(counts)
+            or any(int(declared_counts.get(kind, -1)) != count for kind, count in counts.items())
+        ):
+            raise ObligationRefreshPublishError("MRP current payload row counts are malformed")
+        result[key] = raw
+    required = {str(int(value)) for value in required_run_ids}
+    if not required.issubset(result):
+        raise ObligationRefreshPublishError("MRP current payloads omit a candidate run")
+    return result
 
 
 def _validate_purchase_candidate_payload(
@@ -778,13 +747,12 @@ def _exact_retry(
     # no-copy publication.
     candidate_ids = [int(row.run_id) for row in candidates]
     try:
-        _require_candidate_read_snapshots(
-            db,
-            target=target,
-            candidate_ids=candidate_ids,
-            snapshot_metrics=dict(snapshot_batch.metrics or {}),
-            truth_status="accepted",
-            accepted_at=accepted_at,
+        _require_mrp_current_payloads(
+            snapshot_metrics.get("mrp_result_payloads"),
+            required_run_ids=[
+                *candidate_ids,
+                *(int(row.run_id) for row in retained),
+            ],
         )
     except ObligationRefreshPublishError:
         return None
@@ -831,6 +799,7 @@ def publish_obligation_refresh_batch(
     capabilities: Mapping[str, Any],
     purchase_payload: Mapping[str, Any] | None = None,
     production_payload: Mapping[str, Any] | None = None,
+    mrp_payloads: Mapping[str, Any] | None = None,
 ) -> ObligationRefreshPublishResult:
     """Publish every active source plan together, using only ``flush``.
 
@@ -848,6 +817,10 @@ def publish_obligation_refresh_batch(
     if not isinstance(production_payload, Mapping):
         raise ObligationRefreshPublishError(
             "obligation refresh publication requires an explicit production payload"
+        )
+    if not isinstance(mrp_payloads, Mapping):
+        raise ObligationRefreshPublishError(
+            "obligation refresh publication requires explicit mrp_payloads"
         )
     capability_snapshot = dict(capabilities)
     if db.get_bind().dialect.name == "postgresql":
@@ -900,13 +873,9 @@ def publish_obligation_refresh_batch(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
         models.LedgerBuildBatch.stage == "snapshot_build",
     ).one()
-    candidate_read_snapshots = _require_candidate_read_snapshots(
-        db,
-        target=target,
-        candidate_ids=candidate_ids,
-        snapshot_metrics=dict(snapshot_batch.metrics or {}),
-        truth_status="building",
-        accepted_at=None,
+    direct_mrp_payloads = _require_mrp_current_payloads(
+        mrp_payloads,
+        required_run_ids=[*(int(row.run_id) for row in additions), *(int(row.run_id) for row in replacements), *(int(row.run_id) for row in retained)],
     )
     direct_purchase_payload = purchase_payload
     journal_payload = _validate_purchase_candidate_payload(
@@ -1049,20 +1018,15 @@ def publish_obligation_refresh_batch(
         db, additions=additions, replacements=replacements,
         retained=retained, retired=retired,
     )
-    for snapshot in candidate_read_snapshots:
-        snapshot.truth_status = "accepted"
-        snapshot.reason = None
-        snapshot.published_at = accepted_at
-    # Current user-facing obligation/result views are promoted only after all
-    # candidate snapshots have crossed the accepted boundary.  Snapshot rows
-    # remain immutable evidence; the compact current owner is the runtime read
-    # model and never selects by a historical generation id.
+    # Current user-facing obligation/result views are promoted from the
+    # validated direct payloads; no MRP PlanningRead rows cross publication.
     from .item_ledger.current_execution import publish_current_obligation_views_from_generation
     publish_current_obligation_views_from_generation(
         db,
         int(target.id),
         purchase_payload=journal_payload,
         production_payload=direct_production_payload,
+        mrp_payloads=direct_mrp_payloads,
     )
     try:
         db.flush()

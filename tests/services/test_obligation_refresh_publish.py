@@ -133,11 +133,23 @@ def _seal_build(db, target, candidates, cutoff):
         if stage == "future_supply_capture":
             continue
         if stage == "snapshot_build":
+            parent_generation_id = int((target.source_watermarks or {}).get("parent_generation_id"))
+            direct_payloads = {
+                str(row.run_id): {
+                    "run_id": int(row.run_id),
+                    "row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0},
+                    "total_qty": {"production": 0.0, "purchase": 0.0, "rework": 0.0, "capacity": 0.0},
+                    "rows": [],
+                }
+                for row in db.query(models.PlanningRun).filter(
+                    models.PlanningRun.ledger_generation_id == parent_generation_id,
+                    models.PlanningRun.status == "FIXED_SNAPSHOT",
+                ).all()
+            }
+            direct_payloads.update({str(row.run_id): row._test_mrp_payload for row in candidates})
             metrics = {
                 "candidate_run_ids": [row.run_id for row in candidates],
-                "candidate_read_snapshot_ids": {
-                    str(row.run_id): row._test_read_snapshot_id for row in candidates
-                },
+                "mrp_result_payloads": direct_payloads,
                 "future_supply_captured": True,
                 "future_supply_capture_batch_id": future_supply_capture_batch_id,
                 "purchase_control_journal_snapshot_id": target._test_purchase_journal_snapshot_id,
@@ -164,24 +176,14 @@ def _seal_build(db, target, candidates, cutoff):
 
 
 def _candidate_read_snapshots(db, target, candidates, cutoff):
-    """Persist minimal MRP read snapshots; zero rows in every kind are valid."""
+    """Seed direct MRP payload fixtures; zero rows in every kind are valid."""
     for candidate in candidates:
-        snapshot = models.PlanningReadSnapshot(
-            consumer="mrp_result", snapshot_key=f"run:{candidate.run_id}",
-            ledger_generation_id=target.id, cutoff=cutoff, truth_status="building",
-            reason="unpublished candidate snapshot",
-            payload={
-                "run_id": candidate.run_id,
-                "row_counts": {
-                    "production": 0, "purchase": 0, "rework": 0, "capacity": 0,
-                },
-            },
-            published_at=cutoff,
-        )
-        db.add(snapshot)
-        db.flush()
-        # Test-only transient marker avoids widening the production contract.
-        candidate._test_read_snapshot_id = snapshot.id
+        candidate._test_mrp_payload = {
+            "run_id": int(candidate.run_id),
+            "row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0},
+            "total_qty": {"production": 0.0, "purchase": 0.0, "rework": 0.0, "capacity": 0.0},
+            "rows": [],
+        }
     purchase_journal = models.PlanningReadSnapshot(
         consumer="purchase_control_journal",
         snapshot_key="journal:v1",
@@ -361,6 +363,8 @@ def _publish(db, parent, target, cutoff, capabilities=None):
     metrics = dict(snapshot_batch.metrics or {})
     metrics["purchase_control_journal_payload"] = purchase_payload
     metrics["production_control_journal_payload"] = production_payload
+    if not isinstance(metrics.get("mrp_result_payloads"), dict):
+        metrics["mrp_result_payloads"] = {}
     snapshot_batch.metrics = metrics
     db.flush()
     return publish_obligation_refresh_batch(
@@ -368,6 +372,7 @@ def _publish(db, parent, target, cutoff, capabilities=None):
         accepted_at=cutoff, capabilities=capabilities or _capabilities(),
         purchase_payload=purchase_payload,
         production_payload=production_payload,
+        mrp_payloads=metrics["mrp_result_payloads"],
     )
 
 
@@ -603,7 +608,7 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, truth_status="accepted"
-    ).count() == 1
+    ).count() == 0
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id,
         consumer="purchase_control_journal",
@@ -636,38 +641,41 @@ def test_publish_requires_complete_production_control_journal_snapshot(
 
 
 @pytest.mark.parametrize("mutation, error", [
-    ("missing", "foreign or extra"),
-    ("extra", "foreign or extra"),
-    ("wrong_count", "persisted rows conflict"),
-    ("missing_kind", "row_counts are incomplete"),
+    ("missing", "omit a candidate"),
+    ("extra", "duplicate identity"),
+    ("wrong_count", "row counts are malformed"),
+    ("missing_kind", "row counts are malformed"),
 ])
-def test_publish_rejects_incomplete_or_tampered_candidate_read_snapshots(
+def test_publish_rejects_incomplete_or_tampered_direct_mrp_payloads(
     db_session, mutation, error
 ):
     cutoff, parent, target, _parents, candidates = _batch(
         db_session, count=1, add_count=1
     )
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="mrp_result"
-    ).one()
     checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
         ledger_generation_id=target.id, stage="snapshot_build"
     ).one()
+    payloads = dict(checkpoint.metrics["mrp_result_payloads"])
+    candidate_key = str(candidates[0].run_id)
     if mutation == "missing":
-        db_session.delete(snapshot)
+        payloads.pop(candidate_key)
     elif mutation == "extra":
-        db_session.add(models.PlanningReadSnapshot(
-            consumer="mrp_result", snapshot_key="run:9999", ledger_generation_id=target.id,
-            cutoff=cutoff, truth_status="building", reason="unpublished candidate snapshot",
-            payload={"row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0}},
-            published_at=cutoff,
-        ))
+        payloads[candidate_key] = {
+            **payloads[candidate_key],
+            "run_id": int(candidate_key),
+            "rows": [
+                {"current_identity": "duplicate", "payload": {"row_kind": "production", "item_id": 1}},
+                {"current_identity": "duplicate", "payload": {"row_kind": "production", "item_id": 1}},
+            ],
+            "row_counts": {"production": 2, "purchase": 0, "rework": 0, "capacity": 0},
+        }
     elif mutation == "wrong_count":
-        snapshot.payload = {**snapshot.payload, "row_counts": {
+        payloads[candidate_key] = {**payloads[candidate_key], "row_counts": {
             "production": 1, "purchase": 0, "rework": 0, "capacity": 0,
         }}
     else:
-        snapshot.payload = {**snapshot.payload, "row_counts": {"production": 0}}
+        payloads[candidate_key] = {**payloads[candidate_key], "row_counts": {"production": 0}}
+    checkpoint.metrics = {**checkpoint.metrics, "mrp_result_payloads": payloads}
     db_session.flush()
 
     with pytest.raises(ObligationRefreshPublishError, match=error):
@@ -680,10 +688,13 @@ def test_exact_retry_rejects_tampered_accepted_candidate_read_snapshot(db_sessio
     )
     _publish(db_session, parent, target, cutoff)
     db_session.commit()
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="mrp_result"
+    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id, stage="snapshot_build"
     ).one()
-    snapshot.reason = "tampered"
+    payloads = dict(checkpoint.metrics["mrp_result_payloads"])
+    key = str(_candidates[0].run_id) if _candidates else next(iter(payloads))
+    payloads[key] = {**payloads[key], "rows": [{"current_identity": "tampered", "payload": {"row_kind": "production", "item_id": 1}}]}
+    checkpoint.metrics = {**checkpoint.metrics, "mrp_result_payloads": payloads}
     db_session.flush()
 
     with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):

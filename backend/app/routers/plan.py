@@ -64,7 +64,7 @@ def _read_all_mrp_snapshot_rows(
     run_id: int,
     row_kind: str,
     *,
-    snapshot_id: Optional[int],
+    current_scope_id: Optional[int],
     item_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
     supplier_ref1c: Optional[str] = None,
@@ -95,14 +95,14 @@ def _read_all_mrp_snapshot_rows(
         ) from exc
     rows: list[dict[str, Any]] = []
     offset = 0
-    pinned_snapshot_id = snapshot_id
+    pinned_current_scope_id = current_scope_id
     while True:
         try:
             result = read_mrp_result_rows(
                 db=db,
                 run_id=int(run_id),
                 row_kind=row_kind,
-                snapshot_id=pinned_snapshot_id,
+                current_scope_id=pinned_current_scope_id,
                 item_id=item_id,
                 root_item_id=root_item_id,
                 supplier_ref1c=supplier_ref1c,
@@ -120,7 +120,7 @@ def _read_all_mrp_snapshot_rows(
                 status_code=503,
                 detail={"code": "mrp_result_current_unavailable", "reason": str(exc)},
             ) from exc
-        resolved_id = result.get("snapshot_id")
+        resolved_id = result.get("current_scope_id")
         if resolved_id is None:
             raise HTTPException(
                 status_code=503,
@@ -133,9 +133,9 @@ def _read_all_mrp_snapshot_rows(
                     "rows": [],
                 },
             )
-        if pinned_snapshot_id is None:
-            pinned_snapshot_id = int(resolved_id)
-        elif int(resolved_id) != int(pinned_snapshot_id):
+        if pinned_current_scope_id is None:
+            pinned_current_scope_id = int(resolved_id)
+        elif int(resolved_id) != int(pinned_current_scope_id):
             raise HTTPException(
                 status_code=409,
                 detail={"code": "mrp_result_snapshot_changed"},
@@ -144,7 +144,7 @@ def _read_all_mrp_snapshot_rows(
         rows.extend(page)
         offset += len(page)
         if not page or offset >= int(result.get("total") or 0):
-            return rows, int(pinned_snapshot_id)
+            return rows, int(pinned_current_scope_id)
 
 
 def _page_groups(
@@ -166,19 +166,19 @@ def _page_groups(
     }
 
 
-def _mrp_snapshot_identity(
-    db: Session, run_id: int, snapshot_id: int
+def _mrp_current_scope_identity(
+    db: Session, run_id: int, current_scope_id: int
 ) -> dict[str, Any]:
     try:
         manifest = read_mrp_result_manifest(
-            db=db, run_id=int(run_id), snapshot_id=int(snapshot_id)
+            db=db, run_id=int(run_id), current_scope_id=int(current_scope_id)
         )
     except CurrentExecutionUnavailable as exc:
         raise HTTPException(
             status_code=503,
             detail={"code": "mrp_result_current_unavailable", "reason": str(exc)},
         ) from exc
-    if manifest.get("snapshot_id") is None:
+    if manifest.get("current_scope_id") is None:
         raise HTTPException(
             status_code=503,
             detail={
@@ -188,12 +188,12 @@ def _mrp_snapshot_identity(
                 "truth_reason": manifest.get("truth_reason"),
             },
         )
-    if int(manifest["snapshot_id"]) != int(snapshot_id):
+    if int(manifest["current_scope_id"]) != int(current_scope_id):
         raise HTTPException(
             status_code=409, detail={"code": "mrp_result_snapshot_changed"}
         )
     return {
-        "snapshot_id": int(manifest["snapshot_id"]),
+        "current_scope_id": int(manifest["current_scope_id"]),
         "current_identity": manifest.get("current_identity") or f"mrp-run:{int(run_id)}",
         "source_revision": manifest.get("source_revision"),
         "ledger_generation": int(manifest["ledger_generation"]),
@@ -1096,13 +1096,13 @@ async def get_planning_runs(
 @router.get("/results/{run_id}")
 async def get_planning_result_summary(
     run_id: int,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
     """Сводка из сохранённого Ledger-bound снимка; расчёт не запускается."""
     try:
         return read_mrp_result_manifest(
-            db=db, run_id=int(run_id), snapshot_id=snapshot_id
+            db=db, run_id=int(run_id), current_scope_id=current_scope_id
         )
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
@@ -1122,7 +1122,7 @@ async def get_planning_result_production(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     current_identity: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
@@ -1132,7 +1132,7 @@ async def get_planning_result_production(
             db=db,
             run_id=int(run_id),
             row_kind="production",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             item_id=item_id,
             root_item_id=root_item_id,
             date_from=date_from,
@@ -1162,9 +1162,9 @@ async def get_planning_result_production_grouped(
 ):
     """Группировка сохранённых производственных обязательств по участкам."""
     try:
-        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, current_scope_id = _read_all_mrp_snapshot_rows(
             db, int(run_id), "production",
-            snapshot_id=None,
+            current_scope_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
@@ -1172,7 +1172,7 @@ async def get_planning_result_production_grouped(
         )
         capacity_rows, _ = _read_all_mrp_snapshot_rows(
             db, int(run_id), "capacity",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             date_from=date_from,
             date_to=date_to,
         )
@@ -1183,7 +1183,7 @@ async def get_planning_result_production_grouped(
             groups,
             limit=limit,
             offset=offset,
-            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+            identity=_mrp_current_scope_identity(db, int(run_id), current_scope_id),
         )
     except HTTPException:
         raise
@@ -1206,7 +1206,7 @@ async def get_planning_result_purchases(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     current_identity: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
@@ -1216,7 +1216,7 @@ async def get_planning_result_purchases(
             db=db,
             run_id=int(run_id),
             row_kind="purchase",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             item_id=item_id,
             root_item_id=root_item_id,
             supplier_ref1c=supplier_ref1c,
@@ -1246,9 +1246,9 @@ async def get_planning_result_purchases_grouped(
 ):
     """Агрегированная выдача закупок из принятого снимка."""
     try:
-        base_rows, snapshot_id = _read_all_mrp_snapshot_rows(
+        base_rows, current_scope_id = _read_all_mrp_snapshot_rows(
             db, int(run_id), "purchase",
-            snapshot_id=None,
+            current_scope_id=None,
             date_from=date_from,
             date_to=date_to,
         )
@@ -1280,7 +1280,7 @@ async def get_planning_result_purchases_grouped(
             "total": total,
             "limit": eff_limit,
             "offset": eff_offset,
-            **_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+            **_mrp_current_scope_identity(db, int(run_id), current_scope_id),
         }
     except HTTPException:
         raise
@@ -1300,7 +1300,7 @@ async def get_planning_result_rework(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     current_identity: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
@@ -1310,7 +1310,7 @@ async def get_planning_result_rework(
             db=db,
             run_id=int(run_id),
             row_kind="rework",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             item_id=item_id,
             root_item_id=root_item_id,
             date_from=date_from,
@@ -1340,9 +1340,9 @@ async def get_planning_result_rework_grouped(
 ):
     """Группированная выдача переработки из принятого снимка."""
     try:
-        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, current_scope_id = _read_all_mrp_snapshot_rows(
             db, int(run_id), "rework",
-            snapshot_id=None,
+            current_scope_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
@@ -1364,7 +1364,7 @@ async def get_planning_result_rework_grouped(
             groups,
             limit=limit,
             offset=offset,
-            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+            identity=_mrp_current_scope_identity(db, int(run_id), current_scope_id),
         )
     except HTTPException:
         raise
@@ -1386,9 +1386,9 @@ async def get_planning_result_purchases_grouped_by_category(
 ):
     """Закупки по сохранённой в снимке товарной группе."""
     try:
-        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, current_scope_id = _read_all_mrp_snapshot_rows(
             db, int(run_id), "purchase",
-            snapshot_id=None,
+            current_scope_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
@@ -1398,7 +1398,7 @@ async def get_planning_result_purchases_grouped_by_category(
             _category_groups_from_snapshot(rows, rework=False),
             limit=limit,
             offset=offset,
-            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+            identity=_mrp_current_scope_identity(db, int(run_id), current_scope_id),
         )
     except HTTPException:
         raise
@@ -1420,9 +1420,9 @@ async def get_planning_result_rework_grouped_by_category(
 ):
     """Переработка по сохранённой в снимке товарной группе."""
     try:
-        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, current_scope_id = _read_all_mrp_snapshot_rows(
             db, int(run_id), "rework",
-            snapshot_id=None,
+            current_scope_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
@@ -1432,7 +1432,7 @@ async def get_planning_result_rework_grouped_by_category(
             _category_groups_from_snapshot(rows, rework=True),
             limit=limit,
             offset=offset,
-            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+            identity=_mrp_current_scope_identity(db, int(run_id), current_scope_id),
         )
     except HTTPException:
         raise
@@ -1449,7 +1449,7 @@ async def get_planning_result_capacity(
     date_to: Optional[str] = None,
     limit: int = 200,
     offset: int = 0,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     current_identity: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
@@ -1459,7 +1459,7 @@ async def get_planning_result_capacity(
             db=db,
             run_id=int(run_id),
             row_kind="capacity",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             area_id=area_id,
             date_from=date_from,
             date_to=date_to,
@@ -1494,7 +1494,7 @@ async def export_planning_result_production(
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1502,17 +1502,17 @@ async def export_planning_result_production(
     Колонки: Наименование, Артикул, Количество, Нормо-часы всего, Нормо-часы на ед., Дата потребности, Дата начала, Дата окончания, ЕИ
     """
     try:
-        rows, resolved_snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, resolved_current_scope_id = _read_all_mrp_snapshot_rows(
             db,
             int(run_id),
             "production",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             root_item_id=root_item_id,
             date_from=date_from,
             date_to=date_to,
             sort_dir=sort_dir,
         )
-        current_identity = _mrp_snapshot_identity(db, int(run_id), resolved_snapshot_id)
+        current_identity = _mrp_current_scope_identity(db, int(run_id), resolved_current_scope_id)
 
         headers = [
             "Наименование",
@@ -1553,7 +1553,7 @@ async def export_planning_result_production(
                 db,
                 int(run_id),
                 "capacity",
-                snapshot_id=resolved_snapshot_id,
+                current_scope_id=resolved_current_scope_id,
                 date_from=date_from,
                 date_to=date_to,
             )
@@ -1661,7 +1661,7 @@ async def export_planning_result_production(
                 "data_base64": b64,
                 "filename": f"mrp_production_run_{run_id}.xlsx",
                 "total_rows": len(data_rows) if not groups else sum(len((g.get("orders") or [])) for g in groups),
-                "snapshot_id": resolved_snapshot_id,
+                "current_scope_id": resolved_current_scope_id,
                 "current_identity": current_identity["current_identity"],
                 "source_revision": current_identity["source_revision"],
             }
@@ -1678,7 +1678,7 @@ async def export_planning_result_production(
                 "data": output.getvalue(),
                 "filename": f"mrp_production_run_{run_id}.csv",
                 "total_rows": len(data_rows),
-                "snapshot_id": resolved_snapshot_id,
+                "current_scope_id": resolved_current_scope_id,
                 "current_identity": current_identity["current_identity"],
                 "source_revision": current_identity["source_revision"],
             }
@@ -1699,7 +1699,7 @@ async def export_planning_result_purchases(
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1707,11 +1707,11 @@ async def export_planning_result_purchases(
     Колонки: Наименование, Артикул, Количество, ЕИ
     """
     try:
-        rows, resolved_snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, resolved_current_scope_id = _read_all_mrp_snapshot_rows(
             db,
             int(run_id),
             "purchase",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             root_item_id=root_item_id,
             supplier_ref1c=supplier_ref1c,
             category_id=category_id,
@@ -1720,7 +1720,7 @@ async def export_planning_result_purchases(
             date_to=date_to,
             sort_dir=sort_dir,
         )
-        current_identity = _mrp_snapshot_identity(db, int(run_id), resolved_snapshot_id)
+        current_identity = _mrp_current_scope_identity(db, int(run_id), resolved_current_scope_id)
 
         headers = ["Наименование", "Артикул", "Поставщик", "Категория", "Количество", "ЕИ", "Пометка"]
         data_rows = []
@@ -1741,7 +1741,7 @@ async def export_planning_result_purchases(
                 run_id=int(run_id),
                 groups=groups,
             )
-            result["snapshot_id"] = resolved_snapshot_id
+            result["current_scope_id"] = resolved_current_scope_id
             result["current_identity"] = current_identity["current_identity"]
             result["source_revision"] = current_identity["source_revision"]
             return result
@@ -1758,7 +1758,7 @@ async def export_planning_result_purchases(
                 "data": output.getvalue(),
                 "filename": f"mrp_purchases_run_{run_id}.csv",
                 "total_rows": len(data_rows),
-                "snapshot_id": resolved_snapshot_id,
+                "current_scope_id": resolved_current_scope_id,
                 "current_identity": current_identity["current_identity"],
                 "source_revision": current_identity["source_revision"],
             }
@@ -1991,7 +1991,7 @@ async def export_planning_result_rework(
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
-    snapshot_id: Optional[int] = None,
+    current_scope_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1999,17 +1999,17 @@ async def export_planning_result_rework(
     XLSX группируется по товарным группам.
     """
     try:
-        rows, resolved_snapshot_id = _read_all_mrp_snapshot_rows(
+        rows, resolved_current_scope_id = _read_all_mrp_snapshot_rows(
             db,
             int(run_id),
             "rework",
-            snapshot_id=snapshot_id,
+            current_scope_id=current_scope_id,
             root_item_id=root_item_id,
             date_from=date_from,
             date_to=date_to,
             sort_dir=sort_dir,
         )
-        current_identity = _mrp_snapshot_identity(db, int(run_id), resolved_snapshot_id)
+        current_identity = _mrp_current_scope_identity(db, int(run_id), resolved_current_scope_id)
 
         headers = [
             "Наименование",
@@ -2055,7 +2055,7 @@ async def export_planning_result_rework(
                 run_id=int(run_id),
                 groups=groups,
             )
-            result["snapshot_id"] = resolved_snapshot_id
+            result["current_scope_id"] = resolved_current_scope_id
             result["current_identity"] = current_identity["current_identity"]
             result["source_revision"] = current_identity["source_revision"]
             return result
@@ -2072,7 +2072,7 @@ async def export_planning_result_rework(
             "data": output.getvalue(),
             "filename": f"mrp_rework_run_{run_id}.csv",
             "total_rows": len(data_rows),
-            "snapshot_id": resolved_snapshot_id,
+            "current_scope_id": resolved_current_scope_id,
             "current_identity": current_identity["current_identity"],
             "source_revision": current_identity["source_revision"],
         }

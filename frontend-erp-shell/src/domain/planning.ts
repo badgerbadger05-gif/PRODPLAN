@@ -28,7 +28,7 @@ export type StartPlanningRunResponse = {
 }
 
 export type MrpSummary = {
-  snapshot_id: number | null
+  current_scope_id: number | null
   current_identity?: string | null
   source_revision?: string | null
   ledger_generation: number | null
@@ -153,7 +153,7 @@ export type MrpCapacityRow = {
 }
 
 export type MrpPagedResponse<T> = {
-  snapshot_id: number | null
+  current_scope_id: number | null
   current_identity?: string | null
   source_revision?: string | null
   ledger_generation: number | null

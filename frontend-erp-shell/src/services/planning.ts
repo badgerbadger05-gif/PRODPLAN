@@ -20,8 +20,8 @@ export function getPlanningRunSummary(runId: number) {
   return api<MrpSummary>(`/v1/plan/results/${runId}`)
 }
 
-type MrpSnapshotQuery = {
-  snapshot_id: number
+type MrpCurrentQuery = {
+  current_scope_id: number
   format?: string
   date_from?: string
   date_to?: string
@@ -34,9 +34,9 @@ type MrpSnapshotQuery = {
   current_identity?: string | null
 }
 
-function buildResultQuery(params: MrpSnapshotQuery) {
+function buildResultQuery(params: MrpCurrentQuery) {
   const search = new URLSearchParams()
-  search.set('snapshot_id', String(params.snapshot_id))
+  search.set('current_scope_id', String(params.current_scope_id))
   if (params.format) search.set('format', params.format)
   if (params.date_from) search.set('date_from', params.date_from)
   if (params.date_to) search.set('date_to', params.date_to)
@@ -50,35 +50,35 @@ function buildResultQuery(params: MrpSnapshotQuery) {
   return search.toString()
 }
 
-export function getPlanningResultProduction(runId: number, params: MrpSnapshotQuery) {
+export function getPlanningResultProduction(runId: number, params: MrpCurrentQuery) {
   return api<MrpPagedResponse<MrpProductionRow>>(`/v1/plan/results/${runId}/production?${buildResultQuery(params)}`)
 }
 
-export function getPlanningResultPurchases(runId: number, params: MrpSnapshotQuery) {
+export function getPlanningResultPurchases(runId: number, params: MrpCurrentQuery) {
   return api<MrpPagedResponse<MrpPurchaseRow>>(`/v1/plan/results/${runId}/purchases?${buildResultQuery(params)}`)
 }
 
-export function getPlanningResultRework(runId: number, params: MrpSnapshotQuery) {
+export function getPlanningResultRework(runId: number, params: MrpCurrentQuery) {
   return api<MrpPagedResponse<MrpReworkRow>>(`/v1/plan/results/${runId}/rework?${buildResultQuery(params)}`)
 }
 
-export function getPlanningResultCapacity(runId: number, params: MrpSnapshotQuery) {
+export function getPlanningResultCapacity(runId: number, params: MrpCurrentQuery) {
   return api<MrpPagedResponse<MrpCapacityRow>>(`/v1/plan/results/${runId}/capacity?${buildResultQuery(params)}`)
 }
 
-export function exportPlanningResultProduction(runId: number, params: MrpSnapshotQuery & { format: 'csv' | 'xlsx' }) {
+export function exportPlanningResultProduction(runId: number, params: MrpCurrentQuery & { format: 'csv' | 'xlsx' }) {
   return api<{ data_base64?: string; filename?: string; content_type?: string }>(
     `/v1/plan/results/${runId}/production/export?${buildResultQuery(params)}`,
   )
 }
 
-export function exportPlanningResultPurchases(runId: number, params: MrpSnapshotQuery & { format: 'csv' | 'xlsx' }) {
+export function exportPlanningResultPurchases(runId: number, params: MrpCurrentQuery & { format: 'csv' | 'xlsx' }) {
   return api<{ data_base64?: string; filename?: string; content_type?: string }>(
     `/v1/plan/results/${runId}/purchases/export?${buildResultQuery(params)}`,
   )
 }
 
-export function exportPlanningResultRework(runId: number, params: MrpSnapshotQuery & { format: 'csv' | 'xlsx' }) {
+export function exportPlanningResultRework(runId: number, params: MrpCurrentQuery & { format: 'csv' | 'xlsx' }) {
   return api<{ data_base64?: string; filename?: string; content_type?: string }>(
     `/v1/plan/results/${runId}/rework/export?${buildResultQuery(params)}`,
   )

@@ -101,9 +101,9 @@ export function MrpResultPage() {
   const summarySeq = useRef(0)
   const mutationInFlight = useRef(false)
   const previousRunId = useRef(runId)
-  const snapshotId = summary?.snapshot_id ?? null
+  const currentScopeId = summary?.current_scope_id ?? null
   const truthAccepted = summary?.truth_status === 'accepted'
-    && snapshotId !== null
+    && currentScopeId !== null
     && Boolean(summary.current_identity && summary.source_revision)
   const truthUnavailableReason = summary && !truthAccepted
     ? summary.truth_reason || `Снимок MRP недоступен: ${summary.truth_status || 'unavailable'}`
@@ -148,7 +148,7 @@ export function MrpResultPage() {
       const nextSummary = await getPlanningRunSummary(runId)
       if (seq === summarySeq.current) {
         setSummary(nextSummary)
-        if (nextSummary.truth_status !== 'accepted' || nextSummary.snapshot_id === null) {
+        if (nextSummary.truth_status !== 'accepted' || nextSummary.current_scope_id === null) {
           setError(nextSummary.truth_reason || `Снимок MRP недоступен: ${nextSummary.truth_status || 'unavailable'}`)
         } else {
           setError('')
@@ -166,13 +166,13 @@ export function MrpResultPage() {
     const seq = ++loadSeq.current
     setLoading(true)
     setError('')
-    if (!truthAccepted || snapshotId === null) {
+    if (!truthAccepted || currentScopeId === null) {
       invalidateTabs()
       return
     }
     try {
       const baseParams = {
-        snapshot_id: snapshotId,
+        current_scope_id: currentScopeId,
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
         root_item_id: rootItemId,
@@ -217,7 +217,7 @@ export function MrpResultPage() {
         const mismatchReason = data.truth_reason || 'Ответ вкладки не соответствует зафиксированному снимку MRP'
         setSummary((current) => current ? {
           ...current,
-          snapshot_id: null,
+          current_scope_id: null,
           truth_status: 'unavailable',
           truth_reason: mismatchReason,
         } : current)
@@ -232,7 +232,7 @@ export function MrpResultPage() {
     } finally {
       if (seq === loadSeq.current) setLoading(false)
     }
-  }, [dateFrom, dateTo, highlightedIdentity, invalidateTabs, purchaseCategoryFilter, purchaseSupplierFilter, queryTab, rootItemId, runId, snapshotId, summary, truthAccepted])
+  }, [dateFrom, dateTo, highlightedIdentity, invalidateTabs, purchaseCategoryFilter, purchaseSupplierFilter, queryTab, rootItemId, runId, currentScopeId, summary, truthAccepted])
 
   useEffect(() => {
     if (previousRunId.current === runId) return
@@ -274,11 +274,11 @@ export function MrpResultPage() {
   }, [summary?.run?.source_plan_id])
 
   async function exportActive(format: 'csv' | 'xlsx') {
-    if (!truthAccepted || snapshotId === null) return
+    if (!truthAccepted || currentScopeId === null) return
     setExporting(true)
     setError('')
     try {
-      const baseParams = { snapshot_id: snapshotId, format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
+      const baseParams = { current_scope_id: currentScopeId, format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
       const params = tab === 'purchases'
         ? { ...baseParams, ...buildPurchaseApiFilters(purchaseSupplierFilter, purchaseCategoryFilter) }
         : baseParams

@@ -1376,12 +1376,100 @@ def _production_semantic_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalize_mrp_current_payloads(
+    mrp_payloads: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate and normalize one canonical MRP payload boundary."""
+    if not isinstance(mrp_payloads, Mapping):
+        raise CurrentExecutionUnavailable("runtime MRP publication requires explicit mrp_payloads")
+    rows: list[dict[str, Any]] = []
+    runs: dict[str, Any] = {}
+    seen: set[str] = set()
+    for marker, candidate in sorted(mrp_payloads.items(), key=lambda pair: str(pair[0])):
+        if not isinstance(candidate, Mapping):
+            raise CurrentExecutionUnavailable("MRP current payload is malformed")
+        try:
+            run_id = int(candidate.get("run_id", marker))
+        except (TypeError, ValueError) as exc:
+            raise CurrentExecutionUnavailable("MRP current payload run identity is malformed") from exc
+        raw_rows = candidate.get("rows")
+        if not isinstance(raw_rows, list):
+            raise CurrentExecutionUnavailable("MRP current payload rows are missing")
+        counts = dict(candidate.get("row_counts") or {})
+        totals = dict(candidate.get("total_qty") or {})
+        required_kinds = {"production", "purchase", "rework", "capacity"}
+        if set(counts) != required_kinds or any(int(counts.get(kind, -1)) != sum(
+            1 for row in raw_rows
+            if isinstance(row, Mapping)
+            and str((row.get("payload") if isinstance(row.get("payload"), Mapping) else row).get("row_kind") or "").lower() == kind
+        ) for kind in required_kinds):
+            raise CurrentExecutionUnavailable("MRP current payload row counts are malformed")
+        runs[str(run_id)] = {
+            "summary": dict(candidate.get("summary") or {}),
+            "row_counts": counts,
+            "total_qty": totals,
+        }
+        for raw in raw_rows:
+            if not isinstance(raw, Mapping):
+                raise CurrentExecutionUnavailable("MRP current payload row is malformed")
+            payload_source = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
+            payload = dict(payload_source)
+            kind = str(payload.get("row_kind") or raw.get("row_kind") or "").strip().lower()
+            if kind not in {"production", "purchase", "rework", "capacity"}:
+                raise CurrentExecutionUnavailable("MRP current payload row kind is malformed")
+            payload["run_id"] = run_id
+            payload["row_kind"] = kind
+            identity = str(raw.get("current_identity") or payload.get("current_identity") or "").strip()
+            if not identity:
+                identity = _mrp_current_identity(payload, run_id=run_id, row_kind=kind)
+            if identity in seen:
+                raise CurrentExecutionUnavailable("MRP current payload contains duplicate identity")
+            seen.add(identity)
+            roots = payload.get("root_item_ids")
+            if roots is not None:
+                if not isinstance(roots, (list, tuple)):
+                    raise CurrentExecutionUnavailable("MRP current payload root membership is malformed")
+                try:
+                    payload["root_item_ids"] = sorted({int(value) for value in roots})
+                except (TypeError, ValueError) as exc:
+                    raise CurrentExecutionUnavailable("MRP current payload root membership is malformed") from exc
+            rows.append({
+                "entity_kind": "mrp_result",
+                "business_identity": identity,
+                "scope_key": "mrp:all-live-plans",
+                "payload": _mrp_current_payload(payload, business_identity=identity),
+            })
+    return rows, {"total_rows": len(rows), "runs": runs}
+
+
+def publish_current_mrp_results_from_payloads(
+    db: Session,
+    generation_id: int,
+    mrp_payloads: Mapping[str, Any],
+) -> CurrentExecutionPublishResult:
+    """Publish all MRP result rows directly into the current owner."""
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise CurrentExecutionUnavailable("current MRP publication requires an accepted generation")
+    rows, summary = _normalize_mrp_current_payloads(mrp_payloads)
+    return publish_current_execution_scope(
+        db,
+        source_revision=f"accepted:g{int(generation.id)}:mrp_result",
+        source_generation_id=int(generation.id),
+        scope_key="mrp:all-live-plans",
+        rows=rows,
+        entity_kinds=("mrp_result",),
+        summary=summary,
+    )
+
+
 def _publish_current_obligation_views(
     db: Session,
     generation_id: int,
     *,
     purchase_payload: Mapping[str, Any],
     production_payload: Mapping[str, Any],
+    mrp_payloads: Mapping[str, Any],
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Promote accepted obligation/read-model snapshots to compact current rows.
 
@@ -1439,66 +1527,13 @@ def _publish_current_obligation_views(
         if isinstance(row, dict)
     ]
 
-    mrp_rows: list[dict[str, Any]] = []
-    mrp_metadata: dict[str, Any] = {}
-    mrp_snapshots = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "mrp_result",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc(), models.PlanningReadSnapshot.id.asc()).all()
-    for snapshot in mrp_snapshots:
-        run_marker = snapshot.snapshot_key.removeprefix("run:").split(":", 1)[0]
-        snapshot_payload = dict(snapshot.payload or {})
-        snapshot_summary = dict(snapshot_payload.get("summary") or {})
-        mrp_metadata[run_marker] = {
-            "snapshot_key": str(snapshot.snapshot_key),
-            "summary": snapshot_summary,
-            "row_counts": dict(snapshot_summary.get("row_counts") or snapshot_payload.get("row_counts") or {}),
-            "total_qty": dict(snapshot_summary.get("total_qty") or snapshot_payload.get("total_qty") or {}),
-        }
-        for row in db.query(models.PlanningReadRow).filter(
-            models.PlanningReadRow.snapshot_id == int(snapshot.id),
-        ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
-            payload = dict(row.payload or {})
-            payload.setdefault("run_id", int(run_marker) if run_marker.isdigit() else None)
-            payload.setdefault("row_kind", str(row.row_kind))
-            # `req:<id>` is the persisted obligation key used by older
-            # snapshots; copy it only so the identity resolver can recover
-            # the business requirement.  Arbitrary row keys are never used
-            # as a current identity.
-            payload.setdefault("row_key", str(row.row_key or ""))
-            payload.setdefault("sort_key", str(row.sort_key or ""))
-            payload.setdefault(
-                "root_item_ids",
-                [
-                    int(member.root_item_id)
-                    for member in db.query(models.PlanningReadRootMember).filter(
-                        models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-                        models.PlanningReadRootMember.row_id == int(row.id),
-                    ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
-                ],
-            )
-            stable_mrp_identity = _mrp_current_identity(
-                payload,
-                run_id=int(run_marker) if run_marker.isdigit() else 0,
-                row_kind=str(row.row_kind),
-            )
-            payload = _mrp_current_payload(
-                payload,
-                business_identity=stable_mrp_identity,
-            )
-            mrp_rows.append({
-                "entity_kind": "mrp_result",
-                "business_identity": stable_mrp_identity,
-                "scope_key": "mrp:all-live-plans",
-                "payload": payload,
-            })
+    mrp_rows, mrp_metadata = _normalize_mrp_current_payloads(mrp_payloads)
     _publish(
         consumer="mrp_result",
         entity_kind="mrp_result",
         scope_key="mrp:all-live-plans",
         rows=mrp_rows,
-        summary={"total_rows": len(mrp_rows), "runs": mrp_metadata},
+        summary=mrp_metadata,
     )
 
     # Period work-item links resolve against the identities that this same
@@ -1619,6 +1654,7 @@ def publish_current_obligation_views_from_generation(
     *,
     purchase_payload: Mapping[str, Any] | None = None,
     production_payload: Mapping[str, Any] | None = None,
+    mrp_payloads: Mapping[str, Any] | None = None,
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Publish runtime current views with explicit obligation candidates.
 
@@ -1634,11 +1670,16 @@ def publish_current_obligation_views_from_generation(
         raise CurrentExecutionUnavailable(
             "runtime production publication requires an explicit production payload"
         )
+    if not isinstance(mrp_payloads, Mapping):
+        raise CurrentExecutionUnavailable(
+            "runtime MRP publication requires explicit mrp_payloads"
+        )
     return _publish_current_obligation_views(
         db,
         generation_id,
         purchase_payload=purchase_payload,
         production_payload=production_payload,
+        mrp_payloads=mrp_payloads,
     )
 
 
@@ -1691,9 +1732,50 @@ def publish_current_obligation_views_from_snapshots(
         production_rows.append(row_payload)
     production_payload = dict(production.payload)
     production_payload["rows"] = production_rows
+    mrp_payloads: dict[str, dict[str, Any]] = {}
+    for legacy in db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "mrp_result",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc()).all():
+        marker = str(legacy.snapshot_key).removeprefix("run:").split(":", 1)[0]
+        if not marker.isdigit():
+            raise CurrentExecutionUnavailable("migration MRP snapshot key is malformed")
+        rows: list[dict[str, Any]] = []
+        for legacy_row in db.query(models.PlanningReadRow).filter(
+            models.PlanningReadRow.snapshot_id == int(legacy.id),
+        ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
+            payload = dict(legacy_row.payload or {})
+            payload.setdefault("run_id", int(marker))
+            payload.setdefault("row_kind", str(legacy_row.row_kind))
+            payload.setdefault("sort_key", str(legacy_row.sort_key or ""))
+            payload["root_item_ids"] = [
+                int(member.root_item_id)
+                for member in db.query(models.PlanningReadRootMember).filter(
+                    models.PlanningReadRootMember.snapshot_id == int(legacy.id),
+                    models.PlanningReadRootMember.row_id == int(legacy_row.id),
+                ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
+            ]
+            kind = str(payload["row_kind"]).lower()
+            identity = _mrp_current_identity(payload, run_id=int(marker), row_kind=kind)
+            rows.append({
+                "current_identity": identity,
+                "payload": _mrp_current_payload(payload, business_identity=identity),
+            })
+        legacy_payload = dict(legacy.payload or {})
+        legacy_payload["run_id"] = int(marker)
+        legacy_counts = {kind: 0 for kind in ("production", "purchase", "rework", "capacity")}
+        for row in rows:
+            kind = str((row.get("payload") or {}).get("row_kind") or "").lower()
+            if kind in legacy_counts:
+                legacy_counts[kind] += 1
+        legacy_payload["row_counts"] = legacy_counts
+        legacy_payload["rows"] = rows
+        mrp_payloads[marker] = legacy_payload
     return _publish_current_obligation_views(
         db,
         generation_id,
         purchase_payload=dict(snapshot.payload),
         production_payload=production_payload,
+        mrp_payloads=mrp_payloads,
     )

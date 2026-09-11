@@ -18,6 +18,7 @@ from app.services.mrp_result_snapshot import (
 )
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
+    _mrp_current_identity,
     publish_current_obligation_views_from_generation,
 )
 
@@ -190,8 +191,40 @@ def _publish_current_mrp(db_session, run):
     db_session.flush()
     generation_ids = {int(snapshot.ledger_generation_id) for snapshot in snapshots}
     assert len(generation_ids) == 1
+    mrp_payloads = {}
+    for snapshot in snapshots:
+        marker = str(snapshot.snapshot_key).removeprefix("run:").split(":", 1)[0]
+        rows = []
+        for stored in db_session.query(models.PlanningReadRow).filter_by(snapshot_id=int(snapshot.id)).all():
+            payload = dict(stored.payload or {})
+            payload.setdefault("run_id", int(marker))
+            payload.setdefault("row_kind", str(stored.row_kind))
+            payload.setdefault("sort_key", str(stored.sort_key or ""))
+            payload["root_item_ids"] = [
+                int(member.root_item_id)
+                for member in db_session.query(models.PlanningReadRootMember).filter(
+                    models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
+                    models.PlanningReadRootMember.row_id == int(stored.id),
+                ).all()
+            ]
+            identity = _mrp_current_identity(payload, run_id=int(marker), row_kind=str(stored.row_kind))
+            rows.append({"current_identity": identity, "payload": payload})
+        manifest = dict(snapshot.payload or {})
+        manifest["run_id"] = int(marker)
+        manifest["row_counts"] = {
+            kind: int((manifest.get("row_counts") or {}).get(kind, 0))
+            for kind in ("production", "purchase", "rework", "capacity")
+        }
+        manifest["total_qty"] = {
+            kind: float((manifest.get("total_qty") or {}).get(kind, 0.0))
+            for kind in ("production", "purchase", "rework", "capacity")
+        }
+        manifest["rows"] = rows
+        mrp_payloads[marker] = manifest
+    empty = {"rows": [], "meta": {"row_count": 0}}
     return publish_current_obligation_views_from_generation(
-        db_session, generation_ids.pop(),
+        db_session, generation_ids.pop(), purchase_payload=empty,
+        production_payload=empty, mrp_payloads=mrp_payloads,
     )
 
 
@@ -582,7 +615,7 @@ def test_snapshot_id_cannot_cross_run_or_generation(db_session):
             db_session,
             run_b.run_id,
             row_kind="production",
-            snapshot_id=snapshot.id,
+            current_scope_id=snapshot.id,
         )
 
 
@@ -883,7 +916,7 @@ def test_purchase_export_reads_shared_snapshot_not_legacy_getter(
             date_to=None,
             sort_by=None,
             sort_dir=None,
-            snapshot_id=None,
+            current_scope_id=None,
             db=db_session,
         )
     )

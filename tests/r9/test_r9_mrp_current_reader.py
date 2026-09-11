@@ -6,7 +6,8 @@ from app import models
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
-    publish_current_obligation_views_from_generation,
+    publish_current_obligation_views_from_generation as _publish_current_obligation_views_from_generation,
+    _mrp_current_identity,
     require_current_execution_scope,
 )
 from app.services.mrp_result_snapshot import (
@@ -14,7 +15,7 @@ from app.services.mrp_result_snapshot import (
     read_mrp_result_rows,
 )
 from app.routers.plan import (
-    _mrp_snapshot_identity,
+    _mrp_current_scope_identity,
     export_planning_result_production,
     export_planning_result_purchases,
     export_planning_result_purchases_to_1c,
@@ -82,6 +83,52 @@ def _mrp_snapshot(db, generation):
     db.flush()
 
 
+def publish_current_obligation_views_from_generation(db, generation_id):
+    """Structural fixture adapter: legacy evidence -> explicit current MRP payload."""
+    snapshots = db.query(models.PlanningReadSnapshot).filter_by(
+        consumer="mrp_result", ledger_generation_id=int(generation_id)
+    ).all()
+    payloads = {}
+    for snapshot in snapshots:
+        marker = str(snapshot.snapshot_key).removeprefix("run:").split(":", 1)[0]
+        rows = []
+        for stored in db.query(models.PlanningReadRow).filter_by(snapshot_id=int(snapshot.id)).all():
+            payload = dict(stored.payload or {})
+            payload.setdefault("run_id", int(marker))
+            payload.setdefault("row_kind", str(stored.row_kind))
+            payload.setdefault("sort_key", str(stored.sort_key or ""))
+            payload["root_item_ids"] = [
+                int(member.root_item_id)
+                for member in db.query(models.PlanningReadRootMember).filter(
+                    models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
+                    models.PlanningReadRootMember.row_id == int(stored.id),
+                ).all()
+            ]
+            identity = _mrp_current_identity(
+                payload, run_id=int(marker), row_kind=str(stored.row_kind)
+            )
+            rows.append({"current_identity": identity, "payload": payload})
+        manifest = dict(snapshot.payload or {})
+        manifest["run_id"] = int(marker)
+        nested = dict(manifest.get("summary") or {})
+        declared_counts = dict(nested.get("row_counts") or manifest.get("row_counts") or {})
+        declared_totals = dict(nested.get("total_qty") or manifest.get("total_qty") or {})
+        actual_counts = {str(row["payload"].get("row_kind")): 0 for row in rows}
+        for row in rows:
+            actual_counts[str(row["payload"].get("row_kind"))] += 1
+        declared_counts = actual_counts
+        manifest["row_counts"] = {
+            kind: int(declared_counts.get(kind, 0))
+            for kind in ("production", "purchase", "rework", "capacity")
+        }
+        manifest["total_qty"] = {kind: float(value) for kind, value in declared_totals.items()}
+        manifest["rows"] = rows
+        payloads[marker] = manifest
+    empty = {"rows": [], "meta": {"row_count": 0}}
+    return _publish_current_obligation_views_from_generation(
+        db, int(generation_id), purchase_payload=empty,
+        production_payload=empty, mrp_payloads=payloads,
+    )
 def test_mrp_reader_uses_persisted_current_rows_and_manifest(db_session):
     generation = _generation(db_session)
     _mrp_snapshot(db_session, generation)
@@ -165,18 +212,18 @@ def test_mrp_http_reader_maps_missing_current_to_503(db_session):
 @pytest.mark.parametrize(
     "endpoint,kwargs",
     [
-        (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
         (get_planning_result_production_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
-        (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
         (get_planning_result_purchases_grouped, {"date_from": None, "date_to": None, "limit": 100, "offset": 0}),
-        (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
         (get_planning_result_rework_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
         (get_planning_result_purchases_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
         (get_planning_result_rework_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
-        (get_planning_result_capacity, {"area_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 200, "offset": 0, "snapshot_id": None}),
-        (export_planning_result_production, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
-        (export_planning_result_purchases, {"format": "csv", "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
-        (export_planning_result_rework, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_capacity, {"area_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 200, "offset": 0, "current_scope_id": None}),
+        (export_planning_result_production, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
+        (export_planning_result_purchases, {"format": "csv", "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
+        (export_planning_result_rework, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
     ],
 )
 def test_mrp_detail_grouped_and_export_never_fall_back_to_legacy_snapshot(
@@ -313,7 +360,7 @@ def test_mrp_grouped_identity_uses_current_business_anchor(db_session):
         entity_kind="mrp_result",
         scope_key="mrp:all-live-plans",
     )
-    identity = _mrp_snapshot_identity(db_session, 63, scope.id)
+    identity = _mrp_current_scope_identity(db_session, 63, scope.id)
 
     assert identity["current_identity"] == "mrp-run:63"
     assert identity["source_revision"].startswith("accepted:g")
@@ -336,7 +383,7 @@ def test_mrp_export_returns_current_identity_and_revision(db_session):
         export_planning_result_production(
             41,
             format="csv",
-            snapshot_id=scope.id,
+            current_scope_id=scope.id,
             db=db_session,
         )
     )
@@ -362,7 +409,7 @@ def test_mrp_rework_export_returns_current_identity_and_revision(db_session):
         export_planning_result_rework(
             41,
             format="csv",
-            snapshot_id=scope.id,
+            current_scope_id=scope.id,
             db=db_session,
         )
     )

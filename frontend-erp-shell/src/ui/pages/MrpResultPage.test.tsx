@@ -39,7 +39,7 @@ vi.mock('../../services/planning', () => ({
 }))
 
 const summary: MrpSummary = {
-  snapshot_id: 901,
+  current_scope_id: 901,
   current_identity: 'mrp-run:41',
   source_revision: 'accepted:g77',
   ledger_generation: 77,
@@ -178,7 +178,7 @@ const capacityRows: MrpCapacityRow[] = [{
 
 function paged<T>(rows: T[], total = rows.length, offset = 0) {
   return {
-    snapshot_id: 901,
+    current_scope_id: 901,
     current_identity: 'mrp-run:41',
     source_revision: 'accepted:g77',
     ledger_generation: 77,
@@ -272,7 +272,7 @@ describe('MrpResultPage characterization', () => {
     expect(screen.getByText('12,5 н/ч')).toBeVisible()
     expect(getPlanningRunSummary).toHaveBeenCalledWith(41)
     expect(getPlanningResultProduction).toHaveBeenCalledWith(41, {
-      snapshot_id: 901,
+    current_scope_id: 901,
       date_from: undefined,
       date_to: undefined,
       root_item_id: null,
@@ -302,14 +302,14 @@ describe('MrpResultPage characterization', () => {
       getPlanningResultRework,
       getPlanningResultCapacity,
     ]) {
-      expect(reader).toHaveBeenCalledWith(41, expect.objectContaining({ snapshot_id: 901 }))
+      expect(reader).toHaveBeenCalledWith(41, expect.objectContaining({ current_scope_id: 901 }))
     }
     expect(exportPurchasesTo1C).not.toHaveBeenCalled()
   })
 
   it('shows unavailable instead of zeroes and does not request rows without an accepted snapshot', async () => {
     vi.mocked(getPlanningRunSummary).mockResolvedValue({
-      snapshot_id: null,
+    current_scope_id: null,
       ledger_generation: null,
       cutoff: null,
       truth_status: 'uninitialized',
@@ -339,7 +339,7 @@ describe('MrpResultPage characterization', () => {
   it('clears rows when a tab response does not match the pinned snapshot', async () => {
     vi.mocked(getPlanningResultProduction).mockResolvedValue({
       ...paged(productionRows),
-      snapshot_id: 902,
+    current_scope_id: 902,
       source_revision: 'accepted:g78',
     })
 
@@ -401,7 +401,7 @@ describe('MrpResultPage characterization', () => {
     await user.type(screen.getByLabelText('По'), '2026-07-31')
     await user.click(screen.getByRole('button', { name: 'Сформировать' }))
     await waitFor(() => expect(getPlanningResultProduction).toHaveBeenLastCalledWith(41, {
-      snapshot_id: 901,
+    current_scope_id: 901,
       date_from: '2026-07-21',
       date_to: '2026-07-31',
       root_item_id: null,
@@ -412,7 +412,7 @@ describe('MrpResultPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Корневое изделие' }))
     await user.selectOptions(screen.getByRole('combobox'), '501')
     await waitFor(() => expect(getPlanningResultProduction).toHaveBeenLastCalledWith(41, {
-      snapshot_id: 901,
+    current_scope_id: 901,
       date_from: '2026-07-21',
       date_to: '2026-07-31',
       root_item_id: 501,
@@ -422,7 +422,7 @@ describe('MrpResultPage characterization', () => {
 
     await user.click(screen.getByRole('button', { name: 'Вперед' }))
     await waitFor(() => expect(getPlanningResultProduction).toHaveBeenLastCalledWith(41, {
-      snapshot_id: 901,
+    current_scope_id: 901,
       date_from: '2026-07-21',
       date_to: '2026-07-31',
       root_item_id: 501,
@@ -461,7 +461,7 @@ describe('MrpResultPage characterization', () => {
     await waitFor(() => expect(exportPlanningResultPurchases).toHaveBeenCalledWith(
       41,
       expect.objectContaining({
-        snapshot_id: 901,
+        current_scope_id: 901,
         supplier_ref1c: 'supplier-a',
         category_id: 11,
         root_item_id: null,
@@ -496,7 +496,7 @@ describe('MrpResultPage characterization', () => {
 
     await user.click(screen.getByRole('button', { name: 'XLSX' }))
     expect(exportPlanningResultProduction).toHaveBeenCalledWith(41, {
-      snapshot_id: 901,
+    current_scope_id: 901,
       format: 'xlsx',
       date_from: undefined,
       date_to: undefined,
@@ -539,7 +539,7 @@ describe('MrpResultPage characterization', () => {
       ...summary,
       run: { ...summary.run!, run_id: 42, horizon_days: 99 },
     })
-    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(42, expect.objectContaining({ snapshot_id: 901 })))
+    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(42, expect.objectContaining({ current_scope_id: 901 })))
     newRows.resolve(paged([{ ...productionRows[0], order_id: 4201, item_name: 'Новый прогон' }]))
     expect(await screen.findByText('Новый прогон')).toBeVisible()
     expect(screen.getByText('99 дн.')).toBeVisible()
