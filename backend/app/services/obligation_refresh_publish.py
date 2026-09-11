@@ -648,9 +648,17 @@ def _validate_purchase_candidate_payload(
         try:
             validate_purchase_control_journal_row(row)
             key = str(row["row_key"])
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+        except (KeyError, TypeError, InvalidOperation) as exc:
             raise ObligationRefreshPublishError(
                 "purchase control journal row is malformed"
+            ) from exc
+        except ValueError as exc:
+            if "malformed" in str(exc):
+                raise ObligationRefreshPublishError(
+                    "purchase control journal row is malformed"
+                ) from exc
+            raise ObligationRefreshPublishError(
+                "purchase control journal row violates Ledger fact contract"
             ) from exc
         if key in seen:
             raise ObligationRefreshPublishError(
