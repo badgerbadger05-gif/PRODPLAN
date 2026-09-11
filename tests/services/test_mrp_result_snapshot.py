@@ -16,6 +16,10 @@ from app.services.mrp_result_snapshot import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )
+from app.services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    publish_current_obligation_views_from_generation,
+)
 
 
 def _accepted_generation(db):
@@ -149,6 +153,48 @@ def _publish_read_snapshot_with_rows(db_session, run):
     return snapshot
 
 
+def _publish_current_mrp(db_session, run):
+    """Promote this test's snapshot rows through the real current writer."""
+    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
+        consumer="mrp_result",
+        snapshot_key=f"run:{int(run.run_id)}",
+    ).all()
+    for snapshot in snapshots:
+        for row in db_session.query(models.PlanningReadRow).filter_by(
+            snapshot_id=int(snapshot.id),
+        ).all():
+            payload = dict(row.payload or {})
+            kind = str(row.row_kind or "").strip().lower()
+            payload.setdefault("run_id", int(run.run_id))
+            payload.setdefault("row_kind", kind)
+            if kind != "capacity":
+                payload.setdefault("unit", "шт")
+            item_id = payload.get("item_id")
+            bucket = (
+                payload.get("bucket_date") or payload.get("need_date")
+                or payload.get("start_date") or payload.get("date") or "2026-01-01"
+            )
+            if kind == "purchase" and item_id is not None:
+                payload.setdefault(
+                    "agg_key", f"item:{int(item_id)}|unit:{str(payload.get('unit') or 'шт')}"
+                )
+            elif kind == "rework" and item_id is not None:
+                payload.setdefault(
+                    "agg_key", f"item:{int(item_id)}|bucket:{bucket}|unit:{str(payload.get('unit') or 'шт')}"
+                )
+            elif kind == "production" and item_id is not None:
+                payload.setdefault(
+                    "agg_key", f"item:{int(item_id)}|start:{bucket}|unit:{str(payload.get('unit') or 'шт')}"
+                )
+            row.payload = payload
+    db_session.flush()
+    generation_ids = {int(snapshot.ledger_generation_id) for snapshot in snapshots}
+    assert len(generation_ids) == 1
+    return publish_current_obligation_views_from_generation(
+        db_session, generation_ids.pop(),
+    )
+
+
 def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session):
     generation = _accepted_generation(db_session)
     item = models.Item(item_code="MISSING-SNAPSHOT", item_name="Legacy-looking row")
@@ -177,14 +223,11 @@ def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session)
         )
     )
 
-    result = read_mrp_result_rows(
-        db_session, run.run_id, row_kind="purchase"
-    )
-
-    assert result["truth_status"] == "accepted"
-    assert result["rows"] == []
-    assert result["total"] == 0
-    assert "missing" in result["truth_reason"]
+    with pytest.raises(CurrentExecutionUnavailable, match="manifest"):
+        read_mrp_result_rows(
+            db_session, run.run_id, row_kind="purchase"
+        )
+    assert db_session.query(models.PlanningReadRow).count() == 0
 
 
 def test_candidate_builder_persists_unpublished_rows_but_current_reads_cannot_see_them(
@@ -207,10 +250,8 @@ def test_candidate_builder_persists_unpublished_rows_but_current_reads_cannot_se
         "get_run_purchases",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("GET calculated")),
     )
-    result = read_mrp_result_rows(db_session, run.run_id, row_kind="purchase")
-
-    assert result["snapshot_id"] is None
-    assert result["rows"] == []
+    with pytest.raises(CurrentExecutionUnavailable, match="manifest"):
+        read_mrp_result_rows(db_session, run.run_id, row_kind="purchase")
     stored = db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).one()
     assert stored.payload["item_id"] == item.item_id
 
@@ -450,21 +491,20 @@ def test_builder_publishes_rows_and_frozen_root_membership(
     db_session.flush()
 
     snapshot = build_mrp_result_snapshot(db_session, run.run_id)
+    _publish_current_mrp(db_session, run)
     result = read_mrp_result_rows(
         db_session,
         run.run_id,
         row_kind="purchase",
-        snapshot_id=snapshot.id,
         root_item_id=root.item_id,
     )
     manifest = read_mrp_result_manifest(
-        db_session, run.run_id, snapshot_id=snapshot.id
+        db_session, run.run_id,
     )
     capacity = read_mrp_result_rows(
         db_session,
         run.run_id,
         row_kind="capacity",
-        snapshot_id=snapshot.id,
         area_id=area.resource_id,
         date_from="2026-08-02",
         date_to="2026-08-02",
@@ -485,19 +525,20 @@ def test_builder_publishes_rows_and_frozen_root_membership(
             date_to="2026-08-02",
             limit=200,
             offset=0,
-            snapshot_id=snapshot.id,
             db=db_session,
         )
     )
 
-    assert result["snapshot_id"] == snapshot.id
+    assert result["current_identity"] == f"mrp-run:{run.run_id}"
+    assert result["source_revision"].startswith("accepted:g")
     assert result["ledger_generation"] == generation.id
     assert result["total"] == 1
     assert result["rows"][0]["item_id"] == component.item_id
     assert manifest["snapshot_counts"]["purchase"] == 1
     assert manifest["snapshot_counts"]["capacity"] == 1
-    assert capacity["snapshot_id"] == result["snapshot_id"] == snapshot.id
-    assert capacity_endpoint["snapshot_id"] == snapshot.id
+    assert capacity["current_identity"] == f"mrp-run:{run.run_id}"
+    assert capacity["source_revision"].startswith("accepted:g")
+    assert capacity_endpoint["current_identity"] == f"mrp-run:{run.run_id}"
     assert capacity["total"] == 1
     assert capacity["rows"][0]["overload_hours"] == 2.0
     member = db_session.query(models.PlanningReadRootMember).one()
@@ -535,15 +576,14 @@ def test_snapshot_id_cannot_cross_run_or_generation(db_session):
     db_session.add(snapshot)
     db_session.flush()
 
-    result = read_mrp_result_rows(
-        db_session,
-        run_b.run_id,
-        row_kind="production",
-        snapshot_id=snapshot.id,
-    )
-
-    assert result["rows"] == []
-    assert result["snapshot_id"] is None
+    _publish_current_mrp(db_session, run_a)
+    with pytest.raises(CurrentExecutionUnavailable, match="manifest identity does not match"):
+        read_mrp_result_rows(
+            db_session,
+            run_b.run_id,
+            row_kind="production",
+            snapshot_id=snapshot.id,
+        )
 
 
 def test_builder_rejects_legacy_obligation_without_generation(db_session):
@@ -664,8 +704,10 @@ def test_builder_accepts_a_run_inherited_through_a_physical_refresh(db_session):
     # The snapshot is published at the accepted generation, and it honestly
     # reports that generation rather than the run's older freeze anchor.
     assert int(snapshot.ledger_generation_id) == int(child.id)
+    _publish_current_mrp(db_session, run)
     manifest = read_mrp_result_manifest(db_session, run.run_id)
-    assert manifest["snapshot_id"] == snapshot.id
+    assert manifest["current_identity"] == f"mrp-run:{run.run_id}"
+    assert manifest["source_revision"].startswith("accepted:g")
     assert manifest["ledger_generation"] == int(child.id)
     assert manifest["snapshot_counts"]["purchase"] == 1
 
@@ -691,11 +733,9 @@ def test_inherited_obligation_snapshot_is_reused_by_the_next_refresh(db_session)
     assert repeated.id == first.id
     assert db_session.query(models.PlanningReadSnapshot).count() == 1
     assert db_session.query(models.PlanningReadRow).count() == rows_after_first
-    # Reads keep resolving it through the lineage, still stamped with the
-    # generation it was actually published at.
-    manifest = read_mrp_result_manifest(db_session, run.run_id)
-    assert manifest["snapshot_id"] == first.id
-    assert manifest["ledger_generation"] == int(first_child.id)
+    # Immutable worker evidence is reused; current publication is a separate
+    # accepted boundary and is not inferred from the later physical pointer.
+    assert first.ledger_generation_id == int(first_child.id)
 
 
 def test_builder_rejects_a_run_anchored_outside_the_sealed_lineage(db_session):
@@ -825,6 +865,7 @@ def test_purchase_export_reads_shared_snapshot_not_legacy_getter(
         )
     )
     db_session.flush()
+    _publish_current_mrp(db_session, run)
 
     def legacy_service_must_not_run(*args, **kwargs):
         raise AssertionError("legacy purchase getter was called")
@@ -842,12 +883,13 @@ def test_purchase_export_reads_shared_snapshot_not_legacy_getter(
             date_to=None,
             sort_by=None,
             sort_dir=None,
-            snapshot_id=snapshot.id,
+            snapshot_id=None,
             db=db_session,
         )
     )
 
-    assert result["snapshot_id"] == snapshot.id
+    assert result["current_identity"] == f"mrp-run:{run.run_id}"
+    assert result["source_revision"].startswith("accepted:g")
     assert result["total_rows"] == 1
     assert "Snapshot item" in result["data"]
 
@@ -913,6 +955,7 @@ def test_grouped_endpoints_read_snapshot_rows_not_legacy_group_getters(
         ]
     )
     db_session.flush()
+    _publish_current_mrp(db_session, run)
 
     calls = {"snapshot_reads": 0}
 
@@ -937,8 +980,8 @@ def test_grouped_endpoints_read_snapshot_rows_not_legacy_group_getters(
         raising=False,
     )
 
-    # Static guard: grouped result endpoints in public plan router must stay
-    # snapshot-only and avoid dead legacy grouped live getters.
+    # Static guard: grouped result endpoints use the current reader and avoid
+    # dead legacy grouped live getters.
     assert "get_run_purchases_grouped_by_category" not in inspect.getsource(
         plan_router.get_planning_result_purchases_grouped_by_category
     )
@@ -973,11 +1016,13 @@ def test_grouped_endpoints_read_snapshot_rows_not_legacy_group_getters(
         )
     )
 
-    assert purchase_payload["snapshot_id"] == snapshot.id
+    assert purchase_payload["current_identity"] == f"mrp-run:{run.run_id}"
+    assert purchase_payload["source_revision"].startswith("accepted:g")
     assert purchase_payload["ledger_generation"] == generation.id
     assert purchase_payload["total_groups"] == 1
     assert purchase_payload["total_orders"] == 1
-    assert rework_payload["snapshot_id"] == snapshot.id
+    assert rework_payload["current_identity"] == f"mrp-run:{run.run_id}"
+    assert rework_payload["source_revision"].startswith("accepted:g")
     assert rework_payload["ledger_generation"] == generation.id
     assert rework_payload["total_groups"] == 1
     assert rework_payload["total_orders"] == 1
@@ -1049,6 +1094,7 @@ def test_read_mrp_result_rows_supports_supplier_filter_and_missing_supplier_filt
         ]
     )
     db_session.flush()
+    _publish_current_mrp(db_session, run)
 
     supplier_rows = read_mrp_result_rows(
         db_session,
@@ -1129,6 +1175,7 @@ def test_read_mrp_result_rows_supports_category_filters_and_missing_category(
         ]
     )
     db_session.flush()
+    _publish_current_mrp(db_session, run)
 
     category_rows = read_mrp_result_rows(
         db_session,

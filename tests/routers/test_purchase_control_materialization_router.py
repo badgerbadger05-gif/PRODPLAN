@@ -17,6 +17,11 @@ from app.services import planning_truth
 from app.services import purchase_control_materialization as pcm
 from app.routers import purchase_control as purchase_control_router_module
 from app.services.purchase_control_snapshot import build_candidate_snapshot
+from app.services.item_ledger.current_execution import (
+    load_current_execution_rows,
+    publish_current_obligation_views_from_generation,
+    require_current_execution_scope,
+)
 
 
 CAPABILITIES = {
@@ -211,6 +216,7 @@ def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.Plann
 
     snapshot = build_candidate_snapshot(db, generation.id)
     _accept_generation_snapshot(db, generation, snapshot)
+    publish_current_obligation_views_from_generation(db, generation.id)
     return generation, snapshot
 
 
@@ -237,15 +243,30 @@ def _snapshot_first_row(snapshot: models.PlanningReadSnapshot) -> dict:
     return row
 
 
+def _current_purchase_selection(db):
+    manifest = require_current_execution_scope(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    rows = load_current_execution_rows(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    assert rows
+    return manifest, rows[0]
+
+
 def test_materialize_endpoint_dry_run_preview(client, db_session):
-    generation, snapshot = _build_multi_run_snapshot(db_session)
-    row = _snapshot_first_row(snapshot)
+    generation, _snapshot = _build_multi_run_snapshot(db_session)
+    manifest, current_row = _current_purchase_selection(db_session)
 
     response = client.post(
         "/api/v1/purchase-control/materialize",
         json={
-            "snapshot_id": snapshot.id,
-            "row_keys": [row["row_key"]],
+            "current_identities": [current_row.business_identity],
+            "expected_source_revision": manifest.source_revision,
             "dry_run": True,
         },
     )
@@ -253,33 +274,36 @@ def test_materialize_endpoint_dry_run_preview(client, db_session):
     assert response.status_code == 200, response.json()
     body = response.json()
     assert body["dry_run"] is True
-    assert body["snapshot_id"] == snapshot.id
+    assert body["snapshot_id"] == manifest.id
     assert body["rows_total"] == 1
     assert db_session.query(models.PurchaseExportBatch).count() == 0
     assert db_session.query(models.PurchaseExportObligationAllocation).count() == 0
 
 
 def test_selection_summary_endpoint_reports_missing_accounting_price(client, db_session):
-    _generation, snapshot = _build_multi_run_snapshot(db_session)
-    row = _snapshot_first_row(snapshot)
+    _generation, _snapshot = _build_multi_run_snapshot(db_session)
+    manifest, current_row = _current_purchase_selection(db_session)
 
     response = client.post(
         "/api/v1/purchase-control/selection-summary",
         json={
-            "snapshot_id": snapshot.id,
-            "row_keys": [row["row_key"]],
+            "current_identities": [current_row.business_identity],
+            "expected_source_revision": manifest.source_revision,
         },
     )
 
     assert response.status_code == 200, response.json()
     assert response.json() == {
-        "snapshot_id": snapshot.id,
+        "snapshot_id": manifest.id,
         "selected_rows": 1,
         "priced_rows": 0,
         "unpriced_rows": 1,
         "known_amount": 0.0,
         "total_amount": None,
         "amount_status": "unavailable",
+        "current_identity": None,
+        "current_identities": [current_row.business_identity],
+        "source_revision": manifest.source_revision,
     }
 
 
@@ -299,14 +323,14 @@ def test_materialize_endpoint_returns_not_configured_when_materializer_missing(
 
     monkeypatch.setattr(purchase_control_router_module, "materialize_rows", _missing_writer)
 
-    _generation, snapshot = _build_multi_run_snapshot(db_session)
-    row = _snapshot_first_row(snapshot)
+    _generation, _snapshot = _build_multi_run_snapshot(db_session)
+    manifest, current_row = _current_purchase_selection(db_session)
 
     response = client.post(
         "/api/v1/purchase-control/materialize",
         json={
-            "snapshot_id": snapshot.id,
-            "row_keys": [row["row_key"]],
+            "current_identities": [current_row.business_identity],
+            "expected_source_revision": manifest.source_revision,
             "dry_run": False,
         },
     )
@@ -316,17 +340,18 @@ def test_materialize_endpoint_returns_not_configured_when_materializer_missing(
     assert detail["code"] == "purchase_control_materializer_not_configured"
 
 
-def test_materialize_endpoint_rejects_empty_row_keys(client, db_session):
-    _generation, snapshot = _build_multi_run_snapshot(db_session)
+def test_materialize_endpoint_rejects_empty_current_selection(client, db_session):
+    _generation, _snapshot = _build_multi_run_snapshot(db_session)
+    manifest, _current_row = _current_purchase_selection(db_session)
 
     response = client.post(
         "/api/v1/purchase-control/materialize",
         json={
-            "snapshot_id": snapshot.id,
-            "row_keys": [],
+            "current_identities": [],
+            "expected_source_revision": manifest.source_revision,
             "dry_run": True,
         },
     )
 
     assert response.status_code == 400
-    assert "row_keys must be a non-empty list" in response.text
+    assert "Не выбраны строки журнала закупок" in response.text
