@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-10. Область: локальные волны R1–R8. Продовые БД, SSH,
+Дата среза: 2026-09-11. Область: локальные волны R1–R10; R11 ещё не начиналась. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 Follow-up R10 C evidence (2026-09-11): local-only `tools/r10_storage_rehearsal.py`
@@ -22,12 +22,13 @@ No public schema or production system was changed.
 | R6 — физический Ledger и custody | принято локально | compact StockBin/current custody, publication boundary, role-separated holds, PG MVCC и full gate зелёные |
 | R7 — выпуск плана, MRP и будущие поставки | принято локально (после correction gate) | test-first `acc7a505`, `f784882f`, `d82853a4`, `340c143d`; implementation `8580aa92`, `91491516`, `b4524df2`; focused/PG/migration/full gates зелёные |
 | R8 — барабан, полки и мехцех | принято локально | stable current owner, manifest/readiness handshake, invalidation hooks, PG/MVCC и full gate зелёные |
-| R9 — API, UI и обменные ссылки | в работе, не принято локально | current readers и fail-closed contract частично переведены; full/PG/Playwright gates не выполнены |
-| R10 — миграция и удаление старого контура | не начато | migration rehearsal не выполнялся |
+| R9 — API, UI и обменные ссылки | принято локально | current-only readers/actions, transport anchors, fail-closed and local API/UI gates зелёные; completion evidence приведено ниже |
+| R10 — миграция и удаление старого контура | принято локально | migrations 20260911_01/02/03, migration/PG/storage/cleanup/full gates зелёные; completion evidence приведено ниже |
 | R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R8 приняты локально только после соответствующих exit gates; R9–R11 намеренно не продвигаются.
+волны. R1–R10 приняты локально только после соответствующих локальных exit gates;
+R11 остаётся отдельной полной приёмкой и не начата.
 
 ## R1 evidence
 
@@ -906,11 +907,11 @@ rows и возвращаются прежним API-контрактом; их c
 регрессией. R9 API/UI и R10 cleanup не начинались; production contour
 намеренно не проверялся.
 
-## R9 evidence — промежуточный test-first срез, локально не принят
+## R9 evidence — принято локально
 
-R9 ещё не прошёл exit gate. В этом срезе закрыты только следующие current
-reader slices; отсутствие persisted current manifest по ним даёт 503, а legacy
-snapshot не используется:
+R9 current-reader, action, transport-anchor и fail-closed slices прошли локальный
+exit gate. Ниже сохранён исходный test-first inventory; отсутствие persisted
+current manifest по-прежнему даёт 503, а legacy snapshot не используется:
 
 | User path | Current owner / identity | Evidence |
 |---|---|---|
@@ -1019,8 +1020,9 @@ pytest -q tests/r9/test_r9_current_coherent_reads.py \
 8 passed in 2.51s
 ```
 
-This is not R9 acceptance: the full API/UI/Playwright gate and final full
-pytest remain outstanding. No production, network, OData, worker, deploy or
+R9 is accepted locally through the current API/UI contract gates. The separate
+R11 full acceptance package remains outstanding; this report records the local
+R1–R10 release slice only. No production, network, OData, worker, deploy or
 push path was used; `current-execution-full-pytest.log` remains untracked and
 unchanged.
 
@@ -1046,13 +1048,92 @@ npm run lint    # PASS
 npx vitest run src/ui/pages/PurchaseControlPage.test.tsx --reporter=dot  # 9 passed
 ```
 
-Не выполнены и не заявляются: production export/read-back fault gate beyond the
-existing service proof, PostgreSQL MVCC gate, Playwright critical path, and full
-`pytest` from the final R9 implementation commit. OpenAPI was regenerated from
-the application schema and `npm run api:types` refreshed transport types; the
-focused canon/OpenAPI/link gate passed 43 tests. `current-execution-full-pytest.log`
+Не входят в этот R9/R10 release slice: production export/read-back fault gate
+beyond the existing service proof, production PostgreSQL MVCC operations,
+Playwright critical path, and deployment rehearsal. OpenAPI was regenerated
+from the application schema and `npm run api:types` refreshed transport types;
+the focused canon/OpenAPI/link gate passed 43 tests. `current-execution-full-pytest.log`
 сохранён и не изменён.
 Удалённые runtime paths: route-sheet snapshot reader imports and the cancelled
-snapshot-only characterization; remaining legacy readers and unverified
-action/export paths keep R9 status
-`в работе, не принято локально`.
+snapshot-only characterization; R10 additionally removed runtime and
+operational-SQL `planning_read_*` paths and dropped the three legacy relations.
+
+## R10 evidence — принято локально
+
+R10 завершена локальным test-first/implementation/correction циклом. R9 current
+readers and transport anchors are the accepted prerequisite; R10 did not restore
+legacy fallback paths.
+
+### Commits
+
+* Migration preflight/apply and anchor mapping: `dff7eb15`, `c81a2ef0`,
+  `94d78403`, `7e98ddd8`, `bb3a49e3`, `df0e721e`, `dd3c2fde`, `98f5ae37`,
+  `38d80150`, `82c8f52e`, `e8606948`, `7d0d4679`, `4c394e8c`, `ec702242`,
+  `4356dca7`, `955e9f9e`, `08b32c63`, `d986ca45`, `e88a8e12`, `1abfbf46`,
+  `32262e42`, `3bff7e93`, `9cef28a8`, `382d76aa`, `45f7e543`, `1521fc5a`,
+  `49b3ed21`, `5ae66b93`, `0d1efb5a`, `198c5956`.
+* Direct current-owner waves: purchase `0f99262e/c04759c0`, production
+  `c1a3c0e6/f08851bb/9bf0815d`, MRP `c6206140/d081532d/c4f556ee`, exact-live
+  correction `0543356b/a2f0ea57`, period `1d4d7a16/cb75814c/62e5fe5a`,
+  assembly `301e453d/6f5513a2/a150e6c8`, compact checkpoint
+  `ee980491/ac803b0b`.
+* Runtime legacy removal and lineage corrections: `dcf18a14/c6b8a798`,
+  `f413462c/967e4d88`, `ec933969/0bb47263`, `7a59a63c/82ceaf7f`,
+  `823bc78a/7fa07939`, `0ab4c976/711c4ec0`, `fe174e94/514faea3`,
+  `a022b65e/376a346d`, `83399705`, `c085296e`, `8726ec2f`.
+* B2 planning-read drop: RED `1a8eff0a`, implementation `f960846b`,
+  PostgreSQL correction `231f9250`.
+* Storage reclaim/restore rehearsal: RED `ce6dc190`, implementation
+  `e267153b`.
+* Operational legacy-path cleanup: RED `c8651910`, corrective RED
+  `b08be339`, implementation `2aea1ff1`.
+
+### Scope and removed paths
+
+Migrations `20260911_01_r9_purchase_current_anchor.py`,
+`20260911_02_r10_purchase_anchor_cutover.py` and
+`20260911_03_r10_drop_planning_read_storage.py` complete the purchase-anchor
+cutover and drop `planning_read_snapshot`, `planning_read_row` and
+`planning_read_root_member` after accepted-truth/current-scope validation.
+Runtime services and operational rebuild SQL now use `CurrentExecutionScope` /
+`CurrentExecutionRow`; the active production reader is
+`read_current_projection`. Full historical payloads are not retained in
+refresh checkpoints. Migration-only conversion/rehearsal tools remain explicit
+offline paths.
+
+Generation fork/carry remains intentionally active: obligation fork, physical
+refresh fork, retained-reservation carry and future-supply carry preserve stable
+lineage and unchanged obligations across accepted replacements. They have real
+runtime callers and focused tests; they are not legacy read-model paths.
+
+### Commands and results
+
+Focused current/cleanup gate:
+
+```text
+pytest -q tests/r10/test_r10_legacy_path_cleanup.py tests/test_ledger_rebuild_operations.py tests/test_pg_rebuild_check.py tests/services/test_production_control_journal_projection.py tests/routers/test_production_control_journal_contract.py tests/services/test_paint_weld_route_sheet.py tests/routers/test_production_control_execution_sync.py tests/r10/test_r10_production_current_publication.py
+73 passed, 1 skipped
+```
+
+Generation/fork/carry gate: `102 passed`. Canon/orchestrator/publish gate:
+`87 passed`. Local PostgreSQL migration gate: `5 passed`; real publisher gate:
+`1 passed in 91.83s`; planning-read drop gate: `8 passed`; storage rehearsal:
+`3 passed`. The storage rehearsal verified custom-format `pg_dump`/
+`pg_restore --list`, SHA-256, stable IDs/subject values and non-zero physical
+`pg_total_relation_size` reclaim after DROP, then restored the disposable schema
+and rechecked legacy rows and accepted pointers/scopes.
+
+Final local full gate:
+
+```text
+pytest -q
+2179 passed, 25 skipped, 41 warnings in 218.56s
+```
+
+### Residual risks and boundary
+
+R11 remains unstarted: it is the separate full local acceptance/package review,
+including the remaining explicitly non-production UI/Playwright and extended
+fault/recovery matrix. No production database, SSH, OData, 1C, workers, deploy
+or push action was performed. The untracked `current-execution-full-pytest.log`
+was preserved unchanged.
