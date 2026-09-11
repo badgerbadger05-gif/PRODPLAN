@@ -205,9 +205,14 @@ def test_r10_real_publisher_rehearsal_uses_pointer_and_compacts_current(monkeypa
         assert second["idempotent"] is True
         assert second["change_rows_after"] == change_count
         after = build_manifest(scoped)
-        for table in ("closed_plan_snapshot", "mrp_freeze_baseline", "sync_link", "purchase_export_batch"):
-            category = "delete" if table == "closed_plan_snapshot" else "preserve"
-            assert after["categories"][category][table]["checksum"] == before["categories"][category][table]["checksum"]
+        for table in ("closed_plan_snapshot", "mrp_freeze_baseline", "sync_link"):
+            assert after["categories"]["preserve"][table]["checksum"] == before["categories"]["preserve"][table]["checksum"]
+        with scoped.connect() as connection:
+            anchor = connection.execute(sa.text(
+                "SELECT planning_read_snapshot_id, current_execution_scope_id, idempotency_key "
+                "FROM purchase_export_batch WHERE id=1"
+            )).one()
+            assert anchor[0] is None and anchor[1] is not None and anchor[2] == "r10-real-export"
     finally:
         if scoped is not None:
             scoped.dispose()

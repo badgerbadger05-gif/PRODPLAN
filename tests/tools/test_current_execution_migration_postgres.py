@@ -224,9 +224,15 @@ def test_r10_postgres_rehearsal_isolated_pointer_atomic_and_idempotent(monkeypat
         after = build_manifest(scoped)
         for table in (
             "closed_plan_snapshot", "stock_ledger_entry", "stock_ledger_fact_supersession",
-            "mrp_freeze_baseline", "sync_link", "purchase_export_batch",
+            "mrp_freeze_baseline", "sync_link",
         ):
-            assert after["categories"]["preserve" if table in {"stock_ledger_entry", "stock_ledger_fact_supersession", "mrp_freeze_baseline", "sync_link", "purchase_export_batch"} else "delete"][table]["checksum"] == before["categories"]["preserve" if table in {"stock_ledger_entry", "stock_ledger_fact_supersession", "mrp_freeze_baseline", "sync_link", "purchase_export_batch"} else "delete"][table]["checksum"]
+            assert after["categories"]["preserve"][table]["checksum"] == before["categories"]["preserve"][table]["checksum"]
+        with scoped.connect() as connection:
+            anchor = connection.execute(sa.text(
+                "SELECT planning_read_snapshot_id, current_execution_scope_id, idempotency_key "
+                "FROM purchase_export_batch WHERE id=1"
+            )).one()
+            assert anchor[0] is None and anchor[1] is not None and anchor[2] == "r10-export"
     finally:
         if scoped is not None:
             scoped.dispose()
