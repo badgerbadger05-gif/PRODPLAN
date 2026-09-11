@@ -9,6 +9,7 @@ const views = [
   { value: 'orders', label: 'Все заказы' },
   { value: 'mechshop', label: 'Очередь мехцеха' },
   { value: 'drum', label: 'Барабан сборки' },
+  { value: 'assembly-queue', label: 'Очередь сборки' },
 ] as const
 
 export function ProductionViewBar({ view: activeView, onChange }: Props) {
@@ -33,6 +34,9 @@ export function ProductionViewBar({ view: activeView, onChange }: Props) {
       )}
       {activeView === 'drum' && (
         <span className="productionViewHint">Единственный календарный барабан · readiness gate сохранён на плитках</span>
+      )}
+      {activeView === 'assembly-queue' && (
+        <span className="productionViewHint">Сохранённая текущая очередь сборки · без пересчёта в браузере</span>
       )}
     </div>
   )

@@ -57,6 +57,7 @@ import { ProductionOrdersTable } from './production-control/ProductionOrdersTabl
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
 import { ProductionViewBar } from './production-control/ProductionViewBar'
 import { DrumSchedulePanel } from './production-control/DrumSchedulePanel'
+import { AssemblyQueuePanel } from './production-control/AssemblyQueuePanel'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
 import { ProduceDialog, type ProduceChainSide } from './production-control/ProduceDialog'
 import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
@@ -921,7 +922,7 @@ export function ProductionControlPage() {
   }
 
   useEffect(() => {
-    void load(offsetRef.current)
+    if (initialUrlState.current.view !== 'assembly-queue') void load(offsetRef.current)
     void loadResources()
   }, [load, loadResources])
 
@@ -970,7 +971,7 @@ export function ProductionControlPage() {
     setFilters(nextFilters)
     setView(nextView)
     setOffset(0)
-    if (nextView !== 'drum') void load(0)
+    if (nextView !== 'drum' && nextView !== 'assembly-queue') void load(0)
   }
 
   const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
@@ -986,12 +987,14 @@ export function ProductionControlPage() {
       </div>
 
       <DocumentWindow
-        title={view === 'drum' ? 'Барабан сборки' : 'Журнал заказов на производство'}
+        title={view === 'drum' ? 'Барабан сборки' : view === 'assembly-queue' ? 'Очередь сборки' : 'Журнал заказов на производство'}
         subtitle={view === 'drum'
           ? 'Календарная последовательность трёх финишных участков с readiness gate'
+          : view === 'assembly-queue'
+            ? 'Сохранённый current execution результат принятого Ledger'
           : 'Рабочий список строк по деталям, цехам, обеспечению и запуску в 1С'}
         hotkeys="F5 Обновить · Ctrl+P Печать · Enter Детали"
-        footer={view === 'drum' ? (
+        footer={view === 'drum' || view === 'assembly-queue' ? (
           <footer className="statusBar">
             <span>Сохранённый барабан принятого Ledger</span>
             <span>API: /api</span>
@@ -1010,7 +1013,7 @@ export function ProductionControlPage() {
           />
         )}
       >
-        {view !== 'drum' && <ProductionCommandBar
+        {view !== 'drum' && view !== 'assembly-queue' && <ProductionCommandBar
           rows={rows}
           selectedIds={selectedIds}
           loading={loading}
@@ -1037,6 +1040,8 @@ export function ProductionControlPage() {
 
         {view === 'drum' ? (
           <DrumSchedulePanel />
+        ) : view === 'assembly-queue' ? (
+          <AssemblyQueuePanel />
         ) : (
         <div className="split">
           <div className="tablePane">

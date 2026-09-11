@@ -276,6 +276,8 @@ export type PeriodPlanMatrix = PlanOutputContext & {
 export type ExecutionWorkItem = components['schemas']['ExecutionJournalWorkItem']
 export type ExecutionJournalLedgerLinkEvent = components['schemas']['ExecutionJournalLedgerEvent']
 export type ExecutionJournalLedgerLinks = components['schemas']['ExecutionJournalLedgerLinks']
+export type ExecutionJournalNavigationLink = components['schemas']['ExecutionJournalNavigationLink']
+export type ExecutionJournalBasisLinks = components['schemas']['ExecutionJournalBasisLinks']
 type ApiExecutionJournalRow = components['schemas']['ExecutionJournalRow']
 export type ExecutionJournalRow = Omit<ApiExecutionJournalRow,
   'status' | 'root_item_ids' | 'information_links' | 'reservation_ids' | 'execution_events' | 'execution_allocations'
@@ -283,6 +285,9 @@ export type ExecutionJournalRow = Omit<ApiExecutionJournalRow,
   status?: JournalRowStatus
   root_item_ids?: ApiExecutionJournalRow['root_item_ids']
   information_links?: ApiExecutionJournalRow['information_links']
+  basis_links?: ApiExecutionJournalRow['basis_links']
+  queue_links?: ApiExecutionJournalRow['queue_links']
+  queue_link_reason?: ApiExecutionJournalRow['queue_link_reason']
   reservation_ids?: ApiExecutionJournalRow['reservation_ids']
   execution_events?: ApiExecutionJournalRow['execution_events']
   execution_allocations?: ApiExecutionJournalRow['execution_allocations']

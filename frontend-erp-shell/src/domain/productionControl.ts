@@ -351,7 +351,7 @@ export type ProductionFilters = {
   sort_dir: 'asc' | 'desc'
 }
 
-export type ProductionControlView = 'orders' | 'mechshop' | 'drum'
+export type ProductionControlView = 'orders' | 'mechshop' | 'drum' | 'assembly-queue'
 
 export function productionStatusLabel(value: string) {
   return productionStatusLabels[value] ?? value

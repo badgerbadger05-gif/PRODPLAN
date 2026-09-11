@@ -3402,6 +3402,10 @@ export interface components {
             sort_key: string;
             /** Eligible From */
             eligible_from?: string | null;
+            /** Current Identity */
+            current_identity: string;
+            /** Source Revision */
+            source_revision: string;
         };
         /** AssemblyRateListResponse */
         AssemblyRateListResponse: {
@@ -3957,6 +3961,16 @@ export interface components {
             /** Source Revision */
             source_revision?: string | null;
         };
+        /** ExecutionJournalBasisLinks */
+        ExecutionJournalBasisLinks: {
+            item: components["schemas"]["ExecutionJournalNavigationLink"];
+            /** Reservations */
+            reservations?: components["schemas"]["ExecutionJournalNavigationLink"][];
+            /** Events */
+            events?: components["schemas"]["ExecutionJournalNavigationLink"][];
+            /** Reason */
+            reason?: string | null;
+        };
         /** ExecutionJournalInformationLinkEvent */
         ExecutionJournalInformationLinkEvent: {
             /** Reservation Id */
@@ -4001,6 +4015,21 @@ export interface components {
              * @default []
              */
             events: components["schemas"]["ExecutionJournalLedgerEvent"][];
+        };
+        /** ExecutionJournalNavigationLink */
+        ExecutionJournalNavigationLink: {
+            /** Label */
+            label: string;
+            /** Href */
+            href?: string | null;
+            /** Available */
+            available: boolean;
+            /** Reason */
+            reason?: string | null;
+            /** Current Identity */
+            current_identity?: string | null;
+            /** Source Revision */
+            source_revision?: string | null;
         };
         /** ExecutionJournalResponse */
         ExecutionJournalResponse: {
@@ -4106,6 +4135,11 @@ export interface components {
                 [key: string]: unknown;
             }[];
             ledger_links?: components["schemas"]["ExecutionJournalLedgerLinks"] | null;
+            basis_links?: components["schemas"]["ExecutionJournalBasisLinks"] | null;
+            /** Queue Links */
+            queue_links?: components["schemas"]["ExecutionJournalNavigationLink"][];
+            /** Queue Link Reason */
+            queue_link_reason?: string | null;
             /** Item Article */
             item_article?: string | null;
             /** Stock Qty */
@@ -8766,6 +8800,7 @@ export interface operations {
                 sort_by?: string | null;
                 sort_dir?: string | null;
                 snapshot_id?: number | null;
+                current_identity?: string | null;
             };
             header?: never;
             path: {
@@ -8851,6 +8886,7 @@ export interface operations {
                 sort_by?: string | null;
                 sort_dir?: string | null;
                 snapshot_id?: number | null;
+                current_identity?: string | null;
             };
             header?: never;
             path: {
@@ -8929,6 +8965,7 @@ export interface operations {
                 sort_by?: string | null;
                 sort_dir?: string | null;
                 snapshot_id?: number | null;
+                current_identity?: string | null;
             };
             header?: never;
             path: {
@@ -9085,6 +9122,7 @@ export interface operations {
                 limit?: number;
                 offset?: number;
                 snapshot_id?: number | null;
+                current_identity?: string | null;
             };
             header?: never;
             path: {
@@ -10399,6 +10437,7 @@ export interface operations {
             query?: {
                 limit?: number;
                 offset?: number;
+                current_identity?: string | null;
             };
             header?: never;
             path?: never;
@@ -10661,6 +10700,7 @@ export interface operations {
                 sort_dir?: string | null;
                 limit?: number;
                 offset?: number;
+                current_identity?: string | null;
             };
             header?: never;
             path?: never;
@@ -11810,6 +11850,7 @@ export interface operations {
                 sort_dir?: string | null;
                 limit?: number;
                 offset?: number;
+                current_identity?: string | null;
             };
             header?: never;
             path?: never;

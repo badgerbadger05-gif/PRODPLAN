@@ -31,6 +31,19 @@ export type RootProductOption = ApiSchemas['ProductionControlRootProductOption']
 export type RootProductOptionsResponse = ApiSchemas['ProductionControlRootProductOptionsResponse']
 export type DrumScheduleResponse = ApiSchemas['DrumScheduleResponse']
 export type DrumSlotMoveResponse = ApiSchemas['DrumSlotMoveResponse']
+export type AssemblyQueueResponse = ApiSchemas['AssemblyQueueResponse']
+
+export function listAssemblyQueue(params: {
+  current_identity?: string | null
+  limit?: number
+  offset?: number
+} = {}, signal?: AbortSignal) {
+  const search = new URLSearchParams()
+  search.set('limit', String(params.limit ?? 100))
+  search.set('offset', String(params.offset ?? 0))
+  if (params.current_identity) search.set('current_identity', params.current_identity)
+  return api<AssemblyQueueResponse>(`/v1/production-control/assembly-queue?${search.toString()}`, { signal })
+}
 
 export function listDrumSchedule(signal?: AbortSignal) {
   return api<DrumScheduleResponse>('/v1/production-control/drum?limit=10000&offset=0', {

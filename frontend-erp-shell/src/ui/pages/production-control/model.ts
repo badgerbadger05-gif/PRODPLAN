@@ -57,6 +57,8 @@ export function parseProductionControlUrlState(
   const requestedView = params.get('view')
   const view: ProductionControlView = requestedView === 'drum'
     ? 'drum'
+    : requestedView === 'assembly-queue'
+      ? 'assembly-queue'
     : requestedView === 'mechshop' || params.get('planning_contour') === 'mrp'
       ? 'mechshop'
       : 'orders'
