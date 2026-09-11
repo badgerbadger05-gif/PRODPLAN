@@ -171,7 +171,7 @@ def _seed(session: Session):
         status="completed",
     ))
     session.commit()
-    return pointed_generation.id, newer_generation.id, production_row.id
+    return pointed_generation.id, newer_generation.id, old_generation.id, production_row.id
 
 
 @pytest.mark.integration
@@ -191,7 +191,7 @@ def test_r10_real_publisher_rehearsal_uses_pointer_and_compacts_current(monkeypa
         with scoped.begin() as connection:
             models.Base.metadata.create_all(connection)
         with Session(scoped) as session:
-            pointed_id, newer_id, _row_id = _seed(session)
+            pointed_id, newer_id, anchor_generation_id, _row_id = _seed(session)
 
         before = build_manifest(scoped)
         first = apply_current_obligation_migration(scoped, writers_stopped=True)
@@ -225,7 +225,7 @@ def test_r10_real_publisher_rehearsal_uses_pointer_and_compacts_current(monkeypa
                 "FROM purchase_export_batch WHERE id=1"
             )).one()
             assert anchor[0] is not None
-            assert anchor[1].startswith(f"accepted:g{pointed_id}:purchase_control_journal")
+            assert anchor[1] == f"accepted:g{anchor_generation_id}:purchase_control_journal"
             assert anchor[2] == "r10-real-export"
     finally:
         if scoped is not None:
