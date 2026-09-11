@@ -29,7 +29,6 @@ from app.models import (
     PhysicalImportBatch,
     ClosedPlanSnapshot,
     PlanningTruthState,
-    PlanningReadSnapshot,
     StockBin,
     StockLedgerEntry,
     StockLedgerSupplierReceiptProvenance,
@@ -39,6 +38,8 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
 )
+
+
 from app.services import period_plan_service
 from app.services import obligation_refresh_orchestrator
 from app.services.item_ledger.current_execution import publish_current_execution_scope
@@ -78,11 +79,6 @@ def test_generation_snapshot_build_skips_legacy_run_without_persisted_roots(
     assert list(result) == [f"plan:{int(plan.id)}:run:{int(run.run_id)}"]
     assert result[list(result)[0]]["truth_status"] == "unavailable"
     assert "persisted MRP roots are missing" in result[list(result)[0]]["truth_reason"]
-    assert db_session.query(PlanningReadSnapshot).filter_by(
-        consumer="period_plan_execution",
-        ledger_generation_id=generation_id,
-    ).count() == 0
-
     detail = period_plan_service.get_period_plan(db_session, int(plan.id))
     assert detail["plan_output_truth_status"] == "unavailable"
     assert detail["planned_output_qty"] is None
@@ -557,9 +553,6 @@ def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session)
     assert result["summary"]["total_items"] == 0
     assert result["summary"]["execution_by_flow"] == {}
     assert result["rows"] == []
-    assert db_session.query(PlanningReadSnapshot).count() == 0
-
-
 def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
     item = _make_purchased_item(db_session, "SNAPSHOT-LINEAGE")
     plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
@@ -655,26 +648,6 @@ def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db
             f"plan:{int(plan.id)}:run:{int(run.run_id)}": list_payload,
         }},
     )
-    db_session.add(PlanningReadSnapshot(
-        consumer="period_plan_execution",
-        snapshot_key=f"plan={plan.id};run=77",
-        ledger_generation_id=generation_id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={
-            "plan": {"id": plan.id},
-            "truth_status": "accepted",
-            "summary": {
-                "execution_pct": 62.5,
-                "execution_completed_qty": 5,
-                "execution_base_qty": 8,
-                "planned_output_qty": 5,
-                "accepted_plan_output_qty": 3,
-                "assembly_remaining_qty": 2,
-            },
-        },
-        published_at=datetime.datetime(2026, 7, 24),
-    ))
     db_session.commit()
 
     result = list_period_plans(db_session)
@@ -894,30 +867,6 @@ def test_period_plan_detail_rejects_nonconserving_saved_output_projection(db_ses
             },
         }}, "total_rows": 0},
     )
-    db_session.add(PlanningReadSnapshot(
-        consumer="period_plan_execution",
-        snapshot_key=f"plan={plan.id};run=broken",
-        ledger_generation_id=generation_id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={
-            "plan": {"id": plan.id},
-            "plan_output_rows": [{
-                "plan_line_id": int(line.id),
-                "item_id": int(item.item_id),
-                "bucket_date": line.bucket_date.isoformat(),
-                "planned_output_qty": 5.0,
-                "accepted_plan_output_qty": 4.0,
-                "assembly_remaining_qty": 2.0,
-            }],
-            "summary": {
-                "planned_output_qty": 5.0,
-                "accepted_plan_output_qty": 4.0,
-                "assembly_remaining_qty": 1.0,
-            },
-        },
-        published_at=datetime.datetime(2026, 7, 24),
-    ))
     db_session.commit()
 
     detail = period_plan_service.get_period_plan(db_session, int(plan.id))

@@ -72,7 +72,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Чистый выпуск документа сборки (`max(sum(assembly_in) - sum(assembly_out), 0)` в пределах одного документа) | `backend/app/services/item_ledger/document_net_output.py`; читатели — реплей пополнения и аллокация выпуска плана, собственного отбора фактов у них нет |
 | Атрибуция фактов (пополнение: точный живой резерв первым, излишек и безадресные факты FIFO; расход: адресное удержание первым, иначе FIFO; агрегированная закупка и возвраты по §§14–15) | `backend/app/services/item_ledger/historical_replay_core.py`, `historical_replay_persistence.py`, `supplier_receipt_allocation.py` |
 | Выпуск производственной строки (`produced`, `remaining`) | `backend/app/services/production_output_truth.py`; `remaining_qty` в таблице — только compatibility cache и никогда не читается как факт |
-| Обеспеченность производственной строки материалами | чистый расчёт `production_control_material_availability.py`, сохранённый только внутри generation-scoped `production_control_journal_snapshot.py`; operational `ProductionOrderLineState` не владеет coverage |
+| Обеспеченность производственной строки материалами | чистый расчёт `production_control_material_availability.py`, сохранённый только внутри current `production_control_journal_projection.py`; operational `ProductionOrderLineState` не владеет coverage |
 | Custody материалов производства | append-only `ProductionMaterialCustodyEvent` + явные rewind baselines и compact `ProductionMaterialCustodyProjection.is_current`; live fold статусов не является источником чтения или fallback |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py`; пул строится ОДИН раз, базис — исторический SLE-баланс, net после заморозки неизменяем; единственная точка расширения пулов — `pool_key_for` |
 | Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
@@ -83,7 +83,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Накопленный выпуск плана и future supply | `assembly_output_persistence.py` сохраняет stable `ProductionPlanExecutionFact` и `ProductionPlanLine.accepted_output_qty/remaining_output_qty`; `future_supply_capture.py` сохраняет generation evidence, а `is_current/current_identity` — единственная compact current projection после принятия pointer |
 | Семантическая идентичность спецификации | `specification_revision.py` canonicalizes numeric/order/display noise; `SpecificationRevision.content_hash` — единственная граница rebase, эквивалентный импорт идемпотентен |
 | Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
-| Read-model | `PlanningReadSnapshot` и специализированные `*_snapshot.py`; публичный GET не пересчитывает и не обновляет снимок |
+| Read-model | `CurrentExecutionScope`/`CurrentExecutionRow` и специализированные `*_projection.py`; публичный GET читает только опубликованный current owner и не пересчитывает его |
 | Frontend | OpenAPI + `src/services`; UI только отображает read-model |
 | Запись в 1С | санкционированные `one_c_*_export.py`; запись состава спецификации — только `spec_writeback_1c.py` по явной команде редактора |
 
@@ -324,7 +324,7 @@ provenance старых generation builds, но не являются вторы
 представляет готовый пустой scope и accepted semantic pointer
 (`source_revision`, `source_generation_id`, content hash и summary). Current
 GET читает только этот persisted owner; отсутствие, stale/mismatched или
-неготовое состояние fail-closed и не переключается на `PlanningReadSnapshot`
+неготовое состояние fail-closed и не переключается на legacy read-snapshot таблицы
 или generation-scoped rows.
 
 Generation-local ids из staging (`AssemblyQueueLine.id` и зависимые ids) не

@@ -26,18 +26,6 @@ def _fixture(db_session):
     run = models.PlanningRun(config_snapshot={})
     db_session.add_all([item, imported, generation, run])
     db_session.flush()
-    snapshot = models.PlanningReadSnapshot(
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1",
-        ledger_generation_id=generation.id,
-        cutoff=datetime.datetime(2026, 7, 1),
-        truth_status="building",
-        payload={},
-        published_at=datetime.datetime(2026, 7, 1),
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-
     req = models.MrpRequirement(
         run_id=run.run_id,
         item_id=item.item_id,
@@ -57,7 +45,7 @@ def _fixture(db_session):
     db_session.add(reservation)
     db_session.flush()
 
-    return generation, snapshot, reservation
+    return generation, None, reservation
 
 
 def _batch_payload(*, db_session):
@@ -194,17 +182,6 @@ def test_purchase_export_batch_can_insert(db_session):
 
 def test_purchase_export_obligation_allocation_can_insert(db_session):
     generation, _snapshot, reservation = _fixture(db_session)
-    snapshot = models.PlanningReadSnapshot(
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1-alt",
-        ledger_generation_id=generation.id,
-        cutoff=datetime.datetime(2026, 7, 2),
-        truth_status="building",
-        payload={},
-        published_at=datetime.datetime(2026, 7, 2),
-    )
-    db_session.add(snapshot)
-    db_session.flush()
     manifest = models.CurrentExecutionScope(
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",

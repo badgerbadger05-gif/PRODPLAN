@@ -63,16 +63,6 @@ def _row(identity="buy:req:101"):
     }
 
 
-def _legacy_purchase_count(db_session, generation_id):
-    return db_session.execute(
-        sa.text(
-            "SELECT count(*) FROM planning_read_snapshot "
-            "WHERE consumer = :consumer AND ledger_generation_id = :generation_id"
-        ),
-        {"consumer": "purchase_control_journal", "generation_id": generation_id},
-    ).scalar_one()
-
-
 def test_purchase_current_publisher_uses_candidate_payload_without_snapshot_rows(db_session):
     generation = _accepted_generation(db_session)
 
@@ -99,7 +89,7 @@ def test_purchase_current_publisher_uses_candidate_payload_without_snapshot_rows
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
     )[0].business_identity == "buy:req:101"
-    assert _legacy_purchase_count(db_session, generation.id) == 0
+    assert "planning_read_snapshot" not in sa.inspect(db_session.get_bind()).get_table_names()
 
 
 def test_purchase_current_publisher_supports_empty_scope_and_exact_retry_without_audit(
@@ -127,7 +117,7 @@ def test_purchase_current_publisher_supports_empty_scope_and_exact_retry_without
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
     ).summary["total_rows"] == 0
-    assert _legacy_purchase_count(db_session, generation.id) == 0
+    assert "planning_read_snapshot" not in sa.inspect(db_session.get_bind()).get_table_names()
 
 
 def test_purchase_current_publisher_rejects_duplicate_identity_before_dml(db_session):

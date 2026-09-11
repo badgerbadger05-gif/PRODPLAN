@@ -59,8 +59,8 @@
 
 Поля `material_coverage_*` в `production_order_line_states` удалены миграцией
 `20260731_03`. Обеспеченность материалами хранится в строке принятого
-`PlanningReadSnapshot` производственного журнала и публикуется атомарно вместе
-с Ledger generation; отдельного изменяемого кеша и POST-refresh больше нет.
+current production journal projection и публикуется атомарно вместе с Ledger
+generation; отдельного изменяемого кеша и POST-refresh больше нет.
 
 ## Барабан
 
@@ -124,10 +124,12 @@ oldest-first в пределах экспортной доли, затем об�
 | Статус | Таблица | Назначение |
 |---|---|---|
 | есть | `planning_truth_state` | указатель принятой истины |
-| есть | `planning_read_snapshot` | сохранённые backend read-model |
 | есть | `closed_plan_snapshot` | неизменяемая история закрытого плана |
 
-Все расчётные read-model должны принадлежать одному `ledger_generation` и
+Все расчётные current projections должны принадлежать одному `ledger_generation` и
 `cutoff`.
+Legacy `planning_read_snapshot`, `planning_read_row` и
+`planning_read_root_member` удаляются миграцией `20260911_03`; историческая
+конвертация выполняется только migration tool до этой границы.
 `closed_plan_snapshot` создаётся миграцией `20260726_11` и фиксирует
 execution payload до исключения плана из живого поколения.

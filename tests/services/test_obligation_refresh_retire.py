@@ -254,7 +254,3 @@ def test_refresh_can_retire_one_plan_while_adding_another(db_session):
     live_runs = dict((mrp_scope.summary or {}).get("runs") or {})
     assert str(int(added_run.run_id)) in live_runs
     assert str(int(retired_run.run_id)) not in live_runs
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=int(result.target_generation_id),
-        consumer="mrp_result",
-    ).count() == 0

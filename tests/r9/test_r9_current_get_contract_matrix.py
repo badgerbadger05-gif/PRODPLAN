@@ -17,6 +17,17 @@ from app.services.item_ledger.current_execution import (
 )
 
 
+def _create_legacy_snapshot_table(db_session):
+    """Create an explicit poison table; runtime metadata no longer owns it."""
+    db_session.execute(sa.text(
+        "CREATE TABLE IF NOT EXISTS planning_read_snapshot ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, consumer VARCHAR(128) NOT NULL, "
+        "snapshot_key VARCHAR(256) NOT NULL, ledger_generation_id INTEGER NOT NULL, "
+        "cutoff DATETIME NOT NULL, truth_status VARCHAR(16) NOT NULL, "
+        "payload JSON NOT NULL, published_at DATETIME NOT NULL)"
+    ))
+
+
 def _legacy_generation(db_session):
     batch = models.PhysicalImportBatch(
         batch_key="r9-get-matrix-legacy-batch", status="completed",
@@ -30,6 +41,7 @@ def _legacy_generation(db_session):
     )
     db_session.add(generation)
     db_session.flush()
+    _create_legacy_snapshot_table(db_session)
     db_session.execute(
         sa.text(
             "INSERT INTO planning_read_snapshot "
@@ -120,6 +132,7 @@ def test_missing_current_does_not_fallback_to_legacy_snapshot_or_heavy_replay(db
     )
     db_session.add(generation)
     db_session.flush()
+    _create_legacy_snapshot_table(db_session)
     db_session.execute(
         sa.text(
             "INSERT INTO planning_read_snapshot "

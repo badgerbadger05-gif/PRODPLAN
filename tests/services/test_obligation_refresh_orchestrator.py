@@ -235,10 +235,6 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
         scope_key="assembly:all-live-plans",
     ).one()
     assert int(assembly_scope.source_generation_id) == int(result.target_generation_id)
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=int(result.target_generation_id),
-        consumer="assembly_queue",
-    ).count() == 0
     snapshot_batch = db_session.query(models.LedgerBuildBatch).filter_by(
         ledger_generation_id=int(result.target_generation_id),
         stage="snapshot_build",
@@ -474,9 +470,6 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         <= set(entry)
         for entry in checkpoint["scopes"]
     )
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="mrp_result"
-    ).count() == 0
     production_scope = db_session.query(models.CurrentExecutionScope).filter_by(
         entity_kind="production_control_journal",
         scope_key="production:all-live-orders",
@@ -510,10 +503,6 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     ).all()
     assert len(queue_rows) == 1
     assert queue_rows[0].payload["assembly_remaining_qty"] == "5.000"
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id,
-        consumer="assembly_queue",
-    ).count() == 0
 
 
 def test_obligation_refresh_publishes_purchase_current_without_purchase_snapshot(
@@ -528,10 +517,6 @@ def test_obligation_refresh_publishes_purchase_current_without_purchase_snapshot
     result = _run(db_session, accepted, "orch-purchase-current-direct")
     target = db_session.get(models.LedgerGeneration, result.target_generation_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id,
-        consumer="purchase_control_journal",
-    ).count() == 0
     manifest = db_session.query(models.CurrentExecutionScope).filter_by(
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",

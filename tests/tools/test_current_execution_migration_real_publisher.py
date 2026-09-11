@@ -25,8 +25,33 @@ def _dsn() -> str:
     return value
 
 
+def _create_legacy_read_tables(session: Session) -> None:
+    """Create historical tables explicitly; runtime ORM metadata no longer owns them."""
+    session.execute(sa.text(
+        "CREATE TABLE planning_read_snapshot ("
+        "id BIGSERIAL PRIMARY KEY, consumer VARCHAR(128) NOT NULL, "
+        "snapshot_key VARCHAR(256) NOT NULL, ledger_generation_id BIGINT NOT NULL, "
+        "cutoff TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "truth_status VARCHAR(16) NOT NULL, payload JSONB NOT NULL, "
+        "published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    ))
+    session.execute(sa.text(
+        "CREATE TABLE planning_read_row ("
+        "id BIGSERIAL PRIMARY KEY, snapshot_id BIGINT NOT NULL REFERENCES planning_read_snapshot(id), "
+        "row_key VARCHAR(256) NOT NULL, row_kind VARCHAR(64) NOT NULL DEFAULT '', "
+        "item_id INTEGER, sort_key VARCHAR(256), payload JSONB NOT NULL)"
+    ))
+    session.execute(sa.text(
+        "CREATE TABLE planning_read_root_member ("
+        "id BIGSERIAL PRIMARY KEY, snapshot_id BIGINT NOT NULL REFERENCES planning_read_snapshot(id), "
+        "row_id BIGINT NOT NULL REFERENCES planning_read_row(id), root_key VARCHAR(256) NOT NULL, "
+        "root_item_id INTEGER, payload JSONB NOT NULL DEFAULT '{}'::jsonb)"
+    ))
+
+
 def _seed(session: Session):
     stamp = datetime(2026, 9, 11, tzinfo=timezone.utc)
+    _create_legacy_read_tables(session)
     item = models.Item(item_id=1001, item_code="R10-REAL-1001", item_name="R10 real fixture")
     session.add(item)
     batches = []
@@ -87,51 +112,70 @@ def _seed(session: Session):
     session.add_all((run41, run42, closed_run))
     session.flush()
 
-    snapshots = []
-    def snapshot(consumer, key, generation, payload):
-        value = models.PlanningReadSnapshot(
-            consumer=consumer,
-            snapshot_key=key,
-            ledger_generation_id=generation.id,
-            cutoff=stamp,
-            truth_status="accepted",
-            payload=payload,
-            published_at=stamp,
-        )
-        snapshots.append(value)
-        session.add(value)
-        return value
+    legacy_metadata = sa.MetaData()
+    snapshots_table = sa.Table(
+        "planning_read_snapshot", legacy_metadata, autoload_with=session.get_bind()
+    )
+    rows_table = sa.Table(
+        "planning_read_row", legacy_metadata, autoload_with=session.get_bind()
+    )
+    roots_table = sa.Table(
+        "planning_read_root_member", legacy_metadata, autoload_with=session.get_bind()
+    )
 
-    production = snapshot("production_control_journal", "journal:v1", pointed_generation, {"meta": {}})
-    purchase = snapshot("purchase_control_journal", "journal:v1", pointed_generation, {"meta": {}, "rows": []})
+    def snapshot(consumer, key, generation, payload):
+        snapshot_id = session.execute(
+            snapshots_table.insert().values(
+                consumer=consumer,
+                snapshot_key=key,
+                ledger_generation_id=generation.id,
+                cutoff=stamp,
+                truth_status="accepted",
+                payload=payload,
+                published_at=stamp,
+            ).returning(snapshots_table.c.id)
+        ).scalar_one()
+        return {"id": int(snapshot_id), "consumer": consumer, "payload": payload}
+
+    production = snapshot(
+        "production_control_journal", "journal:v1", pointed_generation, {"meta": {}}
+    )
+    purchase = snapshot(
+        "purchase_control_journal", "journal:v1", pointed_generation, {"meta": {}, "rows": []}
+    )
     snapshot("mrp_result", "run:41", pointed_generation, {"summary": {}})
     snapshot("mrp_result", "run:42", pointed_generation, {"summary": {}})
-    snapshot("period_plan_execution", "plan=7;run=41", pointed_generation, {"plan": {"id": 7}, "run_id": 41, "rows": []})
-    snapshot("period_plan_execution", "plan=8;run=42", pointed_generation, {"plan": {"id": 8}, "run_id": 42, "rows": []})
+    snapshot(
+        "period_plan_execution", "plan=7;run=41", pointed_generation,
+        {"plan": {"id": 7}, "run_id": 41, "rows": []},
+    )
+    snapshot(
+        "period_plan_execution", "plan=8;run=42", pointed_generation,
+        {"plan": {"id": 8}, "run_id": 42, "rows": []},
+    )
     # Historical copies are retained evidence and must not be selected.
     snapshot("production_control_journal", "journal:v1", old_generation, {"meta": {"historical": True}})
     snapshot("purchase_control_journal", "journal:v1", old_generation, {"meta": {"historical": True}, "rows": []})
-    session.flush()
 
-    production_row = models.PlanningReadRow(
-        snapshot_id=production.id,
-        row_key="work-item:1001",
-        row_kind="production",
-        item_id=item.item_id,
-        sort_key="2026-09-11|000000001001",
-        payload={
-            "order_id": 9001,
-            "product_id": 1001,
-            "item_id": 1001,
-            "source_mrp_requirement_id": 501,
-            "planned_qty": 2,
-        },
-    )
-    session.add(production_row)
-    session.flush()
-    session.add(models.PlanningReadRootMember(
-        snapshot_id=production.id,
-        row_id=production_row.id,
+    production_row_id = session.execute(
+        rows_table.insert().values(
+            snapshot_id=production["id"],
+            row_key="work-item:1001",
+            row_kind="production",
+            item_id=item.item_id,
+            sort_key="2026-09-11|000000001001",
+            payload={
+                "order_id": 9001,
+                "product_id": 1001,
+                "item_id": 1001,
+                "source_mrp_requirement_id": 501,
+                "planned_qty": 2,
+            },
+        ).returning(rows_table.c.id)
+    ).scalar_one()
+    session.execute(roots_table.insert().values(
+        snapshot_id=production["id"],
+        row_id=production_row_id,
         root_key="root:1001",
         root_item_id=item.item_id,
         payload={},
@@ -171,7 +215,7 @@ def _seed(session: Session):
         status="completed",
     ))
     session.commit()
-    return pointed_generation.id, newer_generation.id, old_generation.id, production_row.id
+    return pointed_generation.id, newer_generation.id, old_generation.id, production_row_id
 
 
 @pytest.mark.integration

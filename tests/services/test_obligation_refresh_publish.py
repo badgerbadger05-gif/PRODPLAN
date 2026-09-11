@@ -158,8 +158,6 @@ def _seal_build(db, target, candidates, cutoff):
                 "mrp_result_payloads": direct_payloads,
                 "future_supply_captured": True,
                 "future_supply_capture_batch_id": future_supply_capture_batch_id,
-                "purchase_control_journal_snapshot_id": target._test_purchase_journal_snapshot_id,
-                "production_control_journal_snapshot_id": target._test_production_journal_snapshot_id,
             }
         elif stage == "execution_allocation":
             metrics = {
@@ -182,7 +180,7 @@ def _seal_build(db, target, candidates, cutoff):
 
 
 def _candidate_read_snapshots(db, target, candidates, cutoff):
-    """Seed direct MRP payload fixtures; zero rows in every kind are valid."""
+    """Seed direct payload fixtures; legacy read tables are not test owners."""
     for candidate in candidates:
         candidate._test_mrp_payload = {
             "run_id": int(candidate.run_id),
@@ -190,55 +188,32 @@ def _candidate_read_snapshots(db, target, candidates, cutoff):
             "total_qty": {"production": 0.0, "purchase": 0.0, "rework": 0.0, "capacity": 0.0},
             "rows": [],
         }
-    purchase_journal = models.PlanningReadSnapshot(
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1",
-        ledger_generation_id=target.id,
-        cutoff=cutoff,
-        truth_status="building",
-        reason="unpublished Ledger-native purchase journal",
-        payload={
-            "meta": {
-                "ledger_generation": target.id,
-                "ledger_generation_id": target.id,
-                "cutoff": cutoff.isoformat(),
-                "truth_status": "building",
-                "fact_source": "ledger",
-                "received_qty_status": "unavailable",
-                "read_only": True,
-            },
-            "rows": [],
-            "cards": {},
+    target._test_purchase_journal_payload = {
+        "meta": {
+            "ledger_generation": target.id,
+            "ledger_generation_id": target.id,
+            "cutoff": cutoff.isoformat(),
+            "truth_status": "building",
+            "fact_source": "ledger",
+            "received_qty_status": "unavailable",
+            "read_only": True,
         },
-        published_at=cutoff,
-    )
-    db.add(purchase_journal)
-    db.flush()
-    target._test_purchase_journal_snapshot_id = purchase_journal.id
-    production_journal = models.PlanningReadSnapshot(
-        consumer="production_control_journal",
-        snapshot_key="journal:v1",
-        ledger_generation_id=target.id,
-        cutoff=cutoff,
-        truth_status="building",
-        reason="unpublished production-control journal",
-        payload={
-            "meta": {
-                "ledger_generation_id": target.id,
-                "cutoff": cutoff.isoformat(),
-                "truth_status": "building",
-                "read_only": True,
-                "row_count": 0,
-                "accepted_run_ids": [row.run_id for row in candidates],
-                "latest_run_id": None,
-                "latest_source_plan_id": None,
-            },
+        "rows": [],
+        "cards": {},
+    }
+    target._test_production_journal_payload = {
+        "meta": {
+            "ledger_generation_id": target.id,
+            "cutoff": cutoff.isoformat(),
+            "truth_status": "building",
+            "read_only": True,
+            "row_count": 0,
+            "accepted_run_ids": [row.run_id for row in candidates],
+            "latest_run_id": None,
+            "latest_source_plan_id": None,
         },
-        published_at=cutoff,
-    )
-    db.add(production_journal)
-    db.flush()
-    target._test_production_journal_snapshot_id = production_journal.id
+        "rows": [],
+    }
     db.add(models.ProductionMaterialCustodyProjectionManifest(
         ledger_generation_id=target.id,
         cutoff=cutoff,
@@ -276,14 +251,9 @@ def _period_current_payloads(db, target):
 
 
 def _set_purchase_journal_rows(db_session, target, *, rows):
-    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="purchase_control_journal", snapshot_key="journal:v1"
-    ).one_or_none()
-    assert snapshot is not None
-    payload = dict(snapshot.payload)
+    payload = dict(target._test_purchase_journal_payload)
     payload["rows"] = rows
-    snapshot.payload = payload
-    db_session.flush()
+    target._test_purchase_journal_payload = payload
 
 
 def _batch(db, count=2, add_count=0, replace_count=0):
@@ -372,25 +342,15 @@ def _batch(db, count=2, add_count=0, replace_count=0):
 def _publish(db, parent, target, cutoff, capabilities=None):
     # Current publication consumes canonical payloads directly; immutable
     # snapshots remain worker evidence only.
-    purchase_snapshot = db.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id,
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1",
-    ).one_or_none()
-    assert purchase_snapshot is not None
-    purchase_payload = dict(purchase_snapshot.payload or {})
-    production_snapshot = db.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id,
-        consumer="production_control_journal",
-        snapshot_key="journal:v1",
-    ).one_or_none()
-    production_payload = dict(production_snapshot.payload or {}) if production_snapshot else {}
-    production_payload.setdefault("rows", [])
+    purchase_payload = dict(getattr(target, "_test_purchase_journal_payload", None) or {})
+    production_payload = dict(getattr(target, "_test_production_journal_payload", None) or {})
     snapshot_batch = db.query(models.LedgerBuildBatch).filter_by(
         ledger_generation_id=target.id,
         stage="snapshot_build",
     ).one()
     metrics = dict(snapshot_batch.metrics or {})
+    # The fixture supplies explicit candidate payloads to the direct
+    # publisher. Production orchestration seals only compact checkpoints.
     metrics["purchase_control_journal_payload"] = purchase_payload
     metrics["production_control_journal_payload"] = production_payload
     metrics["period_plan_execution_payloads"] = _period_current_payloads(db, target)
@@ -423,10 +383,9 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target.id
     assert [row.status for row in parents] == ["FIXED_SNAPSHOT", "FIXED_SNAPSHOT"]
     assert candidates == []
-    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="mrp_result"
-    ).all()
-    assert snapshots == []
+    assert db_session.query(models.CurrentExecutionScope).filter_by(
+        source_generation_id=target.id, entity_kind="mrp_result"
+    ).count() == 1
 
     db_session.rollback()
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
@@ -434,10 +393,9 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert [db_session.get(models.PlanningRun, row.run_id).status for row in parents] == [
         "FIXED_SNAPSHOT", "FIXED_SNAPSHOT"
     ]
-    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="mrp_result"
-    ).all()
-    assert snapshots == []
+    assert db_session.query(models.CurrentExecutionScope).filter_by(
+        source_generation_id=target.id, entity_kind="mrp_result"
+    ).count() == 0
 
 
 def test_added_run_preserves_source_plan_historical_fixation_time(db_session):
@@ -659,12 +617,10 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert set(result.candidate_run_ids) == {row.run_id for row in candidates}
     assert parents[0].status == "FIXED_SNAPSHOT"
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, truth_status="accepted"
-    ).count() == 0
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id,
-        consumer="purchase_control_journal",
+    assert db_session.query(models.CurrentExecutionScope).filter_by(
+        source_generation_id=target.id,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
     ).count() == 1
 
 
@@ -674,17 +630,12 @@ def test_publish_requires_complete_production_control_journal_snapshot(
     mutation,
 ):
     cutoff, parent, target, _parents, _candidates = _batch(db_session)
-    snapshot = db_session.get(
-        models.PlanningReadSnapshot,
-        target._test_production_journal_snapshot_id,
-    )
+    payload = dict(target._test_production_journal_payload)
     if mutation == "missing":
-        db_session.delete(snapshot)
+        target._test_production_journal_payload = None
     else:
-        payload = dict(snapshot.payload)
         payload["meta"] = {**payload["meta"], "row_count": 1}
-        snapshot.payload = payload
-    db_session.flush()
+        target._test_production_journal_payload = payload
 
     with pytest.raises(
         ObligationRefreshPublishError,

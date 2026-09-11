@@ -235,7 +235,7 @@ FIFO части одного стабильного pair получают `mixed
 semantic pointer, включая валидный пустой scope, source revision/generation,
 content hash и сохранённое summary. Публичный GET читает только опубликованный
 manifest/current rows. Missing, stale, not-ready или mismatched manifest
-fail-closed; generation-scoped rows и `PlanningReadSnapshot` не являются
+fail-closed; generation-scoped rows и legacy read-snapshot таблицы не являются
 runtime fallback.
 
 Generation-local staging ids не входят в business payload: readiness и drum

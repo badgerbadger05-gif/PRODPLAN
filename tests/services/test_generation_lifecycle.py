@@ -551,21 +551,11 @@ def test_acceptance_keeps_purchase_current_state_out_of_read_snapshots(db_sessio
     assert generation.status == "accepted"
     assert generation.accepted_at is not None
 
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer=PRODUCTION_JOURNAL_CONSUMER,
-        snapshot_key=PRODUCTION_JOURNAL_SNAPSHOT_KEY,
-        ledger_generation_id=generation.id,
-    ).count() == 0
     production_scope = db_session.query(models.CurrentExecutionScope).filter_by(
         entity_kind="production_control_journal",
         scope_key="production:all-live-orders",
     ).one()
     assert production_scope.source_generation_id == generation.id
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer=PURCHASE_JOURNAL_CONSUMER,
-        snapshot_key=PURCHASE_JOURNAL_SNAPSHOT_KEY,
-        ledger_generation_id=generation.id,
-    ).count() == 0
     assert db_session.query(models.CurrentExecutionScope).filter_by(
         entity_kind="purchase_control_journal",
         scope_key="purchase:all-live-plans",
@@ -599,17 +589,6 @@ def test_acceptance_fails_closed_when_claimed_journal_candidate_is_missing(
     assert (
         db_session.query(models.PlanningTruthState)
         .filter_by(id=1)
-        .count()
-        == 0
-    )
-    assert (
-        db_session.query(models.PlanningReadSnapshot)
-        .filter_by(
-            ledger_generation_id=generation.id,
-            consumer=PURCHASE_JOURNAL_CONSUMER,
-            truth_status="accepted",
-            snapshot_key=PURCHASE_JOURNAL_SNAPSHOT_KEY,
-        )
         .count()
         == 0
     )
@@ -668,9 +647,6 @@ def test_snapshot_build_failure_rolls_back_acceptance_atomically(db_session, mon
     assert db_session.get(models.LedgerGeneration, generation.id).status == "building"
     assert db_session.get(models.PlanningTruthState, 1) is None
     assert db_session.query(models.StockBin).filter_by(
-        ledger_generation_id=generation.id
-    ).count() == 0
-    assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=generation.id
     ).count() == 0
 
@@ -735,12 +711,6 @@ def test_assembly_queue_materialization_failure_does_not_switch_planning_truth_p
     assert pointer is not None
     assert pointer.current_generation_id == previous_generation_id
     assert db_session.get(models.LedgerGeneration, target_generation.id).status == "building"
-    assert (
-        db_session.query(models.PlanningReadSnapshot)
-        .filter_by(ledger_generation_id=target_generation.id)
-        .count()
-        == 0
-    )
 
 
 def test_accepted_generation_is_immutable(db_session):
