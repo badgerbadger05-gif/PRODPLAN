@@ -13,7 +13,8 @@ from ..services.work_calendar_service import get_planning_anchor_date
 
 from ..services.planning_service import (
     list_planning_runs,
-    # Retained as test guards: tests/services/test_mrp_result_snapshot.py
+    # Retained as test guards for the legacy suite; current routes never invoke
+    # the removed MRP snapshot builder.
     # monkeypatches these names on this module to prove the snapshot routes
     # never fall back to the legacy live getters.
     get_run_purchases,
@@ -125,7 +126,7 @@ def _read_all_mrp_snapshot_rows(
             raise HTTPException(
                 status_code=503,
                 detail={
-                    "code": "mrp_result_snapshot_required",
+                    "code": "mrp_result_current_scope_required",
                     "run_id": int(run_id),
                     "truth_status": result.get("truth_status") or "unavailable",
                     "truth_reason": result.get("truth_reason")
@@ -138,7 +139,7 @@ def _read_all_mrp_snapshot_rows(
         elif int(resolved_id) != int(pinned_current_scope_id):
             raise HTTPException(
                 status_code=409,
-                detail={"code": "mrp_result_snapshot_changed"},
+                detail={"code": "mrp_result_current_scope_changed"},
             )
         page = list(result.get("rows") or [])
         rows.extend(page)
@@ -182,7 +183,7 @@ def _mrp_current_scope_identity(
         raise HTTPException(
             status_code=503,
             detail={
-                "code": "mrp_result_snapshot_required",
+                "code": "mrp_result_current_scope_required",
                 "run_id": int(run_id),
                 "truth_status": manifest.get("truth_status") or "unavailable",
                 "truth_reason": manifest.get("truth_reason"),
@@ -190,7 +191,7 @@ def _mrp_current_scope_identity(
         )
     if int(manifest["current_scope_id"]) != int(current_scope_id):
         raise HTTPException(
-            status_code=409, detail={"code": "mrp_result_snapshot_changed"}
+            status_code=409, detail={"code": "mrp_result_current_scope_changed"}
         )
     return {
         "current_scope_id": int(manifest["current_scope_id"]),

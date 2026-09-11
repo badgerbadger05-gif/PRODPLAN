@@ -7,7 +7,7 @@ on ``int(None)`` while parsing the entry:
 * :func:`obligation_refresh_manifest._existing_result` — the re-read that any
   retry/resume of an interrupted plan closure performs first;
 * :func:`mrp_freeze.freeze_candidate_snapshots`;
-* :func:`mrp_result_snapshot._require_sealed_candidate_manifest`.
+* :func:`mrp_result_projection._require_sealed_candidate_manifest`.
 
 The last two are reached whenever one build both adds and retires a plan.
 """

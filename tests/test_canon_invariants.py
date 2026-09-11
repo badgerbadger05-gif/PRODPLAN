@@ -937,7 +937,7 @@ def test_retired_obligation_refresh_action_has_no_live_acceptor() -> None:
     acceptors = (
         "backend/app/services/obligation_refresh_manifest.py",
         "backend/app/services/obligation_refresh_publish.py",
-        "backend/app/services/mrp_result_snapshot.py",
+        "backend/app/services/mrp_result_projection.py",
         "backend/app/services/item_ledger/candidate_realization_replay.py",
     )
     for relative_path in acceptors:

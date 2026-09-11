@@ -87,7 +87,7 @@ fact_id)`. Возврат поставщику следует решению §1
 | `ledger_generation.id`, `generation_key`, `source_watermarks` | факт публикации + техническая lineage JSON | `generation_lifecycle.py`, `physical_refresh_*`, `obligation_generation.py`, `obligation_refresh_*`, bootstrap/admin | `planning_truth.py`, `live_plan_scope.py`, все generation-bound projections |
 | `ledger_build_batch.ledger_generation_id` | техническая стадия/метрика | lifecycle/build workers | publish gates, diagnostics, SQL verify |
 | `planning_truth_state.current_generation_id` | указатель принятой истины | `planning_truth.py`, accepted publish | физическая visibility, routers/services как fail-closed gate |
-| `planning_read_snapshot.ledger_generation_id` | immutable read-model truth | `mrp_result_snapshot.py`, `*_snapshot.py` | routers, exports, materialization, frontend DTO |
+| `planning_read_snapshot.ledger_generation_id` | immutable read-model truth | `mrp_result_projection.py`, `*_snapshot.py` | routers, exports, materialization, frontend DTO |
 | `planning_read_row.snapshot_id`, `planning_read_root_member.snapshot_id` | дочерняя принадлежность snapshot | snapshot builders | snapshot readers/filter/export |
 | `closed_plan_snapshot.ledger_generation_id` | audit факта закрытия | period-plan close/rebase | resume/rebase validation |
 | `planning_run.ledger_generation_id` | происхождение frozen obligation | run candidate/obligation refresh | `live_plan_scope.py`, MRP snapshot and guards |

@@ -213,7 +213,7 @@ def test_mrp_repair_selection_accepts_empty_and_multi_run_current_manifest(monke
         lambda *_args, **_kwargs: (scope, []),
     )
 
-    assert period_plan_service._has_mrp_result_snapshot(None, 41, 17) is True
-    assert period_plan_service._has_mrp_result_snapshot(None, 42, 17) is True
-    assert period_plan_service._has_mrp_result_snapshot(None, 99, 17) is False
-    assert period_plan_service._has_mrp_result_snapshot(None, 41, 18) is False
+    assert period_plan_service._has_mrp_result_current(None, 41, 17) is True
+    assert period_plan_service._has_mrp_result_current(None, 42, 17) is True
+    assert period_plan_service._has_mrp_result_current(None, 99, 17) is False
+    assert period_plan_service._has_mrp_result_current(None, 41, 18) is False

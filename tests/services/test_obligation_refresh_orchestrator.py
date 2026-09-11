@@ -7,7 +7,7 @@ import pytest
 
 from app import models
 from app.services import obligation_refresh_orchestrator as workflow
-from app.services.mrp_result_snapshot import read_mrp_result_manifest
+from app.services.mrp_result_projection import read_mrp_result_manifest
 from app.services.item_ledger.generation_lifecycle import (
     RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
 )

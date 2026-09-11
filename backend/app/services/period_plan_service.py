@@ -1390,7 +1390,7 @@ def create_mrp_snapshot_for_plan(
     )
 
 
-def _has_mrp_result_snapshot(db: Session, run_id: int, generation_id: Optional[int]) -> bool:
+def _has_mrp_result_current(db: Session, run_id: int, generation_id: Optional[int]) -> bool:
     from .item_ledger.current_execution import (
         CurrentExecutionUnavailable,
         load_current_execution_coherent,
@@ -1478,8 +1478,8 @@ def repair_duplicate_plan_snapshots(
 
     def _rank(run: PlanningRun) -> tuple[int, int, int]:
         return (
-            int(_has_mrp_result_snapshot(db, int(run.run_id), int(parent.id))),
-            int(_has_mrp_result_snapshot(db, int(run.run_id), None)),
+            int(_has_mrp_result_current(db, int(run.run_id), int(parent.id))),
+            int(_has_mrp_result_current(db, int(run.run_id), None)),
             int(run.run_id),
         )
 
