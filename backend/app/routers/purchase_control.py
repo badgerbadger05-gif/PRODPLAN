@@ -184,6 +184,7 @@ def get_orders(
     sort_dir: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -206,6 +207,12 @@ def get_orders(
             entity_kind="purchase_control_journal",
             scope_key="purchase:all-live-plans",
         )
+        if current_identity is not None:
+            target_identity = str(current_identity).strip()
+            current_rows = [
+                current_row for current_row in current_rows
+                if str(current_row.business_identity) == target_identity
+            ]
         rows = []
         for current_row in current_rows:
             payload = dict(current_row.payload or {})

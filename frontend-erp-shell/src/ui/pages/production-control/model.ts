@@ -115,16 +115,19 @@ export function buildProductionOrderParams({
   limit,
   focusProductId,
   focusOrderId,
+  focusCurrentIdentity,
 }: {
   filters: ProductionFilters
   offset: number
   limit: number
   focusProductId?: string | null
   focusOrderId?: string | null
+  focusCurrentIdentity?: string | null
 }): URLSearchParams {
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
   if (focusProductId) params.set('product_id', focusProductId)
   if (focusOrderId) params.set('order_id', focusOrderId)
+  if (focusCurrentIdentity) params.set('current_identity', focusCurrentIdentity)
   Object.entries(filters).forEach(([key, value]) => {
     if (value) params.set(key, value)
   })

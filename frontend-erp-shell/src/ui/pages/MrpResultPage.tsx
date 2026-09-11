@@ -171,7 +171,7 @@ export function MrpResultPage() {
       return
     }
     try {
-      const params = {
+      const baseParams = {
         snapshot_id: snapshotId,
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
@@ -179,6 +179,12 @@ export function MrpResultPage() {
         limit,
         offset: nextOffset,
       }
+      const targetIdentity = (
+        (queryTab ? queryTab === targetTab : targetTab === 'production')
+          ? highlightedIdentity
+          : null
+      )
+      const params = targetIdentity ? { ...baseParams, current_identity: targetIdentity } : baseParams
       let data
       if (targetTab === 'production') {
         data = await getPlanningResultProduction(runId, params)
@@ -226,7 +232,7 @@ export function MrpResultPage() {
     } finally {
       if (seq === loadSeq.current) setLoading(false)
     }
-  }, [dateFrom, dateTo, invalidateTabs, purchaseCategoryFilter, purchaseSupplierFilter, rootItemId, runId, snapshotId, summary, truthAccepted])
+  }, [dateFrom, dateTo, highlightedIdentity, invalidateTabs, purchaseCategoryFilter, purchaseSupplierFilter, queryTab, rootItemId, runId, snapshotId, summary, truthAccepted])
 
   useEffect(() => {
     if (previousRunId.current === runId) return

@@ -1100,6 +1100,7 @@ async def get_planning_result_production(
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     snapshot_id: Optional[int] = None,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """Производственные обязательства из сохранённого снимка."""
@@ -1116,6 +1117,7 @@ async def get_planning_result_production(
             limit=limit,
             offset=offset,
             sort_dir=sort_dir,
+            current_identity=current_identity,
         )
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
@@ -1182,6 +1184,7 @@ async def get_planning_result_purchases(
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     snapshot_id: Optional[int] = None,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """Закупочные обязательства из сохранённого снимка."""
@@ -1201,6 +1204,7 @@ async def get_planning_result_purchases(
             limit=limit,
             offset=offset,
             sort_dir=sort_dir,
+            current_identity=current_identity,
         )
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
@@ -1274,6 +1278,7 @@ async def get_planning_result_rework(
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     snapshot_id: Optional[int] = None,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """Обязательства переработки из сохранённого снимка."""
@@ -1290,6 +1295,7 @@ async def get_planning_result_rework(
             limit=limit,
             offset=offset,
             sort_dir=sort_dir,
+            current_identity=current_identity,
         )
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})
@@ -1421,6 +1427,7 @@ async def get_planning_result_capacity(
     limit: int = 200,
     offset: int = 0,
     snapshot_id: Optional[int] = None,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """Загрузка мощностей из сохранённого MRP-снимка."""
@@ -1435,6 +1442,7 @@ async def get_planning_result_capacity(
             date_to=date_to,
             limit=limit,
             offset=offset,
+            current_identity=current_identity,
         )
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "mrp_result_current_unavailable", "reason": str(e)})

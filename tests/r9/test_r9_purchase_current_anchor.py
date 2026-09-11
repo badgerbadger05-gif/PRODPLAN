@@ -96,9 +96,17 @@ def test_purchase_current_identity_filters_before_pagination(monkeypatch):
     monkeypatch.setattr(current_execution, "load_current_execution_rows", lambda *args, **kwargs: rows)
 
     result = get_orders(
-        db=object(), current_identity="purchase:req:2", limit=1, offset=0,
+        db=object(), current_identity="purchase:req:2", horizon_period_to=None,
+        limit=1, offset=0,
     )
 
     assert result["total"] == 1
     assert result["rows"][0]["current_identity"] == "purchase:req:2"
     assert result["rows"][0]["item_name"] == "Second"
+
+    missing = get_orders(
+        db=object(), current_identity="purchase:req:missing", horizon_period_to=None,
+        limit=1, offset=0,
+    )
+    assert missing["total"] == 0
+    assert missing["rows"] == []

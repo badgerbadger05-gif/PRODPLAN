@@ -134,6 +134,13 @@ def test_mrp_current_identity_filters_before_pagination(db_session):
     assert result["rows"][0]["current_identity"] == target
     assert result["rows"][0]["item_id"] == 11
 
+    missing = read_mrp_result_rows(
+        db_session, 41, row_kind="production", current_identity="mrp:missing",
+        limit=1, offset=0,
+    )
+    assert missing["total"] == 0
+    assert missing["rows"] == []
+
 
 def test_mrp_reader_fails_closed_even_when_legacy_snapshot_exists(db_session):
     generation = _generation(db_session)

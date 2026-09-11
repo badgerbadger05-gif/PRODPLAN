@@ -82,6 +82,7 @@ export function ProductionControlPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const focusProductId = searchParams.get('product_id')
   const focusOrderId = searchParams.get('order_id')
+  const focusCurrentIdentity = searchParams.get('current_identity')?.trim() || null
   const initialUrlState = useRef(parseProductionControlUrlState(searchParams))
   const [rows, setRows] = useState<OrderRow[]>([])
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -184,6 +185,7 @@ export function ProductionControlPage() {
         limit,
         focusProductId,
         focusOrderId,
+        focusCurrentIdentity,
       })
       const data = await listProductionOrders(params)
       if (requestSeq !== listRequestSeq.current) return
@@ -212,7 +214,7 @@ export function ProductionControlPage() {
     } finally {
       if (requestSeq === listRequestSeq.current) setLoading(false)
     }
-  }, [focusOrderId, focusProductId])
+  }, [focusCurrentIdentity, focusOrderId, focusProductId])
 
   const loadResources = useCallback(async () => {
     try {

@@ -867,6 +867,7 @@ def _read_current_mrp_rows(
     limit: int,
     offset: int,
     sort_dir: str,
+    current_identity: str | None,
 ) -> dict[str, Any]:
     kind = str(row_kind or "").strip().lower()
     if kind not in ROW_KINDS:
@@ -885,6 +886,8 @@ def _read_current_mrp_rows(
         if int(payload.get("run_id") or 0) != int(run_id):
             continue
         if str(payload.get("row_kind") or "").strip().lower() != kind:
+            continue
+        if current_identity is not None and str(current.business_identity) != str(current_identity).strip():
             continue
         all_rows.append((current, payload))
 
@@ -1024,6 +1027,7 @@ def read_mrp_result_rows(
     limit: int = 100,
     offset: int = 0,
     sort_dir: str = "asc",
+    current_identity: str | None = None,
 ) -> dict[str, Any]:
     scope = _current_mrp_scope(db)
     if snapshot_id is not None and int(snapshot_id) != int(scope.id):
@@ -1043,4 +1047,5 @@ def read_mrp_result_rows(
         limit=limit,
         offset=offset,
         sort_dir=sort_dir,
+        current_identity=current_identity,
     )

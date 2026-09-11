@@ -171,15 +171,23 @@ def test_r9_production_current_identity_filters_before_pagination(db_session):
         db_session,
         generation,
         consumer="production_control_journal",
-        key="journal:deep-link",
+        key="journal:v1",
         rows=[
             {"row_key": "order:1", "payload": {
                 "journal_row_key": "order:1", "item_id": 10, "order_number": "001",
-                "quantity": 4, "remaining_qty": 4, "status": "open",
+                "order_source": "mrp", "source": "MRP", "item_code": "I-10",
+                "item_name": "First", "item_article": "A-10", "unit": "шт",
+                "quantity": 4, "produced_qty": 0, "remaining_qty": 4, "status": "open",
+                "coverage_status": "unavailable", "coverage_label": "Нет",
+                "issue_status": "not_issued", "issue_count": 0, "comment": "",
             }},
             {"row_key": "order:2", "payload": {
                 "journal_row_key": "order:2", "item_id": 11, "order_number": "002",
-                "quantity": 5, "remaining_qty": 5, "status": "open",
+                "order_source": "mrp", "source": "MRP", "item_code": "I-11",
+                "item_name": "Second", "item_article": "A-11", "unit": "шт",
+                "quantity": 5, "produced_qty": 0, "remaining_qty": 5, "status": "open",
+                "coverage_status": "unavailable", "coverage_label": "Нет",
+                "issue_status": "not_issued", "issue_count": 0, "comment": "",
             }},
         ],
     )
@@ -188,12 +196,20 @@ def test_r9_production_current_identity_filters_before_pagination(db_session):
     db_session.commit()
 
     result = get_orders_journal(
-        current_identity="order:2", limit=1, offset=0, db=db_session,
+        current_identity="order:2", planning_contour=None, launch_source=None,
+        limit=1, offset=0, db=db_session,
     )
 
     assert result.total == 1
-    assert result.rows[0]["current_identity"] == "order:2"
-    assert result.rows[0]["item_id"] == 11
+    assert result.rows[0].current_identity == "order:2"
+    assert result.rows[0].item_id == 11
+
+    missing = get_orders_journal(
+        current_identity="order:missing", planning_contour=None, launch_source=None,
+        limit=1, offset=0, db=db_session,
+    )
+    assert missing.total == 0
+    assert missing.rows == []
 
 
 def test_r9_root_products_read_current_production_rows(db_session):

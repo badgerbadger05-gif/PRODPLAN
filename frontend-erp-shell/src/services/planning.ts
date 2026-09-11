@@ -31,6 +31,7 @@ type MrpSnapshotQuery = {
   category_ref1c?: string | null
   limit?: number
   offset?: number
+  current_identity?: string | null
 }
 
 function buildResultQuery(params: MrpSnapshotQuery) {
@@ -45,6 +46,7 @@ function buildResultQuery(params: MrpSnapshotQuery) {
   if (params.category_ref1c) search.set('category_ref1c', params.category_ref1c)
   if (params.limit) search.set('limit', String(params.limit))
   if (typeof params.offset === 'number') search.set('offset', String(params.offset))
+  if (params.current_identity) search.set('current_identity', params.current_identity)
   return search.toString()
 }
 

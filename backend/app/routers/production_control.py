@@ -1513,6 +1513,7 @@ def get_orders_journal(
     sort_dir: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     try:
@@ -1535,6 +1536,12 @@ def get_orders_journal(
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
         )
+        if current_identity is not None:
+            target_identity = str(current_identity).strip()
+            current_records = [
+                current_row for current_row in current_records
+                if str(current_row.business_identity) == target_identity
+            ]
         current_work_items = {
             (int(work.requirement_id), int(work.item_id)): int(work.id)
             for work in db.query(models.ReplenishmentWorkItem).filter(

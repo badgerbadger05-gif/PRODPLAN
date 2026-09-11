@@ -30,7 +30,7 @@ export type PurchaseOrderColumnKey = typeof purchaseOrderColumns[number]['key']
 export type PurchaseOrderSortKey = Extract<PurchaseOrderColumnKey, 'delivery_date' | 'order'>
 
 export function createPurchaseOrdersDoctype(
-  focus: { orderId?: string | null; search?: string | null } = {},
+  focus: { orderId?: string | null; search?: string | null; currentIdentity?: string | null } = {},
 ): Doctype<PurchaseRow, PurchaseFilters> {
   return {
     meta: {
@@ -120,6 +120,7 @@ export function createPurchaseOrdersDoctype(
           sort_dir: sortDir ?? filters.sort_dir,
         })
         if (focus.orderId) params.set('order_id', focus.orderId)
+        if (focus.currentIdentity) params.set('current_identity', focus.currentIdentity)
         if (filters.search) params.set('search', filters.search)
         if (filters.supplier_id) params.set('supplier_id', filters.supplier_id)
         if (filters.line_status) params.set('line_status', filters.line_status)
