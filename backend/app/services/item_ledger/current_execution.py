@@ -127,6 +127,134 @@ def _period_execution_row_payload(
     return result
 
 
+def _nav_link(
+    *,
+    label: str,
+    href: str | None,
+    available: bool,
+    reason: str | None = None,
+    current_identity: str | None = None,
+    source_revision: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "label": label,
+        "href": href,
+        "available": bool(available),
+        "reason": reason,
+        **({"current_identity": current_identity} if current_identity is not None else {}),
+        **({"source_revision": source_revision} if source_revision is not None else {}),
+    }
+
+
+def _build_basis_links(ledger_links: dict[str, Any] | None) -> dict[str, Any]:
+    """Build persisted navigation from the accepted row's ledger evidence only."""
+    links = dict(ledger_links or {})
+    item_id = links.get("item_id")
+    item_link = _nav_link(
+        label="Ledger item",
+        href=f"#/ledger/items/{int(item_id)}" if item_id is not None else None,
+        available=item_id is not None,
+        reason=None if item_id is not None else "ledger item basis is unavailable",
+    )
+    reservation_links = [
+        _nav_link(
+            label=f"Reservation #{int(reservation_id)}",
+            href=(
+                f"#/ledger/items/{int(item_id)}?tab=reservations&reservation_id={int(reservation_id)}"
+            ) if item_id is not None else None,
+            available=item_id is not None,
+            reason=None if item_id is not None else "ledger reservation basis is unavailable",
+        )
+        for reservation_id in sorted({
+            int(value) for value in links.get("reservation_ids", []) if value is not None
+        })
+    ]
+    event_links = [
+        _nav_link(
+            label=f"Ledger event #{int(event['event_id'])}",
+            href=(
+                f"#/ledger/items/{int(item_id)}?tab=reservations&reservation_id={int(event['reservation_id'])}"
+                f"&event_id={int(event['event_id'])}"
+            ) if item_id is not None else None,
+            available=item_id is not None,
+            reason=None if item_id is not None else "ledger event basis is unavailable",
+        )
+        for event in sorted(
+            (value for value in links.get("events", []) if isinstance(value, dict)),
+            key=lambda value: (int(value.get("event_id") or 0), int(value.get("reservation_id") or 0)),
+        )
+        if event.get("event_id") is not None and event.get("reservation_id") is not None
+    ]
+    return {
+        "item": item_link,
+        "reservations": reservation_links,
+        "events": event_links,
+        "reason": None if item_id is not None else "ledger basis is unavailable",
+    }
+
+
+def _build_queue_links(
+    execution_payload: dict[str, Any],
+    queue_manifest: Any | None,
+    queue_rows: Iterable[Any],
+    *,
+    expected_generation_id: int | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Resolve period roots to every exact current queue line in the same generation."""
+    disabled_reason: str | None = None
+    if queue_manifest is None:
+        disabled_reason = "assembly queue current target is unavailable for this plan/root scope"
+    elif expected_generation_id is None or int(queue_manifest.source_generation_id or 0) != int(expected_generation_id):
+        disabled_reason = "assembly queue current source generation does not match period execution source generation"
+
+    if disabled_reason is not None:
+        return [
+            _nav_link(label="Assembly queue", href=None, available=False, reason=disabled_reason)
+        ], disabled_reason
+
+    plan_id = execution_payload.get("plan_id")
+    root_item_ids = {
+        int(value) for value in execution_payload.get("root_item_ids", []) if value is not None
+    }
+    matches = []
+    for row in queue_rows:
+        if isinstance(row, dict):
+            payload = dict(row.get("payload") or {})
+            row_identity = row.get("business_identity")
+        else:
+            payload = dict(getattr(row, "payload", None) or {})
+            row_identity = getattr(row, "business_identity", None)
+        if plan_id is None or int(payload.get("plan_id") or 0) != int(plan_id):
+            continue
+        if int(payload.get("item_id") or 0) not in root_item_ids:
+            continue
+        identity = str(row_identity or "").strip()
+        if identity.startswith("plan-line:"):
+            matches.append((identity, payload))
+    unique_matches: dict[str, dict[str, Any]] = {}
+    for identity, payload in matches:
+        unique_matches.setdefault(identity, payload)
+    matches = sorted(
+        unique_matches.items(),
+        key=lambda value: (value[0], int(value[1].get("plan_line_id") or 0)),
+    )
+    if not matches:
+        reason = "assembly queue current target is unavailable for this plan/root scope"
+        return [_nav_link(label="Assembly queue", href=None, available=False, reason=reason)], reason
+
+    links = [
+        _nav_link(
+            label="Assembly queue",
+            href=f"#/production-control?view=assembly-queue&current_identity={quote(identity, safe='')}",
+            available=True,
+            current_identity=identity,
+            source_revision=str(queue_manifest.source_revision),
+        )
+        for identity, _payload in matches
+    ]
+    return links, None
+
+
 @dataclass(frozen=True)
 class CurrentExecutionPublishResult:
     changed_rows: int
@@ -1262,6 +1390,16 @@ def publish_current_obligation_views_from_generation(
 
     execution_rows: list[dict[str, Any]] = []
     execution_metadata: dict[str, Any] = {}
+    queue_manifest = get_current_execution_scope(
+        db,
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    )
+    queue_rows = load_current_execution_rows(
+        db,
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    )
     execution_snapshots = db.query(models.PlanningReadSnapshot).filter(
         models.PlanningReadSnapshot.consumer == "period_plan_execution",
         models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
@@ -1300,6 +1438,17 @@ def publish_current_obligation_views_from_generation(
                 business_identity=business_identity,
                 target_catalog=target_catalog,
             )
+            row_payload["basis_links"] = _build_basis_links(
+                row_payload.get("ledger_links")
+            )
+            queue_links, queue_link_reason = _build_queue_links(
+                row_payload,
+                queue_manifest,
+                queue_rows,
+                expected_generation_id=int(generation.id),
+            )
+            row_payload["queue_links"] = queue_links
+            row_payload["queue_link_reason"] = queue_link_reason
             execution_rows.append({
                 "entity_kind": "period_plan_execution",
                 "business_identity": business_identity,

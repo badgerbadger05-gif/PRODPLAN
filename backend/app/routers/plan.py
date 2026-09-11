@@ -396,6 +396,26 @@ class ExecutionJournalLedgerLinks(BaseModel):
     events: list[ExecutionJournalLedgerEvent] = []
 
 
+class ExecutionJournalNavigationLink(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    href: str | None = None
+    available: bool
+    reason: str | None = None
+    current_identity: str | None = None
+    source_revision: str | None = None
+
+
+class ExecutionJournalBasisLinks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item: ExecutionJournalNavigationLink
+    reservations: list[ExecutionJournalNavigationLink] = Field(default_factory=list)
+    events: list[ExecutionJournalNavigationLink] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class ExecutionJournalWorkItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -450,6 +470,9 @@ class ExecutionJournalRow(BaseModel):
     execution_events: list[dict[str, object]] = []
     execution_allocations: list[dict[str, object]] = []
     ledger_links: ExecutionJournalLedgerLinks | None = None
+    basis_links: ExecutionJournalBasisLinks | None = None
+    queue_links: list[ExecutionJournalNavigationLink] = Field(default_factory=list)
+    queue_link_reason: str | None = None
     item_article: str | None = None
     stock_qty: float | None = None
     covered_qty: float | None = None
