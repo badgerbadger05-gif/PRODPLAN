@@ -136,7 +136,7 @@ def _external_scope_snapshot(engine: sa.Engine, schema: str) -> dict[str, Any]:
     """Read committed current state through a separate connection."""
 
     with engine.connect() as connection:
-        connection.exec_driver_sql(f"SET search_path TO {_quote_schema(schema)}, public")
+        connection.exec_driver_sql(f"SET search_path TO {_quote_schema(schema)}")
         reader = Session(bind=connection, autoflush=False, expire_on_commit=False)
         try:
             return _scope_snapshot(reader)
