@@ -66,6 +66,57 @@ def test_manifest_is_deterministic_and_classifies_rows_by_transition():
     assert first["categories"]["migrate"]["planning_read_row"]["row_count"] == 1
 
 
+def test_historical_bucket_evidence_is_migrated_not_unknown():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE planning_run_bucket_modes (run_id INTEGER PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE mrp_bucket_type_legacy (record_id INTEGER PRIMARY KEY)"))
+
+    manifest = build_manifest(engine)
+
+    assert manifest["status"] == "ready"
+    assert set(manifest["categories"]["migrate"]) == {
+        "planning_run_bucket_modes",
+        "mrp_bucket_type_legacy",
+    }
+
+
+def test_table_checksum_is_stable_and_changes_with_subject_values():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE items (item_id INTEGER PRIMARY KEY, item_name TEXT)"))
+        connection.execute(text("INSERT INTO items (item_id, item_name) VALUES (1, 'A')"))
+
+    first = build_manifest(engine)
+    second = build_manifest(engine)
+    assert first["categories"]["preserve"]["items"]["checksum"] == second["categories"]["preserve"]["items"]["checksum"]
+
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE items SET item_name = 'B' WHERE item_id = 1"))
+    changed = build_manifest(engine)
+    assert changed["categories"]["preserve"]["items"]["checksum"] != first["categories"]["preserve"]["items"]["checksum"]
+
+
+def test_nested_legacy_references_are_fail_closed():
+    engine = _engine()
+    _create_inventory_tables(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO current_execution_row "
+            "(id, entity_kind, scope_key, business_identity, payload) "
+            "VALUES (1, 'production_control_journal', 'production:all', 'order:1', :payload)"
+        ), {"payload": json.dumps({"basis": [{"snapshot": {"planning_read_snapshot_id": 7}}]})})
+
+    manifest = build_manifest(engine)
+
+    assert manifest["status"] == "blocked"
+    assert any(
+        finding["key"] == "planning_read_snapshot_id"
+        and finding["identity"] == "order:1"
+        for finding in manifest["dependencies"]["unknown"]
+    )
+
+
 def test_unknown_table_blocks_preflight_instead_of_being_deleted():
     engine = _engine()
     with engine.begin() as connection:
