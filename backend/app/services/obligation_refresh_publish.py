@@ -523,10 +523,6 @@ def _require_sealed_build(
         target=target,
         snapshot_metrics=snapshot_metrics,
     )
-    _require_mrp_current_payloads(
-        snapshot_metrics.get("mrp_result_payloads"),
-        required_run_ids=required_mrp_run_ids,
-    )
 
 
 def _require_mrp_current_payloads(

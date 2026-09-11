@@ -466,8 +466,13 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert all(row.status == "completed" for row in by_stage.values())
     assert by_stage["snapshot_build"].metrics["future_supply_captured"] is True
     assert by_stage["future_supply_capture"].metrics["rows"] == 0
-    mrp_payload = by_stage["snapshot_build"].metrics["mrp_result_payloads"][str(candidate.run_id)]
-    assert mrp_payload["run_id"] == candidate.run_id
+    checkpoint = by_stage["snapshot_build"].metrics["current_scope_checkpoint"]
+    assert checkpoint["version"] == 1
+    assert all(
+        {"scope_id", "source_generation_id", "source_revision", "content_hash", "row_count"}
+        <= set(entry)
+        for entry in checkpoint["scopes"]
+    )
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, consumer="mrp_result"
     ).count() == 0

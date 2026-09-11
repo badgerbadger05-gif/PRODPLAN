@@ -50,7 +50,7 @@ def test_obligation_refresh_checkpoint_is_compact_and_has_no_read_model_payloads
     assert isinstance(metrics.get("assembly_queue_materialization"), dict)
 
 
-def test_published_retry_reuses_current_scopes_without_saved_read_models(db_session):
+def test_published_retry_reuses_current_scopes_without_saved_read_models(db_session, monkeypatch):
     accepted, plan, _line, _item, _parent, _cutoff = _world(
         db_session, with_parent=False
     )
@@ -64,6 +64,11 @@ def test_published_retry_reuses_current_scopes_without_saved_read_models(db_sess
         if key not in HEAVY_CHECKPOINT_FIELDS
     }
     db_session.flush()
+
+    def forbidden_publish(*_args, **_kwargs):
+        raise AssertionError("published retry must not invoke the publisher")
+
+    monkeypatch.setattr(workflow, "publish_obligation_refresh_batch", forbidden_publish)
 
     writes: list[str] = []
     bind = db_session.get_bind()

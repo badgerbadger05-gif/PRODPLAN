@@ -108,6 +108,20 @@ _CORE_CAPABILITIES = {
     "future_supply": True,
 }
 
+_REQUIRED_CURRENT_SCOPE_KEYS = frozenset({
+    ("assembly_queue", "assembly:all-live-plans"),
+    ("assembly_readiness", "assembly:all-live-plans"),
+    ("drum_schedule", "drum:all-live-plans"),
+    ("drum_slot", "drum:all-live-plans"),
+    ("drum_gap", "drum:all-live-plans"),
+    ("drum_excluded", "drum:all-live-plans"),
+    ("shelf_projection", "shelf:all-live-mrps"),
+    ("purchase_control_journal", "purchase:all-live-plans"),
+    ("production_control_journal", "production:all-live-orders"),
+    ("mrp_result", "mrp:all-live-plans"),
+    ("period_plan_execution", "period-plan:all-live-plans"),
+})
+
 
 class ObligationRefreshOrchestratorError(RuntimeError):
     """The complete refresh cannot be safely constructed or retried."""
@@ -201,6 +215,114 @@ def _complete(batch: models.LedgerBuildBatch, metrics: Mapping[str, Any]) -> Non
     batch.completed_at = datetime.now(timezone.utc)
 
 
+def _current_scope_checkpoint(db: Session, generation_id: int) -> dict[str, Any]:
+    """Return compact proof of every current scope published for a generation."""
+    scopes = db.query(models.CurrentExecutionScope).filter_by(
+        source_generation_id=int(generation_id),
+    ).all()
+    actual = {(str(scope.entity_kind), str(scope.scope_key)) for scope in scopes}
+    if actual != _REQUIRED_CURRENT_SCOPE_KEYS:
+        missing = sorted(_REQUIRED_CURRENT_SCOPE_KEYS - actual)
+        extra = sorted(actual - _REQUIRED_CURRENT_SCOPE_KEYS)
+        raise ObligationRefreshOrchestratorError(
+            "current scope checkpoint set mismatch "
+            f"(missing: {missing or 'none'}; extra: {extra or 'none'})"
+        )
+    entries: list[dict[str, Any]] = []
+    for scope in sorted(scopes, key=lambda row: (str(row.entity_kind), str(row.scope_key))):
+        if (
+            int(scope.source_generation_id or -1) != int(generation_id)
+            or not bool(scope.result_ready)
+            or not str(scope.source_revision or "").strip()
+            or not str(scope.content_hash or "").strip()
+        ):
+            raise ObligationRefreshOrchestratorError(
+                f"current scope checkpoint is incomplete for {scope.entity_kind}:{scope.scope_key}"
+            )
+        row_count = db.query(models.CurrentExecutionRow).filter_by(
+            entity_kind=str(scope.entity_kind),
+            scope_key=str(scope.scope_key),
+            result_status="accepted",
+            result_ready=True,
+        ).count()
+        entries.append({
+            "entity_kind": str(scope.entity_kind),
+            "scope_key": str(scope.scope_key),
+            "scope_id": int(scope.id),
+            "source_generation_id": int(scope.source_generation_id),
+            "source_revision": str(scope.source_revision),
+            "content_hash": str(scope.content_hash),
+            "row_count": int(row_count),
+        })
+    return {"version": 1, "scopes": entries}
+
+
+def _validate_current_scope_checkpoint(
+    db: Session,
+    generation_id: int,
+    raw_checkpoint: Any,
+) -> None:
+    if not isinstance(raw_checkpoint, Mapping) or raw_checkpoint.get("version") != 1:
+        raise ObligationRefreshOrchestratorError(
+            "published generation current scope checkpoint is missing or malformed"
+        )
+    raw_scopes = raw_checkpoint.get("scopes")
+    if not isinstance(raw_scopes, list):
+        raise ObligationRefreshOrchestratorError(
+            "published generation current scope checkpoint is missing or malformed"
+        )
+    declared: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for raw in raw_scopes:
+        if not isinstance(raw, Mapping):
+            raise ObligationRefreshOrchestratorError(
+                "published generation current scope checkpoint is malformed"
+            )
+        key = (str(raw.get("entity_kind") or ""), str(raw.get("scope_key") or ""))
+        if key in declared:
+            raise ObligationRefreshOrchestratorError(
+                "published generation current scope checkpoint has duplicate scope"
+            )
+        declared[key] = raw
+    if set(declared) != _REQUIRED_CURRENT_SCOPE_KEYS:
+        raise ObligationRefreshOrchestratorError(
+            "published generation current scope checkpoint set mismatch"
+        )
+    for key, raw in declared.items():
+        scope = db.query(models.CurrentExecutionScope).filter_by(
+            entity_kind=key[0], scope_key=key[1]
+        ).one_or_none()
+        if scope is None or int(scope.source_generation_id or -1) != int(generation_id):
+            raise ObligationRefreshOrchestratorError(
+                f"published generation current scope is missing or stale: {key[0]}:{key[1]}"
+            )
+        try:
+            scope_id = int(raw["scope_id"])
+            source_generation_id = int(raw["source_generation_id"])
+            row_count = int(raw["row_count"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObligationRefreshOrchestratorError(
+                f"published generation current scope checkpoint is malformed for {key[0]}:{key[1]}"
+            ) from exc
+        if (
+            scope_id != int(scope.id)
+            or source_generation_id != int(generation_id)
+            or str(raw.get("source_revision") or "") != str(scope.source_revision)
+            or str(raw.get("content_hash") or "") != str(scope.content_hash)
+            or row_count < 0
+            or not bool(scope.result_ready)
+        ):
+            raise ObligationRefreshOrchestratorError(
+                f"published generation current scope checkpoint conflicts with current scope {key[0]}:{key[1]}"
+            )
+        actual_count = db.query(models.CurrentExecutionRow).filter_by(
+            entity_kind=key[0], scope_key=key[1], result_status="accepted", result_ready=True
+        ).count()
+        if actual_count != row_count:
+            raise ObligationRefreshOrchestratorError(
+                f"published generation current scope row count conflicts for {key[0]}:{key[1]}"
+            )
+
+
 def _manifest_request_matches(
     target: models.LedgerGeneration,
     *, add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
@@ -256,35 +378,37 @@ def _retry_published(
         raise ObligationRefreshOrchestratorError("published generation belongs to another parent")
     if target.accepted_at is None:
         raise ObligationRefreshOrchestratorError("published generation lacks accepted_at")
+    manifest = marks.get(MANIFEST_KEY)
+    try:
+        entries = manifest["entries"]
+        if not isinstance(entries, list) or any(not isinstance(entry, Mapping) for entry in entries):
+            raise TypeError("entries must be mappings")
+        candidate_ids = tuple(sorted(
+            int(entry["candidate_run_id"])
+            for entry in entries
+            if entry.get("action") not in {"retain", "retire"}
+        ))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationRefreshOrchestratorError(
+            "published refresh manifest entries are malformed"
+        ) from exc
     snapshot_batch = db.query(models.LedgerBuildBatch).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
         models.LedgerBuildBatch.stage == "snapshot_build",
     ).one_or_none()
-    metrics = dict(snapshot_batch.metrics or {}) if snapshot_batch is not None else {}
-    purchase_payload = metrics.get("purchase_control_journal_payload")
-    production_payload = metrics.get("production_control_journal_payload")
-    mrp_payloads = metrics.get("mrp_result_payloads")
-    period_payloads = metrics.get("period_plan_execution_payloads")
-    if (
-        not isinstance(purchase_payload, Mapping)
-        or not isinstance(production_payload, Mapping)
-        or not isinstance(mrp_payloads, Mapping)
-        or not isinstance(period_payloads, Mapping)
-    ):
+    if snapshot_batch is None or str(snapshot_batch.status) != "completed":
         raise ObligationRefreshOrchestratorError(
-            "published generation lacks canonical obligation journal payloads"
+            "published generation current scope checkpoint is missing or incomplete"
         )
-    result = publish_obligation_refresh_batch(
-        db, parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
-        accepted_at=target.accepted_at, capabilities=dict(target.capabilities or {}),
-        purchase_payload=purchase_payload,
-        production_payload=production_payload,
-        mrp_payloads=mrp_payloads,
-        period_payloads=period_payloads,
+    _validate_current_scope_checkpoint(
+        db,
+        int(target.id),
+        dict(snapshot_batch.metrics or {}).get("current_scope_checkpoint"),
     )
+    candidate_run_ids = tuple(sorted(candidate_ids))
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
-        candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
+        candidate_run_ids=candidate_run_ids, published=False,
     )
 
 
@@ -568,8 +692,6 @@ def run_obligation_refresh(
     capabilities = dict(_CORE_CAPABILITIES)
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),
-        "mrp_result_payloads": mrp_payloads,
-        "period_plan_execution_payloads": period_payloads,
         "future_supply_captured": True,
         "future_supply_capture_batch_id": int(future_supply_capture_batch.id),
         "future_supply_capture": future_supply_capture,
@@ -582,8 +704,6 @@ def run_obligation_refresh(
         "shelf_projection_summary": _json_value(shelf_projection),
         "supplier_receipt_summary": _json_value(supplier_summary),
         "local_order_reconciliation": _json_value(local_order_reconciliation),
-        "purchase_control_journal_payload": purchase_journal_payload,
-        "production_control_journal_payload": production_journal_payload,
         "assembly_queue_materialization": {
             "rows": len(assembly_queue_lines),
             "open_qty": str(sum(
@@ -615,6 +735,13 @@ def run_obligation_refresh(
         mrp_payloads=mrp_payloads,
         period_payloads=period_payloads,
     )
+    if published.published:
+        compact_metrics = dict(snapshot_batch.metrics or {})
+        compact_metrics["current_scope_checkpoint"] = _current_scope_checkpoint(
+            db, target_id
+        )
+        snapshot_batch.metrics = compact_metrics
+        db.flush()
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,
