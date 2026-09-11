@@ -203,15 +203,44 @@ def test_produce_does_not_close_order_after_documents_are_queued(monkeypatch, db
     assert close_calls == []
 
 
-def test_accepted_production_fact_is_not_hidden_by_closed_order_status():
-    """The accepted Ledger fact remains visible after operator close."""
-    # The canonical fact/status regression is exercised in the service suite;
-    # this contract marker keeps the R9 requirement discoverable beside the
-    # action tests without introducing a second production-fact implementation.
-    from pathlib import Path
+def test_accepted_production_fact_is_not_hidden_by_closed_order_status(db_session, monkeypatch):
+    """An accepted Ledger fact remains visible after explicit order close."""
+    from app.services.production_order_sync import sync_production_facts
+    from tests.services.test_production_order_sync import (
+        _accepted_generation as fact_generation,
+        _assembly_fact,
+        _fact_item,
+        _no_odata,
+        _order_with_line,
+        _recorder_pull,
+    )
 
-    source = Path("tests/services/test_production_order_sync.py").read_text(encoding="utf-8")
-    assert "test_production_fact_cache_keeps_cancellation_separate_from_physical_remaining" in source
+    _no_odata(monkeypatch)
+    _generation, batch = fact_generation(db_session, key="r9-closed-fact")
+    item = _fact_item(db_session, code="R9-CLOSED-FACT")
+    order, product = _order_with_line(
+        db_session, item=item, order_ref1c="r9-closed-order"
+    )
+    order.order_state_key = "ad28565a-991b-11eb-e39a-fa163e61326a"
+    _assembly_fact(
+        db_session,
+        batch=batch,
+        item=item,
+        recorder_ref="r9-closed-assembly",
+        qty=2,
+    )
+    _recorder_pull(
+        db_session,
+        recorder_ref="r9-closed-assembly",
+        order_ref="r9-closed-order",
+    )
+    db_session.commit()
+
+    sync_production_facts(db_session)
+
+    db_session.refresh(product)
+    assert float(product.produced_qty) == 2.0
+    assert float(product.remaining_qty) == 8.0
 
 
 def test_export_piecework_openapi_keeps_all_request_fields():
