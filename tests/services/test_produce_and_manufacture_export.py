@@ -1019,6 +1019,28 @@ def test_successful_export_stamps_link_and_manufacture(db_session, monkeypatch):
     assert link.target_ref_key == "be5ab6fe-manu-ok"
 
 
+def test_fresh_manufacture_export_does_not_origin_lookup(db_session, monkeypatch):
+    """Origin recovery is reserved for an earlier uncertain attempt only."""
+    db = db_session
+    item = _mk_item(db, code="EXP-FRESH-ORIGIN", ref1c="item-ref-fresh-origin")
+    product = _mk_product(db, item, qty=1)
+    mid = produce_line(db, product.product_id, qty=1)["manufacture_id"]
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="fresh-origin-ref")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+    monkeypatch.setattr(
+        exporter,
+        "_find_document_by_origin",
+        lambda *args, **kwargs: pytest.fail("fresh command must not perform origin lookup"),
+    )
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+
+    assert result["manufactures_created"] == 1
+    assert len(fake.posts) == 1
+
+
 def test_failed_posting_keeps_created_ref_on_manufacture(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="EXP-POST-FAIL", ref1c="item-ref-post-fail")
