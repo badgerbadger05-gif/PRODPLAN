@@ -272,6 +272,8 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
                 "priority_key": ["2026-08-01", "2026-08-31", 4001, 4101],
                 "sort_key": "2026-08-01|2026-08-31|0000004001|0000004101",
                 "eligible_from": "2026-08-01T00:00:00.000000Z",
+                "current_identity": "plan-line:4101",
+                "source_revision": "ledger-generation:1",
             },
             {
                 "run_id": 3002,
@@ -289,6 +291,8 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
                 "priority_key": ["2026-09-01", "2026-09-30", 4002, 4102],
                 "sort_key": "2026-09-01|2026-09-30|0000004002|0000004102",
                 "eligible_from": "2026-09-01T00:00:00.000000Z",
+                "current_identity": "plan-line:4102",
+                "source_revision": "ledger-generation:1",
             },
         ],
         "total_rows": 2,
@@ -310,6 +314,69 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
             "truth_reason": None,
         },
     }
+
+
+def test_assembly_queue_filters_exact_current_identity_before_pagination(client, db_session):
+    generation, _ = _accepted_generation(db_session)
+    payload = {
+        "rows": [
+            {
+                "run_id": 3001,
+                "plan_id": 4001,
+                "plan_line_id": 4101,
+                "item_id": 5001,
+                "item_code": "FG-1",
+                "item_name": "Finished good 1",
+                "bucket_date": "2026-08-03",
+                "period_from": "2026-08-01",
+                "period_to": "2026-08-31",
+                "planned_output_qty": 10.0,
+                "accepted_plan_output_qty": 3.0,
+                "assembly_remaining_qty": 7.0,
+                "priority_key": ["2026-08-01", "2026-08-31", 4001, 4101],
+                "sort_key": "2026-08-01|2026-08-31|0000004001|0000004101",
+                "eligible_from": "2026-08-01T00:00:00.000000Z",
+                "current_identity": "plan-line:4101",
+                "source_revision": f"ledger-generation:{generation.id}",
+            },
+            {
+                "run_id": 3002,
+                "plan_id": 4002,
+                "plan_line_id": 4102,
+                "item_id": 5002,
+                "item_code": "FG-2",
+                "item_name": "Finished good 2",
+                "bucket_date": "2026-09-05",
+                "period_from": "2026-09-01",
+                "period_to": "2026-09-30",
+                "planned_output_qty": 20.0,
+                "accepted_plan_output_qty": 5.0,
+                "assembly_remaining_qty": 15.0,
+                "priority_key": ["2026-09-01", "2026-09-30", 4002, 4102],
+                "sort_key": "2026-09-01|2026-09-30|0000004002|0000004102",
+                "eligible_from": "2026-09-01T00:00:00.000000Z",
+                "current_identity": "plan-line:4102",
+                "source_revision": f"ledger-generation:{generation.id}",
+            },
+        ],
+        "total_rows": 2,
+        "total_queue_qty": 22.0,
+    }
+    _publish_snapshot(db_session, payload)
+    db_session.commit()
+
+    response = client.get(
+        "/api/v1/production-control/assembly-queue",
+        params={"current_identity": "plan-line:4102", "limit": 1, "offset": 0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["current_identity"] for row in body["rows"]] == ["plan-line:4102"]
+    assert body["total_rows"] == 1
+    assert client.get(
+        "/api/v1/production-control/assembly-queue",
+        params={"current_identity": "plan-line:missing"},
+    ).json()["rows"] == []
 
 
 def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_session):
