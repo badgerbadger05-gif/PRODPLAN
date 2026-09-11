@@ -8,6 +8,7 @@ type Props = {
   onExportTo1C: () => void
   onSyncFrom1C: () => void
   onProduce: () => void
+  onClose: () => void
   onPiecework: () => void
   onPrintSelected: () => void
   onDeleteSelected: () => void
@@ -26,6 +27,7 @@ export function ProductionCommandBar({
   onExportTo1C,
   onSyncFrom1C,
   onProduce,
+  onClose,
   onPiecework,
   onPrintSelected,
   onDeleteSelected,
@@ -39,10 +41,14 @@ export function ProductionCommandBar({
   const selectedRows = rows.filter((row) => selectedIds.has(productionRowId(row)))
   const selectedOrders = selectedRows.filter((row) => row.product_id != null)
   const canProduce = selectedOrders.length === 1 && selectedRows.length === 1
+  const canClose = canProduce
+    && selectedRows[0]?.available_actions?.includes('close_1c')
+    && Boolean(selectedRows[0]?.current_identity && selectedRows[0]?.source_revision)
   return (
     <div className="commandBar">
       <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
-      <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный; завершить заказ или оставить частичный выпуск">Произвести</button>
+      <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный; факт будет принят после read-back Ledger">Произвести</button>
+      <button onClick={onClose} disabled={!canClose || loading} title="Явно завершить выбранный заказ в 1С">Закрыть в 1С</button>
       <button onClick={onPiecework} disabled={!canProduce || loading}
         style={{ background: '#e8c7d6', borderColor: '#bc91a5', color: '#111', fontWeight: 700 }}
         title="Оформить работу сварщика отдельно от производства и окраски">Сдельный наряд</button>

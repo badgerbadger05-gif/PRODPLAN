@@ -29,6 +29,7 @@ import {
   updateOrderQuantity,
   openPaintWeldChains,
   closePaintWeldChain,
+  closeProductionOrder,
   getStandalonePieceworkOptions,
   createStandalonePiecework,
   postMaterialIssues,
@@ -908,6 +909,49 @@ export function ProductionControlPage() {
     }
   }
 
+  async function closeSelectedOrder() {
+    const selected = rows.filter(
+      (row) => row.product_id != null && selectedIds.has(productionRowId(row)),
+    )
+    if (selected.length !== 1) return
+    const row = selected[0]
+    if (
+      row.product_id == null
+      || !row.current_identity
+      || !row.source_revision
+      || !row.available_actions?.includes('close_1c')
+    ) {
+      setError('Выбранный заказ недоступен для закрытия: отсутствует current action/CAS')
+      return
+    }
+    if (!beginDangerousMutation()) return
+    const orderLabel = row.order_number || row.order_prodplan_number || String(row.product_id)
+    if (!window.confirm(`Явно закрыть заказ «${orderLabel}» в 1С?`)) {
+      endDangerousMutation()
+      return
+    }
+    setLoading(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await closeProductionOrder(row.product_id, {
+        dry_run: false,
+        current_identity: row.current_identity,
+        expected_source_revision: row.source_revision,
+      })
+      setSelectedIds(new Set())
+      setMessage(result.orders_closed
+        ? `В 1С закрыто заказов: ${result.orders_closed}`
+        : 'Закрытие заказа не подтверждено в 1С')
+      await load(offsetRef.current)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      endDangerousMutation()
+      setLoading(false)
+    }
+  }
+
   function toggleSort(key: ProductionOrderSortKey) {
     const next = nextProductionSort(filtersRef.current, key)
     filtersRef.current = next
@@ -1020,6 +1064,7 @@ export function ProductionControlPage() {
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}
+          onClose={() => void closeSelectedOrder()}
           onPiecework={() => void produceActiveLine(selectedRows[0]?.product_id, true)}
           onPrintSelected={() => openRouteSheets(selectedRows.flatMap(productionRowProductIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}

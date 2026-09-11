@@ -378,7 +378,12 @@ export type CloseProductionOrderResult = {
   orders_error: number
 }
 
-export function closeProductionOrder(productId: number, payload: { dry_run?: boolean } = {}) {
+export type CloseProductionOrderPayload = ApiSchemas['CloseProductionOrderPayload']
+
+export function closeProductionOrder(
+  productId: number,
+  payload: CloseProductionOrderPayload = { dry_run: true },
+) {
   return api<CloseProductionOrderResult>(`/v1/production-control/orders/${productId}/close`, {
     method: 'POST',
     body: JSON.stringify(payload),
