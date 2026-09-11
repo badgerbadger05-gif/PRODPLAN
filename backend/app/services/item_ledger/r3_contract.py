@@ -252,6 +252,14 @@ def _r3_identity_before_flush(session: Session, _flush_context, _instances) -> N
             and any(not (row in session.dirty and row.active is False) for row in active_rows)
         ):
             raise ValueError(f"active duplicate business identity {identity}")
+        already_pending = any(
+            isinstance(mapping, models.StockLedgerBusinessIdentityMap)
+            and mapping.business_identity == identity
+            and mapping.stock_ledger_entry is entry
+            for mapping in session.new
+        )
+        if already_pending:
+            continue
         session.add(
             models.StockLedgerBusinessIdentityMap(
                 business_identity=identity,
