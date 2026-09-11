@@ -119,6 +119,8 @@ class AssemblyQueueRow(BaseModel):
     # the live-plan scope was lost.
     sort_key: str
     eligible_from: Optional[str] = None
+    current_identity: str
+    source_revision: str
 
 
 class AssemblyQueueResponse(BaseModel):
@@ -470,6 +472,7 @@ def _items_by_id(db: Session, item_ids: set[int]) -> dict[int, models.Item]:
 def get_assembly_queue(
     limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
     offset: Annotated[int, Query(ge=0)] = 0,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> AssemblyQueueResponse:
     """Read the immutable queue belonging to the exact accepted generation."""
@@ -501,13 +504,35 @@ def get_assembly_queue(
             },
         )
     payload = dict(snapshot.payload or {})
-    all_rows = list(payload.get("rows") or [])
-    # total_rows / total_queue_qty stay whole-queue totals: the page is a window
-    # into the snapshot, not a different queue.
+    source_revision = f"ledger-generation:{int(snapshot.ledger_generation_id)}"
+    all_rows = []
+    for raw_row in list(payload.get("rows") or []):
+        row = dict(raw_row)
+        # Queue line identity is durable plan-line identity. The manifest
+        # generation is a read CAS token, never part of that identity.
+        row["current_identity"] = str(
+            row.get("current_identity") or f"plan-line:{int(row['plan_line_id'])}"
+        )
+        row["source_revision"] = str(row.get("source_revision") or source_revision)
+        all_rows.append(row)
+    if current_identity is not None:
+        all_rows = [
+            row for row in all_rows
+            if row.get("current_identity") == str(current_identity)
+        ]
+        total_rows = len(all_rows)
+        total_queue_qty = sum(
+            float(row.get("assembly_remaining_qty") or 0.0) for row in all_rows
+        )
+    else:
+        # Without a deep-link filter, totals remain whole-queue persisted
+        # values; the page is only a window into that accepted manifest.
+        total_rows = int(payload.get("total_rows") or len(all_rows))
+        total_queue_qty = float(payload.get("total_queue_qty") or 0)
     response = {
         "rows": all_rows[offset : offset + limit],
-        "total_rows": int(payload.get("total_rows") or 0),
-        "total_queue_qty": float(payload.get("total_queue_qty") or 0),
+        "total_rows": total_rows,
+        "total_queue_qty": total_queue_qty,
         "limit": limit,
         "offset": offset,
         "truth_meta": build_truth_meta(planning_truth.get_truth_state(db)),
