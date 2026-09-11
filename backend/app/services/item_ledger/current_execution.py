@@ -1218,8 +1218,8 @@ def publish_current_purchase_control_from_payload(
 ) -> CurrentExecutionPublishResult:
     """Publish the purchase journal directly from its canonical candidate payload.
 
-    Purchase current state is owned by ``CurrentExecutionScope`` and must not
-    require creating an immutable ``PlanningReadSnapshot`` first.  The caller
+    Purchase current state is owned by ``CurrentExecutionScope`` and does not
+    require an intermediate historical read model.  The caller
     supplies the already validated Ledger-native candidate payload; this
     adapter only adds the stable current-row envelope and delegates all
     identity, complete-scope, idempotency and rollback semantics to the one
@@ -1240,10 +1240,10 @@ def publish_current_purchase_control_from_payload(
     for raw in raw_rows:
         if not isinstance(raw, Mapping):
             raise CurrentExecutionUnavailable("purchase candidate row is malformed")
-        # Candidate builders may retain the immutable snapshot envelope
+        # Candidate builders may retain an immutable envelope
         # (``{"row_key": ..., "payload": {...}}``), while the direct
         # current publisher owns the inner business payload.  Normalize both
-        # shapes here so the runtime path never publishes a nested legacy
+        # shapes here so the runtime path never publishes a nested historical
         # envelope as the current DTO.
         candidate = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
         row = dict(candidate)
@@ -1791,7 +1791,7 @@ def publish_current_obligation_views_from_generation(
 
     Purchase and production payloads are mandatory by design.  Runtime
     publication cannot discover or synthesize them from historical
-    ``PlanningReadSnapshot`` rows.
+    explicit current payloads.
     """
     if not isinstance(purchase_payload, Mapping):
         raise CurrentExecutionUnavailable(
@@ -1828,126 +1828,4 @@ def publish_current_obligation_views_from_generation(
         production_payload=production_payload,
         mrp_payloads=mrp_payloads,
         period_payloads=period_current_payloads,
-    )
-
-
-def publish_current_obligation_views_from_snapshots(
-    db: Session,
-    generation_id: int,
-) -> dict[str, CurrentExecutionPublishResult]:
-    """Migration-only adapter for pre-R10 snapshot evidence.
-
-    Production runtime callers must use
-    :func:`publish_current_obligation_views_from_generation`; this explicitly
-    named adapter is retained solely for local migration rehearsal and legacy
-    fixture conversion.
-    """
-    generation = db.get(models.LedgerGeneration, int(generation_id))
-    if generation is None or str(generation.status or "") != "accepted":
-        raise CurrentExecutionUnavailable("snapshot migration requires an accepted generation")
-    snapshot = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one_or_none()
-    if snapshot is None or not isinstance(snapshot.payload, Mapping):
-        raise CurrentExecutionUnavailable(
-            "migration purchase snapshot evidence is missing"
-        )
-    production = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "production_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one_or_none()
-    if production is None or not isinstance(production.payload, Mapping):
-        raise CurrentExecutionUnavailable(
-            "migration production snapshot evidence is missing"
-        )
-    production_rows: list[dict[str, Any]] = []
-    for row in db.query(models.PlanningReadRow).filter(
-        models.PlanningReadRow.snapshot_id == int(production.id),
-    ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
-        row_payload = dict(row.payload or {})
-        row_payload["root_item_ids"] = [
-            int(member.root_item_id)
-            for member in db.query(models.PlanningReadRootMember).filter(
-                models.PlanningReadRootMember.snapshot_id == int(production.id),
-                models.PlanningReadRootMember.row_id == int(row.id),
-            ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
-        ]
-        production_rows.append(row_payload)
-    production_payload = dict(production.payload)
-    production_payload["rows"] = production_rows
-    mrp_payloads: dict[str, dict[str, Any]] = {}
-    for legacy in db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "mrp_result",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc()).all():
-        marker = str(legacy.snapshot_key).removeprefix("run:").split(":", 1)[0]
-        if not marker.isdigit():
-            raise CurrentExecutionUnavailable("migration MRP snapshot key is malformed")
-        rows: list[dict[str, Any]] = []
-        for legacy_row in db.query(models.PlanningReadRow).filter(
-            models.PlanningReadRow.snapshot_id == int(legacy.id),
-        ).order_by(models.PlanningReadRow.sort_key.asc(), models.PlanningReadRow.id.asc()).all():
-            payload = dict(legacy_row.payload or {})
-            payload.setdefault("run_id", int(marker))
-            payload.setdefault("row_kind", str(legacy_row.row_kind))
-            payload.setdefault("sort_key", str(legacy_row.sort_key or ""))
-            payload["root_item_ids"] = [
-                int(member.root_item_id)
-                for member in db.query(models.PlanningReadRootMember).filter(
-                    models.PlanningReadRootMember.snapshot_id == int(legacy.id),
-                    models.PlanningReadRootMember.row_id == int(legacy_row.id),
-                ).order_by(models.PlanningReadRootMember.root_item_id.asc()).all()
-            ]
-            kind = str(payload["row_kind"]).lower()
-            identity = _mrp_current_identity(payload, run_id=int(marker), row_kind=kind)
-            rows.append({
-                "current_identity": identity,
-                "payload": _mrp_current_payload(payload, business_identity=identity),
-            })
-        legacy_payload = dict(legacy.payload or {})
-        legacy_payload["run_id"] = int(marker)
-        legacy_counts = {kind: 0 for kind in ("production", "purchase", "rework", "capacity")}
-        for row in rows:
-            kind = str((row.get("payload") or {}).get("row_kind") or "").lower()
-            if kind in legacy_counts:
-                legacy_counts[kind] += 1
-        legacy_payload["row_counts"] = legacy_counts
-        legacy_payload["rows"] = rows
-        mrp_payloads[marker] = legacy_payload
-    period_payloads: dict[str, dict[str, Any]] = {}
-    for legacy in db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "period_plan_execution",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc()).all():
-        key_parts = {
-            part.split("=", 1)[0]: part.split("=", 1)[1]
-            for part in str(legacy.snapshot_key).split(";")
-            if "=" in part
-        }
-        if not key_parts.get("plan") or not key_parts.get("run"):
-            raise CurrentExecutionUnavailable(
-                "migration period execution snapshot key is malformed"
-            )
-        payload = dict(legacy.payload or {})
-        payload.setdefault("run_id", int(key_parts["run"]))
-        payload.setdefault("plan", {"id": int(key_parts["plan"])})
-        payload.setdefault("facets", {"bom_levels": []})
-        payload.setdefault("plan_output_rows", [])
-        period_payloads[
-            f"plan:{int(key_parts['plan'])}:run:{int(key_parts['run'])}"
-        ] = payload
-    return _publish_current_obligation_views(
-        db,
-        generation_id,
-        purchase_payload=dict(snapshot.payload),
-        production_payload=production_payload,
-        mrp_payloads=mrp_payloads,
-        period_payloads=period_payloads,
     )

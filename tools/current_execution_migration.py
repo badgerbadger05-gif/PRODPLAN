@@ -51,7 +51,7 @@ if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
 try:
     # Kept as a module-level seam so tests can prove the transaction policy
     # without calling OData, workers, or a live integration.
-    from app.services.item_ledger.current_execution import (
+    from tools.current_execution_legacy_adapter import (
         publish_current_obligation_views_from_snapshots,
     )
 except Exception:  # pragma: no cover - standalone preflight remains usable
@@ -676,9 +676,8 @@ def apply_current_obligation_migration(
     """Atomically publish legacy obligation evidence into current execution.
 
     This function owns transaction orchestration only.  The domain mapping and
-    all current-row semantics remain in
-    ``publish_current_obligation_views_from_snapshots`` (the explicitly
-    migration-only adapter).
+    all current-row semantics remain in the explicitly named
+    ``tools.current_execution_legacy_adapter``.
     """
 
     if not writers_stopped:

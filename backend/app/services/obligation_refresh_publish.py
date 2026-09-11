@@ -1052,7 +1052,7 @@ def publish_obligation_refresh_batch(
         retained=retained, retired=retired,
     )
     # Current user-facing obligation/result views are promoted from the
-    # validated direct payloads; no MRP PlanningRead rows cross publication.
+    # validated direct payloads; no historical read-model rows cross publication.
     from .item_ledger.current_execution import publish_current_obligation_views_from_generation
     publish_current_obligation_views_from_generation(
         db,

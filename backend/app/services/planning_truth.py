@@ -7,7 +7,7 @@ an accepted generation identity or stop their calculation with
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 import os
 from typing import Any, Mapping
 
@@ -86,12 +86,6 @@ class PlanningTruthUnavailable(RuntimeError):
             "consumer": self.consumer,
             **self.readiness.as_dict(),
         }
-
-
-class PlanningSnapshotConflict(RuntimeError):
-    """A snapshot key was reused with different immutable content."""
-
-    code = "planning_snapshot_conflict"
 
 
 class PlanningTruthInvalidationConflict(RuntimeError):
@@ -226,8 +220,6 @@ def require_accepted(db: Session) -> PlanningTruthReadiness:
 def get_truth_state(db: Session) -> PlanningTruthReadiness:
     """Consumer-facing name for the current structured readiness state."""
     return get_readiness(db)
-
-
 def require_accepted_truth(
     db: Session,
     consumer: str,
@@ -309,8 +301,6 @@ def publish_generation(
     # the previous generation. Force the readiness read to follow the new FK.
     db.expire(pointer, ["current_generation"])
     return get_readiness(db)
-
-
 def invalidate_current_generation(
     db: Session,
     *,
@@ -374,128 +364,4 @@ def invalidate_current_generation(
     db.flush()
     db.expire(pointer, ["current_generation"])
     return get_readiness(db)
-
-
-def publish_read_snapshot(
-    db: Session,
-    *,
-    consumer: str,
-    snapshot_key: str,
-    payload: Mapping[str, Any],
-    required_capabilities: Iterable[str] = (),
-    reason: str | None = None,
-    published_at: datetime | None = None,
-    allow_stale: bool = False,
-) -> models.PlanningReadSnapshot:
-    """Atomically publish an immutable read payload for current accepted truth.
-
-    ``consumer`` + ``snapshot_key`` is idempotent. Reusing that identity with
-    different content or truth lineage is rejected rather than overwritten.
-    The caller owns the surrounding transaction and must commit it.
-    """
-    truth = require_accepted_truth(
-        db,
-        consumer,
-        required_capabilities=required_capabilities,
-        allow_stale=bool(allow_stale),
-    )
-    existing = db.execute(
-        select(models.PlanningReadSnapshot).where(
-            models.PlanningReadSnapshot.consumer == consumer,
-            models.PlanningReadSnapshot.snapshot_key == snapshot_key,
-            models.PlanningReadSnapshot.ledger_generation_id
-            == truth.generation_id,
-        ),
-    ).scalar_one_or_none()
-    immutable_payload = dict(payload)
-    if existing is not None:
-        same = (
-            existing.ledger_generation_id == truth.generation_id
-            and existing.cutoff == truth.cutoff
-            and existing.truth_status == truth.status
-            and existing.payload == immutable_payload
-            and existing.reason == reason
-        )
-        if not same:
-            raise PlanningSnapshotConflict(
-                f"snapshot {consumer}/{snapshot_key} already exists with different content"
-            )
-        return existing
-
-    snapshot = models.PlanningReadSnapshot(
-        consumer=consumer,
-        snapshot_key=snapshot_key,
-        ledger_generation_id=truth.generation_id,
-        cutoff=truth.cutoff,
-        truth_status=truth.status,
-        payload=immutable_payload,
-        reason=reason,
-        published_at=published_at or datetime.now(timezone.utc),
-    )
-    db.add(snapshot)
-    db.flush()
-    return snapshot
-
-
-def get_latest_read_snapshot(
-    db: Session,
-    *,
-    consumer: str,
-    snapshot_key: str | None = None,
-    required_capabilities: Iterable[str] = (),
-    allow_stale: bool = False,
-    sealed_lineage: Sequence[int] | None = None,
-) -> models.PlanningReadSnapshot | None:
-    """Read the latest snapshot only for the current accepted truth lineage.
-
-    By default a snapshot belongs to exactly one accepted generation and cutoff:
-    anything projecting facts must be rebuilt whenever facts move.
-
-    ``sealed_lineage`` opts a consumer into the wider, obligation-shaped rule:
-    the caller passes the sealed ``parent_generation_id`` chain of the accepted
-    generation, and the newest snapshot anchored anywhere in that chain is
-    returned.  Only a payload that projects a *frozen obligation* may use this —
-    such a payload does not change when a fact-only fork advances the pointer,
-    so republishing it per generation would rewrite identical rows hourly.  The
-    returned snapshot keeps reporting the generation and cutoff it was actually
-    published at; the caller must not restate it as the current one.
-    """
-    truth = require_accepted_truth(
-        db,
-        consumer,
-        required_capabilities=required_capabilities,
-        allow_stale=bool(allow_stale),
-    )
-    query = select(models.PlanningReadSnapshot).where(
-            models.PlanningReadSnapshot.consumer == consumer,
-            models.PlanningReadSnapshot.truth_status == "accepted",
-        )
-    if sealed_lineage is None:
-        query = query.where(
-            models.PlanningReadSnapshot.ledger_generation_id == truth.generation_id,
-            models.PlanningReadSnapshot.cutoff == truth.cutoff,
-        )
-    else:
-        lineage_ids = [int(value) for value in sealed_lineage]
-        if not lineage_ids:
-            raise ValueError("sealed lineage must not be empty")
-        if int(truth.generation_id) not in lineage_ids:
-            raise ValueError(
-                "sealed lineage does not contain the accepted Ledger generation"
-            )
-        query = query.where(
-            models.PlanningReadSnapshot.ledger_generation_id.in_(lineage_ids),
-        )
-    if snapshot_key is not None:
-        query = query.where(
-            models.PlanningReadSnapshot.snapshot_key == snapshot_key,
-        )
-    return db.execute(
-        query
-        .order_by(
-            models.PlanningReadSnapshot.ledger_generation_id.desc(),
-            models.PlanningReadSnapshot.published_at.desc(),
-            models.PlanningReadSnapshot.id.desc(),
-        )
-        .limit(1),
-    ).scalar_one_or_none()
+# End of current truth helpers.
