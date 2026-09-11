@@ -407,7 +407,7 @@ def test_frozen_requirement_has_no_execution_caches_or_mutating_engine() -> None
         REPO / "backend/app/services/purchase_control_journal.py"
     )
     purchase_snapshot = _read(
-        REPO / "backend/app/services/purchase_control_snapshot.py"
+        REPO / "backend/app/services/purchase_control_projection.py"
     )
     assert "PlannedPurchase" not in purchase_journal
     assert "ReplenishmentWorkItem" in purchase_snapshot

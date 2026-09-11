@@ -17,7 +17,13 @@ from app.services.purchase_control_materialization import (
     PurchaseControlMaterializationError,
     materialize_rows as _materialize_rows_impl,
 )
-from app.services.purchase_control_snapshot import build_candidate_snapshot
+from app.services.purchase_control_projection import build_candidate_payload
+from app.services import purchase_control_projection as pcp
+from app.services import purchase_control_projection as pcp
+from app.services.item_ledger.current_execution import (
+    load_current_execution_rows,
+    publish_current_purchase_control_from_payload,
+)
 
 
 CAPABILITIES = {
@@ -48,15 +54,26 @@ def _set_purchase_odata_config(
         "purchase_destination_warehouse_ref1c": destination,
     }
     monkeypatch.setattr(pcm, "_load_odata_config", lambda: config)
-    monkeypatch.setattr(
-        pcm.purchase_control_snapshot,
-        "_load_odata_config",
-        lambda: config,
-    )
+    monkeypatch.setattr(pcp, "_load_odata_config", lambda: config)
     return config
 
 
-def _accepted_generation(db) -> tuple[models.LedgerGeneration, models.PlanningReadSnapshot]:
+class _CandidatePayload:
+    def __init__(self, generation_id: int, payload: dict):
+        self.id = int(generation_id)
+        self.payload = payload
+
+
+_DIRECT_PAYLOADS: dict[int, _CandidatePayload] = {}
+
+
+def _build_candidate(db, generation_id: int) -> _CandidatePayload:
+    candidate = _CandidatePayload(generation_id, build_candidate_payload(db, generation_id))
+    _DIRECT_PAYLOADS[candidate.id] = candidate
+    return candidate
+
+
+def _accepted_generation(db) -> tuple[models.LedgerGeneration, models.Item, models.Supplier]:
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     idx = next(_fixture_seq)
     physical = models.PhysicalImportBatch(
@@ -179,24 +196,21 @@ def _add_buy_run(
     return reservation, planning_run, work_item
 
 
-def _accept_generation_snapshot(db, generation: models.LedgerGeneration, snapshot: models.PlanningReadSnapshot):
+def _accept_generation(db, generation: models.LedgerGeneration, payload: dict):
     accepted_at = generation.cutoff + timedelta(hours=1)
     generation.status = "accepted"
     generation.accepted_at = accepted_at
     generation.capabilities = dict(CAPABILITIES)
-    snapshot.truth_status = "accepted"
-    snapshot.reason = None
-    snapshot.published_at = accepted_at
     planning_truth.publish_generation(db, generation)
     db.flush()
-    _publish_current_purchase_fixture(db, generation, snapshot)
-    return accepted_at, snapshot.id
+    _publish_current_purchase_fixture(db, generation, payload)
+    return accepted_at, int(generation.id)
 
 
 def _publish_current_purchase_fixture(
     db,
     generation: models.LedgerGeneration,
-    snapshot: models.PlanningReadSnapshot,
+    payload: dict,
 ) -> models.CurrentExecutionScope:
     """Expose worker evidence through the current-only materialization contract."""
     manifest = (
@@ -207,22 +221,10 @@ def _publish_current_purchase_fixture(
         )
         .one_or_none()
     )
-    if manifest is None:
-        manifest = models.CurrentExecutionScope(
-            id=int(snapshot.id),
-            entity_kind="purchase_control_journal",
-            scope_key="purchase:all-live-plans",
-        )
-        db.add(manifest)
-    else:
-        # Each fixture has one current scope.  Repoint it to the newly
-        # accepted evidence before exercising the current writer.
-        manifest.id = int(snapshot.id)
-    manifest.source_generation_id = int(generation.id)
-    manifest.source_revision = f"accepted:g{int(generation.id)}:purchase_control_journal"
-    manifest.result_ready = True
-    manifest.content_hash = "p" * 64
-    manifest.summary = dict((snapshot.payload or {}).get("meta") or {})
+    publish_current_purchase_control_from_payload(db, int(generation.id), payload)
+    manifest = db.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
+    ).one()
     db.flush()
     return manifest
 
@@ -237,7 +239,6 @@ def materialize_rows(
     **kwargs,
 ):
     """Adapt immutable worker fixtures to the current persisted read model."""
-    snapshot = db.get(models.PlanningReadSnapshot, int(snapshot_id))
     manifest = (
         db.query(models.CurrentExecutionScope)
         .filter_by(
@@ -246,7 +247,8 @@ def materialize_rows(
         )
         .one()
     )
-    rows = list((snapshot.payload or {}).get("rows") or []) if snapshot is not None else []
+    candidate = _DIRECT_PAYLOADS.get(int(snapshot_id))
+    rows = list((candidate.payload or {}).get("rows") or []) if candidate is not None else []
     return _materialize_rows_impl(
         db,
         current_scope_id=int(snapshot_id),
@@ -272,8 +274,8 @@ def _stale_generation_fixture(db):
         covered_incoming=Decimal("0"),
         uncovered=Decimal("8"),
     )
-    old_snapshot = build_candidate_snapshot(db, old_generation.id)
-    _accept_generation_snapshot(db, old_generation, old_snapshot)
+    old_snapshot = _build_candidate(db, old_generation.id)
+    _accept_generation(db, old_generation, old_snapshot.payload)
 
     current_generation, _, _ = _accepted_generation(db)
     current_generation.status = "accepted"
@@ -289,27 +291,21 @@ def _stale_generation_fixture(db):
             "cutoff": current_generation.cutoff.isoformat(),
         }
     )
-    stale_snapshot = models.PlanningReadSnapshot(
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1",
-        ledger_generation_id=current_generation.id,
-        cutoff=current_generation.cutoff,
-        truth_status="accepted",
-        reason="stale-row-fixture",
-        payload=payload,
-        published_at=current_generation.accepted_at,
-    )
-    db.add(stale_snapshot)
     db.add(current_generation)
     db.flush()
     planning_truth.publish_generation(db, current_generation)
     db.flush()
-    _publish_current_purchase_fixture(db, current_generation, stale_snapshot)
+    _publish_current_purchase_fixture(db, current_generation, payload)
 
-    return current_generation, stale_snapshot, old_reservation
+    stale = _CandidatePayload(current_generation.id, payload)
+    stale.id = int(db.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
+    ).one().id)
+    _DIRECT_PAYLOADS[stale.id] = stale
+    return current_generation, stale, old_reservation
 
 
-def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.PlanningReadSnapshot]:
+def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, _CandidatePayload]:
     generation, item, _supplier = _accepted_generation(db)
     _add_buy_run(
         db,
@@ -334,13 +330,17 @@ def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.Plann
         uncovered=Decimal("7"),
     )
 
-    snapshot = build_candidate_snapshot(db, generation.id)
-    _accept_generation_snapshot(db, generation, snapshot)
+    snapshot = _build_candidate(db, generation.id)
+    _accept_generation(db, generation, snapshot.payload)
+    snapshot.id = int(db.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
+    ).one().id)
+    _DIRECT_PAYLOADS[snapshot.id] = snapshot
     assert len(snapshot.payload.get("rows", [])) == 1
     return generation, snapshot
 
 
-def _snapshot_first_row(snapshot: models.PlanningReadSnapshot) -> dict:
+def _snapshot_first_row(snapshot: _CandidatePayload) -> dict:
     rows = snapshot.payload.get("rows")
     assert isinstance(rows, list) and rows, "snapshot rows are required for materialize test"
     return dict(rows[0])
@@ -714,7 +714,7 @@ def test_materialize_rows_default_writer_recovers_existing_order_without_post(db
     _set_purchase_odata_config(monkeypatch)
     generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
-    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    accepted_snapshot = snapshot.payload
     groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
         db_session, accepted_snapshot, [row["row_key"]]
     )
@@ -756,7 +756,7 @@ def test_materialize_rows_default_writer_rejects_line_payload_mismatch(db_sessio
     _set_purchase_odata_config(monkeypatch)
     _, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
-    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    accepted_snapshot = snapshot.payload
     groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
         db_session, accepted_snapshot, [row["row_key"]]
     )
@@ -795,7 +795,7 @@ def test_materialize_rows_default_writer_rejects_duplicate_marker_search_result(
     _set_purchase_odata_config(monkeypatch)
     _, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
-    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    accepted_snapshot = snapshot.payload
     groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
         db_session, accepted_snapshot, [row["row_key"]]
     )
@@ -831,7 +831,7 @@ def test_materialize_rows_default_writer_rejects_marker_recovery_ambiguity(db_se
     _set_purchase_odata_config(monkeypatch)
     _, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
-    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    accepted_snapshot = snapshot.payload
     groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
         db_session, accepted_snapshot, [row["row_key"]]
     )

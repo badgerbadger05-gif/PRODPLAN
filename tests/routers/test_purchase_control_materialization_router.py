@@ -185,7 +185,7 @@ def _accept_generation(db, generation: models.LedgerGeneration):
     db.flush()
 
 
-def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, dict]:
+def _build_multi_run_current_payload(db) -> tuple[models.LedgerGeneration, dict]:
     generation, item, _supplier = _accepted_generation(db)
     _add_buy_run(
         db,
@@ -252,11 +252,11 @@ def client(db_session):
         yield test_client
 
 
-def _snapshot_first_row(snapshot: models.PlanningReadSnapshot) -> dict:
-    rows = snapshot.payload.get("rows")
-    assert isinstance(rows, list) and rows, "snapshot rows are required"
+def _current_first_row(snapshot: dict) -> dict:
+    rows = snapshot.get("rows")
+    assert isinstance(rows, list) and rows, "current rows are required"
     row = dict(rows[0])
-    assert isinstance(row.get("slices"), list) and row["slices"], "snapshot rows should include replenishment slices"
+    assert isinstance(row.get("slices"), list) and row["slices"], "current rows should include replenishment slices"
     for bucket in row["slices"]:
         assert bucket.get("work_item_id") is not None
     return row
@@ -278,7 +278,7 @@ def _current_purchase_selection(db):
 
 
 def test_materialize_endpoint_dry_run_preview(client, db_session):
-    generation, _snapshot = _build_multi_run_snapshot(db_session)
+    generation, _payload = _build_multi_run_current_payload(db_session)
     manifest, current_row = _current_purchase_selection(db_session)
 
     response = client.post(
@@ -300,7 +300,7 @@ def test_materialize_endpoint_dry_run_preview(client, db_session):
 
 
 def test_selection_summary_endpoint_reports_missing_accounting_price(client, db_session):
-    _generation, _snapshot = _build_multi_run_snapshot(db_session)
+    _generation, _payload = _build_multi_run_current_payload(db_session)
     manifest, current_row = _current_purchase_selection(db_session)
 
     response = client.post(
@@ -342,7 +342,7 @@ def test_materialize_endpoint_returns_not_configured_when_materializer_missing(
 
     monkeypatch.setattr(purchase_control_router_module, "materialize_rows", _missing_writer)
 
-    _generation, _snapshot = _build_multi_run_snapshot(db_session)
+    _generation, _payload = _build_multi_run_current_payload(db_session)
     manifest, current_row = _current_purchase_selection(db_session)
 
     response = client.post(
@@ -360,7 +360,7 @@ def test_materialize_endpoint_returns_not_configured_when_materializer_missing(
 
 
 def test_materialize_endpoint_rejects_empty_current_selection(client, db_session):
-    _generation, _snapshot = _build_multi_run_snapshot(db_session)
+    _generation, _payload = _build_multi_run_current_payload(db_session)
     manifest, _current_row = _current_purchase_selection(db_session)
 
     response = client.post(

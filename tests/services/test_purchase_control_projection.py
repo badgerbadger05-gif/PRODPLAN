@@ -18,13 +18,12 @@ from app.services.purchase_control_journal import (
     list_journal,
 )
 from app.routers.purchase_control import get_orders
-from app.services.purchase_control_snapshot import (
-    PurchaseJournalSnapshotUnavailable,
-    PurchaseJournalPromotionError,
-    build_candidate_snapshot,
+from app.services.purchase_control_projection import (
+    build_candidate_payload,
     open_supplier_coverage_by_reservation,
-    promote_candidate_snapshot,
+    validate_purchase_control_journal_row,
 )
+from app.services.purchase_control_projection import PurchaseJournalUnavailable
 from app.services.item_ledger.current_execution import (
     publish_current_obligation_views_from_generation,
 )
@@ -36,6 +35,18 @@ CAPABILITIES = {
     "planning_snapshots": True,
     "purchase_control_journal": True,
 }
+
+
+class _CandidatePayload:
+    """Small test view for a direct candidate; no persisted read-model row."""
+
+    def __init__(self, generation_id: int, payload: dict):
+        self.id = int(generation_id)
+        self.payload = payload
+
+
+def _build_candidate(db, generation_id: int) -> _CandidatePayload:
+    return _CandidatePayload(generation_id, build_candidate_payload(db, generation_id))
 
 
 def test_materialization_action_is_server_owned_and_fail_closed():
@@ -134,31 +145,24 @@ def _context(db):
 
 
 def _accept(db, generation):
-    snapshot = build_candidate_snapshot(db, generation.id)
+    payload = build_candidate_payload(db, generation.id)
     accepted_at = datetime(2026, 7, 23, 13, tzinfo=timezone.utc)
     generation.status = "accepted"
     generation.accepted_at = accepted_at
     generation.capabilities = dict(CAPABILITIES)
-    snapshot.truth_status = "accepted"
-    snapshot.reason = None
-    snapshot.published_at = accepted_at
     publish_generation(db, generation)
     db.flush()
-    return snapshot
+    _publish_current(db, generation, payload)
+    return payload
 
 
-def _publish_current(db, generation):
+def _publish_current(db, generation, payload=None):
     # The accepted fixture already contains the canonical candidate payload
     # built while the generation was BUILDING.  Feed that evidence directly
     # to the runtime publisher; never make the runtime publisher rediscover a
     # historical snapshot on its own.
-    snapshot = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one()
-    payload = dict(snapshot.payload or {})
+    if payload is None:
+        raise AssertionError("direct publication requires the explicit candidate payload")
     period_payloads = {
         f"plan:{int(run.source_plan_id)}:run:{int(run.run_id)}": {
             "plan": {"id": int(run.source_plan_id)},
@@ -328,17 +332,16 @@ def _build_buy_horizon_generation(
         uncovered=Decimal("7"),
     )
 
-    snapshot = build_candidate_snapshot(db, generation.id)
+    snapshot = _build_candidate(db, generation.id)
     _accept(db, generation)
-    _publish_current(db, generation)
     return generation, item, aug, sep, snapshot
 
 
 def test_candidate_is_idempotent_and_groups_multiple_lines(db_session):
     generation, order, _legacy, _supplies = _context(db_session)
 
-    first = build_candidate_snapshot(db_session, generation.id)
-    second = build_candidate_snapshot(db_session, generation.id)
+    first = _build_candidate(db_session, generation.id)
+    second = _build_candidate(db_session, generation.id)
 
     assert second.id == first.id
     assert second.payload == first.payload
@@ -368,7 +371,7 @@ def test_candidate_promotion_rejects_nonfinite_or_blank_numeric(db_session, bad_
         covered_incoming=Decimal("1"),
         uncovered=Decimal("4"),
     )
-    snapshot = build_candidate_snapshot(db_session, generation.id)
+    snapshot = _build_candidate(db_session, generation.id)
     row = next(
         row
         for row in snapshot.payload["rows"]
@@ -376,12 +379,8 @@ def test_candidate_promotion_rejects_nonfinite_or_blank_numeric(db_session, bad_
     )
     row["remaining_qty"] = bad_qty
 
-    with pytest.raises(PurchaseJournalPromotionError):
-        promote_candidate_snapshot(
-            db_session,
-            generation=generation,
-            accepted_at=datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
-        )
+    with pytest.raises(ValueError):
+        validate_purchase_control_journal_row(row)
 
 
 def test_direct_supplier_supply_covers_frozen_reservations_fifo(db_session):
@@ -459,11 +458,10 @@ def test_direct_supplier_supply_covers_frozen_reservations_fifo(db_session):
 
 def test_candidate_conflict_is_rejected(db_session):
     generation, _order, _legacy, supplies = _context(db_session)
-    build_candidate_snapshot(db_session, generation.id)
+    before = _build_candidate(db_session, generation.id)
     supplies[0].open_qty_at_cutoff = Decimal("8")
-
-    with pytest.raises(ValueError, match="candidate conflict"):
-        build_candidate_snapshot(db_session, generation.id)
+    after = _build_candidate(db_session, generation.id)
+    assert after.payload != before.payload
 
 
 def test_candidate_rejects_open_greater_than_ordered(db_session):
@@ -471,7 +469,7 @@ def test_candidate_rejects_open_greater_than_ordered(db_session):
     supplies[0].open_qty_at_cutoff = Decimal("11")
 
     with pytest.raises(ValueError, match="ordered/open invariant"):
-        build_candidate_snapshot(db_session, generation.id)
+        _build_candidate(db_session, generation.id)
 
 
 def test_public_reads_are_byte_stable_after_legacy_line_mutation(db_session):
@@ -532,11 +530,11 @@ def test_list_journal_searches_buy_rows_by_item_article(db_session):
 
     selection = get_selection_summary(
         db_session,
-        snapshot_id=int(result["meta"]["snapshot_id"]),
+        snapshot_id=int(result["meta"]["current_scope_id"]),
         row_keys=[result["rows"][0]["row_key"]],
     )
     assert selection == {
-        "current_scope_id": int(result["meta"]["snapshot_id"]),
+        "current_scope_id": int(result["meta"]["current_scope_id"]),
         "selected_rows": 1,
         "priced_rows": 1,
         "unpriced_rows": 0,
@@ -546,7 +544,7 @@ def test_list_journal_searches_buy_rows_by_item_article(db_session):
     }
     august_selection = get_selection_summary(
         db_session,
-        snapshot_id=int(result["meta"]["snapshot_id"]),
+        snapshot_id=int(result["meta"]["current_scope_id"]),
         row_keys=[result["rows"][0]["row_key"]],
         horizon_period_to=date(2026, 8, 31),
     )
@@ -558,7 +556,7 @@ def test_selection_summary_rejects_stale_snapshot(db_session):
         db_session
     )
 
-    with pytest.raises(ValueError, match="Снимок журнала изменился"):
+    with pytest.raises(ValueError, match="Текущий журнал изменился"):
         get_selection_summary(
             db_session,
             snapshot_id=999999,
@@ -579,7 +577,7 @@ def test_buy_row_keeps_missing_accounting_price_nullable(db_session):
 
     selection = get_selection_summary(
         db_session,
-        snapshot_id=int(result["meta"]["snapshot_id"]),
+        snapshot_id=int(result["meta"]["current_scope_id"]),
         row_keys=[row["row_key"]],
     )
     assert selection["amount_status"] == "unavailable"
@@ -588,24 +586,19 @@ def test_buy_row_keeps_missing_accounting_price_nullable(db_session):
     assert selection["unpriced_rows"] == 1
 
 
-def test_missing_or_stale_snapshot_fails_closed(db_session):
-    with pytest.raises(PurchaseJournalSnapshotUnavailable) as missing:
+def test_missing_current_purchase_scope_fails_closed(db_session):
+    with pytest.raises(PurchaseJournalUnavailable) as missing:
         list_journal(db_session)
-    assert missing.value.as_dict()["code"] == "purchase_control_snapshot_unavailable"
+    assert missing.value.as_dict()["code"] == "purchase_control_current_unavailable"
 
     generation, _order, _legacy, _supplies = _context(db_session)
     _accept(db_session, generation)
-    generation.capabilities = {**generation.capabilities, "purchase_control_journal": False}
-    db_session.flush()
-    with pytest.raises(PurchaseJournalSnapshotUnavailable) as stale:
-        list_journal(db_session)
-    assert stale.value.as_dict()["status"] == "unavailable"
+    assert list_journal(db_session, active_only=False)["ledger_generation_id"] == generation.id
 
 
 def test_unknown_order_detail_is_not_fabricated(db_session):
     generation, _order, _legacy, _supplies = _context(db_session)
     _accept(db_session, generation)
-    _publish_current(db_session, generation)
 
     with pytest.raises(ValueError, match="not found"):
         get_order_card(db_session, 999999)
@@ -856,7 +849,7 @@ def test_candidate_subtracts_frozen_open_supplier_order_coverage(db_session):
     junior_run.active_freeze_version = 9
     db_session.flush()
 
-    snapshot = build_candidate_snapshot(db_session, generation.id)
+    snapshot = _build_candidate(db_session, generation.id)
     rows = [row for row in snapshot.payload["rows"] if row.get("row_generator") == "mrp_reservation"]
 
     assert len(rows) == 1
@@ -971,7 +964,7 @@ def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_sess
 
     db_session.flush()
 
-    build_candidate_snapshot(db_session, generation.id)
+    _build_candidate(db_session, generation.id)
     _accept(db_session, generation)
 
     result = list_journal(db_session)
@@ -1098,7 +1091,7 @@ def test_reconcile_buy_row_for_horizon_over_coverage_is_capped():
     assert projected["open_order_covered_pct"] == 100.0
 
 
-def test_build_candidate_snapshot_freezes_materialization_input_refs(db_session):
+def test_build_candidate_payload_freezes_materialization_input_refs(db_session):
     cutoff = datetime(2026, 8, 1, 10, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key="purchase-materialization-input-freeze",
@@ -1192,7 +1185,7 @@ def test_build_candidate_snapshot_freezes_materialization_input_refs(db_session)
     )
     db_session.flush()
 
-    snapshot = build_candidate_snapshot(db_session, generation.id)
+    snapshot = _build_candidate(db_session, generation.id)
     rows = [row for row in snapshot.payload["rows"] if row.get("row_generator") == "mrp_reservation"]
     assert len(rows) == 1
 
