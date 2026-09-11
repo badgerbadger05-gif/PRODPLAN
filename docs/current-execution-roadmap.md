@@ -1,6 +1,6 @@
 # Roadmap рефакторинга PRODPLAN: движения, основания, текущее исполнение
 
-Дата: 2026-09-10. Ветка: `codex/current-execution-ledger`.
+Дата: 2026-09-11. Ветка: `codex/current-execution-ledger`.
 
 ## 1. Назначение и границы
 
@@ -317,6 +317,18 @@ flowchart TD
 
 Для каждой R-волны в release report записываются: статус, test-first commit, implementation commit, использованные fixtures, команды и результаты, удалённые прежние пути, оставшиеся риски. Статусы: не начато / тесты зафиксированы / реализация / проверка / принято локально. Статус «принято локально» допустим только после её выходного gate.
 
-Следующая конкретная работа: **R11 — полная локальная приёмка и пакет готовности**. R1–R10 уже имеют отдельные локальные evidence sections; R11 проверяет общий финальный gate и не является разрешением на production/deploy.
+## 12. R11 — финальная локальная приёмка
 
-Проект локально завершён, когда приняты R1–R11 и A01–A18, весь обозначенный пользовательский путь работает на целевой модели, старое хранение удалено, миграция и восстановление проверены. Развёртывание R12 — отдельный статус и отдельная команда владельца.
+R11 принято локально после test-first generative/mutation/fault/no-op soak,
+двух одинаковых disposable-schema migration/storage rehearsals, реального
+R2 TestClient API p95, current-publish budgets, frontend build/lint/unit and
+Playwright smoke, PostgreSQL concurrency/migration/restore gates и полного
+локального Python gate. Машиночитаемая матрица
+`config-test/r11_acceptance_budgets.json` хранит A01–A18 со статусом `covered`
+и конкретными nodes; финальный evidence validator не разрешает unsupported
+`passed`, отсутствующие records или нечисловые/нефинитные budget metrics.
+
+R1–R11 локально завершены: целевая current-only модель, удаление старого
+runtime/storage контура, миграция, restore/reclaim и UI/API evidence записаны
+в release report. Это не разрешение production, SSH, OData, 1C, workers,
+deploy или push. R12 не начата и требует отдельной явной команды владельца.

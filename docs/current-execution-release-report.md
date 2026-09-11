@@ -1,6 +1,6 @@
 # Current-execution release report
 
-Дата среза: 2026-09-11. Область: локальные волны R1–R10; R11 ещё не начиналась. Продовые БД, SSH,
+Дата среза: 2026-09-11. Область: локальные волны R1–R11; R12 не разрешена. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
 Follow-up R10 C evidence (2026-09-11): local-only `tools/r10_storage_rehearsal.py`
@@ -24,11 +24,10 @@ No public schema or production system was changed.
 | R8 — барабан, полки и мехцех | принято локально | stable current owner, manifest/readiness handshake, invalidation hooks, PG/MVCC и full gate зелёные |
 | R9 — API, UI и обменные ссылки | принято локально | current-only readers/actions, transport anchors, fail-closed and local API/UI gates зелёные; completion evidence приведено ниже |
 | R10 — миграция и удаление старого контура | принято локально | migrations 20260911_01/02/03, migration/PG/storage/cleanup/full gates зелёные; completion evidence приведено ниже |
-| R11 — полная локальная приёмка | не начато | этот report не является R11 release approval |
+| R11 — полная локальная приёмка | принято локально | generative/no-op/fault, migration/storage, API/UI и полный локальный gate зелёные; evidence приведено ниже |
 
 `принято локально` выставляется только после полного exit gate соответствующей
-волны. R1–R10 приняты локально только после соответствующих локальных exit gates;
-R11 остаётся отдельной полной приёмкой и не начата.
+волны. R1–R11 приняты локально после соответствующих локальных exit gates.
 
 ## R1 evidence
 
@@ -1132,8 +1131,75 @@ pytest -q
 
 ### Residual risks and boundary
 
-R11 remains unstarted: it is the separate full local acceptance/package review,
-including the remaining explicitly non-production UI/Playwright and extended
-fault/recovery matrix. No production database, SSH, OData, 1C, workers, deploy
-or push action was performed. The untracked `current-execution-full-pytest.log`
-was preserved unchanged.
+R11 is the final local acceptance/package review; its evidence is recorded
+below. No production database, SSH, OData, 1C, workers, deploy or push action
+was performed. The untracked `current-execution-full-pytest.log` was preserved
+unchanged.
+
+## R11 evidence — принято локально
+
+R11 completed the final test-first acceptance package on the Windows local
+checkout. The tested implementation/configuration boundary is `a3c6b1ae`
+(this documentation commit follows it). Main-branch drift was integrated in
+chronological order as `00283159` (artifact ignore) and `a4ed78fd` (dead
+material-issues refresh removal).
+
+### Environment and exact gates
+
+* Windows; Python `3.13.7`; Node `22.19.0`; npm `10.9.3`; PostgreSQL
+  `16.15` on the local DSN identity `127.0.0.1:55444/prodplan_r2` as user
+  `r2_user` (password is intentionally omitted from this report).
+* R11/R10 focused gate: `31 passed`.
+* PostgreSQL concurrency/migration/restore gate: `65 passed in 125.36s`.
+* R2 baseline seed `r2-fixed-20260910-v1`: API p95 `6.419ms`.
+* R11 local report: API p95 `5.95ms`, current-publish p95 `4.204ms`, 100
+  no-op repetitions, DML/row/scope/change growth `0`, WAL `32096`, dead tuples
+  `0`, two semantic mutations and two audit changes, final retry no-op.
+* Frontend: `npm run build` passed; `npm run lint` passed; unit `321 passed`,
+  bundle check `3 passed`; Playwright smoke `18 passed`.
+* Full local Python gate: `2194 passed, 30 skipped, 41 warnings in 214.48s`.
+
+### A01–A18 evidence matrix
+
+| ID | Concrete evidence | Result |
+|---|---|---|
+| A01 | `tests/r3/test_r3_runtime_integration.py::test_seed_repeat_100_preserves_one_id_and_identity_mapping` | covered |
+| A02 | `tests/r5/test_r5_correction_returns.py::test_addressed_receipt_precedes_fifo_and_aggregated_purchase_cap_is_respected` | covered |
+| A03 | `tests/r5/test_r5_correction_returns.py::test_decreasing_m1_replays_shared_pool_and_changes_m2_assignment` | covered |
+| A04 | `tests/r3/test_r3_contract.py::test_frozen_basis_has_explicit_generation_provenance` | covered |
+| A05 | `tests/services/test_obligation_refresh_orchestrator.py::test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay` | covered |
+| A06 | `tests/r8/test_r8_postgres_integration.py::test_r8_current_owner_is_atomic_on_two_postgresql_sessions` | covered |
+| A07 | `tests/r4/test_r4_postgres_integration.py::test_two_postgresql_sessions_serialize_current_replenishment_without_double_apply` | covered |
+| A08 | `tests/r9/test_r9_current_obligation_views.py::test_r9_current_obligation_scope_is_fail_closed_when_not_published` | covered |
+| A09 | `tests/r6/test_r6_physical_custody_contract.py::test_conservation_is_role_separate_and_decimal_exact` | covered |
+| A10 | `tests/r6/test_r6_physical_custody_contract.py::test_late_custody_event_is_explicitly_visible_for_baseline_rewind` | covered |
+| A11 | `tests/r8/test_r8_current_execution.py::test_r8_queue_order_is_oldest_first_with_decimal_and_equal_date_tiebreak` | covered |
+| A12 | R9 current GET contract + PostgreSQL atomic visibility + `frontend-erp-shell/tests/smoke/current-execution-path.spec.ts::follows persisted plan → MRP → journal basis → assembly queue links` | covered |
+| A13 | `tests/services/test_one_c_purchase_order_export.py::test_purchase_order_export_recovers_exact_posted_batch_without_duplicate` | covered |
+| A14 | `tests/r8/test_r8_current_execution.py::test_r8_current_owner_is_stable_across_100_noop_recalculations` | covered |
+| A15 | `tests/r10/test_r10_obligation_refresh_compact_checkpoint.py::test_published_retry_reuses_current_scopes_without_saved_read_models` | covered |
+| A16 | `tests/r10/test_r10_legacy_path_cleanup.py::test_operational_rebuild_sql_uses_current_owner_after_head` | covered |
+| A17 | Two identical disposable-schema storage rehearsals with normalized subject-state comparison, plus R10 drop/restore tests | covered |
+| A18 | Fixed pre-measurement budgets, real R2 TestClient API p95, current-publish p95, no-op/WAL/dead-tuple checks | covered |
+
+The machine-readable matrix remains fail-closed: statuses are `covered`, not
+unsupported `passed`; final evidence validation requires concrete node/command/
+outcome/data records and finite numeric A18 budget metrics.
+
+### Retention, warnings and boundary
+
+Business/audit history remains on the owner/legal horizon with no automatic
+deletion. Technical task/debug records retain for 30 days after terminal
+incident closure. Migration control copies retain for 90 days after owner
+sign-off and verified restore read-back. All deletion is explicit and owner
+approved; no automatic deletion is enabled.
+
+The public-contour contamination incident found during early rehearsal was
+cleaned by exact predicates; the final R11 disposable-schema sentinel proof
+remained unchanged at zero. Remaining warnings are noncritical React `act`
+warnings and Python deprecation warnings. Cross-platform screenshots reuse the
+reviewed Linux baseline with Windows `maxDiffPixelRatio=0.10`; semantic smoke
+assertions remain exact.
+
+R12 is a separate owner command and is not authorized by this report. No
+production DB, SSH, OData, 1C, workers, deploy or push action is implied.
