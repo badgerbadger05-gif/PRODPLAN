@@ -41,6 +41,11 @@ def _schema(engine):
             "ledger_generation_id INTEGER NOT NULL, truth_status TEXT NOT NULL)"
         ))
         connection.execute(text(
+            "CREATE TABLE planning_run ("
+            "run_id INTEGER PRIMARY KEY, source_plan_id INTEGER, "
+            "ledger_generation_id INTEGER, status TEXT NOT NULL)"
+        ))
+        connection.execute(text(
             "CREATE TABLE current_execution_scope ("
             "id INTEGER PRIMARY KEY, entity_kind TEXT NOT NULL, scope_key TEXT NOT NULL, "
             "source_generation_id INTEGER, source_revision TEXT NOT NULL, "
@@ -71,11 +76,15 @@ def _seed_truth(engine, *, generation_id=7, status="accepted", pointer=None):
             text("INSERT INTO planning_truth_state (id, current_generation_id) VALUES (1, :id)"),
             {"id": generation_id if pointer is None else pointer},
         )
+        connection.execute(text(
+            "INSERT INTO planning_run (run_id, source_plan_id, ledger_generation_id, status) "
+            "VALUES (41, 7, :generation_id, 'FIXED_SNAPSHOT')"
+        ), {"generation_id": generation_id})
         evidence = (
             (1, "production_control_journal", "journal:v1"),
             (2, "purchase_control_journal", "journal:v1"),
-            (3, "mrp_result", "run:41:v1"),
-            (4, "period_plan_execution", "plan:7:run:41"),
+            (3, "mrp_result", "run:41"),
+            (4, "period_plan_execution", "plan=7;run=41"),
         )
         for evidence_id, consumer, snapshot_key in evidence:
             connection.execute(text(
@@ -196,6 +205,27 @@ def test_missing_obligation_source_evidence_blocks_before_publisher_and_dml(monk
         assert connection.execute(text("SELECT count(*) FROM current_execution_scope")).scalar_one() == 0
         assert connection.execute(text("SELECT count(*) FROM current_execution_row")).scalar_one() == 0
         assert connection.execute(text("SELECT count(*) FROM current_execution_change")).scalar_one() == 0
+
+
+def test_near_match_snapshot_key_does_not_satisfy_exact_run_source(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE planning_read_snapshot SET snapshot_key = 'run:41:v1' "
+            "WHERE consumer = 'mrp_result'"
+        ))
+
+    called = []
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        lambda session, generation_id: called.append(generation_id),
+    )
+
+    with pytest.raises(PreflightBlocked, match="mrp_result"):
+        apply_current_obligation_migration(engine, writers_stopped=True)
+    assert called == []
 
 
 def test_partial_failure_rolls_back_scopes_rows_and_changes(monkeypatch):
