@@ -398,8 +398,22 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
     require_exact("production_control_journal", "journal:v1")
     require_exact("purchase_control_journal", "journal:v1")
 
-    def require_scoped(consumer: str, prefixes: list[str], applicable: list[str]) -> None:
+    def require_scoped(consumer: str, applicable: list[str] | None) -> None:
         candidates = by_consumer.get(consumer, [])
+        if applicable is None:
+            # A minimal policy schema has no run/plan catalog from which to
+            # derive applicability.  It must still provide one unambiguous
+            # accepted source rather than allowing an empty publisher result.
+            if len(candidates) != 1:
+                raise PreflightBlocked(
+                    f"source evidence for {consumer} is missing or ambiguous "
+                    f"(accepted matches={len(candidates)})"
+                )
+            evidence[consumer] = {
+                "applicable": [str(candidates[0]["snapshot_key"])],
+                "snapshot_ids": [int(candidates[0]["id"])],
+            }
+            return
         if not applicable:
             # A database with no fixed runs/plans has a legitimately empty
             # obligation scope; no fabricated empty source is accepted.
@@ -410,8 +424,7 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
         for key in applicable:
             matches = [
                 row for row in candidates
-                if any(str(row.get("snapshot_key") or "").startswith(prefix) for prefix in prefixes)
-                and str(row.get("snapshot_key") or "").startswith(key)
+                if str(row.get("snapshot_key") or "") == key
             ]
             if len(matches) != 1:
                 missing.append(key)
@@ -429,17 +442,17 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
     if "planning_run" not in table_names:
         # Minimal policy schemas must explicitly stub evidence rather than
         # allowing a publisher to manufacture empty current scopes.
-        require_scoped("mrp_result", ["run:"], ["run:"])
-        require_scoped("period_plan_execution", ["plan:"], ["plan:"])
+        require_scoped("mrp_result", None)
+        require_scoped("period_plan_execution", None)
     else:
-        run_keys = [f"run:{int(row['run_id'])}:" for row in fixed_runs]
+        run_keys = [f"run:{int(row['run_id'])}" for row in fixed_runs]
         plan_keys = sorted({
-            f"plan:{int(row['source_plan_id'])}:"
+            f"plan={int(row['source_plan_id'])};run={int(row['run_id'])}"
             for row in fixed_runs
             if row.get("source_plan_id") is not None
         })
-        require_scoped("mrp_result", ["run:"], run_keys)
-        require_scoped("period_plan_execution", ["plan:"], plan_keys)
+        require_scoped("mrp_result", run_keys)
+        require_scoped("period_plan_execution", plan_keys)
 
     return {
         "status": "ready",
