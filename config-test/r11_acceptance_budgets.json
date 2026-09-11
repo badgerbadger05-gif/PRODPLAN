@@ -39,7 +39,7 @@
     "A14": {"status": "planned", "node": "tests/r8/test_r8_current_execution.py::test_r8_current_owner_is_stable_across_100_noop_recalculations"},
     "A15": {"status": "planned", "node": "tests/r10/test_r10_obligation_refresh_compact_checkpoint.py::test_published_retry_reuses_current_scopes_without_saved_read_models"},
     "A16": {"status": "planned", "node": "tests/r10/test_r10_legacy_path_cleanup.py::test_operational_rebuild_sql_uses_current_owner_after_head"},
-    "A17": {"status": "planned", "nodes": ["tests/r10/test_r10_storage_rehearsal.py::test_storage_rehearsal_restores_subject_values_and_reclaims_dropped_relations", "tests/r10/test_r10_planning_read_drop.py::test_empty_database_drop_is_idempotent_and_downgrade_is_irreversible"]},
+    "A17": {"status": "planned", "nodes": ["tests/r10/test_r10_storage_rehearsal.py::test_storage_rehearsal_restores_subject_values_and_reclaims_dropped_relations", "tests/r10/test_r10_planning_read_drop.py::test_empty_database_drop_is_idempotent_and_downgrade_is_irreversible", "tests/r11/test_r11_final_acceptance_contract.py::test_a17_runs_two_rehearsals_and_compares_normalized_subject_state"]},
     "A18": {"status": "planned", "nodes": ["tests/r11/test_r11_local_acceptance.py::test_report_compares_fixed_budgets", "tests/r11/test_r11_final_acceptance_contract.py::test_api_measurement_uses_real_r2_baseline_probe"]}
   }
 }

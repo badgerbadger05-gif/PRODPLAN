@@ -13,6 +13,8 @@
       "category": "technical_debug",
       "purpose": "Support incident diagnosis without becoming a second business read model.",
       "retention": "Short, operator-defined window documented with the incident; extend only while an incident remains open.",
+      "retention_days_after_closure": 30,
+      "retention_trigger": "30 days after terminal incident closure",
       "deletion_condition": "After incident closure and confirmation that no audit or reproducibility evidence depends on the record.",
       "automatic_deletion": false
     },
@@ -20,6 +22,8 @@
       "category": "migration_control_copy",
       "purpose": "Provide an offline pre/post migration and restore control copy during the cutover decision window.",
       "retention": "Until post-cutover verification, restore rehearsal, and owner sign-off are complete.",
+      "retention_days_after_signoff": 90,
+      "retention_trigger": "90 days after owner sign-off and verified restore read-back",
       "deletion_condition": "Explicit owner-approved deletion only after verified current subject values and restore evidence.",
       "automatic_deletion": false
     }

@@ -119,11 +119,14 @@ def test_final_evidence_requires_configured_nodes_and_passed_records():
 def test_final_evidence_requires_finite_budget_metrics_for_a18():
     from tools.r11_local_acceptance import validate_final_evidence
 
-    node = _budget()["acceptance_matrix"]["A18"]["nodes"][0]
+    nodes = _budget()["acceptance_matrix"]["A18"]["nodes"]
     with pytest.raises(ValueError, match="budget"):
         validate_final_evidence(
             {"matrix": _planned_or_passed_matrix(
-                A18={"status": "passed", "results": [{"node": node, "command": "pytest", "outcome": "passed", "data": {"ok": True}}]}
+                A18={"status": "passed", "results": [
+                    {"node": node, "command": "pytest", "outcome": "passed", "data": {"ok": True}}
+                    for node in nodes
+                ]}
             )},
             budget_path=BUDGET_PATH,
         )

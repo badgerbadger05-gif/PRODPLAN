@@ -745,6 +745,8 @@ def compare_budget(metrics: Mapping[str, Any], *, budget_path: str | Path = DEFA
             values[key] = float(metrics[key])
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{key} must be numeric") from exc
+        if isinstance(metrics[key], bool) or not math.isfinite(values[key]):
+            raise ValueError(f"{key} must be finite numeric")
     checks = {
         "api_p95_ms": "api_p95_ms" in values and values["api_p95_ms"] <= float(budget["api_p95_ms"]),
         "current_publish_p95_ms": "current_publish_p95_ms" in values and values["current_publish_p95_ms"] <= float(budget["current_publish_p95_ms"]),
@@ -756,6 +758,7 @@ def validate_final_evidence(
     evidence: Mapping[str, Any], *, budget_path: str | Path = DEFAULT_BUDGET_PATH
 ) -> dict[str, Any]:
     """Validate a final evidence packet without granting unsupported passes."""
+    budget_document = _load_budget(budget_path)
     expected = {f"A{i:02d}" for i in range(1, 19)}
     matrix = evidence.get("matrix")
     if not isinstance(matrix, Mapping) or set(matrix) != expected:
@@ -769,7 +772,30 @@ def validate_final_evidence(
             raise ValueError(f"{key} evidence status is invalid")
         if status == "passed":
             results = entry.get("results")
-            if not isinstance(results, list) or not results or any(not item for item in results):
+            configured = budget_document["acceptance_matrix"][key]
+            configured_nodes = set(configured.get("nodes", [configured.get("node")]))
+            if not isinstance(results, list) or not results:
                 raise ValueError(f"{key} is marked passed without concrete results")
+            seen_nodes: set[str] = set()
+            for result in results:
+                if not isinstance(result, Mapping):
+                    raise ValueError(f"{key} result must be a record")
+                node = result.get("node")
+                if node not in configured_nodes:
+                    raise ValueError(f"{key} result node is not configured")
+                if not result.get("command") or result.get("outcome") != "passed":
+                    raise ValueError(f"{key} result requires command and outcome=passed")
+                if not isinstance(result.get("data"), Mapping) or not result["data"]:
+                    raise ValueError(f"{key} result requires concrete data")
+                seen_nodes.add(node)
+            if seen_nodes != configured_nodes:
+                raise ValueError(f"{key} does not cover all configured nodes")
+            if key == "A18":
+                metrics = entry.get("budget_metrics")
+                if not isinstance(metrics, Mapping):
+                    raise ValueError("A18 requires budget metrics")
+                comparison = compare_budget(metrics, budget_path=budget_path)
+                if not comparison["within_budget"]:
+                    raise ValueError("A18 budget evidence is missing or outside budget")
             passed.append(key)
     return {"valid": True, "passed": passed, "planned_or_blocked": sorted(expected - set(passed))}
