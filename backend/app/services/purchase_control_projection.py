@@ -19,7 +19,6 @@ from app.services.planning_truth import (
     CAPABILITY_PURCHASE_CONTROL_JOURNAL,
     CAPABILITY_RESERVATION_REPLAY,
     PlanningTruthUnavailable,
-    get_latest_read_snapshot,
     get_truth_state,
 )
 from app.services.odata_config import load_odata_config as _load_odata_config
@@ -57,7 +56,7 @@ _RU_MONTHS = {
 }
 
 
-class PurchaseJournalSnapshotUnavailable(RuntimeError):
+class PurchaseJournalUnavailable(RuntimeError):
     def __init__(self, detail: dict[str, Any]):
         self.detail = detail
         super().__init__(detail["reason"])
@@ -69,7 +68,7 @@ class PurchaseJournalSnapshotUnavailable(RuntimeError):
 def _unavailable(db: Session, reason: str, truth: dict[str, Any] | None = None):
     state = get_truth_state(db)
     detail = {
-        "code": "purchase_control_snapshot_unavailable",
+        "code": "purchase_control_current_unavailable",
         "consumer": CONSUMER,
         "status": "unavailable",
         "truth_status": state.status,
@@ -79,7 +78,7 @@ def _unavailable(db: Session, reason: str, truth: dict[str, Any] | None = None):
     }
     if truth:
         detail["truth"] = jsonable_encoder(truth)
-    return PurchaseJournalSnapshotUnavailable(detail)
+    return PurchaseJournalUnavailable(detail)
 
 
 def validate_purchase_control_journal_buy_row(row: Any) -> None:
@@ -1077,138 +1076,7 @@ def build_candidate_payload(db: Session, generation_id: int) -> dict[str, Any]:
     return payload
 
 
-def build_candidate_snapshot(db: Session, generation_id: int) -> models.PlanningReadSnapshot:
-    """Persist purchase evidence for historical/worker consumers.
-
-    Runtime current publication uses :func:`build_candidate_payload` directly;
-    this wrapper remains only for immutable snapshot evidence and migration
-    compatibility.
-    """
-    generation = db.get(models.LedgerGeneration, int(generation_id))
-    if generation is None or generation.status != "building" or generation.cutoff is None:
-        raise ValueError("purchase journal candidate requires BUILDING Ledger generation")
-    payload = build_candidate_payload(db, generation_id)
-    existing = db.query(models.PlanningReadSnapshot).filter_by(
-        consumer=CONSUMER,
-        snapshot_key=SNAPSHOT_KEY,
-        ledger_generation_id=generation.id,
-    ).one_or_none()
-
-    if existing is not None:
-        if existing.payload != payload or existing.truth_status != "building":
-            raise ValueError("purchase journal candidate conflict")
-        return existing
-
-    snapshot = models.PlanningReadSnapshot(
-        consumer=CONSUMER,
-        snapshot_key=SNAPSHOT_KEY,
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="building",
-        reason="unpublished Ledger-native purchase journal",
-        payload=payload,
-        published_at=datetime.now(timezone.utc),
-    )
-    db.add(snapshot)
-    db.flush()
-    return snapshot
 
 
-class PurchaseJournalPromotionError(RuntimeError):
-    """The journal candidate is not fit to become readable truth."""
 
 
-def promote_candidate_snapshot(
-    db: Session,
-    *,
-    generation: models.LedgerGeneration,
-    accepted_at: datetime,
-) -> models.PlanningReadSnapshot | None:
-    """Turn this generation's BUILDING journal candidate into accepted truth.
-
-    ``build_candidate_snapshot`` always writes a candidate, and readers only
-    accept ``truth_status='accepted'``, so a path that accepts a generation
-    without promoting leaves the purchase journal permanently unavailable.  The
-    obligation refresh publisher does this inline; the physical refresh path
-    needs the same step, so the guards live here rather than being written twice
-    from memory.  Returns ``None`` when the generation has no candidate.
-    """
-    candidate = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == CONSUMER,
-        models.PlanningReadSnapshot.snapshot_key == SNAPSHOT_KEY,
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "building",
-        models.PlanningReadSnapshot.cutoff == generation.cutoff,
-    ).one_or_none()
-    if candidate is None:
-        return None
-
-    payload = candidate.payload if isinstance(candidate.payload, dict) else None
-    meta = payload.get("meta") if isinstance(payload, dict) else None
-    rows = payload.get("rows") if isinstance(payload, dict) else None
-    cards = payload.get("cards") if isinstance(payload, dict) else None
-    if (
-        not isinstance(meta, dict)
-        or meta.get("read_only") is not True
-        or meta.get("fact_source") != "ledger"
-        or int(meta.get("ledger_generation_id") or -1) != int(generation.id)
-        or not isinstance(rows, list)
-        or not isinstance(cards, dict)
-    ):
-        raise PurchaseJournalPromotionError(
-            "purchase control journal candidate is missing or stale"
-        )
-
-    seen: set[str] = set()
-    for row in rows:
-        try:
-            validate_purchase_control_journal_row(row)
-            key = str(row["row_key"])
-        except (KeyError, TypeError) as exc:
-            raise PurchaseJournalPromotionError(
-                "purchase control journal row is malformed"
-            ) from exc
-        except ValueError as exc:
-            raise PurchaseJournalPromotionError(
-                "purchase control journal row violates the Ledger fact contract"
-            ) from exc
-        if key in seen:
-            raise PurchaseJournalPromotionError(
-                "purchase control journal row violates the Ledger fact contract"
-            )
-        seen.add(key)
-
-    candidate.truth_status = "accepted"
-    candidate.reason = None
-    candidate.published_at = accepted_at
-    db.flush()
-    return candidate
-
-
-def read_snapshot(db: Session) -> dict[str, Any]:
-    try:
-        snapshot = get_latest_read_snapshot(
-            db,
-            consumer=CONSUMER,
-            snapshot_key=SNAPSHOT_KEY,
-            required_capabilities=REQUIRED,
-        )
-    except PlanningTruthUnavailable as exc:
-        raise _unavailable(db, str(exc), exc.as_dict()) from exc
-
-    if snapshot is None or not isinstance(snapshot.payload, dict) or not isinstance(snapshot.payload.get("rows"), list):
-        raise _unavailable(db, "No purchase control journal snapshot for current accepted Ledger")
-
-    result = dict(snapshot.payload)
-    meta = dict(result.get("meta") or {})
-    meta.update(
-        {
-            "snapshot_id": snapshot.id,
-            "ledger_generation": snapshot.ledger_generation_id,
-            "cutoff": snapshot.cutoff.isoformat(),
-            "truth_status": snapshot.truth_status,
-            "truth_reason": snapshot.reason,
-        }
-    )
-    result["meta"] = meta
-    return result

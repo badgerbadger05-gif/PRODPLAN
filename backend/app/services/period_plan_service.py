@@ -3336,7 +3336,7 @@ def _build_execution_snapshot_rows(
         )
         .all()
     )
-    from .purchase_control_snapshot import open_supplier_coverage_by_reservation
+    from .purchase_control_projection import open_supplier_coverage_by_reservation
 
     open_purchase_by_reservation, _open_purchase_slices = (
         open_supplier_coverage_by_reservation(

@@ -16,7 +16,8 @@ from app.routers.purchase_control import router as purchase_control_router
 from app.services import planning_truth
 from app.services import purchase_control_materialization as pcm
 from app.routers import purchase_control as purchase_control_router_module
-from app.services.purchase_control_snapshot import build_candidate_snapshot
+from app.services.purchase_control_projection import build_candidate_payload
+from app.services import purchase_control_projection as pcp
 from app.services.item_ledger.current_execution import (
     load_current_execution_rows,
     publish_current_obligation_views_from_generation,
@@ -49,7 +50,7 @@ def _materialization_purchase_odata_config(monkeypatch):
         lambda: config,
     )
     monkeypatch.setattr(
-        pcm.purchase_control_snapshot,
+        pcp,
         "_load_odata_config",
         lambda: config,
     )
@@ -175,21 +176,16 @@ def _add_buy_run(
     return reservation, planning_run, work_item
 
 
-def _accept_generation_snapshot(
-    db, generation: models.LedgerGeneration, snapshot: models.PlanningReadSnapshot
-):
+def _accept_generation(db, generation: models.LedgerGeneration):
     accepted_at = generation.cutoff + timedelta(hours=1)
     generation.status = "accepted"
     generation.accepted_at = accepted_at
     generation.capabilities = dict(CAPABILITIES)
-    snapshot.truth_status = "accepted"
-    snapshot.reason = None
-    snapshot.published_at = accepted_at
     planning_truth.publish_generation(db, generation)
     db.flush()
 
 
-def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.PlanningReadSnapshot]:
+def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, dict]:
     generation, item, _supplier = _accepted_generation(db)
     _add_buy_run(
         db,
@@ -214,8 +210,8 @@ def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.Plann
         uncovered=Decimal("7"),
     )
 
-    snapshot = build_candidate_snapshot(db, generation.id)
-    _accept_generation_snapshot(db, generation, snapshot)
+    payload = build_candidate_payload(db, generation.id)
+    _accept_generation(db, generation)
     period_payloads = {
         f"plan:{int(run.source_plan_id)}:run:{int(run.run_id)}": {
             "plan": {"id": int(run.source_plan_id)},
@@ -235,12 +231,12 @@ def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.Plann
     publish_current_obligation_views_from_generation(
         db,
         generation.id,
-        purchase_payload=dict(snapshot.payload or {}),
+        purchase_payload=payload,
         production_payload={"rows": [], "meta": {"row_count": 0}},
         mrp_payloads={},
         period_payloads=period_payloads,
     )
-    return generation, snapshot
+    return generation, payload
 
 
 @pytest.fixture()

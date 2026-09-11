@@ -8,7 +8,7 @@ from app import models
 from app.services.planning_truth import PlanningTruthUnavailable
 from app.services.production_control_journal import list_journal as production_journal
 from app.services.purchase_control_journal import list_journal as purchase_journal
-from app.services.purchase_control_snapshot import PurchaseJournalSnapshotUnavailable
+from app.services.purchase_control_projection import PurchaseJournalUnavailable
 
 
 def _generation(db, key: str):
@@ -70,23 +70,14 @@ def test_purchase_journal_uses_only_exact_published_generation_and_fixed_plan(db
         "planning_snapshots": True,
         "purchase_control_journal": True,
     }
-    db_session.add(models.PlanningReadSnapshot(
-        consumer="purchase_control_journal",
-        snapshot_key="journal:v1",
-        ledger_generation_id=current.id,
-        cutoff=current.cutoff,
-        truth_status="accepted",
-        reason=None,
-        payload={
-            "meta": {
-                "ledger_generation_id": current.id,
-                "fact_source": "ledger",
-                "read_only": True,
-            },
-            "rows": [],
-            "cards": {},
-        },
-        published_at=current.accepted_at,
+    db_session.add(models.CurrentExecutionScope(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        source_generation_id=current.id,
+        source_revision=f"accepted:g{current.id}:purchase_control_journal",
+        result_ready=True,
+        content_hash="p" * 64,
+        summary={"run_ids": [], "cards": {}},
     ))
     db_session.commit()
 
@@ -97,7 +88,7 @@ def test_purchase_journal_uses_only_exact_published_generation_and_fixed_plan(db
 
 
 def test_purchase_journal_is_explicitly_unavailable_without_published_pointer(db_session):
-    with pytest.raises(PurchaseJournalSnapshotUnavailable, match="No Item Ledger generation"):
+    with pytest.raises(PurchaseJournalUnavailable, match="manifest is missing"):
         purchase_journal(db_session)
 
 

@@ -23,7 +23,7 @@ from app.services.item_ledger.future_supply_capture import (
 from app.services.item_ledger.reservation_consumption_persistence import (
     materialize_reservation_consumption_allocations,
 )
-from app.services.purchase_control_snapshot import (
+from app.services.purchase_control_projection import (
     CONSUMER as PURCHASE_JOURNAL_CONSUMER,
     SNAPSHOT_KEY as PURCHASE_JOURNAL_SNAPSHOT_KEY,
 )

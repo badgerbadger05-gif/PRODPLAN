@@ -39,8 +39,7 @@ from app.services.one_c_purchase_order_export import (
 )
 from app.services.odata_client import OData1CClient
 from app.services.planning_truth import PlanningTruthUnavailable
-from . import purchase_control_snapshot  # compatibility namespace; current writes never read snapshots
-from .purchase_control_snapshot import validate_purchase_control_journal_buy_row
+from .purchase_control_projection import validate_purchase_control_journal_buy_row
 
 
 class PurchaseControlMaterializationError(ValueError):
@@ -860,7 +859,7 @@ def _build_request_payload(
     ledger_generation_id: int,
 ) -> dict[str, Any]:
     return {
-        "source": "purchase_control_snapshot",
+        "source": "purchase_control_projection",
         "current_scope_id": int(snapshot.get("meta", {}).get("current_scope_id") or 0),
         "snapshot_ledger_generation": int(ledger_generation_id),
         "request_hash": _payload_hash(
@@ -1672,7 +1671,7 @@ def materialize_rows(
 class PurchaseControlSnapshotUnavailable(RuntimeError):
     def __init__(self, reason: str):
         self.detail = {
-            "code": "purchase_control_snapshot_unavailable",
+            "code": "purchase_control_current_unavailable",
             "reason": reason,
             "consumer": "purchase_control_journal",
         }

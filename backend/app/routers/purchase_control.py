@@ -22,7 +22,7 @@ from ..services.purchase_control_journal import (
     list_filters,
     list_journal,
 )
-from ..services.purchase_control_snapshot import PurchaseJournalSnapshotUnavailable
+from ..services.purchase_control_projection import PurchaseJournalUnavailable
 from ..services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
@@ -297,7 +297,7 @@ def get_orders(
                 "summary": saved_summary,
                 "meta": saved,
         }
-    except PurchaseJournalSnapshotUnavailable as e:
+    except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "purchase_control_current_unavailable", "reason": str(e)})
@@ -324,7 +324,7 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
         if isinstance(cards, dict) and str(int(order_id)) in cards:
             return {**dict(cards[str(int(order_id))]), "meta": saved}
         raise ValueError(f"Supplier order {order_id} card is not published in current purchase journal")
-    except PurchaseJournalSnapshotUnavailable as e:
+    except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "purchase_control_current_unavailable", "reason": str(e)})
@@ -374,7 +374,7 @@ def get_filters(db: Session = Depends(get_db)):
             "suppliers": [{"supplier_id": value, "supplier_name": name} for value, name in suppliers],
             "states": states,
         }
-    except PurchaseJournalSnapshotUnavailable as e:
+    except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "purchase_control_current_unavailable", "reason": str(e)})
@@ -410,7 +410,7 @@ def summarize_purchase_control_selection(
         result["current_identities"] = identities
         result["source_revision"] = str(manifest.source_revision)
         return result
-    except PurchaseJournalSnapshotUnavailable as e:
+    except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -443,7 +443,7 @@ def materialize_purchase_control_rows(
         )
     except PurchaseControlSnapshotUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail)
-    except PurchaseJournalSnapshotUnavailable as e:
+    except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
     except PurchaseControlMaterializerNotConfigured as e:
         raise HTTPException(

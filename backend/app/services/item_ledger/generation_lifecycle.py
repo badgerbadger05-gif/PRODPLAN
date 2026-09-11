@@ -61,7 +61,7 @@ from .live_plan_scope import (
     sealed_generation_lineage_ids,
 )
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
-from app.services.purchase_control_snapshot import (
+from app.services.purchase_control_projection import (
     build_candidate_payload as build_purchase_journal_payload,
 )
 from app.services.production_control_journal_snapshot import (

@@ -1,17 +1,57 @@
-"""Read-only facade over the immutable purchase-control snapshot."""
+"""Read-only facade over the accepted current purchase-control projection."""
 from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
 from app.services.item_ledger.reservation import replenishment_execution_pct
-from .purchase_control_snapshot import read_snapshot
+from .item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    get_current_execution_scope,
+    load_current_execution_rows,
+    require_current_execution_scope,
+)
+from .purchase_control_projection import PurchaseJournalUnavailable, _unavailable
 
 _EPS = 1e-9
 _BUY_ROW_GENERATOR = "mrp_reservation"
+
+
+def _current_payload(db: Session) -> Dict[str, Any]:
+    """Read one coherent accepted current scope, including valid empty runs."""
+    try:
+        scope = require_current_execution_scope(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+    except CurrentExecutionUnavailable as exc:
+        raise _unavailable(db, str(exc)) from exc
+    rows = load_current_execution_rows(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    summary = dict(scope.summary or {})
+    meta = dict(summary.get("meta") or summary)
+    meta.update({
+        "current_scope_id": int(scope.id),
+        "ledger_generation": scope.source_generation_id,
+        "source_revision": scope.source_revision,
+        "truth_status": "accepted",
+    })
+    public_rows = [dict(row.payload or {}) for row in rows]
+    cards = summary.get("cards") if isinstance(summary.get("cards"), dict) else {}
+    return {"rows": public_rows, "cards": cards, "meta": meta}
+
+
+def _current_scope_id(db: Session) -> int:
+    return int(require_current_execution_scope(
+        db, entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
+    ).id)
 
 
 def _to_float(value: Any) -> float:
@@ -135,10 +175,9 @@ def get_selection_summary(
     horizon_period_to: Optional[date] = None,
 ) -> Dict[str, Any]:
     """Aggregate a selected set using the canonical purchase-row rules."""
-    snapshot = read_snapshot(db)
-    meta = dict(snapshot.get("meta") or {})
-    if int(meta.get("snapshot_id") or 0) != int(snapshot_id):
-        raise ValueError("Снимок журнала изменился; обновите страницу и повторите выбор")
+    snapshot = _current_payload(db)
+    if int(snapshot["meta"].get("current_scope_id") or 0) != int(snapshot_id):
+        raise ValueError("Текущий журнал изменился; обновите страницу и повторите выбор")
 
     return _selection_summary_from_rows(
         rows=snapshot.get("rows") or [],
@@ -155,7 +194,7 @@ def _selection_summary_from_rows(
     row_keys: Sequence[str],
     horizon_period_to: Optional[date] = None,
 ) -> Dict[str, Any]:
-    """Shared selection summary for snapshot compatibility and current rows."""
+    """Shared selection summary for current rows."""
 
     unique_keys = list(dict.fromkeys(str(key or "").strip() for key in row_keys))
     if not unique_keys or any(not key for key in unique_keys):
@@ -243,7 +282,7 @@ def _sum_to_order_by_period(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return ordered
 
 def list_filters(db: Session) -> Dict[str, Any]:
-    snapshot = read_snapshot(db)
+    snapshot = _current_payload(db)
     rows = snapshot["rows"]
     cards = snapshot.get("cards") or {}
     suppliers = sorted(
@@ -278,8 +317,8 @@ def list_filters(db: Session) -> Dict[str, Any]:
 
 
 def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
-    """Filter only the current immutable purchase-journal snapshot."""
-    snapshot = read_snapshot(db)
+    """Filter only the accepted current purchase-journal projection."""
+    snapshot = _current_payload(db)
     rows = [dict(row) for row in snapshot["rows"]]
     meta = dict(snapshot.get("meta") or {})
     run_ids = [int(v) for v in meta.get("run_ids", []) if v is not None]
@@ -393,6 +432,6 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
 
 
 def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) -> Dict[str, Any]:
-    snapshot = read_snapshot(db); card = (snapshot.get("cards") or {}).get(str(int(order_id)))
-    if card is None: raise ValueError(f"Supplier order {order_id} not found in current purchase journal snapshot")
+    snapshot = _current_payload(db); card = (snapshot.get("cards") or {}).get(str(int(order_id)))
+    if card is None: raise ValueError(f"Supplier order {order_id} not found in current purchase journal")
     return {**card, "meta": snapshot["meta"]}
