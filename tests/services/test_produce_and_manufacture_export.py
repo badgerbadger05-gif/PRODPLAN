@@ -1093,6 +1093,12 @@ def test_uncertain_manufacture_create_recovers_by_durable_origin_without_second_
     assert len(fake.posts) == 1
     assert second["manufactures_created"] == 0
     assert second["manufactures_already_linked"] == 1
+    pull = db.query(models.StockRecorderPull).filter_by(
+        recorder_type=exporter.MANUFACTURE_ENTITY,
+        recorder_ref=fake.ref_key,
+    ).one()
+    assert pull.status == "pending"
+    assert pull.source == "manufacture_export"
 
     link = db.query(SyncLink).filter_by(
         source_doctype="manufacture",

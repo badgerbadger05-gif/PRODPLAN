@@ -57,6 +57,7 @@ from .one_c_export_common import (
     find_sync_link as _find_sync_link,
     find_document_by_origin as _find_document_by_origin,
     origin_token as _origin_token,
+    payload_hash as _payload_hash,
     post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
@@ -110,6 +111,21 @@ def _entry_origin_token(entry: ManufactureExportEntry) -> str:
             "qty": float(entry.qty),
         },
     )
+
+
+def _enqueue_manufacture_readback(db: Session, ref_key: str) -> None:
+    """Queue accepted-ledger read-back without doing OData on the action path."""
+    try:
+        from .item_ledger.ingest import enqueue_recorder_pull
+
+        enqueue_recorder_pull(
+            db,
+            MANUFACTURE_ENTITY,
+            ref_key,
+            source="manufacture_export",
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[item-ledger] enqueue pull failed for {MANUFACTURE_ENTITY} {ref_key}: {exc}")
 
 
 def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
@@ -801,6 +817,7 @@ def export_manufactures_to_1c(
         return summary
 
     client = _create_odata_client(config, OData1CClient)
+    _inherit_structural_units_from_parent_order(client, eligible)
 
     # The create response may be lost after 1C accepted the document. Recover
     # by the durable origin marker before any new POST, then persist the link.
@@ -820,10 +837,15 @@ def export_manufactures_to_1c(
         entry.target_ref_key = ref_key
         entry.reason = "найден существующий документ 1С по prodplan-origin"
         _post_document_operational(client, entity=MANUFACTURE_ENTITY, ref_key=ref_key)
+        existing_link = _existing_link(db, entry.manufacture_id)
         _upsert_link(
             db,
             entry=entry,
-            payload_hash="recovered-by-origin",
+            payload_hash=(
+                str(existing_link.payload_hash)
+                if existing_link is not None and existing_link.payload_hash
+                else _payload_hash(_build_header_payload(entry, config))
+            ),
             target_ref_key=ref_key,
             status="success",
             last_error=None,
@@ -835,6 +857,7 @@ def export_manufactures_to_1c(
         m_row.exported_ref1c = ref_key
         m_row.exported_at = datetime.now(timezone.utc)
         m_row.export_error = None
+        _enqueue_manufacture_readback(db, ref_key)
         recovered.append(entry)
     if recovered:
         already_linked.extend(recovered)
@@ -842,7 +865,6 @@ def export_manufactures_to_1c(
     eligible = pending
     summary["manufactures_already_linked"] = len(already_linked)
     summary["manufactures_eligible"] = len(eligible)
-    _inherit_structural_units_from_parent_order(client, eligible)
 
     # Pre-flight: refuse exports whose component write-off cannot be covered
     # by the live 1C balance of the material unit. Catches PRODPLAN/1C ledger
@@ -877,12 +899,7 @@ def export_manufactures_to_1c(
         # pull-by-document for the just-posted Document_СборкаЗапасов. NEVER let
         # this raise into the export flow — the reconcile Balance-sweep (inc3) is
         # the safety net. No OData here: enqueue only writes a 'pending' row.
-        try:
-            from .item_ledger.ingest import enqueue_recorder_pull
-
-            enqueue_recorder_pull(db, MANUFACTURE_ENTITY, ref_key, source="manufacture_export")
-        except Exception as _exc:  # noqa: BLE001
-            print(f"[item-ledger] enqueue pull failed for {MANUFACTURE_ENTITY} {ref_key}: {_exc}")
+        _enqueue_manufacture_readback(db, ref_key)
 
     def _mark_error(entry: ManufactureExportEntry, error: str) -> None:
         m_row = (
