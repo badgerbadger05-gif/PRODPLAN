@@ -344,6 +344,110 @@ def _accepted_truth_generation(engine: Engine) -> int:
     return int(pointer)
 
 
+def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any]:
+    """Verify legacy obligation evidence before invoking the current writer.
+
+    Empty *rows* are valid input, but an absent/unaccepted source snapshot is
+    not.  MRP and period evidence is scoped to fixed runs/plans when those
+    tables are available; the small policy-test schema instead must provide at
+    least one accepted source snapshot for each consumer.
+    """
+
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "planning_read_snapshot" not in table_names:
+        raise PreflightBlocked("legacy obligation source planning_read_snapshot is absent")
+
+    with engine.connect() as connection:
+        all_rows = connection.execute(text(
+            "SELECT id, consumer, snapshot_key, truth_status "
+            "FROM planning_read_snapshot WHERE ledger_generation_id = :generation_id "
+            "ORDER BY consumer, snapshot_key, id"
+        ), {"generation_id": int(generation_id)}).mappings().all()
+
+        fixed_runs: list[dict[str, Any]] = []
+        if "planning_run" in table_names:
+            fixed_runs = [dict(row) for row in connection.execute(text(
+                "SELECT run_id, source_plan_id FROM planning_run "
+                "WHERE ledger_generation_id = :generation_id AND status = 'FIXED_SNAPSHOT' "
+                "ORDER BY run_id"
+            ), {"generation_id": int(generation_id)}).mappings().all()]
+
+    accepted = [row for row in all_rows if str(row.get("truth_status") or "") == "accepted"]
+    by_consumer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in accepted:
+        by_consumer[str(row["consumer"])].append(dict(row))
+
+    evidence: dict[str, Any] = {}
+
+    def require_exact(consumer: str, snapshot_key: str) -> None:
+        matches = [
+            row for row in by_consumer.get(consumer, [])
+            if str(row.get("snapshot_key") or "") == snapshot_key
+        ]
+        if len(matches) != 1:
+            raise PreflightBlocked(
+                f"source evidence for {consumer}/{snapshot_key} is missing or ambiguous "
+                f"(accepted matches={len(matches)})"
+            )
+        evidence[consumer] = {
+            "applicable": [snapshot_key],
+            "snapshot_ids": [int(matches[0]["id"])],
+        }
+
+    require_exact("production_control_journal", "journal:v1")
+    require_exact("purchase_control_journal", "journal:v1")
+
+    def require_scoped(consumer: str, prefixes: list[str], applicable: list[str]) -> None:
+        candidates = by_consumer.get(consumer, [])
+        if not applicable:
+            # A database with no fixed runs/plans has a legitimately empty
+            # obligation scope; no fabricated empty source is accepted.
+            evidence[consumer] = {"applicable": [], "snapshot_ids": []}
+            return
+        selected: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for key in applicable:
+            matches = [
+                row for row in candidates
+                if any(str(row.get("snapshot_key") or "").startswith(prefix) for prefix in prefixes)
+                and str(row.get("snapshot_key") or "").startswith(key)
+            ]
+            if len(matches) != 1:
+                missing.append(key)
+            else:
+                selected.append(matches[0])
+        if missing:
+            raise PreflightBlocked(
+                f"source evidence for {consumer} is missing or ambiguous for {missing}"
+            )
+        evidence[consumer] = {
+            "applicable": list(applicable),
+            "snapshot_ids": sorted(int(row["id"]) for row in selected),
+        }
+
+    if "planning_run" not in table_names:
+        # Minimal policy schemas must explicitly stub evidence rather than
+        # allowing a publisher to manufacture empty current scopes.
+        require_scoped("mrp_result", ["run:"], ["run:"])
+        require_scoped("period_plan_execution", ["plan:"], ["plan:"])
+    else:
+        run_keys = [f"run:{int(row['run_id'])}:" for row in fixed_runs]
+        plan_keys = sorted({
+            f"plan:{int(row['source_plan_id'])}:"
+            for row in fixed_runs
+            if row.get("source_plan_id") is not None
+        })
+        require_scoped("mrp_result", ["run:"], run_keys)
+        require_scoped("period_plan_execution", ["plan:"], plan_keys)
+
+    return {
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "consumers": evidence,
+    }
+
+
 def _postflight_on_session(session: Session, generation_id: int) -> dict[str, Any]:
     """Validate current scopes/rows while the publication transaction is held."""
 
@@ -440,6 +544,7 @@ def apply_current_obligation_migration(
     if publish_current_obligation_views_from_generation is None:
         raise PreflightBlocked("canonical current obligation publisher is unavailable")
 
+    source_evidence = _source_evidence_report(engine, generation_id)
     before_changes = _count_changes(engine)
     publisher_result: Any = None
     with Session(engine, autoflush=False, expire_on_commit=False) as session:
@@ -455,6 +560,7 @@ def apply_current_obligation_migration(
         "status": "ready",
         "generation_id": int(generation_id),
         "preflight": manifest,
+        "source_evidence": source_evidence,
         "postflight": postflight,
         "publisher_consumers": sorted(str(key) for key in (publisher_result or {})),
         "change_rows_before": before_changes,
