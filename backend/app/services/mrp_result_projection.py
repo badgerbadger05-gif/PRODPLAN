@@ -19,11 +19,13 @@ from app import models
 from app.services import planning_service
 from app.services.item_ledger.live_plan_scope import (
     sealed_generation_lineage_ids,
+    sealed_run_anchor,
 )
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PLANNING_SNAPSHOTS,
     get_readiness,
+    require_accepted_truth,
 )
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
@@ -269,7 +271,14 @@ def build_mrp_result_current_payload(
             raise ValueError("fixed run is not bound to an accepted Ledger generation")
         if run.ledger_cutoff != generation.cutoff:
             raise ValueError("fixed run cutoff differs from the accepted Ledger cutoff")
-        _validate_obligation_lineage(db, int(run.run_id), int(generation.id))
+        truth = require_accepted_truth(
+            db,
+            CONSUMER,
+            required_capabilities=REQUIRED_CAPABILITIES,
+        )
+        current_generation = _accepted_generation(db, int(truth.generation_id))
+        sealed_run_anchor(db, run, current_generation)
+        _validate_obligation_lineage(db, int(run.run_id), int(current_generation.id))
     else:
         raise ValueError("MRP current payload requires a fixed or building run")
 
