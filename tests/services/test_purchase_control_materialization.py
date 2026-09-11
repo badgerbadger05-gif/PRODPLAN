@@ -15,7 +15,7 @@ from app.services import planning_truth
 from app.services import purchase_control_materialization as pcm
 from app.services.purchase_control_materialization import (
     PurchaseControlMaterializationError,
-    materialize_rows,
+    materialize_rows as _materialize_rows_impl,
 )
 from app.services.purchase_control_snapshot import build_candidate_snapshot
 
@@ -189,7 +189,74 @@ def _accept_generation_snapshot(db, generation: models.LedgerGeneration, snapsho
     snapshot.published_at = accepted_at
     planning_truth.publish_generation(db, generation)
     db.flush()
+    _publish_current_purchase_fixture(db, generation, snapshot)
     return accepted_at, snapshot.id
+
+
+def _publish_current_purchase_fixture(
+    db,
+    generation: models.LedgerGeneration,
+    snapshot: models.PlanningReadSnapshot,
+) -> models.CurrentExecutionScope:
+    """Expose worker evidence through the current-only materialization contract."""
+    manifest = (
+        db.query(models.CurrentExecutionScope)
+        .filter_by(
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        .one_or_none()
+    )
+    if manifest is None:
+        manifest = models.CurrentExecutionScope(
+            id=int(snapshot.id),
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        db.add(manifest)
+    else:
+        # Each fixture has one current scope.  Repoint it to the newly
+        # accepted evidence before exercising the current writer.
+        manifest.id = int(snapshot.id)
+    manifest.source_generation_id = int(generation.id)
+    manifest.source_revision = f"accepted:g{int(generation.id)}:purchase_control_journal"
+    manifest.result_ready = True
+    manifest.content_hash = "p" * 64
+    manifest.summary = dict((snapshot.payload or {}).get("meta") or {})
+    db.flush()
+    return manifest
+
+
+def materialize_rows(
+    db,
+    *,
+    snapshot_id,
+    row_keys,
+    dry_run=False,
+    materializer=None,
+    **kwargs,
+):
+    """Adapt immutable worker fixtures to the current persisted read model."""
+    snapshot = db.get(models.PlanningReadSnapshot, int(snapshot_id))
+    manifest = (
+        db.query(models.CurrentExecutionScope)
+        .filter_by(
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        .one()
+    )
+    rows = list((snapshot.payload or {}).get("rows") or []) if snapshot is not None else []
+    return _materialize_rows_impl(
+        db,
+        snapshot_id=int(snapshot_id),
+        row_keys=row_keys,
+        dry_run=dry_run,
+        materializer=materializer,
+        current_manifest=manifest,
+        current_rows=rows,
+        **kwargs,
+    )
 
 
 def _stale_generation_fixture(db):
@@ -237,6 +304,7 @@ def _stale_generation_fixture(db):
     db.flush()
     planning_truth.publish_generation(db, current_generation)
     db.flush()
+    _publish_current_purchase_fixture(db, current_generation, stale_snapshot)
 
     return current_generation, stale_snapshot, old_reservation
 
