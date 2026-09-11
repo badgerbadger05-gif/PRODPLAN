@@ -36,6 +36,11 @@ def _schema(engine):
             "id INTEGER PRIMARY KEY, status TEXT NOT NULL)"
         ))
         connection.execute(text(
+            "CREATE TABLE planning_read_snapshot ("
+            "id INTEGER PRIMARY KEY, consumer TEXT NOT NULL, snapshot_key TEXT NOT NULL, "
+            "ledger_generation_id INTEGER NOT NULL, truth_status TEXT NOT NULL)"
+        ))
+        connection.execute(text(
             "CREATE TABLE current_execution_scope ("
             "id INTEGER PRIMARY KEY, entity_kind TEXT NOT NULL, scope_key TEXT NOT NULL, "
             "source_generation_id INTEGER, source_revision TEXT NOT NULL, "
@@ -66,6 +71,21 @@ def _seed_truth(engine, *, generation_id=7, status="accepted", pointer=None):
             text("INSERT INTO planning_truth_state (id, current_generation_id) VALUES (1, :id)"),
             {"id": generation_id if pointer is None else pointer},
         )
+        evidence = (
+            (1, "production_control_journal", "journal:v1"),
+            (2, "purchase_control_journal", "journal:v1"),
+            (3, "mrp_result", "run:41:v1"),
+            (4, "period_plan_execution", "plan:7:run:41"),
+        )
+        for evidence_id, consumer, snapshot_key in evidence:
+            connection.execute(text(
+                "INSERT INTO planning_read_snapshot "
+                "(id, consumer, snapshot_key, ledger_generation_id, truth_status) "
+                "VALUES (:id, :consumer, :snapshot_key, :generation_id, 'accepted')"
+            ), {
+                "id": evidence_id, "consumer": consumer, "snapshot_key": snapshot_key,
+                "generation_id": generation_id,
+            })
 
 
 def _publish_all(session, generation_id: int, *, duplicate=False):
@@ -152,6 +172,30 @@ def test_unknown_manifest_blocks_before_publisher(monkeypatch):
     with pytest.raises(PreflightBlocked, match="unknown"):
         apply_current_obligation_migration(engine, writers_stopped=True)
     assert called == []
+
+
+def test_missing_obligation_source_evidence_blocks_before_publisher_and_dml(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "DELETE FROM planning_read_snapshot WHERE consumer = 'purchase_control_journal'"
+        ))
+
+    called = []
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        lambda session, generation_id: called.append(generation_id),
+    )
+
+    with pytest.raises(PreflightBlocked, match="purchase_control_journal"):
+        apply_current_obligation_migration(engine, writers_stopped=True)
+    assert called == []
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM current_execution_scope")).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM current_execution_row")).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM current_execution_change")).scalar_one() == 0
 
 
 def test_partial_failure_rolls_back_scopes_rows_and_changes(monkeypatch):
