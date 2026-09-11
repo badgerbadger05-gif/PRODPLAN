@@ -216,7 +216,30 @@ def _build_multi_run_snapshot(db) -> tuple[models.LedgerGeneration, models.Plann
 
     snapshot = build_candidate_snapshot(db, generation.id)
     _accept_generation_snapshot(db, generation, snapshot)
-    publish_current_obligation_views_from_generation(db, generation.id)
+    period_payloads = {
+        f"plan:{int(run.source_plan_id)}:run:{int(run.run_id)}": {
+            "plan": {"id": int(run.source_plan_id)},
+            "run_id": int(run.run_id),
+            "truth_status": "accepted",
+            "summary": {},
+            "plan_output_rows": [],
+            "facets": {},
+            "rows": [],
+        }
+        for run in db.query(models.PlanningRun).filter(
+            models.PlanningRun.ledger_generation_id == int(generation.id),
+            models.PlanningRun.status == "FIXED_SNAPSHOT",
+            models.PlanningRun.source_plan_id.isnot(None),
+        ).all()
+    }
+    publish_current_obligation_views_from_generation(
+        db,
+        generation.id,
+        purchase_payload=dict(snapshot.payload or {}),
+        production_payload={"rows": [], "meta": {"row_count": 0}},
+        mrp_payloads={},
+        period_payloads=period_payloads,
+    )
     return generation, snapshot
 
 

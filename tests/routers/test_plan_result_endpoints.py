@@ -33,6 +33,7 @@ from app.services.item_ledger.current_execution import (
     publish_current_obligation_views_from_generation,
 )
 from app.services.mrp_result_snapshot import build_mrp_result_snapshot
+from app.services.mrp_result_snapshot import build_mrp_result_current_payload
 
 
 def _mk_run(db) -> PlanningRun:
@@ -91,7 +92,23 @@ def _publish_result_snapshot(db, run: PlanningRun) -> PlanningReadSnapshot:
     """Build the immutable payload explicitly; HTTP GETs only read it."""
     db.flush()
     snapshot = build_mrp_result_snapshot(db, run.run_id)
-    publish_current_obligation_views_from_generation(db, run.ledger_generation_id)
+    period_payload = {
+        "plan": {"id": int(run.source_plan_id or 1)},
+        "run_id": int(run.run_id),
+        "truth_status": "accepted",
+        "summary": {},
+        "plan_output_rows": [],
+        "facets": {},
+        "rows": [],
+    }
+    publish_current_obligation_views_from_generation(
+        db,
+        run.ledger_generation_id,
+        purchase_payload={"rows": []},
+        production_payload={"rows": [], "meta": {"row_count": 0}},
+        mrp_payloads={str(run.run_id): build_mrp_result_current_payload(db, run.run_id)},
+        period_payloads={f"plan:{int(run.source_plan_id or 1)}:run:{int(run.run_id)}": period_payload},
+    )
     return snapshot
 
 
@@ -134,7 +151,52 @@ def _publish_manual_purchase_snapshot(db, run: PlanningRun, rows: list[dict]) ->
             )
         )
     db.flush()
-    publish_current_obligation_views_from_generation(db, run.ledger_generation_id)
+    current_rows = []
+    for index, source_row in enumerate(rows):
+        payload = dict(source_row)
+        item = db.get(Item, int(payload["item_id"]))
+        payload.setdefault("run_id", int(run.run_id))
+        payload.setdefault("row_kind", "purchase")
+        payload.setdefault("unit", str(payload.get("unit") or (item.unit if item else "шт")))
+        payload.setdefault(
+            "agg_key",
+            f"item:{int(payload['item_id'])}|unit:{str(payload.get('unit') or '')}",
+        )
+        current_rows.append({
+            "current_identity": f"manual:{int(run.run_id)}:purchase:{index}",
+            "payload": payload,
+        })
+    direct_mrp_payload = {
+        "run_id": int(run.run_id),
+        "rows": current_rows,
+        "row_counts": {
+            "production": 0, "purchase": len(current_rows),
+            "rework": 0, "capacity": 0,
+        },
+        "total_qty": {
+            "production": 0.0,
+            "purchase": float(sum(float(row.get("qty") or 0) for row in rows)),
+            "rework": 0.0, "capacity": 0.0,
+        },
+        "summary": {},
+    }
+    period_payload = {
+        "plan": {"id": int(run.source_plan_id or 1)},
+        "run_id": int(run.run_id),
+        "truth_status": "accepted",
+        "summary": {},
+        "plan_output_rows": [],
+        "facets": {},
+        "rows": [],
+    }
+    publish_current_obligation_views_from_generation(
+        db,
+        run.ledger_generation_id,
+        purchase_payload={"rows": []},
+        production_payload={"rows": [], "meta": {"row_count": 0}},
+        mrp_payloads={str(run.run_id): direct_mrp_payload},
+        period_payloads={f"plan:{int(run.source_plan_id or 1)}:run:{int(run.run_id)}": period_payload},
+    )
     return snapshot
 
 

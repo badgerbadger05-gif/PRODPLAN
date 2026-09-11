@@ -120,6 +120,8 @@ def _publish_current(db_session, generation):
         generation.id,
         purchase_payload=_payload(purchase),
         production_payload=_payload(production),
+        mrp_payloads={},
+        period_payloads={},
     )
 
 

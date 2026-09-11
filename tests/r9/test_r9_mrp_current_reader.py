@@ -127,7 +127,7 @@ def publish_current_obligation_views_from_generation(db, generation_id):
     empty = {"rows": [], "meta": {"row_count": 0}}
     return _publish_current_obligation_views_from_generation(
         db, int(generation_id), purchase_payload=empty,
-        production_payload=empty, mrp_payloads=payloads,
+        production_payload=empty, mrp_payloads=payloads, period_payloads={},
     )
 def test_mrp_reader_uses_persisted_current_rows_and_manifest(db_session):
     generation = _generation(db_session)

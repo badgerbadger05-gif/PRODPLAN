@@ -159,12 +159,29 @@ def _publish_current(db, generation):
         models.PlanningReadSnapshot.truth_status == "accepted",
     ).one()
     payload = dict(snapshot.payload or {})
+    period_payloads = {
+        f"plan:{int(run.source_plan_id)}:run:{int(run.run_id)}": {
+            "plan": {"id": int(run.source_plan_id)},
+            "run_id": int(run.run_id),
+            "truth_status": "accepted",
+            "summary": {},
+            "plan_output_rows": [],
+            "facets": {},
+            "rows": [],
+        }
+        for run in db.query(models.PlanningRun).filter(
+            models.PlanningRun.status == "FIXED_SNAPSHOT",
+            models.PlanningRun.source_plan_id.isnot(None),
+            models.PlanningRun.ledger_generation_id == int(generation.id),
+        ).all()
+    }
     publish_current_obligation_views_from_generation(
         db,
         int(generation.id),
         purchase_payload=payload,
         production_payload={"rows": [], "meta": {"row_count": 0}},
         mrp_payloads={},
+        period_payloads=period_payloads,
     )
     db.flush()
 
