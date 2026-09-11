@@ -762,6 +762,7 @@ def export_manufactures_to_1c(
 
     eligible: List[ManufactureExportEntry] = []
     already_linked: List[ManufactureExportEntry] = []
+    recovery_candidates: set[int] = set()
     for entry in entries:
         entry.origin_token = _entry_origin_token(entry)
         link = _existing_link(db, entry.manufacture_id)
@@ -783,6 +784,11 @@ def export_manufactures_to_1c(
             already_linked.append(entry)
             continue
         existing_ref = link_ref or manufacture_ref
+        if link is not None and not link_ref and not manufacture_ref and str(link.status or "") != "success":
+            # Only a prior uncertain attempt with no known 1C reference needs
+            # an origin lookup. Fresh commands must POST directly; known refs
+            # use the existing patch/repair path without a broad lookup.
+            recovery_candidates.add(int(entry.manufacture_id))
         if existing_ref:
             entry.target_ref_key = existing_ref
             entry.unpost_before_patch = True
@@ -824,6 +830,9 @@ def export_manufactures_to_1c(
     recovered: List[ManufactureExportEntry] = []
     pending: List[ManufactureExportEntry] = []
     for entry in eligible:
+        if int(entry.manufacture_id) not in recovery_candidates:
+            pending.append(entry)
+            continue
         document = _find_document_by_origin(
             client,
             entity=MANUFACTURE_ENTITY,
