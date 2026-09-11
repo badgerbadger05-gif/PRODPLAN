@@ -20,11 +20,13 @@ def test_direct_mrp_builder_returns_current_payload_without_snapshot_rows(monkey
         status="FIXED_SNAPSHOT",
         ledger_generation_id=7,
         active_freeze_version=1,
+        ledger_cutoff=None,
     )
+    generation = SimpleNamespace(id=7, status="accepted", cutoff=None)
 
     class FakeDb:
         def get(self, model, key):
-            return run
+            return generation if model is models.LedgerGeneration else run
 
     monkeypatch.setattr(
         mrp_result_projection,
@@ -39,6 +41,7 @@ def test_direct_mrp_builder_returns_current_payload_without_snapshot_rows(monkey
         ("production:item:10:0", "production", 10, "2026-09-01|000000000010|000000000000", rows["production"][0]),
     ])
     monkeypatch.setattr(mrp_result_projection, "_frozen_root_membership", lambda *args, **kwargs: {10: {1}})
+    monkeypatch.setattr(mrp_result_projection, "_validate_obligation_lineage", lambda *args, **kwargs: None)
 
     payload = mrp_result_projection.build_mrp_result_current_payload(FakeDb(), 42)
 
