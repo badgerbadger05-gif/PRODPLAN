@@ -9,10 +9,9 @@ import pytest
 
 from app import models
 from app.routers import plan as plan_router
-from app.services import mrp_result_snapshot
-from app.services.mrp_result_snapshot import (
-    build_mrp_result_candidate_snapshot,
-    build_mrp_result_snapshot,
+from app.services import mrp_result_projection
+from app.services.mrp_result_projection import (
+    build_mrp_result_current_payload,
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )
@@ -20,6 +19,7 @@ from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     _mrp_current_identity,
     publish_current_obligation_views_from_generation,
+    publish_current_mrp_results_from_payloads,
 )
 
 
@@ -135,98 +135,60 @@ def _seal_candidate_manifest(generation, run):
     }
 
 
-def _publish_read_snapshot_with_rows(db_session, run):
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key=f"run:{run.run_id}",
-        ledger_generation_id=run.ledger_generation_id,
-        cutoff=run.ledger_cutoff,
-        truth_status="accepted",
-        payload={
-            "run_id": run.run_id,
-            "row_counts": {"purchase": 3},
-            "total_qty": {"purchase": 12.0},
-        },
-        published_at=datetime.now(timezone.utc),
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-    return snapshot
+class _CurrentPayload:
+    def __init__(self, run, payload):
+        self.id = int(run.run_id)
+        self.cutoff = run.ledger_cutoff
+        self.ledger_generation_id = int(run.ledger_generation_id)
+        self.truth_status = "building" if str(run.status) == "BUILDING_SNAPSHOT" else "accepted"
+        self.payload = payload
+        self.rows = [
+            type("PayloadRow", (), {"payload": row["payload"]})()
+            for row in payload.get("rows", [])
+        ]
 
 
-def _publish_current_mrp(db_session, run):
-    """Promote this test's snapshot rows through the real current writer."""
-    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
-        consumer="mrp_result",
-        snapshot_key=f"run:{int(run.run_id)}",
-    ).all()
-    for snapshot in snapshots:
-        for row in db_session.query(models.PlanningReadRow).filter_by(
-            snapshot_id=int(snapshot.id),
-        ).all():
-            payload = dict(row.payload or {})
-            kind = str(row.row_kind or "").strip().lower()
-            payload.setdefault("run_id", int(run.run_id))
-            payload.setdefault("row_kind", kind)
-            if kind != "capacity":
-                payload.setdefault("unit", "шт")
-            item_id = payload.get("item_id")
-            bucket = (
-                payload.get("bucket_date") or payload.get("need_date")
-                or payload.get("start_date") or payload.get("date") or "2026-01-01"
-            )
-            if kind == "purchase" and item_id is not None:
-                payload.setdefault(
-                    "agg_key", f"item:{int(item_id)}|unit:{str(payload.get('unit') or 'шт')}"
-                )
-            elif kind == "rework" and item_id is not None:
-                payload.setdefault(
-                    "agg_key", f"item:{int(item_id)}|bucket:{bucket}|unit:{str(payload.get('unit') or 'шт')}"
-                )
-            elif kind == "production" and item_id is not None:
-                payload.setdefault(
-                    "agg_key", f"item:{int(item_id)}|start:{bucket}|unit:{str(payload.get('unit') or 'шт')}"
-                )
-            row.payload = payload
-    db_session.flush()
-    generation_ids = {int(snapshot.ledger_generation_id) for snapshot in snapshots}
-    assert len(generation_ids) == 1
-    mrp_payloads = {}
-    for snapshot in snapshots:
-        marker = str(snapshot.snapshot_key).removeprefix("run:").split(":", 1)[0]
-        rows = []
-        for stored in db_session.query(models.PlanningReadRow).filter_by(snapshot_id=int(snapshot.id)).all():
-            payload = dict(stored.payload or {})
-            payload.setdefault("run_id", int(marker))
-            payload.setdefault("row_kind", str(stored.row_kind))
-            payload.setdefault("sort_key", str(stored.sort_key or ""))
-            payload["root_item_ids"] = [
-                int(member.root_item_id)
-                for member in db_session.query(models.PlanningReadRootMember).filter(
-                    models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-                    models.PlanningReadRootMember.row_id == int(stored.id),
-                ).all()
-            ]
-            identity = _mrp_current_identity(payload, run_id=int(marker), row_kind=str(stored.row_kind))
-            rows.append({"current_identity": identity, "payload": payload})
-        manifest = dict(snapshot.payload or {})
-        manifest["run_id"] = int(marker)
-        manifest["row_counts"] = {
-            kind: int((manifest.get("row_counts") or {}).get(kind, 0))
-            for kind in ("production", "purchase", "rework", "capacity")
-        }
-        manifest["total_qty"] = {
-            kind: float((manifest.get("total_qty") or {}).get(kind, 0.0))
-            for kind in ("production", "purchase", "rework", "capacity")
-        }
-        manifest["rows"] = rows
-        mrp_payloads[marker] = manifest
+def _build_current_payload(db_session, run):
+    if not hasattr(run, "run_id"):
+        run = db_session.get(models.PlanningRun, int(run))
+    return _CurrentPayload(run, build_mrp_result_current_payload(db_session, run.run_id))
+
+
+def _publish_current_mrp(db_session, run, candidate=None):
+    candidate = candidate or _build_current_payload(db_session, run)
     empty = {"rows": [], "meta": {"row_count": 0}}
+    truth = db_session.get(models.PlanningTruthState, 1)
+    generation_id = int(truth.current_generation_id) if truth else int(run.ledger_generation_id)
     return publish_current_obligation_views_from_generation(
-        db_session, generation_ids.pop(), purchase_payload=empty,
-        production_payload=empty, mrp_payloads=mrp_payloads, period_payloads={},
+        db_session, generation_id, purchase_payload=empty,
+        production_payload=empty,
+        mrp_payloads={str(run.run_id): candidate.payload}, period_payloads={},
         period_run_ids=[],
     )
+
+
+def _manual_mrp_payload(run, rows):
+    """Build a compact direct payload for reader/export tests."""
+    normalized = []
+    counts = {kind: 0 for kind in ("production", "purchase", "rework", "capacity")}
+    totals = {kind: 0.0 for kind in counts}
+    for index, source in enumerate(rows):
+        payload = dict(source)
+        kind = str(payload.get("row_kind") or "").strip().lower()
+        assert kind in counts
+        payload["run_id"] = int(run.run_id)
+        payload["row_kind"] = kind
+        identity = str(payload.pop("current_identity", f"{kind}:manual:{index}"))
+        normalized.append({"current_identity": identity, "payload": payload})
+        counts[kind] += 1
+        totals[kind] += float(payload.get("qty") or 0)
+    return {
+        "run_id": int(run.run_id),
+        "summary": {},
+        "row_counts": counts,
+        "total_qty": totals,
+        "rows": normalized,
+    }
 
 
 def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session):
@@ -261,10 +223,10 @@ def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session)
         read_mrp_result_rows(
             db_session, run.run_id, row_kind="purchase"
         )
-    assert db_session.query(models.PlanningReadRow).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
-def test_candidate_builder_persists_unpublished_rows_but_current_reads_cannot_see_them(
+def test_candidate_payload_stays_unpublished_until_current_acceptance(
     db_session, monkeypatch
 ):
     accepted = _accepted_generation(db_session)
@@ -272,22 +234,22 @@ def test_candidate_builder_persists_unpublished_rows_but_current_reads_cannot_se
     run, item = _candidate_purchase_run(db_session, candidate_generation)
     _seal_candidate_manifest(candidate_generation, run)
 
-    snapshot = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+    snapshot = _build_current_payload(db_session, run.run_id)
 
     assert snapshot.truth_status == "building"
     assert snapshot.ledger_generation_id == candidate_generation.id
-    assert db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).count() == 1
+    assert len(snapshot.payload["rows"]) == 1
+    assert snapshot.payload["rows"][0]["payload"]["item_id"] == item.item_id
     # A normal GET follows the accepted pointer and must neither see this
     # unpublished generation nor calculate a replacement.
     monkeypatch.setattr(
-        mrp_result_snapshot.planning_service,
+        mrp_result_projection.planning_service,
         "get_run_purchases",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("GET calculated")),
     )
     with pytest.raises(CurrentExecutionUnavailable, match="manifest"):
         read_mrp_result_rows(db_session, run.run_id, row_kind="purchase")
-    stored = db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).one()
-    assert stored.payload["item_id"] == item.item_id
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_candidate_builder_accepts_successor_run_lineage(db_session):
@@ -308,28 +270,24 @@ def test_candidate_builder_accepts_successor_run_lineage(db_session):
     run.prior_run_id = int(predecessor.run_id)
     _seal_candidate_manifest(candidate_generation, run)
 
-    snapshot = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+    snapshot = _build_current_payload(db_session, run.run_id)
 
     assert snapshot.truth_status == "building"
     assert run.prior_run_id == plan.predecessor_run_id == predecessor.run_id
 
 
-def test_candidate_builder_is_idempotent_and_rejects_changed_persisted_snapshot(db_session):
+def test_candidate_payload_is_deterministic_without_persisted_rows(db_session):
     accepted = _accepted_generation(db_session)
     candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
     run, _ = _candidate_purchase_run(db_session, candidate_generation)
     _seal_candidate_manifest(candidate_generation, run)
 
-    first = build_mrp_result_candidate_snapshot(db_session, run.run_id)
-    second = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+    first = _build_current_payload(db_session, run.run_id)
+    second = _build_current_payload(db_session, run.run_id)
 
-    assert second.id == first.id
-    assert db_session.query(models.PlanningReadSnapshot).count() == 1
-    row = db_session.query(models.PlanningReadRow).filter_by(snapshot_id=first.id).one()
-    row.payload = {**row.payload, "qty": 999.0}
-    db_session.flush()
-    with pytest.raises(ValueError, match="conflicts"):
-        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+    assert second.id == first.id == run.run_id
+    assert second.payload == first.payload
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_candidate_builder_rejects_retired_refresh_manifest_action(db_session):
@@ -390,10 +348,10 @@ def test_candidate_builder_rejects_retired_refresh_manifest_action(db_session):
     }
 
     with pytest.raises(ValueError, match="invalid entries"):
-        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
 
-def test_candidate_builder_savepoint_rolls_back_partial_snapshot(db_session, monkeypatch):
+def test_candidate_payload_contains_root_membership_without_persistence(db_session):
     accepted = _accepted_generation(db_session)
     candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
     run, item = _candidate_purchase_run(db_session, candidate_generation)
@@ -412,17 +370,10 @@ def test_candidate_builder_savepoint_rolls_back_partial_snapshot(db_session, mon
     ))
     db_session.flush()
 
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            models,
-            "PlanningReadRootMember",
-            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("membership failed")),
-        )
-        with pytest.raises(RuntimeError, match="membership failed"):
-            build_mrp_result_candidate_snapshot(db_session, run.run_id)
+    payload = _build_current_payload(db_session, run.run_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
-    assert db_session.query(models.PlanningReadRow).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
+    assert payload.payload["rows"][0]["payload"]["root_item_ids"] == [root.item_id]
 
 
 def test_candidate_builder_rejects_missing_or_tampered_sealed_manifest(db_session):
@@ -431,7 +382,7 @@ def test_candidate_builder_rejects_missing_or_tampered_sealed_manifest(db_sessio
     run, _ = _candidate_purchase_run(db_session, candidate_generation)
 
     with pytest.raises(ValueError, match="lacks a sealed"):
-        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
     _seal_candidate_manifest(candidate_generation, run)
     candidate_generation.source_watermarks = {
@@ -439,7 +390,7 @@ def test_candidate_builder_rejects_missing_or_tampered_sealed_manifest(db_sessio
         "obligation_refresh_manifest": {"version": 999, "entries": []},
     }
     with pytest.raises(ValueError, match="hash conflicts"):
-        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
 
 def test_candidate_builder_rejects_rogue_unsealed_building_run(db_session):
@@ -464,7 +415,7 @@ def test_candidate_builder_rejects_rogue_unsealed_building_run(db_session):
     db_session.flush()
 
     with pytest.raises(ValueError, match="missing or extra candidates"):
-        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
 
 def test_builder_publishes_rows_and_frozen_root_membership(
@@ -524,7 +475,7 @@ def test_builder_publishes_rows_and_frozen_root_membership(
     )
     db_session.flush()
 
-    snapshot = build_mrp_result_snapshot(db_session, run.run_id)
+    snapshot = _build_current_payload(db_session, run.run_id)
     _publish_current_mrp(db_session, run)
     result = read_mrp_result_rows(
         db_session,
@@ -575,12 +526,10 @@ def test_builder_publishes_rows_and_frozen_root_membership(
     assert capacity_endpoint["current_identity"] == f"mrp-run:{run.run_id}"
     assert capacity["total"] == 1
     assert capacity["rows"][0]["overload_hours"] == 2.0
-    member = db_session.query(models.PlanningReadRootMember).one()
-    assert member.root_item_id == root.item_id
-    assert member.payload == {"source": "mrp_freeze_component"}
+    assert result["rows"][0]["root_item_ids"] == [root.item_id]
 
 
-def test_snapshot_id_cannot_cross_run_or_generation(db_session):
+def test_current_scope_id_cannot_cross_run_or_generation(db_session):
     generation = _accepted_generation(db_session)
     run_a = models.PlanningRun(
         status="FIXED_SNAPSHOT",
@@ -598,25 +547,16 @@ def test_snapshot_id_cannot_cross_run_or_generation(db_session):
     )
     db_session.add_all([run_a, run_b])
     db_session.flush()
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key=f"run:{run_a.run_id}",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={"run_id": run_a.run_id},
-        published_at=datetime.now(timezone.utc),
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-
     _publish_current_mrp(db_session, run_a)
-    with pytest.raises(CurrentExecutionUnavailable, match="manifest identity does not match"):
+    scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="mrp_result", scope_key="mrp:all-live-plans"
+    ).one()
+    with pytest.raises(CurrentExecutionUnavailable, match="current MRP run is missing"):
         read_mrp_result_rows(
             db_session,
             run_b.run_id,
             row_kind="production",
-            current_scope_id=snapshot.id,
+            current_scope_id=scope.id,
         )
 
 
@@ -651,9 +591,9 @@ def test_builder_rejects_legacy_obligation_without_generation(db_session):
     db_session.flush()
 
     with pytest.raises(ValueError, match="NULL or foreign"):
-        build_mrp_result_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def _physical_refresh_fork(db, parent, *, key, cutoff):
@@ -733,11 +673,12 @@ def test_builder_accepts_a_run_inherited_through_a_physical_refresh(db_session):
         db_session, anchor, key="inherit-child", cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc)
     )
 
-    snapshot = build_mrp_result_snapshot(db_session, run.run_id)
+    snapshot = _build_current_payload(db_session, run.run_id)
 
-    # The snapshot is published at the accepted generation, and it honestly
-    # reports that generation rather than the run's older freeze anchor.
-    assert int(snapshot.ledger_generation_id) == int(child.id)
+    # A physical fact fork does not retarget the frozen obligation. The run
+    # remains anchored to its accepted generation while the fork advances only
+    # the physical pointer.
+    assert int(snapshot.ledger_generation_id) == int(anchor.id)
     _publish_current_mrp(db_session, run)
     manifest = read_mrp_result_manifest(db_session, run.run_id)
     assert manifest["current_identity"] == f"mrp-run:{run.run_id}"
@@ -753,23 +694,21 @@ def test_inherited_obligation_snapshot_is_reused_by_the_next_refresh(db_session)
     first_child = _physical_refresh_fork(
         db_session, anchor, key="reuse-child", cutoff=datetime(2026, 7, 24, tzinfo=timezone.utc)
     )
-    first = build_mrp_result_snapshot(db_session, run.run_id)
-    rows_after_first = db_session.query(models.PlanningReadRow).count()
-
+    first = _build_current_payload(db_session, run.run_id)
     _physical_refresh_fork(
         db_session,
         first_child,
         key="reuse-grandchild",
         cutoff=datetime(2026, 7, 25, tzinfo=timezone.utc),
     )
-    repeated = build_mrp_result_snapshot(db_session, run.run_id)
+    repeated = _build_current_payload(db_session, run.run_id)
 
     assert repeated.id == first.id
-    assert db_session.query(models.PlanningReadSnapshot).count() == 1
-    assert db_session.query(models.PlanningReadRow).count() == rows_after_first
-    # Immutable worker evidence is reused; current publication is a separate
-    # accepted boundary and is not inferred from the later physical pointer.
-    assert first.ledger_generation_id == int(first_child.id)
+    assert repeated.payload == first.payload
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
+    # The current publication remains tied to the obligation's accepted anchor;
+    # it is not inferred from the later physical pointer.
+    assert first.ledger_generation_id == int(anchor.id)
 
 
 def test_builder_rejects_a_run_anchored_outside_the_sealed_lineage(db_session):
@@ -787,9 +726,9 @@ def test_builder_rejects_a_run_anchored_outside_the_sealed_lineage(db_session):
     )
 
     with pytest.raises(ValueError, match="outside the sealed lineage"):
-        build_mrp_result_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_builder_rejects_a_run_whose_cutoff_left_its_anchor(db_session):
@@ -802,10 +741,10 @@ def test_builder_rejects_a_run_whose_cutoff_left_its_anchor(db_session):
     run.ledger_cutoff = child.cutoff
     db_session.flush()
 
-    with pytest.raises(ValueError, match="cutoff differs from the cutoff of"):
-        build_mrp_result_snapshot(db_session, run.run_id)
+    with pytest.raises(ValueError, match="cutoff differs from the accepted Ledger cutoff"):
+        _build_current_payload(db_session, run.run_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_builder_failure_rolls_back_manifest_rows_and_memberships(
@@ -844,14 +783,12 @@ def test_builder_failure_rolls_back_manifest_rows_and_memberships(
         raise RuntimeError("injected root membership failure")
 
     monkeypatch.setattr(
-        mrp_result_snapshot, "_frozen_root_membership", fail_after_manifest_and_rows
+        mrp_result_projection, "_frozen_root_membership", fail_after_manifest_and_rows
     )
     with pytest.raises(RuntimeError, match="injected"):
-        build_mrp_result_snapshot(db_session, run.run_id)
+        _build_current_payload(db_session, run.run_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
-    assert db_session.query(models.PlanningReadRow).count() == 0
-    assert db_session.query(models.PlanningReadRootMember).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).count() == 0
 
 
 def test_purchase_export_reads_shared_snapshot_not_legacy_getter(
@@ -867,39 +804,24 @@ def test_purchase_export_reads_shared_snapshot_not_legacy_getter(
     )
     db_session.add(run)
     db_session.flush()
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key=f"run:{run.run_id}",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={
-            "run_id": run.run_id,
-            "row_counts": {"purchase": 1},
-            "total_qty": {"purchase": 4.0},
-        },
-        published_at=datetime.now(timezone.utc),
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-    db_session.add(
-        models.PlanningReadRow(
-            snapshot_id=snapshot.id,
-            row_key="purchase:one",
-            row_kind="purchase",
-            sort_key="2026-08-01|000000000001|000000000000",
-            payload={
+    _publish_current_mrp(
+        db_session,
+        run,
+        candidate=_CurrentPayload(
+            run,
+            _manual_mrp_payload(run, [{
+                "current_identity": "purchase:one",
+                "row_kind": "purchase",
                 "item_id": 1,
                 "item_name": "Snapshot item",
                 "item_article": "S-1",
                 "qty": 4.0,
                 "unit": "шт.",
                 "bucket_date": "2026-08-01",
-            },
-        )
+                "sort_key": "2026-08-01|000000000001|000000000000",
+            }]),
+        ),
     )
-    db_session.flush()
-    _publish_current_mrp(db_session, run)
 
     def legacy_service_must_not_run(*args, **kwargs):
         raise AssertionError("legacy purchase getter was called")
@@ -941,61 +863,43 @@ def test_grouped_endpoints_read_snapshot_rows_not_legacy_group_getters(
     )
     db_session.add(run)
     db_session.flush()
-    snapshot = models.PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key=f"run:{run.run_id}",
-        ledger_generation_id=generation.id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={
-            "run_id": run.run_id,
-            "row_counts": {"purchase": 1, "rework": 1},
-            "total_qty": {"purchase": 4.0, "rework": 3.0},
-        },
-        published_at=datetime.now(timezone.utc),
-    )
-    db_session.add(snapshot)
-    db_session.flush()
-    db_session.add_all(
-        [
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase:one",
-                row_kind="purchase",
-                sort_key="2026-08-01|000000000001|000000000000",
-                payload={
+    _publish_current_mrp(
+        db_session,
+        run,
+        candidate=_CurrentPayload(
+            run,
+            _manual_mrp_payload(run, [
+                {
+                    "current_identity": "purchase:one",
+                    "row_kind": "purchase",
                     "item_id": 1,
                     "item_name": "Snapshot purchase",
                     "item_article": "P-1",
                     "qty": 4.0,
                     "unit": "шт.",
                     "bucket_date": "2026-08-01",
+                    "sort_key": "2026-08-01|000000000001|000000000000",
                 },
-            ),
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="rework:one",
-                row_kind="rework",
-                sort_key="2026-08-01|000000000002|000000000001",
-                payload={
+                {
+                    "current_identity": "rework:one",
+                    "row_kind": "rework",
                     "item_id": 2,
                     "item_name": "Snapshot rework",
                     "item_article": "R-1",
                     "qty": 3.0,
                     "unit": "шт.",
                     "bucket_date": "2026-08-01",
+                    "sort_key": "2026-08-01|000000000002|000000000001",
                 },
-            ),
-        ]
+            ]),
+        ),
     )
-    db_session.flush()
-    _publish_current_mrp(db_session, run)
 
     calls = {"snapshot_reads": 0}
 
     def _counting_snapshot_reader(*args, **kwargs):
         calls["snapshot_reads"] += 1
-        return mrp_result_snapshot.read_mrp_result_rows(*args, **kwargs)
+        return mrp_result_projection.read_mrp_result_rows(*args, **kwargs)
 
     def _legacy_group_getter_called(*_args, **_kwargs):
         raise AssertionError("legacy grouped getter was called")
@@ -1083,52 +987,45 @@ def test_read_mrp_result_rows_supports_supplier_filter_and_missing_supplier_filt
     db_session.add_all([item_a, item_b, item_c])
     db_session.flush()
 
-    snapshot = _publish_read_snapshot_with_rows(db_session, run)
-    db_session.add_all(
-        [
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase-a",
-                row_kind="purchase",
-                sort_key="2026-01-01|000000000001|000000000000",
-                payload={
+    _publish_current_mrp(
+        db_session,
+        run,
+        candidate=_CurrentPayload(
+            run,
+            _manual_mrp_payload(run, [
+                {
+                    "current_identity": "purchase-a",
+                    "row_kind": "purchase",
                     "item_id": item_a.item_id,
                     "item_name": "A",
                     "supplier_ref1c": "supp-a",
                     "supplier_name": "Поставщик A",
                     "qty": 4,
+                    "sort_key": "2026-01-01|000000000001|000000000000",
                 },
-            ),
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase-b",
-                row_kind="purchase",
-                sort_key="2026-01-01|000000000002|000000000000",
-                payload={
+                {
+                    "current_identity": "purchase-b",
+                    "row_kind": "purchase",
                     "item_id": item_b.item_id,
                     "item_name": "B",
                     "supplier_ref1c": "supp-b",
                     "supplier_name": "   ",
                     "qty": 3,
+                    "sort_key": "2026-01-01|000000000002|000000000000",
                 },
-            ),
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase-c",
-                row_kind="purchase",
-                sort_key="2026-01-02|000000000003|000000000000",
-                payload={
+                {
+                    "current_identity": "purchase-c",
+                    "row_kind": "purchase",
                     "item_id": item_c.item_id,
                     "item_name": "C",
                     "supplier_ref1c": "supp-c",
                     "supplier_name": "",
                     "qty": 5,
+                    "sort_key": "2026-01-02|000000000003|000000000000",
                 },
-            ),
-        ]
+            ]),
+        ),
     )
-    db_session.flush()
-    _publish_current_mrp(db_session, run)
 
     supplier_rows = read_mrp_result_rows(
         db_session,
@@ -1164,52 +1061,45 @@ def test_read_mrp_result_rows_supports_category_filters_and_missing_category(
     db_session.add(run)
     db_session.flush()
 
-    snapshot = _publish_read_snapshot_with_rows(db_session, run)
-    db_session.add_all(
-        [
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase-cat-a",
-                row_kind="purchase",
-                sort_key="2026-01-01|000000000001|000000000000",
-                payload={
+    _publish_current_mrp(
+        db_session,
+        run,
+        candidate=_CurrentPayload(
+            run,
+            _manual_mrp_payload(run, [
+                {
+                    "current_identity": "purchase-cat-a",
+                    "row_kind": "purchase",
                     "item_id": 1,
                     "item_name": "Category A",
                     "category_id": 11,
                     "category_ref1c": "cat-a",
                     "qty": 2,
+                    "sort_key": "2026-01-01|000000000001|000000000000",
                 },
-            ),
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase-cat-b",
-                row_kind="purchase",
-                sort_key="2026-01-01|000000000002|000000000000",
-                payload={
+                {
+                    "current_identity": "purchase-cat-b",
+                    "row_kind": "purchase",
                     "item_id": 2,
                     "item_name": "Category B",
                     "category_id": 12,
                     "category_ref1c": "cat-b",
                     "qty": 4,
+                    "sort_key": "2026-01-01|000000000002|000000000000",
                 },
-            ),
-            models.PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key="purchase-missing-cat",
-                row_kind="purchase",
-                sort_key="2026-01-01|000000000003|000000000000",
-                payload={
+                {
+                    "current_identity": "purchase-missing-cat",
+                    "row_kind": "purchase",
                     "item_id": 3,
                     "item_name": "Missing category",
                     "category_id": None,
                     "category_ref1c": None,
                     "qty": 6,
+                    "sort_key": "2026-01-01|000000000003|000000000000",
                 },
-            ),
-        ]
+            ]),
+        ),
     )
-    db_session.flush()
-    _publish_current_mrp(db_session, run)
 
     category_rows = read_mrp_result_rows(
         db_session,
