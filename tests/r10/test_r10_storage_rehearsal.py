@@ -8,7 +8,11 @@ import re
 
 import pytest
 
-from tools.r10_storage_rehearsal import run_storage_rehearsal
+from tools.r10_storage_rehearsal import (
+    _safe_connection_args,
+    _tool_environment,
+    run_storage_rehearsal,
+)
 
 
 @pytest.mark.integration
@@ -51,3 +55,15 @@ def test_storage_rehearsal_report_contract_is_machine_readable(tmp_path, monkeyp
     # The integration implementation must validate the local DSN itself; this
     # test remains a contract guard even when the local cluster is unavailable.
     assert callable(run_storage_rehearsal)
+
+
+def test_storage_tool_never_embeds_password_in_pg_argv():
+    args, password = _safe_connection_args(
+        "postgresql://r2_user:secret@127.0.0.1:55444/prodplan_r2"
+    )
+    assert password == "secret"
+    assert "secret" not in " ".join(args)
+    environment = _tool_environment(["wsl.exe", "--", "/usr/bin/pg_dump"], password)
+    assert environment is not None
+    assert environment["PGPASSWORD"] == "secret"
+    assert "PGPASSWORD/u" in environment["WSLENV"]

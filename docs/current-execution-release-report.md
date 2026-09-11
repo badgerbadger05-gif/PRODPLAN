@@ -3,6 +3,13 @@
 Дата среза: 2026-09-10. Область: локальные волны R1–R8. Продовые БД, SSH,
 OData, боевые workers, deploy и push не использовались.
 
+Follow-up R10 C evidence (2026-09-11): local-only `tools/r10_storage_rehearsal.py`
+was exercised against the disposable-schema PostgreSQL DSN. The rehearsal
+verified custom-format `pg_dump`/`pg_restore`, SHA-256 and `pg_restore --list`,
+stable current IDs/subject values across `20260911_03`, and non-zero physical
+`pg_total_relation_size` reclaim after dropping the three legacy relations.
+No public schema or production system was changed.
+
 ## Сводка волн
 
 | Волна | Статус на срезе | Доказательство/граница |
