@@ -34,7 +34,7 @@ from app.services.item_ledger.document_net_output import (
 )
 from app.services.item_ledger.physical_visibility import visible_sle_query
 from app.services.item_ledger.recorder_identity import build_recorder_identity_index
-from app.services.item_ledger.assembly_queue_snapshot import materialize_assembly_queue_lines
+from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 
 _STAGE = "assembly_output_allocation"

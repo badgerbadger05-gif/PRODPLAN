@@ -129,7 +129,7 @@ FAULTS = {
     "after_manifest": ("create_obligation_refresh_manifest", True),
     "after_freeze": ("materialize_replenishment_work_items", False),
     "after_work_items": ("replay_candidate_realizations", False),
-    "after_snapshots": ("build_assembly_queue_snapshot", True),
+    "after_materialization": ("materialize_assembly_queue_lines", True),
     "after_snapshot_seal": ("validate_obligation_refresh_build", False),
     "before_publish": ("publish_obligation_refresh_batch", False),
 }

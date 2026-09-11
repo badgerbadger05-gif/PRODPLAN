@@ -629,7 +629,7 @@ def test_snapshot_build_failure_rolls_back_acceptance_atomically(db_session, mon
     ).count() == 0
 
 
-def test_assembly_queue_snapshot_failure_does_not_switch_planning_truth_pointer(
+def test_assembly_queue_materialization_failure_does_not_switch_planning_truth_pointer(
     db_session, monkeypatch
 ):
     anchor_batch = models.PhysicalImportBatch(
@@ -666,17 +666,17 @@ def test_assembly_queue_snapshot_failure_does_not_switch_planning_truth_pointer(
         "assembly-queue-snapshot-rollback",
     )
 
-    def fail_assembly_queue_snapshot(*_args, **_kwargs):
-        raise ValueError("assembly queue snapshot requires a BUILDING generation")
+    def fail_assembly_queue_materialization(*_args, **_kwargs):
+        raise ValueError("assembly queue requires a BUILDING generation")
 
     monkeypatch.setattr(
-        "app.services.item_ledger.generation_lifecycle.build_assembly_queue_snapshot",
-        fail_assembly_queue_snapshot,
+        "app.services.item_ledger.generation_lifecycle.materialize_assembly_queue_lines",
+        fail_assembly_queue_materialization,
     )
 
     with pytest.raises(
         GenerationValidationError,
-        match="planning read snapshot build failed",
+        match="assembly queue materialization failed",
     ):
         accept_generation_build(
             db_session,

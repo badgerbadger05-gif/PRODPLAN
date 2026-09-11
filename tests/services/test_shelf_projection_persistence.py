@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from app import models
-from app.services.item_ledger.assembly_queue_snapshot import (
+from app.services.item_ledger.assembly_queue_materialization import (
     materialize_assembly_queue_lines,
 )
 from app.services.item_ledger.assembly_readiness_persistence import (

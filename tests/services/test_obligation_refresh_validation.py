@@ -315,9 +315,9 @@ def test_orchestrator_refuses_to_publish_a_structurally_broken_candidate(
 ):
     """A corrupted StockBin fold must stop the refresh, not reach the pointer."""
     accepted, _plan, _line, item, _parent, _cutoff = _world(db_session)
-    real_builder = workflow.build_assembly_queue_snapshot
+    real_materializer = workflow.materialize_assembly_queue_lines
 
-    def corrupt_then_build(db, generation_id, *args, **kwargs):
+    def corrupt_then_materialize(db, generation_id, *args, **kwargs):
         db.add(models.StockBin(
             ledger_generation_id=int(generation_id),
             item_id=item.item_id,
@@ -327,9 +327,9 @@ def test_orchestrator_refuses_to_publish_a_structurally_broken_candidate(
             on_hand=Decimal("42"),
         ))
         db.flush()
-        return real_builder(db, generation_id, *args, **kwargs)
+        return real_materializer(db, generation_id, *args, **kwargs)
 
-    monkeypatch.setattr(workflow, "build_assembly_queue_snapshot", corrupt_then_build)
+    monkeypatch.setattr(workflow, "materialize_assembly_queue_lines", corrupt_then_materialize)
 
     with pytest.raises(
         workflow.ObligationRefreshOrchestratorError, match="structurally invalid"

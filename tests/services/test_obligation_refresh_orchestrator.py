@@ -242,7 +242,7 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
         ledger_generation_id=int(result.target_generation_id),
         stage="snapshot_build",
     ).one()
-    assert "assembly_queue_snapshot_id" not in dict(snapshot_batch.metrics or {})
+    assert "assembly_queue_materialization_id" not in dict(snapshot_batch.metrics or {})
     # Current refreshes must not invoke the legacy generation-copy writer;
     # retained obligations stay anchored to their stable run identity.
     assert preserve_flags == []
@@ -491,12 +491,23 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     execution_snapshots = execution_scope.summary["snapshots"]
     assert len(execution_snapshots) == 1
     assert all(row["truth_status"] == "accepted" for row in execution_snapshots.values())
-    queue = db_session.query(models.PlanningReadSnapshot).filter_by(
+    queue_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="assembly_queue",
+        scope_key="assembly:all-live-plans",
+    ).one()
+    assert queue_scope.source_generation_id == target.id
+    assert queue_scope.summary["total_rows"] == 1
+    assert queue_scope.summary["total_queue_qty"] == "5.000"
+    queue_rows = db_session.query(models.CurrentExecutionRow).filter_by(
+        scope_key="assembly:all-live-plans",
+        entity_kind="assembly_queue",
+    ).all()
+    assert len(queue_rows) == 1
+    assert queue_rows[0].payload["assembly_remaining_qty"] == "5.000"
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id,
         consumer="assembly_queue",
-    ).one()
-    assert queue.payload["total_rows"] == 1
-    assert queue.payload["total_queue_qty"] == 5.0
+    ).count() == 0
 
 
 def test_obligation_refresh_publishes_purchase_current_without_purchase_snapshot(

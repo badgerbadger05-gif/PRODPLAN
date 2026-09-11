@@ -16,9 +16,7 @@ from app.services.item_ledger.candidate_realization_replay import (
 from app.services.item_ledger.assembly_output_persistence import (
     materialize_assembly_output_allocations,
 )
-from app.services.item_ledger.assembly_queue_snapshot import (
-    build_assembly_queue_snapshot,
-)
+from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
 from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
 )
@@ -423,9 +421,9 @@ def test_retained_and_candidate_replay_partition_one_sle_and_keep_open_output(
         stock_ledger_entry_id=sle.id,
     ).all()
     assert sum((row.allocated_qty for row in output_allocations), Decimal("0")) == Decimal("5")
-    queue = build_assembly_queue_snapshot(db_session, target.id)
-    assert queue.payload["total_rows"] == 2
-    assert queue.payload["total_queue_qty"] == 15.0
+    queue = materialize_assembly_queue_lines(db_session, target.id)
+    assert len(queue) == 2
+    assert sum((row.assembly_remaining_qty for row in queue), Decimal("0")) == Decimal("15")
 
 
 def test_candidate_replay_rejects_empty_manifest_and_cross_generation_reservation(db_session):

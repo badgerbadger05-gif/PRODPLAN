@@ -21,7 +21,7 @@ from app.services.production_material_custody_projection import (
 )
 from app.services.production_control_material_issues import _source_warehouse_options
 
-from .assembly_queue_snapshot import materialize_assembly_queue_lines
+from .assembly_queue_materialization import materialize_assembly_queue_lines
 from .assembly_readiness_core import (
     FrozenBomEdge,
     ReadinessCurveLine,

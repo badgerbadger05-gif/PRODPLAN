@@ -17,6 +17,8 @@ def test_runtime_assembly_queue_writers_do_not_build_legacy_snapshots():
     assert "build_assembly_queue_snapshot" not in refresh
     assert "assembly_queue_snapshot_id" not in lifecycle
     assert "assembly_queue_snapshot_id" not in refresh
+    assert "assembly_queue_materialization_id" not in lifecycle
+    assert "assembly_queue_materialization_id" not in refresh
 
 
 def test_runtime_assembly_queue_publisher_uses_current_scope_without_legacy_rows():

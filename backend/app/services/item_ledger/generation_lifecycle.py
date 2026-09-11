@@ -43,7 +43,7 @@ from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
 from .supplier_receipt_odata import extract_supplier_document_evidence
-from .assembly_queue_snapshot import build_assembly_queue_snapshot
+from .assembly_queue_materialization import materialize_assembly_queue_lines
 from .assembly_output_persistence import (
     _ALGORITHM_VERSION as ASSEMBLY_OUTPUT_ALGORITHM_VERSION,
     materialize_assembly_output_allocations,
@@ -1536,12 +1536,12 @@ def accept_generation_build(
             rejected_supplier_sle_ids=frozenset(rejected_supplier_sle_ids),
         )
         try:
-            assembly_queue_snapshot = build_assembly_queue_snapshot(
+            assembly_queue_lines = materialize_assembly_queue_lines(
                 db, int(generation.id)
             )
         except (TypeError, ValueError) as exc:
             raise GenerationValidationError(
-                f"planning read snapshot build failed: {exc}"
+                f"assembly queue materialization failed: {exc}"
             ) from exc
         try:
             replenishment_batch = models.LedgerBuildBatch(
@@ -1652,7 +1652,13 @@ def accept_generation_build(
         "drum_schedule": drum_schedule,
         "shelf_projection": shelf_projection,
         "planning_snapshots": planning_snapshots,
-        "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
+        "assembly_queue_materialization": {
+            "rows": len(assembly_queue_lines),
+            "open_qty": str(sum(
+                (Decimal(str(row.assembly_remaining_qty or 0)) for row in assembly_queue_lines),
+                Decimal("0"),
+            )),
+        },
         "replenishment_work_items": replenishment_work_items,
         "purchase_journal_payload": purchase_journal_payload,
         "production_journal_payload": production_journal_payload,

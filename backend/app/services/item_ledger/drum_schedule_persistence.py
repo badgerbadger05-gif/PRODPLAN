@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.work_calendar_service import is_workday
 
-from .assembly_queue_snapshot import materialize_assembly_queue_lines
+from .assembly_queue_materialization import materialize_assembly_queue_lines
 from .assembly_readiness_persistence import materialize_assembly_readiness
 from .drum_saved_calendar import (
     DrumSavedCalendarError,

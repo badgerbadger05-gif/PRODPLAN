@@ -5,7 +5,7 @@ import pytest
 
 from app import models
 from app.services.item_ledger.assembly_output_persistence import materialize_assembly_output_allocations
-from app.services.item_ledger.assembly_queue_snapshot import build_assembly_queue_snapshot
+from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
 from app.services.item_ledger.drum_schedule_persistence import materialize_drum_schedule
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
@@ -1088,10 +1088,7 @@ def test_fully_allocated_queue_line_is_fulfilled_and_excluded_from_snapshot(
     assert queue.assembly_remaining_qty == Decimal("0")
     assert queue.line_status == "fulfilled"
 
-    snapshot = build_assembly_queue_snapshot(db_session, generation.id)
-    assert snapshot.payload["rows"] == []
-    assert snapshot.payload["total_rows"] == 0
-    assert snapshot.payload["total_queue_qty"] == 0.0
+    assert materialize_assembly_queue_lines(db_session, generation.id) == []
 
     repeated = materialize_assembly_output_allocations(db_session, generation.id)
     assert repeated["allocations"] == 1

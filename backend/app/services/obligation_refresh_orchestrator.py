@@ -8,6 +8,8 @@ make the complete new truth visible or undo every candidate row and lock.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -55,9 +57,7 @@ from app.services.obligation_refresh_manifest import (
     create_obligation_refresh_manifest,
 )
 from app.services.obligation_refresh_publish import publish_obligation_refresh_batch
-from app.services.item_ledger.assembly_queue_snapshot import (
-    build_assembly_queue_snapshot,
-)
+from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
 from app.services.item_ledger.assembly_output_persistence import (
     materialize_assembly_output_allocations,
 )
@@ -549,7 +549,12 @@ def run_obligation_refresh(
         target_id,
         accepted_run_ids=(*candidate_ids, *retained_run_ids),
     )
-    assembly_queue_snapshot = build_assembly_queue_snapshot(db, target_id)
+    try:
+        assembly_queue_lines = materialize_assembly_queue_lines(db, target_id)
+    except (TypeError, ValueError) as exc:
+        raise ObligationRefreshOrchestratorError(
+            f"assembly queue materialization failed: {exc}"
+        ) from exc
     target = db.get(models.LedgerGeneration, target_id)
     if target is None or str(target.status) != "building":
         raise ObligationRefreshOrchestratorError(
@@ -579,7 +584,13 @@ def run_obligation_refresh(
         "local_order_reconciliation": _json_value(local_order_reconciliation),
         "purchase_control_journal_payload": purchase_journal_payload,
         "production_control_journal_payload": production_journal_payload,
-        "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
+        "assembly_queue_materialization": {
+            "rows": len(assembly_queue_lines),
+            "open_qty": str(sum(
+                (Decimal(str(row.assembly_remaining_qty or 0)) for row in assembly_queue_lines),
+                Decimal("0"),
+            )),
+        },
     }
     _complete(snapshot_batch, snapshot_metrics)
     target.capabilities = dict(capabilities)

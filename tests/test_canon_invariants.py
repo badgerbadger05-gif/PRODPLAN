@@ -712,14 +712,14 @@ def test_assembly_queue_calculator_owner_is_unique() -> None:
         tree = ast.parse(_read(path), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-                node.name == "build_assembly_queue_snapshot"
+                node.name == "materialize_assembly_queue_lines"
             ):
                 owners.add((relative, node.name))
 
     assert owners == {
         (
-            "backend/app/services/item_ledger/assembly_queue_snapshot.py",
-            "build_assembly_queue_snapshot",
+            "backend/app/services/item_ledger/assembly_queue_materialization.py",
+            "materialize_assembly_queue_lines",
         )
     }
 
@@ -805,7 +805,7 @@ def test_production_control_journal_removes_legacy_capacity_scheduler_fallback()
 
 
 def test_queue_period_and_shelf_transfer_decisions_have_single_saved_inputs() -> None:
-    queue = _read(REPO / "backend/app/services/item_ledger/assembly_queue_snapshot.py")
+    queue = _read(REPO / "backend/app/services/item_ledger/assembly_queue_materialization.py")
     drum = _read(REPO / "backend/app/services/item_ledger/drum_schedule_persistence.py")
     output = _read(REPO / "backend/app/services/item_ledger/assembly_output_persistence.py")
     shelf = _read(REPO / "backend/app/services/item_ledger/shelf_projection_core.py")
@@ -857,7 +857,7 @@ def test_readiness_and_drum_get_have_no_second_planning_engine() -> None:
 
 def test_assembly_output_read_model_uses_accumulated_plan_truth() -> None:
     queue = _read(
-        REPO / "backend/app/services/item_ledger/assembly_queue_snapshot.py"
+        REPO / "backend/app/services/item_ledger/assembly_queue_materialization.py"
     )
     output = _read(
         REPO / "backend/app/services/item_ledger/assembly_output_persistence.py"

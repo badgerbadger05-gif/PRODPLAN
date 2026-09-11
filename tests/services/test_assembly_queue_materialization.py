@@ -4,7 +4,8 @@ from decimal import Decimal
 import pytest
 
 from app import models
-from app.services.item_ledger import assembly_queue_snapshot
+from app.services.item_ledger import assembly_queue_materialization
+from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
 from app.services.item_ledger import drum_schedule_persistence
 from app.services.item_ledger import live_plan_scope
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
@@ -118,7 +119,7 @@ def test_assembly_queue_rejects_divergent_run_and_plan_periods(db_session):
     db_session.flush()
 
     with pytest.raises(ValueError, match="assembly queue period mismatch"):
-        assembly_queue_snapshot._build_rows(db_session, int(generation.id))
+        assembly_queue_materialization._build_rows(db_session, int(generation.id))
 
 
 def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session):
@@ -158,7 +159,7 @@ def test_rebased_queue_keeps_original_plan_execution_and_fixation(db_session):
     )
     db_session.flush()
 
-    [row] = assembly_queue_snapshot._build_rows(db_session, int(generation.id))
+    [row] = assembly_queue_materialization._build_rows(db_session, int(generation.id))
     payload = row["payload"]
 
     assert payload["run_id"] == int(successor.run_id)
@@ -199,7 +200,7 @@ def _allocation(
     return row
 
 
-def test_assembly_queue_snapshot_prefers_fifo_across_live_plans_and_sums_allocations(db_session):
+def test_assembly_queue_materialization_prefers_fifo_across_live_plans_and_sums_allocations(db_session):
     cutoff = datetime(2026, 7, 30, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="fifo", cutoff=cutoff)
 
@@ -292,49 +293,35 @@ def test_assembly_queue_snapshot_prefers_fifo_across_live_plans_and_sums_allocat
         match_rule="fifo",
     )
 
-    snapshot = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
+    rows = materialize_assembly_queue_lines(db_session, generation.id)
 
-    assert snapshot.consumer == assembly_queue_snapshot.CONSUMER
-    assert snapshot.snapshot_key == assembly_queue_snapshot.SNAPSHOT_KEY
-    assert snapshot.truth_status == "accepted"
-    assert snapshot.payload["total_rows"] == 2
-    assert snapshot.payload["total_queue_qty"] == 13.0
-
-    rows = snapshot.payload["rows"]
-    assert [row["plan_id"] for row in rows] == [plan_old.id, plan_new.id]
-    assert [row["plan_line_id"] for row in rows] == [old_line.id, new_line.id]
-    assert rows[0]["item_code"] == "FG-1"
-    assert rows[0]["bucket_date"] == "2026-08-03"
-    assert rows[0]["priority_key"] == [
+    assert len(rows) == 2
+    assert [row.plan_id for row in rows] == [plan_old.id, plan_new.id]
+    assert [row.plan_line_id for row in rows] == [old_line.id, new_line.id]
+    assert rows[0].item.item_code == "FG-1"
+    assert rows[0].bucket_date.isoformat() == "2026-08-03"
+    assert list(rows[0].original_priority) == [
         plan_old.period_from.isoformat(),
         plan_old.period_to.isoformat(),
         int(plan_old.id),
         int(old_line.id),
     ]
-    assert rows[0]["planned_output_qty"] == 12.0
-    assert rows[0]["accepted_plan_output_qty"] == 4.0
-    assert rows[0]["assembly_remaining_qty"] == 8.0
-    assert rows[1]["priority_key"] == [
+    assert rows[0].planned_output_qty == Decimal("12")
+    assert rows[0].accepted_plan_output_qty == Decimal("4")
+    assert rows[0].assembly_remaining_qty == Decimal("8")
+    assert list(rows[1].original_priority) == [
         plan_new.period_from.isoformat(),
         plan_new.period_to.isoformat(),
         int(plan_new.id),
         int(new_line.id),
     ]
-    assert rows[1]["planned_output_qty"] == 7.0
-    assert rows[1]["accepted_plan_output_qty"] == 2.0
-    assert rows[1]["assembly_remaining_qty"] == 5.0
-
-    db_rows = (
-        db_session.query(models.PlanningReadRow)
-        .filter_by(snapshot_id=snapshot.id)
-        .order_by(models.PlanningReadRow.sort_key.asc())
-        .all()
-    )
-    assert [row.row_key for row in db_rows] == [f"plan-line:{old_line.id}", f"plan-line:{new_line.id}"]
-    assert db_rows[0].item_id == item.item_id
+    assert rows[1].planned_output_qty == Decimal("7")
+    assert rows[1].accepted_plan_output_qty == Decimal("2")
+    assert rows[1].assembly_remaining_qty == Decimal("5")
+    assert sum((row.assembly_remaining_qty for row in rows), Decimal("0")) == Decimal("13")
 
 
-def test_assembly_queue_snapshot_excludes_zero_or_negative_remaining_rows(db_session):
+def test_assembly_queue_materialization_excludes_zero_or_negative_remaining_rows(db_session):
     cutoff = datetime(2026, 7, 30, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="zero", cutoff=cutoff)
 
@@ -353,16 +340,12 @@ def test_assembly_queue_snapshot_excludes_zero_or_negative_remaining_rows(db_ses
     _allocation(db_session, generation=generation, plan=plan, line=depleted_line, item=item, qty="12", tag="Y")
     _allocation(db_session, generation=generation, plan=plan, line=positive_line, item=item, qty="4", tag="Z")
 
-    snapshot = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
-
-    rows = snapshot.payload["rows"]
+    rows = materialize_assembly_queue_lines(db_session, generation.id)
     assert len(rows) == 1
-    assert rows[0]["plan_line_id"] == int(positive_line.id)
-    assert rows[0]["planned_output_qty"] == 9.0
-    assert rows[0]["accepted_plan_output_qty"] == 4.0
-    assert rows[0]["assembly_remaining_qty"] == 5.0
-    assert snapshot.payload["total_rows"] == 1
-    assert snapshot.payload["total_queue_qty"] == 5.0
+    assert rows[0].plan_line_id == int(positive_line.id)
+    assert rows[0].planned_output_qty == Decimal("9")
+    assert rows[0].accepted_plan_output_qty == Decimal("4")
+    assert rows[0].assembly_remaining_qty == Decimal("5")
 
 
 def test_canonical_drum_persists_normalized_queue_slots_and_gap(db_session, monkeypatch):
@@ -575,7 +558,7 @@ def test_queue_line_without_rate_is_excluded_from_drum_only(db_session):
     assert Decimal(result["total_open_qty"]) == Decimal("0")
 
 
-def test_assembly_queue_snapshot_is_idempotent_for_same_inputs(db_session):
+def test_assembly_queue_materialization_is_idempotent_for_same_inputs(db_session):
     cutoff = datetime(2026, 7, 30, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="idempotent", cutoff=cutoff)
 
@@ -588,20 +571,17 @@ def test_assembly_queue_snapshot_is_idempotent_for_same_inputs(db_session):
     line = _plan_line(db_session, plan=plan, item=item, bucket_date=date(2026, 8, 3), qty="11")
     _allocation(db_session, generation=generation, plan=plan, line=line, item=item, qty="2", tag="ID")
 
-    first = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
-    second = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
+    first = materialize_assembly_queue_lines(db_session, generation.id)
+    second = materialize_assembly_queue_lines(db_session, generation.id)
 
-    assert second.id == first.id
-    assert db_session.query(models.PlanningReadSnapshot).count() == 1
-    assert (
-        db_session.query(models.PlanningReadRow)
-        .filter_by(snapshot_id=first.id)
-        .count()
-        == 1
-    )
+    assert [row.id for row in second] == [row.id for row in first]
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=generation.id, consumer="assembly_queue"
+    ).count() == 0
+    assert db_session.query(models.PlanningReadRow).count() == 0
 
 
-def test_assembly_queue_snapshot_ignores_live_plan_changes_after_materialization(db_session):
+def test_assembly_queue_materialization_retains_frozen_rows_after_live_plan_changes(db_session):
     cutoff = datetime(2026, 7, 30, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="conflict", cutoff=cutoff)
 
@@ -614,28 +594,17 @@ def test_assembly_queue_snapshot_ignores_live_plan_changes_after_materialization
     line = _plan_line(db_session, plan=plan, item=item, bucket_date=date(2026, 8, 9), qty="10")
     _allocation(db_session, generation=generation, plan=plan, line=line, item=item, qty="3", tag="C")
 
-    first = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
-    assert first.id > 0
+    first = materialize_assembly_queue_lines(db_session, generation.id)
+    assert first and first[0].id > 0
 
     db_session.query(models.ProductionPlanLine).filter_by(id=line.id).update(
         {models.ProductionPlanLine.qty: Decimal("20")}
     )
     db_session.flush()
-    repeated = assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
-    assert repeated.id == first.id
-
-    row = (
-        db_session.query(models.PlanningReadRow)
-        .filter_by(snapshot_id=first.id)
-        .one()
-    )
-    payload = dict(row.payload or {})
-    payload["assembly_remaining_qty"] = 0.0
-    row.payload = payload
-    db_session.flush()
-
-    with pytest.raises(ValueError, match="conflicts"):
-        assembly_queue_snapshot.build_assembly_queue_snapshot(db_session, generation.id)
+    repeated = materialize_assembly_queue_lines(db_session, generation.id)
+    assert [row.id for row in repeated] == [row.id for row in first]
+    assert repeated[0].planned_output_qty == Decimal("10")
+    assert repeated[0].assembly_remaining_qty == Decimal("7")
 
 
 def _forked_generation(db, *, key: str, parent, kind: str, cutoff, watermarks=None):
@@ -692,11 +661,9 @@ def test_physical_refresh_inherits_live_plan_scope_from_sealed_lineage(db_sessio
 
     assert live_plan_scope.live_plan_run_ids(db_session, grandchild) == (int(run.run_id),)
 
-    snapshot = assembly_queue_snapshot.build_assembly_queue_snapshot(
-        db_session, int(grandchild.id)
-    )
-    assert snapshot.payload["total_rows"] == 1
-    assert snapshot.payload["total_queue_qty"] == 12.0
+    rows = materialize_assembly_queue_lines(db_session, int(grandchild.id))
+    assert len(rows) == 1
+    assert rows[0].assembly_remaining_qty == Decimal("12")
     queue_rows = (
         db_session.query(models.AssemblyQueueLine)
         .filter_by(ledger_generation_id=int(grandchild.id))
@@ -721,10 +688,7 @@ def test_inherited_live_plan_scope_drops_a_closed_run(db_session):
     db_session.flush()
 
     assert live_plan_scope.live_plan_run_ids(db_session, child) == ()
-    snapshot = assembly_queue_snapshot.build_assembly_queue_snapshot(
-        db_session, int(child.id)
-    )
-    assert snapshot.payload["total_rows"] == 0
+    assert materialize_assembly_queue_lines(db_session, int(child.id)) == []
 
 
 def test_obligation_refresh_manifest_still_owns_its_scope(db_session):
