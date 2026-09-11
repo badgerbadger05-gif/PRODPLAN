@@ -57,6 +57,91 @@ def test_public_journal_row_strips_internal_material_snapshot():
     assert "_route_sheet_snapshot" in source
 
 
+def test_current_journal_sort_keeps_nulls_last_and_tie_breakers_ascending(db_session):
+    generation = _building_generation(db_session, "journal-current-sort-contract")
+    generation.status = "accepted"
+    generation.accepted_at = generation.cutoff
+    db_session.flush()
+    payload_rows = [
+        {
+            "current_identity": "production-order-line:1:101",
+            "order_id": 1,
+            "product_id": 101,
+            "item_id": 101,
+            "line_number": 2,
+            "order_number": "SORT-B",
+            "order_date": "2026-09-01",
+            "planned_start_date": "2026-09-10",
+            "root_item_ids": [],
+        },
+        {
+            "current_identity": "production-order-line:2:102",
+            "order_id": 2,
+            "product_id": 102,
+            "item_id": 102,
+            "line_number": 1,
+            "order_number": "SORT-A",
+            "order_date": "2026-09-01",
+            "planned_start_date": "2026-09-10",
+            "root_item_ids": [],
+        },
+        {
+            "current_identity": "production-order-line:3:103",
+            "order_id": 3,
+            "product_id": 103,
+            "item_id": 103,
+            "line_number": 1,
+            "order_number": "SORT-DATE",
+            "order_date": "2026-09-01",
+            "planned_start_date": "2026-09-11",
+            "root_item_ids": [],
+        },
+        {
+            "current_identity": "production-order-line:4:104",
+            "order_id": 4,
+            "product_id": 104,
+            "item_id": 104,
+            "line_number": 1,
+            "order_number": "SORT-NULL",
+            "order_date": "2026-09-01",
+            "planned_start_date": None,
+            "root_item_ids": [],
+        },
+    ]
+    publish_current_production_control_from_payload(
+        db_session,
+        generation.id,
+        {
+            "meta": {
+                "ledger_generation_id": generation.id,
+                "truth_status": "accepted",
+                "read_only": True,
+                "row_count": len(payload_rows),
+            },
+            "rows": payload_rows,
+        },
+    )
+    db_session.flush()
+
+    asc = read_snapshot(
+        db_session,
+        sort_by="planned_start_date",
+        sort_dir="asc",
+    )
+    desc = read_snapshot(
+        db_session,
+        sort_by="planned_start_date",
+        sort_dir="desc",
+    )
+
+    assert [row["order_number"] for row in asc["rows"]] == [
+        "SORT-A", "SORT-B", "SORT-DATE", "SORT-NULL",
+    ]
+    assert [row["order_number"] for row in desc["rows"]] == [
+        "SORT-DATE", "SORT-A", "SORT-B", "SORT-NULL",
+    ]
+
+
 @pytest.mark.parametrize("changed_field, changed_value", [
     ("norm_qty_per_unit", 3),
     ("unit_coef", 2),

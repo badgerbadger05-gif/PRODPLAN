@@ -1353,27 +1353,48 @@ def read_snapshot(
         if _matches(row)
         and int((dict(row.payload or {}).get("order_id") or 0)) not in completed_order_ids
     ]
-    descending = str(sort_dir or "").strip().lower() == "desc"
     sort_key = str(sort_by or "").strip().lower()
-    if sort_key in {
+    sortable_primary_fields = {
         "planned_start_date", "planned_finish_date", "readiness_need_date",
         "readiness_action_date", "readiness_priority_key",
-    }:
-        filtered.sort(key=lambda row: (
-            (dict(row.payload or {}).get(sort_key) is None),
-            str(dict(row.payload or {}).get(sort_key) or ""),
-            str(dict(row.payload or {}).get("order_number") or ""),
-            int(dict(row.payload or {}).get("line_number") or 0),
-        ), reverse=descending)
+    }
+    if sort_key in sortable_primary_fields:
+        primary_field = sort_key
+        descending = str(sort_dir or "").strip().lower() == "desc"
     else:
-        filtered.sort(key=lambda row: (
-            dict(row.payload or {}).get("order_date") is None,
-            str(dict(row.payload or {}).get("order_date") or ""),
-            str(dict(row.payload or {}).get("order_number") or ""),
-            int(dict(row.payload or {}).get("line_number") or 0),
-        ), reverse=True)
-        if not descending and sort_key:
-            filtered.reverse()
+        primary_field = "order_date"
+        descending = True
+
+    def _tie_key(row: Any) -> tuple[str, int, str]:
+        payload = dict(row.payload or {})
+        raw_line = payload.get("line_number")
+        try:
+            line_number = int(raw_line) if raw_line is not None else 0
+        except (TypeError, ValueError):
+            line_number = 0
+        return (
+            str(payload.get("order_number") or ""),
+            line_number,
+            str(raw_line or ""),
+        )
+
+    # Keep business tie-breakers ascending regardless of the primary
+    # direction. Partitioning also makes NULLS LAST explicit instead of
+    # allowing ``reverse=True`` to move missing values to the front.
+    filtered.sort(key=_tie_key)
+    present = [
+        row for row in filtered
+        if dict(row.payload or {}).get(primary_field) is not None
+    ]
+    missing = [
+        row for row in filtered
+        if dict(row.payload or {}).get(primary_field) is None
+    ]
+    present.sort(
+        key=lambda row: str(dict(row.payload or {}).get(primary_field)),
+        reverse=descending,
+    )
+    filtered[:] = [*present, *missing]
     total = len(filtered)
     effective_limit = max(1, min(int(limit or 100), 500))
     requested_offset = max(0, int(offset or 0))
