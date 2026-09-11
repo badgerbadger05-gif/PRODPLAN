@@ -378,6 +378,15 @@ describe('MrpResultPage characterization', () => {
     expect((await screen.findByText('Насос ГА-1')).closest('tr')).toHaveClass('activeRow')
   })
 
+  it('passes a deep-link current identity to the MRP reader before paging', async () => {
+    renderPage('/mrp-runs/41?current_identity=run%3A41%3Aproduction%3Arequirement%3A501%3Aitem%3A501%3Aallocation%3Adefault')
+    await screen.findByText('Насос ГА-1')
+    expect(getPlanningResultProduction).toHaveBeenCalledWith(41, expect.objectContaining({
+      current_identity: 'run:41:production:requirement:501:item:501:allocation:default',
+      offset: 0,
+    }))
+  })
+
   it('highlights rework rows by current identity, independent of numeric locators', async () => {
     renderPage('/mrp-runs/41?tab=rework&current_identity=run%3A41%3Arework%3Aitem%3A701%3Aallocation%3Adefault')
     expect((await screen.findByText('Корпус на доработку')).closest('tr')).toHaveClass('activeRow')

@@ -5,6 +5,7 @@ import pytest
 from app import models
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
+    load_current_execution_rows,
     publish_current_obligation_views_from_generation,
     require_current_execution_scope,
 )
@@ -100,6 +101,38 @@ def test_mrp_reader_uses_persisted_current_rows_and_manifest(db_session):
     assert result["current_identity"]
     assert result["source_revision"].startswith("accepted:g")
     assert manifest["current_identity"] == result["current_identity"]
+
+
+def test_mrp_current_identity_filters_before_pagination(db_session):
+    generation = _generation(db_session)
+    _mrp_snapshot(db_session, generation)
+    snapshot = db_session.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "mrp_result",
+    ).one()
+    db_session.add(models.PlanningReadRow(
+        snapshot_id=snapshot.id,
+        row_key="req:41:2",
+        row_kind="production",
+        item_id=11,
+        sort_key="2026-09-10|0002",
+        payload={"item_id": 11, "qty": 8, "run_id": 41, "row_kind": "production"},
+    ))
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+    current = load_current_execution_rows(
+        db_session, entity_kind="mrp_result", scope_key="mrp:all-live-plans",
+    )
+    target = next(row.business_identity for row in current if row.payload.get("item_id") == 11)
+
+    result = read_mrp_result_rows(
+        db_session, 41, row_kind="production", current_identity=target,
+        limit=1, offset=0,
+    )
+
+    assert result["total"] == 1
+    assert result["rows"][0]["current_identity"] == target
+    assert result["rows"][0]["item_id"] == 11
 
 
 def test_mrp_reader_fails_closed_even_when_legacy_snapshot_exists(db_session):

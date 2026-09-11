@@ -470,6 +470,7 @@ describe('PurchaseControlPage Doctype migration', () => {
     renderPage('/purchase-control?current_identity=purchase%3Areq%3A10')
 
     await screen.findAllByText('Шестерня')
+    expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('current_identity')).toBe('purchase:req:10')
     const tables = document.querySelectorAll('.productionOrdersTable')
     const row = within(tables[tables.length - 1] as HTMLElement).getByText('Шестерня')
     expect(row.closest('tr')).toHaveClass('activeRow')

@@ -165,6 +165,37 @@ def test_r9_production_route_does_not_fallback_to_legacy_snapshot(db_session):
     assert "current" in str(getattr(caught.value, "detail", "")).lower()
 
 
+def test_r9_production_current_identity_filters_before_pagination(db_session):
+    generation = _accepted_generation(db_session)
+    _snapshot(
+        db_session,
+        generation,
+        consumer="production_control_journal",
+        key="journal:deep-link",
+        rows=[
+            {"row_key": "order:1", "payload": {
+                "journal_row_key": "order:1", "item_id": 10, "order_number": "001",
+                "quantity": 4, "remaining_qty": 4, "status": "open",
+            }},
+            {"row_key": "order:2", "payload": {
+                "journal_row_key": "order:2", "item_id": 11, "order_number": "002",
+                "quantity": 5, "remaining_qty": 5, "status": "open",
+            }},
+        ],
+    )
+    db_session.commit()
+    publish_current_obligation_views_from_generation(db_session, generation.id)
+    db_session.commit()
+
+    result = get_orders_journal(
+        current_identity="order:2", limit=1, offset=0, db=db_session,
+    )
+
+    assert result.total == 1
+    assert result.rows[0]["current_identity"] == "order:2"
+    assert result.rows[0]["item_id"] == 11
+
+
 def test_r9_root_products_read_current_production_rows(db_session):
     generation = _accepted_generation(db_session)
     _snapshot(

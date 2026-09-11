@@ -71,3 +71,34 @@ def test_purchase_get_attaches_manifest_revision_to_stable_row(monkeypatch):
     assert result["rows"][0]["current_identity"] == "purchase:req:9"
     assert result["rows"][0]["source_revision"] == "accepted:g42-noop-2"
     assert result["source_revision"] == "accepted:g42-noop-2"
+
+
+def test_purchase_current_identity_filters_before_pagination(monkeypatch):
+    manifest = SimpleNamespace(
+        id=17,
+        source_generation_id=42,
+        source_revision="accepted:g42-deep-link",
+        summary={"summary": {"total_rows": 2}},
+    )
+    rows = [
+        SimpleNamespace(
+            business_identity="purchase:req:1",
+            source_revision="accepted:g42",
+            payload={"row_key": "buy:1", "remaining_qty": 2, "item_name": "First"},
+        ),
+        SimpleNamespace(
+            business_identity="purchase:req:2",
+            source_revision="accepted:g42",
+            payload={"row_key": "buy:2", "remaining_qty": 3, "item_name": "Second"},
+        ),
+    ]
+    monkeypatch.setattr(current_execution, "require_current_execution_scope", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(current_execution, "load_current_execution_rows", lambda *args, **kwargs: rows)
+
+    result = get_orders(
+        db=object(), current_identity="purchase:req:2", limit=1, offset=0,
+    )
+
+    assert result["total"] == 1
+    assert result["rows"][0]["current_identity"] == "purchase:req:2"
+    assert result["rows"][0]["item_name"] == "Second"

@@ -543,6 +543,7 @@ describe('ProductionControlPage — characterization', () => {
     renderPage(['/production-control?current_identity=production%3Aorder%3A102'])
     await screen.findByText('MRP run: 77')
 
+    expect(vi.mocked(listProductionOrders).mock.calls[0][0].get('current_identity')).toBe('production:order:102')
     expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
     expect(rowFor('Кронштейн')).toHaveAttribute('aria-selected', 'false')
   })
