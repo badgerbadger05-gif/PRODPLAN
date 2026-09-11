@@ -88,6 +88,7 @@ _PRESERVE_REASONS = {
     "mrp_freeze_component": "frozen BOM obligation",
     "mrp_freeze_bom_node": "frozen BOM structure",
     "mrp_freeze_component_cumulative": "frozen cumulative obligation",
+    "closed_plan_snapshot": "immutable business closure history",
     "alembic_version": "schema migration history",
     "planning_truth_state": "accepted-truth pointer",
 }
@@ -111,9 +112,7 @@ _MIGRATE_REASONS = {
     "mrp_bucket_type_legacy": "historical bucket-type evidence maps to canonical bucket semantics",
 }
 
-_DELETE_REASONS = {
-    "closed_plan_snapshot": "obsolete full-generation archive; delete only after mapped evidence is verified",
-}
+_DELETE_REASONS = {}
 
 _LEGACY_REFERENCE_KEYS = {
     "snapshot_id",
@@ -467,6 +466,81 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
     }
 
 
+def _migrate_purchase_export_anchors(session: Session, generation_id: int) -> dict[str, int]:
+    """Move legacy purchase export evidence to the one canonical current scope."""
+
+    # Inspect on the session's checked-out connection.  Inspecting the Engine
+    # here can acquire a second SQLite in-memory connection and make the
+    # uncommitted publisher rows appear to have vanished.
+    inspector = inspect(session.connection())
+    if "purchase_export_batch" not in set(inspector.get_table_names()):
+        return {"legacy_before": 0, "legacy_after": 0, "current": 0}
+
+    batches = session.execute(text(
+        "SELECT id, planning_read_snapshot_id, current_execution_scope_id, "
+        "current_execution_source_revision "
+        "FROM purchase_export_batch ORDER BY id"
+    )).mappings().all()
+    legacy = [row for row in batches if row["planning_read_snapshot_id"] is not None]
+    for batch in legacy:
+        if batch["current_execution_scope_id"] is not None or batch["current_execution_source_revision"] is not None:
+            raise PreflightBlocked(
+                f"purchase export batch {int(batch['id'])} has ambiguous legacy/current anchors"
+            )
+
+    scope_rows = session.execute(text(
+        "SELECT id, source_generation_id, source_revision, result_ready "
+        "FROM current_execution_scope "
+        "WHERE entity_kind='purchase_control_journal' AND scope_key='purchase:all-live-plans'"
+    )).mappings().all()
+    if len(scope_rows) != 1:
+        raise PreflightBlocked(
+            f"purchase export migration requires exactly one canonical purchase scope, found {len(scope_rows)}"
+        )
+    scope = scope_rows[0]
+    if not bool(scope["result_ready"]):
+        raise PreflightBlocked("purchase export migration requires a ready canonical purchase scope")
+
+    for batch in legacy:
+        snapshot = session.execute(text(
+            "SELECT s.id, s.consumer, s.snapshot_key, s.ledger_generation_id, s.truth_status, "
+            "g.status AS generation_status "
+            "FROM planning_read_snapshot s "
+            "LEFT JOIN ledger_generation g ON g.id=s.ledger_generation_id "
+            "WHERE s.id=:snapshot_id"
+        ), {"snapshot_id": int(batch["planning_read_snapshot_id"])}).mappings().all()
+        if len(snapshot) != 1:
+            raise PreflightBlocked(
+                f"purchase export snapshot {int(batch['planning_read_snapshot_id'])} is missing or ambiguous"
+            )
+        source = snapshot[0]
+        if (
+            str(source["consumer"] or "") != "purchase_control_journal"
+            or str(source["snapshot_key"] or "") != "journal:v1"
+            or str(source["truth_status"] or "") != "accepted"
+            or str(source["generation_status"] or "") != "accepted"
+        ):
+            raise PreflightBlocked(
+                f"purchase export snapshot {int(batch['planning_read_snapshot_id'])} is not an accepted purchase journal basis"
+            )
+        session.execute(text(
+            "UPDATE purchase_export_batch SET "
+            "current_execution_scope_id=:scope_id, "
+            "current_execution_source_revision=:revision, "
+            "planning_read_snapshot_id=NULL WHERE id=:batch_id"
+        ), {
+            "scope_id": int(scope["id"]),
+            "revision": f"accepted:g{int(source['ledger_generation_id'])}:purchase_control_journal",
+            "batch_id": int(batch["id"]),
+        })
+
+    return {
+        "legacy_before": len(legacy),
+        "legacy_after": 0,
+        "current": sum(1 for row in batches if row["current_execution_scope_id"] is not None) + len(legacy),
+    }
+
+
 def _postflight_on_session(session: Session, generation_id: int) -> dict[str, Any]:
     """Validate current scopes/rows while the publication transaction is held."""
 
@@ -513,11 +587,29 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
             + json.dumps([dict(row) for row in duplicates], sort_keys=True)
         )
 
+    purchase_export_anchors = {"legacy": 0, "current": 0}
+    if "purchase_export_batch" in set(inspect(session.connection()).get_table_names()):
+        anchor_counts = session.execute(text(
+            "SELECT "
+            "sum(CASE WHEN planning_read_snapshot_id IS NOT NULL THEN 1 ELSE 0 END) AS legacy, "
+            "sum(CASE WHEN current_execution_scope_id IS NOT NULL THEN 1 ELSE 0 END) AS current "
+            "FROM purchase_export_batch"
+        )).one()
+        purchase_export_anchors = {
+            "legacy": int(anchor_counts[0] or 0),
+            "current": int(anchor_counts[1] or 0),
+        }
+        if purchase_export_anchors["legacy"]:
+            raise PostflightBlocked(
+                f"purchase export legacy anchors remain: {purchase_export_anchors['legacy']}"
+            )
+
     return {
         "status": "ready",
         "generation_id": int(generation_id),
         "scopes": scopes,
         "unique_identities": True,
+        "purchase_export_anchors": purchase_export_anchors,
     }
 
 
@@ -571,6 +663,7 @@ def apply_current_obligation_migration(
             publisher_result = publish_current_obligation_views_from_generation(session, generation_id)
             if fault_after_consumer is not None:
                 raise RuntimeError(f"fault injection after consumer {fault_after_consumer}")
+            _migrate_purchase_export_anchors(session, generation_id)
             postflight = _postflight_on_session(session, generation_id)
 
     after_changes = _count_changes(engine)
