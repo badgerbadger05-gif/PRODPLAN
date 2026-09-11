@@ -267,6 +267,19 @@ def get_orders(
         saved_summary = saved.get("summary")
         if not isinstance(saved_summary, dict):
             raise CurrentExecutionUnavailable("purchase current summary is missing")
+        saved_buckets = [
+            dict(bucket)
+            for bucket in list(saved.get("to_order_by_period") or [])
+            if isinstance(bucket, dict)
+        ]
+        if horizon_period_to is not None:
+            horizon_iso = horizon_period_to.isoformat()
+            saved_buckets = [
+                bucket for bucket in saved_buckets
+                if str(bucket.get("plan_period_to") or "") <= horizon_iso
+            ]
+        for bucket in saved_buckets:
+            bucket.setdefault("period_to", bucket.get("plan_period_to"))
         return {
                 "rows": rows[effective_offset:effective_offset + effective_limit],
                 "total": len(rows),
@@ -278,6 +291,7 @@ def get_orders(
                 "ledger_generation_id": current_manifest.source_generation_id,
                 "source_revision": str(current_manifest.source_revision),
                 "current_identity": None,
+                "to_order_by_period": saved_buckets,
                 "summary": saved_summary,
                 "meta": saved,
         }

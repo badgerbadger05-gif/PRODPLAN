@@ -1270,8 +1270,10 @@ def test_work_item_materials_fail_closed_without_persisted_coverage(db_session):
         )
     app.dependency_overrides.clear()
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"]["code"] == "production_control_current_unavailable"
+    # The accepted current row exists, but its persisted coverage has no
+    # quantity basis for this request; the endpoint fails closed instead of
+    # replaying the historical snapshot.
+    assert response.status_code == 400, response.text
 
 
 def test_work_item_materials_remain_readable_from_the_published_row_generation(db_session):
