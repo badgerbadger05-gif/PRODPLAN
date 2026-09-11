@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "baseline": "R2 local PostgreSQL 16 baseline",
+    "historical_api_p95_ms": [3.8, 4.9],
+    "fixed_before_measurement": true,
+    "rationale": "Conservative operator-local limits are fixed before the R11 harness runs; they are not fitted to R11 output."
+  },
+  "budgets": {
+    "api_p95_ms": 25.0,
+    "current_publish_p95_ms": 500.0,
+    "no_op_repetitions": 100,
+    "no_op_dml_max": 0,
+    "no_op_current_row_growth_max": 0,
+    "no_op_current_scope_growth_max": 0,
+    "no_op_current_change_growth_max": 0,
+    "no_op_wal_bytes_max": 0,
+    "no_op_dead_tuple_growth_max": 0,
+    "mutation_row_growth_max": 64,
+    "mutation_audit_growth_max": 64,
+    "migration_rehearsal_seconds": 180.0,
+    "real_publisher_seconds": 180.0,
+    "storage_rehearsal_seconds": 240.0
+  },
+  "acceptance_matrix": {
+    "A01": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_no_op_publication_soak_contract"},
+    "A02": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
+    "A03": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
+    "A04": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
+    "A05": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_mutation_sequence_contract"},
+    "A06": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
+    "A07": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
+    "A08": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_local_dsn_guard_contract"},
+    "A09": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
+    "A10": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
+    "A11": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_mutation_sequence_contract"},
+    "A12": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_no_op_publication_soak_contract"},
+    "A13": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
+    "A14": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_no_op_publication_soak_contract"},
+    "A15": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_mutation_sequence_contract"},
+    "A16": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_runtime_inventory_contract"},
+    "A17": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
+    "A18": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_report_compares_fixed_budgets"}
+  }
+}
