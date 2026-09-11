@@ -120,6 +120,29 @@ describe('production-control close action boundary', () => {
     expect(init.method).toBe('POST')
     expect(JSON.parse(String(init.body))).toEqual({ dry_run: false })
   })
+
+  it('posts the persisted current CAS fields for an explicit close', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ status: 'ok', orders_closed: 1, orders_error: 0, entries: [] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await closeProductionOrder(101, {
+      dry_run: false,
+      current_identity: 'production:order:101',
+      expected_source_revision: 'rev-7',
+    })
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(JSON.parse(String(init.body))).toEqual({
+      dry_run: false,
+      current_identity: 'production:order:101',
+      expected_source_revision: 'rev-7',
+    })
+  })
 })
 
 describe('production-control launch quantity boundary', () => {

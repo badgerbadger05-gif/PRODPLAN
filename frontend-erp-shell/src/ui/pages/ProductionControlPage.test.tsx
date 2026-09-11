@@ -36,6 +36,7 @@ vi.mock('../../services/productionControl', () => ({
   markMaterialIssueAssembled: vi.fn(),
   syncExecutionFrom1C: vi.fn(),
   produceOrderLine: vi.fn(),
+  closeProductionOrder: vi.fn(),
   getItem: vi.fn(),
   updateItem: vi.fn(),
   updateOrderQuantity: vi.fn(),
@@ -69,6 +70,7 @@ import {
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
   produceOrderLine,
+  closeProductionOrder,
   listRootProductOptions,
   materializeMakeWorkItems,
   openPaintWeldChains,
@@ -1444,11 +1446,27 @@ describe('ProductionControlPage — characterization', () => {
     expect(produceOrderLine).not.toHaveBeenCalled()
   })
 
-  it('offers Produce without a separate close button', async () => {
+  it('offers explicit close only for one selected row with the backend action', async () => {
+    vi.mocked(closeProductionOrder).mockResolvedValue({
+      status: 'ok', dry_run: false, orders_requested: 1, orders_eligible: 1,
+      orders_closed: 1, orders_error: 0,
+    })
+    const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
-    expect(screen.queryByRole('button', { name: 'Закрыть в 1С' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Произвести' })).toBeInTheDocument()
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    const closeButton = screen.getByRole('button', { name: 'Закрыть в 1С' })
+    expect(closeButton).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Произвести' })).toHaveAttribute(
+      'title',
+      expect.not.stringContaining('завершить'),
+    )
+    await user.click(closeButton)
+    await waitFor(() => expect(closeProductionOrder).toHaveBeenCalledWith(101, {
+      dry_run: false,
+      current_identity: 'production:order:101',
+      expected_source_revision: 'rev-7',
+    }))
   })
 
   it('"Синхронизировать" reads order completion and transfer state from 1C', async () => {
