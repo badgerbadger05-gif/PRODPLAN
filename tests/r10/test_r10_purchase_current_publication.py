@@ -79,6 +79,8 @@ def test_purchase_current_publisher_uses_candidate_payload_without_snapshot_rows
     assert manifest is not None
     assert manifest.source_generation_id == generation.id
     assert manifest.source_revision == f"accepted:g{generation.id}:purchase_control_journal"
+    assert manifest.summary["fact_source"] == "ledger"
+    assert manifest.summary["summary"]["total_rows"] == 1
     assert load_current_execution_rows(
         db_session,
         entity_kind="purchase_control_journal",

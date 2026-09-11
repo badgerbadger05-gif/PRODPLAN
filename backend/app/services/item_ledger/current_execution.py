@@ -1129,8 +1129,9 @@ def publish_current_purchase_control_from_payload(
             "payload": row,
         })
     meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
-    summary = dict(payload.get("summary") or {}) if isinstance(payload.get("summary"), Mapping) else {}
-    summary["meta"] = dict(meta)
+    summary = dict(meta)
+    if isinstance(payload.get("summary"), Mapping):
+        summary["summary"] = dict(payload["summary"])
     if isinstance(payload.get("cards"), Mapping):
         summary["cards"] = dict(payload["cards"])
     summary["total_rows"] = len(current_rows)
