@@ -276,8 +276,39 @@ def _physical_refresh_gate_ready(
     return generation, requirement
 
 
-def _synthetic(db, key: str = "ok", replenishment_method: str = "Производство"):
-    generation = _generation(db, key)
+def _synthetic(
+    db,
+    key: str = "ok",
+    replenishment_method: str = "Производство",
+    *,
+    accepted_anchor: bool = False,
+):
+    anchor = None
+    if accepted_anchor:
+        anchor = _generation(db, f"{key}-accepted-anchor")
+        anchor.status = "accepted"
+        anchor.accepted_at = anchor.cutoff
+        anchor.capabilities = {
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+            "planning_snapshots": True,
+        }
+        db.add(models.PlanningTruthState(id=1, current_generation_id=anchor.id))
+        db.flush()
+    generation = _generation(
+        db,
+        key,
+        source_watermarks=(
+            {
+                "generation_kind": "obligation_refresh",
+                "parent_generation_id": int(anchor.id),
+                "replay_from": "2026-07-01T00:00:00+00:00",
+            }
+            if anchor is not None
+            else None
+        ),
+    )
     if not db.query(models.StockWarehouse).filter_by(warehouse_ref1c="WH").count():
         db.add(models.StockWarehouse(
             warehouse_ref1c="WH",
@@ -302,7 +333,9 @@ def _synthetic(db, key: str = "ok", replenishment_method: str = "Произво�
     db.flush()
     run = models.PlanningRun(
         source_plan_id=plan.id,
-        status="FIXED_SNAPSHOT",
+        status="FIXED_SNAPSHOT" if anchor is not None else "BUILDING_SNAPSHOT",
+        ledger_generation_id=anchor.id if anchor is not None else generation.id,
+        ledger_cutoff=anchor.cutoff if anchor is not None else generation.cutoff,
         config_snapshot={},
         period_from=plan.period_from,
         period_to=plan.period_to,
@@ -311,6 +344,19 @@ def _synthetic(db, key: str = "ok", replenishment_method: str = "Произво�
     )
     db.add(run)
     db.flush()
+    if anchor is not None:
+        generation.source_watermarks = {
+            **dict(generation.source_watermarks or {}),
+            "obligation_refresh_manifest": {
+                "entries": [{
+                    "action": "retain",
+                    "plan_id": int(plan.id),
+                    "parent_run_id": int(run.run_id),
+                    "candidate_run_id": None,
+                }],
+            },
+        }
+        db.flush()
     requirement = models.MrpRequirement(
         run_id=run.run_id,
         item_id=item.item_id,
@@ -468,7 +514,7 @@ def _add_matching_reservation_event(
 
 
 def test_successful_synthetic_pipeline_publishes_only_after_validation(db_session):
-    generation, requirement = _synthetic(db_session)
+    generation, requirement = _synthetic(db_session, accepted_anchor=True)
 
     result = accept_generation_build(
         db_session,
@@ -716,7 +762,9 @@ def test_accepted_generation_is_immutable(db_session):
 
 
 def test_foreign_generation_rows_are_isolated(db_session):
-    generation, requirement = _synthetic(db_session, "isolation")
+    generation, requirement = _synthetic(
+        db_session, "isolation", accepted_anchor=True
+    )
     accept_generation_build(
         db_session, generation.id, replay_from=datetime(2026, 7, 1)
     )
@@ -833,7 +881,9 @@ def test_validation_rejects_execution_metric_row_drift(db_session):
 
 
 def test_validation_accepts_current_generation_supplier_reservation_cycle(db_session):
-    generation, _requirement = _synthetic(db_session, "supplier-cycle")
+    generation, _requirement = _synthetic(
+        db_session, "supplier-cycle", accepted_anchor=True
+    )
     accept_generation_build(
         db_session, generation.id, replay_from=datetime(2026, 7, 1)
     )
@@ -851,7 +901,9 @@ def test_validation_accepts_current_generation_supplier_reservation_cycle(db_ses
 
 
 def test_validation_rejects_foreign_generation_supplier_reservation_cycle(db_session):
-    generation, _requirement = _synthetic(db_session, "foreign-supplier-cycle")
+    generation, _requirement = _synthetic(
+        db_session, "foreign-supplier-cycle", accepted_anchor=True
+    )
     accept_generation_build(
         db_session, generation.id, replay_from=datetime(2026, 7, 1)
     )
