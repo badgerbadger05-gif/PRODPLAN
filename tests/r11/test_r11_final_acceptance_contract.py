@@ -34,6 +34,11 @@ def test_a17_runs_two_rehearsals_and_compares_normalized_subject_state(tmp_path)
     assert report["runs"][0]["schema"] != report["runs"][1]["schema"]
 
 
+def test_a17_matrix_points_to_the_pair_rehearsal_node():
+    nodes = _budget()["acceptance_matrix"]["A17"]["nodes"]
+    assert "tests/r11/test_r11_final_acceptance_contract.py::test_a17_runs_two_rehearsals_and_compares_normalized_subject_state" in nodes
+
+
 def test_compare_budget_fails_closed_for_missing_or_non_numeric_api_p95():
     from tools.r11_local_acceptance import compare_budget
 
@@ -42,6 +47,9 @@ def test_compare_budget_fails_closed_for_missing_or_non_numeric_api_p95():
     assert "api_p95_ms" in missing["missing_metrics"]
     with pytest.raises(ValueError, match="api_p95_ms"):
         compare_budget({"api_p95_ms": "not-a-number", "current_publish_p95_ms": 1.0}, budget_path=BUDGET_PATH)
+    for value in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="api_p95_ms"):
+            compare_budget({"api_p95_ms": value, "current_publish_p95_ms": 1.0}, budget_path=BUDGET_PATH)
 
 
 @pytest.mark.integration
@@ -83,6 +91,42 @@ def test_retention_policy_is_explicit_and_never_automatically_deleted():
         assert entry["retention"]
         assert entry["deletion_condition"]
         assert entry["automatic_deletion"] is False
+    assert categories["technical_debug"]["retention_days_after_closure"] == 30
+    assert categories["migration_control_copy"]["retention_days_after_signoff"] == 90
+
+
+def _planned_or_passed_matrix(**overrides):
+    matrix = {
+        key: {"status": "planned"}
+        for key in _budget()["acceptance_matrix"]
+    }
+    matrix.update(overrides)
+    return matrix
+
+
+def test_final_evidence_requires_configured_nodes_and_passed_records():
+    from tools.r11_local_acceptance import validate_final_evidence
+
+    with pytest.raises(ValueError, match="node|outcome|data"):
+        validate_final_evidence(
+            {"matrix": _planned_or_passed_matrix(
+                A01={"status": "passed", "results": [{"node": "wrong", "outcome": "passed"}]}
+            )},
+            budget_path=BUDGET_PATH,
+        )
+
+
+def test_final_evidence_requires_finite_budget_metrics_for_a18():
+    from tools.r11_local_acceptance import validate_final_evidence
+
+    node = _budget()["acceptance_matrix"]["A18"]["nodes"][0]
+    with pytest.raises(ValueError, match="budget"):
+        validate_final_evidence(
+            {"matrix": _planned_or_passed_matrix(
+                A18={"status": "passed", "results": [{"node": node, "command": "pytest", "outcome": "passed", "data": {"ok": True}}]}
+            )},
+            budget_path=BUDGET_PATH,
+        )
 
 
 def test_final_evidence_validator_is_fail_closed_for_unmeasured_matrix():
