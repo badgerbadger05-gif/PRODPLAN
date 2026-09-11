@@ -224,7 +224,8 @@ def _publish_current_mrp(db_session, run):
     empty = {"rows": [], "meta": {"row_count": 0}}
     return publish_current_obligation_views_from_generation(
         db_session, generation_ids.pop(), purchase_payload=empty,
-        production_payload=empty, mrp_payloads=mrp_payloads,
+        production_payload=empty, mrp_payloads=mrp_payloads, period_payloads={},
+        period_run_ids=[],
     )
 
 

@@ -244,9 +244,17 @@ def test_refresh_can_retire_one_plan_while_adding_another(db_session):
         source_plan_id=added_plan.id, status="FIXED_SNAPSHOT",
     ).one()
     assert int(added_run.ledger_generation_id) == int(result.target_generation_id)
-    # The MRP result snapshot of the added candidate was persisted despite the
-    # retire entry sharing the sealed manifest.
+    # The current MRP manifest contains the added run and excludes the retired
+    # run; no historical snapshot is created for this runtime publication.
+    mrp_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="mrp_result",
+        scope_key="mrp:all-live-plans",
+    ).one()
+    assert int(mrp_scope.source_generation_id) == int(result.target_generation_id)
+    live_runs = dict((mrp_scope.summary or {}).get("runs") or {})
+    assert str(int(added_run.run_id)) in live_runs
+    assert str(int(retired_run.run_id)) not in live_runs
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=int(result.target_generation_id),
         consumer="mrp_result",
-    ).count() == 1
+    ).count() == 0
