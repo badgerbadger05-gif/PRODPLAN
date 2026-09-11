@@ -50,7 +50,7 @@ def _schema(conn, schema: str):
         "id BIGINT PRIMARY KEY, ledger_generation_id BIGINT NOT NULL, "
         "planning_read_snapshot_id BIGINT, current_execution_scope_id BIGINT, "
         "current_execution_source_revision VARCHAR(256), idempotency_key VARCHAR(128) NOT NULL, "
-        "CONSTRAINT fk_purchase_export_batch_planning_read_snapshot FOREIGN KEY (planning_read_snapshot_id) REFERENCES planning_read_snapshot(id), "
+        "FOREIGN KEY (planning_read_snapshot_id) REFERENCES planning_read_snapshot(id), "
         "CONSTRAINT fk_purchase_export_batch_ledger_generation FOREIGN KEY (ledger_generation_id) REFERENCES ledger_generation(id), "
         "CONSTRAINT fk_purchase_export_batch_current_execution_scope FOREIGN KEY (current_execution_scope_id) REFERENCES current_execution_scope(id), "
         "CONSTRAINT ck_purchase_export_batch_exactly_one_source_anchor CHECK ("
