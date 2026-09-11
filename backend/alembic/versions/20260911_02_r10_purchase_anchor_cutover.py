@@ -48,6 +48,21 @@ def upgrade() -> None:
             f"cannot cut over purchase export anchors: {int(missing_current)} current anchors are incomplete"
         )
 
+    # Alembic's historical FK name is not stable across the original
+    # PostgreSQL-created schema and isolated rehearsal schemas.  Resolve it
+    # by its semantic shape, and fail closed on a missing/ambiguous relation
+    # rather than guessing a generated identifier.
+    inspector = sa.inspect(connection)
+    legacy_fks = [
+        fk for fk in inspector.get_foreign_keys("purchase_export_batch")
+        if fk.get("constrained_columns") == ["planning_read_snapshot_id"]
+        and fk.get("referred_table") == "planning_read_snapshot"
+    ]
+    if len(legacy_fks) != 1 or not legacy_fks[0].get("name"):
+        raise RuntimeError(
+            "purchase export legacy snapshot foreign key is missing or ambiguous"
+        )
+
     op.drop_constraint(
         "ck_purchase_export_batch_exactly_one_source_anchor",
         "purchase_export_batch",
@@ -58,7 +73,7 @@ def upgrade() -> None:
         table_name="purchase_export_batch",
     )
     op.drop_constraint(
-        "fk_purchase_export_batch_planning_read_snapshot",
+        str(legacy_fks[0]["name"]),
         "purchase_export_batch",
         type_="foreignkey",
     )
