@@ -25,6 +25,7 @@ vi.mock('../../services/productionControl', () => ({
   materializeMakeWorkItems: vi.fn(),
   openPaintWeldChains: vi.fn(),
   closePaintWeldChain: vi.fn(),
+  getPendingChainCommand: vi.fn().mockResolvedValue({ command: null, message: '' }),
   getStandalonePieceworkOptions: vi.fn(),
   createStandalonePiecework: vi.fn(),
   saveProductionControlSettings: vi.fn(),
@@ -72,6 +73,7 @@ import {
   materializeMakeWorkItems,
   openPaintWeldChains,
   closePaintWeldChain,
+  getPendingChainCommand,
   getStandalonePieceworkOptions,
   createStandalonePiecework,
   updateOrderQuantity,
@@ -376,6 +378,7 @@ beforeEach(() => {
     status: 'ok', product_ids: productIds, entries: [], errors: [],
   }))
   vi.mocked(closePaintWeldChain).mockResolvedValue({ status: 'ok' })
+  vi.mocked(getPendingChainCommand).mockReset().mockResolvedValue({ command: null, message: '' })
   vi.mocked(updateOrderStatus).mockResolvedValue({} as never)
   vi.mocked(deleteProductionOrder).mockResolvedValue({} as never)
   vi.mocked(produceOrderLine).mockResolvedValue({ qty: 10 } as never)
@@ -1308,6 +1311,30 @@ describe('ProductionControlPage — characterization', () => {
     tableRow.focus()
     await user.keyboard(' ')
     expect(within(tableRow).getByRole('checkbox')).not.toBeChecked()
+  })
+
+  it('opens a saved unfinished batch instead of asking for quantities and employees again', async () => {
+    const paint = { ...fakeRows()[0], paint_weld_chain: {
+      role: 'painted', link_id: 72, counterpart_product_id: 102,
+    } } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({ rows: [paint], total: 1, limit: 100, offset: 0, truth_meta: fakeTruthMeta } as never)
+    vi.mocked(getPendingChainCommand).mockResolvedValueOnce({
+      command: { product_id: 101, request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40, dry_run: false, allow_production: false },
+      message: 'Сварка проведена. Окраска: конфликт блокировок. Исполнители сохранены.',
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findAllByText('Кронштейн')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Произвести' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).queryByRole('spinbutton')).toBeNull()
+    expect(within(dialog).queryByRole('combobox')).toBeNull()
+    expect(closePaintWeldChain).not.toHaveBeenCalled()
+    await user.click(within(dialog).getByRole('button', { name: 'Продолжить оформление' }))
+    await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101, {
+      request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40,
+    }))
   })
 
   it('asks for an executor on every operation of both chain sides before closing the chain', async () => {
