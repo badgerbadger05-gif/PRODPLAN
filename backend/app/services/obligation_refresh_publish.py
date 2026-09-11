@@ -478,6 +478,7 @@ def _require_sealed_build(
     *,
     target: models.LedgerGeneration,
     candidate_ids: list[int],
+    required_mrp_run_ids: Iterable[int],
     capabilities: dict[str, Any],
 ) -> None:
     """A caller cannot turn a merely BUILDING generation into truth by fiat."""
@@ -524,7 +525,7 @@ def _require_sealed_build(
     )
     _require_mrp_current_payloads(
         snapshot_metrics.get("mrp_result_payloads"),
-        required_run_ids=candidate_ids,
+        required_run_ids=required_mrp_run_ids,
     )
 
 
@@ -539,7 +540,6 @@ def _require_mrp_current_payloads(
             "snapshot_build lacks direct mrp_result_payloads"
         )
     result: dict[str, Mapping[str, Any]] = {}
-    seen: set[str] = set()
     for marker, raw in raw_payloads.items():
         if not isinstance(raw, Mapping):
             raise ObligationRefreshPublishError("MRP current payload is malformed")
@@ -581,8 +581,13 @@ def _require_mrp_current_payloads(
             raise ObligationRefreshPublishError("MRP current payload row counts are malformed")
         result[key] = raw
     required = {str(int(value)) for value in required_run_ids}
-    if not required.issubset(result):
-        raise ObligationRefreshPublishError("MRP current payloads omit a candidate run")
+    actual = set(result)
+    if actual != required:
+        missing = ",".join(sorted(required - actual, key=int)) or "none"
+        extra = ",".join(sorted(actual - required, key=int)) or "none"
+        raise ObligationRefreshPublishError(
+            f"MRP current payload run set mismatch (missing: {missing}; extra: {extra})"
+        )
     return result
 
 
@@ -866,7 +871,14 @@ def publish_obligation_refresh_batch(
     )
     candidate_ids = sorted(int(row.run_id) for row in candidates)
     _require_sealed_build(
-        db, target=target, candidate_ids=candidate_ids,
+        db,
+        target=target,
+        candidate_ids=candidate_ids,
+        required_mrp_run_ids=[
+            *(int(row.run_id) for row in additions),
+            *(int(row.run_id) for row in replacements),
+            *(int(row.run_id) for row in retained),
+        ],
         capabilities=capability_snapshot,
     )
     snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(

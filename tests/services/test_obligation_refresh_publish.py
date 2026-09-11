@@ -134,6 +134,11 @@ def _seal_build(db, target, candidates, cutoff):
             continue
         if stage == "snapshot_build":
             parent_generation_id = int((target.source_watermarks or {}).get("parent_generation_id"))
+            retained_parent_ids = [
+                int(entry["parent_run_id"])
+                for entry in (target.source_watermarks or {}).get(MANIFEST_KEY, {}).get("entries", [])
+                if entry.get("action") == "retain"
+            ]
             direct_payloads = {
                 str(row.run_id): {
                     "run_id": int(row.run_id),
@@ -144,6 +149,7 @@ def _seal_build(db, target, candidates, cutoff):
                 for row in db.query(models.PlanningRun).filter(
                     models.PlanningRun.ledger_generation_id == parent_generation_id,
                     models.PlanningRun.status == "FIXED_SNAPSHOT",
+                    models.PlanningRun.run_id.in_(retained_parent_ids),
                 ).all()
             }
             direct_payloads.update({str(row.run_id): row._test_mrp_payload for row in candidates})
@@ -662,7 +668,7 @@ def test_publish_requires_complete_production_control_journal_snapshot(
 
 
 @pytest.mark.parametrize("mutation, error", [
-    ("missing", "omit a candidate"),
+    ("missing", "run set mismatch"),
     ("extra", "duplicate identity"),
     ("wrong_count", "row counts are malformed"),
     ("missing_kind", "row counts are malformed"),
