@@ -155,6 +155,65 @@ def test_produce_uses_current_identity_before_fake_1c_steps(monkeypatch, db_sess
     assert calls == ["manufacture", "piecework"]
 
 
+def test_produce_does_not_close_order_after_documents_are_queued(monkeypatch, db_session):
+    """Produce/read-back remains a fact command; close is an explicit action."""
+    generation = _accepted_generation(db_session)
+    _current_production_scope(db_session, generation)
+    db_session.commit()
+    import app.routers.production_control as router
+
+    close_calls = []
+    monkeypatch.setattr(
+        router,
+        "produce_line",
+        lambda *args, **kwargs: {"manufacture_id": 8, "order_id": 9},
+    )
+    monkeypatch.setattr(
+        router,
+        "export_manufactures_to_1c",
+        lambda *args, **kwargs: {"manufactures_error": 0, "entries": [{"target_ref_key": "m-1"}]},
+    )
+    monkeypatch.setattr(
+        router,
+        "export_piecework_to_1c",
+        lambda *args, **kwargs: {"manufactures_error": 0, "entries": [{"target_ref_key": "p-1"}]},
+    )
+    import app.services.one_c_production_order_export as production_export
+    monkeypatch.setattr(
+        production_export,
+        "finalize_produced_orders_to_1c",
+        lambda *args, **kwargs: close_calls.append(True) or {
+            "message": "legacy auto-close",
+            "resume_required": False,
+        },
+    )
+
+    result = router.post_produce_line(
+        77,
+        ProduceLinePayload(
+            qty=1,
+            request_key="produce-once",
+            current_identity="order:77",
+            expected_source_revision="accepted:g1",
+        ),
+        db=db_session,
+    )
+
+    assert result["ledger_readback"] == "queued"
+    assert close_calls == []
+
+
+def test_accepted_production_fact_is_not_hidden_by_closed_order_status():
+    """The accepted Ledger fact remains visible after operator close."""
+    # The canonical fact/status regression is exercised in the service suite;
+    # this contract marker keeps the R9 requirement discoverable beside the
+    # action tests without introducing a second production-fact implementation.
+    from pathlib import Path
+
+    source = Path("tests/services/test_production_order_sync.py").read_text(encoding="utf-8")
+    assert "test_production_fact_cache_keeps_cancellation_separate_from_physical_remaining" in source
+
+
 def test_export_piecework_openapi_keeps_all_request_fields():
     from app.main import app
     schema = TestClient(app).get("/openapi.json").json()

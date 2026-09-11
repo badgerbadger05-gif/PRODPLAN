@@ -283,6 +283,33 @@ class _PostFailsAfterCreateClient(_FakeClient):
         raise RuntimeError("posting failed after create")
 
 
+class _UncertainCreateClient(_FakeClient):
+    """1C accepted the create but the transport lost the response."""
+
+    def __init__(self, *, ref_key: str = "uncertain-manufacture-ref"):
+        super().__init__(ref_key=ref_key)
+        self._failed_create = False
+
+    def post(self, entity, payload, **kwargs):
+        self.posts.append((entity, payload))
+        if entity == exporter.MANUFACTURE_ENTITY:
+            self.docs[self.ref_key] = {
+                **payload,
+                "Ref_Key": self.ref_key,
+                "DeletionMark": False,
+            }
+            if not self._failed_create:
+                self._failed_create = True
+                raise TimeoutError("response lost after 1C create")
+        return {"Ref_Key": self.ref_key}
+
+    def get_all(self, entity_name, *, filter_query=None, **_kwargs):
+        if entity_name != exporter.MANUFACTURE_ENTITY:
+            return []
+        marker = str(filter_query or "").split("substringof('")[-1].split("',")[0]
+        return [doc for doc in self.docs.values() if marker in str(doc.get("Комментарий") or "")]
+
+
 def _stub_config(monkeypatch, *, base_url: str) -> None:
     monkeypatch.setattr(
         exporter,
@@ -1042,6 +1069,38 @@ def test_failed_posting_keeps_created_ref_on_manufacture(db_session, monkeypatch
     assert m.status == "exported"
     assert m.exported_ref1c == "created-but-not-posted"
     assert m.export_error is None
+
+
+def test_uncertain_manufacture_create_recovers_by_durable_origin_without_second_post(
+    db_session, monkeypatch
+):
+    """A lost create response must recover the same 1C document on retry."""
+    db = db_session
+    item = _mk_item(db, code="EXP-UNCERTAIN", ref1c="item-ref-uncertain")
+    product = _mk_product(db, item, qty=2)
+    mid = produce_line(db, product.product_id, qty=2, request_key="uncertain-1")["manufacture_id"]
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _UncertainCreateClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    first = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+    assert first["status"] == "partial_error"
+    assert len(fake.posts) == 1
+
+    second = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+    assert second["status"] == "ok"
+    assert len(fake.posts) == 1
+    assert second["manufactures_created"] == 0
+    assert second["manufactures_already_linked"] == 1
+
+    link = db.query(SyncLink).filter_by(
+        source_doctype="manufacture",
+        source_id=mid,
+        target_entity=exporter.MANUFACTURE_ENTITY,
+    ).one()
+    assert link.status == "success"
+    assert link.target_ref_key == fake.ref_key
 
 
 def test_second_export_does_not_touch_successfully_exported_document(db_session, monkeypatch):
