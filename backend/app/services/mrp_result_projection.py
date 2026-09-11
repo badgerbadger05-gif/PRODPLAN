@@ -261,7 +261,16 @@ def build_mrp_result_current_payload(
             raise ValueError("candidate run cutoff differs from the BUILDING Ledger cutoff")
         _require_sealed_candidate_manifest(db, generation, run)
         _validate_obligation_lineage(db, int(run.run_id), int(generation.id))
-    elif status != "FIXED_SNAPSHOT":
+    elif status == "FIXED_SNAPSHOT":
+        if run.ledger_generation_id is None:
+            raise ValueError("fixed run has no Ledger generation")
+        generation = db.get(models.LedgerGeneration, int(run.ledger_generation_id))
+        if generation is None or str(generation.status or "") != "accepted":
+            raise ValueError("fixed run is not bound to an accepted Ledger generation")
+        if run.ledger_cutoff != generation.cutoff:
+            raise ValueError("fixed run cutoff differs from the accepted Ledger cutoff")
+        _validate_obligation_lineage(db, int(run.run_id), int(generation.id))
+    else:
         raise ValueError("MRP current payload requires a fixed or building run")
 
     rows_by_kind, manifest = _collect_mrp_payload(db, run)

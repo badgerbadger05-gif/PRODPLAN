@@ -62,13 +62,17 @@ def _add_obligation(db, kind, run, item, lineage):
         planned_qty=Decimal("2"),
         qty=Decimal("2"),
         need_date=date(2026, 9, 12),
-        order_date=date(2026, 9, 10),
-        lead_time_days=1,
         bucket_date=date(2026, 9, 12),
         ledger_generation_id=lineage,
     )
     if kind == "purchase":
-        db.add(models.PlannedPurchase(**common))
+        db.add(
+            models.PlannedPurchase(
+                **common,
+                order_date=date(2026, 9, 10),
+                lead_time_days=1,
+            )
+        )
     elif kind == "order":
         db.add(
             models.PlannedOrder(
@@ -78,7 +82,14 @@ def _add_obligation(db, kind, run, item, lineage):
             )
         )
     else:
-        db.add(models.PlannedRework(**common, spec_id=None))
+        db.add(
+            models.PlannedRework(
+                **common,
+                order_date=date(2026, 9, 10),
+                lead_time_days=1,
+                spec_id=None,
+            )
+        )
     db.flush()
 
 
