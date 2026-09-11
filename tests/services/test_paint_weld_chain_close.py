@@ -95,6 +95,10 @@ class _FakeClient:
 
     def patch(self, entity_ref, payload, **_):
         self.patches.append((entity_ref, payload))
+        import re
+        match = re.search("guid'([^']+)'", entity_ref)
+        if match and match.group(1) in self.docs:
+            self.docs[match.group(1)].update(payload)
         return {}
 
     def post_operation(self, operation_path):
@@ -394,6 +398,37 @@ def test_combined_accepts_separate_weld_piecework_from_live_1c(db_session, monke
     assert {row["Операция_Key"] for row in fake.posts[0][1]["Операции"]} == {"op-paint"}
     weld_link = db_session.query(SyncLink).filter_by(source_doctype="piecework", source_id=ctx["weld"]["m"].manufacture_id).one()
     assert weld_link.target_ref_key == "manual-weld-ref"
+
+
+def test_repairs_header_normalized_existing_chain_without_duplicate_labor(db_session, monkeypatch):
+    ctx = _setup_chain(db_session)
+    fake = _FakeClient()
+    _stub_live(monkeypatch, fake)
+    ids = [ctx[side]["m"].manufacture_id for side in ("weld", "paint")]
+    entries, _ = exporter._collect_export_entries(db_session, ids)
+    by_id = {e.manufacture_id: e for e in entries}
+    payload = exporter._merge_chain_payloads(
+        weld_payload=exporter._build_header_payload(by_id[ids[0]], operation_ref=""),
+        paint_payload=exporter._build_header_payload(by_id[ids[1]], operation_ref=""))
+    assert payload["ПоложениеЗаказаНаПроизводство"] == "ВТабличнойЧасти"
+    assert payload["ПоложениеСтруктурнойЕдиницы"] == "ВТабличнойЧасти"
+    payload.update(Ref_Key="old-current", Posted=True, DeletionMark=False,
+                   ПоложениеЗаказаНаПроизводство="ВШапке", ПоложениеСтруктурнойЕдиницы="ВШапке")
+    for row in payload["Операции"]:
+        row["ЗаказНаПроизводство_Key"] = payload["ЗаказНаПроизводство_Key"]
+        row["СтруктурнаяЕдиница_Key"] = payload.get("СтруктурнаяЕдиница_Key")
+        row["Стоимость"] = 1234
+    fake.docs["old-current"] = payload
+    preview = exporter._export_checked_piecework(db_session, [by_id[i] for i in ids], dry_run=True, combined=True)
+    assert preview["status"] == "repair_required"
+    assert fake.operations == [] and fake.patches == []
+    result = exporter._export_checked_piecework(db_session, [by_id[i] for i in ids], dry_run=False, combined=True)
+    assert result["status"] == "existing"
+    assert fake.posts == []
+    assert len(fake.patches) == 1
+    assert fake.docs["old-current"]["Posted"] is True
+    assert {r["ЗаказНаПроизводство_Key"] for r in payload["Операции"]} == {e.order_ref1c for e in entries}
+    assert all(r["Стоимость"] == 1234 for r in payload["Операции"])
 
 
 @pytest.mark.parametrize("same_order,posted", [(False, True), (True, True), (False, False)])

@@ -85,7 +85,7 @@ def pending_chain_command(db: Session, product_id: int) -> Dict[str, Any]:
     for side, row in rows.items():
         command[f"{side}_qty"] = float(row.qty)
         label = "Сварка" if side == "weld" else "Окраска"
-        state = "проведение не завершено" if row.export_error else "документ проведён в 1С"
+        state = "документ проведён в 1С" if row.status == "exported" else "проведение не завершено"
         messages.append(f"{label}: выпуск №{row.manufacture_id}, количество {float(row.qty):g}; {state}.")
         if row.export_error:
             messages.append(production_failure_message(row.export_error))
@@ -1427,7 +1427,7 @@ def close_paint_chain(
             or "1С не создала и не провела комбинированный СдельныйНаряд"
         )
         result["message"] = (
-            "Документы сварки и окраски проведены в 1С. Сдельный наряд не оформлен. "
+            "Документы сварки и окраски проведены в 1С. Оформление сдельного наряда не подтверждено. "
             + production_failure_message(result["error"])
             + " Нажмите «Произвести» → «Продолжить оформление»."
         )
