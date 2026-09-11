@@ -9,11 +9,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
+import sys
 from collections import defaultdict
 from typing import Any
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_BACKEND_ROOT = _REPO_ROOT / "backend"
+if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
+    # The supported CLI invocation is `python tools/...` from the repository
+    # root; in that mode Python does not add backend/ to import search paths.
+    sys.path.insert(0, str(_BACKEND_ROOT))
 
 
 _PRESERVE_REASONS = {
