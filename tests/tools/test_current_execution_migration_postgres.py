@@ -9,6 +9,7 @@ checksums must remain untouched.
 
 from __future__ import annotations
 
+import json
 import os
 from uuid import uuid4
 
@@ -124,8 +125,8 @@ def _seed(conn):
     ])
     conn.execute(sa.text(
         "INSERT INTO closed_plan_snapshot(id,plan_id,run_id,ledger_generation_id,payload) "
-        "VALUES (1,9,43,101,'{""closed"":true}'::jsonb)"
-    ))
+        "VALUES (1,9,43,101,CAST(:payload AS jsonb))"
+    ), {"payload": json.dumps({"closed": True})})
     conn.execute(sa.text(
         "INSERT INTO stock_ledger_entry(id,ledger_generation_id,business_identity,qty) VALUES "
         "(1,101,'doc:R10:1',10),(2,102,'doc:R10:1',12)"
