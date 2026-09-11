@@ -148,7 +148,7 @@ def test_runtime_inventory_contract():
 def test_report_compares_fixed_budgets():
     runner = _runner()
     report = runner.compare_budget(
-        {"api_p95_ms": 0, "current_publish_p95_ms": 0},
+        {"api_p95_ms": 1, "current_publish_p95_ms": 1},
         budget_path=BUDGET_PATH,
     )
     assert report["within_budget"] is True

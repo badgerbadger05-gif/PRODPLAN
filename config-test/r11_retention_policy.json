@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "automatic_deletion": false,
+  "categories": [
+    {
+      "category": "business_audit",
+      "purpose": "Preserve business movements, corrections, allocation decisions, and accepted current-change history for subject reconstruction.",
+      "retention": "Retain for the business and statutory audit horizon; deletion requires an explicit owner-approved archival decision.",
+      "deletion_condition": "Only after the applicable business/legal retention horizon and a verified archive with subject-value read-back.",
+      "automatic_deletion": false
+    },
+    {
+      "category": "technical_debug",
+      "purpose": "Support incident diagnosis without becoming a second business read model.",
+      "retention": "Short, operator-defined window documented with the incident; extend only while an incident remains open.",
+      "deletion_condition": "After incident closure and confirmation that no audit or reproducibility evidence depends on the record.",
+      "automatic_deletion": false
+    },
+    {
+      "category": "migration_control_copy",
+      "purpose": "Provide an offline pre/post migration and restore control copy during the cutover decision window.",
+      "retention": "Until post-cutover verification, restore rehearsal, and owner sign-off are complete.",
+      "deletion_condition": "Explicit owner-approved deletion only after verified current subject values and restore evidence.",
+      "automatic_deletion": false
+    }
+  ]
+}

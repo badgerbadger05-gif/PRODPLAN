@@ -272,7 +272,13 @@ def _publish(db: Session, generation_id: int, rows: Iterable[dict[str, Any]]) ->
     )
 
 
-def _run_postgres(dsn: str, budget: dict[str, Any], schema: str) -> dict[str, Any]:
+def _run_postgres(
+    dsn: str,
+    budget: dict[str, Any],
+    schema: str,
+    *,
+    api_metrics: Mapping[str, Any],
+) -> dict[str, Any]:
     from app import models
 
     engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
@@ -391,6 +397,8 @@ def _run_postgres(dsn: str, budget: dict[str, Any], schema: str) -> dict[str, An
                 }
                 limits = budget["budgets"]
                 checks = {
+                    "api_p95": isinstance(api_metrics.get("api_p95_ms"), (int, float))
+                    and float(api_metrics["api_p95_ms"]) <= limits["api_p95_ms"],
                     "no_op_dml": no_op["dml_count"] <= limits["no_op_dml_max"],
                     "no_op_row_growth": no_op["current_row_growth"] <= limits["no_op_current_row_growth_max"],
                     "no_op_scope_growth": no_op["current_scope_growth"] <= limits["no_op_current_scope_growth_max"],
@@ -434,6 +442,113 @@ def _run_postgres(dsn: str, budget: dict[str, Any], schema: str) -> dict[str, An
         engine.dispose()
 
 
+def measure_api_p95(dsn: str, *, sample_count: int = 9) -> dict[str, Any]:
+    """Measure the real R2 FastAPI reader through its TestClient.
+
+    The probe is read-only and exercises the same fixed R2 items endpoint as
+    the baseline; a missing endpoint or malformed metric is an error, never an
+    implicit zero.
+    """
+    url = _validated_url(dsn)
+    if sample_count <= 0:
+        raise ValueError("sample_count must be positive")
+    from fastapi.testclient import TestClient
+    from sqlalchemy.orm import sessionmaker
+    from app.database import get_db
+    from app.main import app
+
+    # Keep a local pooled engine for the request sample; opening a fresh TCP
+    # connection per TestClient request would measure connection setup rather
+    # than the production reader latency.
+    engine = sa.create_engine(url.render_as_string(hide_password=False), pool_pre_ping=True)
+    SessionForProbe = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def override_get_db():
+        db = SessionForProbe()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    path = "/api/v1/items/?skip=0&limit=100"
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as client:
+            warmup = client.get(path)
+            if warmup.status_code != 200:
+                raise RuntimeError(f"R11 API warm-up failed: HTTP {warmup.status_code}")
+            samples: list[float] = []
+            for _ in range(sample_count):
+                started = time.perf_counter()
+                response = client.get(path)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                if response.status_code != 200:
+                    raise RuntimeError(f"R11 API probe failed: HTTP {response.status_code}")
+                samples.append(elapsed_ms)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        engine.dispose()
+    if not samples:
+        raise ValueError("api_p95_ms measurement is missing or non-numeric")
+    return {
+        "api_endpoint": path,
+        "api_sample_count": len(samples),
+        "api_p95_ms": _percentile(samples, 95),
+        "api_p50_ms": _percentile(samples, 50),
+    }
+
+
+def run_storage_rehearsal_pair(
+    dsn: str, *, output_dir: str | os.PathLike[str]
+) -> dict[str, Any]:
+    """Run two identical R10 rehearsals and compare subject state only."""
+    from tools.r10_storage_rehearsal import run_storage_rehearsal
+
+    _validated_url(dsn)
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    reports = [
+        run_storage_rehearsal(dsn, output_dir=root / "run-1"),
+        run_storage_rehearsal(dsn, output_dir=root / "run-2"),
+    ]
+
+    def normalize(report: Mapping[str, Any]) -> dict[str, Any]:
+        before = report["before"]
+        restore = report["restore"]
+        return {
+            "before": {
+                "current_generation_id": before["current_generation_id"],
+                "current_scope_ids": before["current_scope_ids"],
+                "ready_scope_count": before["ready_scope_count"],
+                "subject_values": before["subject_values"],
+            },
+            "cutover": {
+                "current_generation_id": report["cutover"]["current_generation_id"],
+                "current_scope_ids": report["cutover"]["current_scope_ids"],
+                "ready_scope_count": report["cutover"]["ready_scope_count"],
+                "legacy_tables_present": report["cutover"]["legacy_tables_present"],
+            },
+            "restore": {
+                "current_generation_id": restore["current_generation_id"],
+                "current_scope_ids": restore["current_scope_ids"],
+                "ready_scope_count": restore["ready_scope_count"],
+                "subject_values": restore["subject_values"],
+                "legacy_tables_present": restore["legacy_tables_present"],
+            },
+        }
+
+    normalized = [normalize(report) for report in reports]
+    return {
+        "status": "completed" if normalized[0] == normalized[1] else "mismatch",
+        "equivalent": normalized[0] == normalized[1],
+        "normalized_subject_state": normalized[0],
+        "runs": [
+            {"schema": report["schema"], "normalized_subject_state": state}
+            for report, state in zip(reports, normalized)
+        ],
+    }
+
+
 def run_local_acceptance(
     dsn: str,
     *,
@@ -457,7 +572,9 @@ def run_local_acceptance(
     # ``str(URL)`` intentionally masks the password as ``***``.  Keep the
     # validated credential for the private DB connection, while the report
     # and all command-like fields continue to use ``_safe_target(url)``.
-    report = _run_postgres(url.render_as_string(hide_password=False), budget, schema)
+    api_metrics = measure_api_p95(url.render_as_string(hide_password=False))
+    report = _run_postgres(url.render_as_string(hide_password=False), budget, schema, api_metrics=api_metrics)
+    report["api"] = api_metrics
     if output_path is not None:
         Path(output_path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
@@ -618,8 +735,41 @@ def runtime_inventory() -> dict[str, list[str]]:
 
 def compare_budget(metrics: Mapping[str, Any], *, budget_path: str | Path = DEFAULT_BUDGET_PATH) -> dict[str, Any]:
     budget = _load_budget(budget_path)["budgets"]
+    missing: list[str] = []
+    values: dict[str, float] = {}
+    for key in ("api_p95_ms", "current_publish_p95_ms"):
+        if key not in metrics or metrics[key] is None:
+            missing.append(key)
+            continue
+        try:
+            values[key] = float(metrics[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be numeric") from exc
     checks = {
-        "api_p95_ms": float(metrics.get("api_p95_ms", 0)) <= float(budget["api_p95_ms"]),
-        "current_publish_p95_ms": float(metrics.get("current_publish_p95_ms", 0)) <= float(budget["current_publish_p95_ms"]),
+        "api_p95_ms": "api_p95_ms" in values and values["api_p95_ms"] <= float(budget["api_p95_ms"]),
+        "current_publish_p95_ms": "current_publish_p95_ms" in values and values["current_publish_p95_ms"] <= float(budget["current_publish_p95_ms"]),
     }
-    return {"within_budget": all(checks.values()), "checks": checks}
+    return {"within_budget": not missing and all(checks.values()), "checks": checks, "missing_metrics": missing}
+
+
+def validate_final_evidence(
+    evidence: Mapping[str, Any], *, budget_path: str | Path = DEFAULT_BUDGET_PATH
+) -> dict[str, Any]:
+    """Validate a final evidence packet without granting unsupported passes."""
+    expected = {f"A{i:02d}" for i in range(1, 19)}
+    matrix = evidence.get("matrix")
+    if not isinstance(matrix, Mapping) or set(matrix) != expected:
+        raise ValueError("evidence matrix must contain exactly A01-A18")
+    passed: list[str] = []
+    for key, entry in matrix.items():
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"{key} evidence entry is invalid")
+        status = entry.get("status")
+        if status not in {"planned", "covered", "blocked", "passed"}:
+            raise ValueError(f"{key} evidence status is invalid")
+        if status == "passed":
+            results = entry.get("results")
+            if not isinstance(results, list) or not results or any(not item for item in results):
+                raise ValueError(f"{key} is marked passed without concrete results")
+            passed.append(key)
+    return {"valid": True, "passed": passed, "planned_or_blocked": sorted(expected - set(passed))}
