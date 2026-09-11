@@ -29,6 +29,9 @@ from app.models import (
     Unit,
 )
 from app.routers.plan import router as plan_router
+from app.services.item_ledger.current_execution import (
+    publish_current_obligation_views_from_generation,
+)
 from app.services.mrp_result_snapshot import build_mrp_result_snapshot
 
 
@@ -87,7 +90,9 @@ def _mk_run(db) -> PlanningRun:
 def _publish_result_snapshot(db, run: PlanningRun) -> PlanningReadSnapshot:
     """Build the immutable payload explicitly; HTTP GETs only read it."""
     db.flush()
-    return build_mrp_result_snapshot(db, run.run_id)
+    snapshot = build_mrp_result_snapshot(db, run.run_id)
+    publish_current_obligation_views_from_generation(db, run.ledger_generation_id)
+    return snapshot
 
 
 def _publish_manual_purchase_snapshot(db, run: PlanningRun, rows: list[dict]) -> PlanningReadSnapshot:
@@ -110,16 +115,26 @@ def _publish_manual_purchase_snapshot(db, run: PlanningRun, rows: list[dict]) ->
     db.add(snapshot)
     db.flush()
     for index, source_row in enumerate(rows):
+        payload = dict(source_row)
+        item = db.get(Item, int(payload["item_id"]))
+        payload.setdefault("run_id", int(run.run_id))
+        payload.setdefault("row_kind", "purchase")
+        payload.setdefault("unit", str(payload.get("unit") or (item.unit if item else "шт")))
+        payload.setdefault(
+            "agg_key",
+            f"item:{int(payload['item_id'])}|unit:{str(payload.get('unit') or '')}",
+        )
         db.add(
             PlanningReadRow(
                 snapshot_id=snapshot.id,
                 row_key=f"purchase-{index}",
                 row_kind="purchase",
                 sort_key=f"2025-01-1{index}|00000000000{index}|000000000000",
-                payload=source_row,
+                payload=payload,
             )
         )
     db.flush()
+    publish_current_obligation_views_from_generation(db, run.ledger_generation_id)
     return snapshot
 
 
@@ -187,6 +202,8 @@ def test_rework_list_endpoint_returns_rows_with_shortage_fields(client, db_sessi
 
     payload = response.json()
     assert payload["total"] == 1
+    assert payload["rows"][0]["current_identity"]
+    assert payload["rows"][0]["source_revision"].startswith("accepted:g")
     row = payload["rows"][0]
     assert row["item_name"] == "Rework API 1"
     assert row["spec_code"] == "SPEC-API-RW"
@@ -315,9 +332,10 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
     purchase_response = client.get(f"/api/v1/plan/results/{run.run_id}/purchases/grouped-by-category")
     assert purchase_response.status_code == 200
     purchase_payload = purchase_response.json()
-    assert purchase_payload["snapshot_id"] == snapshot.id
     assert purchase_payload["ledger_generation"] == run.ledger_generation_id
     assert purchase_payload["truth_status"] == "accepted"
+    assert purchase_payload["current_identity"] == f"mrp-run:{run.run_id}"
+    assert purchase_payload["source_revision"].startswith("accepted:g")
     assert purchase_payload["total_groups"] == 2
     assert purchase_payload["total_orders"] == 2
     purchase_groups = {group["group_name"]: group for group in purchase_payload["groups"]}
@@ -329,9 +347,10 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
     rework_response = client.get(f"/api/v1/plan/results/{run.run_id}/rework/grouped-by-category")
     assert rework_response.status_code == 200
     rework_payload = rework_response.json()
-    assert rework_payload["snapshot_id"] == snapshot.id
     assert rework_payload["ledger_generation"] == run.ledger_generation_id
     assert rework_payload["truth_status"] == "accepted"
+    assert rework_payload["current_identity"] == f"mrp-run:{run.run_id}"
+    assert rework_payload["source_revision"].startswith("accepted:g")
     assert rework_payload["total_groups"] == 1
     assert rework_payload["total_orders"] == 2
     group = rework_payload["groups"][0]
@@ -480,6 +499,8 @@ def test_purchases_endpoint_supports_supplier_and_category_filters(
     payload = filtered_by_ref.json()
     assert payload["total"] == 1
     assert payload["rows"][0]["item_name"] == "Purchase category B"
+    assert payload["rows"][0]["current_identity"]
+    assert payload["rows"][0]["source_revision"].startswith("accepted:g")
 
     missing_supplier = client.get(
         f"/api/v1/plan/results/{run.run_id}/purchases?supplier_ref1c=__missing_supplier_name"
@@ -747,9 +768,10 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
     grouped_response = client.get(f"/api/v1/plan/results/{run.run_id}/production/grouped")
     assert grouped_response.status_code == 200
     grouped_payload = grouped_response.json()
-    assert grouped_payload["snapshot_id"] == snapshot.id
     assert grouped_payload["ledger_generation"] == run.ledger_generation_id
     assert grouped_payload["truth_status"] == "accepted"
+    assert grouped_payload["current_identity"] == f"mrp-run:{run.run_id}"
+    assert grouped_payload["source_revision"].startswith("accepted:g")
     assert grouped_payload["total_groups"] == 1
     assert grouped_payload["total_orders"] == 1
     group = grouped_payload["groups"][0]
@@ -796,4 +818,4 @@ def test_grouped_and_export_endpoints_fail_closed_without_persisted_snapshot(
     response = client.get(f"/api/v1/plan/results/{run.run_id}/{path}")
 
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "mrp_result_snapshot_required"
+    assert response.json()["detail"]["code"] == "mrp_result_current_unavailable"
