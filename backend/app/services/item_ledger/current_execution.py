@@ -13,7 +13,7 @@ from datetime import date
 from decimal import Decimal
 import hashlib
 import json
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
 from sqlalchemy.orm import Session
@@ -1087,6 +1087,62 @@ def publish_current_execution_from_generation(
         "drum": drum_result,
         "shelf": shelf_result,
     }
+
+
+def publish_current_purchase_control_from_payload(
+    db: Session,
+    generation_id: int,
+    payload: Mapping[str, Any],
+) -> CurrentExecutionPublishResult:
+    """Publish the purchase journal directly from its canonical candidate payload.
+
+    Purchase current state is owned by ``CurrentExecutionScope`` and must not
+    require creating an immutable ``PlanningReadSnapshot`` first.  The caller
+    supplies the already validated Ledger-native candidate payload; this
+    adapter only adds the stable current-row envelope and delegates all
+    identity, complete-scope, idempotency and rollback semantics to the one
+    current execution publisher.
+    """
+
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise CurrentExecutionUnavailable(
+            "purchase current publication requires an accepted generation"
+        )
+    if not isinstance(payload, Mapping):
+        raise CurrentExecutionUnavailable("purchase candidate payload is malformed")
+    raw_rows = payload.get("rows")
+    if not isinstance(raw_rows, list):
+        raise CurrentExecutionUnavailable("purchase candidate rows are missing")
+    current_rows: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            raise CurrentExecutionUnavailable("purchase candidate row is malformed")
+        row = dict(raw)
+        identity = str(row.get("current_identity") or row.get("row_key") or "").strip()
+        if not identity:
+            raise CurrentExecutionUnavailable("purchase candidate row lacks stable identity")
+        current_rows.append({
+            "entity_kind": "purchase_control_journal",
+            "business_identity": identity,
+            "scope_key": "purchase:all-live-plans",
+            "payload": row,
+        })
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    summary = dict(payload.get("summary") or {}) if isinstance(payload.get("summary"), Mapping) else {}
+    summary["meta"] = dict(meta)
+    if isinstance(payload.get("cards"), Mapping):
+        summary["cards"] = dict(payload["cards"])
+    summary["total_rows"] = len(current_rows)
+    return publish_current_execution_scope(
+        db,
+        source_revision=f"accepted:g{int(generation.id)}:purchase_control_journal",
+        source_generation_id=int(generation.id),
+        scope_key="purchase:all-live-plans",
+        rows=current_rows,
+        entity_kinds=("purchase_control_journal",),
+        summary=summary,
+    )
 
 
 def _snapshot_row_identity(payload: dict[str, Any], fallback: str) -> str:
