@@ -163,6 +163,8 @@ def _publish_current(db, generation):
         db,
         int(generation.id),
         purchase_payload=payload,
+        production_payload={"rows": [], "meta": {"row_count": 0}},
+        mrp_payloads={},
     )
     db.flush()
 
