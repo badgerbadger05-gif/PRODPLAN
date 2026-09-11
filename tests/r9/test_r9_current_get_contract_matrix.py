@@ -198,18 +198,18 @@ def test_mrp_route_get_export_matrix_fails_closed_before_snapshot_helpers(
         get_planning_result_capacity,
     )
     endpoints = [
-        (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_production, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
         (get_planning_result_production_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
-        (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_purchases, {"item_id": None, "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
         (get_planning_result_purchases_grouped, {"date_from": None, "date_to": None, "limit": 100, "offset": 0}),
-        (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_rework, {"item_id": None, "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
         (get_planning_result_rework_grouped, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
         (get_planning_result_purchases_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
         (get_planning_result_rework_grouped_by_category, {"item_id": None, "date_from": None, "date_to": None, "limit": 100, "offset": 0, "sort_by": None, "sort_dir": None}),
-        (get_planning_result_capacity, {"area_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 200, "offset": 0, "snapshot_id": None}),
-        (export_planning_result_production, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
-        (export_planning_result_purchases, {"format": "csv", "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
-        (export_planning_result_rework, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "snapshot_id": None}),
+        (get_planning_result_capacity, {"area_id": None, "bucket_type": None, "date_from": None, "date_to": None, "limit": 200, "offset": 0, "current_scope_id": None}),
+        (export_planning_result_production, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
+        (export_planning_result_purchases, {"format": "csv", "root_item_id": None, "bucket_type": None, "supplier_ref1c": None, "category_id": None, "category_ref1c": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
+        (export_planning_result_rework, {"format": "csv", "root_item_id": None, "bucket_type": None, "date_from": None, "date_to": None, "sort_by": None, "sort_dir": None, "current_scope_id": None}),
     ]
     writes: list[str] = []
     bind = db_session.get_bind()
