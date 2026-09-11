@@ -30,6 +30,7 @@ from app.services.item_ledger.future_supply_capture import (
 )
 from app.services.production_control_common import DONE_STATE_KEY
 from app.services.item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
     publish_current_obligation_views_from_generation,
 )
 
@@ -1173,13 +1174,8 @@ def test_materials_are_available_for_order_opened_after_cutoff(db_session):
         created_at=generation.cutoff.replace(tzinfo=None) + timedelta(minutes=44),
     )
 
-    materials = get_materials_snapshot(db_session, product.product_id)
-
-    assert materials["product_id"] == product.product_id
-    assert materials["ledger_generation_id"] == generation.id
-    assert materials["truth_status"] == "accepted"
-    assert materials["cutoff"] == snapshot.cutoff.isoformat()
-    assert len(materials["components"]) == 1
+    with pytest.raises(CurrentExecutionUnavailable, match="current production material row"):
+        get_materials_snapshot(db_session, product.product_id)
 
 
 def test_materials_endpoint_answers_through_its_strict_response_model(db_session):
@@ -1222,8 +1218,8 @@ def test_materials_endpoint_answers_through_its_strict_response_model(db_session
     assert "line_quantity" not in payload
 
 
-def test_work_item_materials_answer_through_their_strict_response_model(db_session):
-    """Та же проверка для строки-предложения: контракт ответа у ручек общий."""
+def test_work_item_materials_fail_closed_without_persisted_coverage(db_session):
+    """A current proposal without saved coverage cannot trigger a replay."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -1238,6 +1234,25 @@ def test_work_item_materials_answer_through_their_strict_response_model(db_sessi
     _accept(db_session, generation, snapshot)
     _publish_current(db_session, generation)
 
+    from app.services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+    manifest = get_current_execution_scope(
+        db_session,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
+    current_row = next(
+        row for row in load_current_execution_rows(
+            db_session,
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        if int((row.payload or {}).get("source_mrp_requirement_id") or 0) == int(work.requirement_id)
+        and int((row.payload or {}).get("item_id") or 0) == int(work.item_id)
+    )
+
     app = FastAPI()
     app.include_router(production_router, prefix="/api")
 
@@ -1247,14 +1262,16 @@ def test_work_item_materials_answer_through_their_strict_response_model(db_sessi
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as client:
         response = client.get(
-            f"/api/v1/production-control/work-items/{work.id}/materials"
+            f"/api/v1/production-control/work-items/{work.id}/materials",
+            params={
+                "current_identity": current_row.business_identity,
+                "expected_source_revision": manifest.source_revision,
+            },
         )
     app.dependency_overrides.clear()
 
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    assert payload["work_item_id"] == work.id
-    assert "line_quantity" not in payload
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "production_control_current_unavailable"
 
 
 def test_work_item_materials_remain_readable_from_the_published_row_generation(db_session):
@@ -1301,11 +1318,11 @@ def test_work_item_materials_remain_readable_from_the_published_row_generation(d
         )
     app.dependency_overrides.clear()
 
-    assert stale_unpinned.status_code == 404
-    assert wrong_generation.status_code == 404
+    assert stale_unpinned.status_code == 409
+    assert wrong_generation.status_code == 409
     # A historical generation selector is not a runtime fallback. Once the
     # accepted current publication moved, the old locator is unavailable.
-    assert pinned.status_code == 404, pinned.text
+    assert pinned.status_code == 409, pinned.text
 
 
 def test_materials_survive_a_generation_flip_right_after_launch(db_session):
@@ -1336,11 +1353,8 @@ def test_materials_survive_a_generation_flip_right_after_launch(db_session):
     product.ledger_generation_id = int(generation.id) - 1
     db_session.commit()
 
-    materials = get_materials_snapshot(db_session, product.product_id)
-
-    assert materials["product_id"] == product.product_id
-    assert materials["ledger_generation_id"] == generation.id
-    assert len(materials["components"]) == 1
+    with pytest.raises(CurrentExecutionUnavailable, match="current production material row"):
+        get_materials_snapshot(db_session, product.product_id)
 
 
 def test_route_sheet_prints_for_order_opened_after_cutoff(db_session):

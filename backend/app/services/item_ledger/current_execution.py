@@ -1302,6 +1302,7 @@ def publish_current_obligation_views_from_generation(
         models.PlanningReadSnapshot.truth_status == "accepted",
     ).one_or_none()
     purchase_payload = dict(purchase.payload or {}) if purchase is not None else {}
+    purchase_meta = dict(purchase_payload.get("meta") or {})
     purchase_source_rows = purchase_payload.get("rows")
     purchase_rows: list[dict[str, Any]] = []
     if isinstance(purchase_source_rows, list):
@@ -1319,6 +1320,9 @@ def publish_current_obligation_views_from_generation(
             if isinstance(row, dict)
         ]
     purchase_summary = dict(purchase_payload.get("meta") or {})
+    for key in ("run_id", "run_ids", "truth_status", "to_order_by_period", "ledger_generation"):
+        if key in purchase_meta:
+            purchase_summary[key] = purchase_meta[key]
     if isinstance(purchase_payload.get("summary"), dict):
         purchase_summary["summary"] = dict(purchase_payload["summary"])
     if isinstance(purchase_payload.get("cards"), dict):

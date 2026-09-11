@@ -1017,6 +1017,24 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
         ),
     )
 
+    by_status: dict[str, int] = {}
+    by_phase: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("line_status") or "unavailable")
+        phase = str(row.get("supply_phase") or "unavailable")
+        by_status[status] = by_status.get(status, 0) + 1
+        by_phase[phase] = by_phase.get(phase, 0) + 1
+    persisted_summary = {
+        "total_rows": len(rows),
+        "by_status": by_status,
+        "by_phase": by_phase,
+        "to_order": by_status.get("to_order", 0),
+        "overdue": by_status.get("overdue", 0),
+        "expected_7d": 0,
+        "in_transit_amount": 0.0,
+        "fact_status": "available",
+    }
+
     row_keys: set[str] = set()
     for row in rows:
         row_key = row.get("row_key")
@@ -1053,6 +1071,7 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
         },
         "rows": rows,
         "cards": cards,
+        "summary": persisted_summary,
     }
 
     existing = db.query(models.PlanningReadSnapshot).filter_by(
