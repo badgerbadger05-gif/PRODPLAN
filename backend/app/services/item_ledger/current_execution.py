@@ -127,6 +127,26 @@ def _period_execution_row_payload(
     return result
 
 
+def _period_execution_summary_for_current(payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist the public execution-summary shape without recalculating it.
+
+    Period snapshots retain root-output bookkeeping names for the historical
+    snapshot service. The current HTTP DTO exposes canonical execution names;
+    normalize the already-persisted values at publication time so a current
+    GET remains a typed read of saved data and does not call finalization.
+    """
+    summary = dict(payload.get("summary") or {})
+    for public_name, snapshot_name in (
+        ("execution_completed_qty", "root_output_completed_qty"),
+        ("execution_base_qty", "root_output_base_qty"),
+        ("execution_pct", "root_output_pct"),
+    ):
+        if public_name not in summary and snapshot_name in summary:
+            summary[public_name] = summary[snapshot_name]
+        summary.pop(snapshot_name, None)
+    return summary
+
+
 def _nav_link(
     *,
     label: str,
@@ -1429,7 +1449,7 @@ def publish_current_obligation_views_from_generation(
             "snapshot_key": str(snapshot.snapshot_key),
             "plan": plan,
             "run_id": run_id,
-            "summary": dict(payload.get("summary") or {}),
+            "summary": _period_execution_summary_for_current(payload),
             "plan_output_rows": list(payload.get("plan_output_rows") or []),
             "truth_status": payload.get("truth_status"),
             "truth_generation_id": payload.get("truth_generation_id"),
