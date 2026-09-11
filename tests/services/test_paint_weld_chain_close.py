@@ -33,6 +33,34 @@ from app.services import one_c_piecework_export as exporter
 from app.services.paint_weld_chain import close_paint_chain
 
 
+def test_pending_command_restores_saved_batch_after_page_reload(db_session):
+    from app.services.paint_weld_chain import pending_chain_command
+    ctx = _setup_chain(db_session)
+    for side in ("weld", "paint"):
+        ctx[side]["m"].request_key = "original-command"
+        ctx[side]["m"].complete_order = False
+    ctx["paint"]["m"].status = "error"
+    ctx["paint"]["m"].export_error = "Неустранимый конфликт блокировок"
+    db_session.commit()
+    result = pending_chain_command(db_session, ctx["paint"]["product"].product_id)
+    assert result["command"]["request_key"] == "original-command"
+    assert result["command"]["partial"] is True
+    assert result["command"]["weld_qty"] == float(ctx["weld"]["m"].qty)
+    assert "конфликта блокировок" in result["message"]
+    assert "проведение не завершено" in result["message"]
+    assert db_session.query(ProductionManufacture).count() == 2
+
+
+def test_pending_command_refuses_unrelated_batches(db_session):
+    from app.services.paint_weld_chain import pending_chain_command
+    ctx = _setup_chain(db_session)
+    ctx["paint"]["m"].request_key = "paint-batch"
+    ctx["weld"]["m"].request_key = "other-batch"
+    db_session.commit()
+    with pytest.raises(ValueError, match="неполной связью"):
+        pending_chain_command(db_session, ctx["paint"]["product"].product_id)
+
+
 @pytest.fixture(autouse=True)
 def _accepted_journal_truth(db_session):
     cutoff = datetime(2026, 7, 18)
@@ -499,7 +527,9 @@ def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, mo
     assert first["resume_required"] is True
     assert first["posted_sides"] == ["weld"]
     assert first["pending_sides"] == ["paint"]
-    assert "докат" in first["message"]
+    assert "Продолжить оформление" in first["message"]
+    assert "докат" not in first["message"]
+    assert "weld" not in first["message"]
     assert "1С отказала" in first["error"]
     # комбинированный наряд не создавался
     assert fake.posts == []

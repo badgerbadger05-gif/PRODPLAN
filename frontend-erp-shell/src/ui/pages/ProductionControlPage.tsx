@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { createRequestKey } from '../../lib/requestKey'
+import { getPendingChainCommand, type PendingChainCommand } from '../../services/productionControl'
 import {
   coverageLabels,
   type ControlWarehouse,
@@ -114,6 +115,7 @@ export function ProductionControlPage() {
   // Диалог «Произвести»: 1С не проведёт сдельный наряд без исполнителя, поэтому
   // операции выбираются поимённо до отправки, а не подставляются заглушкой.
   const [produceOpen, setProduceOpen] = useState(false)
+  const [pendingProduction, setPendingProduction] = useState<PendingChainCommand | null>(null)
   const [produceQty, setProduceQty] = useState('')
   const [produceSaving, setProduceSaving] = useState(false)
   const [produceError, setProduceError] = useState('')
@@ -578,6 +580,14 @@ export function ProductionControlPage() {
     const row = rows.find((item) => item.product_id === productId)
     if (!row) return
     const chain = row.paint_weld_chain
+    if (chain && !laborOnly) {
+      const pending = await getPendingChainCommand(productId)
+      if (pending.command) {
+        setProduceError('')
+        setPendingProduction(pending)
+        return
+      }
+    }
     const counterpartProductId = chain?.counterpart_product_id ?? null
     setPieceworkOnly(laborOnly)
     setPieceworkRow(null)
@@ -700,7 +710,7 @@ export function ProductionControlPage() {
           ...(paintExecutors.length ? { paint_operation_executors: paintExecutors } : {}),
         })
         setProduceOpen(false)
-        setMessage(
+        setMessage(result.resume_required ? '' :
           result.message
             || (result.resume_required
               ? 'Цепочка сварка–окраска закрыта частично. Повторите действие для завершения.'
@@ -708,6 +718,7 @@ export function ProductionControlPage() {
         )
         await loadMaterials(productId)
         await load(offsetRef.current)
+        if (result.resume_required) setError(result.message || 'Оформление выпуска не завершено. Нажмите «Произвести», чтобы продолжить.')
       } catch (e) {
         setProduceError(e instanceof Error ? e.message : String(e))
       } finally {
@@ -1037,6 +1048,42 @@ export function ProductionControlPage() {
         }}
         onClose={() => setRootDialogOpen(false)}
       />
+      {pendingProduction?.command && (
+        <div className="dialogOverlay" role="dialog" aria-modal="true" aria-labelledby="resume-production-title">
+          <div className="dialogBox">
+            <div className="dialogHeader" id="resume-production-title">Продолжить оформление выпуска</div>
+            <div className="dialogBody">
+              <p>{pendingProduction.message}</p>
+              {produceError && <div className="dialogError" role="alert">{produceError}</div>}
+            </div>
+            <div className="dialogFooter">
+              <button disabled={produceSaving} onClick={() => setPendingProduction(null)}>Отмена</button>
+              <button className="primary" disabled={produceSaving} onClick={() => void (async () => {
+                const command = pendingProduction.command!
+                setProduceSaving(true)
+                setProduceError('')
+                try {
+                  const result = await closePaintWeldChain(command.product_id, {
+                    request_key: command.request_key,
+                    partial: command.partial,
+                    weld_qty: command.weld_qty,
+                    paint_qty: command.paint_qty,
+                  })
+                  if (result.resume_required) {
+                    setProduceError(result.message || 'Оформление пока не завершено. Повторите попытку позже.')
+                  } else {
+                    setPendingProduction(null)
+                    setError('')
+                    setMessage(result.message || 'Оформление выпуска завершено.')
+                  }
+                  await load(offsetRef.current)
+                } catch (e) { setProduceError(e instanceof Error ? e.message : String(e)) }
+                finally { setProduceSaving(false) }
+              })()}>{produceSaving ? 'Оформляем…' : 'Продолжить оформление'}</button>
+            </div>
+          </div>
+        </div>
+      )}
       {produceOpen && activeRow && (
         <ProduceDialog
           produceRow={pieceworkOnly && pieceworkRow ? pieceworkRow : activeRow}

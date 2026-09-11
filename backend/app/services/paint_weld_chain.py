@@ -47,6 +47,50 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+
+def production_failure_message(error: str) -> str:
+    if "конфликт блокировок" in str(error).lower():
+        return "1С не смогла провести документ из-за конфликта блокировок при одновременной работе с данными. Повторите попытку чуть позже."
+    return "1С не завершила оформление документа. Подробности ошибки: " + str(error)
+
+
+def pending_chain_command(db: Session, product_id: int) -> Dict[str, Any]:
+    """Read the saved unfinished command, never reconstruct physical output."""
+    from .production_control_production_flow import _resumable_manufacture
+
+    _, paint, weld = _chain_link_for_product(db, product_id)
+    pending = {
+        side: _resumable_manufacture(db, int(product.product_id))
+        for side, product in (("weld", weld), ("paint", paint))
+    }
+    rows = {side: value[0] for side, value in pending.items() if value is not None}
+    if not rows:
+        return {"command": None, "message": ""}
+    keys = {row.request_key for row in rows.values()}
+    if len(keys) == 1 and None not in keys:
+        for side, product in (("weld", weld), ("paint", paint)):
+            if side not in rows:
+                counterpart = db.query(ProductionManufacture).filter(
+                    ProductionManufacture.product_id == product.product_id,
+                    ProductionManufacture.request_key == next(iter(keys)),
+                    ProductionManufacture.status != "cancelled",
+                ).one_or_none()
+                if counterpart is not None:
+                    rows[side] = counterpart
+    if len(keys) != 1 or None in keys or len(rows) != 2:
+        raise ValueError("Обнаружен незавершённый выпуск с неполной связью документов. Требуется проверить документы выпуска; новый выпуск не начат.")
+    command = {"product_id": product_id, "request_key": next(iter(keys)), "dry_run": False,
+               "partial": next(iter(rows.values())).complete_order is False}
+    messages = []
+    for side, row in rows.items():
+        command[f"{side}_qty"] = float(row.qty)
+        label = "Сварка" if side == "weld" else "Окраска"
+        state = "проведение не завершено" if row.export_error else "документ проведён в 1С"
+        messages.append(f"{label}: выпуск №{row.manufacture_id}, количество {float(row.qty):g}; {state}.")
+        if row.export_error:
+            messages.append(production_failure_message(row.export_error))
+    return {"command": command, "message": " ".join(messages) + " Количества и исполнители сохранены. Продолжение использует документы этого выпуска; повторно вводить данные не нужно."}
+
 from .item_ledger.reservation import replenishment_remaining
 from .item_ledger.live_plan_scope import sealed_generation_lineage_ids
 
@@ -1336,7 +1380,7 @@ def close_paint_chain(
         plan["manufacture_ref1c"] = exported_ref or None
         plan["error"] = reason
         pending_sides.append(side)
-        failures.append(f"{side}: {reason}")
+        failures.append(f"{'Сварка' if side == 'weld' else 'Окраска'}: {reason}")
         # Локальный выпуск без 1С-документа откатывается, иначе гард
         # «по этой строке уже создана команда на весь объём» заблокирует докат.
         if manufacture_id in created_manufacture_ids and not exported_ref:
@@ -1355,11 +1399,12 @@ def close_paint_chain(
         result["resume_required"] = True
         result["error"] = "; ".join(failures)
         result["message"] = (
-            "Цепочка частично проведена: СборкаЗапасов стороны "
-            f"{', '.join(posted_sides)} в 1С, сторона "
-            f"{', '.join(pending_sides)} — нет, комбинированный СдельныйНаряд не "
-            "создавался. Требуется докат: повторите закрытие цепочки, проведённая "
-            "сборка переиспользуется без дубля."
+            "Выпуск оформлен не полностью. "
+            + "; ".join(f"{'Сварка' if side == 'weld' else 'Окраска'}: документ проведён в 1С" for side in posted_sides)
+            + ". " + "; ".join(f"{'Сварка' if side == 'weld' else 'Окраска'}: проведение не завершено" for side in pending_sides)
+            + ". Сдельный наряд пока не оформлен. "
+            + production_failure_message(result["error"])
+            + " Нажмите «Произвести» → «Продолжить оформление». Уже созданные документы будут использованы повторно."
         )
         return result
 
@@ -1382,8 +1427,9 @@ def close_paint_chain(
             or "1С не создала и не провела комбинированный СдельныйНаряд"
         )
         result["message"] = (
-            "Обе СборкиЗапасов проведены в 1С, комбинированный СдельныйНаряд — нет. "
-            "Требуется докат: повторите закрытие цепочки."
+            "Документы сварки и окраски проведены в 1С. Сдельный наряд не оформлен. "
+            + production_failure_message(result["error"])
+            + " Нажмите «Произвести» → «Продолжить оформление»."
         )
         return result
     from .one_c_production_order_export import finalize_produced_orders_to_1c
