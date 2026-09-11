@@ -15,6 +15,7 @@ import type { ProductionResource } from '../../domain/resources'
 vi.mock('../../services/productionControl', () => ({
   listProductionOrders: vi.fn(),
   listDrumSchedule: vi.fn(),
+  listAssemblyQueue: vi.fn(),
   moveDrumSlot: vi.fn(),
   listProductionEmployees: vi.fn(),
   listProductionOperations: vi.fn(),
@@ -55,6 +56,7 @@ vi.mock('../../services/itemLedger', () => ({
 import {
   listProductionOrders,
   listDrumSchedule,
+  listAssemblyQueue,
   moveDrumSlot,
   listProductionEmployees,
   listProductionOperations,
@@ -408,6 +410,42 @@ beforeEach(() => {
 })
 
 describe('ProductionControlPage — characterization', () => {
+  it('loads and highlights the exact current assembly queue target from the URL', async () => {
+    vi.mocked(listAssemblyQueue).mockResolvedValue({
+      rows: [{
+        plan_id: 1,
+        plan_line_id: 502,
+        run_id: 77,
+        item_id: 201,
+        item_code: 'ART-1',
+        item_name: 'Кронштейн',
+        bucket_date: '2026-09-03',
+        period_from: '2026-09-01',
+        period_to: '2026-09-30',
+        planned_output_qty: 10,
+        accepted_plan_output_qty: 4,
+        assembly_remaining_qty: 6,
+        priority_key: ['2026-09-03', 1],
+        sort_key: '2026-09-03|1',
+        eligible_from: '2026-09-03',
+        current_identity: 'plan-line:502',
+        source_revision: 'accepted:g77:assembly_queue',
+      }],
+      total_rows: 1,
+      total_queue_qty: 6,
+      limit: 100,
+      offset: 0,
+      truth_meta: fakeTruthMeta,
+    } as never)
+
+    renderPage(['/production-control?view=assembly-queue&current_identity=plan-line%3A502'])
+
+    expect(await screen.findByText('Кронштейн')).toBeInTheDocument()
+    expect(listAssemblyQueue).toHaveBeenCalledWith({ current_identity: 'plan-line:502' })
+    expect(screen.getByTestId('assembly-queue-row-plan-line:502')).toHaveClass('activeRow')
+    expect(screen.getByText('accepted:g77:assembly_queue')).toBeInTheDocument()
+  })
+
   it('shows accepted Ledger balances, active reservations and live orders for the selected item', async () => {
     renderPage()
 

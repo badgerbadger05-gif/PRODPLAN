@@ -96,6 +96,15 @@ describe('production control model', () => {
     })
   })
 
+  it('parses the current assembly queue view and stable row identity', () => {
+    expect(parseProductionControlUrlState(new URLSearchParams(
+      'view=assembly-queue&current_identity=plan-line%3A502',
+    ))).toMatchObject({
+      view: 'assembly-queue',
+      activeCurrentIdentity: 'plan-line:502',
+    })
+  })
+
   it('derives active, selected, specific, and deletable rows', () => {
     expect(activeProductionRow(rows, 2)?.product_id).toBe(2)
     expect(activeProductionRow(rows, 99)?.product_id).toBe(1)

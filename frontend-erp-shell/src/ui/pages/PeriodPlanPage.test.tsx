@@ -188,6 +188,21 @@ const journalResponseWithLedgerLinks: ExecutionJournalResponse = {
           },
         ],
       },
+      basis_links: {
+        item: { label: 'Ledger item', href: '#/ledger/items/501?tab=current', available: true, reason: null },
+        reservations: [{ label: 'Ledger reservation', href: '#/ledger/reservations/101', available: true, reason: null }],
+        events: [{ label: 'Ledger event', href: '#/ledger/events/11', available: true, reason: null }],
+        reason: null,
+      },
+      queue_links: [{
+        label: 'Assembly queue',
+        href: '#/production-control?view=assembly-queue&current_identity=plan-line%3A502',
+        available: true,
+        reason: null,
+        current_identity: 'plan-line:502',
+        source_revision: 'accepted:g77:assembly_queue',
+      }],
+      queue_link_reason: null,
       work_items: [
         {
           type: 'planned_order',
@@ -653,7 +668,7 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.queryByText(/MRP-снимок не создан/)).not.toBeInTheDocument()
   })
 
-  it('shows ledger links in expanded journal rows while preserving work-item links', async () => {
+  it('shows persisted basis and queue links in expanded journal rows while preserving work-item links', async () => {
     const user = userEvent.setup()
     vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponseWithLedgerLinks)
     renderAt('/period-plan/123')
@@ -665,14 +680,12 @@ describe('PeriodPlanPage — detail view', () => {
     const journalRow = await screen.findByText('Насос ГА-1')
     await user.click(journalRow.closest('tr') as HTMLTableRowElement)
 
-    expect(await screen.findByRole('link', { name: 'Номенклатура #501' })).toHaveAttribute('href', '#/ledger/items/501')
-    expect(screen.getByRole('link', { name: 'Резерв #101' })).toHaveAttribute(
+    expect(await screen.findByRole('link', { name: 'Ledger item' })).toHaveAttribute('href', '#/ledger/items/501?tab=current')
+    expect(screen.getByRole('link', { name: 'Ledger reservation' })).toHaveAttribute('href', '#/ledger/reservations/101')
+    expect(screen.getByRole('link', { name: 'Ledger event' })).toHaveAttribute('href', '#/ledger/events/11')
+    expect(screen.getByRole('link', { name: 'Assembly queue' })).toHaveAttribute(
       'href',
-      '#/ledger/items/501?tab=reservations&reservation_id=101',
-    )
-    expect(screen.getByRole('link', { name: 'Событие #11' })).toHaveAttribute(
-      'href',
-      '#/ledger/items/501?tab=reservations&reservation_id=101&event_id=11',
+      '#/production-control?view=assembly-queue&current_identity=plan-line%3A502',
     )
     expect(screen.getByRole('link', { name: 'Задание #77' })).toHaveAttribute(
       'href',
