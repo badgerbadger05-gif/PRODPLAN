@@ -64,6 +64,12 @@ def _schema(engine):
             "business_identity TEXT NOT NULL, scope_key TEXT NOT NULL, source_revision TEXT NOT NULL, "
             "operation TEXT NOT NULL, reason TEXT NOT NULL, before_payload TEXT, after_payload TEXT)"
         ))
+        connection.execute(text(
+            "CREATE TABLE purchase_export_batch ("
+            "id INTEGER PRIMARY KEY, ledger_generation_id INTEGER NOT NULL, "
+            "planning_read_snapshot_id INTEGER, current_execution_scope_id INTEGER, "
+            "current_execution_source_revision TEXT, idempotency_key TEXT NOT NULL)"
+        ))
 
 
 def _seed_truth(engine, *, generation_id=7, status="accepted", pointer=None):
@@ -95,6 +101,11 @@ def _seed_truth(engine, *, generation_id=7, status="accepted", pointer=None):
                 "id": evidence_id, "consumer": consumer, "snapshot_key": snapshot_key,
                 "generation_id": generation_id,
             })
+        connection.execute(text(
+            "INSERT INTO purchase_export_batch "
+            "(id, ledger_generation_id, planning_read_snapshot_id, idempotency_key) "
+            "VALUES (1, :generation_id, 2, 'r10-unit-export')"
+        ), {"generation_id": generation_id})
 
 
 def _publish_all(session, generation_id: int, *, duplicate=False):
@@ -295,6 +306,7 @@ def test_postflight_reports_expected_scope_anchor_and_revision():
     _schema(engine)
     _seed_truth(engine)
     with engine.begin() as connection:
+        connection.execute(text("DELETE FROM purchase_export_batch"))
         # Build a complete accepted fixture through a direct transaction, as the
         # production publisher does; postflight itself must remain read-only.
         pass
@@ -309,3 +321,57 @@ def test_postflight_reports_expected_scope_anchor_and_revision():
     assert report["status"] == "ready"
     assert report["generation_id"] == 7
     assert report["scopes"]["production_control_journal"]["source_revision"] == "accepted:g7:production_control_journal"
+
+
+def test_apply_migrates_purchase_export_anchor_and_retry_is_noop(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    def idempotent_publisher(session, generation_id):
+        if session.execute(text("SELECT count(*) FROM current_execution_scope")).scalar_one() == 0:
+            _publish_all(session, generation_id)
+        return {}
+
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        idempotent_publisher,
+    )
+
+    first = apply_current_obligation_migration(engine, writers_stopped=True)
+    with engine.connect() as connection:
+        anchor = connection.execute(text(
+            "SELECT planning_read_snapshot_id, current_execution_scope_id, current_execution_source_revision "
+            "FROM purchase_export_batch WHERE id=1"
+        )).one()
+        change_count = connection.execute(text("SELECT count(*) FROM current_execution_change")).scalar_one()
+    assert anchor[0] is None
+    assert anchor[1] == 2
+    assert anchor[2] == "accepted:g7:purchase_control_journal"
+    assert first["postflight"]["purchase_export_anchors"] == {"legacy": 0, "current": 1}
+
+    second = apply_current_obligation_migration(engine, writers_stopped=True)
+    assert second["idempotent"] is True
+    assert second["postflight"]["purchase_export_anchors"] == {"legacy": 0, "current": 1}
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM current_execution_change")).scalar_one() == change_count
+
+
+def test_wrong_purchase_export_snapshot_rolls_back_publication_and_anchor(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE purchase_export_batch SET planning_read_snapshot_id=1 WHERE id=1"
+        ))
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        _publish_all,
+    )
+
+    with pytest.raises(PreflightBlocked, match="purchase export snapshot"):
+        apply_current_obligation_migration(engine, writers_stopped=True)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM current_execution_scope")).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM current_execution_row")).scalar_one() == 0
+        assert connection.execute(text("SELECT planning_read_snapshot_id FROM purchase_export_batch WHERE id=1")).scalar_one() == 1

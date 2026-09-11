@@ -66,6 +66,21 @@ def test_manifest_is_deterministic_and_classifies_rows_by_transition():
     assert first["categories"]["migrate"]["planning_read_row"]["row_count"] == 1
 
 
+def test_closed_plan_snapshot_is_preserved_business_closure_history():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE closed_plan_snapshot (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        ))
+        connection.execute(text("INSERT INTO closed_plan_snapshot(id, payload) VALUES (1, '{}')"))
+
+    manifest = build_manifest(engine)
+
+    assert manifest["status"] == "ready"
+    assert manifest["categories"]["preserve"]["closed_plan_snapshot"]["row_count"] == 1
+    assert "closed_plan_snapshot" not in manifest["categories"]["delete"]
+
+
 def test_historical_bucket_evidence_is_migrated_not_unknown():
     engine = _engine()
     with engine.begin() as connection:

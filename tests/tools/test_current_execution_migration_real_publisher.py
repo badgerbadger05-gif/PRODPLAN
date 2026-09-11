@@ -103,7 +103,7 @@ def _seed(session: Session):
         return value
 
     production = snapshot("production_control_journal", "journal:v1", pointed_generation, {"meta": {}})
-    snapshot("purchase_control_journal", "journal:v1", pointed_generation, {"meta": {}, "rows": []})
+    purchase = snapshot("purchase_control_journal", "journal:v1", pointed_generation, {"meta": {}, "rows": []})
     snapshot("mrp_result", "run:41", pointed_generation, {"summary": {}})
     snapshot("mrp_result", "run:42", pointed_generation, {"summary": {}})
     snapshot("period_plan_execution", "plan=7;run=41", pointed_generation, {"plan": {"id": 7}, "run_id": 41, "rows": []})
@@ -154,7 +154,7 @@ def _seed(session: Session):
     ))
     session.add(models.PurchaseExportBatch(
         ledger_generation_id=old_generation.id,
-        planning_read_snapshot_id=production.id,
+        planning_read_snapshot_id=purchase.id,
         idempotency_key="r10-real-export",
         status="completed",
     ))

@@ -144,7 +144,7 @@ def _seed(conn):
     ))
     conn.execute(sa.text(
         "INSERT INTO purchase_export_batch(id,ledger_generation_id,planning_read_snapshot_id,current_execution_scope_id,current_execution_source_revision,idempotency_key) "
-        "VALUES (1,101,1,NULL,NULL,'r10-export')"
+        "VALUES (1,101,2,NULL,NULL,'r10-export')"
     ))
 
 
