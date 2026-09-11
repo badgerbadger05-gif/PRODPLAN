@@ -492,7 +492,7 @@ def test_successful_synthetic_pipeline_publishes_only_after_validation(db_sessio
     ).count() == 1
 
 
-def test_acceptance_marks_journal_snapshots_as_accepted_truth(db_session):
+def test_acceptance_keeps_purchase_current_state_out_of_read_snapshots(db_session):
     generation, _requirement = _synthetic(db_session, "journal-truth")
 
     accept_generation_build(
@@ -505,16 +505,6 @@ def test_acceptance_marks_journal_snapshots_as_accepted_truth(db_session):
     assert generation.status == "accepted"
     assert generation.accepted_at is not None
 
-    purchase_snapshot = (
-        db_session.query(models.PlanningReadSnapshot)
-        .filter_by(
-            consumer=PURCHASE_JOURNAL_CONSUMER,
-            snapshot_key=PURCHASE_JOURNAL_SNAPSHOT_KEY,
-            ledger_generation_id=generation.id,
-            truth_status="accepted",
-        )
-        .one()
-    )
     production_snapshot = (
         db_session.query(models.PlanningReadSnapshot)
         .filter_by(
@@ -525,8 +515,16 @@ def test_acceptance_marks_journal_snapshots_as_accepted_truth(db_session):
         )
         .one()
     )
-    assert purchase_snapshot.published_at == generation.accepted_at
     assert production_snapshot.published_at == generation.accepted_at
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
+        consumer=PURCHASE_JOURNAL_CONSUMER,
+        snapshot_key=PURCHASE_JOURNAL_SNAPSHOT_KEY,
+        ledger_generation_id=generation.id,
+    ).count() == 0
+    assert db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    ).one().source_generation_id == generation.id
 
 
 def test_acceptance_fails_closed_when_claimed_journal_candidate_is_missing(
@@ -538,12 +536,12 @@ def test_acceptance_fails_closed_when_claimed_journal_candidate_is_missing(
         return None
 
     monkeypatch.setattr(
-        "app.services.item_ledger.generation_lifecycle.build_purchase_journal_candidate",
+        "app.services.item_ledger.generation_lifecycle.build_purchase_journal_payload",
         no_purchase_candidate,
     )
     with pytest.raises(
         GenerationValidationError,
-        match="no journal candidate to publish",
+        match="purchase journal candidate payload is missing",
     ):
         accept_generation_build(
             db_session,

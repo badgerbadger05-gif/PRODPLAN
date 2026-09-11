@@ -167,7 +167,7 @@ def test_apply_uses_truth_pointer_and_rejects_pointer_to_nonaccepted_even_if_new
 
     called = []
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         lambda session, generation_id: called.append(generation_id),
     )
 
@@ -185,7 +185,7 @@ def test_unknown_manifest_blocks_before_publisher(monkeypatch):
 
     called = []
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         lambda session, generation_id: called.append(generation_id),
     )
 
@@ -205,7 +205,7 @@ def test_missing_obligation_source_evidence_blocks_before_publisher_and_dml(monk
 
     called = []
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         lambda session, generation_id: called.append(generation_id),
     )
 
@@ -230,7 +230,7 @@ def test_near_match_snapshot_key_does_not_satisfy_exact_run_source(monkeypatch):
 
     called = []
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         lambda session, generation_id: called.append(generation_id),
     )
 
@@ -244,7 +244,7 @@ def test_partial_failure_rolls_back_scopes_rows_and_changes(monkeypatch):
     _schema(engine)
     _seed_truth(engine)
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         _publish_all,
     )
 
@@ -263,7 +263,7 @@ def test_postflight_ambiguity_rolls_back_all_published_rows(monkeypatch):
     _schema(engine)
     _seed_truth(engine)
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         lambda session, generation_id: _publish_all(session, generation_id, duplicate=True),
     )
 
@@ -287,7 +287,7 @@ def test_second_apply_is_idempotent_and_adds_no_change_rows(monkeypatch):
         return {}
 
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         idempotent_publisher,
     )
 
@@ -333,7 +333,7 @@ def test_apply_migrates_purchase_export_anchor_and_retry_is_noop(monkeypatch):
         return {}
 
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         idempotent_publisher,
     )
 
@@ -365,7 +365,7 @@ def test_wrong_purchase_export_snapshot_rolls_back_publication_and_anchor(monkey
             "UPDATE purchase_export_batch SET planning_read_snapshot_id=1 WHERE id=1"
         ))
     monkeypatch.setattr(
-        "tools.current_execution_migration.publish_current_obligation_views_from_generation",
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
         _publish_all,
     )
 

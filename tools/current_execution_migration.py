@@ -52,10 +52,10 @@ try:
     # Kept as a module-level seam so tests can prove the transaction policy
     # without calling OData, workers, or a live integration.
     from app.services.item_ledger.current_execution import (
-        publish_current_obligation_views_from_generation,
+        publish_current_obligation_views_from_snapshots,
     )
 except Exception:  # pragma: no cover - standalone preflight remains usable
-    publish_current_obligation_views_from_generation = None
+    publish_current_obligation_views_from_snapshots = None
 
 
 _PRESERVE_REASONS = {
@@ -677,7 +677,8 @@ def apply_current_obligation_migration(
 
     This function owns transaction orchestration only.  The domain mapping and
     all current-row semantics remain in
-    ``publish_current_obligation_views_from_generation``.
+    ``publish_current_obligation_views_from_snapshots`` (the explicitly
+    migration-only adapter).
     """
 
     if not writers_stopped:
@@ -691,7 +692,7 @@ def apply_current_obligation_migration(
         )
 
     generation_id = _accepted_truth_generation(engine)
-    if publish_current_obligation_views_from_generation is None:
+    if publish_current_obligation_views_from_snapshots is None:
         raise PreflightBlocked("canonical current obligation publisher is unavailable")
 
     source_evidence = _source_evidence_report(engine, generation_id)
@@ -699,7 +700,7 @@ def apply_current_obligation_migration(
     publisher_result: Any = None
     with Session(engine, autoflush=False, expire_on_commit=False) as session:
         with session.begin():
-            publisher_result = publish_current_obligation_views_from_generation(session, generation_id)
+            publisher_result = publish_current_obligation_views_from_snapshots(session, generation_id)
             if fault_after_consumer is not None:
                 raise RuntimeError(f"fault injection after consumer {fault_after_consumer}")
             _migrate_purchase_export_anchors(session, generation_id)

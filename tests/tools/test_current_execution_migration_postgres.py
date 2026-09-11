@@ -195,7 +195,7 @@ def test_r10_postgres_rehearsal_isolated_pointer_atomic_and_idempotent(monkeypat
             _seed(connection)
 
         from tools import current_execution_migration as migration
-        monkeypatch.setattr(migration, "publish_current_obligation_views_from_generation", _publisher)
+        monkeypatch.setattr(migration, "publish_current_obligation_views_from_snapshots", _publisher)
 
         before = build_manifest(scoped)
         with pytest.raises(RuntimeError, match="fault injection"):

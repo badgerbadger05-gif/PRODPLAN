@@ -1118,8 +1118,20 @@ def publish_current_purchase_control_from_payload(
     for raw in raw_rows:
         if not isinstance(raw, Mapping):
             raise CurrentExecutionUnavailable("purchase candidate row is malformed")
-        row = dict(raw)
-        identity = str(row.get("current_identity") or row.get("row_key") or "").strip()
+        # Candidate builders may retain the immutable snapshot envelope
+        # (``{"row_key": ..., "payload": {...}}``), while the direct
+        # current publisher owns the inner business payload.  Normalize both
+        # shapes here so the runtime path never publishes a nested legacy
+        # envelope as the current DTO.
+        candidate = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
+        row = dict(candidate)
+        identity = str(
+            raw.get("current_identity")
+            or row.get("current_identity")
+            or raw.get("row_key")
+            or row.get("row_key")
+            or ""
+        ).strip()
         if not identity:
             raise CurrentExecutionUnavailable("purchase candidate row lacks stable identity")
         current_rows.append({
@@ -1279,11 +1291,11 @@ def _production_semantic_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def publish_current_obligation_views_from_generation(
+def _publish_current_obligation_views(
     db: Session,
     generation_id: int,
     *,
-    purchase_payload: Mapping[str, Any] | None = None,
+    purchase_payload: Mapping[str, Any],
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Promote accepted obligation/read-model snapshots to compact current rows.
 
@@ -1354,59 +1366,24 @@ def publish_current_obligation_views_from_generation(
         summary=production_summary,
     )
 
-    if purchase_payload is not None:
-        results["purchase_control_journal"] = publish_current_purchase_control_from_payload(
-            db,
-            int(generation.id),
-            purchase_payload,
-        )
-        purchase = None
-    else:
-        purchase = db.query(models.PlanningReadSnapshot).filter(
-            models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-            models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-            models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-            models.PlanningReadSnapshot.truth_status == "accepted",
-        ).one_or_none()
-    purchase_source_payload = (
-        dict(purchase.payload or {})
-        if purchase is not None
-        else dict(purchase_payload or {})
+    results["purchase_control_journal"] = publish_current_purchase_control_from_payload(
+        db,
+        int(generation.id),
+        purchase_payload,
     )
-    purchase_meta = dict(purchase_source_payload.get("meta") or {})
-    purchase_source_rows = purchase_source_payload.get("rows")
-    purchase_rows: list[dict[str, Any]] = []
-    if isinstance(purchase_source_rows, list):
-        purchase_rows = [
-            {
-                "entity_kind": "purchase_control_journal",
-                "business_identity": _snapshot_row_identity(
-                    dict(row.get("payload") or row) if isinstance(row, dict) else {},
-                    "purchase",
-                ),
-                "scope_key": "purchase:all-live-plans",
-                "payload": dict(row.get("payload") or row) if isinstance(row, dict) else {},
-            }
-            for index, row in enumerate(purchase_source_rows)
-            if isinstance(row, dict)
-        ]
-    purchase_summary = dict(purchase_source_payload.get("meta") or {})
-    for key in ("run_id", "run_ids", "truth_status", "to_order_by_period", "ledger_generation"):
-        if key in purchase_meta:
-            purchase_summary[key] = purchase_meta[key]
-    if isinstance(purchase_source_payload.get("summary"), dict):
-        purchase_summary["summary"] = dict(purchase_source_payload["summary"])
-    if isinstance(purchase_source_payload.get("cards"), dict):
-        purchase_summary["cards"] = dict(purchase_source_payload["cards"])
-    purchase_summary["total_rows"] = len(purchase_rows)
-    if purchase_payload is None:
-        _publish(
-            consumer="purchase_control_journal",
-            entity_kind="purchase_control_journal",
-            scope_key="purchase:all-live-plans",
-            rows=purchase_rows,
-            summary=purchase_summary,
-        )
+    purchase_rows = [
+        {
+            "entity_kind": "purchase_control_journal",
+            "business_identity": _snapshot_row_identity(
+                dict(row.get("payload") or row) if isinstance(row, dict) else {},
+                "purchase",
+            ),
+            "scope_key": "purchase:all-live-plans",
+            "payload": dict(row.get("payload") or row) if isinstance(row, dict) else {},
+        }
+        for row in list(purchase_payload.get("rows") or [])
+        if isinstance(row, dict)
+    ]
 
     mrp_rows: list[dict[str, Any]] = []
     mrp_metadata: dict[str, Any] = {}
@@ -1575,3 +1552,56 @@ def publish_current_obligation_views_from_generation(
         summary={"total_rows": len(execution_rows), "snapshots": execution_metadata},
     )
     return results
+
+
+def publish_current_obligation_views_from_generation(
+    db: Session,
+    generation_id: int,
+    *,
+    purchase_payload: Mapping[str, Any] | None = None,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Publish runtime current views with an explicit purchase candidate.
+
+    The purchase payload is mandatory by design.  Runtime publication cannot
+    discover or synthesize it from a historical ``PlanningReadSnapshot``.
+    """
+    if not isinstance(purchase_payload, Mapping):
+        raise CurrentExecutionUnavailable(
+            "runtime purchase publication requires an explicit purchase payload"
+        )
+    return _publish_current_obligation_views(
+        db,
+        generation_id,
+        purchase_payload=purchase_payload,
+    )
+
+
+def publish_current_obligation_views_from_snapshots(
+    db: Session,
+    generation_id: int,
+) -> dict[str, CurrentExecutionPublishResult]:
+    """Migration-only adapter for pre-R10 snapshot evidence.
+
+    Production runtime callers must use
+    :func:`publish_current_obligation_views_from_generation`; this explicitly
+    named adapter is retained solely for local migration rehearsal and legacy
+    fixture conversion.
+    """
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise CurrentExecutionUnavailable("snapshot migration requires an accepted generation")
+    snapshot = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one_or_none()
+    if snapshot is None or not isinstance(snapshot.payload, Mapping):
+        raise CurrentExecutionUnavailable(
+            "migration purchase snapshot evidence is missing"
+        )
+    return _publish_current_obligation_views(
+        db,
+        generation_id,
+        purchase_payload=dict(snapshot.payload),
+    )

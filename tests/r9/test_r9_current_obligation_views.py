@@ -9,6 +9,7 @@ from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
     publish_current_obligation_views_from_generation,
+    publish_current_obligation_views_from_snapshots,
     require_current_execution_scope,
 )
 from app.routers.production_control import get_orders_journal, list_root_products, get_order_line_materials
@@ -68,6 +69,31 @@ def _snapshot(db_session, generation, *, consumer, key, rows, meta=None):
     return snapshot
 
 
+def _publish_current(db_session, generation):
+    """Use the runtime direct payload seam, adapting old fixture evidence only when present."""
+    purchase = db_session.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == generation.id,
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one_or_none()
+    if purchase is not None:
+        return publish_current_obligation_views_from_snapshots(db_session, generation.id)
+    return publish_current_obligation_views_from_generation(
+        db_session,
+        generation.id,
+        purchase_payload={
+            "rows": [],
+            "meta": {
+                "ledger_generation_id": generation.id,
+                "truth_status": "accepted",
+                "read_only": True,
+                "fact_source": "ledger",
+            },
+        },
+    )
+
+
 def test_r9_publishes_obligation_and_fact_views_to_stable_current_owner(db_session):
     generation = _accepted_generation(db_session)
     _snapshot(
@@ -93,7 +119,7 @@ def test_r9_publishes_obligation_and_fact_views_to_stable_current_owner(db_sessi
     )
     db_session.commit()
 
-    result = publish_current_obligation_views_from_generation(db_session, generation.id)
+    result = _publish_current(db_session, generation)
     db_session.commit()
 
     assert result["production_control_journal"].changed_rows == 1
@@ -119,7 +145,7 @@ def test_r9_republishing_same_business_rows_is_idempotent(db_session):
         rows=[{"row_key": "buy:1", "payload": {"row_key": "buy:1", "to_order_qty": 2}}],
     )
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, generation.id)
+    _publish_current(db_session, generation)
     db_session.commit()
     first = load_current_execution_rows(
         db_session, entity_kind="purchase_control_journal",
@@ -127,7 +153,7 @@ def test_r9_republishing_same_business_rows_is_idempotent(db_session):
     )[0]
     changes_before = db_session.query(models.CurrentExecutionChange).count()
 
-    second = publish_current_obligation_views_from_generation(db_session, generation.id)
+    second = _publish_current(db_session, generation)
     db_session.commit()
     current = load_current_execution_rows(
         db_session, entity_kind="purchase_control_journal",
@@ -192,7 +218,7 @@ def test_r9_production_current_identity_filters_before_pagination(db_session):
         ],
     )
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, generation.id)
+    _publish_current(db_session, generation)
     db_session.commit()
 
     result = get_orders_journal(
@@ -237,7 +263,7 @@ def test_r9_root_products_read_current_production_rows(db_session):
         snapshot_id=snapshot.id, row_id=row.id, root_key="root:10", root_item_id=10,
     ))
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, generation.id)
+    _publish_current(db_session, generation)
     db_session.commit()
 
     result = list_root_products(db=db_session)
@@ -265,7 +291,7 @@ def test_r9_materials_read_current_payload_without_snapshot_fallback(db_session)
         }}],
     )
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, generation.id)
+    _publish_current(db_session, generation)
     db_session.commit()
 
     result = get_order_line_materials(77, db=db_session)
@@ -306,7 +332,7 @@ def test_r9_production_proposal_identity_survives_new_technical_generation(db_se
         rows=[{"row_key": "work-item:701", "payload": payload}],
     )
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, first.id)
+    _publish_current(db_session, first)
     db_session.commit()
     first_row = load_current_execution_rows(
         db_session, entity_kind="production_control_journal",
@@ -344,7 +370,7 @@ def test_r9_production_proposal_identity_survives_new_technical_generation(db_se
         rows=[{"row_key": "work-item:702", "payload": second_payload}],
     )
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, second.id)
+    _publish_current(db_session, second)
     db_session.commit()
 
     current = load_current_execution_rows(
@@ -383,7 +409,7 @@ def test_r9_purchase_selection_uses_current_manifest_revision_and_identity(db_se
         "meta": {"summary": {"total": 1}},
     }
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, generation.id)
+    _publish_current(db_session, generation)
     db_session.commit()
     manifest = require_current_execution_scope(
         db_session,
@@ -435,7 +461,7 @@ def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
         rows=[{"row_key": "buy:stable", "payload": {"row_key": "buy:stable", "to_order_qty": 2}}],
     )
     db_session.commit()
-    publish_current_obligation_views_from_generation(db_session, first.id)
+    _publish_current(db_session, first)
     db_session.commit()
     current_id = load_current_execution_rows(
         db_session, entity_kind="purchase_control_journal",
@@ -462,7 +488,7 @@ def test_r9_technical_snapshot_ids_do_not_churn_current_identity(db_session):
         rows=[{"row_key": "buy:stable", "payload": {"row_key": "buy:stable", "to_order_qty": 2}}],
     )
     db_session.commit()
-    result = publish_current_obligation_views_from_generation(db_session, second.id)
+    result = _publish_current(db_session, second)
     db_session.commit()
     current = load_current_execution_rows(
         db_session, entity_kind="purchase_control_journal",
@@ -481,4 +507,4 @@ def test_r9_missing_business_identity_fails_closed(db_session):
     )
     db_session.commit()
     with pytest.raises(CurrentExecutionUnavailable, match="business identity"):
-        publish_current_obligation_views_from_generation(db_session, generation.id)
+        _publish_current(db_session, generation)

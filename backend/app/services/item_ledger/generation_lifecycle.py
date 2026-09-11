@@ -63,9 +63,7 @@ from .live_plan_scope import (
 )
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.purchase_control_snapshot import (
-    PurchaseJournalPromotionError,
-    build_candidate_snapshot as build_purchase_journal_candidate,
-    promote_candidate_snapshot as promote_purchase_journal_candidate,
+    build_candidate_payload as build_purchase_journal_payload,
 )
 from app.services.production_control_journal_snapshot import (
     ProductionControlJournalPromotionError,
@@ -1316,24 +1314,6 @@ def _promote_accepted_generation_read_snapshots(
     capabilities = dict(generation.capabilities or {})
 
     try:
-        if capabilities.get("purchase_control_journal"):
-            purchase_snapshot = promote_purchase_journal_candidate(
-                db,
-                generation=generation,
-                accepted_at=accepted_at,
-            )
-            if purchase_snapshot is None:
-                raise GenerationValidationError(
-                    f"generation {generation.id} claims the purchase_control_journal "
-                    "capability but has no journal candidate to publish"
-                )
-        else:
-            promote_purchase_journal_candidate(
-                db,
-                generation=generation,
-                accepted_at=accepted_at,
-            )
-
         if capabilities.get("production_control_journal"):
             production_snapshot = promote_production_journal_candidate(
                 db,
@@ -1351,7 +1331,7 @@ def _promote_accepted_generation_read_snapshots(
                 generation=generation,
                 accepted_at=accepted_at,
             )
-    except (PurchaseJournalPromotionError, ProductionControlJournalPromotionError) as exc:
+    except ProductionControlJournalPromotionError as exc:
         raise GenerationValidationError(
             f"generation {generation.id} cannot publish read snapshots: {exc}"
         ) from exc
@@ -1635,9 +1615,11 @@ def accept_generation_build(
             replenishment_batch.status = "completed"
             replenishment_batch.metrics = replenishment_work_items
             replenishment_batch.completed_at = datetime.now(timezone.utc)
-            purchase_journal_snapshot = build_purchase_journal_candidate(
+            purchase_journal_payload = build_purchase_journal_payload(
                 db, int(generation.id)
             )
+            if not isinstance(purchase_journal_payload, dict):
+                raise ValueError("purchase journal candidate payload is missing")
             fixed_run_ids = [
                 int(run_id)
                 for (run_id,) in db.query(models.PlanningRun.run_id)
@@ -1684,7 +1666,9 @@ def accept_generation_build(
         )
         from .current_execution import publish_current_obligation_views_from_generation
         publish_current_obligation_views_from_generation(
-            db, generation_id=int(generation.id)
+            db,
+            generation_id=int(generation.id),
+            purchase_payload=purchase_journal_payload,
         )
     return {
         **validation,
@@ -1701,7 +1685,7 @@ def accept_generation_build(
         "planning_snapshots": planning_snapshots,
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
         "replenishment_work_items": replenishment_work_items,
-        "purchase_journal_snapshot_id": int(purchase_journal_snapshot.id),
+        "purchase_journal_payload": purchase_journal_payload,
         "production_journal_snapshot_id": int(production_journal_snapshot.id),
         "supplier_receipts": {
             "documents_fetched": (
