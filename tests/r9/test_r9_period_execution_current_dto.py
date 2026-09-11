@@ -12,6 +12,8 @@ from app import models
 from app.routers.plan import period_plans_execution_journal
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
+    _build_basis_links,
+    _build_queue_links,
     _mrp_current_identity,
     _mrp_current_payload,
     load_current_execution_rows,
@@ -57,7 +59,27 @@ def _period_row():
         "status": "none",
         "status_label": "Не оформлено",
         "explanations": ["Требуется закупка"],
+        "root_item_ids": [700],
         "information_links": {"reservation_events": []},
+        "reservation_ids": [3],
+        "execution_events": [{
+            "event_id": 9,
+            "reservation_id": 3,
+            "stock_ledger_entry_id": 101,
+            "event_kind": "realize",
+        }],
+        "ledger_links": {
+            "item_id": 501,
+            "reservation_ids": [3],
+            "events": [{
+                "event_id": 9,
+                "reservation_id": 3,
+                "sle_id": 101,
+                "fact_ref": "FACT-1",
+                "fact_line_ref": "1",
+                "match_rule": "exact",
+            }],
+        },
         "facets": {"bom_levels": [0]},
         "work_items": [{
             "type": "planned_purchase",
@@ -110,6 +132,29 @@ def test_period_publication_persists_stable_work_item_dto_and_navigation(db_sess
     ))
     db_session.commit()
 
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g-current:assembly_queue",
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        rows=[{
+            "entity_kind": "assembly_queue",
+            "business_identity": "plan-line:900",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "plan_id": 7,
+                "plan_line_id": 900,
+                "item_id": 700,
+                "run_id": 41,
+                "period_from": "2026-09-11",
+                "period_to": "2026-09-11",
+                "assembly_remaining_qty": "4",
+            },
+        }],
+        entity_kinds=("assembly_queue",),
+        summary={"total_rows": 1, "total_queue_qty": "4"},
+    )
+
     publish_current_obligation_views_from_generation(db_session, generation.id)
     db_session.commit()
     [current] = load_current_execution_rows(
@@ -127,6 +172,74 @@ def test_period_publication_persists_stable_work_item_dto_and_navigation(db_sess
     assert work_item["current_identity"] == mrp_current.business_identity
     assert work_item["navigation_href"]
     assert work_item["navigation_reason"] is None
+    assert current.payload["basis_links"]["item"] == {
+        "label": "Ledger item",
+        "href": "#/ledger/items/501",
+        "available": True,
+        "reason": None,
+    }
+    assert current.payload["basis_links"]["reservations"] == [{
+        "label": "Reservation #3",
+        "href": "#/ledger/items/501?tab=reservations&reservation_id=3",
+        "available": True,
+        "reason": None,
+    }]
+    assert current.payload["basis_links"]["events"] == [{
+        "label": "Ledger event #9",
+        "href": "#/ledger/items/501?tab=reservations&reservation_id=3&event_id=9",
+        "available": True,
+        "reason": None,
+    }]
+    assert current.payload["queue_links"] == [{
+        "label": "Assembly queue",
+        "href": "#/production-control?view=assembly-queue&current_identity=plan-line%3A900",
+        "available": True,
+        "reason": None,
+        "current_identity": "plan-line:900",
+        "source_revision": "accepted:g-current:assembly_queue",
+    }]
+    assert current.payload["queue_link_reason"] is None
+
+
+def test_period_navigation_links_disable_missing_ambiguous_and_mismatched_queue_targets():
+    payload = {"plan_id": 7, "root_item_ids": [700]}
+    manifest = SimpleNamespace(source_generation_id=11, source_revision="accepted:g11:assembly_queue")
+    exact = SimpleNamespace(
+        business_identity="plan-line:900",
+        payload={"plan_id": 7, "plan_line_id": 900, "item_id": 700},
+    )
+    link, reason = _build_queue_links(payload, manifest, [exact], expected_generation_id=11)
+    assert reason is None
+    assert link[0]["available"] is True
+
+    missing, reason = _build_queue_links(payload, manifest, [], expected_generation_id=11)
+    assert missing[0]["available"] is False
+    assert reason == "assembly queue current target is unavailable for this plan/root scope"
+
+    ambiguous, reason = _build_queue_links(
+        payload,
+        manifest,
+        [exact, SimpleNamespace(
+            business_identity="plan-line:901",
+            payload={"plan_id": 7, "plan_line_id": 901, "item_id": 700},
+        )],
+        expected_generation_id=11,
+    )
+    assert [link["current_identity"] for link in ambiguous] == [
+        "plan-line:900", "plan-line:901"
+    ]
+    assert all(link["available"] for link in ambiguous)
+    assert reason is None
+
+    mismatched, reason = _build_queue_links(payload, manifest, [exact], expected_generation_id=12)
+    assert mismatched[0]["available"] is False
+    assert reason == "assembly queue current source generation does not match period execution source generation"
+
+
+def test_basis_links_are_disabled_when_persisted_ledger_basis_is_missing():
+    basis = _build_basis_links({"item_id": None, "reservation_ids": [], "events": []})
+    assert basis["item"]["available"] is False
+    assert basis["item"]["reason"] == "ledger item basis is unavailable"
 
 
 def test_period_current_get_returns_persisted_summary_without_business_recalculation(
@@ -156,6 +269,26 @@ def test_period_current_get_returns_persisted_summary_without_business_recalcula
     })
     row["current_identity"] = "plan:7:req:101"
     row["source_revision"] = "accepted:g-current:period_plan_execution"
+    row["basis_links"] = {
+        "item": {
+            "label": "Ledger item",
+            "href": "#/ledger/items/501",
+            "available": True,
+            "reason": None,
+        },
+        "reservations": [],
+        "events": [],
+        "reason": None,
+    }
+    row["queue_links"] = [{
+        "label": "Assembly queue",
+        "href": "#/production-control?view=assembly-queue&current_identity=plan-line%3A900",
+        "available": True,
+        "reason": None,
+        "current_identity": "plan-line:900",
+        "source_revision": "accepted:g-current:assembly_queue",
+    }]
+    row["queue_link_reason"] = None
     publish_current_execution_scope(
         db_session,
         source_revision="accepted:g-current:period_plan_execution",
@@ -186,6 +319,9 @@ def test_period_current_get_returns_persisted_summary_without_business_recalcula
     assert response.facets == {"bom_levels": [0]}
     assert response.rows[0].status_label == "Не оформлено"
     assert response.rows[0].work_items[0].assigned_qty == 0.0
+    assert response.rows[0].basis_links.item.href == "#/ledger/items/501"
+    assert response.rows[0].queue_links[0].current_identity == "plan-line:900"
+    assert response.rows[0].queue_links[0].source_revision == "accepted:g-current:assembly_queue"
 
 
 def test_mrp_republish_technical_locators_do_not_leak_or_churn_current_owner(db_session):
