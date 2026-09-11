@@ -48,7 +48,7 @@ from app.services.production_material_custody_projection import (
     build_material_custody_projection,
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
-from app.services.mrp_result_snapshot import (
+from app.services.mrp_result_projection import (
     build_mrp_result_current_payload,
 )
 from app.services.obligation_refresh_manifest import (

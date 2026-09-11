@@ -25,7 +25,7 @@ from ..services.planning_service import (
     get_active_planning_config_full
 )
 from ..schemas import ProductionGroupedResponse, PurchaseCategoryGroupedResponse, ReworkGroupedResponse
-from ..services.mrp_result_snapshot import (
+from ..services.mrp_result_projection import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )

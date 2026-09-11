@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.services import mrp_result_snapshot
+from app.services import mrp_result_projection
 from app.services.item_ledger import current_execution
 from app import models
 from app.services.obligation_refresh_publish import (
@@ -27,20 +27,20 @@ def test_direct_mrp_builder_returns_current_payload_without_snapshot_rows(monkey
             return run
 
     monkeypatch.setattr(
-        mrp_result_snapshot,
-        "_collect_snapshot_payload",
+        mrp_result_projection,
+        "_collect_mrp_payload",
         lambda db, actual_run: (
             {"production": [{"item_id": 10, "agg_key": "item:10|start:2026-09-01|unit:шт", "qty": 2}],
              "purchase": [], "rework": [], "capacity": []},
             {"run_id": 42, "summary": {}, "row_counts": {"production": 1, "purchase": 0, "rework": 0, "capacity": 0}, "total_qty": {"production": 2.0}},
         ),
     )
-    monkeypatch.setattr(mrp_result_snapshot, "_row_specs", lambda rows: [
+    monkeypatch.setattr(mrp_result_projection, "_row_specs", lambda rows: [
         ("production:item:10:0", "production", 10, "2026-09-01|000000000010|000000000000", rows["production"][0]),
     ])
-    monkeypatch.setattr(mrp_result_snapshot, "_frozen_root_membership", lambda *args, **kwargs: {10: {1}})
+    monkeypatch.setattr(mrp_result_projection, "_frozen_root_membership", lambda *args, **kwargs: {10: {1}})
 
-    payload = mrp_result_snapshot.build_mrp_result_current_payload(FakeDb(), 42)
+    payload = mrp_result_projection.build_mrp_result_current_payload(FakeDb(), 42)
 
     assert payload["run_id"] == 42
     assert payload["rows"][0]["current_identity"].startswith("mrp-run:42:production:")

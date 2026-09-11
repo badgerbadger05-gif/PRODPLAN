@@ -1,37 +1,30 @@
-"""Immutable, Ledger-bound read snapshots for the MRP result screen.
+"""Current, Ledger-bound MRP result projection.
 
-Building a snapshot is an explicit worker/command operation.  HTTP GET handlers
-must call :func:`read_mrp_result_rows` (or
-:func:`read_mrp_result_manifest`) and never invoke the builder.
+The pure payload builder is used by accepted-generation publication. HTTP GET
+handlers read only the compact current execution scope and rows.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import date, datetime, timezone
+from datetime import date
 from hashlib import sha256
 import json
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import and_, func
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
 from app.services import planning_service
 from app.services.item_ledger.live_plan_scope import (
     sealed_generation_lineage_ids,
-    sealed_run_anchor,
 )
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PLANNING_SNAPSHOTS,
-    PlanningTruthUnavailable,
-    get_latest_read_snapshot,
     get_readiness,
-    publish_read_snapshot,
-    require_accepted_truth,
 )
-from app.services.planning_run_candidate import _resolve_parent_generation_id
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
@@ -47,9 +40,6 @@ REQUIRED_CAPABILITIES = (
 ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
 _MAX_PAGE = 5000
 
-
-def _snapshot_key(run_id: int) -> str:
-    return f"run:{int(run_id)}"
 
 
 def _unavailable(
@@ -185,13 +175,12 @@ def _validate_obligation_lineage(
             )
 
 
-def _collect_snapshot_payload(
+def _collect_mrp_payload(
     db: Session, run: models.PlanningRun
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    """Collect frozen MRP rows once for either an accepted or candidate build.
+    """Collect frozen MRP rows once for an accepted or candidate payload build.
 
-    This is deliberately a builder-only helper.  Read handlers only query the
-    persisted ``PlanningRead*`` tables and must never call it.
+    This is deliberately a builder-only helper. Read handlers never call it.
     """
     run_id = int(run.run_id)
     rows_by_kind = {
@@ -252,11 +241,9 @@ def build_mrp_result_current_payload(
 ) -> dict[str, Any]:
     """Build the direct current-owner payload for one MRP run.
 
-    This is deliberately a pure candidate builder: it reads the canonical
-    planning projection and returns a validated manifest/row payload without
-    creating any ``PlanningRead*`` rows.  Runtime publishers persist the
-    payload in ``CurrentExecutionRow``; the old snapshot builders below are
-    retained only for migration evidence and historical tests.
+    This is a pure candidate builder: it reads the canonical planning
+    projection and returns a validated manifest/row payload for the compact
+    current execution owner.
     """
     run = db.get(models.PlanningRun, int(run_id))
     if run is None:
@@ -277,7 +264,7 @@ def build_mrp_result_current_payload(
     elif status != "FIXED_SNAPSHOT":
         raise ValueError("MRP current payload requires a fixed or building run")
 
-    rows_by_kind, manifest = _collect_snapshot_payload(db, run)
+    rows_by_kind, manifest = _collect_mrp_payload(db, run)
     specs = _row_specs(rows_by_kind)
     membership = _frozen_root_membership(
         db, run, {item_id for _, _, item_id, _, _ in specs if item_id is not None}
@@ -314,49 +301,6 @@ def build_mrp_result_current_payload(
     manifest["meta"] = {"row_count": len(rows), "run_id": int(run.run_id)}
     return manifest
 
-
-def _candidate_snapshot_matches(
-    db: Session,
-    snapshot: models.PlanningReadSnapshot,
-    *,
-    manifest: dict[str, Any],
-    row_specs: list[tuple[str, str, int | None, str, dict[str, Any]]],
-    membership: dict[int, set[int]],
-) -> bool:
-    """An existing candidate is reusable only for the exact same frozen data."""
-    if dict(snapshot.payload or {}) != manifest:
-        return False
-    rows = (
-        db.query(models.PlanningReadRow)
-        .filter(models.PlanningReadRow.snapshot_id == int(snapshot.id))
-        .order_by(models.PlanningReadRow.id)
-        .all()
-    )
-    if len(rows) != len(row_specs):
-        return False
-    for row, (row_key, kind, item_id, sort_key, payload) in zip(rows, row_specs):
-        if (
-            row.row_key != row_key
-            or row.row_kind != kind
-            or row.item_id != item_id
-            or row.sort_key != sort_key
-            or dict(row.payload or {}) != payload
-        ):
-            return False
-        expected_roots = sorted(membership.get(item_id, ())) if item_id is not None else []
-        actual_roots = [
-            int(root_id)
-            for (root_id,) in db.query(models.PlanningReadRootMember.root_item_id)
-            .filter(
-                models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-                models.PlanningReadRootMember.row_id == int(row.id),
-            )
-            .order_by(models.PlanningReadRootMember.root_item_id)
-            .all()
-        ]
-        if actual_roots != expected_roots:
-            return False
-    return True
 
 
 def _require_sealed_candidate_manifest(
@@ -473,437 +417,9 @@ def _require_sealed_candidate_manifest(
         raise ValueError("candidate run is absent from sealed obligation_refresh_manifest")
 
 
-def build_mrp_result_candidate_snapshot(
-    db: Session, run_id: int
-) -> models.PlanningReadSnapshot:
-    """Persist an unpublished MRP result snapshot for a building candidate.
-
-    Candidate snapshots are bound to their BUILDING ``obligation_refresh``
-    Ledger generation.  They intentionally bypass accepted-truth readiness and
-    ``publish_read_snapshot``: nothing built here is visible to normal GET
-    reads until the outer publish transaction promotes its run and generation.
-    The caller owns the transaction; this function never commits or rolls back.
-    """
-    run = db.get(models.PlanningRun, int(run_id))
-    if run is None:
-        raise ValueError(f"planning run {run_id} not found")
-    if str(run.status or "") != "BUILDING_SNAPSHOT":
-        raise ValueError("candidate MRP result snapshot requires a building run")
-    if run.ledger_generation_id is None:
-        raise ValueError("candidate run has no Ledger generation")
-    generation = db.get(models.LedgerGeneration, int(run.ledger_generation_id))
-    if generation is None or str(generation.status or "") != "building":
-        raise ValueError("candidate run is not bound to a BUILDING Ledger generation")
-    if (generation.source_watermarks or {}).get("generation_kind") != "obligation_refresh":
-        raise ValueError("candidate Ledger generation is not an obligation_refresh")
-    if run.ledger_cutoff is None or generation.cutoff is None or run.ledger_cutoff != generation.cutoff:
-        raise ValueError("candidate run cutoff differs from the BUILDING Ledger cutoff")
-    _require_sealed_candidate_manifest(db, generation, run)
-    _validate_obligation_lineage(db, int(run.run_id), int(generation.id))
-
-    rows_by_kind, manifest = _collect_snapshot_payload(db, run)
-    row_specs = _row_specs(rows_by_kind)
-    membership = _frozen_root_membership(
-        db, run, {item_id for _, _, item_id, _, _ in row_specs if item_id is not None}
-    )
-    existing = (
-        db.query(models.PlanningReadSnapshot)
-        .filter(
-            models.PlanningReadSnapshot.consumer == CONSUMER,
-            models.PlanningReadSnapshot.snapshot_key == _snapshot_key(run.run_id),
-            models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        )
-        .one_or_none()
-    )
-    if existing is not None:
-        if (
-            existing.cutoff != generation.cutoff
-            or existing.truth_status != "building"
-            or not _candidate_snapshot_matches(
-                db, existing, manifest=manifest, row_specs=row_specs, membership=membership
-            )
-        ):
-            raise ValueError("candidate MRP result snapshot conflicts with persisted data")
-        return existing
-
-    with db.begin_nested():
-        snapshot = models.PlanningReadSnapshot(
-            consumer=CONSUMER,
-            snapshot_key=_snapshot_key(run.run_id),
-            ledger_generation_id=int(generation.id),
-            cutoff=generation.cutoff,
-            truth_status="building",
-            reason="unpublished candidate snapshot",
-            payload=manifest,
-            published_at=datetime.now(timezone.utc),
-        )
-        db.add(snapshot)
-        db.flush()
-        persisted: list[tuple[models.PlanningReadRow, int | None]] = []
-        for row_key, kind, item_id, sort_key, payload in row_specs:
-            row = models.PlanningReadRow(
-                snapshot_id=int(snapshot.id), row_key=row_key, row_kind=kind,
-                item_id=item_id, sort_key=sort_key, payload=payload,
-            )
-            db.add(row)
-            persisted.append((row, item_id))
-        db.flush()
-        for row, item_id in persisted:
-            if item_id is None:
-                continue
-            for root_id in sorted(membership.get(item_id, ())):
-                db.add(models.PlanningReadRootMember(
-                    snapshot_id=int(snapshot.id), row_id=int(row.id),
-                    root_key=str(root_id), root_item_id=root_id,
-                    payload={"source": "mrp_freeze_component"},
-                ))
-        db.flush()
-    return snapshot
-
-
-def build_mrp_result_snapshot(
-    db: Session,
-    run_id: int,
-    *,
-    allow_stale_truth: bool = False,
-) -> models.PlanningReadSnapshot:
-    """Build and publish one immutable result snapshot for a fixed run.
-
-    The run must be a live obligation of the accepted truth: anchored anywhere
-    in its sealed lineage, with its own frozen cutoff.  A fact-only fork never
-    re-anchors an obligation, so requiring the run to carry the accepted
-    generation id is exactly what killed this page after the first physical
-    refresh.
-
-    The payload is a projection of frozen obligation tables, so an existing
-    snapshot from anywhere in that lineage is reused verbatim instead of being
-    rebuilt per generation.  Planned result tables are treated as frozen
-    obligations; no legacy fact fields are consulted here.
-    """
-    truth = require_accepted_truth(
-        db,
-        CONSUMER,
-        required_capabilities=REQUIRED_CAPABILITIES,
-        allow_stale=bool(allow_stale_truth),
-    )
-    run = db.get(models.PlanningRun, int(run_id))
-    if run is None:
-        raise ValueError(f"planning run {run_id} not found")
-    if str(run.status or "") != "FIXED_SNAPSHOT":
-        raise ValueError("MRP result snapshot requires a fixed run")
-    accepted = _accepted_generation(db, int(truth.generation_id))
-    lineage = sealed_generation_lineage_ids(db, accepted)
-    sealed_run_anchor(db, run, accepted)
-    _validate_obligation_lineage(db, int(run_id), int(truth.generation_id))
-
-    existing = get_latest_read_snapshot(
-        db,
-        consumer=CONSUMER,
-        snapshot_key=_snapshot_key(run_id),
-        required_capabilities=REQUIRED_CAPABILITIES,
-        allow_stale=bool(allow_stale_truth),
-        sealed_lineage=lineage,
-    )
-    if existing is not None:
-        return existing
-
-    with db.begin_nested():
-        rows_by_kind = {
-            "production": _collect_all(
-                planning_service.get_run_production, db, int(run_id)
-            ),
-            "purchase": _collect_all(
-                planning_service.get_run_purchases, db, int(run_id)
-            ),
-            "rework": _collect_all(
-                planning_service.get_run_rework, db, int(run_id)
-            ),
-            "capacity": _collect_all(
-                planning_service.get_run_capacity, db, int(run_id)
-            ),
-        }
-        summary = planning_service.get_run_summary(db, int(run_id))
-        manifest = {
-            "run_id": int(run_id),
-            "summary": summary,
-            "row_counts": {kind: len(rows) for kind, rows in rows_by_kind.items()},
-            "total_qty": {
-                kind: float(sum(float(row.get("qty") or 0) for row in rows))
-                for kind, rows in rows_by_kind.items()
-            },
-        }
-        snapshot = publish_read_snapshot(
-            db,
-            consumer=CONSUMER,
-            snapshot_key=_snapshot_key(run_id),
-            payload=manifest,
-            required_capabilities=REQUIRED_CAPABILITIES,
-            allow_stale=bool(allow_stale_truth),
-        )
-
-        persisted: list[tuple[models.PlanningReadRow, int | None]] = []
-        for kind, rows in rows_by_kind.items():
-            for index, payload in enumerate(rows):
-                item_id = int(payload["item_id"]) if payload.get("item_id") is not None else None
-                identity = (
-                    payload.get("order_id")
-                    or payload.get("purchase_id")
-                    or payload.get("rework_id")
-                    or payload.get("agg_key")
-                    or index
-                )
-                bucket = str(
-                    payload.get("bucket_date")
-                    or payload.get("need_date")
-                    or payload.get("start_date")
-                    or ""
-                )
-                row = models.PlanningReadRow(
-                    snapshot_id=int(snapshot.id),
-                    row_key=f"{kind}:{identity}:{index}",
-                    row_kind=kind,
-                    item_id=item_id,
-                    sort_key=f"{bucket}|{item_id or 0:012d}|{index:012d}",
-                    payload=dict(payload),
-                )
-                db.add(row)
-                persisted.append((row, item_id))
-        db.flush()
-
-        membership = _frozen_root_membership(
-            db, run, {item_id for _, item_id in persisted if item_id is not None}
-        )
-        for row, item_id in persisted:
-            if item_id is None:
-                continue
-            for root_id in sorted(membership.get(item_id, ())):
-                db.add(
-                    models.PlanningReadRootMember(
-                        snapshot_id=int(snapshot.id),
-                        row_id=int(row.id),
-                        root_key=str(root_id),
-                        root_item_id=root_id,
-                        payload={"source": "mrp_freeze_component"},
-                    )
-                )
-        db.flush()
-    return snapshot
-
-
-def _resolve_snapshot(
-    db: Session, run_id: int, snapshot_id: int | None
-) -> models.PlanningReadSnapshot | None:
-    """Read the newest obligation snapshot of the accepted sealed lineage.
-
-    The obligation is not republished by a fact-only fork, so the snapshot that
-    is current for this run lives at the generation which last froze it.  It is
-    returned with its own generation and cutoff, never restated as today's.
-    """
-    truth = require_accepted_truth(
-        db,
-        CONSUMER,
-        required_capabilities=REQUIRED_CAPABILITIES,
-    )
-    latest = get_latest_read_snapshot(
-        db,
-        consumer=CONSUMER,
-        snapshot_key=_snapshot_key(run_id),
-        required_capabilities=REQUIRED_CAPABILITIES,
-        sealed_lineage=sealed_generation_lineage_ids(
-            db, _accepted_generation(db, int(truth.generation_id))
-        ),
-    )
-    if latest is None:
-        return None
-    if snapshot_id is None:
-        return latest
-    requested = db.get(models.PlanningReadSnapshot, int(snapshot_id))
-    if (
-        requested is None
-        or requested.id != latest.id
-        or requested.consumer != CONSUMER
-        or requested.snapshot_key != _snapshot_key(run_id)
-    ):
-        return None
-    return requested
-
-
-def _read_mrp_snapshot_manifest(
-    db: Session, run_id: int, *, snapshot_id: int | None = None
-) -> dict[str, Any]:
-    """Read the immutable manifest; never calculate or publish."""
-    try:
-        snapshot = _resolve_snapshot(db, int(run_id), snapshot_id)
-    except PlanningTruthUnavailable as exc:
-        return _unavailable(db, run_id, exc.readiness.reason)
-    if snapshot is None:
-        return _unavailable(db, run_id, "MRP result snapshot is missing")
-    payload = dict(snapshot.payload or {})
-    summary = dict(payload.pop("summary", {}) or {})
-    return {
-        "snapshot_id": int(snapshot.id),
-        "run_id": int(run_id),
-        "ledger_generation": int(snapshot.ledger_generation_id),
-        "cutoff": snapshot.cutoff.isoformat(),
-        "truth_status": snapshot.truth_status,
-        "truth_reason": snapshot.reason,
-        **summary,
-        "snapshot_counts": payload.get("row_counts", {}),
-        "snapshot_total_qty": payload.get("total_qty", {}),
-    }
-
-
-def _read_mrp_snapshot_rows(
-    db: Session,
-    run_id: int,
-    *,
-    row_kind: str,
-    snapshot_id: int | None = None,
-    item_id: int | None = None,
-    root_item_id: int | None = None,
-    area_id: int | None = None,
-    date_from: str | date | None = None,
-    date_to: str | date | None = None,
-    supplier_ref1c: str | None = None,
-    category_id: int | None = None,
-    category_ref1c: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-    sort_dir: str = "asc",
-) -> dict[str, Any]:
-    """Filter and paginate one immutable snapshot using SQL."""
-    kind = str(row_kind or "").strip().lower()
-    if kind not in ROW_KINDS:
-        raise ValueError(f"unsupported MRP result row kind: {row_kind}")
-    effective_limit = max(1, min(int(limit or 100), _MAX_PAGE))
-    effective_offset = max(0, int(offset or 0))
-    try:
-        snapshot = _resolve_snapshot(db, int(run_id), snapshot_id)
-    except PlanningTruthUnavailable as exc:
-        return _unavailable(
-            db, run_id, exc.readiness.reason,
-            limit=effective_limit, offset=effective_offset,
-        )
-    if snapshot is None:
-        return _unavailable(
-            db, run_id, "MRP result snapshot is missing",
-            limit=effective_limit, offset=effective_offset,
-        )
-
-    query = db.query(models.PlanningReadRow).filter(
-        models.PlanningReadRow.snapshot_id == int(snapshot.id),
-        models.PlanningReadRow.row_kind == kind,
-    )
-    if item_id is not None:
-        query = query.filter(models.PlanningReadRow.item_id == int(item_id))
-    if root_item_id is not None:
-        query = query.join(
-            models.PlanningReadRootMember,
-            models.PlanningReadRootMember.row_id == models.PlanningReadRow.id,
-        ).filter(
-            models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-            models.PlanningReadRootMember.root_item_id == int(root_item_id),
-        )
-    if area_id is not None:
-        query = query.filter(
-            models.PlanningReadRow.payload["area_id"].as_integer()
-            == int(area_id)
-        )
-    if supplier_ref1c is not None:
-        if supplier_ref1c == "__missing_supplier_name":
-            supplier_name = func.trim(
-                func.coalesce(models.PlanningReadRow.payload["supplier_name"].as_string(), "")
-            )
-            query = query.filter(
-                supplier_name == ""
-            )
-        else:
-            query = query.filter(
-                func.coalesce(
-                    models.PlanningReadRow.payload["supplier_ref1c"].as_string(),
-                    "",
-                )
-                == str(supplier_ref1c)
-            )
-    if category_id is not None:
-        query = query.filter(
-            models.PlanningReadRow.payload["category_id"].as_integer() == int(category_id)
-        )
-    elif category_ref1c is not None:
-        if category_ref1c == "__missing_category":
-            category_ref = func.trim(
-                func.coalesce(
-                    models.PlanningReadRow.payload["category_ref1c"].as_string(),
-                    "",
-                )
-            )
-            query = query.filter(
-                and_(
-                    models.PlanningReadRow.payload["category_id"].as_integer().is_(None),
-                    category_ref == "",
-                )
-            )
-        else:
-            query = query.filter(
-                func.coalesce(
-                    models.PlanningReadRow.payload["category_ref1c"].as_string(),
-                    "",
-                )
-                == str(category_ref1c)
-            )
-    if date_from:
-        value = date_from.isoformat() if isinstance(date_from, date) else str(date_from)
-        query = query.filter(models.PlanningReadRow.sort_key >= f"{value}|")
-    if date_to:
-        value = date_to.isoformat() if isinstance(date_to, date) else str(date_to)
-        query = query.filter(models.PlanningReadRow.sort_key < f"{value}|\uffff")
-
-    total = int(query.with_entities(func.count(models.PlanningReadRow.id)).scalar() or 0)
-    ordering = models.PlanningReadRow.sort_key.desc() if sort_dir == "desc" else models.PlanningReadRow.sort_key.asc()
-    records = query.order_by(ordering, models.PlanningReadRow.id).offset(
-        effective_offset
-    ).limit(effective_limit).all()
-    payloads = [dict(record.payload or {}) for record in records]
-    if (
-        item_id is None
-        and root_item_id is None
-        and area_id is None
-        and not date_from
-        and not date_to
-    ):
-        total_qty = float(
-            ((snapshot.payload or {}).get("total_qty") or {}).get(kind, 0.0)
-        )
-    else:
-        total_qty = float(
-            sum(
-                float((payload or {}).get("qty") or 0)
-                for (payload,) in query.with_entities(
-                    models.PlanningReadRow.payload
-                ).all()
-            )
-        )
-    return {
-        "snapshot_id": int(snapshot.id),
-        "run_id": int(run_id),
-        "ledger_generation": int(snapshot.ledger_generation_id),
-        "cutoff": snapshot.cutoff.isoformat(),
-        "truth_status": snapshot.truth_status,
-        "truth_reason": snapshot.reason,
-        "rows": payloads,
-        "total": total,
-        "total_qty": total_qty,
-        "limit": effective_limit,
-        "offset": effective_offset,
-    }
-
 
 def _current_mrp_scope(db: Session):
-    """Resolve the sole user-facing MRP result owner.
-
-    The old snapshot helpers above remain available to migration/build code,
-    but these public read functions intentionally never fall back to them.
-    """
+    """Resolve the sole user-facing MRP result owner."""
 
     return require_current_execution_scope(
         db,

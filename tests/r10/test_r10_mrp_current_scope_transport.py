@@ -3,15 +3,15 @@
 import inspect
 
 from app.routers import plan as plan_router
-from app.services import mrp_result_snapshot
+from app.services import mrp_result_projection
 
 
 def test_mrp_service_uses_current_scope_id_anchor():
     assert "current_scope_id" in inspect.signature(
-        mrp_result_snapshot.read_mrp_result_manifest
+        mrp_result_projection.read_mrp_result_manifest
     ).parameters
     assert "current_scope_id" in inspect.signature(
-        mrp_result_snapshot.read_mrp_result_rows
+        mrp_result_projection.read_mrp_result_rows
     ).parameters
 
 

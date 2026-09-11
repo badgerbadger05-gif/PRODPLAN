@@ -10,7 +10,7 @@ from app.services.item_ledger.current_execution import (
     _mrp_current_identity,
     require_current_execution_scope,
 )
-from app.services.mrp_result_snapshot import (
+from app.services.mrp_result_projection import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
 )

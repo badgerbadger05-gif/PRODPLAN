@@ -70,7 +70,7 @@ from app.services.production_control_journal_projection import (
 from app.services.production_material_custody_projection import (
     build_material_custody_projection,
 )
-from app.services.mrp_result_snapshot import build_mrp_result_current_payload
+from app.services.mrp_result_projection import build_mrp_result_current_payload
 
 
 logger = logging.getLogger(__name__)

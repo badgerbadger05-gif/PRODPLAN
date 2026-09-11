@@ -20,8 +20,6 @@ from app.models import (
     PlannedPurchase,
     PlannedRework,
     PlanningRun,
-    PlanningReadRow,
-    PlanningReadSnapshot,
     PlanningTruthState,
     ProductionResource,
     ProductionStage,
@@ -32,8 +30,7 @@ from app.routers.plan import router as plan_router
 from app.services.item_ledger.current_execution import (
     publish_current_obligation_views_from_generation,
 )
-from app.services.mrp_result_snapshot import build_mrp_result_snapshot
-from app.services.mrp_result_snapshot import build_mrp_result_current_payload
+from app.services.mrp_result_projection import build_mrp_result_current_payload
 
 
 def _mk_run(db) -> PlanningRun:
@@ -88,10 +85,10 @@ def _mk_run(db) -> PlanningRun:
     return run
 
 
-def _publish_result_snapshot(db, run: PlanningRun) -> PlanningReadSnapshot:
-    """Build the immutable payload explicitly; HTTP GETs only read it."""
+def _publish_result_current(db, run: PlanningRun) -> dict:
+    """Build and publish the direct current MRP payload used by GETs."""
     db.flush()
-    snapshot = build_mrp_result_snapshot(db, run.run_id)
+    mrp_payload = build_mrp_result_current_payload(db, run.run_id)
     period_payload = {
         "plan": {"id": int(run.source_plan_id or 1)},
         "run_id": int(run.run_id),
@@ -106,50 +103,14 @@ def _publish_result_snapshot(db, run: PlanningRun) -> PlanningReadSnapshot:
         run.ledger_generation_id,
         purchase_payload={"rows": []},
         production_payload={"rows": [], "meta": {"row_count": 0}},
-        mrp_payloads={str(run.run_id): build_mrp_result_current_payload(db, run.run_id)},
+        mrp_payloads={str(run.run_id): mrp_payload},
         period_payloads={f"plan:{int(run.source_plan_id or 1)}:run:{int(run.run_id)}": period_payload},
     )
-    return snapshot
+    return mrp_payload
 
 
-def _publish_manual_purchase_snapshot(db, run: PlanningRun, rows: list[dict]) -> PlanningReadSnapshot:
-    db.flush()
-    snapshot = PlanningReadSnapshot(
-        consumer="mrp_result",
-        snapshot_key=f"run:{run.run_id}",
-        ledger_generation_id=run.ledger_generation_id,
-        cutoff=run.ledger_cutoff,
-        truth_status="accepted",
-        payload={
-            "run_id": run.run_id,
-            "row_counts": {"purchase": len(rows)},
-            "total_qty": {
-                "purchase": float(sum(float(row.get("qty") or 0) for row in rows)),
-            },
-        },
-        published_at=datetime.datetime.now(timezone.utc),
-    )
-    db.add(snapshot)
-    db.flush()
-    for index, source_row in enumerate(rows):
-        payload = dict(source_row)
-        item = db.get(Item, int(payload["item_id"]))
-        payload.setdefault("run_id", int(run.run_id))
-        payload.setdefault("row_kind", "purchase")
-        payload.setdefault("unit", str(payload.get("unit") or (item.unit if item else "шт")))
-        payload.setdefault(
-            "agg_key",
-            f"item:{int(payload['item_id'])}|unit:{str(payload.get('unit') or '')}",
-        )
-        db.add(
-            PlanningReadRow(
-                snapshot_id=snapshot.id,
-                row_key=f"purchase-{index}",
-                row_kind="purchase",
-                sort_key=f"2025-01-1{index}|00000000000{index}|000000000000",
-                payload=payload,
-            )
-        )
+def _publish_manual_purchase_current(db, run: PlanningRun, rows: list[dict]) -> dict:
+    """Publish manually prepared purchase rows through the current owner."""
     db.flush()
     current_rows = []
     for index, source_row in enumerate(rows):
@@ -197,7 +158,7 @@ def _publish_manual_purchase_snapshot(db, run: PlanningRun, rows: list[dict]) ->
         mrp_payloads={str(run.run_id): direct_mrp_payload},
         period_payloads={f"plan:{int(run.source_plan_id or 1)}:run:{int(run.run_id)}": period_payload},
     )
-    return snapshot
+    return direct_mrp_payload
 
 
 @pytest.fixture()
@@ -256,7 +217,7 @@ def test_rework_list_endpoint_returns_rows_with_shortage_fields(client, db_sessi
             ledger_generation_id=run.ledger_generation_id,
         )
     )
-    snapshot = _publish_result_snapshot(db, run)
+    snapshot = _publish_result_current(db, run)
     db.commit()
 
     response = client.get(f"/api/v1/plan/results/{run.run_id}/rework")
@@ -388,7 +349,7 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
             ),
         ]
     )
-    snapshot = _publish_result_snapshot(db, run)
+    snapshot = _publish_result_current(db, run)
     db.commit()
 
     purchase_response = client.get(f"/api/v1/plan/results/{run.run_id}/purchases/grouped-by-category")
@@ -490,7 +451,7 @@ def test_purchases_endpoint_supports_supplier_and_category_filters(
         ]
     )
     db_session.flush()
-    _publish_manual_purchase_snapshot(
+    _publish_manual_purchase_current(
         db_session,
         run,
         [
@@ -610,7 +571,7 @@ def test_purchases_endpoint_supports_missing_category_filter(
     db_session.add(category_row)
     db_session.flush()
 
-    _publish_manual_purchase_snapshot(
+    _publish_manual_purchase_current(
         db_session,
         run,
         [
@@ -718,7 +679,7 @@ def test_export_endpoints_return_xlsx_payloads(client, db_session):
             ledger_generation_id=run.ledger_generation_id,
         )
     )
-    snapshot = _publish_result_snapshot(db, run)
+    snapshot = _publish_result_current(db, run)
     db.commit()
 
     purchase_response = client.get(f"/api/v1/plan/results/{run.run_id}/purchases/export?format=xlsx")
@@ -809,7 +770,7 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
             overload_hours=4,
         )
     )
-    snapshot = _publish_result_snapshot(db, run)
+    snapshot = _publish_result_current(db, run)
     db.commit()
 
     production_response = client.get(f"/api/v1/plan/results/{run.run_id}/production")

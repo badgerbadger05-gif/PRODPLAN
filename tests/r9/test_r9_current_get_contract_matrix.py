@@ -126,8 +126,8 @@ def test_missing_current_does_not_fallback_to_legacy_snapshot_or_heavy_replay(db
 
     # These are the old heavy/snapshot boundaries.  The current loader must
     # fail before either can be consulted.
-    monkeypatch.setattr("app.services.mrp_result_snapshot._read_snapshot_rows", forbidden, raising=False)
-    monkeypatch.setattr("app.services.mrp_result_snapshot.preview_make_work_item_materials", forbidden, raising=False)
+    monkeypatch.setattr("app.services.mrp_result_projection._read_snapshot_rows", forbidden, raising=False)
+    monkeypatch.setattr("app.services.mrp_result_projection.preview_make_work_item_materials", forbidden, raising=False)
     with pytest.raises(CurrentExecutionUnavailable):
         load_current_execution_coherent(
             db_session, entity_kind="mrp_result", scope_key="mrp:all-live-plans",
@@ -169,20 +169,17 @@ def test_mrp_route_get_export_matrix_fails_closed_before_snapshot_helpers(
 ):
     """All MRP GET/group/export adapters reject missing current before legacy IO."""
     generation = _legacy_generation(db_session)
-    monkeypatch.setattr(
-        "app.services.mrp_result_snapshot._read_mrp_snapshot_rows",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy MRP snapshot row helper was called")
-        ),
-        raising=True,
-    )
-    monkeypatch.setattr(
-        "app.services.mrp_result_snapshot._resolve_snapshot",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy MRP snapshot resolver was called")
-        ),
-        raising=True,
-    )
+    from pathlib import Path
+
+    projection_source = (
+        Path(__file__).parents[2]
+        / "backend"
+        / "app"
+        / "services"
+        / "mrp_result_projection.py"
+    ).read_text(encoding="utf-8")
+    assert "_read_mrp_snapshot_rows" not in projection_source
+    assert "_resolve_snapshot" not in projection_source
     from app.routers.plan import (
         export_planning_result_production,
         export_planning_result_purchases,
