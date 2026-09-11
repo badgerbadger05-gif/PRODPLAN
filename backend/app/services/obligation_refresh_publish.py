@@ -619,6 +619,47 @@ def _require_candidate_read_snapshots(
     return [by_id[declared[run_id]] for run_id in sorted(declared)]
 
 
+def _validate_purchase_candidate_payload(
+    target: models.LedgerGeneration,
+    payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate the direct purchase candidate without creating a snapshot row."""
+    if not isinstance(payload, Mapping):
+        raise ObligationRefreshPublishError(
+            "snapshot_build lacks direct purchase control journal payload"
+        )
+    result = dict(payload)
+    meta = result.get("meta")
+    rows = result.get("rows")
+    cards = result.get("cards")
+    if (
+        not isinstance(meta, Mapping)
+        or meta.get("read_only") is not True
+        or meta.get("fact_source") != "ledger"
+        or int(meta.get("ledger_generation_id") or -1) != int(target.id)
+        or not isinstance(rows, list)
+        or not isinstance(cards, Mapping)
+    ):
+        raise ObligationRefreshPublishError(
+            "purchase control journal direct candidate is missing or stale"
+        )
+    seen: set[str] = set()
+    for row in rows:
+        try:
+            validate_purchase_control_journal_row(row)
+            key = str(row["row_key"])
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise ObligationRefreshPublishError(
+                "purchase control journal row is malformed"
+            ) from exc
+        if key in seen:
+            raise ObligationRefreshPublishError(
+                "purchase control journal row violates Ledger fact contract"
+            )
+        seen.add(key)
+    return result
+
+
 def _exact_retry(
     db: Session, *, parent: models.LedgerGeneration, target: models.LedgerGeneration,
     pointer: models.PlanningTruthState, accepted_at: datetime, capabilities: dict[str, Any],
@@ -702,24 +743,13 @@ def _exact_retry(
     except ObligationRefreshPublishError:
         return None
     try:
-        journal_id = int(snapshot_metrics["purchase_control_journal_snapshot_id"])
-    except (KeyError, TypeError, ValueError):
+        journal_payload = _validate_purchase_candidate_payload(
+            target,
+            snapshot_metrics.get("purchase_control_journal_payload"),
+        )
+    except ObligationRefreshPublishError:
         return None
-    journal = db.get(models.PlanningReadSnapshot, journal_id)
-    if (journal is None or journal.consumer != "purchase_control_journal" or journal.snapshot_key != "journal:v1"
-            or journal.ledger_generation_id != target.id or journal.truth_status != "accepted"
-            or journal.reason is not None
-            or _utc(journal.published_at, "purchase journal published_at") != accepted_at):
-        return None
-    journal_payload = journal.payload if isinstance(journal.payload, dict) else None
-    journal_meta = journal_payload.get("meta") if journal_payload else None
-    journal_rows = journal_payload.get("rows") if journal_payload else None
-    journal_cards = journal_payload.get("cards") if journal_payload else None
-    if (not isinstance(journal_meta, dict) or journal_meta.get("read_only") is not True
-            or journal_meta.get("fact_source") != "ledger"
-            or int(journal_meta.get("ledger_generation_id") or -1) != int(target.id)
-            or not isinstance(journal_rows, list) or not isinstance(journal_cards, dict)):
-        return None
+    journal_rows = journal_payload.get("rows")
     seen_journal_rows: set[str] = set()
     for row in journal_rows:
         try:
@@ -836,6 +866,7 @@ def publish_obligation_refresh_batch(
     target_generation_id: int,
     accepted_at: datetime,
     capabilities: Mapping[str, Any],
+    purchase_payload: Mapping[str, Any] | None = None,
 ) -> ObligationRefreshPublishResult:
     """Publish every active source plan together, using only ``flush``.
 
@@ -905,27 +936,16 @@ def publish_obligation_refresh_batch(
         truth_status="building",
         accepted_at=None,
     )
-    try:
-        purchase_journal_id = int(dict(snapshot_batch.metrics or {})["purchase_control_journal_snapshot_id"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ObligationRefreshPublishError("snapshot_build lacks purchase control journal snapshot") from exc
-    candidate_purchase_journal = _lock(db.query(models.PlanningReadSnapshot)).filter(
-        models.PlanningReadSnapshot.id == purchase_journal_id,
-        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
-        models.PlanningReadSnapshot.truth_status == "building",
-        models.PlanningReadSnapshot.cutoff == target.cutoff,
-    ).one_or_none()
-    journal_payload = candidate_purchase_journal.payload if candidate_purchase_journal is not None else None
-    journal_meta = journal_payload.get("meta") if isinstance(journal_payload, dict) else None
-    journal_rows = journal_payload.get("rows") if isinstance(journal_payload, dict) else None
-    journal_cards = journal_payload.get("cards") if isinstance(journal_payload, dict) else None
-    if (candidate_purchase_journal is None or not isinstance(journal_meta, dict)
-            or journal_meta.get("read_only") is not True or journal_meta.get("fact_source") != "ledger"
-            or int(journal_meta.get("ledger_generation_id") or -1) != int(target.id)
-            or not isinstance(journal_rows, list) or not isinstance(journal_cards, dict)):
-        raise ObligationRefreshPublishError("purchase control journal candidate is missing or stale")
+    direct_purchase_payload = (
+        purchase_payload
+        if purchase_payload is not None
+        else dict(snapshot_batch.metrics or {}).get("purchase_control_journal_payload")
+    )
+    journal_payload = _validate_purchase_candidate_payload(
+        target,
+        direct_purchase_payload,
+    )
+    journal_rows = journal_payload["rows"]
     seen_supply_rows: set[str] = set()
     for row in journal_rows:
         try:
@@ -1091,7 +1111,6 @@ def publish_obligation_refresh_batch(
     )
     for snapshot in [
         *candidate_read_snapshots,
-        candidate_purchase_journal,
         candidate_production_journal,
     ]:
         snapshot.truth_status = "accepted"
@@ -1102,7 +1121,11 @@ def publish_obligation_refresh_batch(
     # remain immutable evidence; the compact current owner is the runtime read
     # model and never selects by a historical generation id.
     from .item_ledger.current_execution import publish_current_obligation_views_from_generation
-    publish_current_obligation_views_from_generation(db, int(target.id))
+    publish_current_obligation_views_from_generation(
+        db,
+        int(target.id),
+        purchase_payload=journal_payload,
+    )
     try:
         db.flush()
     except IntegrityError as exc:

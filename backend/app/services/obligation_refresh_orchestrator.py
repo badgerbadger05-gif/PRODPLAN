@@ -41,7 +41,7 @@ from app.services.item_ledger.supplier_receipt_allocation import (
 from app.services.item_ledger.current_replenishment import (
     apply_current_replenishment_for_accepted_generation,
 )
-from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
+from app.services.purchase_control_snapshot import build_candidate_payload as build_purchase_journal_payload
 from app.services.production_control_journal_snapshot import (
     build_candidate_snapshot as build_production_journal_candidate,
 )
@@ -540,7 +540,10 @@ def run_obligation_refresh(
     drum_schedule = materialize_drum_schedule(db, target_id)
     shelf_projection = materialize_shelf_projections(db, target_id)
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
-    purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
+    # Purchase current state is published directly from the canonical payload;
+    # unlike MRP/production evidence it does not need a PlanningReadSnapshot
+    # row as an intermediate runtime owner.
+    purchase_journal_payload = build_purchase_journal_payload(db, target_id)
     # Reconciliation takes row locks on mutable executor orders.  Keep it next
     # to the production snapshot which consumes those quantities, after every
     # unrelated heavy projection, so operators are not blocked while assembly,
@@ -582,7 +585,7 @@ def run_obligation_refresh(
         "shelf_projection_summary": _json_value(shelf_projection),
         "supplier_receipt_summary": _json_value(supplier_summary),
         "local_order_reconciliation": _json_value(local_order_reconciliation),
-        "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
+        "purchase_control_journal_payload": purchase_journal_payload,
         "production_control_journal_snapshot_id": int(production_journal_snapshot.id),
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
     }
@@ -604,6 +607,7 @@ def run_obligation_refresh(
     published = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
+        purchase_payload=purchase_journal_payload,
     )
     _publish_execution_snapshots(db, target_id)
     _publish_retained_mrp_snapshots(

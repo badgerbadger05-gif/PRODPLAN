@@ -962,7 +962,7 @@ def _build_buyer_rows(
     return rows
 
 
-def build_candidate_snapshot(db: Session, generation_id: int) -> models.PlanningReadSnapshot:
+def build_candidate_payload(db: Session, generation_id: int) -> dict[str, Any]:
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None or generation.status != "building" or generation.cutoff is None:
         raise ValueError("purchase journal candidate requires BUILDING Ledger generation")
@@ -1074,6 +1074,20 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
         "summary": persisted_summary,
     }
 
+    return payload
+
+
+def build_candidate_snapshot(db: Session, generation_id: int) -> models.PlanningReadSnapshot:
+    """Persist purchase evidence for historical/worker consumers.
+
+    Runtime current publication uses :func:`build_candidate_payload` directly;
+    this wrapper remains only for immutable snapshot evidence and migration
+    compatibility.
+    """
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or generation.status != "building" or generation.cutoff is None:
+        raise ValueError("purchase journal candidate requires BUILDING Ledger generation")
+    payload = build_candidate_payload(db, generation_id)
     existing = db.query(models.PlanningReadSnapshot).filter_by(
         consumer=CONSUMER,
         snapshot_key=SNAPSHOT_KEY,

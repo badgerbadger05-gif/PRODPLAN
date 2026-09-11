@@ -1281,6 +1281,8 @@ def _production_semantic_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def publish_current_obligation_views_from_generation(
     db: Session,
     generation_id: int,
+    *,
+    purchase_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Promote accepted obligation/read-model snapshots to compact current rows.
 
@@ -1351,15 +1353,27 @@ def publish_current_obligation_views_from_generation(
         summary=production_summary,
     )
 
-    purchase = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
-        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).one_or_none()
-    purchase_payload = dict(purchase.payload or {}) if purchase is not None else {}
-    purchase_meta = dict(purchase_payload.get("meta") or {})
-    purchase_source_rows = purchase_payload.get("rows")
+    if purchase_payload is not None:
+        results["purchase_control_journal"] = publish_current_purchase_control_from_payload(
+            db,
+            int(generation.id),
+            purchase_payload,
+        )
+        purchase = None
+    else:
+        purchase = db.query(models.PlanningReadSnapshot).filter(
+            models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+            models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+            models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+            models.PlanningReadSnapshot.truth_status == "accepted",
+        ).one_or_none()
+    purchase_source_payload = (
+        dict(purchase.payload or {})
+        if purchase is not None
+        else dict(purchase_payload or {})
+    )
+    purchase_meta = dict(purchase_source_payload.get("meta") or {})
+    purchase_source_rows = purchase_source_payload.get("rows")
     purchase_rows: list[dict[str, Any]] = []
     if isinstance(purchase_source_rows, list):
         purchase_rows = [
@@ -1375,22 +1389,23 @@ def publish_current_obligation_views_from_generation(
             for index, row in enumerate(purchase_source_rows)
             if isinstance(row, dict)
         ]
-    purchase_summary = dict(purchase_payload.get("meta") or {})
+    purchase_summary = dict(purchase_source_payload.get("meta") or {})
     for key in ("run_id", "run_ids", "truth_status", "to_order_by_period", "ledger_generation"):
         if key in purchase_meta:
             purchase_summary[key] = purchase_meta[key]
-    if isinstance(purchase_payload.get("summary"), dict):
-        purchase_summary["summary"] = dict(purchase_payload["summary"])
-    if isinstance(purchase_payload.get("cards"), dict):
-        purchase_summary["cards"] = dict(purchase_payload["cards"])
+    if isinstance(purchase_source_payload.get("summary"), dict):
+        purchase_summary["summary"] = dict(purchase_source_payload["summary"])
+    if isinstance(purchase_source_payload.get("cards"), dict):
+        purchase_summary["cards"] = dict(purchase_source_payload["cards"])
     purchase_summary["total_rows"] = len(purchase_rows)
-    _publish(
-        consumer="purchase_control_journal",
-        entity_kind="purchase_control_journal",
-        scope_key="purchase:all-live-plans",
-        rows=purchase_rows,
-        summary=purchase_summary,
-    )
+    if purchase_payload is None:
+        _publish(
+            consumer="purchase_control_journal",
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+            rows=purchase_rows,
+            summary=purchase_summary,
+        )
 
     mrp_rows: list[dict[str, Any]] = []
     mrp_metadata: dict[str, Any] = {}
