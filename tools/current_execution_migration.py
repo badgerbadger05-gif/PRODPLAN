@@ -476,6 +476,30 @@ def _migrate_purchase_export_anchors(session: Session, generation_id: int) -> di
     if "purchase_export_batch" not in set(inspector.get_table_names()):
         return {"legacy_before": 0, "legacy_after": 0, "current": 0}
 
+    batch_columns = {column["name"] for column in inspector.get_columns("purchase_export_batch")}
+    required_current = {"current_execution_scope_id", "current_execution_source_revision"}
+    if not required_current <= batch_columns:
+        raise PreflightBlocked(
+            "purchase export batch has no complete current execution anchor columns"
+        )
+    # Post-cutover schemas have no legacy selector at all.  They are already
+    # migrated; validate the compact current anchor rather than attempting to
+    # query a dropped column.
+    if "planning_read_snapshot_id" not in batch_columns:
+        incomplete = session.execute(text(
+            "SELECT count(*) FROM purchase_export_batch "
+            "WHERE current_execution_scope_id IS NULL "
+            "   OR current_execution_source_revision IS NULL"
+        )).scalar_one()
+        if int(incomplete or 0):
+            raise PreflightBlocked(
+                f"purchase export batch has {int(incomplete)} incomplete current anchors"
+            )
+        current = session.execute(text(
+            "SELECT count(*) FROM purchase_export_batch"
+        )).scalar_one()
+        return {"legacy_before": 0, "legacy_after": 0, "current": int(current or 0)}
+
     batches = session.execute(text(
         "SELECT id, planning_read_snapshot_id, current_execution_scope_id, "
         "current_execution_source_revision "
@@ -589,16 +613,31 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
 
     purchase_export_anchors = {"legacy": 0, "current": 0}
     if "purchase_export_batch" in set(inspect(session.connection()).get_table_names()):
-        anchor_counts = session.execute(text(
-            "SELECT "
-            "sum(CASE WHEN planning_read_snapshot_id IS NOT NULL THEN 1 ELSE 0 END) AS legacy, "
-            "sum(CASE WHEN current_execution_scope_id IS NOT NULL THEN 1 ELSE 0 END) AS current "
-            "FROM purchase_export_batch"
-        )).one()
-        purchase_export_anchors = {
-            "legacy": int(anchor_counts[0] or 0),
-            "current": int(anchor_counts[1] or 0),
+        batch_columns = {
+            column["name"]
+            for column in inspect(session.connection()).get_columns("purchase_export_batch")
         }
+        if not {"current_execution_scope_id", "current_execution_source_revision"} <= batch_columns:
+            raise PostflightBlocked("purchase export batch has no complete current anchor columns")
+        current_expr = (
+            "sum(CASE WHEN current_execution_scope_id IS NOT NULL "
+            "AND current_execution_source_revision IS NOT NULL THEN 1 ELSE 0 END) AS current"
+        )
+        if "planning_read_snapshot_id" in batch_columns:
+            anchor_counts = session.execute(text(
+                "SELECT "
+                "sum(CASE WHEN planning_read_snapshot_id IS NOT NULL THEN 1 ELSE 0 END) AS legacy, "
+                f"{current_expr} FROM purchase_export_batch"
+            )).one()
+            purchase_export_anchors = {
+                "legacy": int(anchor_counts[0] or 0),
+                "current": int(anchor_counts[1] or 0),
+            }
+        else:
+            anchor_counts = session.execute(text(
+                f"SELECT {current_expr} FROM purchase_export_batch"
+            )).one()
+            purchase_export_anchors = {"legacy": 0, "current": int(anchor_counts[0] or 0)}
         if purchase_export_anchors["legacy"]:
             raise PostflightBlocked(
                 f"purchase export legacy anchors remain: {purchase_export_anchors['legacy']}"

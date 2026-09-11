@@ -39,7 +39,7 @@ from app.services.one_c_purchase_order_export import (
 )
 from app.services.odata_client import OData1CClient
 from app.services.planning_truth import PlanningTruthUnavailable
-from . import purchase_control_snapshot
+from . import purchase_control_snapshot  # compatibility namespace; current writes never read snapshots
 from .purchase_control_snapshot import validate_purchase_control_journal_buy_row
 
 
@@ -1394,26 +1394,20 @@ def materialize_rows(
     current_rows: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
-        if current_manifest is not None and current_rows is not None:
-            summary = dict(current_manifest.summary or {})
-            legacy_snapshot_raw = summary.get("planning_read_snapshot_id")
-            legacy_snapshot_id = (
-                int(_to_int(legacy_snapshot_raw, field="planning_read_snapshot_id"))
-                if legacy_snapshot_raw not in (None, "")
-                else None
+        if current_manifest is None or current_rows is None:
+            raise PurchaseControlSnapshotUnavailable(
+                "current purchase-control execution scope is required"
             )
-            snapshot = {
-                "rows": [dict(row) for row in current_rows],
-                "meta": {
-                    **summary,
-                    "snapshot_id": int(current_manifest.id),
-                    "planning_read_snapshot_id": legacy_snapshot_id,
-                    "ledger_generation": int(current_manifest.source_generation_id or 0),
-                    "source_revision": str(current_manifest.source_revision),
-                },
-            }
-        else:
-            snapshot = purchase_control_snapshot.read_snapshot(db)
+        summary = dict(current_manifest.summary or {})
+        snapshot = {
+            "rows": [dict(row) for row in current_rows],
+            "meta": {
+                **summary,
+                "snapshot_id": int(current_manifest.id),
+                "ledger_generation": int(current_manifest.source_generation_id or 0),
+                "source_revision": str(current_manifest.source_revision),
+            },
+        }
     except PlanningTruthUnavailable as exc:
         raise PurchaseControlSnapshotUnavailable(str(exc)) from exc
 
@@ -1501,26 +1495,10 @@ def materialize_rows(
                 "aborted materialization batch requires manual resolution"
             )
         if batch is None:
-            planning_read_snapshot_id = None
-            current_execution_scope_id = None
-            current_execution_source_revision = None
-            if current_manifest is not None:
-                current_execution_scope_id = int(current_manifest.id)
-                current_execution_source_revision = str(current_manifest.source_revision)
-            else:
-                planning_read_snapshot_id = int(
-                    _to_int(
-                        meta.get("planning_read_snapshot_id") or meta.get("snapshot_id"),
-                        field="planning_read_snapshot_id",
-                    )
-                )
-                if planning_read_snapshot_id <= 0:
-                    raise PurchaseControlMaterializationError(
-                        "legacy purchase snapshot lacks immutable source anchor"
-                    )
+            current_execution_scope_id = int(current_manifest.id)
+            current_execution_source_revision = str(current_manifest.source_revision)
             batch = models.PurchaseExportBatch(
                 ledger_generation_id=int(ledger_generation_id),
-                planning_read_snapshot_id=planning_read_snapshot_id,
                 current_execution_scope_id=current_execution_scope_id,
                 current_execution_source_revision=current_execution_source_revision,
                 idempotency_key=key,

@@ -1,13 +1,19 @@
 """R9 purchase-control current anchor and transport contracts."""
 
 from fastapi.testclient import TestClient
+import pytest
 from types import SimpleNamespace
+from pathlib import Path
 
 from app import models
 from app.main import app
 from app.routers.purchase_control import _canonical_purchase_sort
 from app.routers.purchase_control import get_orders
 from app.services.item_ledger import current_execution
+from app.services.purchase_control_materialization import (
+    PurchaseControlSnapshotUnavailable,
+    materialize_rows,
+)
 
 
 def test_purchase_export_batch_is_current_anchor_only_after_r10_cutover():
@@ -104,3 +110,17 @@ def test_purchase_current_identity_filters_before_pagination(monkeypatch):
     )
     assert missing["total"] == 0
     assert missing["rows"] == []
+
+
+def test_purchase_materialize_rejects_snapshot_only_anchor():
+    with pytest.raises(PurchaseControlSnapshotUnavailable, match="current purchase-control execution scope"):
+        materialize_rows(db=object(), snapshot_id=7, row_keys=["legacy-row"], dry_run=True)
+
+
+def test_purchase_materialization_has_no_legacy_anchor_reader_or_writer():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "backend/app/services/purchase_control_materialization.py"
+    ).read_text(encoding="utf-8")
+    assert "planning_read_snapshot_id" not in source
+    assert "read_snapshot(" not in source

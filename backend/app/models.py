@@ -1975,21 +1975,10 @@ class PurchaseExportBatch(Base):
             "status IN ('building', 'completed', 'failed', 'aborted')",
             name="ck_purchase_export_batch_status",
         ),
-        CheckConstraint(
-            "(planning_read_snapshot_id IS NOT NULL AND current_execution_scope_id IS NULL "
-            "AND current_execution_source_revision IS NULL) "
-            "OR (planning_read_snapshot_id IS NULL AND current_execution_scope_id IS NOT NULL "
-            "AND current_execution_source_revision IS NOT NULL)",
-            name="ck_purchase_export_batch_exactly_one_source_anchor",
-        ),
         UniqueConstraint("idempotency_key", name="uq_purchase_export_batch_idempotency_key"),
         Index(
             "ix_purchase_export_batch_ledger_generation_id",
             "ledger_generation_id",
-        ),
-        Index(
-            "ix_purchase_export_batch_planning_read_snapshot_id",
-            "planning_read_snapshot_id",
         ),
         Index(
             "ix_purchase_export_batch_current_execution_scope_id",
@@ -2003,17 +1992,12 @@ class PurchaseExportBatch(Base):
         ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    planning_read_snapshot_id = Column(
-        BigInteger,
-        ForeignKey("planning_read_snapshot.id", ondelete="RESTRICT"),
-        nullable=True,
-    )
     current_execution_scope_id = Column(
         BigInteger,
         ForeignKey("current_execution_scope.id", ondelete="RESTRICT"),
-        nullable=True,
+        nullable=False,
     )
-    current_execution_source_revision = Column(String(256), nullable=True)
+    current_execution_source_revision = Column(String(256), nullable=False)
     idempotency_key = Column(String(128), nullable=False)
     status = Column(String(24), nullable=False, server_default="building")
     payload_hash = Column(String(64), nullable=True)
@@ -2030,7 +2014,6 @@ class PurchaseExportBatch(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     ledger_generation = relationship("LedgerGeneration")
-    planning_read_snapshot = relationship("PlanningReadSnapshot")
     current_execution_scope = relationship("CurrentExecutionScope")
 
 

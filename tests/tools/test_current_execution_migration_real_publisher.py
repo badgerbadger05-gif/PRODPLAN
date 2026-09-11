@@ -152,9 +152,21 @@ def _seed(session: Session):
         target_ref_key="r10-real-ref", ledger_generation_id=old_generation.id,
         status="success",
     ))
+    purchase_scope = models.CurrentExecutionScope(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        source_generation_id=old_generation.id,
+        source_revision=f"accepted:g{old_generation.id}:purchase_control_journal",
+        result_ready=True,
+        content_hash="r" * 64,
+        summary={},
+    )
+    session.add(purchase_scope)
+    session.flush()
     session.add(models.PurchaseExportBatch(
         ledger_generation_id=old_generation.id,
-        planning_read_snapshot_id=purchase.id,
+        current_execution_scope_id=purchase_scope.id,
+        current_execution_source_revision=purchase_scope.source_revision,
         idempotency_key="r10-real-export",
         status="completed",
     ))
@@ -209,10 +221,12 @@ def test_r10_real_publisher_rehearsal_uses_pointer_and_compacts_current(monkeypa
             assert after["categories"]["preserve"][table]["checksum"] == before["categories"]["preserve"][table]["checksum"]
         with scoped.connect() as connection:
             anchor = connection.execute(sa.text(
-                "SELECT planning_read_snapshot_id, current_execution_scope_id, idempotency_key "
+                "SELECT current_execution_scope_id, current_execution_source_revision, idempotency_key "
                 "FROM purchase_export_batch WHERE id=1"
             )).one()
-            assert anchor[0] is None and anchor[1] is not None and anchor[2] == "r10-real-export"
+            assert anchor[0] is not None
+            assert anchor[1].startswith(f"accepted:g{pointed_id}:purchase_control_journal")
+            assert anchor[2] == "r10-real-export"
     finally:
         if scoped is not None:
             scoped.dispose()

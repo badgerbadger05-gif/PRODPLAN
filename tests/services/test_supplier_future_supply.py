@@ -100,18 +100,27 @@ def _buy_context(db):
         payload={},
         published_at=cutoff,
     )
+    manifest = models.CurrentExecutionScope(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        source_generation_id=generation.id,
+        source_revision=f"building:g{generation.id}:purchase_control_journal",
+        result_ready=True,
+        content_hash="f" * 64,
+        summary={},
+    )
+    db.add_all((reservation, snapshot, manifest))
+    db.flush()
     batch = models.PurchaseExportBatch(
         ledger_generation_id=generation.id,
-        planning_read_snapshot_id=snapshot.id,
+        current_execution_scope_id=manifest.id,
+        current_execution_source_revision=manifest.source_revision,
         idempotency_key="batch-buy-key",
         status="building",
         payload_hash="b" * 64,
         request_payload={"request": True},
         result_payload={"result": True},
     )
-    db.add_all((reservation, snapshot))
-    db.flush()
-    batch.planning_read_snapshot_id = snapshot.id
     db.add(batch)
     db.flush()
     allocation = models.PurchaseExportObligationAllocation(
