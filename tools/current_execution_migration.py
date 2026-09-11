@@ -14,9 +14,31 @@ from pathlib import Path
 import sys
 from collections import defaultdict
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
+
+
+# This is the deliberately small obligation hand-off surface for R10.  The
+# tuple is (publisher consumer, current scope key, current entity kind).  It
+# must remain aligned with the canonical publisher; it is not a second reader
+# or a second publication engine.
+EXPECTED_CURRENT_SCOPES = (
+    ("production_control_journal", "production:all-live-orders", "production_control_journal"),
+    ("purchase_control_journal", "purchase:all-live-plans", "purchase_control_journal"),
+    ("mrp_result", "mrp:all-live-plans", "mrp_result"),
+    ("period_plan_execution", "period-plan:all-live-plans", "period_plan_execution"),
+)
+
+
+class PreflightBlocked(RuntimeError):
+    """The migration may not start because its read-only preflight is unsafe."""
+
+
+class PostflightBlocked(RuntimeError):
+    """The canonical publication did not produce an unambiguous current view."""
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +47,15 @@ if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
     # The supported CLI invocation is `python tools/...` from the repository
     # root; in that mode Python does not add backend/ to import search paths.
     sys.path.insert(0, str(_BACKEND_ROOT))
+
+try:
+    # Kept as a module-level seam so tests can prove the transaction policy
+    # without calling OData, workers, or a live integration.
+    from app.services.item_ledger.current_execution import (
+        publish_current_obligation_views_from_generation,
+    )
+except Exception:  # pragma: no cover - standalone preflight remains usable
+    publish_current_obligation_views_from_generation = None
 
 
 _PRESERVE_REASONS = {
@@ -290,16 +321,201 @@ def build_manifest(engine: Engine) -> dict[str, Any]:
     }
 
 
+def _accepted_truth_generation(engine: Engine) -> int:
+    """Resolve exactly the accepted generation named by the truth pointer.
+
+    Deliberately no ``MAX(id)``/latest-row heuristic is allowed here.  The
+    pointer is the only source of the migration source generation.
+    """
+
+    with engine.connect() as connection:
+        pointer = connection.execute(text(
+            "SELECT current_generation_id FROM planning_truth_state WHERE id = 1"
+        )).scalar_one_or_none()
+        if pointer is None:
+            raise PreflightBlocked("planning_truth_state has no current_generation_id")
+        status = connection.execute(text(
+            "SELECT status FROM ledger_generation WHERE id = :generation_id"
+        ), {"generation_id": int(pointer)}).scalar_one_or_none()
+    if str(status or "") != "accepted":
+        raise PreflightBlocked(
+            f"truth pointer generation {int(pointer)} is not accepted (status={status!r})"
+        )
+    return int(pointer)
+
+
+def _postflight_on_session(session: Session, generation_id: int) -> dict[str, Any]:
+    """Validate current scopes/rows while the publication transaction is held."""
+
+    scopes: dict[str, dict[str, Any]] = {}
+    for consumer, scope_key, entity_kind in EXPECTED_CURRENT_SCOPES:
+        rows = session.execute(text(
+            "SELECT entity_kind, scope_key, source_generation_id, source_revision, result_ready "
+            "FROM current_execution_scope WHERE entity_kind = :entity_kind AND scope_key = :scope_key"
+        ), {"entity_kind": entity_kind, "scope_key": scope_key}).mappings().all()
+        if len(rows) != 1:
+            raise PostflightBlocked(
+                f"expected exactly one current scope for {consumer}, found {len(rows)}"
+            )
+        row = rows[0]
+        expected_revision = f"accepted:g{int(generation_id)}:{consumer}"
+        if int(row["source_generation_id"] or 0) != int(generation_id):
+            raise PostflightBlocked(f"scope {consumer} has wrong source generation")
+        if str(row["source_revision"] or "") != expected_revision:
+            raise PostflightBlocked(f"scope {consumer} has wrong source revision")
+        if not bool(row["result_ready"]):
+            raise PostflightBlocked(f"scope {consumer} is not ready")
+        scopes[consumer] = {
+            "entity_kind": entity_kind,
+            "scope_key": scope_key,
+            "source_generation_id": int(row["source_generation_id"]),
+            "source_revision": str(row["source_revision"]),
+            "result_ready": bool(row["result_ready"]),
+        }
+
+    duplicates = session.execute(text(
+        "SELECT entity_kind, scope_key, business_identity, count(*) AS row_count "
+        "FROM current_execution_row "
+        "WHERE entity_kind IN (:production, :purchase, :mrp, :period) "
+        "GROUP BY entity_kind, scope_key, business_identity HAVING count(*) > 1"
+    ), {
+        "production": "production_control_journal",
+        "purchase": "purchase_control_journal",
+        "mrp": "mrp_result",
+        "period": "period_plan_execution",
+    }).mappings().all()
+    if duplicates:
+        raise PostflightBlocked(
+            "duplicate current business identities: "
+            + json.dumps([dict(row) for row in duplicates], sort_keys=True)
+        )
+
+    return {
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "scopes": scopes,
+        "unique_identities": True,
+    }
+
+
+def postflight_manifest(engine: Engine, *, generation_id: int) -> dict[str, Any]:
+    """Read-only postflight for an already published current obligation set."""
+
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        return _postflight_on_session(session, int(generation_id))
+
+
+def _count_changes(engine: Engine) -> int:
+    inspector = inspect(engine)
+    if "current_execution_change" not in set(inspector.get_table_names()):
+        return 0
+    with engine.connect() as connection:
+        return int(connection.execute(text("SELECT count(*) FROM current_execution_change")).scalar_one())
+
+
+def apply_current_obligation_migration(
+    engine: Engine,
+    *,
+    writers_stopped: bool,
+    fault_after_consumer: str | None = None,
+) -> dict[str, Any]:
+    """Atomically publish legacy obligation evidence into current execution.
+
+    This function owns transaction orchestration only.  The domain mapping and
+    all current-row semantics remain in
+    ``publish_current_obligation_views_from_generation``.
+    """
+
+    if not writers_stopped:
+        raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+
+    manifest = build_manifest(engine)
+    if manifest["status"] != "ready":
+        raise PreflightBlocked(
+            "R10 preflight is blocked by unknown or ambiguous dependencies: "
+            + json.dumps(manifest["dependencies"], sort_keys=True)
+        )
+
+    generation_id = _accepted_truth_generation(engine)
+    if publish_current_obligation_views_from_generation is None:
+        raise PreflightBlocked("canonical current obligation publisher is unavailable")
+
+    before_changes = _count_changes(engine)
+    publisher_result: Any = None
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        with session.begin():
+            publisher_result = publish_current_obligation_views_from_generation(session, generation_id)
+            if fault_after_consumer is not None:
+                raise RuntimeError(f"fault injection after consumer {fault_after_consumer}")
+            postflight = _postflight_on_session(session, generation_id)
+
+    after_changes = _count_changes(engine)
+    return {
+        "phase": "apply",
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "preflight": manifest,
+        "postflight": postflight,
+        "publisher_consumers": sorted(str(key) for key in (publisher_result or {})),
+        "change_rows_before": before_changes,
+        "change_rows_after": after_changes,
+        "idempotent": after_changes == before_changes,
+    }
+
+
+def _assert_local_database_url(database_url: str) -> None:
+    parsed = urlparse(database_url)
+    if parsed.scheme.startswith("sqlite"):
+        return
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("R10 apply is local-only; database host must be loopback")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
+    parser.add_argument(
+        "--phase",
+        choices=("preflight", "apply", "postflight"),
+        default="preflight",
+        help="read-only manifest, atomic current publication, or read-only postflight",
+    )
+    parser.add_argument(
+        "--writers-stopped",
+        action="store_true",
+        help="explicit acknowledgement required by --phase apply",
+    )
+    parser.add_argument("--generation-id", type=int)
+    parser.add_argument("--fault-after-consumer")
     args = parser.parse_args(argv)
     if not args.database_url:
         parser.error("--database-url or DATABASE_URL is required")
+    try:
+        _assert_local_database_url(args.database_url)
+    except ValueError as exc:
+        parser.error(str(exc))
     engine = create_engine(args.database_url, future=True)
-    manifest = build_manifest(engine)
-    print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if manifest["status"] == "ready" else 2
+    try:
+        if args.phase == "preflight":
+            report = build_manifest(engine)
+        elif args.phase == "apply":
+            report = apply_current_obligation_migration(
+                engine,
+                writers_stopped=args.writers_stopped,
+                fault_after_consumer=args.fault_after_consumer,
+            )
+        else:
+            generation_id = args.generation_id
+            if generation_id is None:
+                generation_id = _accepted_truth_generation(engine)
+            report = postflight_manifest(engine, generation_id=int(generation_id))
+    except (PreflightBlocked, PostflightBlocked, RuntimeError) as exc:
+        report = {"phase": args.phase, "status": "blocked", "reason": str(exc)}
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 2
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+    return 0 if report.get("status") == "ready" else 2
 
 
 if __name__ == "__main__":
