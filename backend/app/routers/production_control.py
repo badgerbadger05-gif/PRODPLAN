@@ -120,6 +120,8 @@ class AssemblyQueueRow(BaseModel):
     # the live-plan scope was lost.
     sort_key: str
     eligible_from: Optional[str] = None
+    current_identity: str
+    source_revision: str
 
 
 class AssemblyQueueResponse(BaseModel):
@@ -477,6 +479,7 @@ def _items_by_id(db: Session, item_ids: set[int]) -> dict[int, models.Item]:
 def get_assembly_queue(
     limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
     offset: Annotated[int, Query(ge=0)] = 0,
+    current_identity: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> AssemblyQueueResponse:
     """Read the compact current queue; legacy snapshots serve only old data."""
@@ -508,6 +511,12 @@ def get_assembly_queue(
             )
         except planning_truth.PlanningTruthUnavailable as exc:
             raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+        if current_identity is not None:
+            target_identity = str(current_identity).strip()
+            current_rows = [
+                row for row in current_rows
+                if str(row.business_identity) == target_identity
+            ]
         item_ids = {int(row.payload.get("item_id")) for row in current_rows if row.payload.get("item_id") is not None}
         items = _items_by_id(db, item_ids)
         ordered = sorted(
@@ -540,17 +549,28 @@ def get_assembly_queue(
                 "eligible_from": payload.get("eligible_from"),
                 "priority_key": list(payload.get("original_priority") or []),
                 "sort_key": str(payload.get("sort_key") or ""),
+                "current_identity": str(row.business_identity),
+                "source_revision": str(current_scope.source_revision),
             })
         summary = dict(current_scope.summary or {})
-        if "total_rows" not in summary or "total_queue_qty" not in summary:
+        if current_identity is not None:
+            total_rows = len(payload_rows)
+            total_queue_qty = sum(
+                float(row["assembly_remaining_qty"] or 0.0)
+                for row in payload_rows
+            )
+        elif "total_rows" not in summary or "total_queue_qty" not in summary:
             raise HTTPException(
                 status_code=503,
                 detail={"code": "assembly_queue_unavailable", "reason": "current queue summary is missing"},
             )
+        else:
+            total_rows = int(summary["total_rows"])
+            total_queue_qty = float(summary["total_queue_qty"])
         return AssemblyQueueResponse.model_validate({
             "rows": payload_rows[offset:offset + limit],
-            "total_rows": int(summary["total_rows"]),
-            "total_queue_qty": float(summary["total_queue_qty"]),
+            "total_rows": total_rows,
+            "total_queue_qty": total_queue_qty,
             "limit": limit,
             "offset": offset,
             "truth_meta": build_truth_meta(truth),
