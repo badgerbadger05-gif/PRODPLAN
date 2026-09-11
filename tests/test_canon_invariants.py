@@ -638,6 +638,13 @@ def test_direct_1c_writer_registry_is_exact() -> None:
             "_export_checked_piecework",
             "_post_export_entries",
         ),
+        # Existing owned chain document: restore per-row order/workshop
+        # after 1C applied header values. No new writer outside the exporter.
+        (
+            "backend/app/services/one_c_piecework_export.py",
+            "_export_checked_piecework",
+            "patch",
+        ),
         (
             "backend/app/services/one_c_piecework_export.py",
             "posted",
