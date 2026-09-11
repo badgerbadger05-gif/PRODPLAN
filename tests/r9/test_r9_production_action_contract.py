@@ -208,7 +208,6 @@ def test_accepted_production_fact_is_not_hidden_by_closed_order_status(db_sessio
     from app.services.production_order_sync import sync_production_facts
     from tests.services.test_production_order_sync import (
         _accepted_generation as fact_generation,
-        _assembly_fact,
         _fact_item,
         _no_odata,
         _order_with_line,
@@ -222,13 +221,31 @@ def test_accepted_production_fact_is_not_hidden_by_closed_order_status(db_sessio
         db_session, item=item, order_ref1c="r9-closed-order"
     )
     order.order_state_key = "ad28565a-991b-11eb-e39a-fa163e61326a"
-    _assembly_fact(
-        db_session,
-        batch=batch,
-        item=item,
-        recorder_ref="r9-closed-assembly",
+    # Keep this contract fixture independent from the OData-pull writer.  The
+    # production-fact reader consumes the accepted Ledger row directly; using
+    # ``ingest_source='pull'`` here would exercise the global runtime identity
+    # listener and make the R9 module order-dependent.
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=batch.id,
+        source_content_hash="r9-closed-fact-content",
+        business_identity="assembly:Document_СборкаЗапасов:r9-closed-assembly:1",
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="warehouse-1",
         qty=2,
-    )
+        qty_after=2,
+        posting_at=datetime(2026, 7, 22),
+        known_at=datetime(2026, 7, 22),
+        record_type="Receipt",
+        movement_kind="assembly_in",
+        recorder_type="Document_СборкаЗапасов",
+        recorder_ref="r9-closed-assembly",
+        line_no="1",
+        ingest_source="test",
+        active=True,
+    ))
+    db_session.flush()
     _recorder_pull(
         db_session,
         recorder_ref="r9-closed-assembly",
