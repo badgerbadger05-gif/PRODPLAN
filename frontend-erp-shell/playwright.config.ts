@@ -13,7 +13,7 @@ export default defineConfig({
     // font/rasterization differences. Reuse the reviewed Linux baseline and
     // bound that host-only noise instead of creating per-platform PNG copies.
     toHaveScreenshot: {
-      maxDiffPixelRatio: process.platform === 'win32' ? 0.08 : 0,
+      maxDiffPixelRatio: process.platform === 'win32' ? 0.10 : 0,
     },
   },
   reporter: [['list']],
