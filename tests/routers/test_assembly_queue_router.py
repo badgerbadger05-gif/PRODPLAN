@@ -311,6 +311,84 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
     assert response.json()["detail"]["code"] == "assembly_queue_unavailable"
 
 
+def test_current_assembly_queue_exposes_identity_revision_and_filters_before_page(
+    client, db_session
+):
+    generation, _ = _accepted_generation(db_session)
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    rows = [
+        {
+            "entity_kind": "assembly_queue",
+            "business_identity": "plan-line:501",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "plan_id": 401,
+                "plan_line_id": 501,
+                "run_id": 301,
+                "item_id": 7,
+                "period_from": "2026-08-01",
+                "period_to": "2026-08-31",
+                "bucket_date": "2026-08-03",
+                "planned_output_qty": "10",
+                "accepted_plan_output_qty": "3",
+                "assembly_remaining_qty": "7",
+                "original_priority": ["2026-08-01", "2026-08-31", 401, 501],
+                "sort_key": "2026-08-01|2026-08-31|0000000401|0000000501",
+            },
+        },
+        {
+            "entity_kind": "assembly_queue",
+            "business_identity": "plan-line:502",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "plan_id": 401,
+                "plan_line_id": 502,
+                "run_id": 301,
+                "item_id": 8,
+                "period_from": "2026-08-01",
+                "period_to": "2026-08-31",
+                "bucket_date": "2026-08-04",
+                "planned_output_qty": "10",
+                "accepted_plan_output_qty": "0",
+                "assembly_remaining_qty": "10",
+                "original_priority": ["2026-08-01", "2026-08-31", 401, 502],
+                "sort_key": "2026-08-01|2026-08-31|0000000401|0000000502",
+            },
+        },
+    ]
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:r8-queue",
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        rows=rows,
+        entity_kinds=("assembly_queue",),
+        summary={"total_rows": 2, "total_queue_qty": 17},
+    )
+    db_session.commit()
+
+    response = client.get(
+        "/api/v1/production-control/assembly-queue",
+        params={"current_identity": "plan-line:502", "limit": 1, "offset": 0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["current_identity"] for row in body["rows"]] == ["plan-line:502"]
+    assert body["rows"][0]["source_revision"] == "accepted:r8-queue"
+    assert body["total_rows"] == 1
+    assert body["total_queue_qty"] == 10.0
+
+    unknown = client.get(
+        "/api/v1/production-control/assembly-queue",
+        params={"current_identity": "plan-line:missing"},
+    )
+    assert unknown.status_code == 200
+    assert unknown.json()["rows"] == []
+    assert unknown.json()["total_rows"] == 0
+    assert unknown.json()["total_queue_qty"] == 0.0
+
+
 def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_session):
     _accepted_generation(db_session)
     rows = [
