@@ -1,6 +1,7 @@
 """Schema contract for canonical material coverage ownership."""
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -49,14 +50,14 @@ def test_material_cache_drop_migration_is_linear_head():
     assert len(ScriptDirectory.from_config(config).get_heads()) == 1
 
 
-def test_ownership_migrations_round_trip_on_disposable_sqlite(tmp_path):
-    db_path = tmp_path / "ownership-roundtrip.db"
+def test_ownership_migrations_upgrade_on_disposable_sqlite(tmp_path):
+    """The disposable schema reaches head; the current cutover is irreversible."""
+    db_path = tmp_path / "ownership-upgrade.db"
     result = subprocess.run(
         [
             sys.executable,
             str(REPO_ROOT / "tests" / "alembic_sqlite_upgrade.py"),
             str(db_path),
-            "--round-trip",
         ],
         cwd=str(REPO_ROOT),
         capture_output=True,
@@ -66,3 +67,18 @@ def test_ownership_migrations_round_trip_on_disposable_sqlite(tmp_path):
     )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
     assert "---JSON---" in result.stdout
+    schema = json.loads(result.stdout.split("---JSON---", 1)[1])['tables']
+    purchase_columns = set(schema["purchase_export_batch"])
+    assert "planning_read_snapshot_id" not in purchase_columns
+    assert {
+        "current_execution_scope_id",
+        "current_execution_source_revision",
+    } <= purchase_columns
+
+    cutover_tests = (
+        REPO_ROOT / "tests" / "tools" / "test_r10_purchase_anchor_cutover.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "test_cutover_removes_legacy_anchor_after_verified_current_mapping_and_downgrade_fails_closed"
+        in cutover_tests
+    )
