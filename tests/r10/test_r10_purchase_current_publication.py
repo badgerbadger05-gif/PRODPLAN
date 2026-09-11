@@ -1,6 +1,7 @@
 """R10 purchase publication must own current state without read snapshots."""
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from app.services.item_ledger.current_execution import (
     get_current_execution_scope,
     load_current_execution_rows,
     publish_current_purchase_control_from_payload,
+    publish_current_obligation_views_from_generation,
 )
 
 
@@ -141,3 +143,22 @@ def test_purchase_current_publisher_rejects_duplicate_identity_before_dml(db_ses
     ) is None
     assert db_session.query(models.CurrentExecutionRow).count() == 0
     assert db_session.query(models.PlanningReadSnapshot).count() == 0
+
+
+def test_runtime_purchase_publication_has_no_snapshot_fallback_or_lifecycle_writer():
+    repo = Path(__file__).resolve().parents[2]
+    lifecycle = (
+        repo / "backend/app/services/item_ledger/generation_lifecycle.py"
+    ).read_text(encoding="utf-8")
+    current = (
+        repo / "backend/app/services/item_ledger/current_execution.py"
+    ).read_text(encoding="utf-8")
+    assert "build_purchase_journal_candidate" not in lifecycle
+    assert "publish_current_obligation_views_from_snapshots" in current
+
+
+def test_runtime_obligation_publisher_requires_direct_purchase_payload(db_session):
+    generation = _accepted_generation(db_session)
+
+    with pytest.raises(CurrentExecutionUnavailable, match="purchase payload"):
+        publish_current_obligation_views_from_generation(db_session, generation.id)
