@@ -459,7 +459,9 @@ test('unified Produce sends actual quantity and partial intent', async ({ page }
   })
   await page.goto('/#/production-control')
   await page.getByRole('row').filter({ hasText: 'Кронштейн опорный' }).first().getByRole('checkbox').check()
-  await expect(page.getByRole('button', { name: 'Закрыть в 1С', exact: true })).toHaveCount(0)
+  // The unified command bar keeps the legacy close action visible but
+  // disabled unless the current row explicitly grants close_1c.
+  await expect(page.getByRole('button', { name: 'Закрыть в 1С', exact: true })).toBeDisabled()
   await page.getByRole('button', { name: 'Произвести', exact: true }).click()
   const dialog = page.getByRole('dialog')
   await dialog.getByRole('spinbutton').fill('7')

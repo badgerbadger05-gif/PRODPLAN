@@ -10,6 +10,8 @@ async function mockMrpResultApi(page: Page) {
       await route.fulfill({
         json: {
           current_scope_id: 901,
+          current_identity: 'mrp-run:77',
+          source_revision: 'accepted:g77:mrp_result',
           ledger_generation: 77,
           cutoff: '2026-07-20T08:18:42+00:00',
           truth_status: 'accepted',
@@ -45,6 +47,8 @@ async function mockMrpResultApi(page: Page) {
       await route.fulfill({
         json: {
           current_scope_id: 901,
+          current_identity: 'mrp-run:77',
+          source_revision: 'accepted:g77:mrp_result',
           ledger_generation: 77,
           cutoff: '2026-07-20T08:18:42+00:00',
           truth_status: 'accepted',
