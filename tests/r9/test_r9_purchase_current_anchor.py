@@ -10,24 +10,18 @@ from app.routers.purchase_control import get_orders
 from app.services.item_ledger import current_execution
 
 
-def test_purchase_export_batch_has_nullable_current_scope_anchor():
+def test_purchase_export_batch_is_current_anchor_only_after_r10_cutover():
     table = models.PurchaseExportBatch.__table__
 
-    assert table.c.current_execution_scope_id.nullable is True
-    assert table.c.current_execution_source_revision.nullable is True
-    # Historical batches keep their old FK, but current batches must be able
-    # to omit it rather than pretending a CurrentExecutionScope id is a
-    # PlanningReadSnapshot id.
-    assert table.c.planning_read_snapshot_id.nullable is True
+    assert table.c.current_execution_scope_id.nullable is False
+    assert table.c.current_execution_source_revision.nullable is False
+    assert "planning_read_snapshot_id" not in table.c
     foreign_keys = {
         (fk.parent.name, fk.target_fullname, fk.ondelete)
         for fk in table.foreign_keys
     }
-    assert (
-        "current_execution_scope_id",
-        "current_execution_scope.id",
-        "RESTRICT",
-    ) in foreign_keys
+    assert ("current_execution_scope_id", "current_execution_scope.id", "RESTRICT") in foreign_keys
+    assert not any(parent == "planning_read_snapshot_id" for parent, *_ in foreign_keys)
 
 
 def test_purchase_sort_uses_typed_numeric_primary_and_tie_ascending():

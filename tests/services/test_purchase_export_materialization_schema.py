@@ -62,9 +62,21 @@ def _fixture(db_session):
 
 def _batch_payload(*, db_session):
     generation, snapshot, _ = _fixture(db_session)
+    manifest = models.CurrentExecutionScope(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        source_generation_id=generation.id,
+        source_revision=f"accepted:g{generation.id}:purchase_control_journal",
+        result_ready=True,
+        content_hash="b" * 64,
+        summary={},
+    )
+    db_session.add(manifest)
+    db_session.flush()
     batch = models.PurchaseExportBatch(
         ledger_generation_id=generation.id,
-        planning_read_snapshot_id=snapshot.id,
+        current_execution_scope_id=manifest.id,
+        current_execution_source_revision=manifest.source_revision,
         idempotency_key="batch-schema-key",
         status="building",
         payload_hash="a" * 64,
@@ -83,9 +95,9 @@ def test_purchase_export_batch_metadata_contract():
         for col in table.columns
         if not col.nullable
     )
-    assert table.c.planning_read_snapshot_id.nullable is True
-    assert table.c.current_execution_scope_id.nullable is True
-    assert table.c.current_execution_source_revision.nullable is True
+    assert "planning_read_snapshot_id" not in table.c
+    assert table.c.current_execution_scope_id.nullable is False
+    assert table.c.current_execution_source_revision.nullable is False
     assert "payload_hash" in table.c
     assert table.c.request_payload is not None and table.c.result_payload is not None
 
@@ -93,7 +105,7 @@ def test_purchase_export_batch_metadata_contract():
         (fk.parent.name, fk.target_fullname, fk.ondelete) for fk in table.foreign_keys
     }
     assert ("ledger_generation_id", "ledger_generation.id", "RESTRICT") in foreign_keys
-    assert ("planning_read_snapshot_id", "planning_read_snapshot.id", "RESTRICT") in foreign_keys
+    assert ("planning_read_snapshot_id", "planning_read_snapshot.id", "RESTRICT") not in foreign_keys
 
     unique = {
         tuple(constraint.columns.keys())
@@ -107,23 +119,11 @@ def test_purchase_export_batch_metadata_contract():
         for constraint in table.constraints
         if constraint.__class__.__name__ == "CheckConstraint"
     }
-    assert {
-        "ck_purchase_export_batch_status",
-        "ck_purchase_export_batch_exactly_one_source_anchor",
-    } <= checks
-    anchor_check = next(
-        constraint
-        for constraint in table.constraints
-        if constraint.name == "ck_purchase_export_batch_exactly_one_source_anchor"
-    )
-    anchor_sql = str(anchor_check.sqltext)
-    assert "current_execution_source_revision IS NOT NULL" in anchor_sql
-    assert "current_execution_source_revision IS NULL" in anchor_sql
+    assert checks == {"ck_purchase_export_batch_status"}
 
     indexes = {index.name for index in table.indexes}
     assert {
         "ix_purchase_export_batch_ledger_generation_id",
-        "ix_purchase_export_batch_planning_read_snapshot_id",
         "ix_purchase_export_batch_current_execution_scope_id",
     } <= indexes
 
@@ -205,9 +205,21 @@ def test_purchase_export_obligation_allocation_can_insert(db_session):
     )
     db_session.add(snapshot)
     db_session.flush()
+    manifest = models.CurrentExecutionScope(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        source_generation_id=generation.id,
+        source_revision=f"accepted:g{generation.id}:purchase_control_journal",
+        result_ready=True,
+        content_hash="c" * 64,
+        summary={},
+    )
+    db_session.add(manifest)
+    db_session.flush()
     batch = models.PurchaseExportBatch(
         ledger_generation_id=generation.id,
-        planning_read_snapshot_id=snapshot.id,
+        current_execution_scope_id=manifest.id,
+        current_execution_source_revision=manifest.source_revision,
         idempotency_key="batch-alloc-key",
         status="building",
         request_payload={"request": True},

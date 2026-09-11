@@ -80,10 +80,11 @@ def test_cutover_blocks_unmigrated_legacy_anchor_and_downgrade_is_explicitly_uns
     try:
         with engine.begin() as conn:
             _schema(conn, schema)
+            conn.execute(sa.text("INSERT INTO ledger_generation(id) VALUES (1)"))
+            conn.execute(sa.text("INSERT INTO planning_read_snapshot(id) VALUES (10)"))
             conn.execute(sa.text(
-                "INSERT INTO ledger_generation(id) VALUES (1); "
-                "INSERT INTO planning_read_snapshot(id) VALUES (10); "
-                "INSERT INTO purchase_export_batch(id,ledger_generation_id,planning_read_snapshot_id,idempotency_key) VALUES (1,1,10,'bad')"
+                "INSERT INTO purchase_export_batch(id,ledger_generation_id,planning_read_snapshot_id,idempotency_key) "
+                "VALUES (1,1,10,'bad')"
             ))
             module = _migration()
             with pytest.raises(RuntimeError, match="legacy|current anchor"):
@@ -103,10 +104,11 @@ def test_cutover_removes_legacy_anchor_after_verified_current_mapping_and_downgr
     try:
         with engine.begin() as conn:
             _schema(conn, schema)
+            conn.execute(sa.text("INSERT INTO ledger_generation(id) VALUES (1)"))
+            conn.execute(sa.text("INSERT INTO current_execution_scope(id) VALUES (20)"))
             conn.execute(sa.text(
-                "INSERT INTO ledger_generation(id) VALUES (1); "
-                "INSERT INTO current_execution_scope(id) VALUES (20); "
-                "INSERT INTO purchase_export_batch(id,ledger_generation_id,current_execution_scope_id,current_execution_source_revision,idempotency_key) VALUES (1,1,20,'accepted:g1:purchase_control_journal','good')"
+                "INSERT INTO purchase_export_batch(id,ledger_generation_id,current_execution_scope_id,current_execution_source_revision,idempotency_key) "
+                "VALUES (1,1,20,'accepted:g1:purchase_control_journal','good')"
             ))
             module = _migration()
             _run(module, conn, "upgrade")
