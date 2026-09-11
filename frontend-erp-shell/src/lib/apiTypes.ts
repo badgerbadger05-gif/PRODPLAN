@@ -6017,8 +6017,8 @@ export interface components {
         };
         /** PurchaseControlMaterializeRequest */
         PurchaseControlMaterializeRequest: {
-            /** Snapshot Id */
-            snapshot_id?: number | null;
+            /** Current Scope Id */
+            current_scope_id?: number | null;
             /** Row Keys */
             row_keys?: string[];
             /**
@@ -6035,8 +6035,8 @@ export interface components {
         };
         /** PurchaseControlSelectionSummaryRequest */
         PurchaseControlSelectionSummaryRequest: {
-            /** Snapshot Id */
-            snapshot_id?: number | null;
+            /** Current Scope Id */
+            current_scope_id?: number | null;
             /** Row Keys */
             row_keys?: string[];
             /** Horizon Period To */
@@ -6050,8 +6050,8 @@ export interface components {
         };
         /** PurchaseControlSelectionSummaryResponse */
         PurchaseControlSelectionSummaryResponse: {
-            /** Snapshot Id */
-            snapshot_id: number;
+            /** Current Scope Id */
+            current_scope_id: number;
             /** Selected Rows */
             selected_rows: number;
             /** Priced Rows */

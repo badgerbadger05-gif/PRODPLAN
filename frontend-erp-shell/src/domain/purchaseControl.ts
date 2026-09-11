@@ -123,7 +123,7 @@ export type PurchaseSelectionSummaryRequest = components['schemas']['PurchaseCon
 export type PurchaseSelectionSummary = components['schemas']['PurchaseControlSelectionSummaryResponse']
 
 export type PurchaseSnapshotMeta = {
-  snapshot_id?: number
+  current_scope_id?: number
   ledger_generation: number
   ledger_generation_id?: number
   cutoff: string

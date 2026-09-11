@@ -191,7 +191,7 @@ describe('PurchaseControlPage Doctype migration', () => {
       ledger_generation_id: 23,
       source_revision: 'accepted:g23',
       meta: {
-        snapshot_id: 51,
+        current_scope_id: 51,
         ledger_generation: 23,
         ledger_generation_id: 23,
         cutoff: '2026-07-23T12:00:00+00:00',
@@ -235,7 +235,7 @@ describe('PurchaseControlPage Doctype migration', () => {
       },
       lines: [orderedRow],
       meta: {
-        snapshot_id: 51,
+        current_scope_id: 51,
         ledger_generation: 23,
         cutoff: '2026-07-23T12:00:00+00:00',
         truth_status: 'accepted',
@@ -292,13 +292,13 @@ describe('PurchaseControlPage Doctype migration', () => {
     })
     vi.mocked(syncSupplierOrdersFrom1C).mockResolvedValue({ orders_created: 0, orders_updated: 1 })
     vi.mocked(materializePurchaseControlRows).mockResolvedValue({
-      snapshot_id: 51,
+      current_scope_id: 51,
       rows_total: 1,
       dry_run: false,
       status: 'completed',
     })
     vi.mocked(getPurchaseSelectionSummary).mockResolvedValue({
-      snapshot_id: 51,
+      current_scope_id: 51,
       selected_rows: 1,
       priced_rows: 1,
       unpriced_rows: 0,
@@ -342,6 +342,7 @@ describe('PurchaseControlPage Doctype migration', () => {
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Выбрать строку buy:9:default' }))
     await waitFor(() => expect(getPurchaseSelectionSummary).toHaveBeenCalledWith({
+      current_scope_id: 51,
       current_identities: ['purchase:req:9'],
       expected_source_revision: 'accepted:g23',
       horizon_period_to: null,
@@ -349,7 +350,7 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(await screen.findByText('Сумма: 1 200')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Сформировать заказы (1)' }))
 
-    await waitFor(() => expect(materializePurchaseControlRows).toHaveBeenCalledWith({ current_identities: ['purchase:req:9'], expected_source_revision: 'accepted:g23', dry_run: false }))
+    await waitFor(() => expect(materializePurchaseControlRows).toHaveBeenCalledWith({ current_scope_id: 51, current_identities: ['purchase:req:9'], expected_source_revision: 'accepted:g23', dry_run: false }))
     expect(await screen.findByText('Сформировано заказов по 1 строкам current-журнала')).toBeInTheDocument()
     await waitFor(() => expect(syncSupplierOrdersFrom1C).toHaveBeenCalled())
   })
@@ -412,7 +413,7 @@ describe('PurchaseControlPage Doctype migration', () => {
         fact_status: 'available',
       },
       meta: {
-        snapshot_id: 52,
+        current_scope_id: 52,
         ledger_generation: 23,
         cutoff: '2026-07-23T12:00:00+00:00',
         truth_status: 'accepted',
@@ -465,7 +466,7 @@ describe('PurchaseControlPage Doctype migration', () => {
       ledger_generation_id: 23,
       source_revision: 'accepted:g23',
       summary: { total_rows: 2, by_status: { to_order: 2 }, by_phase: { no_goods: 2 }, to_order: 2, overdue: 0, expected_7d: 2, in_transit_amount: 1200, fact_status: 'available' },
-      meta: { snapshot_id: 51, ledger_generation: 23, ledger_generation_id: 23, cutoff: '2026-07-23T12:00:00+00:00', truth_status: 'accepted', truth_reason: null, fact_source: 'ledger', received_qty_status: 'available', read_only: true },
+      meta: { current_scope_id: 51, ledger_generation: 23, ledger_generation_id: 23, cutoff: '2026-07-23T12:00:00+00:00', truth_status: 'accepted', truth_reason: null, fact_source: 'ledger', received_qty_status: 'available', read_only: true },
     })
     renderPage('/purchase-control?current_identity=purchase%3Areq%3A10')
 
@@ -487,7 +488,7 @@ describe('PurchaseControlPage Doctype migration', () => {
       truth_status: 'accepted',
       ledger_generation_id: 23,
       meta: {
-        snapshot_id: 51,
+        current_scope_id: 51,
         ledger_generation: 23,
         cutoff: '2026-07-23T12:00:00+00:00',
         truth_status: 'accepted',
@@ -536,7 +537,7 @@ describe('PurchaseControlPage Doctype migration', () => {
         fact_status: 'available',
       },
       meta: {
-        snapshot_id: 51,
+        current_scope_id: 51,
         ledger_generation: 23,
         ledger_generation_id: 23,
         cutoff: '2026-07-23T12:00:00+00:00',

@@ -155,6 +155,14 @@ export function createPurchaseOrdersDoctype(
           : 'Выберите MRP-строки к заказу',
         async run({ selection, listMeta }) {
           const sourceRevision = String(listMeta.source_revision ?? '')
+          const currentScopeId = Number(
+            listMeta.current_scope_id
+              ?? (listMeta.meta as { current_scope_id?: number | null } | undefined)?.current_scope_id
+              ?? 0,
+          )
+          if (!Number.isInteger(currentScopeId) || currentScopeId <= 0) {
+            return { error: 'Current-область закупок ещё не зафиксирована' }
+          }
           if (!sourceRevision) return { error: 'Current-ревизия закупок ещё не зафиксирована' }
           if (selection.some((row) => !row.current_identity || row.source_revision !== sourceRevision)) {
             return { error: 'Выбранная строка не подтверждена текущей ревизией закупок' }
@@ -164,6 +172,7 @@ export function createPurchaseOrdersDoctype(
           ]
           if (!selectedIdentities.length) return { error: 'В выбранных строках нет current-идентичностей' }
           const result = await materializePurchaseControlRows({
+            current_scope_id: currentScopeId,
             current_identities: selectedIdentities,
             expected_source_revision: sourceRevision,
             dry_run: false,

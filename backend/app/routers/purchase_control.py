@@ -262,6 +262,8 @@ def get_orders(
         effective_limit = max(1, min(int(limit or 100), 500))
         effective_offset = max(0, int(offset or 0))
         saved = dict(current_manifest.summary or {})
+        saved.pop("snapshot_id", None)
+        saved["current_scope_id"] = int(current_manifest.id)
         saved["source_revision"] = str(current_manifest.source_revision)
         saved["current_execution_scope_id"] = int(current_manifest.id)
         saved_summary = saved.get("summary")

@@ -72,7 +72,7 @@ export function PurchaseControlPage() {
       renderTopBadge={(state) => {
         const meta = state.listMeta.meta as {
           ledger_generation?: number | null
-          snapshot_id?: number | null
+          current_scope_id?: number | null
           source_revision?: string | null
           truth_status?: string | null
           truth_reason?: string | null
@@ -137,6 +137,7 @@ export function PurchaseControlPage() {
       renderDetail={(_, state) => <PurchaseDetailPane activeRow={state.activeRow} embedded />}
       renderToolbarAfter={(state) => {
         const summary = state.listMeta.summary as PurchaseJournalSummary | undefined
+        const currentMeta = state.listMeta.meta as { current_scope_id?: number | null } | undefined
         const eligibleCount = state.rows.filter((row) => doctype.selectable?.(row) !== false).length
         const sourceRevision = String(state.listMeta.source_revision ?? '')
         const selectionKey = state.selection
@@ -153,6 +154,7 @@ export function PurchaseControlPage() {
               Снять выбор
             </button>
             <PurchaseSelectionSummary
+              currentScopeId={Number(state.listMeta.current_scope_id ?? currentMeta?.current_scope_id ?? 0) || null}
               sourceRevision={sourceRevision}
               selectionKey={selectionKey}
               horizonPeriodTo={state.filters.horizon_period_to}

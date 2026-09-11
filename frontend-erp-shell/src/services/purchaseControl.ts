@@ -32,6 +32,7 @@ export function getPurchaseSelectionSummary(
 }
 
 export function materializePurchaseControlRows(payload: {
+  current_scope_id: number
   current_identities: string[]
   expected_source_revision: string
   dry_run?: boolean
@@ -39,6 +40,7 @@ export function materializePurchaseControlRows(payload: {
   return api<Record<string, unknown>>('/v1/purchase-control/materialize', {
     method: 'POST',
     body: JSON.stringify({
+      current_scope_id: payload.current_scope_id,
       current_identities: payload.current_identities,
       expected_source_revision: payload.expected_source_revision,
       dry_run: payload.dry_run ?? false,
