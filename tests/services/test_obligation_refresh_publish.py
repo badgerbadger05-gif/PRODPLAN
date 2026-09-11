@@ -251,6 +251,30 @@ def _candidate_read_snapshots(db, target, candidates, cutoff):
     db.flush()
 
 
+def _period_current_payloads(db, target):
+    entries = (target.source_watermarks or {}).get(MANIFEST_KEY, {}).get("entries", [])
+    live_run_ids = [
+        int(entry["parent_run_id"] if entry.get("action") == "retain" else entry["candidate_run_id"])
+        for entry in entries
+        if entry.get("action") != "retire"
+    ]
+    runs = db.query(models.PlanningRun).filter(
+        models.PlanningRun.run_id.in_(live_run_ids),
+    ).all()
+    return {
+        f"plan:{int(run.source_plan_id)}:run:{int(run.run_id)}": {
+            "plan": {"id": int(run.source_plan_id), "name": "test"},
+            "run_id": int(run.run_id),
+            "truth_status": "accepted",
+            "summary": {"truth_status": "accepted", "total_items": 0},
+            "plan_output_rows": [],
+            "facets": {"bom_levels": [], "flows": []},
+            "rows": [],
+        }
+        for run in runs
+    }
+
+
 def _set_purchase_journal_rows(db_session, target, *, rows):
     snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, consumer="purchase_control_journal", snapshot_key="journal:v1"
@@ -369,6 +393,7 @@ def _publish(db, parent, target, cutoff, capabilities=None):
     metrics = dict(snapshot_batch.metrics or {})
     metrics["purchase_control_journal_payload"] = purchase_payload
     metrics["production_control_journal_payload"] = production_payload
+    metrics["period_plan_execution_payloads"] = _period_current_payloads(db, target)
     if not isinstance(metrics.get("mrp_result_payloads"), dict):
         metrics["mrp_result_payloads"] = {}
     snapshot_batch.metrics = metrics
@@ -379,6 +404,7 @@ def _publish(db, parent, target, cutoff, capabilities=None):
         purchase_payload=purchase_payload,
         production_payload=production_payload,
         mrp_payloads=metrics["mrp_result_payloads"],
+        period_payloads=metrics["period_plan_execution_payloads"],
     )
 
 

@@ -236,23 +236,6 @@ def _manifest_request_matches(
         raise ObligationRefreshOrchestratorError("conflicting retry of published refresh request")
 
 
-def _publish_execution_snapshots(db: Session, generation_id: int) -> None:
-    """Journals must never go dark after a refresh: every published generation
-    carries its own period-plan execution snapshots, same as genesis accept.
-    The builder is idempotent (existing identical snapshot is returned as-is),
-    so the exact-retry path is safe to route through here too."""
-    from app.services.period_plan_service import (
-        build_period_plan_execution_snapshots_for_generation,
-    )
-
-    try:
-        build_period_plan_execution_snapshots_for_generation(db, int(generation_id))
-    except (TypeError, ValueError) as exc:
-        raise ObligationRefreshOrchestratorError(
-            f"period-plan execution snapshot build failed: {exc}"
-        ) from exc
-
-
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
@@ -281,10 +264,12 @@ def _retry_published(
     purchase_payload = metrics.get("purchase_control_journal_payload")
     production_payload = metrics.get("production_control_journal_payload")
     mrp_payloads = metrics.get("mrp_result_payloads")
+    period_payloads = metrics.get("period_plan_execution_payloads")
     if (
         not isinstance(purchase_payload, Mapping)
         or not isinstance(production_payload, Mapping)
         or not isinstance(mrp_payloads, Mapping)
+        or not isinstance(period_payloads, Mapping)
     ):
         raise ObligationRefreshOrchestratorError(
             "published generation lacks canonical obligation journal payloads"
@@ -295,8 +280,8 @@ def _retry_published(
         purchase_payload=purchase_payload,
         production_payload=production_payload,
         mrp_payloads=mrp_payloads,
+        period_payloads=period_payloads,
     )
-    _publish_execution_snapshots(db, int(target.id))
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
@@ -538,8 +523,16 @@ def run_obligation_refresh(
         str(run_id): build_mrp_result_current_payload(db, int(run_id))
         for run_id in sorted({int(value) for value in (*candidate_ids, *retained_run_ids)})
     }
+    from app.services.period_plan_service import (
+        build_period_plan_execution_current_payloads_for_generation,
+    )
+    period_payloads = build_period_plan_execution_current_payloads_for_generation(
+        db,
+        target_id,
+        run_ids=(*candidate_ids, *retained_run_ids),
+    )
     # Purchase current state is published directly from the canonical payload;
-    # unlike MRP/production evidence it does not need a PlanningReadSnapshot
+    # unlike MRP/production evidence it does not need a historical read snapshot
     # row as an intermediate runtime owner.
     purchase_journal_payload = build_purchase_journal_payload(db, target_id)
     # Reconciliation takes row locks on mutable executor orders.  Keep it next
@@ -571,6 +564,7 @@ def run_obligation_refresh(
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),
         "mrp_result_payloads": mrp_payloads,
+        "period_plan_execution_payloads": period_payloads,
         "future_supply_captured": True,
         "future_supply_capture_batch_id": int(future_supply_capture_batch.id),
         "future_supply_capture": future_supply_capture,
@@ -608,8 +602,8 @@ def run_obligation_refresh(
         purchase_payload=purchase_journal_payload,
         production_payload=production_journal_payload,
         mrp_payloads=mrp_payloads,
+        period_payloads=period_payloads,
     )
-    _publish_execution_snapshots(db, target_id)
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,

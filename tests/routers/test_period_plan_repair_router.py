@@ -24,13 +24,13 @@ from app.models import (
     Item,
     LedgerGeneration,
     PhysicalImportBatch,
-    PlanningReadSnapshot,
     PlanningRun,
     PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
 )
 from app.routers.plan import router as plan_router
+from app.services.item_ledger.current_execution import publish_current_execution_scope
 
 
 CUTOFF = datetime.datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
@@ -109,11 +109,15 @@ def _fixed_run(db, plan, generation):
 
 
 def _mrp_result_snapshot(db, run, generation):
-    db.add(PlanningReadSnapshot(
-        consumer="mrp_result", snapshot_key=f"run:{int(run.run_id)}",
-        ledger_generation_id=generation.id, cutoff=CUTOFF, truth_status="accepted",
-        payload={"run_id": int(run.run_id)}, published_at=CUTOFF,
-    ))
+    publish_current_execution_scope(
+        db,
+        source_revision=f"repair:g{int(generation.id)}",
+        source_generation_id=int(generation.id),
+        scope_key="mrp:all-live-plans",
+        rows=[],
+        entity_kinds=("mrp_result",),
+        summary={"runs": {str(int(run.run_id)): {"row_counts": {}}}},
+    )
     db.flush()
 
 

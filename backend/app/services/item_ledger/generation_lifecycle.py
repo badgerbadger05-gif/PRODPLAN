@@ -1330,7 +1330,7 @@ def _promote_accepted_generation_read_snapshots(
 
     # MRP result payloads are built directly by the caller and published into
     # CurrentExecutionScope.  Runtime lifecycle publication must not create
-    # PlanningReadSnapshot/Row/RootMember rows for this consumer.
+    # Historical read-model rows are not written for this consumer.
 
 
 def accept_generation_build(
@@ -1536,15 +1536,6 @@ def accept_generation_build(
             rejected_supplier_sle_ids=frozenset(rejected_supplier_sle_ids),
         )
         try:
-            from ..period_plan_service import (
-                build_period_plan_execution_snapshots_for_generation,
-            )
-
-            planning_snapshots = (
-                build_period_plan_execution_snapshots_for_generation(
-                    db, int(generation.id)
-                )
-            )
             assembly_queue_snapshot = build_assembly_queue_snapshot(
                 db, int(generation.id)
             )
@@ -1590,6 +1581,22 @@ def accept_generation_build(
                 str(run_id): build_mrp_result_current_payload(db, int(run_id))
                 for run_id in sorted({int(value) for value in fixed_run_ids})
             }
+            from ..period_plan_service import (
+                build_period_plan_execution_current_payloads_for_generation,
+            )
+            period_payloads = build_period_plan_execution_current_payloads_for_generation(
+                db,
+                int(generation.id),
+                run_ids=fixed_run_ids,
+            )
+            planning_snapshots = {
+                "ledger_generation_id": int(generation.id),
+                "snapshots": len(period_payloads),
+                "plan_runs": [
+                    dict(payload.get("meta") or {})
+                    for payload in period_payloads.values()
+                ],
+            }
         except ValueError as exc:
             raise GenerationValidationError(
                 f"replenishment work item / purchase journal build failed: {exc}"
@@ -1629,6 +1636,8 @@ def accept_generation_build(
             purchase_payload=purchase_journal_payload,
             production_payload=production_journal_payload,
             mrp_payloads=mrp_payloads,
+            period_payloads=period_payloads,
+            period_run_ids=fixed_run_ids,
         )
     return {
         **validation,

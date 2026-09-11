@@ -188,11 +188,13 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
         ledger_generation_id=result.target_generation_id,
         stage="reservation_replay",
     ).one()
-    execution_snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=result.target_generation_id,
-        consumer="period_plan_execution",
-        snapshot_key=f"plan={plan.id};run={candidate.run_id}",
+    execution_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
     ).one()
+    execution_snapshot = execution_scope.summary["snapshots"][
+        f"plan:{int(plan.id)}:run:{int(candidate.run_id)}"
+    ]
     requirement = db_session.query(models.MrpRequirement).filter_by(
         run_id=candidate.run_id,
     ).one()
@@ -223,9 +225,8 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
     assert replay_batch.status == "completed"
     assert replay_batch.metrics["facts"] == 0
     assert "replay_summary" not in replay_batch.metrics
-    assert execution_snapshot.payload["rows"] == []
-    assert execution_snapshot.payload["summary"]["execution_completed_qty"] == 0
-    assert execution_snapshot.payload["summary"]["execution_base_qty"] == 2
+    assert execution_snapshot["summary"]["execution_completed_qty"] == 0
+    assert execution_snapshot["summary"]["execution_base_qty"] == 2
     assert queue_line.assembly_remaining_qty == Decimal("2")
     assert readiness.open_qty == Decimal("2")
     # Current refreshes must not invoke the legacy generation-copy writer;
@@ -467,12 +468,15 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert mrp_scope.source_generation_id == target.id
     # This public read function consumes the stored current row; it does not run MRP.
     assert read_mrp_result_manifest(db_session, candidate.run_id)["run_id"] == candidate.run_id
-    # Journals must not go dark after a refresh: every published generation
-    # carries its own period-plan execution snapshots (decisions-log /).
-    execution_snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
-        ledger_generation_id=target.id, consumer="period_plan_execution").all()
+    # Journals must not go dark after a refresh: the current period manifest
+    # carries each live plan/run payload without copying historical snapshots.
+    execution_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
+    ).one()
+    execution_snapshots = execution_scope.summary["snapshots"]
     assert len(execution_snapshots) == 1
-    assert all(row.truth_status == "accepted" for row in execution_snapshots)
+    assert all(row["truth_status"] == "accepted" for row in execution_snapshots.values())
     queue = db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id,
         consumer="assembly_queue",

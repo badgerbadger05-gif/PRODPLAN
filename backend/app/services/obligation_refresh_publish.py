@@ -761,6 +761,17 @@ def _exact_retry(
         )
     except ObligationRefreshPublishError:
         return None
+    try:
+        from .item_ledger.current_execution import _require_period_current_payloads
+        _require_period_current_payloads(
+            snapshot_metrics.get("period_plan_execution_payloads"),
+            required_run_ids=[
+                *candidate_ids,
+                *(int(row.run_id) for row in retained),
+            ],
+        )
+    except (ObligationRefreshPublishError, ValueError):
+        return None
     for candidate in [*additions, *replacements]:
         source_plan = _lock(db.query(models.ProductionPlanHeader)).filter(
             models.ProductionPlanHeader.id == int(candidate.source_plan_id),
@@ -805,6 +816,7 @@ def publish_obligation_refresh_batch(
     purchase_payload: Mapping[str, Any] | None = None,
     production_payload: Mapping[str, Any] | None = None,
     mrp_payloads: Mapping[str, Any] | None = None,
+    period_payloads: Mapping[str, Any] | None = None,
 ) -> ObligationRefreshPublishResult:
     """Publish every active source plan together, using only ``flush``.
 
@@ -826,6 +838,10 @@ def publish_obligation_refresh_batch(
     if not isinstance(mrp_payloads, Mapping):
         raise ObligationRefreshPublishError(
             "obligation refresh publication requires explicit mrp_payloads"
+        )
+    if not isinstance(period_payloads, Mapping):
+        raise ObligationRefreshPublishError(
+            "obligation refresh publication requires explicit period_payloads"
         )
     capability_snapshot = dict(capabilities)
     if db.get_bind().dialect.name == "postgresql":
@@ -880,6 +896,15 @@ def publish_obligation_refresh_batch(
             *(int(row.run_id) for row in retained),
         ],
         capabilities=capability_snapshot,
+    )
+    from .item_ledger.current_execution import _require_period_current_payloads
+    direct_period_payloads = _require_period_current_payloads(
+        period_payloads,
+        required_run_ids=[
+            *(int(row.run_id) for row in additions),
+            *(int(row.run_id) for row in replacements),
+            *(int(row.run_id) for row in retained),
+        ],
     )
     snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
@@ -1039,6 +1064,7 @@ def publish_obligation_refresh_batch(
         purchase_payload=journal_payload,
         production_payload=direct_production_payload,
         mrp_payloads=direct_mrp_payloads,
+        period_payloads=direct_period_payloads,
     )
     try:
         db.flush()

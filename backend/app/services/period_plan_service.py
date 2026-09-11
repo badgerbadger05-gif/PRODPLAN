@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
@@ -24,7 +24,7 @@ from ..models import (
     PlannedRework,
     ClosedPlanSnapshot,
     PlanningRun,
-    PlanningReadSnapshot,
+    CurrentExecutionScope,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -56,6 +56,8 @@ from .planning_run_candidate import _resolve_parent_generation_id
 from .forecast import forecast_payload as _forecast_payload
 from .item_ledger.live_plan_scope import live_plan_run_ids
 from .item_ledger.r3_contract import current_live_run
+from .item_ledger.r3_contract import CurrentMrpResolutionError
+from .item_ledger.current_execution import CurrentExecutionUnavailable
 from .item_ledger.reservation import (
     replenishment_execution_pct,
     replenishment_execution_status,
@@ -312,24 +314,28 @@ def list_period_plans(
             else None
         )
         if truth_generation_id is not None:
-            snapshots = (
-                db.query(PlanningReadSnapshot)
-                .filter(
-                    PlanningReadSnapshot.consumer == "period_plan_execution",
-                    PlanningReadSnapshot.ledger_generation_id
-                    == int(truth_generation_id),
-                    PlanningReadSnapshot.truth_status == "accepted",
-                    PlanningReadSnapshot.cutoff == truth_generation.cutoff,
-                )
-                .order_by(
-                    PlanningReadSnapshot.published_at.desc(),
-                    PlanningReadSnapshot.id.desc(),
-                )
-                .all()
+            from .item_ledger.current_execution import (
+                CurrentExecutionUnavailable,
+                load_current_execution_coherent,
             )
+            try:
+                current_scope, _current_rows = load_current_execution_coherent(
+                    db,
+                    entity_kind="period_plan_execution",
+                    scope_key="period-plan:all-live-plans",
+                )
+                if int(current_scope.source_generation_id or 0) != int(truth_generation_id):
+                    raise CurrentExecutionUnavailable(
+                        "current period execution belongs to another Ledger generation"
+                    )
+                snapshots = dict((current_scope.summary or {}).get("snapshots") or {})
+            except (CurrentExecutionUnavailable, ValueError):
+                snapshots = {}
             wanted = set(plan_ids)
-            for snapshot in snapshots:
-                payload = dict(snapshot.payload or {})
+            for payload in snapshots.values():
+                if not isinstance(payload, Mapping):
+                    continue
+                payload = dict(payload)
                 payload_plan = dict(payload.get("plan") or {})
                 try:
                     payload_plan_id = int(payload_plan.get("id"))
@@ -373,7 +379,7 @@ def list_period_plans(
                         None if plan_output_available else "Saved plan-output summary is missing"
                     ),
                     "plan_output_generation_id": int(truth_generation_id),
-                    "plan_output_cutoff": snapshot.cutoff.isoformat(),
+                    "plan_output_cutoff": truth_generation.cutoff.isoformat(),
                     "execution_by_flow": summary.get("execution_by_flow") or {},
                     "execution_status": (
                         str(payload.get("truth_status") or "")
@@ -546,7 +552,7 @@ def _saved_plan_output_payload(
     db: Session,
     plan_id: int,
 ) -> tuple[Optional[Dict[str, Any]], Optional[int], Optional[str], Optional[str]]:
-    """Read one accepted, precomputed plan-output projection without fallback."""
+    """Read one accepted plan-output projection from the current scope."""
     pointer = db.get(PlanningTruthState, 1)
     if pointer is None or pointer.current_generation_id is None:
         return None, None, None, "Accepted Ledger generation is unavailable"
@@ -561,36 +567,15 @@ def _saved_plan_output_payload(
             "Accepted Ledger generation cutoff is unavailable",
         )
     cutoff = generation.cutoff.isoformat()
-    snapshots = (
-        db.query(PlanningReadSnapshot)
-        .filter(
-            PlanningReadSnapshot.consumer == "period_plan_execution",
-            PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-            PlanningReadSnapshot.truth_status == "accepted",
-            PlanningReadSnapshot.cutoff == generation.cutoff,
-        )
-        .order_by(PlanningReadSnapshot.published_at.desc(), PlanningReadSnapshot.id.desc())
-        .all()
-    )
-    for snapshot in snapshots:
-        payload = dict(snapshot.payload or {})
-        payload_plan = dict(payload.get("plan") or {})
-        try:
-            payload_plan_id = int(payload_plan.get("id"))
-        except (TypeError, ValueError):
-            continue
-        if payload_plan_id != int(plan_id):
-            continue
-        validation_error = _saved_plan_output_validation_error(payload)
-        if validation_error is not None:
-            return None, int(generation.id), cutoff, validation_error
-        return payload, int(generation.id), cutoff, None
-    return (
-        None,
-        int(generation.id),
-        cutoff,
-        "Saved plan-output read model is missing",
-    )
+    try:
+        run = current_live_run(db, int(plan_id))
+        payload = _read_current_period_payload_for_run(db, plan_id=int(plan_id), run=run)
+    except (CurrentExecutionUnavailable, CurrentMrpResolutionError, ValueError) as exc:
+        return None, int(generation.id), cutoff, str(exc) or "Saved plan-output read model is missing"
+    validation_error = _saved_plan_output_validation_error(payload)
+    if validation_error is not None:
+        return None, int(generation.id), cutoff, validation_error
+    return payload, int(generation.id), cutoff, None
 
 
 def _plan_output_header_fields(
@@ -1406,19 +1391,28 @@ def create_mrp_snapshot_for_plan(
 
 
 def _has_mrp_result_snapshot(db: Session, run_id: int, generation_id: Optional[int]) -> bool:
-    # Lazy: ``mrp_result_snapshot`` owns both the consumer name and the key
-    # spelling, and importing it at module scope would close an import cycle.
-    from .mrp_result_snapshot import CONSUMER as MRP_RESULT_CONSUMER, _snapshot_key
-
-    query = db.query(PlanningReadSnapshot.id).filter(
-        PlanningReadSnapshot.consumer == MRP_RESULT_CONSUMER,
-        PlanningReadSnapshot.snapshot_key == _snapshot_key(int(run_id)),
+    from .item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
+        load_current_execution_coherent,
     )
-    if generation_id is not None:
-        query = query.filter(
-            PlanningReadSnapshot.ledger_generation_id == int(generation_id)
+
+    try:
+        scope, _rows = load_current_execution_coherent(
+            db,
+            entity_kind="mrp_result",
+            scope_key="mrp:all-live-plans",
         )
-    return query.first() is not None
+    except CurrentExecutionUnavailable:
+        return False
+    if generation_id is not None and int(scope.source_generation_id or -1) != int(generation_id):
+        return False
+    runs = dict((scope.summary or {}).get("runs") or {})
+    if str(int(run_id)) not in runs:
+        return False
+    # An empty run is valid: the compact summary is its manifest anchor.
+    # The exact publisher guarantees row/run coherence for the complete scope;
+    # do not reject a valid multi-run manifest because other rows are present.
+    return True
 
 
 def repair_duplicate_plan_snapshots(
@@ -2074,33 +2068,53 @@ def _read_period_plan_execution_payload_for_run(
     run: PlanningRun,
     generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    payload_generation_id = (
-        int(generation_id) if generation_id is not None else int(run.ledger_generation_id)
-        if run.ledger_generation_id is not None else None
+    return _read_current_period_payload_for_run(
+        db,
+        plan_id=int(plan.id),
+        run=run,
     )
-    if payload_generation_id is None:
-        raise ValueError(f"run_id={int(run.run_id)}: execution snapshot generation is unknown")
-    snapshot_key = _execution_snapshot_key(
-        plan_id=plan.id,
-        run_id=run.run_id,
-        root_item_id=None,
-        bom_level=None,
-        flow=None,
+
+
+def _read_current_period_payload_for_run(
+    db: Session,
+    *,
+    plan_id: int,
+    run: PlanningRun,
+) -> Dict[str, Any]:
+    """Read one run from the coherent current period scope."""
+    from .item_ledger.current_execution import (
+        CurrentExecutionUnavailable,
+        load_current_execution_coherent,
     )
-    snapshot = (
-        db.query(PlanningReadSnapshot)
-        .filter(
-            PlanningReadSnapshot.consumer == "period_plan_execution",
-            PlanningReadSnapshot.snapshot_key == snapshot_key,
-            PlanningReadSnapshot.ledger_generation_id == payload_generation_id,
+
+    try:
+        scope, current_rows = load_current_execution_coherent(
+            db,
+            entity_kind="period_plan_execution",
+            scope_key="period-plan:all-live-plans",
         )
-        .one_or_none()
-    )
-    if snapshot is None:
+    except CurrentExecutionUnavailable as exc:
         raise ValueError(
-            f"run_id={int(run.run_id)}: execution snapshot is missing for the run"
+            f"run_id={int(run.run_id)}: current period execution is unavailable: {exc}"
+        ) from exc
+    scope_summary = dict(scope.summary or {})
+    snapshots = scope_summary.get("snapshots")
+    key = f"plan:{int(plan_id)}:run:{int(run.run_id)}"
+    metadata = snapshots.get(key) if isinstance(snapshots, Mapping) else None
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            f"run_id={int(run.run_id)}: current period execution payload is missing"
         )
-    return dict(snapshot.payload)
+    payload = dict(metadata)
+    payload.setdefault("plan", {"id": int(plan_id)})
+    payload.setdefault("run_id", int(run.run_id))
+    payload["rows"] = [
+        dict(row.payload or {})
+        for row in current_rows
+        if int((row.payload or {}).get("run_id") or 0) == int(run.run_id)
+        and int((row.payload or {}).get("plan_id") or 0) == int(plan_id)
+    ]
+    return payload
 
 
 def _latest_closed_plan_snapshot(
@@ -2171,10 +2185,8 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
     if str(run.status or "") == "CLOSED":
         if existing_closed_snapshot is None:
             raise ValueError("closed plan snapshot is missing for this run")
-        # A retained/closed run remains anchored to its own immutable
-        # generation across fact-only refreshes.  Select that anchor rather
-        # than the latest technical generation; this also excludes stale
-        # pre-R10 carry-forward copies.
+        # A retained/closed run remains represented by its immutable closed
+        # payload; current period scope is intentionally not consulted here.
         anchor_generation_id = run.ledger_generation_id
         if anchor_generation_id is None:
             raise ValueError("closed planning run has no immutable Ledger anchor")
@@ -2187,14 +2199,6 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
             raise ValueError(
                 "закрытый прогон всё ещё присутствует в текущем planning truth"
             )
-        current_payload = _read_period_plan_execution_payload_for_run(
-            db,
-            plan=plan,
-            run=run,
-            generation_id=int(existing_closed_snapshot.ledger_generation_id),
-        )
-        if dict(existing_closed_snapshot.payload or {}) != current_payload:
-            raise ValueError("closed plan snapshot payload mismatch for this run")
         if dry_run:
             db.rollback()
             return {
@@ -2365,8 +2369,6 @@ def _plan_matrix_forecasts(
                 if not prev or (payload.get("forecast_shift_days") or 0) > (prev.get("forecast_shift_days") or 0):
                     result[key] = payload
     return result
-
-
 def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
     plan = _get_plan(db, plan_id)
     buckets = _fridays_between(plan.period_from, plan.period_to)
@@ -2507,13 +2509,22 @@ def _execution_snapshot_key(
     return f"plan={int(plan_id)};run={int(run_id)}"
 
 
-def _resolve_execution_run(db: Session, plan: ProductionPlanHeader, run_id: Optional[int]) -> PlanningRun:
+def _resolve_execution_run(
+    db: Session,
+    plan: ProductionPlanHeader,
+    run_id: Optional[int],
+    *,
+    allow_building: bool = False,
+) -> PlanningRun:
+    allowed_statuses = {"FIXED_SNAPSHOT", "CLOSED"}
+    if allow_building:
+        allowed_statuses.add("BUILDING_SNAPSHOT")
     if run_id is not None:
         run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
         if (
             not run
             or int(run.source_plan_id or -1) != int(plan.id)
-            or str(run.status or "") not in {"FIXED_SNAPSHOT", "CLOSED"}
+            or str(run.status or "") not in allowed_statuses
         ):
             raise ValueError("Run not found for this plan")
         return run
@@ -2521,7 +2532,7 @@ def _resolve_execution_run(db: Session, plan: ProductionPlanHeader, run_id: Opti
         db.query(PlanningRun)
         .filter(
             PlanningRun.source_plan_id == int(plan.id),
-            PlanningRun.status.in_(("FIXED_SNAPSHOT", "CLOSED")),
+            PlanningRun.status.in_(tuple(sorted(allowed_statuses))),
         )
         .order_by(PlanningRun.run_id.desc())
         .first()
@@ -2625,8 +2636,6 @@ def _attach_run_output_summary(
     result["plan_output_rows"] = plan_output_rows
     result["summary"] = summary
     return result
-
-
 def _execution_unavailable_payload(
     db: Session,
     *,
@@ -2647,8 +2656,10 @@ def _execution_unavailable_payload(
     )
     cutoff = state_value("cutoff")
     cutoff_value = cutoff.isoformat() if hasattr(cutoff, "isoformat") else cutoff
-    truth_status = "unavailable" if reason else (state_value("status") or "unavailable")
-    generation = state_value("generation_id")
+    truth_status = "unavailable" if reason else (
+        state_value("truth_status") or state_value("status") or "unavailable"
+    )
+    generation = state_value("ledger_generation") or state_value("generation_id")
     return {
         "plan": _serialize_plan(plan),
         "run_id": int(run.run_id),
@@ -3612,16 +3623,8 @@ def get_period_plan_execution_journal(
     limit: int = 100,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    """Read the immutable execution snapshot. Never computes or publishes."""
+    """Read the current execution payload, or immutable closed history."""
     from .planning_truth import get_truth_state
-    from .planning_truth import (
-        CAPABILITY_EXECUTION_ALLOCATIONS,
-        CAPABILITY_PHYSICAL_LEDGER,
-        CAPABILITY_PLANNING_SNAPSHOTS,
-        CAPABILITY_RESERVATION_REPLAY,
-        PlanningTruthUnavailable,
-        get_latest_read_snapshot,
-    )
 
     plan = _get_plan(db, plan_id)
     run = _resolve_execution_run(db, plan, run_id)
@@ -3650,28 +3653,14 @@ def get_period_plan_execution_journal(
                 sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
         payload = dict(closed_snapshot.payload or {})
     else:
-        snapshot_key = _execution_snapshot_key(
-            plan_id=plan.id,
-            run_id=run.run_id,
-            root_item_id=root_item_id,
-            bom_level=bom_level,
-            flow=flow,
-        )
-        capabilities = (
-            CAPABILITY_PHYSICAL_LEDGER,
-            CAPABILITY_RESERVATION_REPLAY,
-            CAPABILITY_EXECUTION_ALLOCATIONS,
-            "supplier_receipt_coverage",
-            CAPABILITY_PLANNING_SNAPSHOTS,
-        )
         try:
-            snapshot = get_latest_read_snapshot(
+            payload = _read_current_period_payload_for_run(
                 db,
-                consumer="period_plan_execution",
-                snapshot_key=snapshot_key,
-                required_capabilities=capabilities,
+                plan_id=int(plan.id),
+                run=run,
             )
-        except PlanningTruthUnavailable as exc:
+        except ValueError as exc:
+            truth_state = get_truth_state(db)
             return _finalize_execution_payload(db, _execution_unavailable_payload(
                 db,
                 plan=plan,
@@ -3679,19 +3668,15 @@ def get_period_plan_execution_journal(
                 root_item_id=None,
                 bom_level=None,
                 flow=None,
-                truth_state=exc.state,
+                truth_state=truth_state,
+                reason=(
+                    None
+                    if str(getattr(truth_state, "truth_status", "")) == "uninitialized"
+                    else str(exc)
+                ),
             ), root_item_id=root_item_id, bom_level=bom_level, flow=flow,
                 status=status, include_net_zero=include_net_zero,
                 sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
-        if snapshot is None:
-            return _finalize_execution_payload(db, _execution_unavailable_payload(
-                db, plan=plan, run=run, root_item_id=None,
-                bom_level=None, flow=None, truth_state=get_truth_state(db),
-                reason="Execution snapshot is missing for the accepted Ledger generation",
-            ), root_item_id=root_item_id, bom_level=bom_level, flow=flow,
-                status=status, include_net_zero=include_net_zero,
-                sort_by=sort_by, sort_dir=sort_dir, limit=limit, offset=offset)
-        payload = dict(snapshot.payload)
 
     validation_error = _saved_plan_output_validation_error(payload)
     if (
@@ -3736,7 +3721,7 @@ def get_period_plan_execution_journal(
     )
 
 
-def build_period_plan_execution_snapshot(
+def build_period_plan_execution_payload(
     db: Session,
     plan_id: int,
     *,
@@ -3745,13 +3730,13 @@ def build_period_plan_execution_snapshot(
     bom_level: Optional[int] = None,
     flow: Optional[str] = None,
     generation_id: Optional[int] = None,
-    persist: bool = False,
+    allow_building: bool = False,
 ) -> Dict[str, Any]:
-    """Build one immutable Ledger-native plan/run execution snapshot."""
+    """Build one direct Ledger-native plan/run execution payload."""
     from .planning_truth import get_truth_state
 
     plan = _get_plan(db, plan_id)
-    run = _resolve_execution_run(db, plan, run_id)
+    run = _resolve_execution_run(db, plan, run_id, allow_building=allow_building)
     reqs_with_items = (
         db.query(MrpRequirement, Item)
         .join(Item, Item.item_id == MrpRequirement.item_id)
@@ -3874,139 +3859,106 @@ def build_period_plan_execution_snapshot(
         "rows": rows,
         "summary": summary,
     }, run)
-    snapshot_key = _execution_snapshot_key(
-        plan_id=plan.id,
-        run_id=run.run_id,
-        root_item_id=None,
-        bom_level=None,
-        flow=None,
-    )
-    if not persist:
-        return payload
-
-    existing = (
-        db.query(PlanningReadSnapshot)
-        .filter(
-            PlanningReadSnapshot.consumer == "period_plan_execution",
-            PlanningReadSnapshot.snapshot_key == snapshot_key,
-            PlanningReadSnapshot.ledger_generation_id == int(generation_id),
-        )
-        .one_or_none()
-    )
-    if existing is not None:
-        if (
-            existing.cutoff != generation.cutoff
-            or str(existing.truth_status) != "accepted"
-            or dict(existing.payload or {}) != payload
-            or existing.reason is not None
-        ):
-            raise ValueError(
-                f"execution snapshot {snapshot_key} conflicts with sealed candidate"
-            )
-        return dict(existing.payload)
-    db.add(PlanningReadSnapshot(
-        consumer="period_plan_execution",
-        snapshot_key=snapshot_key,
-        ledger_generation_id=int(generation_id),
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload=payload,
-        reason=None,
-        published_at=datetime.now(timezone.utc),
-    ))
-    db.flush()
     return payload
 
 
-def build_period_plan_execution_snapshots_for_generation(
+def build_period_plan_execution_current_payload(
     db: Session,
+    plan_id: int,
+    *,
+    run_id: int,
     generation_id: int,
 ) -> Dict[str, Any]:
-    """Build every fixed plan/run snapshot belonging to one candidate."""
+    """Build one direct period execution payload for current publication.
+
+    This is a pure candidate builder.  It deliberately does not persist a
+    snapshot; the caller publishes the returned payload into the compact
+    current owner
+    in the same transaction as the generation.
+    Retained runs are evaluated at their immutable obligation anchor, while
+    candidate runs use the target generation's reservation fold.
+    """
+    plan = _get_plan(db, int(plan_id))
+    run = _resolve_execution_run(db, plan, int(run_id), allow_building=True)
+    anchor_generation_id = (
+        int(run.ledger_generation_id)
+        if run.ledger_generation_id is not None
+        else int(generation_id)
+    )
+    try:
+        payload = build_period_plan_execution_payload(
+            db,
+            int(plan.id),
+            run_id=int(run.run_id),
+            generation_id=anchor_generation_id,
+            allow_building=True,
+        )
+    except ValueError as exc:
+        if "persisted MRP roots" not in str(exc):
+            raise
+        from .planning_truth import get_truth_state
+
+        payload = _execution_unavailable_payload(
+            db,
+            plan=plan,
+            run=run,
+            root_item_id=None,
+            bom_level=None,
+            flow=None,
+            truth_state=get_truth_state(db),
+            reason="Execution payload is unavailable because persisted MRP roots are missing",
+        )
+    rows = list(payload.get("rows") or [])
+    payload["facets"] = {
+        "bom_levels": sorted({int(row.get("bom_level") or 0) for row in rows}),
+    }
+    payload["current_scope_key"] = f"plan:{int(plan.id)}:run:{int(run.run_id)}"
+    payload["meta"] = {
+        "plan_id": int(plan.id),
+        "run_id": int(run.run_id),
+        "ledger_generation_id": payload.get("truth_generation_id"),
+        "truth_status": payload.get("truth_status"),
+    }
+    return payload
+
+
+def build_period_plan_execution_current_payloads_for_generation(
+    db: Session,
+    generation_id: int,
+    *,
+    run_ids: Iterable[int] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Build the exact live plan/run payload set for one generation."""
     generation = db.get(LedgerGeneration, int(generation_id))
     if generation is None:
-        raise ValueError("execution snapshot generation does not exist")
-    reservation_run_ids = {
-        int(run_id)
-        for (run_id,) in (
-            db.query(ReservationEntry.run_id)
-            .filter(
-                ReservationEntry.ledger_generation_id == int(generation_id),
-                ReservationEntry.run_id.isnot(None),
-            )
-            .distinct()
-            .all()
-        )
-    }
-    # A candidate run with zero reservations (e.g. a plan whose demand is fully
-    # stock-covered) still owns a journal: derive runs from the generation's own
-    # FIXED_SNAPSHOT lineage too, not only from reservation back-references.
-    generation_run_ids = {
-        int(run_id)
-        for (run_id,) in (
-            db.query(PlanningRun.run_id)
-            .filter(
-                PlanningRun.ledger_generation_id == int(generation_id),
-                PlanningRun.status == "FIXED_SNAPSHOT",
-                PlanningRun.source_plan_id.isnot(None),
-            )
-            .all()
-        )
-    }
-    run_ids = sorted(reservation_run_ids | generation_run_ids)
+        raise ValueError("current period payload generation does not exist")
+    required_ids = tuple(
+        sorted({int(value) for value in (run_ids if run_ids is not None else live_plan_run_ids(db, generation))})
+    )
     runs = (
         db.query(PlanningRun)
-        .filter(PlanningRun.run_id.in_(run_ids))
+        .filter(PlanningRun.run_id.in_(required_ids))
         .order_by(PlanningRun.run_id.asc())
         .all()
-        if run_ids
+        if required_ids
         else []
     )
-    if len(runs) != len(run_ids):
-        raise ValueError("execution snapshot run lineage is incomplete")
-    snapshots: List[Dict[str, int]] = []
-    unavailable_plan_runs: List[Dict[str, Any]] = []
+    if {int(run.run_id) for run in runs} != set(required_ids):
+        raise ValueError("current period payload live run set is incomplete")
+    result: Dict[str, Dict[str, Any]] = {}
     for run in runs:
-        if (
-            str(run.status or "") != "FIXED_SNAPSHOT"
-            or run.source_plan_id is None
-        ):
-            raise ValueError(
-                f"execution snapshot run {run.run_id} lacks fixed period-plan lineage"
-            )
-        has_persisted_roots = (
-            db.query(MrpRunRoot.id)
-            .filter(MrpRunRoot.run_id == int(run.run_id))
-            .first()
-            is not None
-        )
-        if not has_persisted_roots:
-            # Synthetic and pre-root-ledger runs cannot prove either run-local
-            # execution or exact plan-output lineage.  Their individual read
-            # model remains absent (and therefore fail-closed on GET), but an
-            # unrelated legacy run must not veto publication of the physical
-            # Ledger generation used by every other consumer.
-            unavailable_plan_runs.append({
-                "plan_id": int(run.source_plan_id),
-                "run_id": int(run.run_id),
-                "reason": "missing_mrp_roots",
-            })
-            continue
-        build_period_plan_execution_snapshot(
+        if run.source_plan_id is None:
+            raise ValueError(f"run_id={int(run.run_id)} lacks period-plan lineage")
+        payload = build_period_plan_execution_current_payload(
             db,
             int(run.source_plan_id),
             run_id=int(run.run_id),
-            generation_id=int(generation_id),
-            persist=True,
+            generation_id=int(generation.id),
         )
-        snapshots.append({
-            "plan_id": int(run.source_plan_id),
-            "run_id": int(run.run_id),
-        })
-    return {
-        "ledger_generation_id": int(generation_id),
-        "snapshots": len(snapshots),
-        "plan_runs": snapshots,
-        "unavailable": len(unavailable_plan_runs),
-        "unavailable_plan_runs": unavailable_plan_runs,
-    }
+        result[str(payload["current_scope_key"])] = payload
+    if set(result) != {
+        f"plan:{int(run.source_plan_id)}:run:{int(run.run_id)}"
+        for run in runs
+    }:
+        raise ValueError("current period payload scope set is incomplete")
+    return result

@@ -197,3 +197,23 @@ def test_period_runtime_source_has_no_legacy_snapshot_lookup():
     assert "PlanningReadSnapshot" not in current_source
     assert "PlanningReadSnapshot" not in service_source
     assert "get_latest_read_snapshot" not in service_source
+
+
+def test_mrp_repair_selection_accepts_empty_and_multi_run_current_manifest(monkeypatch):
+    from types import SimpleNamespace
+    from app.services import period_plan_service
+
+    scope = SimpleNamespace(
+        source_generation_id=17,
+        summary={"runs": {"41": {"row_counts": {}}, "42": {"row_counts": {}}}},
+    )
+    monkeypatch.setattr(
+        current_execution,
+        "load_current_execution_coherent",
+        lambda *_args, **_kwargs: (scope, []),
+    )
+
+    assert period_plan_service._has_mrp_result_snapshot(None, 41, 17) is True
+    assert period_plan_service._has_mrp_result_snapshot(None, 42, 17) is True
+    assert period_plan_service._has_mrp_result_snapshot(None, 99, 17) is False
+    assert period_plan_service._has_mrp_result_snapshot(None, 41, 18) is False

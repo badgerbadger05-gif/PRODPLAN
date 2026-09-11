@@ -604,13 +604,13 @@ def test_snapshot_build_failure_rolls_back_acceptance_atomically(db_session, mon
         raise ValueError("snapshot provenance is incomplete")
 
     monkeypatch.setattr(
-        "app.services.period_plan_service.build_period_plan_execution_snapshots_for_generation",
+        "app.services.period_plan_service.build_period_plan_execution_current_payloads_for_generation",
         fail_snapshot_build,
     )
 
     with pytest.raises(
         GenerationValidationError,
-        match="planning read snapshot build failed",
+            match="replenishment work item / purchase journal build failed",
     ):
         accept_generation_build(
             db_session,

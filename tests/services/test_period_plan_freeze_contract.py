@@ -43,7 +43,7 @@ from app.services.period_plan_service import (
     _build_execution_snapshot_rows,
     _execution_row_summary,
     _explode_bom_net_first,
-    build_period_plan_execution_snapshot,
+    build_period_plan_execution_payload,
     fix_period_plan,
 )
 
@@ -377,7 +377,7 @@ def test_planned_production_orders_are_linked_back_to_their_requirement(db_sessi
         (child.item_id, "buy"),
     }
 
-    payload = build_period_plan_execution_snapshot(
+    payload = build_period_plan_execution_payload(
         db_session, plan.id, run_id=int(run.run_id),
     )
     row = next(r for r in payload["rows"] if r["req_id"] == int(requirement.id))

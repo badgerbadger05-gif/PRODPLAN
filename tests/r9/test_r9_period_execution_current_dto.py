@@ -97,12 +97,31 @@ def _period_row():
 
 def test_period_publication_persists_stable_work_item_dto_and_navigation(db_session):
     generation = _generation(db_session)
+    plan_model = models.ProductionPlanHeader(
+        id=7,
+        name="Plan 7",
+        status="fixed",
+        period_from=datetime(2026, 9, 1).date(),
+        period_to=datetime(2026, 9, 30).date(),
+    )
+    run_model = models.PlanningRun(
+        run_id=41,
+        source_plan_id=7,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        status="FIXED_SNAPSHOT",
+        period_from=plan_model.period_from,
+        period_to=plan_model.period_to,
+    )
+    db_session.add_all([plan_model, run_model])
+    db_session.flush()
     payload = {
         "plan": {"id": 7, "name": "Plan 7"},
         "run_id": 41,
-        "truth_status": "accepted",
-        "rows": [_period_row()],
-        "facets": {"bom_levels": [0], "flows": ["purchase"]},
+            "truth_status": "accepted",
+            "rows": [_period_row()],
+            "plan_output_rows": [],
+            "facets": {"bom_levels": [0], "flows": ["purchase"]},
         "summary": {
             "truth_status": "accepted", "total_items": 1,
             "execution_pct": 0.0, "execution_available_base_qty": 5.0,
@@ -155,7 +174,29 @@ def test_period_publication_persists_stable_work_item_dto_and_navigation(db_sess
         summary={"total_rows": 1, "total_queue_qty": "4"},
     )
 
-    publish_current_obligation_views_from_generation(db_session, generation.id)
+    mrp_row = {
+        "run_id": 41,
+        "row_kind": "purchase",
+        "req_id": 101,
+        "item_id": 501,
+        "qty": 5,
+    }
+    mrp_identity = _mrp_current_identity(mrp_row, run_id=41, row_kind="purchase")
+    publish_current_obligation_views_from_generation(
+        db_session,
+        generation.id,
+        purchase_payload={"rows": []},
+        production_payload={"rows": [], "meta": {"row_count": 0}},
+        mrp_payloads={"41": {
+            "run_id": 41,
+            "rows": [{
+                "current_identity": mrp_identity,
+                "payload": _mrp_current_payload(mrp_row, business_identity=mrp_identity),
+            }],
+            "row_counts": {"production": 0, "purchase": 1, "rework": 0, "capacity": 0},
+        }},
+        period_payloads={"plan:7:run:41": payload},
+    )
     db_session.commit()
     [current] = load_current_execution_rows(
         db_session, entity_kind="period_plan_execution",

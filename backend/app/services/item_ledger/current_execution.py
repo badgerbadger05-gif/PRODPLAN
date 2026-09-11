@@ -147,6 +147,128 @@ def _period_execution_summary_for_current(payload: dict[str, Any]) -> dict[str, 
     return summary
 
 
+def _period_current_scope_key(payload: Mapping[str, Any]) -> str:
+    plan = payload.get("plan") if isinstance(payload.get("plan"), Mapping) else {}
+    try:
+        plan_id = int(plan.get("id"))
+        run_id = int(payload.get("run_id"))
+    except (TypeError, ValueError) as exc:
+        raise CurrentExecutionUnavailable(
+            "period current payload plan/run identity is malformed"
+        ) from exc
+    if plan_id <= 0 or run_id <= 0:
+        raise CurrentExecutionUnavailable(
+            "period current payload plan/run identity is malformed"
+        )
+    return f"plan:{plan_id}:run:{run_id}"
+
+
+def _require_period_current_payloads(
+    raw_payloads: Any,
+    *,
+    required_run_ids: Iterable[int],
+) -> dict[str, Mapping[str, Any]]:
+    """Validate the direct period execution boundary before any DML."""
+    if not isinstance(raw_payloads, Mapping):
+        raise CurrentExecutionUnavailable(
+            "runtime period publication requires explicit period_payloads"
+        )
+    result: dict[str, Mapping[str, Any]] = {}
+    for marker, raw in raw_payloads.items():
+        if not isinstance(raw, Mapping):
+            raise CurrentExecutionUnavailable("period current payload is malformed")
+        key = _period_current_scope_key(raw)
+        if str(marker) != key:
+            raise CurrentExecutionUnavailable(
+                "period current payload scope key is malformed"
+            )
+        if key in result:
+            raise CurrentExecutionUnavailable(
+                "period current payload has duplicate run"
+            )
+        plan = raw.get("plan")
+        rows = raw.get("rows")
+        summary = raw.get("summary")
+        output_rows = raw.get("plan_output_rows")
+        facets = raw.get("facets")
+        if (
+            not isinstance(plan, Mapping)
+            or not isinstance(rows, list)
+            or not isinstance(summary, Mapping)
+            or not isinstance(output_rows, list)
+            or not isinstance(facets, Mapping)
+        ):
+            raise CurrentExecutionUnavailable(
+                "period current payload is incomplete"
+            )
+        truth_status = str(raw.get("truth_status") or "")
+        if truth_status not in {"accepted", "unavailable"}:
+            raise CurrentExecutionUnavailable(
+                "period current payload truth status is malformed"
+            )
+        identities: set[str] = set()
+        run_id = int(raw["run_id"])
+        plan_id = int(plan["id"])
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise CurrentExecutionUnavailable("period current payload row is malformed")
+            row_run_id = int(row.get("run_id", run_id))
+            row_plan_id = int(row.get("plan_id", plan_id))
+            if row_run_id != run_id or row_plan_id != plan_id:
+                raise CurrentExecutionUnavailable(
+                    "period current payload row lineage is malformed"
+                )
+            identity = str(row.get("current_identity") or "").strip()
+            if not identity:
+                req_id = row.get("req_id") or row.get("requirement_id")
+                identity = f"plan:{plan_id}:req:{int(req_id)}" if req_id is not None else ""
+            if not identity or identity in identities:
+                raise CurrentExecutionUnavailable(
+                    "period current payload contains duplicate identity"
+                )
+            identities.add(identity)
+            roots = row.get("root_item_ids")
+            if roots is not None:
+                if not isinstance(roots, (list, tuple)):
+                    raise CurrentExecutionUnavailable(
+                        "period current payload root membership is malformed"
+                    )
+                try:
+                    if any(int(value) <= 0 for value in roots):
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise CurrentExecutionUnavailable(
+                        "period current payload root membership is malformed"
+                    ) from exc
+            for item in row.get("work_items") or []:
+                if not isinstance(item, Mapping):
+                    raise CurrentExecutionUnavailable(
+                        "period current payload work item is malformed"
+                    )
+                if item.get("current_identity") and not item.get("navigation_href"):
+                    raise CurrentExecutionUnavailable(
+                        "period current payload work-item link is incomplete"
+                    )
+        for output in output_rows:
+            if not isinstance(output, Mapping):
+                raise CurrentExecutionUnavailable(
+                    "period current payload plan-output row is malformed"
+                )
+        result[key] = raw
+    required = {int(value) for value in required_run_ids}
+    actual = {
+        int(raw.get("run_id"))
+        for raw in result.values()
+    }
+    if actual != required:
+        missing = ",".join(str(value) for value in sorted(required - actual)) or "none"
+        extra = ",".join(str(value) for value in sorted(actual - required)) or "none"
+        raise CurrentExecutionUnavailable(
+            f"period current payload run set mismatch (missing: {missing}; extra: {extra})"
+        )
+    return result
+
+
 def _nav_link(
     *,
     label: str,
@@ -1470,6 +1592,7 @@ def _publish_current_obligation_views(
     purchase_payload: Mapping[str, Any],
     production_payload: Mapping[str, Any],
     mrp_payloads: Mapping[str, Any],
+    period_payloads: Mapping[str, Any],
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Promote accepted obligation/read-model snapshots to compact current rows.
 
@@ -1583,17 +1706,12 @@ def _publish_current_obligation_views(
         entity_kind="assembly_queue",
         scope_key="assembly:all-live-plans",
     )
-    execution_snapshots = db.query(models.PlanningReadSnapshot).filter(
-        models.PlanningReadSnapshot.consumer == "period_plan_execution",
-        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-        models.PlanningReadSnapshot.truth_status == "accepted",
-    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc(), models.PlanningReadSnapshot.id.asc()).all()
-    for snapshot in execution_snapshots:
-        payload = dict(snapshot.payload or {})
+    for scope_key, raw_payload in period_payloads.items():
+        payload = dict(raw_payload)
         plan = dict(payload.get("plan") or {})
         run_id = payload.get("run_id")
-        execution_metadata[str(snapshot.snapshot_key)] = {
-            "snapshot_key": str(snapshot.snapshot_key),
+        execution_metadata[str(scope_key)] = {
+            "scope_key": str(scope_key),
             "plan": plan,
             "run_id": run_id,
             "summary": _period_execution_summary_for_current(payload),
@@ -1608,14 +1726,25 @@ def _publish_current_obligation_views(
         source_rows = payload.get("rows")
         if not isinstance(source_rows, list):
             continue
-        for index, row in enumerate(source_rows):
+        for row in source_rows:
             if not isinstance(row, dict):
                 continue
             row_payload = dict(row)
             row_payload.setdefault("run_id", run_id)
             row_payload.setdefault("plan_id", plan.get("id"))
-            identity = _snapshot_row_identity(row_payload, "period-plan")
-            business_identity = f"plan:{plan.get('id')}:{identity}"
+            identity = str(row_payload.get("current_identity") or "").strip()
+            if not identity:
+                req_id = row_payload.get("req_id") or row_payload.get("requirement_id")
+                identity = (
+                    f"req:{int(req_id)}"
+                    if req_id is not None
+                    else _snapshot_row_identity(row_payload, "period-plan")
+                )
+            business_identity = (
+                identity
+                if identity.startswith("plan:")
+                else f"plan:{int(plan.get('id'))}:{identity}"
+            )
             row_payload = _period_execution_row_payload(
                 row_payload,
                 business_identity=business_identity,
@@ -1655,6 +1784,8 @@ def publish_current_obligation_views_from_generation(
     purchase_payload: Mapping[str, Any] | None = None,
     production_payload: Mapping[str, Any] | None = None,
     mrp_payloads: Mapping[str, Any] | None = None,
+    period_payloads: Mapping[str, Any] | None = None,
+    period_run_ids: Iterable[int] | None = None,
 ) -> dict[str, CurrentExecutionPublishResult]:
     """Publish runtime current views with explicit obligation candidates.
 
@@ -1674,12 +1805,29 @@ def publish_current_obligation_views_from_generation(
         raise CurrentExecutionUnavailable(
             "runtime MRP publication requires explicit mrp_payloads"
         )
+    if not isinstance(period_payloads, Mapping):
+        raise CurrentExecutionUnavailable(
+            "runtime period publication requires explicit period_payloads"
+        )
+    from .live_plan_scope import live_plan_run_ids
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise CurrentExecutionUnavailable("runtime period publication generation is missing")
+    period_current_payloads = _require_period_current_payloads(
+        period_payloads,
+        required_run_ids=(
+            tuple(sorted({int(value) for value in period_run_ids}))
+            if period_run_ids is not None
+            else live_plan_run_ids(db, generation)
+        ),
+    )
     return _publish_current_obligation_views(
         db,
         generation_id,
         purchase_payload=purchase_payload,
         production_payload=production_payload,
         mrp_payloads=mrp_payloads,
+        period_payloads=period_current_payloads,
     )
 
 
@@ -1772,10 +1920,34 @@ def publish_current_obligation_views_from_snapshots(
         legacy_payload["row_counts"] = legacy_counts
         legacy_payload["rows"] = rows
         mrp_payloads[marker] = legacy_payload
+    period_payloads: dict[str, dict[str, Any]] = {}
+    for legacy in db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "period_plan_execution",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).order_by(models.PlanningReadSnapshot.snapshot_key.asc()).all():
+        key_parts = {
+            part.split("=", 1)[0]: part.split("=", 1)[1]
+            for part in str(legacy.snapshot_key).split(";")
+            if "=" in part
+        }
+        if not key_parts.get("plan") or not key_parts.get("run"):
+            raise CurrentExecutionUnavailable(
+                "migration period execution snapshot key is malformed"
+            )
+        payload = dict(legacy.payload or {})
+        payload.setdefault("run_id", int(key_parts["run"]))
+        payload.setdefault("plan", {"id": int(key_parts["plan"])})
+        payload.setdefault("facets", {"bom_levels": []})
+        payload.setdefault("plan_output_rows", [])
+        period_payloads[
+            f"plan:{int(key_parts['plan'])}:run:{int(key_parts['run'])}"
+        ] = payload
     return _publish_current_obligation_views(
         db,
         generation_id,
         purchase_payload=dict(snapshot.payload),
         production_payload=production_payload,
         mrp_payloads=mrp_payloads,
+        period_payloads=period_payloads,
     )

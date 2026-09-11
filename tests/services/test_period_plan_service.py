@@ -41,10 +41,11 @@ from app.models import (
 )
 from app.services import period_plan_service
 from app.services import obligation_refresh_orchestrator
+from app.services.item_ledger.current_execution import publish_current_execution_scope
 from app.services.period_plan_service import (
     _build_execution_snapshot_rows,
-    build_period_plan_execution_snapshot,
-    build_period_plan_execution_snapshots_for_generation,
+    build_period_plan_execution_payload,
+    build_period_plan_execution_current_payloads_for_generation,
     create_mrp_snapshot_from_period_plan,
     get_period_plan_matrix,
     get_period_plan_execution_journal,
@@ -70,18 +71,13 @@ def test_generation_snapshot_build_skips_legacy_run_without_persisted_roots(
     db_session.add(run)
     db_session.flush()
 
-    result = build_period_plan_execution_snapshots_for_generation(
-        db_session, generation_id
+    result = build_period_plan_execution_current_payloads_for_generation(
+        db_session, generation_id, run_ids=[run.run_id]
     )
 
-    assert result["snapshots"] == 0
-    assert result["plan_runs"] == []
-    assert result["unavailable"] == 1
-    assert result["unavailable_plan_runs"] == [{
-        "plan_id": int(plan.id),
-        "run_id": int(run.run_id),
-        "reason": "missing_mrp_roots",
-    }]
+    assert list(result) == [f"plan:{int(plan.id)}:run:{int(run.run_id)}"]
+    assert result[list(result)[0]]["truth_status"] == "unavailable"
+    assert "persisted MRP roots are missing" in result[list(result)[0]]["truth_reason"]
     assert db_session.query(PlanningReadSnapshot).filter_by(
         consumer="period_plan_execution",
         ledger_generation_id=generation_id,
@@ -278,10 +274,27 @@ def test_execution_journal_repeated_get_reads_snapshot_without_computation_or_wr
             "assembly_remaining_qty": 3.0,
         },
     }
+    payload["facets"] = {"bom_levels": [0], "flows": []}
+    current_row = {**payload["rows"][0], "run_id": run.run_id, "plan_id": plan.id}
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:g-current:period_plan_execution",
+        source_generation_id=int(db_session.info["period_plan_ledger_generation_id"]),
+        scope_key="period-plan:all-live-plans",
+        rows=[{
+            "entity_kind": "period_plan_execution",
+            "business_identity": f"plan:{plan.id}:req:11",
+            "scope_key": "period-plan:all-live-plans",
+            "payload": current_row,
+        }],
+        entity_kinds=("period_plan_execution",),
+        summary={"snapshots": {f"plan:{plan.id}:run:{run.run_id}": payload}},
+    )
+    db_session.flush()
     monkeypatch.setattr(
-        planning_truth,
-        "get_latest_read_snapshot",
-        lambda *args, **kwargs: SimpleNamespace(payload=payload),
+        period_plan_service,
+        "_read_current_period_payload_for_run",
+        lambda *args, **kwargs: payload,
     )
     before_new = set(db_session.new)
     first = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
@@ -322,9 +335,9 @@ def test_execution_journal_filters_sorts_and_pages_on_backend(
         {"req_id": 5, "item_id": 5, "bom_level": 2, "status": "covered", "remaining_qty": 0},
     ]
     monkeypatch.setattr(
-        planning_truth,
-        "get_latest_read_snapshot",
-        lambda *args, **kwargs: SimpleNamespace(payload={
+        period_plan_service,
+        "_read_current_period_payload_for_run",
+        lambda *args, **kwargs: {
             "plan": {"id": plan.id},
             "run_id": run.run_id,
             "truth_status": "accepted",
@@ -344,7 +357,7 @@ def test_execution_journal_filters_sorts_and_pages_on_backend(
                 "accepted_plan_output_qty": 0.0,
                 "assembly_remaining_qty": 3.0,
             },
-        }),
+        },
     )
 
     result = get_period_plan_execution_journal(
@@ -384,9 +397,9 @@ def test_execution_journal_rejects_accepted_snapshot_without_plan_output(
     db_session.add(run)
     db_session.commit()
     monkeypatch.setattr(
-        planning_truth,
-        "get_latest_read_snapshot",
-        lambda *args, **kwargs: SimpleNamespace(payload={
+        period_plan_service,
+        "_read_current_period_payload_for_run",
+        lambda *args, **kwargs: {
             "plan": {"id": plan.id},
             "run_id": run.run_id,
             "truth_status": "accepted",
@@ -394,7 +407,7 @@ def test_execution_journal_rejects_accepted_snapshot_without_plan_output(
             "cutoff": "2026-07-23T12:00:00",
             "rows": [],
             "summary": {"execution_completed_qty": 0, "execution_base_qty": 3},
-        }),
+        },
     )
 
     result = get_period_plan_execution_journal(
@@ -430,7 +443,11 @@ def test_execution_journal_missing_current_snapshot_is_unavailable(
         reason=None,
     )
     monkeypatch.setattr(
-        planning_truth, "get_latest_read_snapshot", lambda *args, **kwargs: None
+        period_plan_service,
+        "_read_current_period_payload_for_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("current period execution payload is missing")
+        ),
     )
     monkeypatch.setattr(planning_truth, "get_truth_state", lambda db: accepted)
 
@@ -439,7 +456,7 @@ def test_execution_journal_missing_current_snapshot_is_unavailable(
     assert result["truth_status"] == "unavailable"
     assert result["ledger_generation"] == 9
     assert result["summary"]["execution_pct"] is None
-    assert "snapshot is missing" in result["truth_reason"]
+    assert "current period execution payload is missing" in result["truth_reason"]
 
 
 def test_execution_journal_reads_closed_plan_snapshot_without_current_truth(db_session):
@@ -467,11 +484,10 @@ def test_execution_journal_reads_closed_plan_snapshot_without_current_truth(db_s
     _add_root_for_plan(db_session, run, plan)
     db_session.flush()
 
-    payload = build_period_plan_execution_snapshot(
+    payload = build_period_plan_execution_payload(
         db_session,
         plan.id,
         run_id=run.run_id,
-        persist=True,
     )
     generation = db_session.get(LedgerGeneration, generation_id)
     assert generation is not None
@@ -533,7 +549,7 @@ def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session)
     _add_root_for_plan(db_session, run, plan)
     db_session.commit()
 
-    result = build_period_plan_execution_snapshot(db_session, plan.id, run_id=run.run_id)
+    result = build_period_plan_execution_payload(db_session, plan.id, run_id=run.run_id)
 
     current = db_session.query(PlanningTruthState.current_generation_id).scalar()
     assert result["run_id"] == int(run.run_id)
@@ -559,22 +575,32 @@ def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
     db_session.flush()
     _add_root_for_plan(db_session, run, plan)
 
-    payload = build_period_plan_execution_snapshot(
+    payload = build_period_plan_execution_payload(
         db_session,
         plan.id,
         run_id=run.run_id,
         generation_id=generation_id,
-        persist=True,
     )
 
-    snapshot = db_session.query(PlanningReadSnapshot).one()
     generation = db_session.get(LedgerGeneration, generation_id)
-    assert snapshot.consumer == "period_plan_execution"
-    assert snapshot.snapshot_key == f"plan={plan.id};run={run.run_id}"
-    assert snapshot.ledger_generation_id == generation_id
-    assert snapshot.cutoff == generation.cutoff
-    assert snapshot.truth_status == "accepted"
-    assert snapshot.payload == payload
+    publish_current_execution_scope(
+        db_session,
+        source_revision=f"period-test:{int(generation_id)}",
+        source_generation_id=generation_id,
+        scope_key="period-plan:all-live-plans",
+        rows=[],
+        entity_kinds=("period_plan_execution",),
+        summary={"snapshots": {
+            f"plan:{int(plan.id)}:run:{int(run.run_id)}": payload,
+        }},
+    )
+    scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
+    ).one()
+    assert scope.summary["snapshots"][
+        f"plan:{int(plan.id)}:run:{int(run.run_id)}"
+    ] == payload
     assert payload["summary"]["planned_output_qty"] == 5.0
     assert payload["summary"]["accepted_plan_output_qty"] == 0.0
     assert payload["summary"]["assembly_remaining_qty"] == 5.0
@@ -591,6 +617,44 @@ def test_period_plan_list_reads_persisted_plan_output_not_latest_mrp_progress(db
     line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
     line.accepted_output_qty = 3
     line.remaining_output_qty = 2
+    run = PlanningRun(
+        source_plan_id=int(plan.id),
+        ledger_generation_id=generation_id,
+        status="FIXED_SNAPSHOT",
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(models.PlanningLivePointer(
+        plan_id=int(plan.id), run_id=int(run.run_id), status="active"
+    ))
+    list_payload = {
+        "plan": {"id": int(plan.id)},
+        "run_id": int(run.run_id),
+        "truth_status": "accepted",
+        "plan_output_rows": [],
+        "facets": {},
+        "summary": {
+            "execution_pct": 62.5,
+            "execution_completed_qty": 5,
+            "execution_base_qty": 8,
+            "planned_output_qty": 5,
+            "accepted_plan_output_qty": 3,
+            "assembly_remaining_qty": 2,
+        },
+    }
+    publish_current_execution_scope(
+        db_session,
+        source_revision=f"period-test:{int(generation_id)}",
+        source_generation_id=generation_id,
+        scope_key="period-plan:all-live-plans",
+        rows=[],
+        entity_kinds=("period_plan_execution",),
+        summary={"snapshots": {
+            f"plan:{int(plan.id)}:run:{int(run.run_id)}": list_payload,
+        }},
+    )
     db_session.add(PlanningReadSnapshot(
         consumer="period_plan_execution",
         snapshot_key=f"plan={plan.id};run=77",
@@ -690,7 +754,7 @@ def test_replacement_mrp_journal_exposes_own_receipts_before_root_output(
     ))
     db_session.flush()
 
-    payload = build_period_plan_execution_snapshot(
+    payload = build_period_plan_execution_payload(
         db_session,
         plan.id,
         run_id=replacement.run_id,
@@ -720,14 +784,29 @@ def test_period_plan_detail_and_matrix_read_saved_plan_output_projection(db_sess
     generation_id = int(db_session.query(PlanningTruthState.current_generation_id).scalar())
     generation = db_session.get(LedgerGeneration, generation_id)
     line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
-    db_session.add(PlanningReadSnapshot(
-        consumer="period_plan_execution",
-        snapshot_key=f"plan={plan.id};run=101",
+    run = PlanningRun(
+        source_plan_id=int(plan.id),
         ledger_generation_id=generation_id,
-        cutoff=generation.cutoff,
-        truth_status="accepted",
-        payload={
-            "plan": {"id": plan.id},
+        status="FIXED_SNAPSHOT",
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(models.PlanningLivePointer(
+        plan_id=int(plan.id), run_id=int(run.run_id), status="active"
+    ))
+    period_key = f"plan:{int(plan.id)}:run:{int(run.run_id)}"
+    publish_current_execution_scope(
+        db_session,
+        source_revision=f"period-test:{int(generation_id)}",
+        source_generation_id=generation_id,
+        scope_key="period-plan:all-live-plans",
+        rows=[],
+        entity_kinds=("period_plan_execution",),
+        summary={"snapshots": {period_key: {
+            "plan": {"id": int(plan.id)},
+            "run_id": int(run.run_id),
             "truth_status": "accepted",
             "plan_output_rows": [{
                 "plan_line_id": int(line.id),
@@ -742,9 +821,8 @@ def test_period_plan_detail_and_matrix_read_saved_plan_output_projection(db_sess
                 "accepted_plan_output_qty": 3.0,
                 "assembly_remaining_qty": 2.0,
             },
-        },
-        published_at=datetime.datetime(2026, 7, 24),
-    ))
+        }}, "total_rows": 0},
+    )
     # Mutable table state after publication must not change the GET projection.
     line.accepted_output_qty = Decimal("0")
     line.remaining_output_qty = Decimal("5")
@@ -777,6 +855,45 @@ def test_period_plan_detail_rejects_nonconserving_saved_output_projection(db_ses
     )
     generation = db_session.get(LedgerGeneration, generation_id)
     line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    run = PlanningRun(
+        source_plan_id=int(plan.id),
+        ledger_generation_id=generation_id,
+        status="FIXED_SNAPSHOT",
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(models.PlanningLivePointer(
+        plan_id=int(plan.id), run_id=int(run.run_id), status="active"
+    ))
+    period_key = f"plan:{int(plan.id)}:run:{int(run.run_id)}"
+    publish_current_execution_scope(
+        db_session,
+        source_revision=f"period-test:{int(generation_id)}",
+        source_generation_id=generation_id,
+        scope_key="period-plan:all-live-plans",
+        rows=[],
+        entity_kinds=("period_plan_execution",),
+        summary={"snapshots": {period_key: {
+            "plan": {"id": int(plan.id)},
+            "run_id": int(run.run_id),
+            "truth_status": "accepted",
+            "plan_output_rows": [{
+                "plan_line_id": int(line.id),
+                "item_id": int(item.item_id),
+                "bucket_date": line.bucket_date.isoformat(),
+                "planned_output_qty": 5.0,
+                "accepted_plan_output_qty": 4.0,
+                "assembly_remaining_qty": 2.0,
+            }],
+            "summary": {
+                "planned_output_qty": 5.0,
+                "accepted_plan_output_qty": 4.0,
+                "assembly_remaining_qty": 1.0,
+            },
+        }}, "total_rows": 0},
+    )
     db_session.add(PlanningReadSnapshot(
         consumer="period_plan_execution",
         snapshot_key=f"plan={plan.id};run=broken",

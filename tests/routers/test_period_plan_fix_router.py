@@ -113,12 +113,6 @@ def test_execution_journal_route_returns_typed_payload_after_fix(client, db_sess
     )
     assert fix_result.status_code == 200, fix_result.text
     run_id = fix_result.json()["mrp"]["run_id"]
-    from app.services.item_ledger.current_execution import (
-        publish_current_obligation_views_from_generation,
-    )
-    publish_current_obligation_views_from_generation(
-        db_session, fix_result.json()["mrp"]["ledger_generation_id"],
-    )
     db_session.commit()
 
     response = client.get(
