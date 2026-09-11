@@ -112,15 +112,19 @@ def _seed(session: Session):
     session.add_all((run41, run42, closed_run))
     session.flush()
 
+    # Reflect through the session transaction's connection: with NullPool the
+    # engine would otherwise use a second PostgreSQL connection and could not
+    # see the just-created legacy tables before this seed commits.
     legacy_metadata = sa.MetaData()
+    legacy_connection = session.connection()
     snapshots_table = sa.Table(
-        "planning_read_snapshot", legacy_metadata, autoload_with=session.get_bind()
+        "planning_read_snapshot", legacy_metadata, autoload_with=legacy_connection
     )
     rows_table = sa.Table(
-        "planning_read_row", legacy_metadata, autoload_with=session.get_bind()
+        "planning_read_row", legacy_metadata, autoload_with=legacy_connection
     )
     roots_table = sa.Table(
-        "planning_read_root_member", legacy_metadata, autoload_with=session.get_bind()
+        "planning_read_root_member", legacy_metadata, autoload_with=legacy_connection
     )
 
     def snapshot(consumer, key, generation, payload):
@@ -147,11 +151,21 @@ def _seed(session: Session):
     snapshot("mrp_result", "run:42", pointed_generation, {"summary": {}})
     snapshot(
         "period_plan_execution", "plan=7;run=41", pointed_generation,
-        {"plan": {"id": 7}, "run_id": 41, "rows": []},
+        {
+            "plan": {"id": 7}, "run_id": 41, "truth_status": "accepted",
+            "summary": {"truth_status": "accepted", "total_items": 0},
+            "facets": {"bom_levels": [], "flows": []},
+            "plan_output_rows": [], "rows": [],
+        },
     )
     snapshot(
         "period_plan_execution", "plan=8;run=42", pointed_generation,
-        {"plan": {"id": 8}, "run_id": 42, "rows": []},
+        {
+            "plan": {"id": 8}, "run_id": 42, "truth_status": "accepted",
+            "summary": {"truth_status": "accepted", "total_items": 0},
+            "facets": {"bom_levels": [], "flows": []},
+            "plan_output_rows": [], "rows": [],
+        },
     )
     # Historical copies are retained evidence and must not be selected.
     snapshot("production_control_journal", "journal:v1", old_generation, {"meta": {"historical": True}})

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -55,7 +57,7 @@ def _run(module, connection, name: str = "upgrade"):
 def _legacy_schema(connection, *, external_fk: bool = False) -> None:
     connection.execute(sa.text(
         "CREATE TABLE ledger_generation ("
-        "id INTEGER PRIMARY KEY, status VARCHAR(32) NOT NULL, cutoff DATETIME)"
+        "id INTEGER PRIMARY KEY, status VARCHAR(32) NOT NULL, cutoff TIMESTAMP)"
     ))
     connection.execute(sa.text(
         "CREATE TABLE planning_truth_state ("
@@ -106,13 +108,14 @@ def _accepted_current_truth(connection, *, status: str = "accepted") -> None:
             sa.text(
                 "INSERT INTO current_execution_scope "
                 "(id,entity_kind,scope_key,source_generation_id,source_revision,result_ready,summary) "
-                "VALUES (:id,:kind,:scope,1,:revision,1,:summary)"
+                "VALUES (:id,:kind,:scope,1,:revision,:ready,:summary)"
             ),
             {
                 "id": index,
                 "kind": kind,
                 "scope": scope_key,
                 "revision": f"accepted:g1:{kind}",
+                "ready": True,
                 "summary": "{}",
             },
         )
@@ -205,3 +208,41 @@ def test_postgres_path_declares_exclusive_nowait_protection_before_drop():
     upper = source.upper()
     assert "ACCESS EXCLUSIVE" in upper
     assert "NOWAIT" in upper or "LOCK" in upper
+
+
+@pytest.mark.integration
+def test_postgres_drop_removes_legacy_tables_after_exact_current_truth():
+    dsn = os.getenv("PRODPLAN_R2_TEST_DSN")
+    if not dsn:
+        pytest.skip("PRODPLAN_R2_TEST_DSN is not configured")
+    from app.r2_local_contract import validate_r2_dsn
+
+    validate_r2_dsn(dsn)
+    engine = sa.create_engine(dsn, poolclass=sa.pool.NullPool)
+    schema = f"r10_drop_{uuid4().hex}"
+    scoped = None
+    try:
+        with engine.begin() as connection:
+            connection.execute(sa.text(f"CREATE SCHEMA {schema}"))
+        scoped = sa.create_engine(
+            dsn,
+            poolclass=sa.pool.NullPool,
+            connect_args={"options": f"-csearch_path={schema}"},
+        )
+        migration = _migration()
+        with scoped.begin() as connection:
+            _legacy_schema(connection)
+            _accepted_current_truth(connection)
+            connection.execute(sa.text(
+                "INSERT INTO planning_read_snapshot "
+                "(id,consumer,snapshot_key,ledger_generation_id,truth_status,payload) "
+                "VALUES (1,'mrp_result','legacy',1,'accepted','{}')"
+            ))
+            _run(migration, connection)
+            assert not LEGACY_TABLES & set(sa.inspect(connection).get_table_names())
+    finally:
+        if scoped is not None:
+            scoped.dispose()
+        with engine.begin() as connection:
+            connection.execute(sa.text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        engine.dispose()
