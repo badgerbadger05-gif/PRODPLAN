@@ -49,11 +49,14 @@ from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
     DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
     add_unit_payload as _add_unit_payload,
+    add_origin_marker as _add_origin_marker,
     clean_ref1c as _clean_ref1c,
     config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
     current_1c_datetime as _current_1c_datetime,
     find_sync_link as _find_sync_link,
+    find_document_by_origin as _find_document_by_origin,
+    origin_token as _origin_token,
     post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
@@ -94,6 +97,19 @@ class ManufactureExportEntry:
     status: str = "planned"
     error: Optional[str] = None
     reason: Optional[str] = None
+    origin_token: Optional[str] = None
+
+
+def _entry_origin_token(entry: ManufactureExportEntry) -> str:
+    """Stable 1C recovery marker for one durable local Produce command."""
+    return _origin_token(
+        "manufacture",
+        {
+            "manufacture_id": int(entry.manufacture_id),
+            "product_id": int(entry.product_id),
+            "qty": float(entry.qty),
+        },
+    )
 
 
 def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
@@ -592,6 +608,8 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     )
     if entry.executor:
         comment += f"; executor={entry.executor}"
+    if entry.origin_token:
+        comment = _add_origin_marker(comment, entry.origin_token)
     product_row: Dict[str, Any] = {
         "LineNumber": 1,
         "Номенклатура_Key": entry.item_ref1c,
@@ -729,6 +747,7 @@ def export_manufactures_to_1c(
     eligible: List[ManufactureExportEntry] = []
     already_linked: List[ManufactureExportEntry] = []
     for entry in entries:
+        entry.origin_token = _entry_origin_token(entry)
         link = _existing_link(db, entry.manufacture_id)
         link_ref = _clean_ref1c(link.target_ref_key) if link else ""
         m_row = (
@@ -782,6 +801,47 @@ def export_manufactures_to_1c(
         return summary
 
     client = _create_odata_client(config, OData1CClient)
+
+    # The create response may be lost after 1C accepted the document. Recover
+    # by the durable origin marker before any new POST, then persist the link.
+    recovered: List[ManufactureExportEntry] = []
+    pending: List[ManufactureExportEntry] = []
+    for entry in eligible:
+        document = _find_document_by_origin(
+            client,
+            entity=MANUFACTURE_ENTITY,
+            token=str(entry.origin_token),
+        )
+        ref_key = _clean_ref1c((document or {}).get("Ref_Key"))
+        if not ref_key:
+            pending.append(entry)
+            continue
+        entry.status = "existing"
+        entry.target_ref_key = ref_key
+        entry.reason = "найден существующий документ 1С по prodplan-origin"
+        _post_document_operational(client, entity=MANUFACTURE_ENTITY, ref_key=ref_key)
+        _upsert_link(
+            db,
+            entry=entry,
+            payload_hash="recovered-by-origin",
+            target_ref_key=ref_key,
+            status="success",
+            last_error=None,
+        )
+        m_row = db.query(ProductionManufacture).filter(
+            ProductionManufacture.manufacture_id == entry.manufacture_id
+        ).one()
+        m_row.status = "exported"
+        m_row.exported_ref1c = ref_key
+        m_row.exported_at = datetime.now(timezone.utc)
+        m_row.export_error = None
+        recovered.append(entry)
+    if recovered:
+        already_linked.extend(recovered)
+        db.commit()
+    eligible = pending
+    summary["manufactures_already_linked"] = len(already_linked)
+    summary["manufactures_eligible"] = len(eligible)
     _inherit_structural_units_from_parent_order(client, eligible)
 
     # Pre-flight: refuse exports whose component write-off cannot be covered
