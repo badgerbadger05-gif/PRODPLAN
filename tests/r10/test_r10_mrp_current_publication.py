@@ -42,6 +42,12 @@ def test_direct_mrp_builder_returns_current_payload_without_snapshot_rows(monkey
     ])
     monkeypatch.setattr(mrp_result_projection, "_frozen_root_membership", lambda *args, **kwargs: {10: {1}})
     monkeypatch.setattr(mrp_result_projection, "_validate_obligation_lineage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        mrp_result_projection,
+        "require_accepted_truth",
+        lambda *args, **kwargs: SimpleNamespace(generation_id=7),
+    )
+    monkeypatch.setattr(mrp_result_projection, "sealed_run_anchor", lambda *args, **kwargs: generation)
 
     payload = mrp_result_projection.build_mrp_result_current_payload(FakeDb(), 42)
 
