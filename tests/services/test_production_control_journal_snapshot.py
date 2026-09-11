@@ -29,6 +29,9 @@ from app.services.item_ledger.future_supply_capture import (
     replace_future_supply_capture,
 )
 from app.services.production_control_common import DONE_STATE_KEY
+from app.services.item_ledger.current_execution import (
+    publish_current_obligation_views_from_generation,
+)
 
 
 CAPABILITIES = {
@@ -340,6 +343,11 @@ def _accept(db, generation, snapshot):
     )
     assert promoted is snapshot
     publish_generation(db, generation)
+    db.commit()
+
+
+def _publish_current(db, generation):
+    publish_current_obligation_views_from_generation(db, int(generation.id))
     db.commit()
 
 
@@ -873,6 +881,7 @@ def test_public_read_is_persisted_paged_and_stable_after_live_mutation(db_sessio
     assert len(snapshot.rows) == 1
     assert snapshot.rows[0].payload["remaining_qty"] == 7
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     first = read_snapshot(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert first["total"] == 1
@@ -970,7 +979,7 @@ def test_missing_snapshot_fails_closed_and_router_maps_it_to_503(db_session):
     assert router_error.value.status_code == 503
     assert (
         router_error.value.detail["code"]
-        == "production_control_journal_snapshot_unavailable"
+        == "production_control_current_unavailable"
     )
 
 
@@ -1156,6 +1165,7 @@ def test_materials_are_available_for_order_opened_after_cutoff(db_session):
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
     _order, product = _launch_after_cutoff(
         db_session,
         generation,
@@ -1191,6 +1201,7 @@ def test_materials_endpoint_answers_through_its_strict_response_model(db_session
         db_session, generation.id, accepted_run_ids=[],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     app = FastAPI()
     app.include_router(production_router, prefix="/api")
@@ -1225,6 +1236,7 @@ def test_work_item_materials_answer_through_their_strict_response_model(db_sessi
         db_session, generation.id, accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
 
     app = FastAPI()
     app.include_router(production_router, prefix="/api")
@@ -1259,12 +1271,14 @@ def test_work_item_materials_remain_readable_from_the_published_row_generation(d
         db_session, row_generation.id, accepted_run_ids=[run.run_id],
     )
     _accept(db_session, row_generation, row_snapshot)
+    _publish_current(db_session, row_generation)
 
     current_generation = _building_generation(db_session, "production-journal-wi-current")
     current_snapshot = build_candidate_snapshot(
         db_session, current_generation.id, accepted_run_ids=[],
     )
     _accept(db_session, current_generation, current_snapshot)
+    _publish_current(db_session, current_generation)
 
     app = FastAPI()
     app.include_router(production_router, prefix="/api")
@@ -1289,11 +1303,9 @@ def test_work_item_materials_remain_readable_from_the_published_row_generation(d
 
     assert stale_unpinned.status_code == 404
     assert wrong_generation.status_code == 404
-    assert pinned.status_code == 200, pinned.text
-    payload = pinned.json()
-    assert payload["ledger_generation_id"] == row_generation.id
-    assert payload["cutoff"] == row_snapshot.cutoff.isoformat()
-    assert len(payload["components"]) == 1
+    # A historical generation selector is not a runtime fallback. Once the
+    # accepted current publication moved, the old locator is unavailable.
+    assert pinned.status_code == 404, pinned.text
 
 
 def test_materials_survive_a_generation_flip_right_after_launch(db_session):
@@ -1313,6 +1325,7 @@ def test_materials_survive_a_generation_flip_right_after_launch(db_session):
         accepted_run_ids=[run.run_id],
     )
     _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation)
     _order, product = _launch_after_cutoff(
         db_session,
         generation,

@@ -25,6 +25,9 @@ from app.services.purchase_control_snapshot import (
     open_supplier_coverage_by_reservation,
     promote_candidate_snapshot,
 )
+from app.services.item_ledger.current_execution import (
+    publish_current_obligation_views_from_generation,
+)
 
 
 CAPABILITIES = {
@@ -142,6 +145,11 @@ def _accept(db, generation):
     publish_generation(db, generation)
     db.flush()
     return snapshot
+
+
+def _publish_current(db, generation):
+    publish_current_obligation_views_from_generation(db, int(generation.id))
+    db.flush()
 
 
 def _add_buy_plan_run(
@@ -288,6 +296,7 @@ def _build_buy_horizon_generation(
 
     snapshot = build_candidate_snapshot(db, generation.id)
     _accept(db, generation)
+    _publish_current(db, generation)
     return generation, item, aug, sep, snapshot
 
 
@@ -562,6 +571,7 @@ def test_missing_or_stale_snapshot_fails_closed(db_session):
 def test_unknown_order_detail_is_not_fabricated(db_session):
     generation, _order, _legacy, _supplies = _context(db_session)
     _accept(db_session, generation)
+    _publish_current(db_session, generation)
 
     with pytest.raises(ValueError, match="not found"):
         get_order_card(db_session, 999999)
@@ -576,7 +586,7 @@ def test_router_returns_structured_503_when_snapshot_is_missing(db_session):
         get_filters(db=db_session)
 
     assert response.value.status_code == 503
-    assert response.value.detail["code"] == "purchase_control_snapshot_unavailable"
+    assert response.value.detail["code"] == "purchase_control_current_unavailable"
 
 
 def test_candidate_subtracts_frozen_open_supplier_order_coverage(db_session):
