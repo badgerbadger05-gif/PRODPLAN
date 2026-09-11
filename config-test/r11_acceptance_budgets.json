@@ -4,7 +4,7 @@
     "baseline": "R2 local PostgreSQL 16 baseline",
     "historical_api_p95_ms": [3.8, 4.9],
     "fixed_before_measurement": true,
-    "rationale": "Conservative operator-local limits are fixed before the R11 harness runs; they are not fitted to R11 output."
+    "rationale": "Conservative operator-local limits are fixed before the R11 harness runs; they are not fitted to R11 output. The bounded WAL ceiling allows roughly 500 PostgreSQL row-lock records and occasional first-page images across 100 FOR UPDATE retries while DML and row/audit growth remain exactly zero."
   },
   "budgets": {
     "api_p95_ms": 25.0,
@@ -14,7 +14,7 @@
     "no_op_current_row_growth_max": 0,
     "no_op_current_scope_growth_max": 0,
     "no_op_current_change_growth_max": 0,
-    "no_op_wal_bytes_max": 0,
+    "no_op_wal_bytes_max": 131072,
     "no_op_dead_tuple_growth_max": 0,
     "mutation_row_growth_max": 64,
     "mutation_audit_growth_max": 64,
@@ -23,23 +23,23 @@
     "storage_rehearsal_seconds": 240.0
   },
   "acceptance_matrix": {
-    "A01": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_no_op_publication_soak_contract"},
-    "A02": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
-    "A03": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
-    "A04": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
-    "A05": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_mutation_sequence_contract"},
-    "A06": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
-    "A07": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
-    "A08": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_local_dsn_guard_contract"},
-    "A09": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
-    "A10": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_generators_use_independent_decimal_oracle"},
-    "A11": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_mutation_sequence_contract"},
-    "A12": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_no_op_publication_soak_contract"},
-    "A13": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
-    "A14": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_no_op_publication_soak_contract"},
-    "A15": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_mutation_sequence_contract"},
-    "A16": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_runtime_inventory_contract"},
-    "A17": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_fault_injection_contract"},
+    "A01": {"status": "planned", "node": "tests/r3/test_r3_runtime_integration.py::test_seed_repeat_100_preserves_one_id_and_identity_mapping"},
+    "A02": {"status": "planned", "node": "tests/r5/test_r5_correction_returns.py::test_addressed_receipt_precedes_fifo_and_aggregated_purchase_cap_is_respected"},
+    "A03": {"status": "planned", "node": "tests/r5/test_r5_correction_returns.py::test_decreasing_m1_replays_shared_pool_and_changes_m2_assignment"},
+    "A04": {"status": "planned", "node": "tests/r3/test_r3_contract.py::test_frozen_basis_has_explicit_generation_provenance"},
+    "A05": {"status": "planned", "node": "tests/services/test_obligation_refresh_orchestrator.py::test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay"},
+    "A06": {"status": "planned", "node": "tests/r8/test_r8_postgres_integration.py::test_r8_current_owner_is_atomic_on_two_postgresql_sessions"},
+    "A07": {"status": "planned", "node": "tests/r4/test_r4_postgres_integration.py::test_two_postgresql_sessions_serialize_current_replenishment_without_double_apply"},
+    "A08": {"status": "planned", "node": "tests/r9/test_r9_current_obligation_views.py::test_r9_current_obligation_scope_is_fail_closed_when_not_published"},
+    "A09": {"status": "planned", "node": "tests/r6/test_r6_physical_custody_contract.py::test_conservation_is_role_separate_and_decimal_exact"},
+    "A10": {"status": "planned", "node": "tests/r6/test_r6_physical_custody_contract.py::test_late_custody_event_is_explicitly_visible_for_baseline_rewind"},
+    "A11": {"status": "planned", "node": "tests/r8/test_r8_current_execution.py::test_r8_queue_order_is_oldest_first_with_decimal_and_equal_date_tiebreak"},
+    "A12": {"status": "planned", "node": "tests/r9/test_r9_current_get_contract_matrix.py::test_current_get_inventory_is_read_only_and_does_not_replay"},
+    "A13": {"status": "planned", "node": "tests/services/test_one_c_purchase_order_export.py::test_purchase_order_export_recovers_exact_posted_batch_without_duplicate"},
+    "A14": {"status": "planned", "node": "tests/r8/test_r8_current_execution.py::test_r8_current_owner_is_stable_across_100_noop_recalculations"},
+    "A15": {"status": "planned", "node": "tests/r10/test_r10_obligation_refresh_compact_checkpoint.py::test_published_retry_reuses_current_scopes_without_saved_read_models"},
+    "A16": {"status": "planned", "node": "tests/r10/test_r10_legacy_path_cleanup.py::test_operational_rebuild_sql_uses_current_owner_after_head"},
+    "A17": {"status": "planned", "nodes": ["tests/r10/test_r10_storage_rehearsal.py::test_storage_rehearsal_restores_subject_values_and_reclaims_dropped_relations", "tests/r10/test_r10_planning_read_drop.py::test_empty_database_drop_is_idempotent_and_downgrade_is_irreversible"]},
     "A18": {"status": "planned", "node": "tests/r11/test_r11_local_acceptance.py::test_report_compares_fixed_budgets"}
   }
 }

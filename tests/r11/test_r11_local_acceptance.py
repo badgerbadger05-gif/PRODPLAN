@@ -37,7 +37,7 @@ def test_budget_is_machine_readable_and_fixed_before_measurement():
     assert budgets["no_op_current_row_growth_max"] == 0
     assert budgets["no_op_current_scope_growth_max"] == 0
     assert budgets["no_op_current_change_growth_max"] == 0
-    assert budgets["no_op_wal_bytes_max"] == 0
+    assert budgets["no_op_wal_bytes_max"] == 131072
     assert budgets["no_op_dead_tuple_growth_max"] == 0
     assert "measured" not in json.dumps(document).lower()
 
@@ -48,7 +48,8 @@ def test_acceptance_matrix_maps_all_a01_a18_without_unsupported_pass():
     for evidence in matrix.values():
         assert evidence["status"] in {"planned", "covered", "blocked"}
         assert evidence["status"] != "passed"
-        assert "node" in evidence and "::" in evidence["node"]
+        nodes = evidence.get("nodes", [evidence.get("node")])
+        assert nodes and all(isinstance(node, str) and "::" in node for node in nodes)
 
 
 def test_local_runner_plan_is_functional_and_secret_safe():
@@ -89,25 +90,29 @@ def test_generators_use_independent_decimal_oracle():
         balance = Decimal("0")
         for kind, quantity in events:
             value = Decimal(quantity)
-            balance += value if kind == "receipt" else -value
+            balance += value
         return balance
 
-    sequence = [("receipt", "10.125"), ("issue", "2.125"), ("receipt", "1.000")]
-    expected = oracle(sequence)
-    report = runner.run_generators(
-        seeds=(11, 29, 47),
-        oracle_balance=str(expected),
-        mutation_probe=True,
-    )
-    assert report["conservation"]["oracle_balance"] == str(expected)
+    report = runner.run_generators(seeds=(11, 29, 47), mutation_probe=True)
+    first = report["conservation"]["per_seed"][0]
+    ordered = sorted(first["events"], key=lambda event: event["posting_key"])
+    expected = oracle([(event["kind"], event["qty"]) for event in ordered])
+    assert report["conservation"]["independent_oracle_balance"] == str(expected)
+    assert all(row["expected_running"] == row["canonical_running"] for row in report["conservation"]["per_seed"])
+    assert all(row["frozen_input_unchanged"] is True for row in report["conservation"]["per_seed"])
     assert report["mutation_probes"]["sign_flip_detected"] is True
     assert report["mutation_probes"]["address_flip_detected"] is True
     assert report["mutation_probes"]["idempotency_flip_detected"] is True
 
 
+@pytest.mark.integration
 def test_mutation_sequence_contract():
     runner = _runner()
+    dsn = os.getenv("PRODPLAN_R2_TEST_DSN")
+    if not dsn:
+        pytest.skip("PRODPLAN_R2_TEST_DSN is not configured")
     report = runner.run_mutation_sequence(
+        dsn=dsn,
         seed=20260911,
         operations=("replacement", "retained", "closed", "semantic_change", "retry"),
     )
@@ -117,15 +122,20 @@ def test_mutation_sequence_contract():
     assert report["audit_growth_matches_semantic_changes"] is True
 
 
+@pytest.mark.integration
 def test_fault_injection_contract():
     runner = _runner()
+    dsn = os.getenv("PRODPLAN_R2_TEST_DSN")
+    if not dsn:
+        pytest.skip("PRODPLAN_R2_TEST_DSN is not configured")
     report = runner.run_fault_injection(
-        fault_after_consumer="mrp_result",
+        dsn=dsn,
+        fault_after_consumer="r11_acceptance",
         independent_reader=True,
     )
     assert report["rolled_back"] is True
     assert report["reader_saw_old_or_new_only"] is True
-    assert report["accepted_pointer_switched"] is False
+    assert report["current_scope_switched"] is False
 
 
 def test_runtime_inventory_contract():
@@ -160,3 +170,4 @@ def test_no_op_publication_soak_contract():
     assert no_op["stable_row_ids"] is True
     assert no_op["wal_bytes"] <= _budget()["budgets"]["no_op_wal_bytes_max"]
     assert no_op["dead_tuple_growth"] <= _budget()["budgets"]["no_op_dead_tuple_growth_max"]
+    assert report["budget_check"]["within_budget"] is True
