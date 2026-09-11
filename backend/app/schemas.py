@@ -525,6 +525,8 @@ class ProductionGroupOrder(BaseModel):
     display_qty: Optional[float] = None
     display_norm_hours_total: Optional[float] = None
     overload: Optional[bool] = None
+    current_identity: Optional[str] = None
+    source_revision: Optional[str] = None
 
 
 class ProductionGroup(BaseModel):
@@ -548,10 +550,12 @@ class ProductionGroupedResponse(BaseModel):
     total_orders: int
     limit: int
     offset: int
+    current_identity: str
+    source_revision: str
 
 
 class ReworkGroupOrder(BaseModel):
-    rework_id: int
+    rework_id: Optional[int] = None
     item_id: int
     item_name: Optional[str] = None
     item_article: Optional[str] = None
@@ -572,6 +576,8 @@ class ReworkGroupOrder(BaseModel):
     component_blocked: bool = False
     component_partial: bool = False
     shortage: Optional[dict] = None
+    current_identity: Optional[str] = None
+    source_revision: Optional[str] = None
 
 
 class ReworkGroup(BaseModel):
@@ -596,10 +602,12 @@ class ReworkGroupedResponse(BaseModel):
     total_orders: int
     limit: int
     offset: int
+    current_identity: str
+    source_revision: str
 
 
 class PurchaseCategoryGroupOrder(BaseModel):
-    purchase_id: int
+    purchase_id: Optional[int] = None
     item_id: int
     item_name: Optional[str] = None
     item_article: Optional[str] = None
@@ -624,6 +632,8 @@ class PurchaseCategoryGroupOrder(BaseModel):
     turning_blank_priority: Optional[bool] = False
     late_supplier_order: Optional[bool] = False
     source_purchase_ids: List[int] = []
+    current_identity: Optional[str] = None
+    source_revision: Optional[str] = None
 
 
 class PurchaseCategoryGroup(BaseModel):
@@ -644,6 +654,8 @@ class PurchaseCategoryGroupedResponse(BaseModel):
     total_orders: int
     limit: int
     offset: int
+    current_identity: str
+    source_revision: str
 
 
 class PlannedReworkBase(BaseModel):
