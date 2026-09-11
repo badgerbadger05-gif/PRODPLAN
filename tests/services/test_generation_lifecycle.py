@@ -30,7 +30,7 @@ from app.services.purchase_control_projection import (
 from app.services.item_ledger.assembly_output_persistence import (
     materialize_assembly_output_allocations,
 )
-from app.services.production_control_journal_snapshot import (
+from app.services.production_control_journal_projection import (
     CONSUMER as PRODUCTION_JOURNAL_CONSUMER,
     SNAPSHOT_KEY as PRODUCTION_JOURNAL_SNAPSHOT_KEY,
 )

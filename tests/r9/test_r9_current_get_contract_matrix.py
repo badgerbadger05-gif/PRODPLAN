@@ -250,7 +250,7 @@ def test_representative_current_routes_fail_closed_without_legacy_reads_or_dml(
     forbidden = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("legacy reader reached before current gate")
     )
-    monkeypatch.setattr(production_router, "read_production_control_journal_snapshot", forbidden, raising=True)
+    monkeypatch.setattr(production_router, "read_production_control_journal_current", forbidden, raising=True)
     monkeypatch.setattr(purchase_router, "list_journal", forbidden, raising=True)
     monkeypatch.setattr(plan_router, "get_period_plan_execution_journal", forbidden, raising=True)
     monkeypatch.setattr(production_router.planning_truth, "require_accepted_truth", lambda *a, **k: object())

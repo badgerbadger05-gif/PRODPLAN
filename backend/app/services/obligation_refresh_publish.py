@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.purchase_control_projection import validate_purchase_control_journal_row
-from app.services.production_control_journal_snapshot import (
+from app.services.production_control_journal_projection import (
     validate_candidate_payload as validate_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (

@@ -41,7 +41,7 @@ from app.services.item_ledger.current_replenishment import (
     apply_current_replenishment_for_accepted_generation,
 )
 from app.services.purchase_control_projection import build_candidate_payload as build_purchase_journal_payload
-from app.services.production_control_journal_snapshot import (
+from app.services.production_control_journal_projection import (
     build_candidate_payload as build_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (

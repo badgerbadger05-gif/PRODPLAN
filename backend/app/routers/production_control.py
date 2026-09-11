@@ -38,13 +38,13 @@ from ..services.production_control_journal import (
     update_line_state,
     update_local_order_quantity,
 )
-from ..services.production_control_journal_snapshot import (
+from ..services.production_control_journal_projection import (
     CONSUMER as PRODUCTION_JOURNAL_CONSUMER,
     PROPOSAL_ROW_KIND as PRODUCTION_JOURNAL_PROPOSAL_ROW_KIND,
     SNAPSHOT_KEY as PRODUCTION_JOURNAL_SNAPSHOT_KEY,
-    ProductionControlJournalSnapshotUnavailable,
+    ProductionControlJournalUnavailable,
     list_root_product_options,
-    read_snapshot as read_production_control_journal_snapshot,
+    read_snapshot as read_production_control_journal_current,
     _public_journal_row,
 )
 from ..services.production_control_material_availability import (
@@ -1502,7 +1502,7 @@ def list_root_products(
         return {"rows": options, "total": len(options)}
     except CurrentExecutionUnavailable as exc:
         raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(exc)}) from exc
-    except ProductionControlJournalSnapshotUnavailable as exc:
+    except ProductionControlJournalUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
@@ -1644,7 +1644,7 @@ def get_orders_journal(
         })
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
-    except ProductionControlJournalSnapshotUnavailable as exc:
+    except ProductionControlJournalUnavailable as exc:
         raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except CurrentExecutionUnavailable as exc:
         raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(exc)}) from exc

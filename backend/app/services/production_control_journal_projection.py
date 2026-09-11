@@ -37,7 +37,6 @@ from app.services.planning_truth import (
     CAPABILITY_RESERVATION_REPLAY,
     PlanningTruthReadiness,
     PlanningTruthUnavailable,
-    get_latest_read_snapshot,
     get_truth_state,
 )
 from app.services.production_control_journal import (
@@ -63,7 +62,7 @@ REQUIRED = (
 _PAGE_SIZE = 500
 
 
-class ProductionControlJournalSnapshotUnavailable(RuntimeError):
+class ProductionControlJournalUnavailable(RuntimeError):
     def __init__(self, detail: dict[str, Any]):
         self.detail = detail
         super().__init__(detail["reason"])
@@ -305,10 +304,10 @@ def _unavailable(
     db: Session,
     reason: str,
     truth: Mapping[str, Any] | None = None,
-) -> ProductionControlJournalSnapshotUnavailable:
+) -> ProductionControlJournalUnavailable:
     state = get_truth_state(db)
     detail: dict[str, Any] = {
-        "code": "production_control_journal_snapshot_unavailable",
+        "code": "production_control_journal_current_unavailable",
         "consumer": CONSUMER,
         "status": "unavailable",
         "truth_status": state.status,
@@ -318,7 +317,7 @@ def _unavailable(
     }
     if truth is not None:
         detail["truth"] = jsonable_encoder(dict(truth))
-    return ProductionControlJournalSnapshotUnavailable(detail)
+    return ProductionControlJournalUnavailable(detail)
 
 
 def _route_sheet_unavailable(
@@ -534,40 +533,6 @@ def _root_membership_by_row(
     return result
 
 
-def _persisted_candidate_matches(
-    db: Session,
-    *,
-    snapshot: models.PlanningReadSnapshot,
-    payload: Mapping[str, Any],
-    rows: Sequence[Mapping[str, Any]],
-    roots_by_row: Mapping[str, set[int]],
-) -> bool:
-    if (
-        snapshot.truth_status != "building"
-        or snapshot.reason is None
-        or snapshot.payload != dict(payload)
-    ):
-        return False
-    persisted = (
-        db.query(models.PlanningReadRow)
-        .filter(models.PlanningReadRow.snapshot_id == int(snapshot.id))
-        .order_by(models.PlanningReadRow.row_key.asc())
-        .all()
-    )
-    expected = {str(row["journal_row_key"]): dict(row) for row in rows}
-    if len(persisted) != len(expected):
-        return False
-    for row in persisted:
-        if (
-            row.row_kind not in ROW_KINDS
-            or row.payload != expected.get(str(row.row_key))
-            or int(row.item_id or -1) != int(row.payload.get("item_id") or -1)
-        ):
-            return False
-        actual_roots = {int(member.root_item_id) for member in row.root_members}
-        if actual_roots != set(roots_by_row.get(str(row.row_key), set())):
-            return False
-    return True
 
 
 def _candidate_business_identity(payload: Mapping[str, Any]) -> str:
@@ -646,7 +611,7 @@ def build_candidate_payload(
 
     The returned structure is the direct input to the compact current owner.
     Each row carries its exact root membership so runtime publication does not
-    need ``PlanningReadSnapshot``/``PlanningReadRootMember`` as an
+    need an
     intermediate owner.
     """
     _generation, payload, rows, roots_by_row = _build_candidate_components(
@@ -669,76 +634,6 @@ def build_candidate_payload(
     }
 
 
-def build_candidate_snapshot(
-    db: Session,
-    generation_id: int,
-    *,
-    accepted_run_ids: Sequence[int],
-) -> models.PlanningReadSnapshot:
-    generation, payload, rows, roots_by_row = _build_candidate_components(
-        db,
-        generation_id,
-        accepted_run_ids=accepted_run_ids,
-    )
-    existing = (
-        db.query(models.PlanningReadSnapshot)
-        .filter_by(
-            consumer=CONSUMER,
-            snapshot_key=SNAPSHOT_KEY,
-            ledger_generation_id=int(generation.id),
-        )
-        .one_or_none()
-    )
-    if existing is not None:
-        if not _persisted_candidate_matches(
-            db,
-            snapshot=existing,
-            payload=payload,
-            rows=rows,
-            roots_by_row=roots_by_row,
-        ):
-            raise ValueError("production-control journal candidate conflict")
-        return existing
-
-    snapshot = models.PlanningReadSnapshot(
-        consumer=CONSUMER,
-        snapshot_key=SNAPSHOT_KEY,
-        ledger_generation_id=int(generation.id),
-        cutoff=generation.cutoff,
-        truth_status="building",
-        reason="unpublished production-control journal",
-        payload=payload,
-        published_at=datetime.now(timezone.utc),
-    )
-    db.add(snapshot)
-    db.flush()
-    for position, payload_row in enumerate(rows):
-        row_key = str(payload_row["journal_row_key"])
-        row = models.PlanningReadRow(
-            snapshot_id=int(snapshot.id),
-            row_key=row_key,
-            row_kind=(
-                ROW_KIND
-                if payload_row.get("product_id") is not None
-                else PROPOSAL_ROW_KIND
-            ),
-            item_id=int(payload_row["item_id"]),
-            sort_key=f"{position:012d}",
-            payload=dict(payload_row),
-        )
-        db.add(row)
-        db.flush()
-        for root_item_id in sorted(roots_by_row.get(row_key, set())):
-            db.add(
-                models.PlanningReadRootMember(
-                    snapshot_id=int(snapshot.id),
-                    row_id=int(row.id),
-                    root_key=f"item:{root_item_id}",
-                    root_item_id=int(root_item_id),
-                )
-            )
-    db.flush()
-    return snapshot
 
 
 def validate_candidate_payload(
@@ -832,134 +727,8 @@ def validate_candidate_payload(
         product_ids.add(product_id)
 
 
-def validate_candidate_snapshot(
-    db: Session,
-    candidate: models.PlanningReadSnapshot,
-    generation: models.LedgerGeneration,
-) -> None:
-    payload = candidate.payload if isinstance(candidate.payload, dict) else None
-    meta = payload.get("meta") if payload else None
-    if (
-        not isinstance(meta, dict)
-        or meta.get("read_only") is not True
-        or int(meta.get("ledger_generation_id") or -1) != int(generation.id)
-        or meta.get("truth_status") != "building"
-    ):
-        raise ProductionControlJournalPromotionError(
-            "production-control journal candidate is missing or stale"
-        )
-    try:
-        expected_count = int(meta["row_count"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ProductionControlJournalPromotionError(
-            "production-control journal candidate row count is malformed"
-        ) from exc
-    rows = (
-        db.query(models.PlanningReadRow)
-        .filter(
-            models.PlanningReadRow.snapshot_id == int(candidate.id),
-            models.PlanningReadRow.row_kind.in_(ROW_KINDS),
-        )
-        .all()
-    )
-    if expected_count < 0 or len(rows) != expected_count:
-        raise ProductionControlJournalPromotionError(
-            "production-control journal candidate rows are incomplete"
-        )
-    product_ids: set[int] = set()
-    work_item_ids: set[int] = set()
-    for row in rows:
-        payload_row = row.payload if isinstance(row.payload, dict) else None
-        try:
-            item_id = int(payload_row["item_id"]) if payload_row else -1
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ProductionControlJournalPromotionError(
-                "production-control journal candidate row is malformed"
-            ) from exc
-        if row.row_kind == PROPOSAL_ROW_KIND:
-            try:
-                work_item_id = int(payload_row["work_item_id"]) if payload_row else -1
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ProductionControlJournalPromotionError(
-                    "production-control journal proposal row is malformed"
-                ) from exc
-            if (
-                item_id <= 0
-                or work_item_id <= 0
-                or work_item_id in work_item_ids
-                or payload_row.get("product_id") is not None
-                or payload_row.get("order_id") is not None
-                or payload_row.get("available_actions") != (
-                    # A MAKE proposal is materializable unless it is a welded
-                    # part of a weld→paint chain, which ``list_make_proposals``
-                    # marks with a ``selection_disabled_reason`` and an empty
-                    # action set (launch happens from the painted row).  The
-                    # promoter must accept that shape; requiring ``["materialize"]``
-                    # unconditionally rejected every chained welded proposal and
-                    # blocked the whole journal candidate promotion.
-                    []
-                    if payload_row.get("selection_disabled_reason")
-                    else ["materialize"]
-                )
-                or row.row_key != f"work-item:{work_item_id}"
-                or payload_row.get("journal_row_key") != row.row_key
-                or int(row.item_id or -1) != item_id
-            ):
-                raise ProductionControlJournalPromotionError(
-                    "production-control journal proposal row is malformed"
-                )
-            work_item_ids.add(work_item_id)
-            continue
-        try:
-            product_id = int(payload_row["product_id"]) if payload_row else -1
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ProductionControlJournalPromotionError(
-                "production-control journal candidate row is malformed"
-            ) from exc
-        if "_route_sheet_snapshot" not in payload_row:
-            raise ProductionControlJournalPromotionError(
-                "production-control journal candidate row is missing route-sheet snapshot"
-            )
-        _route_sheet_payload_value(payload_row, product_id=product_id)
-        if (
-            product_id <= 0
-            or item_id <= 0
-            or product_id in product_ids
-            or row.row_key != f"product:{product_id}"
-            or payload_row.get("journal_row_key") != row.row_key
-            or int(row.item_id or -1) != item_id
-        ):
-            raise ProductionControlJournalPromotionError(
-                "production-control journal candidate row is malformed"
-            )
-        product_ids.add(product_id)
 
 
-def promote_candidate_snapshot(
-    db: Session,
-    *,
-    generation: models.LedgerGeneration,
-    accepted_at: datetime,
-) -> models.PlanningReadSnapshot | None:
-    candidate = (
-        db.query(models.PlanningReadSnapshot)
-        .filter(
-            models.PlanningReadSnapshot.consumer == CONSUMER,
-            models.PlanningReadSnapshot.snapshot_key == SNAPSHOT_KEY,
-            models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
-            models.PlanningReadSnapshot.truth_status == "building",
-            models.PlanningReadSnapshot.cutoff == generation.cutoff,
-        )
-        .one_or_none()
-    )
-    if candidate is None:
-        return None
-    validate_candidate_snapshot(db, candidate, generation)
-    candidate.truth_status = "accepted"
-    candidate.reason = None
-    candidate.published_at = accepted_at
-    db.flush()
-    return candidate
 
 
 def read_route_sheet_snapshot_rows(
@@ -1093,172 +862,6 @@ def read_route_sheet_snapshot_rows(
     return ordered
 
 
-def _read_snapshot_from_snapshots(
-    db: Session,
-    *,
-    product_id: int | None = None,
-    order_id: int | None = None,
-    root_item_id: int | None = None,
-    workshop_id: int | None = None,
-    status: str | None = None,
-    coverage_status: str | None = None,
-    planning_contour: str | None = None,
-    launch_source: str | None = None,
-    search: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    sort_by: str | None = None,
-    sort_dir: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> dict[str, Any]:
-    try:
-        snapshot = get_latest_read_snapshot(
-            db,
-            consumer=CONSUMER,
-            snapshot_key=SNAPSHOT_KEY,
-            required_capabilities=REQUIRED,
-        )
-    except PlanningTruthUnavailable as exc:
-        raise _unavailable(db, str(exc), exc.as_dict()) from exc
-    if snapshot is None:
-        raise _unavailable(
-            db,
-            "accepted production-control journal snapshot is missing",
-        )
-    payload = snapshot.payload if isinstance(snapshot.payload, dict) else None
-    meta = payload.get("meta") if payload else None
-    if (
-        not isinstance(meta, dict)
-        or meta.get("read_only") is not True
-        or int(meta.get("ledger_generation_id") or -1)
-        != int(snapshot.ledger_generation_id)
-    ):
-        raise _unavailable(
-            db,
-            "accepted production-control journal snapshot is malformed",
-        )
-
-    query = db.query(models.PlanningReadRow).filter(
-        models.PlanningReadRow.snapshot_id == int(snapshot.id),
-        models.PlanningReadRow.row_kind.in_(ROW_KINDS),
-    )
-    row_payload = models.PlanningReadRow.payload
-    # Completion is mutable execution state read back from 1C.  The accepted
-    # planning row remains immutable, but a completed live order must disappear
-    # immediately and must not distort pagination while the next generation is
-    # being built.
-    completed_order_ids = select(models.ProductionOrder.order_id).where(
-        func.lower(func.coalesce(models.ProductionOrder.order_state_key, ""))
-        == DONE_STATE_KEY
-    )
-    order_id_expr = row_payload["order_id"].as_integer()
-    query = query.filter(
-        or_(
-            order_id_expr.is_(None),
-            order_id_expr.notin_(completed_order_ids),
-        )
-    )
-    if product_id is not None:
-        query = query.filter(row_payload["product_id"].as_integer() == int(product_id))
-    if order_id is not None:
-        query = query.filter(row_payload["order_id"].as_integer() == int(order_id))
-    if root_item_id is not None:
-        query = query.join(
-            models.PlanningReadRootMember,
-            models.PlanningReadRootMember.row_id == models.PlanningReadRow.id,
-        ).filter(
-            models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
-            models.PlanningReadRootMember.root_item_id == int(root_item_id),
-        )
-    if workshop_id is not None:
-        query = query.filter(
-            row_payload["workshop_id"].as_integer() == int(workshop_id)
-        )
-    if status:
-        values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
-        query = query.filter(row_payload["status"].as_string().in_(values))
-    if coverage_status:
-        query = query.filter(
-            row_payload["coverage_status"].as_string() == str(coverage_status)
-        )
-    if planning_contour:
-        contour = str(planning_contour).strip().lower()
-        if contour not in {"mrp", "1c"}:
-            raise ValueError("unknown planning_contour")
-        query = query.filter(row_payload["order_source"].as_string() == contour)
-    if launch_source:
-        query = query.filter(
-            row_payload["launch_source"].as_string() == str(launch_source).strip()
-        )
-    if search and search.strip():
-        pattern = f"%{search.strip()}%"
-        query = query.filter(
-            or_(
-                row_payload["order_number"].as_string().ilike(pattern),
-                row_payload["item_name"].as_string().ilike(pattern),
-                row_payload["item_article"].as_string().ilike(pattern),
-                row_payload["item_code"].as_string().ilike(pattern),
-            )
-        )
-    if date_from:
-        query = query.filter(row_payload["order_date"].as_string() >= str(date_from))
-    if date_to:
-        query = query.filter(row_payload["order_date"].as_string() <= str(date_to))
-
-    total = int(query.with_entities(func.count(models.PlanningReadRow.id)).scalar() or 0)
-    effective_limit = max(1, min(int(limit or 100), 500))
-    requested_offset = max(0, int(offset or 0))
-    max_offset = (
-        max(0, ((total - 1) // effective_limit) * effective_limit)
-        if total
-        else 0
-    )
-    effective_offset = min(requested_offset, max_offset)
-    sort_field = str(sort_by or "").strip().lower()
-    descending = str(sort_dir or "").strip().lower() == "desc"
-    if sort_field in {
-        "planned_start_date", "planned_finish_date", "readiness_need_date",
-        "readiness_action_date", "readiness_priority_key",
-    }:
-        expression = row_payload[sort_field].as_string()
-        ordering = expression.desc() if descending else expression.asc()
-        query = query.order_by(
-            case((expression.is_(None), 1), else_=0),
-            ordering,
-            row_payload["order_number"].as_string().asc(),
-            row_payload["line_number"].as_integer().asc(),
-        )
-    else:
-        query = query.order_by(
-            row_payload["order_date"].as_string().desc(),
-            row_payload["order_number"].as_string().asc(),
-            row_payload["line_number"].as_integer().asc(),
-        )
-    records = query.offset(effective_offset).limit(effective_limit).all()
-    public_rows = []
-    for record in records:
-        row = _public_journal_row(record.payload)
-        # Internal generation-scoped material details are consumed by the
-        # dedicated /materials reader.  They are not part of the public journal
-        # row contract and must never leak through its strict response model.
-        public_rows.append(row)
-    # Заказ, открытый после cutoff этого поколения, в снимок попасть не мог.
-    # Накладываем исполнительный факт на строку-предложение, иначе оператор
-    # видит «Не создан» по уже существующему документу 1С.  Плановые величины
-    # строки при этом остаются снимочными.
-    overlay_launch_facts(
-        db, public_rows, cutoff=_generation_cutoff(db, snapshot.ledger_generation_id)
-    )
-    overlay_execution_state(db, public_rows)
-    return {
-        "rows": public_rows,
-        "total": total,
-        "limit": effective_limit,
-        "offset": effective_offset,
-        "latest_run_id": meta.get("latest_run_id"),
-        "latest_source_plan_id": meta.get("latest_source_plan_id"),
-    }
 
 
 def read_snapshot(
