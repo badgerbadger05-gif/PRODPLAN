@@ -478,6 +478,30 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert queue.payload["total_queue_qty"] == 5.0
 
 
+def test_obligation_refresh_publishes_purchase_current_without_purchase_snapshot(
+    db_session,
+):
+    accepted, _plan, _line, _item, parent, _cutoff = _world(
+        db_session,
+        with_parent=True,
+        qty=5,
+    )
+
+    result = _run(db_session, accepted, "orch-purchase-current-direct")
+    target = db_session.get(models.LedgerGeneration, result.target_generation_id)
+
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id,
+        consumer="purchase_control_journal",
+    ).count() == 0
+    manifest = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    ).one()
+    assert manifest.source_generation_id == target.id
+    assert manifest.source_revision == f"accepted:g{target.id}:purchase_control_journal"
+
+
 def test_single_stage_reuses_execution_batch_with_reservation_consumption_algorithm_version(
     db_session,
 ):

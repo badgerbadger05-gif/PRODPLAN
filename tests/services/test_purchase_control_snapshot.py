@@ -502,7 +502,7 @@ def test_list_journal_searches_buy_rows_by_item_article(db_session):
         row_keys=[result["rows"][0]["row_key"]],
     )
     assert selection == {
-        "snapshot_id": int(result["meta"]["snapshot_id"]),
+        "current_scope_id": int(result["meta"]["snapshot_id"]),
         "selected_rows": 1,
         "priced_rows": 1,
         "unpriced_rows": 0,
