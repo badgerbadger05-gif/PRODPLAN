@@ -148,7 +148,22 @@ def _accept(db, generation):
 
 
 def _publish_current(db, generation):
-    publish_current_obligation_views_from_generation(db, int(generation.id))
+    # The accepted fixture already contains the canonical candidate payload
+    # built while the generation was BUILDING.  Feed that evidence directly
+    # to the runtime publisher; never make the runtime publisher rediscover a
+    # historical snapshot on its own.
+    snapshot = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "accepted",
+    ).one()
+    payload = dict(snapshot.payload or {})
+    publish_current_obligation_views_from_generation(
+        db,
+        int(generation.id),
+        purchase_payload=payload,
+    )
     db.flush()
 
 
