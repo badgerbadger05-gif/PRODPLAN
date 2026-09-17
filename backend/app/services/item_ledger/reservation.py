@@ -21,6 +21,56 @@ BUY = "buy"
 REWORK = "rework"
 
 
+def reservation_business_identity(requirement_id: int, realization_mode: str) -> str:
+    """Stable obligation identity; generation is deliberately excluded."""
+    value = f"reservation:req:{int(requirement_id)}:mode:{str(realization_mode or '').strip()}"
+    if len(value) > 256:
+        raise ValueError("reservation business identity exceeds 256 characters")
+    return value
+
+
+def reservation_event_identity(
+    entry: models.ReservationEntry,
+    *,
+    event_kind: str,
+    reserved_delta: Number,
+    realized_delta: Number,
+    sle_id: int | None,
+    fact_ref: str,
+    fact_line_ref: str,
+    match_rule: str,
+) -> str:
+    """Stable semantic event identity, excluding generation/cycle/idempotency."""
+    import hashlib
+
+    def _qty(value: Number) -> str:
+        return format(_dec(value).quantize(Decimal("0.001")), "f")
+
+    raw = "|".join((
+        reservation_business_identity(int(entry.requirement_id), str(entry.realization_mode)),
+        str(event_kind or ""),
+        str(int(sle_id)) if sle_id is not None else "",
+        str(fact_ref or "").strip(),
+        str(fact_line_ref or "").strip(),
+        _qty(reserved_delta),
+        _qty(realized_delta),
+        str(match_rule or "").strip(),
+    ))
+    if len(raw) <= 320:
+        return raw
+    return f"{raw[:255]}|sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def reservation_event_origin_kind(
+    *, event_kind: str, realized_delta: Number, sle_id: int | None
+) -> str:
+    if sle_id is None and _dec(realized_delta) == 0:
+        return "obligation"
+    if str(event_kind or "") == "unrealize" or _dec(realized_delta) < 0:
+        return "correction"
+    return "factual"
+
+
 def _dec(value: Number) -> Decimal:
     if isinstance(value, Decimal):
         return value
@@ -122,9 +172,17 @@ def fold_reservation_entry(
         models.ReservationEvent.reservation_id == reservation_id,
     )
     if entry is not None:
-        event_query = event_query.filter(
-            models.ReservationEvent.ledger_generation_id == entry.ledger_generation_id,
-        )
+        if bool(getattr(entry, "is_current", False)):
+            # A stable owner may retain factual events whose source generation
+            # predates the current publication.  The current flag, not that
+            # provenance value, defines the accepted fold.
+            event_query = event_query.filter(
+                models.ReservationEvent.is_current.is_(True),
+            )
+        else:
+            event_query = event_query.filter(
+                models.ReservationEvent.ledger_generation_id == entry.ledger_generation_id,
+            )
 
     events = (
         event_query
@@ -160,6 +218,34 @@ def append_realization_event(
     event_kind: str | None = None,
 ) -> bool:
     generation_id = int(entry.ledger_generation_id)
+    resolved_kind = event_kind or ("realize" if _dec(realized_delta) >= 0 else "unrealize")
+    delta = _dec(realized_delta)
+    if reserved_delta is None:
+        seeded_query = session.query(models.ReservationEvent.id).filter(
+            models.ReservationEvent.reservation_id == int(entry.id),
+            models.ReservationEvent.origin_kind == "obligation",
+        )
+        if not bool(getattr(entry, "is_current", False)):
+            seeded_query = seeded_query.filter(
+                models.ReservationEvent.ledger_generation_id == generation_id,
+            )
+        seeded = seeded_query.first() is not None
+        reserved_delta = Decimal("0") if seeded else _dec(entry.reserved_qty)
+    event_identity = reservation_event_identity(
+        entry,
+        event_kind=resolved_kind,
+        reserved_delta=reserved_delta,
+        realized_delta=delta,
+        sle_id=sle_id,
+        fact_ref=fact_ref,
+        fact_line_ref=fact_line_ref,
+        match_rule=match_rule,
+    )
+    if session.query(models.ReservationEvent.id).filter(
+        models.ReservationEvent.event_identity == event_identity,
+        models.ReservationEvent.reservation_id == int(entry.id),
+    ).first() is not None:
+        return False
     exists = (
         session.query(models.ReservationEvent.id)
         .filter(
@@ -170,7 +256,6 @@ def append_realization_event(
     )
     if exists is not None:
         return False
-    delta = _dec(realized_delta)
     if sle_id is not None and delta != 0:
         sle = session.get(models.StockLedgerEntry, int(sle_id))
         if sle is None:
@@ -233,7 +318,7 @@ def append_realization_event(
             characteristic_ref=str(entry.characteristic_ref or ""),
             organization_ref=str(entry.organization_ref or ""),
             planning_stock_pool=str(entry.planning_stock_pool or "default"),
-            event_kind=event_kind or ("realize" if delta >= 0 else "unrealize"),
+            event_kind=resolved_kind,
             reserved_delta=_dec(reserved_delta),
             realized_delta=delta,
             sle_id=int(sle_id) if sle_id is not None else None,
@@ -242,6 +327,11 @@ def append_realization_event(
             match_rule=str(match_rule or ""),
             cycle_id=str(cycle_id or ""),
             idempotency_key=str(idempotency_key),
+            event_identity=event_identity,
+            origin_kind=reservation_event_origin_kind(
+                event_kind=resolved_kind, realized_delta=delta, sle_id=sle_id,
+            ),
+            is_current=bool(getattr(entry, "is_current", False)),
             event_at=event_at or datetime.now(timezone.utc),
         )
     )

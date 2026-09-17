@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 
@@ -386,6 +386,7 @@ def get_future_supply(
     rows = (
         db.query(models.LedgerFutureSupplyCurrent)
         .filter(
+                models.LedgerFutureSupplyCurrent.source_generation_id == int(truth.generation_id),
             models.LedgerFutureSupplyCurrent.item_id == int(item_id),
             models.LedgerFutureSupplyCurrent.evidence_status == "exact",
             models.LedgerFutureSupplyCurrent.open_qty_at_cutoff > EPS,
@@ -609,7 +610,13 @@ def get_reservations(
 
     q = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.item_id == int(item_id),
-        models.ReservationEntry.ledger_generation_id == generation_id,
+        or_(
+            models.ReservationEntry.is_current.is_(True),
+            and_(
+                models.ReservationEntry.current_identity == "",
+                models.ReservationEntry.ledger_generation_id == generation_id,
+            ),
+        ),
     )
     if status is not None:
         q = q.filter(models.ReservationEntry.lifecycle_status == status)
@@ -706,7 +713,13 @@ def get_reservation_events(
         db.query(models.ReservationEntry)
         .filter(
             models.ReservationEntry.id == int(reservation_id),
-            models.ReservationEntry.ledger_generation_id == generation_id,
+            or_(
+                models.ReservationEntry.is_current.is_(True),
+                and_(
+                    models.ReservationEntry.current_identity == "",
+                    models.ReservationEntry.ledger_generation_id == generation_id,
+                ),
+            ),
         )
         .one_or_none()
     )
@@ -719,7 +732,10 @@ def get_reservation_events(
         db.query(models.ReservationEvent)
         .filter(
             models.ReservationEvent.reservation_id == int(reservation_id),
-            models.ReservationEvent.ledger_generation_id == generation_id,
+            or_(
+                models.ReservationEvent.is_current.is_(True),
+                models.ReservationEvent.ledger_generation_id == generation_id,
+            ),
         )
         .order_by(
             models.ReservationEvent.event_at.asc(),

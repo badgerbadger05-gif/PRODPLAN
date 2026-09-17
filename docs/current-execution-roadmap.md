@@ -214,16 +214,21 @@ flowchart TD
 
 **Выход:** каждый затронутый экран и команда используют одну модель исполнения; нет fallback к историческому снимку. Экспортные тесты не вызывают настоящую 1С.
 
-### R10. Миграция и удаление старого контура
+### R10. Миграция и поэтапное удаление старого контура
 
-**Результат:** проверенный переход существующих данных и удалённая архитектура полных поколений.
+**Результат:** проверенный bootstrap current owner без исторического WAL-взрыва;
+удаление полных поколений выполняется отдельной будущей GC-волной после
+cutover зависимых projections.
 
 Работы:
 - Rehearsal миграции на локальном наборе с историческими копиями, бизнес-заменами, закрытыми планами и экспортными связями.
 - Сформировать preflight и детальный манифест: какие данные сохраняются/переносятся/удаляются, сколько строк и почему, какие зависимости неизвестны.
 - Проверить старые ID → устойчивые ID, FK и JSON-ссылки, source supersession, frozen-базисы, историю закрытий и основания внешних действий.
-- Зафиксировать границы остановки писателей, применить миграцию, проверить postflight; повтор запуска должен быть предсказуемым.
-- Удалить неиспользуемые generation-fork/carry/snapshot paths и документацию, индексы/таблицы без читателей. Не оставлять старый runtime «на всякий случай».
+- Зафиксировать границы остановки писателей, применить bootstrap-миграцию только к exact accepted pointer, проверить postflight; повтор запуска должен быть предсказуемым.
+- Не выполнять в bootstrap-миграции исторический rebind/delete/archive: старые rows остаются `legacy` и недоступны runtime. Удаление generation-fork/carry/snapshot paths и compact GC archive — отдельная будущая волна с доказанными зависимостями.
+- После `20260914_01` bounded `20260914_02` сохраняет compatibility owner только для exact accepted generation и active BUILDING staging. После успешной публикации current execution старые non-building projection copies удаляются set-based в FK-safe порядке; `ledger_generation` и reservation/history GC в этой волне не выполняются.
+- `20260914_02` разрешает необратимое удаление только при операторском PostgreSQL session guard `prodplan.execution_projection_backup_ready=on`; one-off R10 apply сначала публикует полный execution contour (assembly/readiness/drum включая excluded и shelf), затем obligation scopes и postflight проверяет все семь execution manifests.
+- Accepted-generation GC/reclaim остаётся отдельным пунктом 4: `tools/accepted_generation_gc.py` сначала создаёт read-only manifest с exact candidate IDs и FK blockers, затем guarded local apply архивирует reservation events и удаляет только proven historical rows. Physical `pg_repack`/`VACUUM FULL` выполняются только отдельной explicit phase.
 - Отдельно репетировать возврат места и восстановление из контрольной копии; DELETE не считается доказательством уменьшения файла БД.
 - Локальный storage rehearsal `tools/r10_storage_rehearsal.py` создаёт только
   disposable schema, проверяет custom-format dump/restore, SHA-256, stable IDs

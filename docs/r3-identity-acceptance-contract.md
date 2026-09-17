@@ -7,10 +7,13 @@
 ## Схема и владельцы
 
 * `StockLedgerEntry.business_identity` — стабильный ключ движения
-  `movement:<recorder_type>:<recorder_ref>:<line_no>`. Поколение и batch —
-  только provenance. `stock_ledger_business_identity_map` хранит явное ребро
-  для каждой исторической копии; migration mapping не выбирает «последнюю
-  строку».
+  `movement:<recorder_type>:<recorder_ref>:<line_no>`. Для synthetic
+  `cutoff_balance_adjustment` в ключ входят snap `content_hash` и digest
+  полного physical key: один synthetic recorder может содержать несколько
+  ячеек с line `0`, а последовательные snap revisions могут затронуть одну
+  ячейку. Поколение и batch ID — только provenance. `stock_ledger_business_identity_map`
+  хранит явное ребро для каждой исторической копии; migration mapping не
+  выбирает «последнюю строку».
 * `PhysicalImportPage` и поля completeness на `PhysicalImportBatch` отделяют
   получение страниц источника от `LedgerGeneration`. Публикация возможна
   только при полном непрерывном наборе страниц в порядке источника.

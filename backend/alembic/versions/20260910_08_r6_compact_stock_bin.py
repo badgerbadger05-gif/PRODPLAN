@@ -58,12 +58,14 @@ def _deduplicate(bind) -> None:
                     f"R6 StockBin migration ambiguous for physical key {key}: "
                     f"expected one row for accepted generation {current}, found {len(selected)}"
                 )
-            if len(selected) == 0 and any(
-                row["generation_status"] != "building" for row in candidates
-            ):
-                raise RuntimeError(
-                    f"R6 StockBin migration missing accepted row for physical key {key}"
-                )
+            if len(selected) == 0:
+                # A key present only in historical accepted/failed copies is
+                # absent from the current accepted fold.  StockBin has no
+                # zero-row owner: retaining or synthesising one would invent
+                # a physical fact.  The cleanup below removes non-BUILDING
+                # historical copies; any BUILDING copy remains explicit
+                # staging.  Do not choose a latest historical heuristic.
+                continue
 
 
 def upgrade() -> None:

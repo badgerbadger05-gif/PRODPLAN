@@ -37,6 +37,7 @@ from .future_supply_capture import (
     replace_future_supply_capture,
     carry_forward_future_supply,
     verify_future_supply_capture,
+    publish_current_future_supply,
 )
 from .supplier_future_supply import supplier_future_supply_evidence
 from .physical import canonical_content_hash
@@ -74,6 +75,7 @@ from app.services.mrp_result_projection import build_mrp_result_current_payload
 
 
 logger = logging.getLogger(__name__)
+
 
 # 1C permits editing a posted supplier document behind the accepted cutoff, so a
 # handful of receipts can legitimately fail provenance verification at any time.
@@ -604,15 +606,49 @@ def _reservation_fold_checkpoint(
             reserved + _d(event.reserved_delta),
             realized + _d(event.realized_delta),
         )
+    # R4 canon: replenishment receipts of ``buy`` reservations are owned by the
+    # current replenishment writer (``reservation_consumption_allocation`` rows
+    # with ``allocation_role='replenishment_receipt'``), not by ReservationEvent.
+    # The accepted cache is ``min(events + current receipt allocations, required)``.
+    from sqlalchemy import func as _sa_func
+
+    r4_received_by_entry: dict[int, Decimal] = {}
+    entry_ids = list(entry_by_id)
+    for start in range(0, len(entry_ids), 5000):
+        chunk = entry_ids[start:start + 5000]
+        for reservation_id, allocated in db.query(
+            models.ReservationConsumptionAllocation.reservation_id,
+            _sa_func.coalesce(_sa_func.sum(models.ReservationConsumptionAllocation.allocated_qty), 0),
+        ).filter(
+            models.ReservationConsumptionAllocation.reservation_id.in_(chunk),
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.allocation_role == "replenishment_receipt",
+        ).group_by(models.ReservationConsumptionAllocation.reservation_id).all():
+            r4_received_by_entry[int(reservation_id)] = _d(allocated)
     for entry in entries:
         reserved, realized = event_sums[int(entry.id)]
+        if int(entry.id) in r4_received_by_entry:
+            realized = min(
+                max(realized + r4_received_by_entry[int(entry.id)], Decimal("0")),
+                _d(entry.replenishment_required_qty),
+            )
         if (
             reserved != _d(entry.reserved_qty)
             or realized != _d(entry.realized_qty)
             or realized != _d(entry.replenishment_received_qty)
         ):
+            detail = "; ".join(
+                f"e{int(ev.id)}:{ev.event_kind}/{ev.origin_kind}:r{_d(ev.reserved_delta)}:z{_d(ev.realized_delta)}"
+                f":sle{ev.sle_id}:{ev.match_rule}:{str(ev.cycle_id or '')[:40]}"
+                for ev in events if int(ev.reservation_id) == int(entry.id)
+            )
             raise GenerationValidationError(
-                f"reservation {entry.id} cache differs from event fold"
+                f"reservation {entry.id} cache differs from event fold "
+                f"(identity={entry.current_identity!r} req={entry.requirement_id} mode={entry.realization_mode} "
+                f"cache reserved={_d(entry.reserved_qty)} realized={_d(entry.realized_qty)} "
+                f"received={_d(entry.replenishment_received_qty)}; fold reserved={reserved} realized={realized} "
+                f"r4_received={r4_received_by_entry.get(int(entry.id))}; "
+                f"events=[{detail}])"
             )
         covered = _d(entry.covered_from_stock_at_freeze_qty)
         replenishment_required = _d(entry.replenishment_required_qty)
@@ -1026,6 +1062,9 @@ def validate_generation_build(
         f"historical-obligations:g{generation.id}",
         f"historical-replay:g{generation.id}",
     }
+    # Incremental physical refresh carries the accepted realization stream into
+    # bounded staging before applying only the new physical delta.
+    allowed_reservation_cycles.add(f"obligation-carry:g{generation.id}")
     supplier_cycle_prefix = f"historical-supplier:g{generation.id}:"
 
     def _is_allowed_cycle(cycle_id: str) -> bool:
@@ -1313,6 +1352,14 @@ def _publish_accepted_generation_current_state(
         generation,
         expected_parent_id=expected_parent_id,
     )
+    # Publish future supply only after the accepted truth pointer has switched;
+    # this atomically replaces the compact owner and prunes bounded staging.
+    try:
+        publish_current_future_supply(db, int(generation.id))
+    except FutureSupplyCaptureError as exc:
+        raise GenerationValidationError(
+            f"future supply current publication failed: {exc}"
+        ) from exc
     # R3 explicit business pointer: current reads must not traverse sealed
     # generation/prior-run ancestry.  The pointer update is in this same
     # caller-owned publication transaction.
@@ -1365,7 +1412,9 @@ def accept_generation_build(
             future_supply = _zero_future_supply_capture(db, generation)
         obligations = materialize_historical_obligations(db, int(generation.id))
         replay = run_historical_replay(
-            db, int(generation.id), replay_from=replay_from
+            db,
+            int(generation.id),
+            replay_from=replay_from,
         )
         try:
             consumption_batch = models.LedgerBuildBatch(
@@ -1560,6 +1609,8 @@ def accept_generation_build(
             replenishment_batch.status = "completed"
             replenishment_batch.metrics = replenishment_work_items
             replenishment_batch.completed_at = datetime.now(timezone.utc)
+            from .reservation_current import publish_current_reservations
+            publish_current_reservations(db, generation_id=int(generation.id))
             purchase_journal_payload = build_purchase_journal_payload(
                 db, int(generation.id)
             )
@@ -1642,6 +1693,13 @@ def accept_generation_build(
             period_payloads=period_payloads,
             period_run_ids=fixed_run_ids,
         )
+        # Current execution and obligation owners are now complete.  Retain
+        # only the exact accepted compatibility generation plus active BUILDING
+        # staging; a failure aborts this caller-owned publication transaction.
+        from .execution_projection_retention import (
+            prune_retired_execution_projections,
+        )
+        prune_retired_execution_projections(db, int(generation.id))
     return {
         **validation,
         "status": "accepted",

@@ -717,7 +717,21 @@ def _exact_retry(
             snapshot_metrics=snapshot_metrics,
         )
     except ObligationRefreshPublishError:
-        return None
+        # Successful publication removes bounded generation staging.  An
+        # exact retry must therefore accept the compact current owner as the
+        # proof, while still rejecting a target whose current owner belongs to
+        # another generation or whose declared capture was non-empty but is
+        # now absent.
+        current_rows = db.query(models.LedgerFutureSupplyCurrent).all()
+        expected_rows = int(snapshot_metrics.get("rows", -1))
+        if current_rows:
+            if any(
+                int(row.source_generation_id) != int(target.id)
+                for row in current_rows
+            ):
+                return None
+        elif expected_rows != 0:
+            return None
     try:
         journal_payload = _validate_purchase_candidate_payload(
             target,
@@ -1062,6 +1076,13 @@ def publish_obligation_refresh_batch(
         mrp_payloads=direct_mrp_payloads,
         period_payloads=direct_period_payloads,
     )
+    # The accepted current owner is fully published before retired projection
+    # copies are removed.  Cleanup is in this same transaction and therefore
+    # cannot leave a partially published refresh visible.
+    from .item_ledger.execution_projection_retention import (
+        prune_retired_execution_projections,
+    )
+    prune_retired_execution_projections(db, int(target.id))
     try:
         db.flush()
     except IntegrityError as exc:

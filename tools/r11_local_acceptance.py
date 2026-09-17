@@ -737,7 +737,12 @@ def compare_budget(metrics: Mapping[str, Any], *, budget_path: str | Path = DEFA
     budget = _load_budget(budget_path)["budgets"]
     missing: list[str] = []
     values: dict[str, float] = {}
-    for key in ("api_p95_ms", "current_publish_p95_ms"):
+    for key in (
+        "api_p95_ms",
+        "current_publish_p95_ms",
+        "physical_refresh_seconds",
+        "physical_refresh_replayed_rows",
+    ):
         if key not in metrics or metrics[key] is None:
             missing.append(key)
             continue
@@ -750,6 +755,8 @@ def compare_budget(metrics: Mapping[str, Any], *, budget_path: str | Path = DEFA
     checks = {
         "api_p95_ms": "api_p95_ms" in values and values["api_p95_ms"] <= float(budget["api_p95_ms"]),
         "current_publish_p95_ms": "current_publish_p95_ms" in values and values["current_publish_p95_ms"] <= float(budget["current_publish_p95_ms"]),
+        "physical_refresh_seconds": "physical_refresh_seconds" in values and values["physical_refresh_seconds"] <= float(budget["physical_refresh_seconds_max"]),
+        "physical_refresh_replayed_rows": "physical_refresh_replayed_rows" in values and values["physical_refresh_replayed_rows"] <= float(budget["physical_refresh_replayed_rows_max"]),
     }
     return {"within_budget": not missing and all(checks.values()), "checks": checks, "missing_metrics": missing}
 

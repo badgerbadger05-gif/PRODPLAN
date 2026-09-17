@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import hashlib
 import math
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi.encoders import jsonable_encoder
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app import models
 from app.services.item_ledger.reservation import (
     replenishment_execution_pct,
     replenishment_remaining,
+    reservation_business_identity,
 )
 from app.services.planning_truth import (
     CAPABILITY_PHYSICAL_LEDGER,
@@ -24,6 +28,7 @@ from app.services.planning_truth import (
 from app.services.odata_config import load_odata_config as _load_odata_config
 from app.services.production_control_common import to_float_strict as _to_float
 from app.services.supplier_order_status import phase_value, state_counts_in_mrp
+from app.services.item_ledger.future_supply_read import future_supply_model
 
 
 CONSUMER = "purchase_control_journal"
@@ -63,6 +68,10 @@ class PurchaseJournalUnavailable(RuntimeError):
 
     def as_dict(self):
         return dict(self.detail)
+
+
+class PurchaseControlCompactPayloadError(ValueError):
+    """Bounded compact purchase payload is unavailable or ambiguous."""
 
 
 def _unavailable(db: Session, reason: str, truth: dict[str, Any] | None = None):
@@ -196,6 +205,43 @@ def _clean_ref(value: Any) -> str:
     return str(value).strip()
 
 
+def _supplier_current_row_key(
+    current_identity: Any,
+    *,
+    supply_kind: Any = "supplier_order",
+    source_ref: Any = "",
+    source_line_ref: Any = "",
+    source_local_id: Any = "",
+) -> str:
+    """Encode the stable Ledger supply identity into the journal key.
+
+    The ORM contract caps ``current_identity`` at 256 characters while the
+    journal keeps its historical ``ledger-supply:`` namespace.  Preserve the
+    identity verbatim for normal captures and use a deterministic digest only
+    for the bounded edge case.
+    """
+    identity = _clean_ref(current_identity)
+    # Compatibility for pre-R7 fixtures/captures that predate the populated
+    # column.  This is the same exact-source identity used by capture; it is
+    # stable across physical generation rows and never uses ``supply.id``.
+    if not identity and _clean_ref(source_ref) and _clean_ref(source_line_ref):
+        identity = ":".join(
+            (
+                _clean_ref(supply_kind),
+                _clean_ref(source_ref),
+                _clean_ref(source_line_ref),
+                _clean_ref(source_local_id),
+            )
+        )
+    if not identity:
+        raise ValueError("LedgerFutureSupply supplier-order current identity is missing")
+    prefix = "ledger-supply:"
+    if len(identity) <= 256 - len(prefix):
+        return f"{prefix}{identity}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{prefix}sha256:{digest}"
+
+
 def _overdue_days(need_date_iso: Any, cutoff_date: date | None) -> int:
     """Days the demand date is already in the past at the truth cutoff.
 
@@ -283,6 +329,8 @@ def open_supplier_coverage_by_reservation(
     db: Session,
     generation_id: int,
     entries: list[tuple[Any, Any, Any]],
+    *,
+    affected_scopes: Sequence[tuple[int, str, str, str, str]] | None = None,
 ) -> tuple[dict[int, float], dict[int, list[dict[str, Any]]]]:
     """Allocate frozen supplier-order remainder to active BUY reservations.
 
@@ -308,17 +356,33 @@ def open_supplier_coverage_by_reservation(
         )
 
     supplies: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    future_supply = future_supply_model(db, int(generation_id))
+    supply_query = db.query(future_supply).filter(
+        future_supply.ledger_generation_id == int(generation_id),
+        future_supply.supply_kind == "supplier_order",
+        future_supply.evidence_status == "exact",
+        future_supply.open_qty_at_cutoff > _EPS_FLOAT,
+    )
+    if affected_scopes is not None:
+        item_pool_pairs = sorted({
+            (int(scope[0]), _clean_ref(scope[3]))
+            for scope in affected_scopes
+        })
+        if item_pool_pairs:
+            supply_query = supply_query.filter(or_(*(
+                and_(
+                    future_supply.item_id == item_id,
+                    future_supply.planning_stock_pool == pool,
+                )
+                for item_id, pool in item_pool_pairs
+            )))
+        else:
+            supply_query = supply_query.filter(future_supply.id < 0)
     for supply in (
-        db.query(models.LedgerFutureSupply)
-        .filter(
-            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
-            models.LedgerFutureSupply.supply_kind == "supplier_order",
-            models.LedgerFutureSupply.evidence_status == "exact",
-            models.LedgerFutureSupply.open_qty_at_cutoff > _EPS_FLOAT,
-        )
+        supply_query
         .order_by(
-            models.LedgerFutureSupply.eta_date.asc(),
-            models.LedgerFutureSupply.id.asc(),
+            future_supply.eta_date.asc(),
+            future_supply.id.asc(),
         )
         .all()
     ):
@@ -343,14 +407,11 @@ def open_supplier_coverage_by_reservation(
         return {}, {}
 
     requirement_ids = sorted(reservation_by_requirement)
-    claims = (
-        db.query(models.MrpFreezeAllocation)
-        .filter(
-            models.MrpFreezeAllocation.requirement_id.in_(requirement_ids),
-            models.MrpFreezeAllocation.source_type == "supplier_order",
-        )
-        .all()
+    claims_query = db.query(models.MrpFreezeAllocation).filter(
+        models.MrpFreezeAllocation.requirement_id.in_(requirement_ids),
+        models.MrpFreezeAllocation.source_type == "supplier_order",
     )
+    claims = claims_query.all()
     claims.sort(
         key=lambda allocation: (
             reservation_by_requirement[int(allocation.requirement_id)].priority_period_from,
@@ -489,16 +550,31 @@ def open_supplier_coverage_by_reservation(
 def _build_supplier_card_rows(
     db: Session,
     generation: models.LedgerGeneration,
+    *,
+    affected_scopes: Sequence[tuple[int, str, str, str, str]] | None = None,
+    cutoff_date: date | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    supplies = (
-        db.query(models.LedgerFutureSupply, models.Item)
-        .join(models.Item, models.Item.item_id == models.LedgerFutureSupply.item_id)
+    effective_cutoff_date = cutoff_date or generation.cutoff.date()
+    future_supply = future_supply_model(db, int(generation.id))
+    supply_query = (
+        db.query(future_supply, models.Item)
+        .join(models.Item, models.Item.item_id == future_supply.item_id)
         .filter(
-            models.LedgerFutureSupply.ledger_generation_id == generation.id,
-            models.LedgerFutureSupply.supply_kind == "supplier_order",
+            future_supply.ledger_generation_id == generation.id,
+            future_supply.supply_kind == "supplier_order",
         )
-        .all()
     )
+    if affected_scopes is not None:
+        supply_query = supply_query.filter(or_(*(
+            and_(
+                future_supply.item_id == int(scope[0]),
+                future_supply.characteristic_ref == _clean_ref(scope[1]),
+                future_supply.organization_ref == _clean_ref(scope[2]),
+                future_supply.planning_stock_pool == _clean_ref(scope[3]),
+            )
+            for scope in affected_scopes
+        ))) if affected_scopes else supply_query.filter(future_supply.id < 0)
+    supplies = supply_query.all()
 
     cards: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
@@ -540,12 +616,18 @@ def _build_supplier_card_rows(
         order_state_name = str(supply.source_state_key or "")
         supply_phase = phase_value(order_state_name)
         overdue_days = (
-            max((generation.cutoff.date() - supply.eta_date).days, 0)
+            max((effective_cutoff_date - supply.eta_date).days, 0)
             if supply.eta_date is not None
             else 0
         )
         row = {
-            "row_key": f"ledger-supply:{int(supply.id)}",
+            "row_key": _supplier_current_row_key(
+                supply.current_identity,
+                supply_kind=supply.supply_kind,
+                source_ref=source_ref,
+                source_line_ref=source_line_ref,
+                source_local_id=supply.source_local_id,
+            ),
             "line_id": None,
             "purchase_id": None,
             "source_purchase_ids": [],
@@ -564,6 +646,7 @@ def _build_supplier_card_rows(
             "item_article": item.item_article,
             "item_name": str(item.item_name or ""),
             "unit": item.unit,
+            "planning_stock_pool": _clean_ref(supply.planning_stock_pool),
             "quantity": ordered,
             "received_qty": realized,
             "remaining_qty": open_qty,
@@ -574,7 +657,7 @@ def _build_supplier_card_rows(
                 open_qty=open_qty,
                 realized_qty=realized,
                 eta_date=supply.eta_date,
-                cutoff_date=generation.cutoff.date(),
+                cutoff_date=effective_cutoff_date,
                 supply_phase=supply_phase,
             ),
             "price": None,
@@ -626,45 +709,51 @@ def _build_buyer_rows(
     generation_id: int,
     to_order_by_period: list[dict[str, Any]],
     cutoff_date: date | None = None,
+    *,
+    entries_override: Sequence[tuple[Any, Any, Any]] | None = None,
+    affected_scopes: Sequence[tuple[int, str, str, str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     configured_destination_warehouse_ref1c = _clean_ref(
         _load_odata_config().get("purchase_destination_warehouse_ref1c")
     )
 
-    entries = (
-        db.query(
-            models.ReplenishmentWorkItem,
-            models.ReservationEntry,
-            models.Item,
+    if entries_override is None:
+        entries = (
+            db.query(
+                models.ReplenishmentWorkItem,
+                models.ReservationEntry,
+                models.Item,
+            )
+            .join(
+                models.ReservationEntry,
+                models.ReservationEntry.id
+                == models.ReplenishmentWorkItem.reservation_id,
+            )
+            .join(
+                models.Item,
+                models.Item.item_id == models.ReplenishmentWorkItem.item_id,
+            )
+            .filter(
+                models.ReplenishmentWorkItem.ledger_generation_id == generation_id,
+                models.ReplenishmentWorkItem.replenishment_method == _BUY_MODE,
+                models.ReservationEntry.lifecycle_status == "active",
+            )
+            .order_by(
+                models.Item.item_code.asc(),
+                models.ReservationEntry.planning_stock_pool.asc(),
+                models.ReplenishmentWorkItem.run_id.asc(),
+                models.ReplenishmentWorkItem.id.asc(),
+            )
+            .all()
         )
-        .join(
-            models.ReservationEntry,
-            models.ReservationEntry.id
-            == models.ReplenishmentWorkItem.reservation_id,
-        )
-        .join(
-            models.Item,
-            models.Item.item_id == models.ReplenishmentWorkItem.item_id,
-        )
-        .filter(
-            models.ReplenishmentWorkItem.ledger_generation_id == generation_id,
-            models.ReplenishmentWorkItem.replenishment_method == _BUY_MODE,
-            models.ReservationEntry.lifecycle_status == "active",
-        )
-        .order_by(
-            models.Item.item_code.asc(),
-            models.ReservationEntry.planning_stock_pool.asc(),
-            models.ReplenishmentWorkItem.run_id.asc(),
-            models.ReplenishmentWorkItem.id.asc(),
-        )
-        .all()
-    )
+    else:
+        entries = list(entries_override)
     if not entries:
         return []
 
     open_covered_by_reservation, open_coverage_slices = (
         open_supplier_coverage_by_reservation(
-            db, int(generation_id), entries
+            db, int(generation_id), entries, affected_scopes=affected_scopes
         )
     )
 
@@ -1076,7 +1165,682 @@ def build_candidate_payload(db: Session, generation_id: int) -> dict[str, Any]:
     return payload
 
 
+def _normalise_compact_purchase_scopes(
+    affected_scopes: Iterable[tuple[int, str, str, str, str]] | None,
+) -> tuple[tuple[int, str, str, str, str], ...] | None:
+    if affected_scopes is None:
+        return None
+    result: list[tuple[int, str, str, str, str]] = []
+    seen: set[tuple[int, str, str, str, str]] = set()
+    for raw in affected_scopes:
+        try:
+            values = tuple(raw)
+            scope = (
+                int(values[0]),
+                _clean_ref(values[1]),
+                _clean_ref(values[2]),
+                _clean_ref(values[3]),
+                _clean_ref(values[4]),
+            )
+        except (TypeError, ValueError, IndexError) as exc:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase affected scope is malformed"
+            ) from exc
+        if len(values) != 5 or scope[0] <= 0 or scope[4] != _BUY_MODE:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase affected scope is malformed"
+            )
+        if scope in seen:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase affected scopes contain duplicates"
+            )
+        seen.add(scope)
+        result.append(scope)
+    return tuple(sorted(result))
 
 
+def _compact_purchase_row_without_work_item(
+    row: dict[str, Any],
+    *,
+    identity_by_reservation: Mapping[int, str],
+) -> dict[str, Any]:
+    """Remove synthetic staged IDs while retaining stable reservation lineage."""
+
+    compact = dict(row)
+    compact["current_reservation_identities"] = sorted(
+        identity_by_reservation[int(reservation_id)]
+        for reservation_id in compact.get("reservation_ids", [])
+        if int(reservation_id) in identity_by_reservation
+    )
+    for field_name in ("slices", "horizon_buckets"):
+        values = []
+        for raw in compact.get(field_name, []) or []:
+            value = dict(raw)
+            reservation_id = int(value["reservation_id"])
+            value.pop("work_item_id", None)
+            value["current_identity"] = identity_by_reservation[reservation_id]
+            values.append(value)
+        compact[field_name] = values
+    materialization = compact.get("materialization_input")
+    if isinstance(materialization, dict):
+        materialization = dict(materialization)
+        materialization["slices"] = [
+            {
+                key: value
+                for key, value in dict(raw).items()
+                if key != "work_item_id"
+            }
+            for raw in materialization.get("slices", []) or []
+        ]
+        compact["materialization_input"] = materialization
+    return compact
 
 
+def _normalise_legacy_parent_buy_row(
+    row: dict[str, Any],
+    *,
+    reservation_by_requirement: Mapping[int, models.ReservationEntry],
+) -> dict[str, Any]:
+    """Rebind a pre-R4 current BUY payload to stable reservation owners.
+
+    Older current manifests retained staged ``reservation_id`` and
+    ``work_item_id`` values.  They are provenance-only and cannot be copied
+    into a new compact refresh.  Requirement lineage is the durable bridge;
+    the caller supplies a complete, uniqueness-checked current-owner map.
+    """
+    compact = dict(row)
+    raw_requirement_ids = compact.get("requirement_ids")
+    if not isinstance(raw_requirement_ids, list) or not raw_requirement_ids:
+        raise PurchaseControlCompactPayloadError(
+            "legacy compact purchase BUY row lacks requirement lineage"
+        )
+    requirement_ids: list[int] = []
+    for value in raw_requirement_ids:
+        try:
+            requirement_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise PurchaseControlCompactPayloadError(
+                "legacy compact purchase BUY requirement identity is malformed"
+            ) from exc
+        if requirement_id <= 0 or requirement_id not in reservation_by_requirement:
+            raise PurchaseControlCompactPayloadError(
+                f"legacy compact purchase BUY owner is missing for requirement {value!r}"
+            )
+        requirement_ids.append(requirement_id)
+
+    reservations = [reservation_by_requirement[requirement_id] for requirement_id in requirement_ids]
+    compact["reservation_ids"] = sorted(int(reservation.id) for reservation in reservations)
+    compact["current_reservation_identities"] = sorted(
+        str(reservation.current_identity) for reservation in reservations
+    )
+
+    def normalise_slice(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, Mapping):
+            raise PurchaseControlCompactPayloadError(
+                "legacy compact purchase BUY slice is malformed"
+            )
+        value = dict(raw)
+        try:
+            requirement_id = int(value["requirement_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PurchaseControlCompactPayloadError(
+                "legacy compact purchase BUY slice lacks requirement lineage"
+            ) from exc
+        reservation = reservation_by_requirement.get(requirement_id)
+        if reservation is None:
+            raise PurchaseControlCompactPayloadError(
+                f"legacy compact purchase BUY owner is missing for requirement {requirement_id}"
+            )
+        value["reservation_id"] = int(reservation.id)
+        value["current_identity"] = str(reservation.current_identity)
+        value.pop("work_item_id", None)
+        return value
+
+    for field_name in ("slices", "horizon_buckets"):
+        raw_values = compact.get(field_name)
+        if raw_values is not None:
+            if not isinstance(raw_values, list):
+                raise PurchaseControlCompactPayloadError(
+                    f"legacy compact purchase BUY {field_name} are malformed"
+                )
+            compact[field_name] = [normalise_slice(value) for value in raw_values]
+
+    materialization = compact.get("materialization_input")
+    if isinstance(materialization, Mapping):
+        materialization_copy = dict(materialization)
+        raw_values = materialization_copy.get("slices")
+        if raw_values is not None:
+            if not isinstance(raw_values, list):
+                raise PurchaseControlCompactPayloadError(
+                    "legacy compact purchase BUY materialization slices are malformed"
+                )
+            materialization_copy["slices"] = [normalise_slice(value) for value in raw_values]
+        compact["materialization_input"] = materialization_copy
+    return compact
+
+
+def _load_parent_compact_purchase_rows(
+    db: Session,
+    *,
+    parent_generation_id: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load the complete accepted purchase scope for bounded row reuse.
+
+    The physical publisher must still hand a complete scope to the current
+    writer, but unchanged rows are already the accepted truth.  Reusing that
+    manifest avoids re-running supplier coverage/custody math for every BUY
+    owner on each physical tick.
+    """
+    from app.services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+
+    scope = get_current_execution_scope(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    if (
+        scope is None
+        or not bool(scope.result_ready)
+        or int(scope.source_generation_id or 0) != int(parent_generation_id)
+    ):
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase parent scope is missing or stale"
+        )
+    rows: list[dict[str, Any]] = []
+    for current in load_current_execution_rows(
+        db,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    ):
+        payload = current.payload if isinstance(current.payload, Mapping) else None
+        if not isinstance(payload, Mapping):
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase parent row is malformed"
+            )
+        row = dict(payload)
+        row.setdefault("row_key", str(current.business_identity))
+        rows.append(row)
+
+    buy_rows = [
+        row for row in rows if row.get("row_generator") == _BUY_ROW_GENERATOR
+    ]
+    requirement_ids = sorted({
+        int(value)
+        for row in buy_rows
+        for value in (row.get("requirement_ids") or [])
+        if value not in (None, "")
+    })
+    if buy_rows and not requirement_ids:
+        raise PurchaseControlCompactPayloadError(
+            "legacy compact purchase BUY manifest has no requirements"
+        )
+    reservation_by_requirement: dict[int, models.ReservationEntry] = {}
+    if requirement_ids:
+        owners = (
+            db.query(models.ReservationEntry)
+            .filter(
+                models.ReservationEntry.requirement_id.in_(requirement_ids),
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.owner_kind == "current",
+                models.ReservationEntry.lifecycle_status == "active",
+                models.ReservationEntry.realization_mode == _BUY_MODE,
+            )
+            .order_by(models.ReservationEntry.requirement_id.asc(), models.ReservationEntry.id.asc())
+            .all()
+        )
+        for reservation in owners:
+            requirement_id = int(reservation.requirement_id)
+            expected_identity = reservation_business_identity(requirement_id, _BUY_MODE)
+            if _clean_ref(reservation.current_identity) != expected_identity:
+                raise PurchaseControlCompactPayloadError(
+                    f"current BUY owner identity is malformed for requirement {requirement_id}"
+                )
+            if requirement_id in reservation_by_requirement:
+                raise PurchaseControlCompactPayloadError(
+                    f"current BUY owner is ambiguous for requirement {requirement_id}"
+                )
+            reservation_by_requirement[requirement_id] = reservation
+        missing = [
+            requirement_id
+            for requirement_id in requirement_ids
+            if requirement_id not in reservation_by_requirement
+        ]
+        if missing:
+            raise PurchaseControlCompactPayloadError(
+                f"current BUY owner is missing for requirements {missing[:8]}"
+            )
+        normalised_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if row.get("row_generator") != _BUY_ROW_GENERATOR:
+                normalised_rows.append(row)
+                continue
+            has_stable_identity = (
+                isinstance(row.get("current_reservation_identities"), list)
+                and bool(row.get("current_reservation_identities"))
+            )
+            has_staged_identity = any(
+                isinstance(value, Mapping) and "work_item_id" in value
+                for field_name in ("slices", "horizon_buckets")
+                for value in (row.get(field_name) or [])
+            )
+            materialization = row.get("materialization_input")
+            has_staged_identity = has_staged_identity or any(
+                isinstance(value, Mapping) and "work_item_id" in value
+                for value in (
+                    materialization.get("slices", [])
+                    if isinstance(materialization, Mapping)
+                    else []
+                )
+            )
+            if has_stable_identity and not has_staged_identity:
+                normalised_rows.append(row)
+            else:
+                normalised_rows.append(
+                    _normalise_legacy_parent_buy_row(
+                        row,
+                        reservation_by_requirement=reservation_by_requirement,
+                    )
+                )
+        rows = normalised_rows
+    summary = dict(scope.summary or {})
+    cards = summary.get("cards")
+    return rows, dict(cards) if isinstance(cards, Mapping) else {}
+
+
+def validate_compact_current_purchase_control_payload(
+    payload: Mapping[str, Any],
+    target_generation: models.LedgerGeneration,
+) -> None:
+    """Validate a direct compact purchase payload without staging reads."""
+
+    meta = payload.get("meta") if isinstance(payload, Mapping) else None
+    rows = payload.get("rows") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(meta, Mapping)
+        or meta.get("read_only") is not True
+        or str(meta.get("truth_status") or "") != "building"
+        or int(meta.get("ledger_generation_id") or -1) != int(target_generation.id)
+        or not isinstance(rows, list)
+    ):
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload metadata or rows are malformed"
+        )
+    try:
+        row_count = int(meta.get("row_count"))
+    except (TypeError, ValueError) as exc:
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload row count is malformed"
+        ) from exc
+    if row_count < 0 or row_count != len(rows):
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload row count is incomplete"
+        )
+    identities: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase payload row is malformed"
+            )
+        row_key = str(row.get("row_key") or "")
+        if not row_key or row_key in identities:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase payload row identity is duplicated"
+            )
+        identities.add(row_key)
+        if row.get("row_generator") == _BUY_ROW_GENERATOR:
+            validate_purchase_control_journal_buy_row(row)
+            stable = row.get("current_reservation_identities")
+            if not isinstance(stable, list) or not stable or any(
+                not str(value).strip() for value in stable
+            ):
+                raise PurchaseControlCompactPayloadError(
+                    "compact purchase BUY row lacks stable reservation identity"
+                )
+            if any("work_item_id" in dict(value) for value in row.get("slices", [])):
+                raise PurchaseControlCompactPayloadError(
+                    "compact purchase BUY row leaks staged work identity"
+                )
+        else:
+            validate_purchase_control_journal_supply_row(row)
+
+
+def build_compact_current_purchase_control_payload(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    accepted_run_ids: Sequence[int],
+    affected_scopes: Iterable[tuple[int, str, str, str, str]] | None = None,
+    reuse_parent_current: bool = False,
+) -> dict[str, Any]:
+    """Build purchase-control DTOs from current BUY owners and current supply.
+
+    The BUILDING target is only a candidate boundary.  Stable current
+    ``ReservationEntry`` owners, ``LedgerFutureSupplyCurrent`` supplier lines,
+    and canonical ``_build_buyer_rows`` math provide the business payload.  No
+    target-generation ``ReplenishmentWorkItem`` or reservation rows are read or
+    written, and this function never moves planning truth or publishes rows.
+    """
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or str(target.status or "") != "building":
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload requires a BUILDING target"
+        )
+    if parent is None or str(parent.status or "") != "accepted":
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload requires an accepted parent"
+        )
+    if target.id == parent.id or parent.cutoff is None or target.cutoff is None:
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload generations are malformed"
+        )
+    pointer = db.get(models.PlanningTruthState, 1)
+    if pointer is None or int(pointer.current_generation_id or -1) != int(parent.id):
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload parent is not current truth"
+        )
+    run_ids = tuple(sorted({int(value) for value in accepted_run_ids}))
+    if not run_ids:
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase payload requires fixed live run ids"
+        )
+    scopes = _normalise_compact_purchase_scopes(affected_scopes)
+    parent_rows: list[dict[str, Any]] = []
+    parent_cards: dict[str, Any] = {}
+    reused_row_count = 0
+    if reuse_parent_current:
+        if scopes is None:
+            raise PurchaseControlCompactPayloadError(
+                "bounded compact purchase refresh requires explicit affected scopes"
+            )
+        parent_rows, parent_cards = _load_parent_compact_purchase_rows(
+            db, parent_generation_id=int(parent.id)
+        )
+        # A stock-only physical delta has no BUY scope.  Preserve the accepted
+        # complete purchase payload without touching ReservationEvent,
+        # custody, or future-supply history.
+        if not scopes:
+            rows = list(parent_rows)
+            rows.sort(
+                key=lambda row: (
+                    str(row.get("order_number") or ""),
+                    str(row.get("item_code") or ""),
+                    str(row.get("row_key") or ""),
+                )
+            )
+            payload = {
+                "meta": {
+                    "ledger_generation_id": int(target.id),
+                    "source_generation_id": int(parent.id),
+                    "cutoff": target.cutoff.isoformat(),
+                    "truth_status": "building",
+                    "read_only": True,
+                    "fact_source": "current",
+                    "received_qty_status": "available",
+                    "run_ids": list(run_ids),
+                    "to_order_by_period": [],
+                    "affected_scopes": [],
+                    "row_count": len(rows),
+                    "bounded_reuse": True,
+                    "recomputed_scope_count": 0,
+                    "reused_row_count": len(rows),
+                },
+                "rows": rows,
+                "cards": parent_cards,
+                "summary": {
+                    "total_rows": len(rows),
+                    "to_order": sum(
+                        1 for row in rows
+                        if str(row.get("line_status") or "") == "to_order"
+                    ),
+                    "fact_status": "available",
+                },
+            }
+            validate_compact_current_purchase_control_payload(payload, target)
+            return payload
+    scope_keys = set(scopes or ())
+    requested_item_pools = {
+        (int(scope[0]), _clean_ref(scope[3]))
+        for scope in scopes or ()
+    }
+    item_ids = sorted({scope[0] for scope in scopes}) if scopes else None
+    owner_query = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.is_current.is_(True),
+            models.ReservationEntry.owner_kind == "current",
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.realization_mode == _BUY_MODE,
+            models.ReservationEntry.current_identity != "",
+            models.ReservationEntry.run_id.in_(run_ids),
+        )
+    )
+    if item_ids is not None:
+        owner_query = owner_query.filter(models.ReservationEntry.item_id.in_(item_ids))
+    reservations = owner_query.order_by(
+        models.ReservationEntry.item_id.asc(),
+        models.ReservationEntry.planning_stock_pool.asc(),
+        models.ReservationEntry.id.asc(),
+    ).all()
+    identities: dict[str, int] = {}
+    scope_by_item_pool: dict[tuple[int, str], tuple[int, str, str, str, str]] = {}
+    recomputed_scope_set: set[tuple[int, str, str, str, str]] = set()
+    for reservation in reservations:
+        scope = (
+            int(reservation.item_id),
+            _clean_ref(reservation.characteristic_ref),
+            _clean_ref(reservation.organization_ref),
+            _clean_ref(reservation.planning_stock_pool),
+            _BUY_MODE,
+        )
+        item_pool = (scope[0], scope[3])
+        if scopes is not None:
+            # Buyer rows are canonically grouped by item and planning pool,
+            # not by characteristic/organization.  When reusing a complete
+            # parent manifest, expand a requested scope to every current
+            # owner in that item/pool group so an unaffected sibling cannot
+            # be dropped from the aggregate row.  The ordinary compact
+            # builder retains its exact-scope behavior.
+            if reuse_parent_current:
+                if item_pool not in requested_item_pools:
+                    continue
+            elif scope not in scope_keys:
+                continue
+        recomputed_scope_set.add(scope)
+        previous_scope = scope_by_item_pool.get(item_pool)
+        if (
+            not reuse_parent_current
+            and previous_scope is not None
+            and previous_scope != scope
+        ):
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase owners have ambiguous characteristic or organization scope"
+            )
+        scope_by_item_pool[item_pool] = scope
+        expected = reservation_business_identity(
+            int(reservation.requirement_id), _BUY_MODE
+        )
+        identity = _clean_ref(reservation.current_identity)
+        if identity != expected:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase owner has an ambiguous stable identity"
+            )
+        previous = identities.get(identity)
+        if previous is not None and previous != int(reservation.id):
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase owners contain duplicate stable identity"
+            )
+        identities[identity] = int(reservation.id)
+    if scopes is not None:
+        reservations = [
+            row
+            for row in reservations
+            if (
+                int(row.item_id),
+                _clean_ref(row.characteristic_ref),
+                _clean_ref(row.organization_ref),
+                _clean_ref(row.planning_stock_pool),
+                _BUY_MODE,
+            ) in (
+                recomputed_scope_set
+                if reuse_parent_current
+                else scope_keys
+            )
+        ]
+        if reuse_parent_current and recomputed_scope_set:
+            scopes = tuple(sorted(recomputed_scope_set))
+    items = {
+        int(item.item_id): item
+        for item in db.query(models.Item)
+        .filter(models.Item.item_id.in_(sorted({int(row.item_id) for row in reservations})))
+        .all()
+    }
+    if len(items) != len({int(row.item_id) for row in reservations}):
+        raise PurchaseControlCompactPayloadError(
+            "compact purchase owner references missing item"
+        )
+    requirements = {
+        int(requirement.id): requirement
+        for requirement in db.query(models.MrpRequirement)
+        .filter(models.MrpRequirement.id.in_(sorted({int(row.requirement_id) for row in reservations})))
+        .all()
+    }
+    entries: list[tuple[Any, Any, Any]] = []
+    identity_by_reservation: dict[int, str] = {}
+    for reservation in reservations:
+        if reservation.run_id is None or int(reservation.run_id) not in run_ids:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase owner has an invalid live run"
+            )
+        if int(reservation.requirement_id) not in requirements:
+            raise PurchaseControlCompactPayloadError(
+                "compact purchase owner has missing requirement lineage"
+            )
+        identity = _clean_ref(reservation.current_identity)
+        identity_by_reservation[int(reservation.id)] = identity
+        required = reservation.replenishment_required_qty or 0
+        fulfilled = reservation.replenishment_received_qty or 0
+        remaining = replenishment_remaining(required, fulfilled)
+        synthetic_work = SimpleNamespace(
+            id=-int(reservation.id),
+            reservation_id=int(reservation.id),
+            item_id=int(reservation.item_id),
+            requirement_id=int(reservation.requirement_id),
+            run_id=int(reservation.run_id),
+            replenishment_required_qty=required,
+            replenishment_fulfilled_qty=fulfilled,
+            replenishment_remaining_qty=remaining,
+        )
+        entries.append((synthetic_work, reservation, items[int(reservation.item_id)]))
+
+    to_order_by_period: list[dict[str, Any]] = []
+    buyer_rows = _build_buyer_rows(
+        db,
+        int(parent.id),
+        to_order_by_period,
+        cutoff_date=target.cutoff.date(),
+        entries_override=entries,
+        affected_scopes=scopes,
+    )
+    buyer_rows = [
+        _compact_purchase_row_without_work_item(
+            dict(row), identity_by_reservation=identity_by_reservation
+        )
+        for row in buyer_rows
+    ]
+    supplier_rows, recomputed_cards = _build_supplier_card_rows(
+        db,
+        parent,
+        affected_scopes=scopes,
+        cutoff_date=target.cutoff.date(),
+    )
+    if reuse_parent_current:
+        affected_item_pools = {
+            (int(scope[0]), _clean_ref(scope[3]))
+            for scope in scopes or ()
+        }
+        recomputed_row_keys = {
+            str(row.get("row_key") or "")
+            for row in [*supplier_rows, *buyer_rows]
+            if str(row.get("row_key") or "")
+        }
+        unchanged_rows = [
+            row for row in parent_rows
+            if (
+                int(row.get("item_id") or 0),
+                _clean_ref(row.get("planning_stock_pool")),
+            ) not in affected_item_pools
+            and str(row.get("row_key") or "") not in recomputed_row_keys
+        ]
+        reused_row_count = len(unchanged_rows)
+        replaced_order_ids: set[str] = set()
+        for key, card in parent_cards.items():
+            lines = card.get("lines", []) if isinstance(card, Mapping) else []
+            if any(
+                (
+                    int(line.get("item_id") or 0),
+                    _clean_ref(line.get("planning_stock_pool")),
+                ) in affected_item_pools
+                for line in lines
+                if isinstance(line, Mapping)
+            ):
+                replaced_order_ids.add(str(key))
+        replaced_order_ids.update(
+            str(row.get("order_id"))
+            for row in supplier_rows
+            if row.get("order_id") not in (None, "")
+        )
+        preserved_cards = {
+            key: value
+            for key, value in parent_cards.items()
+            if str(key) not in replaced_order_ids
+        }
+        preserved_cards.update(recomputed_cards)
+        bounded_cards = preserved_cards
+        rows = [*unchanged_rows, *supplier_rows, *buyer_rows]
+    else:
+        bounded_cards = recomputed_cards
+        rows = [*supplier_rows, *buyer_rows]
+    rows.sort(
+        key=lambda row: (
+            str(row.get("order_number") or ""),
+            str(row.get("item_code") or ""),
+            str(row.get("row_key") or ""),
+        )
+    )
+    for row in rows:
+        validate_purchase_control_journal_row(row)
+    payload = {
+        "meta": {
+            "ledger_generation_id": int(target.id),
+            "source_generation_id": int(parent.id),
+            "cutoff": target.cutoff.isoformat(),
+            "truth_status": "building",
+            "read_only": True,
+            "fact_source": "current",
+            "received_qty_status": "available",
+            "run_ids": list(run_ids),
+            "to_order_by_period": to_order_by_period,
+            "affected_scopes": [list(scope) for scope in scopes] if scopes else None,
+            "row_count": len(rows),
+            "bounded_reuse": bool(reuse_parent_current),
+            "recomputed_scope_count": len(scopes or ()) if reuse_parent_current else None,
+            "reused_row_count": reused_row_count,
+        },
+        "rows": rows,
+        "cards": bounded_cards,
+        "summary": {
+            "total_rows": len(rows),
+            "to_order": sum(
+                1 for row in rows if str(row.get("line_status") or "") == "to_order"
+            ),
+            "fact_status": "available",
+        },
+    }
+    validate_compact_current_purchase_control_payload(payload, target)
+    return payload

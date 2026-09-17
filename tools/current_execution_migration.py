@@ -32,6 +32,21 @@ EXPECTED_CURRENT_SCOPES = (
     ("period_plan_execution", "period-plan:all-live-plans", "period_plan_execution"),
 )
 
+# The execution compatibility owner is published from the exact accepted
+# generation immediately before the obligation hand-off.  These manifests are
+# required by the destructive projection cutover; they are intentionally kept
+# separate from EXPECTED_CURRENT_SCOPES because the legacy obligation adapter
+# publishes only the four journal consumers below.
+EXPECTED_EXECUTION_SCOPES = (
+    ("assembly_queue", "assembly:all-live-plans", "assembly_queue"),
+    ("assembly_readiness", "assembly:all-live-plans", "assembly_readiness"),
+    ("drum_schedule", "drum:all-live-plans", "drum_schedule"),
+    ("drum_slot", "drum:all-live-plans", "drum_slot"),
+    ("drum_gap", "drum:all-live-plans", "drum_gap"),
+    ("drum_excluded", "drum:all-live-plans", "drum_excluded"),
+    ("shelf_projection", "shelf:all-live-mrps", "shelf_projection"),
+)
+
 
 class PreflightBlocked(RuntimeError):
     """The migration may not start because its read-only preflight is unsafe."""
@@ -43,19 +58,25 @@ class PostflightBlocked(RuntimeError):
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _BACKEND_ROOT = _REPO_ROOT / "backend"
+if _REPO_ROOT.is_dir() and str(_REPO_ROOT) not in sys.path:
+    # When invoked as ``python tools/current_execution_migration.py`` Python
+    # puts ``tools/`` (not the repository root) on sys.path.  The adapter is
+    # a supported ``tools.*`` import and must resolve in that invocation too.
+    sys.path.insert(0, str(_REPO_ROOT))
 if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
     # The supported CLI invocation is `python tools/...` from the repository
     # root; in that mode Python does not add backend/ to import search paths.
     sys.path.insert(0, str(_BACKEND_ROOT))
 
-try:
-    # Kept as a module-level seam so tests can prove the transaction policy
-    # without calling OData, workers, or a live integration.
-    from tools.current_execution_legacy_adapter import (
-        publish_current_obligation_views_from_snapshots,
-    )
-except Exception:  # pragma: no cover - standalone preflight remains usable
-    publish_current_obligation_views_from_snapshots = None
+# These are supported CLI dependencies, not optional preflight plugins.  Do
+# not turn an import regression into a misleading "publisher unavailable"
+# apply response; fail at startup with the real traceback instead.
+from tools.current_execution_legacy_adapter import (
+    publish_current_obligation_views_from_snapshots,
+)
+from app.services.item_ledger.current_execution import (
+    publish_current_execution_from_generation,
+)
 
 
 _PRESERVE_REASONS = {
@@ -122,6 +143,15 @@ _LEGACY_REFERENCE_KEYS = {
     "parent_generation_id",
 }
 _LEGACY_ID_KEYS = {"legacy_row_id", "planning_read_row_id", "source_row_id"}
+
+_EXECUTION_PROJECTION_TABLES = frozenset({
+    "assembly_queue_line",
+    "assembly_readiness",
+    "drum_schedule",
+    "drum_slot",
+    "drum_capacity_gap",
+    "shelf_projection",
+})
 
 
 def _known_schema_tables() -> set[str]:
@@ -565,6 +595,28 @@ def _migrate_purchase_export_anchors(session: Session, generation_id: int) -> di
     }
 
 
+def _execution_contour_mode(session: Session) -> str:
+    """Return ``full`` or ``absent`` for the one-off rehearsal schema.
+
+    The real local database has the complete generation-scoped execution
+    contour and must publish/verify it.  Tiny obligation-only test schemas from
+    the earlier R10 adapter intentionally omit those tables; they are not a
+    production migration target.  A partially present contour is unsafe and
+    blocks rather than silently bypassing the manifest.
+    """
+    names = set(inspect(session.connection()).get_table_names())
+    present = names & _EXECUTION_PROJECTION_TABLES
+    if not present:
+        return "absent"
+    if present != _EXECUTION_PROJECTION_TABLES:
+        missing = sorted(_EXECUTION_PROJECTION_TABLES - present)
+        raise PreflightBlocked(
+            "execution contour is incomplete; missing projection tables: "
+            + ", ".join(missing)
+        )
+    return "full"
+
+
 def _postflight_on_session(session: Session, generation_id: int) -> dict[str, Any]:
     """Validate current scopes/rows while the publication transaction is held."""
 
@@ -593,6 +645,32 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
             "source_revision": str(row["source_revision"]),
             "result_ready": bool(row["result_ready"]),
         }
+
+    execution_scopes: dict[str, dict[str, Any]] = {}
+    if _execution_contour_mode(session) == "full":
+        for consumer, scope_key, entity_kind in EXPECTED_EXECUTION_SCOPES:
+            rows = session.execute(text(
+                "SELECT entity_kind, scope_key, source_generation_id, source_revision, result_ready "
+                "FROM current_execution_scope WHERE entity_kind = :entity_kind AND scope_key = :scope_key"
+            ), {"entity_kind": entity_kind, "scope_key": scope_key}).mappings().all()
+            if len(rows) != 1:
+                raise PostflightBlocked(
+                    f"expected exactly one execution scope for {consumer}, found {len(rows)}"
+                )
+            row = rows[0]
+            if int(row["source_generation_id"] or 0) != int(generation_id):
+                raise PostflightBlocked(f"execution scope {consumer} has wrong source generation")
+            if str(row["source_revision"] or "") != f"accepted:g{int(generation_id)}":
+                raise PostflightBlocked(f"execution scope {consumer} has wrong source revision")
+            if not bool(row["result_ready"]):
+                raise PostflightBlocked(f"execution scope {consumer} is not ready")
+            execution_scopes[consumer] = {
+                "entity_kind": entity_kind,
+                "scope_key": scope_key,
+                "source_generation_id": int(row["source_generation_id"]),
+                "source_revision": str(row["source_revision"]),
+                "result_ready": bool(row["result_ready"]),
+            }
 
     duplicates = session.execute(text(
         "SELECT entity_kind, scope_key, business_identity, count(*) AS row_count "
@@ -647,6 +725,7 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
         "status": "ready",
         "generation_id": int(generation_id),
         "scopes": scopes,
+        "execution_scopes": execution_scopes,
         "unique_identities": True,
         "purchase_export_anchors": purchase_export_anchors,
     }
@@ -697,8 +776,21 @@ def apply_current_obligation_migration(
     source_evidence = _source_evidence_report(engine, generation_id)
     before_changes = _count_changes(engine)
     publisher_result: Any = None
+    execution_publisher_result: Any = None
     with Session(engine, autoflush=False, expire_on_commit=False) as session:
         with session.begin():
+            # The destructive projection cutover requires a complete current
+            # execution contour first.  Publish it from the exact accepted
+            # generation in this same transaction, before the obligation
+            # adapter; no empty/fallback manifest is fabricated.
+            if _execution_contour_mode(session) == "full":
+                if publish_current_execution_from_generation is None:
+                    raise PreflightBlocked(
+                        "canonical current execution publisher is unavailable"
+                    )
+                execution_publisher_result = publish_current_execution_from_generation(
+                    session, int(generation_id)
+                )
             publisher_result = publish_current_obligation_views_from_snapshots(session, generation_id)
             if fault_after_consumer is not None:
                 raise RuntimeError(f"fault injection after consumer {fault_after_consumer}")
@@ -713,7 +805,10 @@ def apply_current_obligation_migration(
         "preflight": manifest,
         "source_evidence": source_evidence,
         "postflight": postflight,
-        "publisher_consumers": sorted(str(key) for key in (publisher_result or {})),
+        "publisher_consumers": sorted(
+            [str(key) for key in (publisher_result or {})]
+            + (["current_execution"] if execution_publisher_result is not None else [])
+        ),
         "change_rows_before": before_changes,
         "change_rows_after": after_changes,
         "idempotent": after_changes == before_changes,

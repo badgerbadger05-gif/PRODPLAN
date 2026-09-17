@@ -64,6 +64,45 @@ def test_stock_bin_migration_allows_a_new_building_only_physical_key():
         migration._deduplicate(conn)
 
 
+def test_stock_bin_migration_allows_key_absent_from_current_accepted_fold():
+    """Historical-only keys are pruned, not fabricated into current stock."""
+    sa = pytest.importorskip("sqlalchemy")
+    path = (
+        Path(__file__).parents[2]
+        / "backend/alembic/versions/20260910_08_r6_compact_stock_bin.py"
+    )
+    spec = spec_from_file_location("r6_stock_bin_migration_missing_current", path)
+    migration = module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(migration)
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE planning_truth_state (id INTEGER PRIMARY KEY, current_generation_id INTEGER)"
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE ledger_generation (id INTEGER PRIMARY KEY, status VARCHAR(16))"
+        )
+        conn.exec_driver_sql(
+            "CREATE TABLE stock_bin (id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL, "
+            "characteristic_ref VARCHAR(36), organization_ref VARCHAR(36), "
+            "warehouse_ref1c VARCHAR(36), ledger_generation_id INTEGER NOT NULL)"
+        )
+        conn.exec_driver_sql("INSERT INTO planning_truth_state VALUES (1, 10)")
+        conn.exec_driver_sql(
+            "INSERT INTO ledger_generation VALUES "
+            "(9, 'accepted'), (10, 'accepted'), (12, 'failed')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO stock_bin VALUES "
+            "(1, 673, '', 'ORG', 'WH', 9), (2, 673, '', 'ORG', 'WH', 12)"
+        )
+        # There is no row for this key in accepted generation 10.  The
+        # migration must leave the key without a current owner rather than
+        # selecting either historical row or inventing a zero row.
+        migration._deduplicate(conn)
+
+
 def test_compact_stock_fold_keeps_full_key_and_negative_physical_quantity():
     rows = [
         {"item_id": 10, "characteristic_ref": "", "organization_ref": "ORG-A", "warehouse_ref1c": "WH-1", "qty": "-3.125"},

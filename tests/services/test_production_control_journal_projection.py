@@ -19,12 +19,16 @@ from app.services.production_control_journal_projection import (
     RouteSheetSnapshotUnavailable,
     list_root_product_options,
     _public_journal_row,
+    _compact_business_payload,
     _drum_readiness_pull_by_run_item,
+    _affected_production_product_ids,
     build_candidate_payload,
+    build_compact_current_production_control_payload,
     read_route_sheet_snapshot_rows,
     validate_candidate_payload,
     read_current_projection,
 )
+from app.services.production_control_journal import list_make_proposals
 from app.services.item_ledger.future_supply_capture import (
     FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
     replace_future_supply_capture,
@@ -56,6 +60,34 @@ def test_public_journal_row_strips_internal_material_snapshot():
     assert _public_journal_row(source) == {"product_id": 7}
     assert "material_coverage_snapshot" in source
     assert "_route_sheet_snapshot" in source
+
+
+def test_affected_product_scope_accepts_nullable_production_spec_id(db_session):
+    """1C order lines may omit spec_id; affected-scope lookup must stay safe."""
+    _item, _order, product = _journal_line(db_session)
+    db_session.flush()
+    assert product.spec_id is None
+
+    impacted = _affected_production_product_ids(
+        db_session,
+        product_ids=[product.product_id],
+        affected_item_ids=[product.item_id],
+    )
+
+    assert impacted == {product.product_id}
+
+
+def test_compact_business_payload_has_no_legacy_snapshot_locator():
+    source = {
+        "generation_id": 12,
+        "snapshot_id": 34,
+        "business": {"item_id": 7, "qty": "2"},
+    }
+
+    compact = _compact_business_payload(source)
+
+    assert compact == {"business": {"item_id": 7, "qty": "2"}}
+    assert "planning_read_snapshot_id" not in compact
 
 
 def test_current_journal_sort_keeps_nulls_last_and_tie_breakers_ascending(db_session):
@@ -315,9 +347,10 @@ def _journal_line(db):
     return item, order, product
 
 
-def _make_proposal(db, generation):
+def _make_proposal(db, generation, tag=""):
+    suffix = str(tag)
     item = models.Item(
-        item_code="SNAP-MAKE-PROPOSAL",
+        item_code=f"SNAP-MAKE-PROPOSAL{suffix}",
         item_name="Snapshot MAKE proposal",
         item_article="SNAP-MAKE",
         unit="шт",
@@ -325,7 +358,7 @@ def _make_proposal(db, generation):
         status="active",
     )
     component = models.Item(
-        item_code="SNAP-MAKE-COMPONENT",
+        item_code=f"SNAP-MAKE-COMPONENT{suffix}",
         item_name="Snapshot MAKE component",
         item_article="SNAP-COMP",
         unit="шт",
@@ -333,12 +366,12 @@ def _make_proposal(db, generation):
         status="active",
     )
     spec = models.Specification(
-        spec_code="SNAP-MAKE-SPEC",
-        spec_name="Snapshot MAKE specification",
-        spec_ref1c="snap-make-spec",
+        spec_code=f"SNAP-MAKE-SPEC{suffix}",
+        spec_name=f"Snapshot MAKE specification{suffix}",
+        spec_ref1c=f"snap-make-spec{suffix}",
     )
     plan = models.ProductionPlanHeader(
-        name="Snapshot proposal plan",
+        name=f"Snapshot proposal plan{suffix}",
         period_from=generation.cutoff.date(),
         period_to=generation.cutoff.date(),
         status="fixed",
@@ -560,6 +593,52 @@ def test_candidate_payload_row_contains_route_sheet_payload(db_session):
     assert "_route_sheet_snapshot" in row
 
 
+def test_compact_current_production_control_payload_uses_current_sources_and_publishes(
+    db_session,
+):
+    parent = _building_generation(db_session, "production-journal-compact-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    target = _building_generation(db_session, "production-journal-compact-target")
+    item, order, product = _journal_line(db_session)
+    db_session.flush()
+
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": []},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[999],
+    )
+
+    assert payload["meta"]["ledger_generation_id"] == target.id
+    row = next(row for row in payload["rows"] if row["product_id"] == product.product_id)
+    assert row["current_identity"] == f"production-order-line:{order.order_id}:1"
+    assert "material_coverage_snapshot" not in row
+    assert not any(
+        key in {"generation_id", "ledger_generation_id", "source_generation_id", "snapshot_id"}
+        for key in row
+    )
+
+    # The builder's output is the same DTO boundary consumed after the target
+    # has been accepted; no generation-scoped staging owner is needed.
+    target.status = "accepted"
+    target.accepted_at = target.cutoff
+    db_session.flush()
+    result = publish_current_production_control_from_payload(
+        db_session,
+        target.id,
+        payload,
+    )
+    assert result.changed_rows == len(payload["rows"])
+    assert db_session.query(models.ReplenishmentWorkItem).count() == 0
+    assert db_session.query(models.AssemblyQueueLine).count() == 0
+
+
 def test_candidate_payload_contains_unmaterialized_make_proposal(db_session):
     generation = _building_generation(db_session, "production-journal-make-proposal")
     run, work = _make_proposal(db_session, generation)
@@ -583,6 +662,421 @@ def test_candidate_payload_contains_unmaterialized_make_proposal(db_session):
     assert row["available_actions"] == ["materialize"]
     assert "_route_sheet_snapshot" not in row
     assert db_session.query(models.ProductionOrder).count() == 0
+
+
+def test_compact_current_production_control_payload_uses_stable_reservation_not_work_item(
+    db_session,
+):
+    parent = _building_generation(db_session, "production-journal-compact-mrp-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run, work = _make_proposal(db_session, parent)
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = f"reservation:req:{reservation.requirement_id}:mode:make"
+    # The compact builder must not need the generation-local work item.
+    db_session.delete(work)
+    target = _building_generation(db_session, "production-journal-compact-mrp-target")
+    db_session.flush()
+
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={
+            "queue_rows": [{
+                "entity_kind": "assembly_queue",
+                "business_identity": f"plan-line:{run.source_plan_id}",
+                "payload": {
+                    "run_id": run.run_id,
+                    "item_id": reservation.item_id,
+                },
+            }],
+        },
+        drum_payload={"rows": []},
+        shelf_payload={"rows": [{
+            "entity_kind": "shelf_projection",
+            "payload": {
+                "item_id": reservation.item_id,
+                "materialized_qty": 4,
+                "pull_qty": 4,
+                "warehouse_ref1c": "WH",
+            },
+        }]},
+        accepted_run_ids=[run.run_id],
+    )
+
+    row = next(row for row in payload["rows"] if row.get("product_id") is None)
+    assert row["reservation_id"] == reservation.id
+    assert "work_item_id" not in row
+    assert row["launchable_qty"] == 4
+    assert row["root_item_ids"] == [reservation.item_id]
+    assert db_session.query(models.ReplenishmentWorkItem).count() == 0
+
+
+def test_compact_make_coverage_uses_one_bulk_fold_not_per_row_preview(
+    db_session, monkeypatch
+):
+    parent = _building_generation(db_session, "production-journal-compact-bulk-coverage-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run, work = _make_proposal(db_session, parent)
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = f"reservation:req:{reservation.requirement_id}:mode:make"
+    db_session.delete(work)
+    target = _building_generation(db_session, "production-journal-compact-bulk-coverage-target")
+    db_session.flush()
+
+    def fail_per_row_preview(*args, **kwargs):
+        raise AssertionError("compact refresh must not preview each MAKE row")
+
+    monkeypatch.setattr(
+        "app.services.production_control_material_availability.preview_make_work_item_materials",
+        fail_per_row_preview,
+    )
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={
+            "queue_rows": [{
+                "entity_kind": "assembly_queue",
+                "business_identity": "plan-line:bulk-coverage",
+                "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
+            }],
+        },
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[run.run_id],
+    )
+    row = next(row for row in payload["rows"] if row.get("product_id") is None)
+    assert row["coverage_status"] == "shortage"
+    assert "material_coverage_snapshot" not in row
+
+
+def test_compact_production_reuses_unchanged_parent_material_snapshot(
+    db_session, monkeypatch
+):
+    parent = _building_generation(db_session, "production-journal-reuse-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    target = _building_generation(db_session, "production-journal-reuse-target")
+    _item, order, product = _journal_line(db_session)
+    snapshot = {
+        "ledger_generation_id": int(parent.id),
+        "product_id": int(product.product_id),
+        "coverage_status": "ready",
+        "coverage_label": "Обеспечен",
+        "components": [{"component_item_id": 987654, "coverage": "ok"}],
+    }
+    db_session.add(
+        models.CurrentExecutionScope(
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            source_revision="accepted:parent",
+            source_generation_id=parent.id,
+            result_ready=True,
+            content_hash="a" * 64,
+            summary={"total_rows": 1},
+        )
+    )
+    db_session.add(
+        models.CurrentExecutionRow(
+            entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+            business_identity=f"production-order-line:{order.order_id}:1",
+            source_revision="accepted:parent",
+            source_generation_id=parent.id,
+            result_status="accepted",
+            result_ready=True,
+            content_hash="b" * 64,
+            payload={
+                "product_id": int(product.product_id),
+                "item_id": int(product.item_id),
+                "material_coverage_snapshot": snapshot,
+            },
+        )
+    )
+    db_session.flush()
+    calls = []
+
+    def fail_preview(*args, **kwargs):
+        calls.append(int(args[1]))
+        raise AssertionError("unchanged production rows must reuse parent coverage")
+
+    monkeypatch.setattr(
+        "app.services.production_control_material_availability.preview_materials",
+        fail_preview,
+    )
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": []},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[999],
+        affected_item_ids=[123456],
+    )
+    assert len(payload["rows"]) == payload["meta"]["row_count"] == 1
+    assert calls == []
+    row = payload["rows"][0]
+    assert row["product_id"] == product.product_id
+    assert row["coverage_status"] == "ready"
+
+    calls.clear()
+
+    def count_preview(db, product_id, *, ledger_generation_id=None, **kwargs):
+        calls.append(int(product_id))
+        return dict(snapshot)
+
+    monkeypatch.setattr(
+        "app.services.production_control_material_availability.preview_materials",
+        count_preview,
+    )
+    changed_payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": []},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[999],
+        affected_item_ids=[987654],
+    )
+    assert len(changed_payload["rows"]) == changed_payload["meta"]["row_count"] == 1
+    assert calls == [product.product_id]
+
+
+def test_compact_make_row_parity_with_legacy_builder(db_session):
+    parent = _building_generation(db_session, "production-journal-compact-parity-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run, work = _make_proposal(db_session, parent)
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = f"reservation:req:{reservation.requirement_id}:mode:make"
+    target = _building_generation(db_session, "production-journal-compact-parity-target")
+    db_session.flush()
+
+    from app.services.production_control_journal_projection import _build_rows
+
+    legacy_rows, _ = _build_rows(db_session, parent, [run.run_id])
+    legacy = next(row for row in legacy_rows if row.get("product_id") is None)
+    legacy["root_item_ids"] = [int(reservation.item_id)]
+    compact = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={
+            "queue_rows": [{
+                "entity_kind": "assembly_queue",
+                "business_identity": "plan-line:parity",
+                "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
+            }],
+        },
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[run.run_id],
+    )
+    compact_row = next(row for row in compact["rows"] if row.get("product_id") is None)
+
+    ignored = {"work_item_id", "journal_row_key", "current_identity"}
+    # material_coverage_snapshot is evidence consumed only during candidate
+    # publication and is intentionally removed from the compact current owner.
+    ignored.add("material_coverage_snapshot")
+    legacy_normalized = {
+        key: value for key, value in legacy.items() if key not in ignored
+    }
+    compact_normalized = {
+        key: value for key, value in compact_row.items() if key not in ignored
+    }
+    assert legacy_normalized == compact_normalized
+
+
+def test_compact_purchase_payload_next_target_keeps_stable_business_rows_and_no_audit(
+    db_session,
+):
+    parent = _building_generation(db_session, "production-journal-compact-next-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run, work = _make_proposal(db_session, parent)
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = (
+        f"reservation:req:{reservation.requirement_id}:mode:make"
+    )
+    db_session.delete(work)
+    target1 = _building_generation(db_session, "production-journal-compact-next-1")
+    target2 = _building_generation(db_session, "production-journal-compact-next-2")
+    queue = [{
+        "entity_kind": "assembly_queue",
+        "business_identity": "plan-line:next-target",
+        "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
+    }]
+    shelf = [{
+        "entity_kind": "shelf_projection",
+        "payload": {
+            "item_id": reservation.item_id,
+            "materialized_qty": 4,
+            "pull_qty": 4,
+            "warehouse_ref1c": "WH",
+        },
+    }]
+    audit_before = db_session.query(models.CurrentExecutionChange).count()
+    first = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target1.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": queue},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": shelf},
+        accepted_run_ids=[run.run_id],
+    )
+    second = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target2.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": queue},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": shelf},
+        accepted_run_ids=[run.run_id],
+    )
+
+    def business_rows(payload):
+        return [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"material_coverage_calculated_at"}
+            }
+            for row in payload["rows"]
+        ]
+
+    assert business_rows(first) == business_rows(second)
+    assert first["rows"][0]["current_identity"] == (
+        f"mrp-reservation:{reservation.current_identity}"
+    )
+    assert db_session.query(models.CurrentExecutionChange).count() == audit_before
+    assert db_session.query(models.ReservationCurrentChange).count() == 0
+    assert db_session.query(models.ReplenishmentWorkItem).count() == 0
+
+
+def test_compact_purchase_payload_affected_scope_changes_only_that_make_row(db_session):
+    parent = _building_generation(db_session, "production-journal-compact-scope-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run1, work1 = _make_proposal(db_session, parent, "-one")
+    run2, work2 = _make_proposal(db_session, parent, "-two")
+    reservations = []
+    for work in (work1, work2):
+        reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+        reservation.owner_kind = "current"
+        reservation.is_current = True
+        reservation.current_identity = (
+            f"reservation:req:{reservation.requirement_id}:mode:make"
+        )
+        reservations.append(reservation)
+        db_session.delete(work)
+    target = _building_generation(db_session, "production-journal-compact-scope-target")
+    db_session.flush()
+    queue = [
+        {
+            "entity_kind": "assembly_queue",
+            "business_identity": f"plan-line:{run1.run_id}",
+            "payload": {"run_id": run1.run_id, "item_id": reservations[0].item_id},
+        },
+        {
+            "entity_kind": "assembly_queue",
+            "business_identity": f"plan-line:{run2.run_id}",
+            "payload": {"run_id": run2.run_id, "item_id": reservations[1].item_id},
+        },
+    ]
+
+    def shelf_rows(first_qty):
+        return [{
+            "entity_kind": "shelf_projection",
+            "payload": {
+                "item_id": reservation.item_id,
+                "materialized_qty": first_qty if index == 0 else 4,
+                "pull_qty": first_qty if index == 0 else 4,
+                "warehouse_ref1c": "WH",
+            },
+        } for index, reservation in enumerate(reservations)]
+
+    base = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": queue},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": shelf_rows(4)},
+        accepted_run_ids=[run1.run_id, run2.run_id],
+    )
+    changed = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": queue},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": shelf_rows(0)},
+        accepted_run_ids=[run1.run_id, run2.run_id],
+    )
+    base_by_identity = {row["current_identity"]: row for row in base["rows"]}
+    changed_by_identity = {row["current_identity"]: row for row in changed["rows"]}
+    second_identity = f"mrp-reservation:{reservations[1].current_identity}"
+    assert changed_by_identity[second_identity] == base_by_identity[second_identity]
+    first_identity = f"mrp-reservation:{reservations[0].current_identity}"
+    assert first_identity not in changed_by_identity
+
+
+def test_compact_purchase_payload_fails_closed_on_stale_parent_and_ambiguous_owner(
+    db_session,
+):
+    parent = _building_generation(db_session, "production-journal-compact-stale-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    pointer = models.PlanningTruthState(id=1, current_generation_id=parent.id)
+    db_session.add(pointer)
+    run, work = _make_proposal(db_session, parent)
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = "wrong-stable-owner"
+    db_session.delete(work)
+    target = _building_generation(db_session, "production-journal-compact-stale-target")
+    kwargs = dict(
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={"queue_rows": []},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[run.run_id],
+    )
+    pointer.current_generation_id = target.id
+    with pytest.raises(ProductionControlJournalPromotionError, match="current truth"):
+        build_compact_current_production_control_payload(db_session, **kwargs)
+    pointer.current_generation_id = parent.id
+    with pytest.raises(ProductionControlJournalPromotionError, match="ambiguous stable"):
+        build_compact_current_production_control_payload(db_session, **kwargs)
 
 
 @pytest.mark.parametrize("root_copies", [1, 2, 3])

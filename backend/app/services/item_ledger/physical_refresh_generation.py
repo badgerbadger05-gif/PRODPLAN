@@ -198,6 +198,7 @@ def _exact_existing(
     cutoff: datetime,
     from_cutoff: datetime,
     replay_from: datetime,
+    lightweight: bool = False,
 ) -> None:
     expected_marks = _expected_watermarks(
         parent_id=parent.id,
@@ -225,7 +226,7 @@ def _exact_existing(
     ).all()
     expected_provenance = _provenance_summary(_provenance_rows(db, int(parent.id)))
     existing_provenance = _provenance_summary(_provenance_rows(db, int(existing.id)))
-    if existing_provenance != expected_provenance:
+    if not lightweight and existing_provenance != expected_provenance:
         raise PhysicalRefreshGenerationError("existing physical refresh provenance conflicts")
     if len(checkpoints) != 1:
         raise PhysicalRefreshGenerationError(
@@ -264,6 +265,7 @@ def fork_physical_refresh_generation(
     *,
     from_cutoff: datetime,
     target_cutoff: datetime,
+    lightweight: bool = False,
 ) -> PhysicalRefreshGenerationResult:
     """Fork a BUILDING refresh candidate from the current accepted prefix.
 
@@ -314,6 +316,7 @@ def fork_physical_refresh_generation(
             cutoff=target,
             from_cutoff=replay_from,
             replay_from=inherited_replay_from,
+            lightweight=lightweight,
         )
         return PhysicalRefreshGenerationResult(
             ledger_generation_id=int(existing.id),
@@ -341,12 +344,19 @@ def fork_physical_refresh_generation(
     )
     db.add(candidate)
     db.flush()
-    materialize_generation_stock_bins(db, int(candidate.id), publish_current=False)
-    provenance = _clone_supplier_receipt_provenance(
-        db,
-        parent_generation_id=int(parent.id),
-        target_generation_id=int(candidate.id),
-    )
+    if lightweight:
+        # Automatic refresh first proves whether there is a semantic delta.
+        # Do not clone 11k stock bins or supplier provenance merely to discard
+        # an equivalent import; explicit maintenance/acceptance keeps the
+        # normal materialized fork below.
+        provenance = _provenance_summary(_provenance_rows(db, int(parent.id)))
+    else:
+        materialize_generation_stock_bins(db, int(candidate.id), publish_current=False)
+        provenance = _clone_supplier_receipt_provenance(
+            db,
+            parent_generation_id=int(parent.id),
+            target_generation_id=int(candidate.id),
+        )
     db.add(models.LedgerBuildBatch(
         ledger_generation_id=int(candidate.id),
         stage="physical_import",

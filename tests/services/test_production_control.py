@@ -57,6 +57,7 @@ from app.services.production_control_journal import (
 )
 from app.services.production_control_material_availability import (
     preview_materials,
+    preview_materials_bulk,
 )
 from app.services import production_control_material_availability as material_availability
 from app.services.production_material_custody_events import (
@@ -64,6 +65,10 @@ from app.services.production_material_custody_events import (
 )
 from app.services.production_material_custody_projection import (
     initialize_material_custody_baseline,
+)
+from app.services.production_material_custody import (
+    MaterialCustodyState,
+    ProductMaterialCustody,
 )
 from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
 from app.services.production_control_printing import (
@@ -2209,6 +2214,130 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
         assert c["coverage"] == "ok"
         assert c["missing_qty"] == 0
         assert c["eta_dates"] == []
+
+
+def test_bulk_material_preview_matches_scalar_and_loads_custody_once(
+    db_session, monkeypatch
+):
+    parent, _spec, _components = _make_basic_spec(
+        db_session,
+        parent_name="BulkPreviewParent",
+        child_specs=[("BULK-COMP", "Bulk component", 100, 2)],
+    )
+    _order_one, product_one = _make_internal_order_for(db_session, parent, qty=2)
+    _order_two, product_two = _make_internal_order_for(db_session, parent, qty=3)
+    generation_id = int(db_session.info["production_journal_generation_id"])
+
+    scalar = {
+        int(product.product_id): preview_materials(
+            db_session,
+            int(product.product_id),
+            ledger_generation_id=generation_id,
+        )
+        for product in (product_one, product_two)
+    }
+
+    from app.services import production_material_custody_projection as custody_projection
+
+    original_loader = custody_projection.load_material_custody_projection
+    calls = 0
+    eta_calls = 0
+    reservation_order_calls = 0
+    position_calls = 0
+
+    def tracked_loader(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        custody_projection,
+        "load_material_custody_projection",
+        tracked_loader,
+    )
+    original_eta = material_availability._future_supply_eta_by_item
+    original_reservation_orders = material_availability._reservation_orders_by_item
+
+    def tracked_eta(*args, **kwargs):
+        nonlocal eta_calls
+        eta_calls += 1
+        return original_eta(*args, **kwargs)
+
+    def tracked_reservation_orders(*args, **kwargs):
+        nonlocal reservation_order_calls
+        reservation_order_calls += 1
+        return original_reservation_orders(*args, **kwargs)
+
+    monkeypatch.setattr(material_availability, "_future_supply_eta_by_item", tracked_eta)
+    monkeypatch.setattr(
+        material_availability,
+        "_reservation_orders_by_item",
+        tracked_reservation_orders,
+    )
+    import app.services.item_ledger as item_ledger_package
+
+    original_positions = item_ledger_package.item_ledger_position
+
+    def tracked_positions(*args, **kwargs):
+        nonlocal position_calls
+        position_calls += 1
+        return original_positions(*args, **kwargs)
+
+    monkeypatch.setattr(item_ledger_package, "item_ledger_position", tracked_positions)
+    bulk = preview_materials_bulk(
+        db_session,
+        [product_one.product_id, product_two.product_id],
+        ledger_generation_id=generation_id,
+    )
+
+    assert bulk == scalar
+    assert calls == 1
+    assert eta_calls == 1
+    assert reservation_order_calls == 1
+    assert position_calls == 1
+
+
+def test_bulk_material_preview_preserves_own_vs_other_custody_semantics(
+    db_session, monkeypatch
+):
+    parent, _spec, components = _make_basic_spec(
+        db_session,
+        parent_name="BulkCustodyParent",
+        child_specs=[("BULK-CUSTODY-COMP", "Custody component", 100, 2)],
+    )
+    _order_one, product_one = _make_internal_order_for(db_session, parent, qty=2)
+    _order_two, product_two = _make_internal_order_for(db_session, parent, qty=3)
+    generation_id = int(db_session.info["production_journal_generation_id"])
+    custody = MaterialCustodyState(
+        by_product={
+            int(product_one.product_id): ProductMaterialCustody(
+                at_workshop={int(components[0].item_id): 1.0}
+            ),
+            999999: ProductMaterialCustody(
+                in_transit={int(components[0].item_id): 4.0}
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "app.services.production_material_custody_projection.load_material_custody_projection",
+        lambda *args, **kwargs: custody,
+    )
+    scalar = {
+        int(product.product_id): preview_materials(
+            db_session,
+            int(product.product_id),
+            ledger_generation_id=generation_id,
+        )
+        for product in (product_one, product_two)
+    }
+    bulk = preview_materials_bulk(
+        db_session,
+        [product_one.product_id, product_two.product_id],
+        ledger_generation_id=generation_id,
+    )
+    assert bulk == scalar
+    assert bulk[product_one.product_id]["components"][0]["reserved_for_order_qty"] == 1.0
+    assert bulk[product_two.product_id]["components"][0]["reserved_qty"] == 5.0
 
 
 @pytest.mark.parametrize(

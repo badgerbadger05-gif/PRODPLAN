@@ -396,6 +396,8 @@ def carry_forward_retained_reservations(
     target_generation_id: int,
     retained_run_ids: tuple[int, ...],
     preserve_realization: bool = False,
+    source_current: bool = False,
+    preserve_realization_before: datetime | None = None,
 ) -> int:
     """Copy immutable retained obligations, but never carry physical realization.
 
@@ -412,10 +414,22 @@ def carry_forward_retained_reservations(
         models.ReservationEntry.ledger_generation_id == int(target_generation_id),
         models.ReservationEntry.run_id.in_(run_ids),
     ).count()
-    source_entries = db.query(models.ReservationEntry).filter(
-        models.ReservationEntry.ledger_generation_id == int(parent_generation_id),
+    source_query = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.run_id.in_(run_ids),
-    ).order_by(models.ReservationEntry.id.asc()).all()
+    )
+    if source_current:
+        # Physical refreshes carry the stable accepted owner forward.  Its
+        # ledger_generation_id is provenance and may point at an older
+        # physical fork, so selecting by the exact current marker is the only
+        # safe way to find the owner after a no-op physical publication.
+        source_query = source_query.filter(
+            models.ReservationEntry.is_current.is_(True),
+        )
+    else:
+        source_query = source_query.filter(
+            models.ReservationEntry.ledger_generation_id == int(parent_generation_id),
+        )
+    source_entries = source_query.order_by(models.ReservationEntry.id.asc()).all()
     if existing_count:
         if existing_count != len(source_entries):
             raise ObligationGenerationError(
@@ -448,6 +462,15 @@ def carry_forward_retained_reservations(
             lifecycle_status=source.lifecycle_status,
             opened_at=source.opened_at,
             closed_at=source.closed_at,
+            # The obligation refresh creates a new physical staging row, but
+            # it is the same business reservation owner.  Preserve the R11
+            # identity so R4 can compare it before current-owner rebind.
+            current_identity=(
+                str(source.current_identity or "").strip()
+                or f"reservation:req:{int(source.requirement_id)}:mode:{str(source.realization_mode or '').strip()}"
+            ),
+            owner_kind="building",
+            is_current=False,
         )
         db.add(target)
         db.flush()
@@ -464,11 +487,37 @@ def carry_forward_retained_reservations(
         # single synthetic ``open`` event carried a non-zero ``realized_delta``
         # with ``sle_id=None`` and therefore failed that checkpoint with
         # "reservation realization references a non-visible physical fact".)
-        source_events = db.query(models.ReservationEvent).filter(
-            models.ReservationEvent.ledger_generation_id == int(parent_generation_id),
+        source_event_query = db.query(models.ReservationEvent).filter(
             models.ReservationEvent.reservation_id.in_(tuple(new_ids)),
-        ).order_by(models.ReservationEvent.id.asc()).all()
+        )
+        if source_current:
+            source_event_query = source_event_query.filter(
+                models.ReservationEvent.is_current.is_(True),
+            )
+        else:
+            source_event_query = source_event_query.filter(
+                models.ReservationEvent.ledger_generation_id == int(parent_generation_id),
+            )
+        source_events = source_event_query.order_by(models.ReservationEvent.id.asc()).all()
         for source_event in source_events:
+            if (
+                preserve_realization_before is not None
+                and source_event.sle_id is not None
+                and source_event.event_at is not None
+                and (
+                    source_event.event_at.replace(tzinfo=timezone.utc)
+                    if source_event.event_at.tzinfo is None
+                    else source_event.event_at
+                ) >= (
+                    preserve_realization_before.replace(tzinfo=timezone.utc)
+                    if preserve_realization_before.tzinfo is None
+                    else preserve_realization_before
+                )
+            ):
+                # A correction/backdate recomputes this suffix from its earliest
+                # affected boundary.  Keep the immutable obligation basis but
+                # do not duplicate the old suffix into the target fold.
+                continue
             db.add(models.ReservationEvent(
                 ledger_generation_id=int(target_generation_id),
                 reservation_id=new_ids[int(source_event.reservation_id)],
@@ -490,6 +539,12 @@ def carry_forward_retained_reservations(
                 ),
                 event_at=source_event.event_at,
             ))
+        db.flush()
+        if preserve_realization_before is not None:
+            # Rebuild the target cache from the retained prefix. The replay
+            # stage appends the suffix and folds it again before validation.
+            for target_id in new_ids.values():
+                _fold_entry(db, db.get(models.ReservationEntry, int(target_id)))
     else:
         for source in source_entries:
             target_id = new_ids[int(source.id)]

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
@@ -167,6 +168,70 @@ def _rates_and_capacity(
     return normalized, capacity, horizon, horizon_by_resource
 
 
+def _rates_and_capacity_for_items(
+    db: Session, item_ids: set[int]
+) -> tuple[
+    dict[int, tuple[AssemblyRateProfile, ...]],
+    dict[int, Decimal],
+    int,
+    dict[int, int],
+]:
+    """Resolve the same rate/resource contour without queue staging rows."""
+
+    ids = sorted({int(value) for value in item_ids})
+    rate_rows = (
+        db.query(models.AssemblyRate)
+        .filter(models.AssemblyRate.item_id.in_(ids))
+        .order_by(models.AssemblyRate.item_id, models.AssemblyRate.resource_id)
+        .all()
+        if ids else []
+    )
+    items = {
+        int(item.item_id): item
+        for item in (
+            db.query(models.Item).filter(models.Item.item_id.in_(ids)).all()
+            if ids else []
+        )
+    }
+    rates: dict[int, list[AssemblyRateProfile]] = {}
+    for row in rate_rows:
+        item = items.get(int(row.item_id))
+        if item is None:
+            raise ValueError(f"assembly rate references missing item {int(row.item_id)}")
+        if item.optimal_batch is None:
+            continue
+        rates.setdefault(int(row.item_id), []).append(
+            AssemblyRateProfile(
+                resource_id=int(row.resource_id),
+                qty_per_capacity=_d(item.optimal_batch),
+            )
+        )
+    normalized = {item_id: tuple(values) for item_id, values in rates.items()}
+    for item_id, profiles in normalized.items():
+        if len(profiles) > 1:
+            raise ValueError(f"ambiguous assembly rate for item {item_id}")
+        if profiles and _d(profiles[0].qty_per_capacity) <= 0:
+            raise ValueError(f"invalid assembly rate for item {item_id}")
+    resource_ids = sorted(
+        {profile.resource_id for values in normalized.values() for profile in values}
+    )
+    resources = (
+        db.query(models.ProductionResource)
+        .filter(models.ProductionResource.resource_id.in_(resource_ids))
+        .all()
+        if resource_ids else []
+    )
+    capacity = {int(row.resource_id): _d(row.capacity) for row in resources}
+    if set(resource_ids) != set(capacity):
+        raise ValueError("assembly rate references missing production resource")
+    horizon_by_resource = {
+        int(row.resource_id): max(int(row.planning_range or 0), 1)
+        for row in resources
+    }
+    horizon = max(list(horizon_by_resource.values()) or [1])
+    return normalized, capacity, horizon, horizon_by_resource
+
+
 def _planning_start(generation: models.LedgerGeneration) -> date:
     # The fact cutoff and the calendar epoch are independent. A retained-plan
     # refresh keeps yesterday's physical facts but starts a new calendar today.
@@ -261,6 +326,302 @@ def _plan(
             "excluded_open_qty": str(excluded_open_qty),
             "excluded_item_ids": sorted({int(row.item_id) for row in excluded_rows}),
         },
+    )
+
+
+def _compact_slot_readiness_payload(
+    readiness: Mapping[str, Any],
+    phase: str,
+    slot_qty: Decimal,
+) -> tuple[date | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply the persisted drum tile projection to an in-memory DTO."""
+
+    curve = list(readiness.get("readiness_curve") or [])
+    phase_rank = _READINESS_RANK.get(str(phase), 99)
+    tile_curve = [
+        {
+            "horizon": str(point.get("horizon") or ""),
+            "cumulative_qty": str(
+                slot_qty
+                if _READINESS_RANK.get(str(point.get("horizon")), 99) >= phase_rank
+                else Decimal("0")
+            ),
+            "available_date": point.get("available_date"),
+            "actions": list(point.get("actions") or []),
+            "required_actions": list(point.get("required_actions") or []),
+            "blockers": list(point.get("blockers") or []),
+        }
+        for point in curve
+    ]
+    if phase_rank >= 99:
+        return None, tile_curve, []
+    current_index = next(
+        (index for index, point in enumerate(curve) if str(point.get("horizon")) == phase),
+        None,
+    )
+    if current_index is None:
+        return None, tile_curve, []
+    current = curve[current_index]
+    previous = curve[current_index - 1] if current_index > 0 else {"cumulative_qty": "0", "actions": []}
+    increment = max(
+        _d(current.get("cumulative_qty")) - _d(previous.get("cumulative_qty")),
+        Decimal("0"),
+    )
+    current_date = (
+        date.fromisoformat(str(current["available_date"]))
+        if current.get("available_date") else None
+    )
+    if increment <= 0:
+        return current_date, tile_curve, []
+    previous_qty = {
+        _action_key(row): _d(row.get("qty"))
+        for row in list(previous.get("actions") or [])
+    }
+    ratio = slot_qty / increment
+    actions: list[dict[str, Any]] = []
+    for row in list(current.get("actions") or []):
+        delta = max(
+            _d(row.get("qty")) - previous_qty.get(_action_key(row), Decimal("0")),
+            Decimal("0"),
+        )
+        if delta <= 0:
+            continue
+        action = dict(row)
+        action["qty"] = str((delta * ratio).quantize(Decimal("0.001")))
+        actions.append(action)
+    return current_date, tile_curve, actions
+
+
+@dataclass(frozen=True)
+class CompactDrumSchedulePayload:
+    """Validated drum DTOs with stable plan-line identities and no staging ids."""
+
+    target_generation_id: int
+    parent_generation_id: int
+    rows: tuple[dict[str, Any], ...]
+    metrics: dict[str, Any]
+
+
+def build_compact_current_drum_payload(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    assembly_payload: Any,
+) -> CompactDrumSchedulePayload:
+    """Build drum schedule/slot/gap DTOs from compact queue/readiness payloads.
+
+    QueueLine ids passed to the pure scheduler are negative ephemeral keys.  No
+    such key is returned: every output row carries ``plan_line_id`` and the
+    stable ``queue_owner_identity``.  ``resolve_compact_queue_owner_ids`` in
+    ``current_execution`` may add the actual CurrentExecutionRow id after the
+    queue scope has been published.
+    """
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or str(target.status or "") != "building":
+        raise ValueError("compact drum payload requires a BUILDING target")
+    if parent is None or str(parent.status or "") != "accepted":
+        raise ValueError("compact drum payload requires an accepted parent")
+    if int(target.id) == int(parent.id) or target.cutoff is None:
+        raise ValueError("compact drum payload target boundary is invalid")
+    queue_rows = list(getattr(assembly_payload, "queue_rows", ()) or ())
+    readiness_rows = list(getattr(assembly_payload, "readiness_rows", ()) or ())
+    readiness_by_line: dict[int, Mapping[str, Any]] = {}
+    for raw in readiness_rows:
+        payload = raw.get("payload") if isinstance(raw, Mapping) else None
+        if not isinstance(payload, Mapping):
+            raise ValueError("compact readiness row is malformed")
+        line_id = int(payload.get("plan_line_id") or 0)
+        if line_id <= 0 or line_id in readiness_by_line:
+            raise ValueError("compact readiness has duplicate plan line")
+        readiness_by_line[line_id] = payload
+
+    queue_lines: list[QueueLine] = []
+    queue_by_line: dict[int, Mapping[str, Any]] = {}
+    for raw in queue_rows:
+        payload = raw.get("payload") if isinstance(raw, Mapping) else None
+        identity = str(raw.get("business_identity") or "") if isinstance(raw, Mapping) else ""
+        if not isinstance(payload, Mapping) or not identity.startswith("plan-line:"):
+            raise ValueError("compact queue row is malformed")
+        plan_line_id = int(payload.get("plan_line_id") or 0)
+        if plan_line_id <= 0 or plan_line_id in queue_by_line:
+            raise ValueError("compact queue has duplicate plan line")
+        readiness = readiness_by_line.get(plan_line_id)
+        if readiness is None:
+            raise ValueError(f"compact drum readiness missing plan line {plan_line_id}")
+        queue_by_line[plan_line_id] = payload
+        queue_lines.append(
+            QueueLine(
+                queue_line_id=-plan_line_id,
+                plan_id=int(payload["plan_id"]),
+                plan_line_id=plan_line_id,
+                item_id=int(payload["item_id"]),
+                sort_key=str(payload["sort_key"]),
+                planned_output_qty=_d(payload["planned_output_qty"]),
+                accepted_plan_output_qty=_d(payload["accepted_plan_output_qty"]),
+                original_priority=tuple(payload.get("original_priority") or ()),
+                assembly_remaining_qty=_d(payload["assembly_remaining_qty"]),
+                ready_qty=_d(readiness.get("ready_qty")),
+                readiness_status=str(readiness.get("status") or "unavailable"),
+                readiness_curve=tuple(
+                    (
+                        str(point.get("horizon") or ""),
+                        _d(point.get("cumulative_qty")),
+                        date.fromisoformat(str(point["available_date"]))
+                        if point.get("available_date") else None,
+                    )
+                    for point in list(readiness.get("readiness_curve") or [])
+                ),
+            )
+        )
+
+    item_ids = {int(row.item_id) for row in queue_lines}
+    rates, capacity, horizon, horizon_by_resource = _rates_and_capacity_for_items(db, item_ids)
+    schedule_from = _planning_start(target)
+    schedule_to = schedule_from + timedelta(days=horizon - 1)
+    calendar: dict[date, bool] = {}
+    cursor = schedule_from
+    while cursor <= schedule_to:
+        calendar[cursor] = is_workday(db, cursor)
+        cursor += timedelta(days=1)
+    resource_horizon_end = {
+        resource_id: schedule_from + timedelta(days=days - 1)
+        for resource_id, days in horizon_by_resource.items()
+    }
+    scheduled = tuple(row for row in queue_lines if int(row.item_id) in rates)
+    plan = build_drum_plan(
+        scheduled,
+        rates,
+        calendar,
+        schedule_from=schedule_from,
+        schedule_to=schedule_to,
+        resource_capacity_by_id=capacity,
+        resource_horizon_end_by_id=resource_horizon_end,
+    )
+    excluded = tuple(row for row in queue_lines if int(row.item_id) not in rates)
+    metrics = {
+        **dict(plan.metrics),
+        "queue_lines": len(queue_lines),
+        "excluded_lines": len(excluded),
+        "excluded_open_qty": str(sum((_d(row.assembly_remaining_qty) for row in excluded), Decimal("0"))),
+        "excluded_item_ids": sorted({int(row.item_id) for row in excluded}),
+    }
+    rows: list[dict[str, Any]] = [{
+        "entity_kind": "drum_schedule",
+        "business_identity": "drum:all-live-plans",
+        "scope_key": "drum:all-live-plans",
+        "payload": {
+            "schedule_from": plan.schedule_from.isoformat(),
+            "schedule_to": plan.schedule_to.isoformat(),
+            "working_days": [value.isoformat() for value in plan.working_days],
+            "resource_horizon_ends": {str(key): value.isoformat() for key, value in plan.resource_horizon_ends},
+            "resource_daily_capacities": {str(key): str(value) for key, value in plan.resource_daily_capacities},
+            "queue_signature": plan.queue_signature,
+            "slot_signature": plan.slot_signature,
+            "gap_signature": plan.gap_signature,
+            "metrics": metrics,
+        },
+    }]
+    manual_rows = {
+        str(row.business_identity): dict(row.manual_input or {})
+        for row in db.query(models.CurrentExecutionRow).filter(
+            models.CurrentExecutionRow.entity_kind == "drum_slot",
+            models.CurrentExecutionRow.result_status == "accepted",
+        ).all()
+        if row.manual_input
+    }
+    for slot in plan.slots:
+        line = int(slot.plan_line_id)
+        readiness = readiness_by_line[line]
+        readiness_date, curve, actions = _compact_slot_readiness_payload(
+            readiness, slot.readiness_phase, slot.slot_qty
+        )
+        identity = f"slot:plan-line:{line}:ordinal:{int(slot.slot_ordinal)}"
+        payload = {
+            "queue_owner_identity": f"plan-line:{line}",
+            "plan_id": int(slot.plan_id), "plan_line_id": line,
+            "run_id": int(queue_by_line[line]["run_id"]),
+            "item_id": int(slot.item_id), "resource_id": int(slot.resource_id),
+            "slot_date": slot.slot_date.isoformat(), "auto_slot_date": slot.slot_date.isoformat(),
+            "slot_qty": str(slot.slot_qty), "capacity_load": str(slot.capacity_load),
+            "planned_output_qty": str(slot.planned_output_qty),
+            "accepted_plan_output_qty": str(slot.accepted_plan_output_qty),
+            "assembly_remaining_qty": str(slot.assembly_remaining_qty),
+            "slot_ordinal": int(slot.slot_ordinal),
+            "readiness_phase": str(slot.readiness_phase),
+            "readiness_date": readiness_date.isoformat() if readiness_date else None,
+            "readiness_curve": curve, "action_manifest": actions,
+            "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
+            "blocking_manifest": list(readiness.get("blocking_manifest") or []),
+            "original_priority": list(slot.original_priority),
+        }
+        manual = manual_rows.get(identity)
+        if manual:
+            if manual.get("slot_date"):
+                payload["slot_date"] = str(manual["slot_date"])
+            if manual.get("resource_id") is not None:
+                payload["resource_id"] = int(manual["resource_id"])
+        rows.append({
+            "entity_kind": "drum_slot", "business_identity": identity,
+            "scope_key": "drum:all-live-plans", "payload": payload,
+            **({"manual_input": manual} if manual else {}),
+        })
+    for gap in plan.gaps:
+        line = int(gap.plan_line_id)
+        readiness = readiness_by_line[line]
+        readiness_date, curve, actions = _compact_slot_readiness_payload(
+            readiness, gap.readiness_phase, gap.gap_qty
+        )
+        rows.append({
+            "entity_kind": "drum_gap",
+            "business_identity": f"gap:plan-line:{line}:date:{gap.gap_date.isoformat()}",
+            "scope_key": "drum:all-live-plans",
+            "payload": {
+                "queue_owner_identity": f"plan-line:{line}",
+                "plan_id": int(gap.plan_id), "plan_line_id": line,
+                "run_id": int(queue_by_line[line]["run_id"]),
+                "item_id": int(gap.item_id), "resource_id": int(gap.resource_id),
+                "gap_date": gap.gap_date.isoformat(), "required_qty": str(gap.required_qty),
+                "available_capacity": str(gap.available_capacity), "gap_qty": str(gap.gap_qty),
+                "readiness_phase": str(gap.readiness_phase),
+                "readiness_date": readiness_date.isoformat() if readiness_date else None,
+                "readiness_curve": curve, "action_manifest": actions,
+                "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
+                "blocking_manifest": list(readiness.get("blocking_manifest") or []),
+                "original_priority": list(gap.original_priority),
+            },
+        })
+    for queue in excluded:
+        line = int(queue.plan_line_id)
+        readiness = readiness_by_line[line]
+        rows.append({
+            "entity_kind": "drum_excluded",
+            "business_identity": f"excluded:plan-line:{line}",
+            "scope_key": "drum:all-live-plans",
+            "payload": {
+                "queue_owner_identity": f"plan-line:{line}",
+                "plan_id": int(queue.plan_id), "plan_line_id": line,
+                "run_id": int(queue_by_line[line]["run_id"]), "item_id": int(queue.item_id),
+                "period_from": str(queue_by_line[line]["period_from"]),
+                "period_to": str(queue_by_line[line]["period_to"]),
+                "planned_output_qty": str(queue.planned_output_qty),
+                "accepted_plan_output_qty": str(queue.accepted_plan_output_qty),
+                "assembly_remaining_qty": str(queue.assembly_remaining_qty),
+                "reason": "ASSEMBLY_RATE_MISSING",
+                "readiness_status": str(readiness.get("status") or "unavailable"),
+                "readiness_date": readiness.get("readiness_date"),
+                "readiness_curve": list(readiness.get("readiness_curve") or []),
+                "action_manifest": list(readiness.get("action_manifest") or []),
+                "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
+                "blocking_manifest": list(readiness.get("blocking_manifest") or []),
+                "original_priority": list(queue.original_priority),
+            },
+        })
+    return CompactDrumSchedulePayload(
+        target_generation_id=int(target.id), parent_generation_id=int(parent.id),
+        rows=tuple(rows), metrics=metrics,
     )
 
 

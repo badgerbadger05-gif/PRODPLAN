@@ -13,6 +13,7 @@ from datetime import date
 from decimal import Decimal
 import hashlib
 import json
+from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
@@ -404,6 +405,18 @@ class CurrentExecutionPublishResult:
     idempotent: bool
 
 
+@dataclass(frozen=True)
+class CompactCurrentAssemblyPayload:
+    """Validated queue/readiness DTOs built without generation staging rows."""
+
+    target_generation_id: int
+    parent_generation_id: int
+    affected_physical_keys: tuple[tuple[int, str, str, str], ...]
+    queue_rows: tuple[dict[str, Any], ...]
+    readiness_rows: tuple[dict[str, Any], ...]
+    readiness_metrics: dict[str, Any]
+
+
 def drum_slot_identity(plan_line_id: int, slot_ordinal: int) -> str:
     return f"slot:plan-line:{int(plan_line_id)}:ordinal:{int(slot_ordinal)}"
 
@@ -411,6 +424,63 @@ def drum_slot_identity(plan_line_id: int, slot_ordinal: int) -> str:
 def drum_gap_identity(plan_line_id: int, gap_date: date | str) -> str:
     value = gap_date.isoformat() if isinstance(gap_date, date) else str(gap_date)
     return f"gap:plan-line:{int(plan_line_id)}:date:{value}"
+
+
+def resolve_compact_queue_owner_ids(
+    db: Session,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    scope_key: str = "assembly:all-live-plans",
+) -> tuple[dict[str, Any], ...]:
+    """Resolve plan-line identities to published CurrentExecutionRow ids.
+
+    Compact drum/readiness builders intentionally run before their queue scope
+    is published, so they must not pretend that ``plan_line_id`` is a current
+    row id.  This helper is the explicit post-publication bridge for payloads
+    that need the compatibility ``queue_line_id`` field.
+    """
+
+    owners = {
+        int((row.payload or {}).get("plan_line_id")): int(row.id)
+        for row in load_current_execution_rows(
+            db,
+            entity_kind="assembly_queue",
+            scope_key=str(scope_key),
+        )
+        if (row.payload or {}).get("plan_line_id") is not None
+    }
+    resolved: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        entity_kind = str(row.get("entity_kind") or "").strip()
+        if entity_kind == "drum_schedule":
+            # The schedule is an aggregate calendar/resource manifest.  It
+            # intentionally has no plan-line owner; only slot/gap/excluded
+            # rows point back to an assembly queue line.
+            resolved.append(row)
+            continue
+        if entity_kind not in {
+            "assembly_readiness",
+            "drum_slot",
+            "drum_gap",
+            "drum_excluded",
+        }:
+            raise CurrentExecutionUnavailable(
+                f"unknown compact queue dependent row kind: {entity_kind or '<missing>'}"
+            )
+        payload = dict(row.get("payload") or {})
+        plan_line_id = payload.get("plan_line_id")
+        if plan_line_id is None:
+            raise CurrentExecutionUnavailable("compact dependent row lacks plan_line_id")
+        owner_id = owners.get(int(plan_line_id))
+        if owner_id is None:
+            raise CurrentExecutionUnavailable(
+                f"no published current queue owner for plan line {int(plan_line_id)}"
+            )
+        payload["queue_line_id"] = owner_id
+        row["payload"] = payload
+        resolved.append(row)
+    return tuple(resolved)
 
 
 def _jsonable(value: Any) -> Any:
@@ -428,11 +498,61 @@ def _hash(payload: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _drop_semantic_neutral_fields(value: Any, *, entity_kind: str, path: tuple[str, ...] = ()) -> Any:
+    """Return the business comparison view of a current execution payload.
+
+    Generation refreshes legitimately rebuild compatibility DTOs.  Only the
+    explicitly technical fields below are ignored; quantities, identities and
+    other business evidence remain part of the comparison.
+    """
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, child in value.items():
+            name = str(key)
+            if (
+                entity_kind == "production_control_journal"
+                and not path
+                and name == "material_coverage_calculated_at"
+            ):
+                continue
+            if (
+                entity_kind == "production_control_journal"
+                and path == ("material_coverage_snapshot",)
+                and name == "work_item_id"
+            ):
+                continue
+            if entity_kind == "period_plan_execution" and path and path[-1] == "queue_links" and name == "source_revision":
+                continue
+            if entity_kind == "purchase_control_journal" and path and path[-1] in {
+                "horizon_buckets", "slices", "materialization_input"
+            } and name == "work_item_id":
+                continue
+            result[name] = _drop_semantic_neutral_fields(
+                child, entity_kind=entity_kind, path=(*path, name)
+            )
+        return result
+    if isinstance(value, list):
+        return [
+            _drop_semantic_neutral_fields(child, entity_kind=entity_kind, path=path)
+            for child in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _drop_semantic_neutral_fields(child, entity_kind=entity_kind, path=path)
+            for child in value
+        )
+    return value
+
+
 def _semantic_payload(row: dict[str, Any], existing_manual: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     payload = dict(row.get("payload") or {})
     supplied_manual = row.get("manual_input")
     manual = dict(existing_manual or {}) if supplied_manual is None else dict(supplied_manual or {})
     return payload, manual
+
+
+def _semantic_view(payload: dict[str, Any], entity_kind: str) -> dict[str, Any]:
+    return _drop_semantic_neutral_fields(payload, entity_kind=entity_kind)
 
 
 def order_execution_queue(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -510,13 +630,14 @@ def publish_current_execution_scope(
         if row_scope != scope:
             raise CurrentExecutionUnavailable("current execution row is outside complete scope")
         payload, manual = _semantic_payload(row)
+        semantic_payload = _semantic_view(payload, entity_kind)
         key = (entity_kind, identity)
         if key in incoming:
             raise CurrentExecutionUnavailable(f"duplicate current execution identity {entity_kind}:{identity}")
         incoming[key] = (
             payload,
             manual,
-            _hash({"payload": payload, "manual_input": manual}),
+            _hash({"payload": semantic_payload, "manual_input": manual}),
             "manual_input" in row,
         )
 
@@ -527,7 +648,7 @@ def publish_current_execution_scope(
         raise CurrentExecutionUnavailable("empty complete scope requires explicit entity kinds")
     for kind in sorted(expected_kinds):
         entries = [
-            (identity, payload, manual)
+            (identity, _semantic_view(payload, kind), manual)
             for (entry_kind, identity), (payload, manual, _content_hash, _manual_supplied)
             in incoming.items()
             if entry_kind == kind
@@ -573,13 +694,25 @@ def publish_current_execution_scope(
         row = existing_by_key.get(key)
         if row is not None and not manual_supplied:
             manual = dict(row.manual_input or {})
-            content_hash = _hash({"payload": payload, "manual_input": manual})
+            content_hash = _hash({
+                "payload": _semantic_view(payload, key[0]),
+                "manual_input": manual,
+            })
         if row is not None and (
             str(row.result_status) == "accepted"
             and bool(row.result_ready)
-            and str(row.content_hash) == content_hash
         ):
-            continue
+            # A deployment may introduce a stricter semantic normalizer.  Do
+            # not rewrite every row merely to migrate its hash: compare the
+            # persisted payload through the new view and preserve the legacy
+            # hash until a real business update occurs.
+            existing_manual = dict(row.manual_input or {})
+            existing_semantic_hash = _hash({
+                "payload": _semantic_view(dict(row.payload or {}), key[0]),
+                "manual_input": existing_manual,
+            })
+            if str(row.content_hash) == content_hash or content_hash == existing_semantic_hash:
+                continue
         if row is None:
             row = models.CurrentExecutionRow(
                 entity_kind=key[0],
@@ -848,6 +981,131 @@ def invalidate_current_execution_for_calendar_change(
         ):
             invalidated.append(entity_kind)
     return tuple(invalidated)
+
+
+def build_compact_current_assembly_payload(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    affected_physical_keys: Iterable[tuple[int, str, str, str]],
+) -> CompactCurrentAssemblyPayload:
+    """Build queue/readiness current DTOs from accepted obligations and owners.
+
+    This is deliberately a build/validate boundary.  It does not publish a
+    current scope, move ``PlanningTruthState``, or materialize any target
+    ``AssemblyQueueLine``/``AssemblyReadiness`` rows.  The queue builder and
+    readiness allocator remain the canonical business calculators; this
+    adapter only supplies stable in-memory queue owners and serializes their
+    existing result shapes for a later atomic publisher.
+    """
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or str(target.status or "") != "building":
+        raise CurrentExecutionUnavailable(
+            "compact assembly payload requires a BUILDING physical target"
+        )
+    if parent is None or str(parent.status or "") != "accepted":
+        raise CurrentExecutionUnavailable(
+            "compact assembly payload requires an accepted parent"
+        )
+    if int(target.id) == int(parent.id):
+        raise CurrentExecutionUnavailable(
+            "compact assembly payload target must differ from parent"
+        )
+    if target.cutoff is None or parent.cutoff is None:
+        raise CurrentExecutionUnavailable(
+            "compact assembly payload requires target and parent cutoffs"
+        )
+
+    normalized_keys: list[tuple[int, str, str, str]] = []
+    seen_keys: set[tuple[int, str, str, str]] = set()
+    for raw in affected_physical_keys:
+        values = tuple(raw)
+        if len(values) != 4:
+            raise CurrentExecutionUnavailable(
+                "compact assembly affected physical key is malformed"
+            )
+        try:
+            key = (
+                int(values[0]),
+                str(values[1] or "").strip(),
+                str(values[2] or "").strip(),
+                str(values[3] or "").strip(),
+            )
+        except (TypeError, ValueError) as exc:
+            raise CurrentExecutionUnavailable(
+                "compact assembly affected physical key is malformed"
+            ) from exc
+        if key[0] <= 0 or key in seen_keys:
+            raise CurrentExecutionUnavailable(
+                "compact assembly affected physical keys are malformed"
+            )
+        seen_keys.add(key)
+        normalized_keys.append(key)
+    normalized_keys.sort()
+
+    from .assembly_queue_materialization import _build_rows
+    from .assembly_readiness_persistence import (
+        build_assembly_readiness_payload_rows,
+    )
+
+    queue_dtos: list[Any] = []
+    queue_payload: list[dict[str, Any]] = []
+    for raw in _build_rows(db, int(parent.id)):
+        payload = dict(raw["payload"])
+        plan_line_id = int(payload["plan_line_id"])
+        queue_dtos.append(SimpleNamespace(
+            id=plan_line_id,
+            plan_id=int(payload["plan_id"]),
+            plan_line_id=plan_line_id,
+            planning_run_id=int(payload["run_id"]),
+            item_id=int(payload["item_id"]),
+            bucket_date=payload.get("bucket_date"),
+            period_from=payload.get("period_from"),
+            period_to=payload.get("period_to"),
+            assembly_remaining_qty=Decimal(str(payload["assembly_remaining_qty"])),
+            original_priority=list(payload.get("priority_key") or []),
+            sort_key=str(raw["sort_key"]),
+        ))
+        eligible_from = payload.get("eligible_from")
+        queue_payload.append({
+            "entity_kind": "assembly_queue",
+            "business_identity": f"plan-line:{plan_line_id}",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "plan_id": int(payload["plan_id"]),
+                "plan_line_id": plan_line_id,
+                "run_id": int(payload["run_id"]),
+                "item_id": int(payload["item_id"]),
+                "bucket_date": str(payload.get("bucket_date") or ""),
+                "period_from": str(payload["period_from"] or ""),
+                "period_to": str(payload["period_to"] or ""),
+                "planned_output_qty": str(payload["planned_output_qty"]),
+                "accepted_plan_output_qty": str(payload["accepted_plan_output_qty"]),
+                "assembly_remaining_qty": str(payload["assembly_remaining_qty"]),
+                "eligible_from": eligible_from.isoformat() if hasattr(eligible_from, "isoformat") else eligible_from,
+                "original_priority": list(payload.get("priority_key") or []),
+                "sort_key": str(raw["sort_key"]),
+            },
+        })
+
+    readiness_payload, readiness_metrics = build_assembly_readiness_payload_rows(
+        db,
+        generation_id=int(parent.id),
+        queue_rows=queue_dtos,
+        current_owner=True,
+        as_of=target.cutoff.date(),
+    )
+    return CompactCurrentAssemblyPayload(
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_physical_keys=tuple(normalized_keys),
+        queue_rows=tuple(queue_payload),
+        readiness_rows=tuple(readiness_payload),
+        readiness_metrics=dict(readiness_metrics),
+    )
 
 
 def publish_current_execution_from_generation(
@@ -1266,8 +1524,17 @@ def publish_current_purchase_control_from_payload(
     summary = dict(meta)
     if isinstance(payload.get("summary"), Mapping):
         summary["summary"] = dict(payload["summary"])
+    else:
+        summary["summary"] = {}
     if isinstance(payload.get("cards"), Mapping):
         summary["cards"] = dict(payload["cards"])
+    else:
+        summary["cards"] = {}
+    # Keep the source envelope explicitly available as well as the flattened
+    # metadata keys used by older current-only readers.  This makes the
+    # persisted scope contract unambiguous: meta, summary and cards are all
+    # present even for a valid empty publication.
+    summary["meta"] = dict(meta)
     summary["total_rows"] = len(current_rows)
     return publish_current_execution_scope(
         db,
@@ -1315,11 +1582,23 @@ def publish_current_production_control_from_payload(
             raise CurrentExecutionUnavailable("production candidate row is malformed")
         candidate = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
         row = dict(candidate)
-        identity = str(
-            raw.get("current_identity")
-            or row.get("current_identity")
-            or ""
-        ).strip()
+        # For MRP-linked production rows the canonical identity is derived
+        # from the stable production product/line discriminator.  Do not trust
+        # a legacy snapshot-provided identity that predates this discriminator:
+        # two products can legitimately share one allocation key.
+        has_mrp_product_key = (
+            (row.get("source_mrp_requirement_id") or row.get("requirement_id"))
+            not in (None, "")
+            and (row.get("source_mrp_allocation_key") or row.get("source_mrp_allocation_id"))
+            not in (None, "")
+            and (row.get("product_id") or row.get("line_number"))
+            not in (None, "")
+        )
+        identity = (
+            _production_snapshot_identity(row)
+            if has_mrp_product_key
+            else str(raw.get("current_identity") or row.get("current_identity") or "").strip()
+        )
         if not identity:
             identity = _production_snapshot_identity(row)
         if not identity:
@@ -1413,10 +1692,16 @@ def _mrp_current_identity(payload: dict[str, Any], *, run_id: int, row_kind: str
         )
     if item_id not in (None, ""):
         if kind == "production":
-            semantic = payload.get("agg_key") or payload.get("demand_ref")
-            if semantic in (None, "") and bucket in (None, ""):
-                raise CurrentExecutionUnavailable("MRP production row lacks start-date aggregate identity")
-            semantic = semantic or f"item:{int(item_id)}|start:{bucket or ''}|unit:{unit}"
+            semantic = payload.get("agg_key")
+            if semantic in (None, ""):
+                # A planned-order aggregate is one demand in one start bucket:
+                # the same requirement is legitimately split across weekly
+                # buckets, so ``demand_ref`` alone is not a stable identity.
+                base = payload.get("demand_ref")
+                if base in (None, "") and bucket in (None, ""):
+                    raise CurrentExecutionUnavailable("MRP production row lacks start-date aggregate identity")
+                base = base or f"item:{int(item_id)}"
+                semantic = f"{base}|start:{bucket or ''}|unit:{unit}"
         elif kind == "purchase":
             semantic = payload.get("agg_key")
             if semantic in (None, "") and not unit:
@@ -1464,12 +1749,20 @@ def _production_snapshot_identity(payload: dict[str, Any]) -> str:
 
     requirement_id = payload.get("source_mrp_requirement_id") or payload.get("requirement_id")
     if requirement_id not in (None, ""):
-        discriminator = (
-            payload.get("source_mrp_allocation_key")
-            or payload.get("source_mrp_allocation_id")
-            or payload.get("item_id")
-            or "default"
-        )
+        allocation = payload.get("source_mrp_allocation_key") or payload.get("source_mrp_allocation_id")
+        if allocation not in (None, ""):
+            product_id = payload.get("product_id")
+            if product_id not in (None, ""):
+                discriminator = f"{str(allocation).strip()}:product:{int(product_id)}"
+            else:
+                line = payload.get("line_number")
+                discriminator = (
+                    f"{str(allocation).strip()}:line:{str(line).strip()}"
+                    if line not in (None, "")
+                    else str(allocation).strip()
+                )
+        else:
+            discriminator = payload.get("item_id") or "default"
         return f"production-mrp-requirement:{int(requirement_id)}:{discriminator}"
     order_id = payload.get("order_id")
     if order_id not in (None, ""):
@@ -1485,10 +1778,47 @@ def _production_snapshot_identity(payload: dict[str, Any]) -> str:
     return _snapshot_row_identity(payload, "production")
 
 
+_PRODUCTION_GENERATION_REFERENCE_KEYS = frozenset({
+    "snapshot_id",
+    "generation_id",
+    "ledger_generation_id",
+    "parent_generation_id",
+    "source_generation_id",
+    "truth_generation_id",
+    "current_generation_id",
+    # Retired planning snapshot locator; keep it out of canonical current
+    # payloads even when nested inside legacy material-coverage evidence.
+    "planning_read_" "snapshot_id",
+})
+
+
+def _drop_production_generation_references(value: Any) -> Any:
+    """Remove generation/snapshot locators from a production current DTO.
+
+    The accepted-generation pointer remains on ``CurrentExecutionScope``.  A
+    production row may contain nested evidence (most notably material
+    coverage), but that evidence is semantic payload and must not retain a
+    generation-local foreign reference.  Keep the shape and values of all
+    other nested objects unchanged, including lists used by the UI.
+    """
+
+    if isinstance(value, dict):
+        return {
+            str(key): _drop_production_generation_references(child)
+            for key, child in value.items()
+            if str(key) not in _PRODUCTION_GENERATION_REFERENCE_KEYS
+        }
+    if isinstance(value, list):
+        return [_drop_production_generation_references(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_drop_production_generation_references(child) for child in value)
+    return value
+
+
 def _production_semantic_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop generation-local proposal locators from the current business row."""
 
-    result = dict(payload)
+    result = _drop_production_generation_references(dict(payload))
     if result.get("source_mrp_requirement_id") not in (None, "") or str(
         result.get("journal_row_key") or result.get("row_key") or ""
     ).startswith("work-item:"):

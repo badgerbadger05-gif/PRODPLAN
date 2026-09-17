@@ -265,6 +265,14 @@ def rebuild_running_balance(
         bin_row.on_hand = on_hand
         bin_row.last_entry_id = last_entry_id
     session.flush()
+    # Current StockBin provenance may be cached by compact readers during a
+    # bounded publication.  Rebuilds can replace the current owner in-place,
+    # so invalidate that session-local metadata after the write.
+    from app.services.mrp_stock_helpers import (
+        invalidate_current_stock_bin_provenance_cache,
+    )
+
+    invalidate_current_stock_bin_provenance_cache(session)
     return on_hand
 
 

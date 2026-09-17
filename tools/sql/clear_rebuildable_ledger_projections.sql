@@ -117,6 +117,7 @@ BEGIN
                   ('production_products', 'ledger_generation_id', 'ledger_generation'),
                   ('production_products', 'source_mrp_requirement_id', 'mrp_requirement'),
                   ('production_products', 'source_planned_order_id', 'planned_order'),
+                  ('reservation_current_change', 'reservation_id', 'reservation_entry'),
                   ('sync_link', 'ledger_generation_id', 'ledger_generation')
           ) AS expected_fk(table_name, column_name, target_table)
     LOOP
@@ -315,6 +316,11 @@ ALTER TABLE production_products
     FOREIGN KEY (source_planned_order_id)
     REFERENCES planned_order(order_id)
     ON DELETE SET NULL;
+ALTER TABLE reservation_current_change
+    ADD CONSTRAINT fk_reservation_current_change_reservation
+    FOREIGN KEY (reservation_id)
+    REFERENCES reservation_entry(id)
+    ON DELETE CASCADE;
 ALTER TABLE sync_link
     ADD CONSTRAINT fk_sync_link_ledger_generation
     FOREIGN KEY (ledger_generation_id)

@@ -43,6 +43,78 @@ class PlanningWarehouseScope:
     organization_ref: str = DEFAULT_ORGANIZATION_REF1C
 
 
+def _stock_bin_related_generation_ids(
+    db: Session,
+    *,
+    requested_generation_id: int,
+    provenance_ids: Set[int],
+) -> Set[int]:
+    """Resolve compact-owner provenance compatible with one truth boundary.
+
+    A bounded physical publish updates affected compact rows before the CAS
+    pointer, so the transaction can briefly contain ``parent`` and its one
+    BUILDING child.  After the CAS, unchanged rows may still retain an
+    ancestor provenance; rewriting thousands of stable owners solely to stamp
+    a technical generation would defeat the compact-owner contract.  Accept
+    only that exact lineage (plus one in-flight BUILDING child), never an
+    unrelated generation.
+    """
+    cache = db.info.setdefault("_stock_bin_lineage_cache", {})
+    cache_key = (int(requested_generation_id), tuple(sorted(provenance_ids)))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return set(cached)
+
+    allowed: Set[int] = {int(requested_generation_id)}
+    cursor = db.get(LedgerGeneration, int(requested_generation_id))
+    while cursor is not None:
+        watermarks = cursor.source_watermarks or {}
+        raw_parent = watermarks.get("parent_generation_id")
+        try:
+            parent_id = int(raw_parent) if raw_parent not in (None, "") else None
+        except (TypeError, ValueError):
+            parent_id = None
+        if parent_id is None or parent_id in allowed:
+            break
+        allowed.add(parent_id)
+        cursor = db.get(LedgerGeneration, parent_id)
+
+    pending = set(provenance_ids) - allowed
+    building_descendants: Set[int] = set()
+    changed = True
+    while pending and changed:
+        changed = False
+        for generation_id in tuple(pending):
+            generation = db.get(LedgerGeneration, int(generation_id))
+            if generation is None or str(generation.status or "") != "building":
+                continue
+            raw_parent = (generation.source_watermarks or {}).get("parent_generation_id")
+            try:
+                parent_id = int(raw_parent) if raw_parent not in (None, "") else None
+            except (TypeError, ValueError):
+                parent_id = None
+            if parent_id in allowed:
+                allowed.add(int(generation_id))
+                building_descendants.add(int(generation_id))
+                pending.remove(generation_id)
+                changed = True
+    # Two simultaneous BUILDING owners are not a valid compact projection,
+    # even if both claim the same parent.
+    if len(building_descendants) > 1:
+        allowed = set()
+    cache[cache_key] = tuple(sorted(allowed))
+    return allowed
+
+
+def invalidate_current_stock_bin_provenance_cache(db: Session) -> None:
+    """Invalidate compact StockBin provenance metadata after an in-tx write."""
+    db.info.pop("_stock_bin_provenance_cache", None)
+    db.info["_stock_bin_provenance_revision"] = int(
+        db.info.get("_stock_bin_provenance_revision", 0)
+    ) + 1
+    db.info.pop("_stock_bin_lineage_cache", None)
+
+
 def planning_warehouse_scope(db: Session) -> PlanningWarehouseScope:
     ignored_refs = {
         str(ref) for (ref,) in db.query(IgnoredWarehouse.warehouse_ref1c).all() if ref
@@ -130,16 +202,32 @@ def planning_stock_by_item(
     }
     # A malformed compact projection must fail closed even if its rows happen
     # to satisfy the requested query filters.
-    provenance_ids = {
-        int(generation_id)
-        for (generation_id,) in db.query(StockBin.ledger_generation_id)
-        .filter(StockBin.is_current.is_(True))
-        .distinct()
-        .all()
-    }
-    if provenance_ids and provenance_ids != {int(ledger_generation_id)}:
+    provenance_revision = int(db.info.get("_stock_bin_provenance_revision", 0))
+    provenance_cache = db.info.get("_stock_bin_provenance_cache")
+    if provenance_cache is not None and provenance_cache[0] == provenance_revision:
+        provenance_ids = set(provenance_cache[1])
+    else:
+        provenance_ids = {
+            int(generation_id)
+            for (generation_id,) in db.query(StockBin.ledger_generation_id)
+            .filter(StockBin.is_current.is_(True))
+            .distinct()
+            .all()
+        }
+        db.info["_stock_bin_provenance_cache"] = (
+            provenance_revision,
+            tuple(sorted(provenance_ids)),
+        )
+    related_ids = _stock_bin_related_generation_ids(
+        db,
+        requested_generation_id=int(ledger_generation_id),
+        provenance_ids=provenance_ids,
+    )
+    if provenance_ids and not provenance_ids.issubset(related_ids):
         raise ValueError(
-            "current StockBin provenance contains a stale or ambiguous generation"
+            "current StockBin provenance contains a stale or ambiguous generation "
+            f"(requested={int(ledger_generation_id)}, pointer={current_generation_id}, "
+            f"stored={sorted(provenance_ids)})"
         )
     return result
 

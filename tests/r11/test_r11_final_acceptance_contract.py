@@ -52,6 +52,31 @@ def test_compare_budget_fails_closed_for_missing_or_non_numeric_api_p95():
             compare_budget({"api_p95_ms": value, "current_publish_p95_ms": 1.0}, budget_path=BUDGET_PATH)
 
 
+def test_compare_budget_requires_prod_scale_physical_refresh_metrics():
+    from tools.r11_local_acceptance import compare_budget
+
+    base = {"api_p95_ms": 1.0, "current_publish_p95_ms": 1.0}
+    missing = compare_budget(base, budget_path=BUDGET_PATH)
+    assert set(missing["missing_metrics"]) == {
+        "physical_refresh_seconds",
+        "physical_refresh_replayed_rows",
+    }
+    within = compare_budget({
+        **base,
+        "physical_refresh_seconds": 599.0,
+        "physical_refresh_replayed_rows": 9999,
+    }, budget_path=BUDGET_PATH)
+    assert within["within_budget"] is True
+    outside = compare_budget({
+        **base,
+        "physical_refresh_seconds": 1800.0,
+        "physical_refresh_replayed_rows": 146196,
+    }, budget_path=BUDGET_PATH)
+    assert outside["within_budget"] is False
+    assert outside["checks"]["physical_refresh_seconds"] is False
+    assert outside["checks"]["physical_refresh_replayed_rows"] is False
+
+
 @pytest.mark.integration
 def test_api_measurement_uses_real_r2_baseline_probe():
     from tools.r11_local_acceptance import measure_api_p95

@@ -105,10 +105,10 @@ def test_publish_future_supply_promotes_only_truth_pointer_rows(db_session):
 
     result = publish_current_future_supply(db_session, generation.id)
 
-    row = db_session.query(models.LedgerFutureSupply).one()
     assert result["rows"] == 1
+    assert db_session.query(models.LedgerFutureSupply).count() == 0
     current = db_session.query(models.LedgerFutureSupplyCurrent).one()
-    assert current.current_identity == row.current_identity
+    assert current.current_identity == "supplier_order:SO-P:1:local-1"
     assert current.source_generation_id == generation.id
 
 

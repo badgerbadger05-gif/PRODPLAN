@@ -162,17 +162,22 @@ remaining output сохраняются, а `ProductionPlanExecutionFact` име
 документа берётся только из `document_net_output.py`, затем применяется
 адресный матч и детерминированный FIFO через `assembly_output_core.py`.
 
-`LedgerFutureSupply` хранит immutable generation capture для воспроизводимой
-истории. Единственный current quantity owner — compact
+`LedgerFutureSupply` допускается только как bounded `BUILDING` staging до
+атомарной публикации; после принятия generation-scoped rows удаляются в той
+же транзакции только после успешной записи compact owner. Единственный current
+quantity owner — compact
 `LedgerFutureSupplyCurrent`, одна строка на `current_identity`; изменения
 фиксируются в append-only `LedgerFutureSupplyCurrentChange`. Текущий читатель
-не выбирает generation rows и не использует legacy `is_current`; публикация
+читает current owner для точного accepted `PlanningTruthState` pointer, а
+BUILDING reader использует staging через единый selector; latest/max heuristic,
+legacy `is_current` и fallback при отсутствующей truth запрещены. Публикация
 compact owner и accepted `PlanningTruthState` pointer атомарна. Каждая exact
 строка обязана иметь `current_identity` из `(supply_kind, source_ref,
 source_line_ref, source_local_id)`; generation, cutoff и `source_content_hash`
 не заменяют бизнес-идентичность. BUILDING и ambiguous/rejected capture остаются
-невидимыми current read до доказанной exact publication; старые generation rows
-остаются только provenance/audit.
+невидимыми current read до доказанной exact publication; неиспользуемые
+accepted/history rows не остаются persistent evidence; provenance
+сохраняется через source generation/batch в current owner и change audit.
 
 Specification rebase закрывает прежний MRP и создаёт successor только на
 сохранённый remaining basis; исходная матрица и уже принятый выпуск не
@@ -180,6 +185,28 @@ Specification rebase закрывает прежний MRP и создаёт suc
 транспортный порядок, формат Decimal и display noise; настоящий semantic
 change создаёт ровно одну новую revision/rebase request, повтор идентичного
 импорта — no-op. Формулы и предметные решения остаются в decisions log.
+
+## Объём вычислений штатного физического refresh
+
+Штатный hourly physical refresh является инкрементальной операцией. Его
+обычный вход состоит только из движений с `posting_at` после cutoff текущего
+принятого родителя и из явно обнаруженных новых, изменённых или исчезнувших
+регистраторов за этим cutoff. Backdate/correction расширяет расчёт только на
+доказанно затронутый distribution scope и начинает перепроход с самой ранней
+изменённой границы; перепроход завершается на фактической convergence boundary.
+
+Унаследованный bootstrap `replay_from` остаётся provenance и границей
+восстановления, но не является нижней границей штатного hourly-вычисления.
+Полный historical replay от bootstrap-анкора разрешён только при bootstrap,
+восстановлении из проверенной копии или явно запущенной операции обслуживания.
+Он не входит в acceptance обычного refresh и не может запускаться ради замера
+известного отступления от этой цели.
+
+Production-метрики refresh обязаны отдельно фиксировать длительность,
+количество входных delta-фактов, количество replayed ledger rows и affected
+scopes. Приёмка на копии БД производственного объёма проверяет фиксированные
+до запуска бюджеты времени и replayed rows; синтетический seed не заменяет
+этот gate.
 
 ## Запрещено
 
@@ -193,6 +220,9 @@ change создаёт ровно одну новую revision/rebase request, п
   specification-rebase;
 - переносить журнал исполнения старого MRP в новый MRP;
 - пересчитывать исходную потребность при refresh или поступлении;
+- выполнять полный historical replay от унаследованного `replay_from` в
+  штатном physical refresh; полный replay допустим только для bootstrap,
+  recovery или явной maintenance-операции;
 - считать выполнение по статусам и накопительным полям заказов;
 - писать состояние заказа 1С (`СостояниеЗаказа`, `ВариантЗавершения`)
   автоматически — скриптом, фоновым процессом или «согласователем»; запись
@@ -317,6 +347,30 @@ provenance старых generation builds, но не являются вторы
 После completed R4 marker их writer для того же scope отклоняется. Это не
 смешивает supplier receipt replenishment с assembly_out material consumption.
 
+## R11. Стабильный current owner резерва
+
+`ReservationEntry.current_identity` имеет каноническую форму
+`reservation:req:<requirement_id>:mode:<realization_mode>` и не включает
+generation, snapshot или cycle. `ReservationEntry.is_current=true` — единственный
+accepted owner; строки `owner_kind=building` разрешены только как bounded replay
+staging до публикации. Accepted reader использует только exact
+`PlanningTruthState` pointer, BUILDING reader — явную staging-ветку; legacy rows
+не являются fallback.
+
+`ReservationEvent.event_identity` строится из стабильного reservation identity,
+типа события, physical `sle_id`, fact refs, дельт и match rule. `origin_kind`
+определяется семантикой (`obligation`, `factual`, `correction`), а не cycle,
+generation или idempotency. Повтор physical replay той же семантики не создаёт
+новой current строки или audit. `ReservationCurrentChange` хранит только
+semantic obligation changes. Revision `20260914_01` — только bootstrap exact
+accepted `PlanningTruthState` pointer: она помечает его owner/event rows и не
+делает исторический rebind, archive insert, DELETE или compaction. Старые rows
+получают `owner_kind=legacy`, `is_current=false` и runtime не читаются. Пустая
+`reservation_event_archive` создаётся как будущий compact owner; историческая
+GC/архивация разрешается отдельной revision после cutover зависимых projections,
+backup prerequisite и bounded dependency proof. Неоднозначные legacy events не
+читаются runtime; raw recovery остаётся во внешнем verified backup.
+
 ## R8. Очередь, readiness, барабан и полки
 
 Текущая область исполнения имеет одного compact owner: `CurrentExecutionRow`
@@ -331,6 +385,22 @@ Generation-local ids из staging (`AssemblyQueueLine.id` и зависимые 
 являются частью current business identity. Readiness и drum сохраняют ссылку
 на stable current queue owner по `plan_line_id`; повтор публикации новой
 technical generation с тем же результатом не создаёт row/audit churn.
+До полного cutover manual drum actions, work-item navigation и supplier
+provenance используют bounded compatibility owner: только строки exact accepted
+generation. После успешной публикации current execution и obligation views
+retired non-building copies удаляются set-based в FK-safe порядке; active
+BUILDING staging и exact current generation не удаляются. Это не является
+ledger/history GC и не освобождает `ledger_generation` в R12. Необратимый
+cutover допускается только в PostgreSQL-сессии с операторским guard
+`prodplan.execution_projection_backup_ready=on` после проверки verified backup.
+Accepted-generation GC и physical reclaim — отдельный manifest-first контур:
+сначала read-only candidate/dependency manifest, затем guarded local apply;
+`VACUUM FULL`/`pg_repack` не входят в транзакцию GC и запускаются только
+отдельной explicit phase по allowlist.
+GC manifest различает cleanup candidates, deletable generation metadata и
+retained metadata с blocker per generation; external/unknown FK не запрещает
+доказанную очистку других GC-owned evidence, но всегда удерживает связанную
+metadata и соответствующий неизвестный evidence target.
 Очередь и drum читаются oldest-first по полной typed tie-break цепочке:
 дата, ресурс, `original_priority`, ordinal и stable identity.
 

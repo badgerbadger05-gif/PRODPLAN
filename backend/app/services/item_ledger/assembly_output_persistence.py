@@ -18,7 +18,7 @@ from hashlib import sha256
 import json
 from typing import Any
 
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -34,7 +34,10 @@ from app.services.item_ledger.document_net_output import (
 )
 from app.services.item_ledger.physical_visibility import visible_sle_query
 from app.services.item_ledger.recorder_identity import build_recorder_identity_index
-from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
+from app.services.item_ledger.assembly_queue_materialization import (
+    _build_rows_by_scope,
+    materialize_assembly_queue_lines,
+)
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 
 _STAGE = "assembly_output_allocation"
@@ -50,6 +53,30 @@ def _dec(value: Any) -> Decimal:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _required_int(value: Any, *, field: str, context: str) -> int:
+    """Coerce a required persisted identity with a diagnostic on bad data."""
+    if value in (None, ""):
+        raise ValueError(f"bounded assembly output {context} has missing {field}")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"bounded assembly output {context} has invalid {field}={value!r}"
+        ) from exc
+    if number <= 0:
+        raise ValueError(
+            f"bounded assembly output {context} has non-positive {field}={number}"
+        )
+    return number
+
+
+def _comparable_datetime(value: datetime | None) -> datetime | None:
+    """Normalize DB-naive and API-aware timestamps for Python comparisons."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
 
 
 def _qty_text(value: Any) -> str:
@@ -68,6 +95,8 @@ def _checksum(rows: list[dict[str, Any]]) -> str:
 def _ensure_plan_execution_baseline(
     db: Session,
     generation: models.LedgerGeneration,
+    *,
+    item_ids: set[int] | None = None,
 ) -> None:
     """Persist the initial plan remainder before any queue projection is built.
 
@@ -96,6 +125,9 @@ def _ensure_plan_execution_baseline(
         .filter(
             models.ProductionPlanHeader.status == "fixed",
             models.ProductionPlanLine.qty >= 0,
+            models.ProductionPlanLine.item_id.in_(sorted(item_ids))
+            if item_ids is not None
+            else True,
         )
         .with_for_update()
         .all()
@@ -305,7 +337,14 @@ def _fact_provenance(
             else ()
         )
     }
-    run_ids = sorted({int(row.run_id) for row in requirements.values()})
+    run_ids = sorted({
+        _required_int(
+            row.run_id,
+            field="run_id",
+            context=f"MRP requirement id={getattr(row, 'id', None)!r}",
+        )
+        for row in requirements.values()
+    })
     runs = {
         int(row.run_id): row
         for row in (
@@ -503,12 +542,26 @@ def _expected_signatures(
                 - _dec(allocation.qty),
                 Decimal("0"),
             )
+            allocation_context = (
+                f"SLE={allocation.stock_ledger_entry_id!r},"
+                f" plan_line_id={allocation.plan_line_id!r}"
+            )
             allocation_rows.append(
                 {
-                    "stock_ledger_entry_id": int(allocation.stock_ledger_entry_id),
-                    "run_id": int(allocation.run_id),
-                    "plan_id": int(allocation.plan_id),
-                    "plan_line_id": int(allocation.plan_line_id),
+                    "stock_ledger_entry_id": _required_int(
+                        allocation.stock_ledger_entry_id,
+                        field="stock_ledger_entry_id", context=allocation_context,
+                    ),
+                    "run_id": _required_int(
+                        allocation.run_id, field="run_id", context=allocation_context,
+                    ),
+                    "plan_id": _required_int(
+                        allocation.plan_id, field="plan_id", context=allocation_context,
+                    ),
+                    "plan_line_id": _required_int(
+                        allocation.plan_line_id,
+                        field="plan_line_id", context=allocation_context,
+                    ),
                     "allocated_qty": _qty_text(allocation.qty),
                     "match_rule": _text(allocation.match_rule),
                     "allocation_ordinal": int(allocation.allocation_ordinal),
@@ -841,6 +894,595 @@ def _persist_rows(
             raise ValueError("assembly allocation violates run-root output conservation")
 
     db.flush()
+
+
+@dataclass(frozen=True)
+class BoundedAssemblyOutputResult:
+    """Evidence returned by the compact current-owner output publisher.
+
+    This result deliberately has no generation-local persistence identity.  The
+    caller owns the transaction and decides when the surrounding current
+    manifests may be published.
+    """
+
+    target_generation_id: int
+    parent_generation_id: int
+    source_revision: str
+    affected_sle_ids: tuple[int, ...]
+    affected_scopes: tuple[tuple[int, str, str], ...]
+    fact_signature: tuple[dict[str, Any], ...]
+    allocation_signature: tuple[dict[str, Any], ...]
+    metrics: dict[str, Any]
+    idempotent: bool = False
+
+
+def _bounded_scope(value: Any) -> tuple[int, str, str]:
+    if isinstance(value, dict):
+        try:
+            return (
+                int(value["item_id"]),
+                _text(value.get("characteristic_ref")),
+                _text(value.get("organization_ref")),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("affected physical scope is incomplete") from exc
+    try:
+        item_id, characteristic_ref, organization_ref = tuple(value)
+        return int(item_id), _text(characteristic_ref), _text(organization_ref)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "affected physical scope must be (item_id, characteristic_ref, organization_ref)"
+        ) from exc
+
+
+def _bounded_candidates(
+    db: Session,
+    parent_generation_id: int,
+    item_ids: set[int],
+    *,
+    require_owner: bool = True,
+    owner_run_by_line: dict[int, int] | None = None,
+) -> tuple[QueueCandidate, ...]:
+    """Read current plan owners, never generation-local queue staging."""
+
+    rows = _build_rows_by_scope(db, int(parent_generation_id), include_zero=True)
+    stable_owner_runs = owner_run_by_line or {}
+    scoped_rows: list[dict[str, Any]] = []
+    candidate_pairs: set[tuple[int, int]] = set()
+    for row in rows:
+        payload = row["payload"]
+        context = (
+            f"current owner plan_line_id={payload.get('plan_line_id')!r},"
+            f" run_id={payload.get('run_id')!r}"
+        )
+        item_id = _required_int(
+            payload.get("item_id"), field="item_id", context=context
+        )
+        if item_id not in item_ids:
+            continue
+        run_id = _required_int(
+            payload.get("run_id"), field="run_id", context=context
+        )
+        plan_line_id = _required_int(
+            payload.get("plan_line_id"), field="plan_line_id", context=context
+        )
+        scoped_rows.append(row)
+        candidate_pairs.add((run_id, plan_line_id))
+    candidate_run_ids = {pair[0] for pair in candidate_pairs}
+    candidate_run_ids.update(
+        _required_int(value, field="run_id", context="stable owner fallback")
+        for value in stable_owner_runs.values()
+    )
+    candidate_line_ids = {pair[1] for pair in candidate_pairs}
+    root_pairs = set()
+    if candidate_pairs:
+        root_pairs = {
+            (int(run_id), int(plan_line_id))
+            for run_id, plan_line_id in (
+                db.query(models.MrpRunRoot.run_id, models.MrpRunRoot.plan_line_id)
+                .filter(
+                    models.MrpRunRoot.run_id.in_(candidate_run_ids),
+                    models.MrpRunRoot.plan_line_id.in_(candidate_line_ids),
+                )
+                .all()
+            )
+        }
+    candidates: list[QueueCandidate] = []
+    for row in scoped_rows:
+        payload = row["payload"]
+        # A fixed plan may be represented by a newer PlanningRun while its
+        # persisted execution facts still belong to the stable MrpRunRoot of
+        # an earlier run.  Reallocation must retain that owner identity; using
+        # the run returned by the plan join creates a (run, line) pair for
+        # which no current root exists.
+        context = (
+            f"current owner plan_line_id={payload.get('plan_line_id')!r},"
+            f" run_id={payload.get('run_id')!r}"
+        )
+        plan_line_id = _required_int(
+            payload.get("plan_line_id"), field="plan_line_id", context=context
+        )
+        run_id = _required_int(
+            payload.get("run_id"), field="run_id", context=context
+        )
+        fallback_run_id = stable_owner_runs.get(plan_line_id)
+        if (
+            (run_id, plan_line_id) not in root_pairs
+            and fallback_run_id is not None
+            and (int(fallback_run_id), plan_line_id) in root_pairs
+        ):
+            run_id = int(fallback_run_id)
+        plan_id = _required_int(
+            payload.get("plan_id"), field="plan_id", context=context
+        )
+        item_id = _required_int(
+            payload.get("item_id"), field="item_id", context=context
+        )
+        candidates.append(
+            QueueCandidate(
+                run_id=run_id,
+                plan_id=plan_id,
+                plan_line_id=plan_line_id,
+                item_id=item_id,
+                open_qty=_dec(payload["assembly_remaining_qty"]),
+                eligible_from=payload.get("eligible_from"),
+            )
+        )
+    if require_owner and not candidates and item_ids:
+        # An output with no live owner is not silently treated as surplus: the
+        # current publisher must fail closed before changing any owner rows.
+        raise ValueError("bounded assembly output has no live plan owner")
+    return tuple(candidates)
+
+
+def _single_stable_owner_run_by_line(
+    rows: list[models.ProductionPlanExecutionFact],
+) -> dict[int, int]:
+    """Return only unambiguous owners; preserve multi-root lineage as-is."""
+
+    owners: dict[int, set[int]] = {}
+    for row in rows:
+        plan_line_id = _required_int(
+            row.plan_line_id,
+            field="plan_line_id",
+            context=f"execution fact id={getattr(row, 'id', None)!r}",
+        )
+        run_id = _required_int(
+            row.run_id,
+            field="run_id",
+            context=f"execution fact id={getattr(row, 'id', None)!r}",
+        )
+        owners.setdefault(plan_line_id, set()).add(run_id)
+    return {
+        line_id: next(iter(run_ids))
+        for line_id, run_ids in owners.items()
+        if len(run_ids) == 1
+    }
+
+
+def _bounded_visible_facts(
+    db: Session,
+    target: models.LedgerGeneration,
+    scopes: tuple[tuple[int, str, str], ...],
+    *,
+    earliest_posting_at: datetime | None,
+) -> tuple[_OutputFact, ...]:
+    """Read only visible netted rows for explicit physical scopes.
+
+    The query is intentionally scope-shaped.  In particular it does not use
+    ``visible_sles_for_generation`` or scan a visible historical prefix.
+    Netting still receives every visible line of each affected document so a
+    correction cannot be mistaken for a second assembly output.
+    """
+
+    if target.physical_import_batch_id is None or target.cutoff is None:
+        raise ValueError("bounded assembly output requires target physical boundary")
+    predicates = [
+        and_(
+            models.StockLedgerEntry.item_id == int(item_id),
+            models.StockLedgerEntry.characteristic_ref == characteristic_ref,
+            models.StockLedgerEntry.organization_ref == organization_ref,
+        )
+        for item_id, characteristic_ref, organization_ref in scopes
+    ]
+    if not predicates:
+        return ()
+    query = visible_sle_query(
+        db,
+        physical_import_batch_id=int(target.physical_import_batch_id),
+        cutoff=_comparable_datetime(target.cutoff),
+    ).filter(
+        or_(*predicates),
+        models.StockLedgerEntry.movement_kind.in_(sorted(NETTED_MOVEMENT_KINDS)),
+    )
+    if earliest_posting_at is not None:
+        # The complete document/scope is retained for canonical netting.  The
+        # boundary is evidence for the bounded refresh, not a license to drop
+        # an older offset needed to conserve a document's output.
+        query = query.order_by(
+            models.StockLedgerEntry.posting_at.asc(),
+            models.StockLedgerEntry.id.asc(),
+        )
+    rows = query.all()
+    net_qty_by_sle = net_document_output_qty(rows)
+    facts = [
+        _OutputFact(
+            stock_ledger_entry_id=int(row.id),
+            item_id=int(row.item_id),
+            posting_at=row.posting_at,
+            qty=net_qty_by_sle.get(int(row.id), Decimal("0")),
+            source_content_hash=_text(row.source_content_hash),
+            recorder_type=_text(row.recorder_type),
+            recorder_ref=_text(row.recorder_ref),
+            line_no=_text(row.line_no),
+        )
+        for row in rows
+        if _text(row.movement_kind) == OUTPUT_MOVEMENT_KIND
+        and _dec(row.qty) > 0
+        and net_qty_by_sle.get(int(row.id), Decimal("0")) > 0
+    ]
+    return tuple(facts)
+
+
+def _bounded_existing_facts(
+    db: Session,
+    scopes: tuple[tuple[int, str, str], ...],
+) -> list[models.ProductionPlanExecutionFact]:
+    predicates = [
+        and_(
+            models.StockLedgerEntry.item_id == int(item_id),
+            models.StockLedgerEntry.characteristic_ref == characteristic_ref,
+            models.StockLedgerEntry.organization_ref == organization_ref,
+        )
+        for item_id, characteristic_ref, organization_ref in scopes
+    ]
+    if not predicates:
+        return []
+    return (
+        db.query(models.ProductionPlanExecutionFact)
+        .join(
+            models.StockLedgerEntry,
+            models.StockLedgerEntry.id
+            == models.ProductionPlanExecutionFact.stock_ledger_entry_id,
+        )
+        .filter(or_(*predicates))
+        .order_by(
+            models.ProductionPlanExecutionFact.stock_ledger_entry_id.asc(),
+            models.ProductionPlanExecutionFact.plan_line_id.asc(),
+            models.ProductionPlanExecutionFact.id.asc(),
+        )
+        .with_for_update()
+        .all()
+    )
+
+
+def _bounded_allocation_signature(
+    rows: list[models.ProductionPlanExecutionFact],
+) -> list[dict[str, Any]]:
+    ordinal_by_sle: dict[int, int] = {}
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        context = f"execution fact id={getattr(row, 'id', None)!r}"
+        sle_id = _required_int(
+            row.stock_ledger_entry_id,
+            field="stock_ledger_entry_id",
+            context=context,
+        )
+        run_id = _required_int(row.run_id, field="run_id", context=context)
+        plan_id = _required_int(row.plan_id, field="plan_id", context=context)
+        plan_line_id = _required_int(
+            row.plan_line_id, field="plan_line_id", context=context
+        )
+        ordinal = ordinal_by_sle.get(sle_id, 0)
+        ordinal_by_sle[sle_id] = ordinal + 1
+        result.append(
+            {
+                "stock_ledger_entry_id": sle_id,
+                "run_id": run_id,
+                "plan_id": plan_id,
+                "plan_line_id": plan_line_id,
+                "allocated_qty": _qty_text(row.allocated_qty),
+                "match_rule": _text(row.match_rule),
+                "allocation_ordinal": ordinal,
+            }
+        )
+    return sorted(
+        result,
+        key=lambda row: (
+            int(row["stock_ledger_entry_id"]),
+            int(row["plan_id"]),
+            int(row["plan_line_id"]),
+            int(row["allocation_ordinal"]),
+        ),
+    )
+
+
+def _restore_bounded_execution_facts(
+    db: Session,
+    rows: list[models.ProductionPlanExecutionFact],
+) -> None:
+    """Return only affected owner quantities to their pre-fact basis."""
+
+    for row in rows:
+        line = (
+            db.query(models.ProductionPlanLine)
+            .filter(models.ProductionPlanLine.id == int(row.plan_line_id))
+            .with_for_update()
+            .one_or_none()
+        )
+        root = (
+            db.query(models.MrpRunRoot)
+            .filter(
+                models.MrpRunRoot.run_id == int(row.run_id),
+                models.MrpRunRoot.plan_line_id == int(row.plan_line_id),
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if line is None or root is None:
+            raise ValueError("bounded assembly output references missing current owner")
+        qty = _dec(row.allocated_qty)
+        if qty <= 0:
+            raise ValueError("bounded assembly execution fact has non-positive quantity")
+        line.accepted_output_qty = _dec(line.accepted_output_qty) - qty
+        line.remaining_output_qty = _dec(line.remaining_output_qty) + qty
+        root.accepted_qty = _dec(root.accepted_qty) - qty
+        root.remaining_qty = _dec(root.remaining_qty) + qty
+        if min(
+            _dec(line.accepted_output_qty),
+            _dec(line.remaining_output_qty),
+            _dec(root.accepted_qty),
+            _dec(root.remaining_qty),
+        ) < 0:
+            raise ValueError("bounded assembly output owner conservation underflow")
+        if _dec(line.qty) != _dec(line.accepted_output_qty) + _dec(line.remaining_output_qty):
+            raise ValueError("bounded assembly plan-line conservation failed")
+        if _dec(root.planned_qty) != _dec(root.accepted_qty) + _dec(root.remaining_qty):
+            raise ValueError("bounded assembly run-root conservation failed")
+        db.delete(row)
+    if rows:
+        db.flush()
+
+
+def _persist_bounded_owner_rows(
+    db: Session,
+    target: models.LedgerGeneration,
+    allocation_signature: list[dict[str, Any]],
+) -> None:
+    """Write the sole stable execution owner; no output staging tables."""
+
+    for alloc in allocation_signature:
+        context = (
+            f"SLE={alloc.get('stock_ledger_entry_id')!r},"
+            f" plan_line_id={alloc.get('plan_line_id')!r}"
+        )
+        sle_id = _required_int(
+            alloc.get("stock_ledger_entry_id"), field="stock_ledger_entry_id", context=context
+        )
+        run_id = _required_int(alloc.get("run_id"), field="run_id", context=context)
+        plan_id = _required_int(alloc.get("plan_id"), field="plan_id", context=context)
+        plan_line_id = _required_int(
+            alloc.get("plan_line_id"), field="plan_line_id", context=context
+        )
+        line = (
+            db.query(models.ProductionPlanLine)
+            .filter(models.ProductionPlanLine.id == plan_line_id)
+            .with_for_update()
+            .one_or_none()
+        )
+        root = (
+            db.query(models.MrpRunRoot)
+            .filter(
+                models.MrpRunRoot.run_id == run_id,
+                models.MrpRunRoot.plan_line_id == plan_line_id,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if line is None or root is None or line.remaining_output_qty is None:
+            raise ValueError(
+                "bounded assembly output references incomplete current owner "
+                f"(run_id={run_id}, "
+                f"plan_line_id={plan_line_id}, "
+                f"line_missing={line is None}, root_missing={root is None}, "
+                f"remainder_missing={line is not None and line.remaining_output_qty is None})"
+            )
+        qty = _dec(alloc["allocated_qty"])
+        if qty <= 0 or qty > _dec(line.remaining_output_qty) or qty > _dec(root.remaining_qty):
+            raise ValueError("bounded assembly output exceeds current owner remainder")
+        db.add(
+            models.ProductionPlanExecutionFact(
+                stock_ledger_entry_id=sle_id,
+                plan_id=plan_id,
+                plan_line_id=plan_line_id,
+                run_id=run_id,
+                allocated_qty=qty,
+                match_rule=_text(alloc["match_rule"]),
+                accepted_at=target.cutoff or datetime.now(timezone.utc),
+            )
+        )
+        line.accepted_output_qty = _dec(line.accepted_output_qty) + qty
+        line.remaining_output_qty = _dec(line.remaining_output_qty) - qty
+        root.accepted_qty = _dec(root.accepted_qty) + qty
+        root.remaining_qty = _dec(root.remaining_qty) - qty
+        if _dec(line.qty) != _dec(line.accepted_output_qty) + _dec(line.remaining_output_qty):
+            raise ValueError("bounded assembly plan-line conservation failed")
+        if _dec(root.planned_qty) != _dec(root.accepted_qty) + _dec(root.remaining_qty):
+            raise ValueError("bounded assembly run-root conservation failed")
+    if allocation_signature:
+        db.flush()
+
+
+def apply_bounded_assembly_output_plan_execution(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    affected_sle_ids: tuple[int, ...] | list[int] = (),
+    affected_physical_scopes: tuple[Any, ...] | list[Any] = (),
+    earliest_posting_at: datetime | None,
+    source_revision: str | int,
+) -> BoundedAssemblyOutputResult:
+    """Replay assembly output for explicit scopes into stable plan owners.
+
+    This is the bounded current-owner publisher.  It deliberately does not
+    create output decisions, output allocations, queue lines, or build-batch
+    audit rows.  The caller must commit/rollback the encompassing transaction.
+    """
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or parent is None:
+        raise ValueError("bounded assembly output generation does not exist")
+    if str(target.status) != "building":
+        raise ValueError("bounded assembly output requires BUILDING target")
+    if str(parent.status) != "accepted":
+        raise ValueError("bounded assembly output requires accepted parent")
+    if target.physical_import_batch is None or str(target.physical_import_batch.status) != "completed":
+        raise ValueError("bounded assembly output requires completed target import")
+    if target.cutoff is None:
+        raise ValueError("bounded assembly output requires target cutoff")
+    if (
+        _comparable_datetime(earliest_posting_at) is not None
+        and _comparable_datetime(earliest_posting_at)
+        > _comparable_datetime(target.cutoff)
+    ):
+        raise ValueError("bounded assembly output earliest posting exceeds target cutoff")
+
+    requested_ids = tuple(sorted({int(value) for value in affected_sle_ids}))
+    scopes = {_bounded_scope(value) for value in affected_physical_scopes}
+    if requested_ids:
+        source_rows = (
+            db.query(models.StockLedgerEntry)
+            .filter(models.StockLedgerEntry.id.in_(requested_ids))
+            .all()
+        )
+        if {int(row.id) for row in source_rows} != set(requested_ids):
+            raise ValueError("bounded assembly output references unknown SLE")
+        scopes.update(
+            (
+                int(row.item_id),
+                _text(row.characteristic_ref),
+                _text(row.organization_ref),
+            )
+            for row in source_rows
+        )
+    ordered_scopes = tuple(sorted(scopes))
+    if not ordered_scopes:
+        raise ValueError("bounded assembly output requires affected SLE ids or scopes")
+
+    facts = _bounded_visible_facts(
+        db,
+        target,
+        ordered_scopes,
+        earliest_posting_at=earliest_posting_at,
+    )
+    item_ids = {int(scope[0]) for scope in ordered_scopes}
+    # Older fixed plans may not have had their persisted output remainder
+    # initialized yet.  Initialize only the affected item owners using the
+    # canonical baseline helper; never materialize generation-scoped staging.
+    _ensure_plan_execution_baseline(db, parent, item_ids=item_ids)
+    existing = _bounded_existing_facts(db, ordered_scopes)
+    visible_fact_ids = {int(fact.stock_ledger_entry_id) for fact in facts}
+    existing_fact_ids = {int(row.stock_ledger_entry_id) for row in existing}
+    removed_existing = [
+        row for row in existing if int(row.stock_ledger_entry_id) not in visible_fact_ids
+    ]
+    retained_existing = [
+        row for row in existing if int(row.stock_ledger_entry_id) in visible_fact_ids
+    ]
+    new_facts = tuple(
+        fact for fact in facts
+        if int(fact.stock_ledger_entry_id) not in existing_fact_ids
+    )
+
+    # A physical refresh with no bounded semantic diff is a true no-op even
+    # when the stable line has execution facts under several historical roots.
+    # Do not collapse that lineage into one owner merely to recompute a
+    # checksum: unchanged rows must remain byte-stable and incur no DML.
+    if not removed_existing and not new_facts:
+        return BoundedAssemblyOutputResult(
+            target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id),
+            source_revision=_text(source_revision),
+            affected_sle_ids=tuple(int(fact.stock_ledger_entry_id) for fact in facts),
+            affected_scopes=ordered_scopes,
+            fact_signature=(),
+            allocation_signature=tuple(_bounded_allocation_signature(existing)),
+            metrics={
+                "facts": len(facts),
+                "allocations": len(existing),
+                "fact_qty": _qty_text(sum((_dec(fact.qty) for fact in facts), Decimal("0"))),
+                "allocated_qty": _qty_text(sum((_dec(row.allocated_qty) for row in existing), Decimal("0"))),
+                "affected_scopes": len(ordered_scopes),
+                "bounded_fact_rows": len(facts),
+                "replayed_fact_rows": 0,
+                "source_revision": _text(source_revision),
+            },
+            idempotent=True,
+        )
+
+    # Corrections remove only assignments whose SLE is no longer visible.  All
+    # retained assignments (including assignments under different historical
+    # roots) stay in place; only the genuinely new visible facts go through the
+    # canonical allocator below.
+    if removed_existing:
+        _restore_bounded_execution_facts(db, removed_existing)
+
+    # A line with one retained root can safely continue assigning new facts to
+    # that same root even when the plan join points at a newer run with no
+    # root.  For multi-root lineage this mapping is intentionally empty: the
+    # canonical current candidate must prove a valid root instead of us
+    # choosing one historical root arbitrarily.
+    stable_owner_runs = _single_stable_owner_run_by_line(retained_existing)
+    candidates = (
+        _bounded_candidates(
+            db,
+            int(parent.id),
+            item_ids,
+            require_owner=True,
+            owner_run_by_line=stable_owner_runs,
+        )
+        if new_facts
+        else ()
+    )
+    provenance = _fact_provenance(db, new_facts, candidates)
+    fact_signature, allocation_signature, metrics, _ = _expected_signatures(
+        new_facts, candidates, provenance
+    )
+    if any(
+        _text(row["decision_status"]) in {"ambiguous", "invalid"}
+        for row in fact_signature
+    ):
+        raise ValueError("bounded assembly output has ambiguous or unmatched provenance")
+    _persist_bounded_owner_rows(db, target, allocation_signature)
+    retained_signature = _bounded_allocation_signature(retained_existing)
+    combined_allocation_signature = sorted(
+        [*retained_signature, *allocation_signature],
+        key=lambda row: (
+            int(row["stock_ledger_entry_id"]),
+            int(row["plan_id"]),
+            int(row["plan_line_id"]),
+            int(row["allocation_ordinal"]),
+        ),
+    )
+    return BoundedAssemblyOutputResult(
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        source_revision=_text(source_revision),
+        affected_sle_ids=tuple(int(fact.stock_ledger_entry_id) for fact in facts),
+        affected_scopes=ordered_scopes,
+        fact_signature=tuple(fact_signature),
+        allocation_signature=tuple(combined_allocation_signature),
+        metrics={
+            **metrics,
+            "affected_scopes": len(ordered_scopes),
+            "bounded_fact_rows": len(facts),
+            "replayed_fact_rows": len(new_facts) + len(removed_existing),
+            "source_revision": _text(source_revision),
+        },
+        idempotent=False,
+    )
 
 
 def _apply_allocations_to_assembly_queue(

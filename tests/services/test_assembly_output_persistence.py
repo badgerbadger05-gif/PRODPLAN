@@ -4,7 +4,10 @@ from decimal import Decimal
 import pytest
 
 from app import models
-from app.services.item_ledger.assembly_output_persistence import materialize_assembly_output_allocations
+from app.services.item_ledger.assembly_output_persistence import (
+    apply_bounded_assembly_output_plan_execution,
+    materialize_assembly_output_allocations,
+)
 from app.services.item_ledger.assembly_queue_materialization import materialize_assembly_queue_lines
 from app.services.item_ledger.drum_schedule_persistence import materialize_drum_schedule
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
@@ -31,6 +34,13 @@ def _building_generation(db, *, key: str, cutoff):
         algorithm_version="tests",
     )
     db.add(generation)
+    db.flush()
+    return generation
+
+
+def _accepted_parent(db, *, key: str, cutoff):
+    generation = _building_generation(db, key=key, cutoff=cutoff)
+    generation.status = "accepted"
     db.flush()
     return generation
 
@@ -192,6 +202,529 @@ def test_visible_only_positive_assembly_in(db_session):
     assert db_session.query(models.AssemblyOutputFactDecision).filter_by(
         ledger_generation_id=generation.id,
     ).count() == 1
+
+
+def test_bounded_output_publishes_stable_owner_and_retries_without_staging(db_session):
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED")
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+    )
+    sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-forward",
+        content_hash="b" * 64,
+    )
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="batch-1",
+    )
+    assert result.idempotent is False
+    assert result.metrics["bounded_fact_rows"] == 1
+    assert result.metrics["affected_scopes"] == 1
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("3")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("2")
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 1
+    assert db_session.query(models.AssemblyOutputFactDecision).count() == 0
+    assert db_session.query(models.AssemblyOutputAllocation).count() == 0
+    assert db_session.query(models.AssemblyQueueLine).count() == 0
+
+    fact_id = int(db_session.query(models.ProductionPlanExecutionFact.id).one()[0])
+    repeated = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="batch-1",
+    )
+    assert repeated.idempotent is True
+    assert int(db_session.query(models.ProductionPlanExecutionFact.id).one()[0]) == fact_id
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("3")
+
+
+def test_bounded_output_reuses_existing_owner_when_live_run_has_no_root(db_session):
+    """A refreshed plan run must not replace the stable execution root.
+
+    Physical refreshes inherit the fixed plan/run join, but execution facts
+    remain owned by the root that accepted them.  This mirrors the production
+    failure where plan line 68 was joined to run 393 although its current
+    facts/root were still owned by run 6.
+    """
+
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-owner-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-owner-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED-OWNER")
+    plan, old_run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+    )
+    old_run.status = "CLOSED"
+    old_root = (
+        db_session.query(models.MrpRunRoot)
+        .filter_by(run_id=int(old_run.run_id), plan_line_id=int(line.id))
+        .one()
+    )
+    old_line_sle = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-owner-old",
+        content_hash="o" * 64,
+    )
+    db_session.add(
+        models.ProductionPlanExecutionFact(
+            stock_ledger_entry_id=int(old_line_sle.id),
+            plan_id=int(plan.id),
+            plan_line_id=int(line.id),
+            run_id=int(old_run.run_id),
+            allocated_qty=Decimal("2"),
+            match_rule="fifo",
+            accepted_at=cutoff,
+        )
+    )
+    line.accepted_output_qty = Decimal("2")
+    line.remaining_output_qty = Decimal("3")
+    old_root.accepted_qty = Decimal("2")
+    old_root.remaining_qty = Decimal("3")
+
+    # The live plan join now resolves this newer run, intentionally without a
+    # corresponding MrpRunRoot.  The bounded publisher must retain old_run.
+    new_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=int(parent.id),
+        ledger_cutoff=parent.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(new_run)
+    db_session.flush()
+    line.locked_by_run_id = int(new_run.run_id)
+    new_sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        recorder="bounded-owner-new",
+        content_hash="n" * 64,
+    )
+    db_session.flush()
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(old_line_sle.id), int(new_sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="owner-rebind",
+    )
+
+    assert result.idempotent is False
+    facts = (
+        db_session.query(models.ProductionPlanExecutionFact)
+        .order_by(models.ProductionPlanExecutionFact.stock_ledger_entry_id)
+        .all()
+    )
+    assert [(int(row.run_id), int(row.plan_line_id), str(row.allocated_qty)) for row in facts] == [
+        (int(old_run.run_id), int(line.id), "2.000"),
+        (int(old_run.run_id), int(line.id), "3.000"),
+    ]
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("5")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("0")
+
+
+def test_bounded_output_diff_preserves_multiple_historical_roots(db_session):
+    """Corrections retain old root assignments and allocate only the delta."""
+
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-multi-root-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-multi-root-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED-MULTI-ROOT")
+    plan, old_run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("6"),
+    )
+    old_run.status = "CLOSED"
+    old_root = (
+        db_session.query(models.MrpRunRoot)
+        .filter_by(run_id=int(old_run.run_id), plan_line_id=int(line.id))
+        .one()
+    )
+    old_root.accepted_qty = Decimal("2")
+    old_root.remaining_qty = Decimal("4")
+    second_run = models.PlanningRun(
+        status="CLOSED",
+        config_snapshot={},
+        ledger_generation_id=int(parent.id),
+        ledger_cutoff=parent.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime(2026, 7, 2, tzinfo=timezone.utc),
+    )
+    db_session.add(second_run)
+    db_session.flush()
+    second_root = models.MrpRunRoot(
+        run_id=int(second_run.run_id),
+        plan_line_id=int(line.id),
+        planned_qty=Decimal("3"),
+        accepted_qty=Decimal("1"),
+        remaining_qty=Decimal("2"),
+    )
+    db_session.add(second_root)
+    current_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=int(parent.id),
+        ledger_cutoff=parent.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime(2026, 7, 3, tzinfo=timezone.utc),
+    )
+    db_session.add(current_run)
+    db_session.flush()
+    db_session.add(
+        models.MrpRunRoot(
+            run_id=int(current_run.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal("3"),
+            accepted_qty=Decimal("0"),
+            remaining_qty=Decimal("3"),
+        )
+    )
+    line.accepted_output_qty = Decimal("3")
+    line.remaining_output_qty = Decimal("3")
+    line.locked_by_run_id = int(current_run.run_id)
+    first = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-multi-root-old-a",
+        content_hash="a" * 64,
+    )
+    second = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="1",
+        at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        recorder="bounded-multi-root-old-b",
+        content_hash="b" * 64,
+    )
+    db_session.add_all(
+        [
+            models.ProductionPlanExecutionFact(
+                stock_ledger_entry_id=int(first.id),
+                plan_id=int(plan.id),
+                plan_line_id=int(line.id),
+                run_id=int(old_run.run_id),
+                allocated_qty=Decimal("2"),
+                match_rule="fifo",
+                accepted_at=cutoff,
+            ),
+            models.ProductionPlanExecutionFact(
+                stock_ledger_entry_id=int(second.id),
+                plan_id=int(plan.id),
+                plan_line_id=int(line.id),
+                run_id=int(second_run.run_id),
+                allocated_qty=Decimal("1"),
+                match_rule="fifo",
+                accepted_at=cutoff,
+            ),
+        ]
+    )
+    first.active = False
+    replacement = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-multi-root-replacement",
+        content_hash="r" * 64,
+    )
+    db_session.add(
+        models.StockLedgerFactSupersession(
+            old_sle_id=int(first.id),
+            new_sle_id=int(replacement.id),
+            import_batch_id=int(target.physical_import_batch.id),
+        )
+    )
+    db_session.flush()
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(first.id), int(second.id), int(replacement.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="multi-root-correction",
+    )
+
+    assert result.idempotent is False
+    assert result.metrics["replayed_fact_rows"] == 2
+    facts = (
+        db_session.query(models.ProductionPlanExecutionFact)
+        .order_by(models.ProductionPlanExecutionFact.stock_ledger_entry_id)
+        .all()
+    )
+    assert [(int(row.stock_ledger_entry_id), int(row.run_id), str(row.allocated_qty)) for row in facts] == [
+        (int(second.id), int(second_run.run_id), "1.000"),
+        (int(replacement.id), int(current_run.run_id), "2.000"),
+    ]
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("3")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("3")
+
+
+def test_bounded_output_noop_keeps_multiple_historical_roots_byte_stable(db_session):
+    """A no-op must not collapse unchanged execution lineage to one root."""
+
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-multi-root-noop-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-multi-root-noop-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED-MULTI-ROOT-NOOP")
+    plan, first_run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("3"),
+    )
+    first_run.status = "CLOSED"
+    first_root = (
+        db_session.query(models.MrpRunRoot)
+        .filter_by(run_id=int(first_run.run_id), plan_line_id=int(line.id))
+        .one()
+    )
+    first_root.planned_qty = Decimal("2")
+    first_root.accepted_qty = Decimal("2")
+    first_root.remaining_qty = Decimal("0")
+    second_run = models.PlanningRun(
+        status="CLOSED",
+        config_snapshot={},
+        ledger_generation_id=int(parent.id),
+        ledger_cutoff=parent.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime(2026, 7, 2, tzinfo=timezone.utc),
+    )
+    db_session.add(second_run)
+    db_session.flush()
+    db_session.add(
+        models.MrpRunRoot(
+            run_id=int(second_run.run_id),
+            plan_line_id=int(line.id),
+            planned_qty=Decimal("1"),
+            accepted_qty=Decimal("1"),
+            remaining_qty=Decimal("0"),
+        )
+    )
+    line.accepted_output_qty = Decimal("3")
+    line.remaining_output_qty = Decimal("0")
+    first_sle = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-multi-root-noop-a",
+        content_hash="a" * 64,
+    )
+    second_sle = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="1",
+        at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        recorder="bounded-multi-root-noop-b",
+        content_hash="b" * 64,
+    )
+    db_session.add_all(
+        [
+            models.ProductionPlanExecutionFact(
+                stock_ledger_entry_id=int(first_sle.id),
+                plan_id=int(plan.id),
+                plan_line_id=int(line.id),
+                run_id=int(first_run.run_id),
+                allocated_qty=Decimal("2"),
+                match_rule="fifo",
+                accepted_at=cutoff,
+            ),
+            models.ProductionPlanExecutionFact(
+                stock_ledger_entry_id=int(second_sle.id),
+                plan_id=int(plan.id),
+                plan_line_id=int(line.id),
+                run_id=int(second_run.run_id),
+                allocated_qty=Decimal("1"),
+                match_rule="fifo",
+                accepted_at=cutoff,
+            ),
+        ]
+    )
+    db_session.flush()
+    before = [
+        (int(row.id), int(row.run_id), str(row.allocated_qty))
+        for row in db_session.query(models.ProductionPlanExecutionFact)
+        .order_by(models.ProductionPlanExecutionFact.id)
+        .all()
+    ]
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(first_sle.id), int(second_sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="multi-root-noop",
+    )
+
+    after = [
+        (int(row.id), int(row.run_id), str(row.allocated_qty))
+        for row in db_session.query(models.ProductionPlanExecutionFact)
+        .order_by(models.ProductionPlanExecutionFact.id)
+        .all()
+    ]
+    assert result.idempotent is True
+    assert before == after
+    assert result.metrics["replayed_fact_rows"] == 0
+
+
+def test_bounded_output_initializes_missing_current_remainder(db_session):
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-baseline-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-baseline-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED-BASELINE")
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+    )
+    line.remaining_output_qty = None
+    sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-baseline",
+        content_hash="e" * 64,
+    )
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="baseline",
+    )
+
+    assert result.idempotent is False
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("2")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("3")
+
+
+def test_bounded_output_correction_restores_scope_before_reallocation(db_session):
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-correction-parent", cutoff=cutoff)
+    target_a = _building_generation(db_session, key="bounded-correction-a", cutoff=cutoff)
+    target_b = _building_generation(db_session, key="bounded-correction-b", cutoff=cutoff)
+    item = _item(db_session, "ASM-CORRECTION")
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+    )
+    old = _sline(
+        db_session,
+        batch=target_a.physical_import_batch,
+        item=item,
+        qty="2",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-correction",
+        content_hash="c" * 64,
+    )
+    first = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target_a.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(old.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="a",
+    )
+    assert first.metrics["allocated_qty"] == "2"
+    old.active = False
+    replacement = _sline(
+        db_session,
+        batch=target_b.physical_import_batch,
+        item=item,
+        qty="4",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-correction",
+        content_hash="d" * 64,
+    )
+    db_session.add(
+        models.StockLedgerFactSupersession(
+            old_sle_id=int(old.id),
+            new_sle_id=int(replacement.id),
+            import_batch_id=int(target_b.physical_import_batch.id),
+        )
+    )
+    db_session.flush()
+    second = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target_b.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(old.id), int(replacement.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="b",
+    )
+    assert second.metrics["allocated_qty"] == "4"
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 1
+    fact = db_session.query(models.ProductionPlanExecutionFact).one()
+    assert int(fact.stock_ledger_entry_id) == int(replacement.id)
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("4")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("1")
 
 
 def test_fifo_across_two_live_fixed_plans(db_session):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -30,6 +32,7 @@ from .production_control_domain import (
     default_spec_id as _default_spec_id,
     unit_display as _unit_display,
 )
+from .item_ledger.future_supply_read import future_supply_model
 from .planning_truth import (
     CAPABILITY_FUTURE_SUPPLY,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -105,6 +108,62 @@ def _components_for_product(
 
 class AmbiguousFrozenMaterialBom(ValueError):
     pass
+
+
+@dataclass
+class _BulkPreviewContext:
+    """Shared read-only inputs for one bounded material-preview batch."""
+
+    ledger_generation_id: int
+    allow_building_read: bool
+    positions: Dict[int, Dict[str, float]]
+    custody: Any
+    future_supply_eta: Dict[int, List[Dict[str, Any]]]
+    reservation_orders: Dict[int, List[Dict[str, Any]]]
+    resolved: Dict[int, tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]]]
+
+
+def _resolve_preview_components(
+    db: Session,
+    product: ProductionProduct,
+) -> tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]]:
+    """Resolve one product's canonical basis/BOM without availability reads."""
+    basis_spec_id, basis_item, custody_product_id = _paint_weld_material_basis(db, product)
+    material_product = product
+    if custody_product_id != int(product.product_id):
+        material_product = db.get(ProductionProduct, custody_product_id)
+        if material_product is None:
+            raise ValueError("Связанная строка заказа для material custody не найдена")
+        basis_spec_id = _default_spec_id(db, material_product)
+    ambiguous_bom = False
+    try:
+        frozen_components = (
+            _frozen_components_for_product(
+                db,
+                material_product,
+                parent_item_id=int(basis_item.item_id),
+            )
+            if basis_item is not None
+            else None
+        )
+    except AmbiguousFrozenMaterialBom:
+        ambiguous_bom = True
+        frozen_components = []
+    spec_id, components = _components_for_product(
+        db,
+        material_product,
+        spec_id_override=basis_spec_id,
+    )
+    if frozen_components is not None:
+        components = frozen_components
+    return (
+        basis_spec_id,
+        basis_item,
+        custody_product_id,
+        ambiguous_bom,
+        spec_id,
+        components,
+    )
 
 
 def _unique_frozen_components(rows: Sequence[MrpFreezeComponent]) -> List[MrpFreezeComponent]:
@@ -249,7 +308,7 @@ def _future_supply_eta_by_item(
     if not ids or ledger_generation_id is None:
         return {}
 
-    source = LedgerFutureSupplyCurrent if current_only else LedgerFutureSupply
+    source = future_supply_model(db, int(ledger_generation_id))
     query = db.query(
         source.item_id,
         source.eta_date,
@@ -257,10 +316,7 @@ def _future_supply_eta_by_item(
         source.supply_kind,
         source.source_ref,
     ).filter(source.item_id.in_(ids))
-    if current_only:
-        query = query.filter(source.source_generation_id.isnot(None))
-    else:
-        query = query.filter(source.ledger_generation_id == int(ledger_generation_id))
+    query = query.filter(source.ledger_generation_id == int(ledger_generation_id))
     query = (
         query
         .filter(source.evidence_status == "exact")
@@ -387,6 +443,7 @@ def preview_materials(
     *,
     ledger_generation_id: int | None = None,
     _product_override: ProductionProduct | None = None,
+    _bulk_context: _BulkPreviewContext | None = None,
 ) -> Dict[str, Any]:
     """
     Return the BOM components required for a production line plus per-component
@@ -430,53 +487,53 @@ def preview_materials(
     )
     if not product:
         raise ValueError("Строка заказа не найдена")
-    basis_spec_id, basis_item, custody_product_id = _paint_weld_material_basis(db, product)
-    # A linked executor owns both the material custody and the quantity to
-    # weld. The painted output can be larger because intermediates already
-    # existed when the obligation was frozen.
-    material_product = product
-    if custody_product_id != int(product.product_id):
-        material_product = db.get(ProductionProduct, custody_product_id)
-        basis_spec_id = _default_spec_id(db, material_product)
-    ambiguous_bom = False
-    try:
-        frozen_components = (
-            _frozen_components_for_product(
-                db, material_product, parent_item_id=int(basis_item.item_id),
-            )
-            if basis_item is not None else None
-        )
-    except AmbiguousFrozenMaterialBom:
-        ambiguous_bom = True
-        frozen_components = []
-    spec_id, components = _components_for_product(
-        db,
-        material_product,
-        spec_id_override=basis_spec_id,
+    resolved = (
+        _bulk_context.resolved.get(int(product.product_id))
+        if _bulk_context is not None
+        else None
     )
-    if frozen_components is not None:
-        components = frozen_components
+    if resolved is None:
+        resolved = _resolve_preview_components(db, product)
+    (
+        _basis_spec_id,
+        basis_item,
+        custody_product_id,
+        ambiguous_bom,
+        spec_id,
+        resolved_components,
+    ) = resolved
+    components = deepcopy(resolved_components)
 
     comp_ids = [int(c["component_item_id"]) for c in components]
-    from .item_ledger import item_ledger_position
+    if _bulk_context is not None:
+        ledger_positions = {
+            int(item_id): dict(position)
+            for item_id, position in _bulk_context.positions.items()
+            if int(item_id) in set(comp_ids)
+        }
+    else:
+        from .item_ledger import item_ledger_position
 
-    ledger_positions = item_ledger_position(
-        db,
-        comp_ids,
-        ledger_generation_id=ledger_generation_id,
-        allow_building_read=allow_building_read,
-    )
+        ledger_positions = item_ledger_position(
+            db,
+            comp_ids,
+            ledger_generation_id=ledger_generation_id,
+            allow_building_read=allow_building_read,
+        )
     stock_by_item = {
         item_id: _to_float_strict(position["on_hand"], field="item_ledger_position.on_hand")
         for item_id, position in ledger_positions.items()
     }
 
-    from .production_material_custody_projection import load_material_custody_projection
+    if _bulk_context is not None:
+        reservation_state = _bulk_context.custody
+    else:
+        from .production_material_custody_projection import load_material_custody_projection
 
-    reservation_state = load_material_custody_projection(
-        db,
-        ledger_generation_id=int(ledger_generation_id),
-    )
+        reservation_state = load_material_custody_projection(
+            db,
+            ledger_generation_id=int(ledger_generation_id),
+        )
     # Components held by OTHER lines are unavailable; components this line
     # already holds (in transit or delivered to its workshop) count as its own
     # coverage instead of re-entering the pool.
@@ -484,17 +541,32 @@ def preview_materials(
         exclude_product_id=custody_product_id
     )
     own_reservation = reservation_state.for_product(custody_product_id)
-    reserved_orders_by_item = _reservation_orders_by_item(
-        db,
-        reservation_state,
-        exclude_product_id=custody_product_id,
-    )
-    future_supply_eta = _future_supply_eta_by_item(
-        db,
-        comp_ids,
-        ledger_generation_id=ledger_generation_id,
-        current_only=not allow_building_read,
-    )
+    if _bulk_context is not None:
+        reserved_orders_by_item = {
+            int(item_id): [
+                dict(row)
+                for row in values
+                if int(row.get("product_id") or 0) != int(custody_product_id)
+            ]
+            for item_id, values in _bulk_context.reservation_orders.items()
+        }
+        future_supply_eta = {
+            int(item_id): [dict(row) for row in values]
+            for item_id, values in _bulk_context.future_supply_eta.items()
+            if int(item_id) in set(comp_ids)
+        }
+    else:
+        reserved_orders_by_item = _reservation_orders_by_item(
+            db,
+            reservation_state,
+            exclude_product_id=custody_product_id,
+        )
+        future_supply_eta = _future_supply_eta_by_item(
+            db,
+            comp_ids,
+            ledger_generation_id=ledger_generation_id,
+            current_only=not allow_building_read,
+        )
     use_projection_coverage = bool(comp_ids)
     live_require_reserved_at_workshop = False
 
@@ -582,6 +654,94 @@ def preview_materials(
         "coverage_basis_item_article": str(basis_item.item_article or "") if basis_item is not None else str(product.item.item_article or ""),
     }
     return payload
+
+
+def preview_materials_bulk(
+    db: Session,
+    product_ids: Sequence[int],
+    *,
+    ledger_generation_id: int,
+) -> Dict[int, Dict[str, Any]]:
+    """Preview bounded production products with shared Ledger read context.
+
+    Product-specific BOM, frozen-plan, paint/weld, and custody-owner rules
+    remain in :func:`preview_materials`.  Only immutable read inputs that are
+    independent of the product being rendered are loaded once for the batch:
+    item positions, custody projection, future-supply ETA rows, and reserved
+    order display data.
+    """
+    ids = tuple(dict.fromkeys(int(value) for value in product_ids))
+    if not ids:
+        return {}
+    products = (
+        db.query(ProductionProduct)
+        .options(
+            joinedload(ProductionProduct.order),
+            joinedload(ProductionProduct.item),
+            joinedload(ProductionProduct.control_state),
+        )
+        .filter(ProductionProduct.product_id.in_(ids))
+        .all()
+    )
+    products_by_id = {int(product.product_id): product for product in products}
+    missing = [product_id for product_id in ids if product_id not in products_by_id]
+    if missing:
+        raise ValueError(f"Строка заказа не найдена: {missing[0]}")
+
+    resolved: dict[
+        int,
+        tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]],
+    ] = {}
+    component_ids: set[int] = set()
+    for product_id in ids:
+        value = _resolve_preview_components(db, products_by_id[product_id])
+        resolved[product_id] = value
+        component_ids.update(int(row["component_item_id"]) for row in value[5])
+
+    from .item_ledger import item_ledger_position
+    from .production_material_custody_projection import load_material_custody_projection
+
+    generation_id = int(ledger_generation_id)
+    positions = item_ledger_position(
+        db,
+        sorted(component_ids),
+        ledger_generation_id=generation_id,
+        allow_building_read=True,
+    )
+    custody = load_material_custody_projection(
+        db,
+        ledger_generation_id=generation_id,
+    )
+    reservation_orders = _reservation_orders_by_item(
+        db,
+        custody,
+        exclude_product_id=-1,
+    )
+    future_supply_eta = _future_supply_eta_by_item(
+        db,
+        sorted(component_ids),
+        ledger_generation_id=generation_id,
+        current_only=False,
+    )
+    context = _BulkPreviewContext(
+        ledger_generation_id=generation_id,
+        allow_building_read=True,
+        positions=positions,
+        custody=custody,
+        future_supply_eta=future_supply_eta,
+        reservation_orders=reservation_orders,
+        resolved=resolved,
+    )
+    return {
+        product_id: preview_materials(
+            db,
+            product_id,
+            ledger_generation_id=generation_id,
+            _product_override=products_by_id[product_id],
+            _bulk_context=context,
+        )
+        for product_id in ids
+    }
 
 
 def preview_make_work_item_materials(
@@ -877,6 +1037,11 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
         raise CurrentExecutionUnavailable("current production material coverage is missing")
     public = public_materials_payload(material)
     public["truth_status"] = "accepted"
+    # Generation provenance belongs to the accepted current manifest, not to
+    # the persisted nested material DTO.  Reattach it only at this read
+    # boundary for the response contract without creating a GC-blocking JSON
+    # dependency inside ``current_execution_row.payload``.
+    public["ledger_generation_id"] = int(manifest.source_generation_id or 0)
     generation = db.get(models.LedgerGeneration, int(manifest.source_generation_id or 0))
     public["cutoff"] = generation.cutoff.isoformat() if generation and generation.cutoff else None
     return public

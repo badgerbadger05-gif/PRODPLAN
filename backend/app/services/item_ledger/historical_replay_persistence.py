@@ -22,7 +22,7 @@ from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 from .document_net_output import net_document_output_qty
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
-from .physical_visibility import visible_sles_for_generation
+from .physical_visibility import visible_sle_query, visible_sles_for_generation
 from .recorder_identity import SYNC_LINK_FACT_STATUSES
 from .reservation import append_realization_event, fold_reservation_entry
 
@@ -224,16 +224,38 @@ def run_historical_replay(
     entry_by_core_id: dict[str, ReservationEntry] = {}
     pools_by_key: dict[tuple[int, str, str], set[str]] = {}
     has_warehouse_policy = db.query(models.StockWarehouse).count() > 0
-    visible_candidates = [
+    # The lower bound is a real database predicate, not a Python-side slice.
+    # A physical refresh normally starts at the parent cutoff; applying the
+    # predicate here keeps the immutable historical prefix out of the replay
+    # scan altogether.  Backdated/correction callers may deliberately pass an
+    # earlier affected boundary.
+    candidate_rows = [
         row
-        for row in visible_sles_for_generation(db, int(generation.id))
+        for row in visible_sle_query(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=generation.cutoff,
+        ).filter(StockLedgerEntry.posting_at > lower_bound).all()
         if str(row.movement_kind or "") in (
             _SAFE_REALIZATION_KINDS | _IGNORED_FACT_KINDS
         )
         and _decimal(row.qty) != 0
     ]
-    candidate_rows = [row for row in visible_candidates if row.posting_at > lower_bound]
-    excluded_pre_replay = len(visible_candidates) - len(candidate_rows)
+    # ``excluded_pre_replay`` is retained as an operational metric, but is no
+    # longer obtained by loading every historical row into Python.
+    visible_candidates_count = int(
+        visible_sle_query(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=generation.cutoff,
+        ).filter(
+            StockLedgerEntry.movement_kind.in_(
+                tuple(_SAFE_REALIZATION_KINDS | _IGNORED_FACT_KINDS)
+            ),
+            StockLedgerEntry.qty != 0,
+        ).count()
+    )
+    excluded_pre_replay = max(visible_candidates_count - len(candidate_rows), 0)
     physical_rows = [
         row for row in candidate_rows
         if str(row.movement_kind or "") in _SAFE_REALIZATION_KINDS

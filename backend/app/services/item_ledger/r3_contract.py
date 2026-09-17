@@ -51,6 +51,51 @@ def business_identity_for_movement(
     return "movement:" + ":".join(parts)
 
 
+def business_identity_for_cutoff_balance_adjustment(
+    recorder_ref: str,
+    line_no: str,
+    *,
+    item_id: int,
+    characteristic_ref: str,
+    organization_ref: str,
+    warehouse_ref1c: str,
+    snap_content_hash: str,
+) -> str:
+    """Return the stable identity of one synthetic cutoff adjustment cell.
+
+    A cutoff snap is not a 1C document.  It deliberately uses the synthetic
+    recorder type and line ``0`` for every cell, so the ordinary recorder/type
+    /line identity is ambiguous when two cells share a recorder reference.
+    The snap content hash identifies the synthetic occurrence, while a compact
+    digest of the physical key identifies its cell.  Generation and import
+    batch IDs remain provenance and are not used as business identity.
+    """
+    ref = str(recorder_ref or "").strip()
+    line = str(line_no or "").strip()
+    snap_hash = str(snap_content_hash or "").strip()
+    if not ref or not line or not snap_hash:
+        raise ValueError(
+            "cutoff adjustment identity requires recorder ref, line and snap hash"
+        )
+    cell_hash = hashlib.md5(
+        "\x1f".join(
+            (
+                str(int(item_id)),
+                str(characteristic_ref or "").strip(),
+                str(organization_ref or "").strip(),
+                str(warehouse_ref1c or "").strip(),
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    identity = (
+        "movement:cutoff_balance_adjustment:"
+        f"snap:{snap_hash}:ref:{ref}:line:{line}:cell:{cell_hash}"
+    )
+    if len(identity) > 256:
+        raise ValueError("cutoff adjustment business identity exceeds 256 characters")
+    return identity
+
+
 @dataclass(frozen=True)
 class ImportPageReceipt:
     page_no: int

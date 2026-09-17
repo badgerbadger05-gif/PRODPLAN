@@ -39,6 +39,13 @@ def test_budget_is_machine_readable_and_fixed_before_measurement():
     assert budgets["no_op_current_change_growth_max"] == 0
     assert budgets["no_op_wal_bytes_max"] == 131072
     assert budgets["no_op_dead_tuple_growth_max"] == 0
+    assert budgets["physical_refresh_seconds_max"] == 600.0
+    assert budgets["physical_refresh_replayed_rows_max"] == 10000
+    assert budgets["physical_refresh_no_op_replayed_rows_max"] == 0
+    physical_baseline = document["provenance"]["physical_refresh_baseline"]
+    assert physical_baseline["database_source"].endswith("production-size dump")
+    assert physical_baseline["full_replay_ledger_rows"] >= 100000
+    assert physical_baseline["accepted_as_target"] is False
     assert "measured" not in json.dumps(document).lower()
 
 
@@ -148,7 +155,12 @@ def test_runtime_inventory_contract():
 def test_report_compares_fixed_budgets():
     runner = _runner()
     report = runner.compare_budget(
-        {"api_p95_ms": 1, "current_publish_p95_ms": 1},
+        {
+            "api_p95_ms": 1,
+            "current_publish_p95_ms": 1,
+            "physical_refresh_seconds": 1,
+            "physical_refresh_replayed_rows": 1,
+        },
         budget_path=BUDGET_PATH,
     )
     assert report["within_budget"] is True

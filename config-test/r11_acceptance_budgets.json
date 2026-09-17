@@ -3,8 +3,15 @@
   "provenance": {
     "baseline": "R2 local PostgreSQL 16 baseline",
     "historical_api_p95_ms": [3.8, 4.9],
+    "physical_refresh_baseline": {
+      "database_source": "2026-09-15 restored production-size dump",
+      "full_replay_seconds_range": [1800, 1980],
+      "full_replay_ledger_rows": 146196,
+      "hourly_delta_rows_reference": 366,
+      "accepted_as_target": false
+    },
     "fixed_before_measurement": true,
-    "rationale": "Conservative operator-local limits are fixed before the R11 harness runs; they are not fitted to R11 output. The bounded WAL ceiling allows roughly 500 PostgreSQL row-lock records and occasional first-page images across 100 FOR UPDATE retries while DML and row/audit growth remain exactly zero."
+    "rationale": "Conservative operator-local limits are fixed before the R11 harness runs; they are not fitted to R11 output. The bounded WAL ceiling allows roughly 500 PostgreSQL row-lock records and occasional first-page images across 100 FOR UPDATE retries while DML and row/audit growth remain exactly zero. Physical-refresh limits deliberately reject the inherited bootstrap replay observed on the restored production-size database while allowing OData delta import, affected-scope convergence and current publication."
   },
   "budgets": {
     "api_p95_ms": 25.0,
@@ -20,7 +27,10 @@
     "mutation_audit_growth_max": 64,
     "migration_rehearsal_seconds": 180.0,
     "real_publisher_seconds": 180.0,
-    "storage_rehearsal_seconds": 240.0
+    "storage_rehearsal_seconds": 240.0,
+    "physical_refresh_seconds_max": 600.0,
+    "physical_refresh_replayed_rows_max": 10000,
+    "physical_refresh_no_op_replayed_rows_max": 0
   },
   "acceptance_matrix": {
     "A01": {"status": "covered", "node": "tests/r3/test_r3_runtime_integration.py::test_seed_repeat_100_preserves_one_id_and_identity_mapping"},
@@ -40,6 +50,6 @@
     "A15": {"status": "covered", "node": "tests/r10/test_r10_obligation_refresh_compact_checkpoint.py::test_published_retry_reuses_current_scopes_without_saved_read_models"},
     "A16": {"status": "covered", "node": "tests/r10/test_r10_legacy_path_cleanup.py::test_operational_rebuild_sql_uses_current_owner_after_head"},
     "A17": {"status": "covered", "nodes": ["tests/r10/test_r10_storage_rehearsal.py::test_storage_rehearsal_restores_subject_values_and_reclaims_dropped_relations", "tests/r10/test_r10_planning_read_drop.py::test_empty_database_drop_is_idempotent_and_downgrade_is_irreversible", "tests/r11/test_r11_final_acceptance_contract.py::test_a17_runs_two_rehearsals_and_compares_normalized_subject_state"]},
-    "A18": {"status": "covered", "nodes": ["tests/r11/test_r11_local_acceptance.py::test_report_compares_fixed_budgets", "tests/r11/test_r11_final_acceptance_contract.py::test_api_measurement_uses_real_r2_baseline_probe"]}
+    "A18": {"status": "covered", "nodes": ["tests/r11/test_r11_local_acceptance.py::test_report_compares_fixed_budgets", "tests/r11/test_r11_final_acceptance_contract.py::test_api_measurement_uses_real_r2_baseline_probe", "tests/services/test_physical_refresh_incremental.py::test_delta_reader_reports_stable_current_scope_without_mutating_owner", "tests/services/test_physical_refresh_orchestrator.py::test_run_physical_refresh_nonzero_delta_discards_candidate_before_publication", "tests/r11/test_physical_refresh_acceptance.py::test_physical_refresh_acceptance_requires_production_scale_and_budget"]}
   }
 }

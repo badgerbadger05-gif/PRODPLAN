@@ -621,14 +621,9 @@ def test_production_refresh_resolves_live_pool_for_supplier_and_wip(db_session):
         "orch-live-planning-pools",
         add=[plan.id],
     )
-    exact = (
-        db_session.query(models.LedgerFutureSupply)
-        .filter_by(
-            ledger_generation_id=result.target_generation_id,
-            evidence_status="exact",
-        )
-        .all()
-    )
+    # Accepted publication owns future supply in the compact current table;
+    # generation rows are bounded staging and are removed after publication.
+    exact = db_session.query(models.LedgerFutureSupplyCurrent).all()
     by_kind = {row.supply_kind: row for row in exact}
 
     assert set(by_kind) >= {"supplier_order", "wip_order"}
@@ -727,11 +722,9 @@ def test_production_refresh_rejects_only_lines_outside_the_live_contour(db_sessi
     )
 
     assert result.published is True
-    rows = (
-        db_session.query(models.LedgerFutureSupply)
-        .filter_by(ledger_generation_id=result.target_generation_id)
-        .all()
-    )
+    # Rejected contour evidence remains represented by the capture checkpoint;
+    # only exact business owners survive in the accepted current table.
+    rows = db_session.query(models.LedgerFutureSupplyCurrent).all()
     by_line = {
         (row.supply_kind, row.source_line_ref): row for row in rows
     }
@@ -741,13 +734,6 @@ def test_production_refresh_rejects_only_lines_outside_the_live_contour(db_sessi
     assert by_line[("wip_order", "1")].evidence_status == "exact"
     assert by_line[("wip_order", "1")].planning_stock_pool == "default"
     assert by_line[("wip_order", "1")].open_qty_at_cutoff == Decimal("4")
-    for identity in (("supplier_order", "2"), ("wip_order", "2")):
-        rejected = by_line[identity]
-        assert rejected.evidence_status == "rejected"
-        assert rejected.reason == "planning_pool_not_mapped"
-        assert rejected.planning_stock_pool == ""
-        assert rejected.open_qty_at_cutoff == Decimal("0")
-
     capture = (
         db_session.query(models.LedgerBuildBatch)
         .filter_by(

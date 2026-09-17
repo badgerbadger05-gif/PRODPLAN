@@ -268,6 +268,25 @@ def get_orders(
         saved["current_execution_scope_id"] = int(current_manifest.id)
         saved_summary = saved.get("summary")
         if not isinstance(saved_summary, dict):
+            nested_meta = saved.get("meta")
+            if isinstance(nested_meta, dict) and isinstance(nested_meta.get("summary"), dict):
+                saved_summary = dict(nested_meta["summary"])
+        # A ready current scope with zero rows is a valid persisted empty
+        # result.  Older publishers did not always persist the summary
+        # envelope for that case; derive only the zero cardinality contract,
+        # never business rows or totals from legacy sources.
+        if not isinstance(saved_summary, dict) and not rows:
+            saved_summary = {
+                "total_rows": 0,
+                "by_status": {},
+                "by_phase": {},
+                "to_order": 0,
+                "overdue": 0,
+                "expected_7d": 0,
+                "in_transit_amount": 0.0,
+                "fact_status": "available",
+            }
+        if not isinstance(saved_summary, dict):
             raise CurrentExecutionUnavailable("purchase current summary is missing")
         saved_buckets = [
             dict(bucket)

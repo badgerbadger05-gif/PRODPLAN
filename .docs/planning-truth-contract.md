@@ -181,14 +181,16 @@ projection; перескок через unseen physical/backdated event запр
 `AssemblyOutputAllocation` generation-scoped только как audit/provenance и не
 является вторым владельцем количества.
 
-Future supply разделяет immutable generation capture и compact current read.
-`LedgerFutureSupply` остаётся immutable generation evidence, а
-`LedgerFutureSupplyCurrent` — единственный compact current quantity owner по
+Future supply разделяет bounded BUILDING staging и compact current read.
+`LedgerFutureSupply` существует только до успешной публикации accepted
+generation и затем удаляется в той же транзакции; `LedgerFutureSupplyCurrent` —
+единственный compact current quantity owner по
 `current_identity`; `LedgerFutureSupplyCurrentChange` хранит before/after audit.
-Legacy `is_current` не является runtime-reader fallback. Compact publication и
-accepted truth pointer переключаются атомарно; BUILDING и ambiguous/rejected
-capture current reader не видит. Исторические readers могут явно запрашивать
-generation evidence для сборки candidate.
+Legacy `is_current` не является runtime-reader fallback. Accepted/current readers
+используют только exact pointer, BUILDING readers — staging через единый helper;
+latest/max heuristic и fallback при отсутствующей truth запрещены. Compact
+publication и accepted truth pointer переключаются атомарно; ambiguous/rejected
+capture current reader не видит. Change audit растёт только при semantic change.
 
 Specification import сначала приводит payload к семантическому canonical form
 (включая Decimal и порядок строк), затем сравнивает единственный revision hash.
@@ -220,6 +222,30 @@ fail-closed.
 freeze/custody consumers, `replenishment_receipt` — только current
 replenishment reader. Пересечение ролей в quantity sums запрещено.
 
+### Stable reservation owner
+
+`ReservationEntry` сохраняет один stable owner на business identity
+`reservation:req:<requirement_id>:mode:<realization_mode>`. Generation — только
+provenance: accepted/current readers читают `is_current` для exact
+`PlanningTruthState` pointer, а `owner_kind=building` разрешён лишь в bounded
+staging до атомарной публикации. Physical refresh не создаёт persistent
+reservation copy; publisher set-based rebind-ит allocations, work items и
+purchase dependencies, затем удаляет staging duplicates. Failed build не
+меняет prior current owner. Migration `20260914_01` не выполняет этот
+historical rebind: она bootstrap-ит только exact accepted pointer, оставляя
+старые rows с `owner_kind=legacy`/`is_current=false`. Их compaction и archive
+перенесены в отдельную будущую GC revision после cutover projections и
+проверки bounded dependency/backup safety.
+
+`ReservationEvent` получает semantic `event_identity` без generation/cycle и
+явный `origin_kind` по событийному смыслу. Дубликаты одного physical fact при
+разных cycle/idempotency схлопываются, фактические/correction events сохраняются
+ровно один раз. `ReservationCurrentChange` — append-only audit только
+semantic changes; технический replay не является audit. Legacy raw events не
+используются как runtime fallback: восстановление обеспечивается verified
+backup. В `20260914_01` archive только создаётся пустым; compact semantic
+archive и удаление legacy copies выполняются отдельной будущей GC revision.
+
 R5 использует этот же writer для полного signed replay supplier receipts,
 corrections и returns. Current хранит только положительный итог basis; exact и
 FIFO части одного стабильного pair получают `mixed`, а over-return остаётся
@@ -243,6 +269,17 @@ Generation-local staging ids не входят в business payload: readiness и
 с тем же результатом меняет только manifest provenance, без current row,
 updated_at или audit churn. Current drum order использует typed deterministic
 date/resource/priority/ordinal tie-break.
+
+Переходный compatibility owner для manual drum actions, work-item navigation и
+supplier provenance ограничен exact accepted generation. После атомарной
+публикации current execution удаляются только retired non-building projection
+copies set-based и в FK-safe порядке; активный BUILDING staging и exact current
+generation сохраняются. Это bounded retention, а не удаление ledger/history:
+полный GC разрешён только отдельной волной после cutover зависимостей и
+backup prerequisite.
+Миграция cutover дополнительно требует PostgreSQL session guard
+`prodplan.execution_projection_backup_ready=on`; отсутствие guard блокирует
+любой DELETE.
 
 Reference, custody и manual mutation writers инвалидируют только свои
 зависимые manifests и делают это на фактическом semantic change; no-op update

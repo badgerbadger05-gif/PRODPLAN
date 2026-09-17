@@ -14,6 +14,7 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     SupplierReceiptEvidenceError,
     _validate_operations,
     allocate_supplier_receipts,
+    normalize_supplier_receipt_evidence,
     rebuild_supplier_receipt_coverage,
 )
 from app import models
@@ -645,6 +646,39 @@ def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):
     assert provenance.match_status == "exact"
     assert provenance.supplier_order_line_no == "1"
     assert _supplier_event_rows(db_session, generation.id)[0][1].requirement_id == req.id
+
+
+def test_normalizer_maps_one_document_line_to_multiple_aggregate_sles(db_session):
+    generation, _req = _persistence_fixture(db_session)
+    first = db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="doc"
+    ).one()
+    second = models.StockLedgerEntry(
+        ingest_batch_id=first.ingest_batch_id,
+        source_content_hash="aggregate".ljust(64, "0"),
+        item_id=first.item_id,
+        characteristic_ref="",
+        warehouse_ref1c="wh",
+        qty=Decimal("2"),
+        posting_at=datetime.datetime(2026, 7, 2, 0, 1),
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Document_Receipt",
+        recorder_ref="doc",
+        line_no="1",
+    )
+    db_session.add(second)
+    db_session.commit()
+    rows = db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="doc"
+    ).order_by(models.StockLedgerEntry.id).all()
+    normalized = normalize_supplier_receipt_evidence(
+        db_session,
+        explicit_sles=rows,
+        evidence=[_evidence(RECEIPT_OPERATION, 5)],
+    )
+    assert [row.fact.sle_id for row in normalized] == [row.id for row in rows]
+    assert sum((row.fact.signed_qty for row in normalized), Decimal("0")) == Decimal("5")
 
 
 def test_duplicate_order_lines_persist_ambiguity_without_allocation(db_session):

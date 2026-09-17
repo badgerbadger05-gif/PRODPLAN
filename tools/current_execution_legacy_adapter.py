@@ -60,6 +60,8 @@ def _rows_for_snapshot(
     rows_table: Table,
     roots_table: Table,
     snapshot_id: int,
+    *,
+    include_row_kind: bool = False,
 ) -> list[dict[str, Any]]:
     rows = session.execute(
         select(rows_table)
@@ -78,8 +80,11 @@ def _rows_for_snapshot(
             .order_by(roots_table.c.root_item_id.asc())
         ).scalars()
         payload["root_item_ids"] = [int(value) for value in members]
-        payload.setdefault("row_kind", str(row.get("row_kind") or ""))
-        payload.setdefault("sort_key", str(row.get("sort_key") or ""))
+        if include_row_kind:
+            # Only MRP rows carry a business row kind; the production journal
+            # reader DTO is extra="forbid" and rejects these legacy columns.
+            payload.setdefault("row_kind", str(row.get("row_kind") or ""))
+            payload.setdefault("sort_key", str(row.get("sort_key") or ""))
         result.append(payload)
     return result
 
@@ -99,7 +104,7 @@ def _mrp_payload(
 
     rows: list[dict[str, Any]] = []
     counts = {kind: 0 for kind in _KINDS}
-    for payload in _rows_for_snapshot(session, rows_table, roots_table, int(snapshot["id"])):
+    for payload in _rows_for_snapshot(session, rows_table, roots_table, int(snapshot["id"]), include_row_kind=True):
         payload["run_id"] = int(run_id)
         kind = str(payload.get("row_kind") or "").strip().lower()
         if kind not in counts:

@@ -82,9 +82,32 @@ def _accepted_parent_with_future_supply(
         source_state_key="ready",
         capture_cutoff=CUTOFF,
         source_content_hash=f"hash-{key}",
+        current_identity=f"{supply_kind}:order-{key}:1:",
         evidence_status="exact",
     )
     db.add(supply)
+    db.flush()
+    db.add(models.LedgerFutureSupplyCurrent(
+        current_identity=supply.current_identity,
+        source_generation_id=int(parent.id),
+        source_capture_batch_id=int(batch.id),
+        supply_kind=supply.supply_kind,
+        item_id=supply.item_id,
+        planning_stock_pool=supply.planning_stock_pool,
+        destination_warehouse_ref1c=supply.destination_warehouse_ref1c,
+        source_ref=supply.source_ref,
+        source_line_ref=supply.source_line_ref,
+        source_requirement_id=supply.source_requirement_id,
+        ordered_qty_at_cutoff=supply.ordered_qty_at_cutoff,
+        realized_qty_at_cutoff=supply.realized_qty_at_cutoff,
+        open_qty_at_cutoff=supply.open_qty_at_cutoff,
+        eta_date=supply.eta_date,
+        source_state_key=supply.source_state_key,
+        capture_cutoff=supply.capture_cutoff,
+        source_content_hash=supply.source_content_hash,
+        evidence_status=supply.evidence_status,
+    ))
+    db.add(models.PlanningTruthState(id=1, current_generation_id=int(parent.id)))
     db.flush()
     return parent
 
@@ -322,8 +345,8 @@ def test_accept_carries_the_parent_capture_and_claims_the_capability(db_session)
         **dict(generation.source_watermarks or {}),
         "parent_generation_id": int(parent.id),
     }
-    pointer = models.PlanningTruthState(id=1, current_generation_id=int(parent.id))
-    db_session.add(pointer)
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = int(parent.id)
     db_session.flush()
 
     result = accept_generation_build(
@@ -334,6 +357,9 @@ def test_accept_carries_the_parent_capture_and_claims_the_capability(db_session)
     assert result["future_supply"]["rows"] == 1
     assert db_session.query(models.LedgerFutureSupply).filter_by(
         ledger_generation_id=int(generation.id)
+    ).count() == 0
+    assert db_session.query(models.LedgerFutureSupplyCurrent).filter_by(
+        source_generation_id=int(generation.id)
     ).count() == 1
     db_session.refresh(generation)
     assert generation.capabilities["future_supply"] is True
@@ -355,10 +381,7 @@ def test_accept_recaptures_current_supplier_orders_on_physical_refresh(db_sessio
         **dict(generation.source_watermarks or {}),
         "parent_generation_id": int(parent.id),
     }
-    db_session.add(models.PlanningTruthState(
-        id=1,
-        current_generation_id=int(parent.id),
-    ))
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(parent.id)
     order = models.SupplierOrder(
         order_number="SUP-CURRENT",
         order_date=datetime(2026, 7, 1),
@@ -391,8 +414,8 @@ def test_accept_recaptures_current_supplier_orders_on_physical_refresh(db_sessio
         planning_pool_by_warehouse={"WH": "default"},
     )
 
-    supplier = db_session.query(models.LedgerFutureSupply).filter_by(
-        ledger_generation_id=int(generation.id),
+    supplier = db_session.query(models.LedgerFutureSupplyCurrent).filter_by(
+        source_generation_id=int(generation.id),
         supply_kind="supplier_order",
         source_ref="supplier-current",
         source_line_ref="1",

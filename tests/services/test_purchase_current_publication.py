@@ -10,6 +10,7 @@ from app.services.item_ledger.current_execution import (
     load_current_execution_rows,
     publish_current_purchase_control_from_payload,
 )
+from app.routers.purchase_control import get_orders
 from app.services.purchase_control_projection import validate_purchase_control_journal_row
 
 
@@ -79,6 +80,13 @@ def test_empty_purchase_payload_is_a_valid_current_scope(db_session):
     assert load_current_execution_rows(
         db_session, entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
     ) == []
+    scope = get_current_execution_scope(
+        db_session, entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
+    )
+    assert {"meta", "summary", "cards"} <= set(scope.summary)
+    response = get_orders(db=db_session, limit=100, offset=0, horizon_period_to=None)
+    assert response["rows"] == []
+    assert response["summary"]["total_rows"] == 0
 
 
 def test_retry_is_idempotent_and_malformed_row_fails_before_publish(db_session):

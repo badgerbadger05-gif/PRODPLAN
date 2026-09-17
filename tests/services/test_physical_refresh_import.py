@@ -302,6 +302,7 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RegisterClient(),
+        audit_all_known_recorders=True,
     )
 
     assert isinstance(result, PhysicalRefreshImportResult)
@@ -374,6 +375,7 @@ def test_physical_refresh_recorder_audit_reuses_completed_checkpoint_without_cli
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RegisterClient(),
+        audit_all_known_recorders=True,
     )
     assert created_calls == [("called", "")]
 
@@ -400,6 +402,7 @@ def test_physical_refresh_recorder_audit_reuses_completed_checkpoint_without_cli
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RegisterClient(),
+        audit_all_known_recorders=True,
     )
 
     assert first.from_checkpoint is False
@@ -782,6 +785,7 @@ def test_physical_refresh_recorder_audit_rejects_pull_error_status(db_session, m
             ledger_generation_id=target.id,
             parent_generation_id=parent.id,
             client=_RegisterClient(),
+            audit_all_known_recorders=True,
         )
     assert (
         db_session.query(models.LedgerBuildBatch)
@@ -817,6 +821,7 @@ def test_physical_refresh_recorder_audit_rejects_nonzero_skips(db_session, monke
             ledger_generation_id=target.id,
             parent_generation_id=parent.id,
             client=_RegisterClient(),
+            audit_all_known_recorders=True,
         )
     assert (
         db_session.query(models.LedgerBuildBatch)
@@ -936,6 +941,7 @@ def test_recorder_audit_allows_noop_with_older_recorder_watermark(db_session, mo
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RegisterClient(),
+        audit_all_known_recorders=True,
     )
     assert result.terminal_physical_import_batch_id > int(parent_batch.id)
 
@@ -1007,6 +1013,7 @@ def test_opening_adjustment_rows_never_enter_the_audit(db_session, monkeypatch):
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RegisterClient(),
+        audit_all_known_recorders=True,
     )
 
     assert pulled == ["real-doc"]
@@ -1053,6 +1060,8 @@ def test_backdated_recorder_absent_from_ledger_joins_the_audit(db_session, monke
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=client,
+        discovery_lookback=None,
+        audit_all_known_recorders=True,
     )
 
     assert ("Document_СборкаЗапасов", "backdated-doc") in calls
@@ -1090,6 +1099,7 @@ def test_backdated_recorder_movements_reach_the_refreshed_generation(db_session)
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=client,
+        discovery_lookback=None,
     )
 
     assert result.backdated_recorders == 1
@@ -1133,6 +1143,7 @@ def test_recorder_audit_discovery_is_floored_at_the_opening_boundary(db_session,
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=client,
+        discovery_lookback=None,
     )
 
     starts = client.discovery_window_starts()
@@ -1190,6 +1201,7 @@ def test_recorder_audit_fails_closed_when_discovery_cannot_read_the_register(
             ledger_generation_id=target.id,
             parent_generation_id=parent.id,
             client=_BrokenClient(),
+            discovery_lookback=None,
         )
     assert (
         db_session.query(models.LedgerBuildBatch)
@@ -1206,6 +1218,7 @@ def test_old_recorder_correction_is_revisioned_inside_refresh(db_session):
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RecorderClient({"DOC-CORRECT": [_movement_line(8)]}),
+        audit_all_known_recorders=True,
     )
 
     assert result.changed_recorders == 1
@@ -1228,6 +1241,7 @@ def test_old_recorder_deletion_creates_tombstone_inside_refresh(db_session):
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
         client=_RecorderClient({"DOC-DELETE": []}),
+        audit_all_known_recorders=True,
     )
 
     assert result.changed_recorders == 1

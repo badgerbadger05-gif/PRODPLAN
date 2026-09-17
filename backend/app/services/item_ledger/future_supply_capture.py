@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app import models
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sle_query
+from .future_supply_read import future_supply_model
 
 
 _KINDS = frozenset({"wip_order", "supplier_order"})
@@ -460,7 +461,7 @@ def _carry_forward_rows(
         raise FutureSupplyCaptureError("future supply carry-forward requires parent and target cutoffs")
 
     carried: list[dict[str, Any]] = []
-    for source in _generation_rows(db, int(parent.id)):
+    for source in _read_generation_rows(db, int(parent.id)):
         row = {
             field: getattr(source, field)
             for field in _CARRY_FORWARD_FIELDS
@@ -553,6 +554,14 @@ def carry_forward_future_supply_evidence(
 def _generation_rows(db: Session, generation_id: int) -> list[models.LedgerFutureSupply]:
     return db.query(models.LedgerFutureSupply).filter(
         models.LedgerFutureSupply.ledger_generation_id == int(generation_id)
+    ).all()
+
+
+def _read_generation_rows(db: Session, generation_id: int) -> list[Any]:
+    """Read one generation through the canonical staging/current owner."""
+    source = future_supply_model(db, int(generation_id))
+    return db.query(source).filter(
+        source.ledger_generation_id == int(generation_id)
     ).all()
 
 
@@ -826,9 +835,9 @@ def publish_current_future_supply(
 ) -> Mapping[str, Any]:
     """Promote one accepted capture into the compact current projection.
 
-    The generation remains immutable evidence; ``is_current`` is only the
-    accepted pointer's materialized read state.  Old rows are retained as
-    history but are never selected by current readers.
+    The generation's bounded staging is copied into the compact current owner;
+    after successful publication its staging rows are removed in this same
+    transaction.  ``is_current`` is legacy metadata only.
     """
     target = db.get(models.LedgerGeneration, int(generation_id))
     pointer = db.query(models.PlanningTruthState).filter_by(id=1).one_or_none()
@@ -842,6 +851,38 @@ def publish_current_future_supply(
             "future supply current publication requires the accepted truth pointer"
         )
     rows = _generation_rows(db, int(target.id))
+    if not rows:
+        # Accepted publication prunes its staging evidence.  An exact retry
+        # must therefore prove that the current owner already belongs to this
+        # accepted generation (or that this was an empty capture) instead of
+        # interpreting absent staging as an empty replacement.
+        current_rows = db.query(models.LedgerFutureSupplyCurrent).all()
+        batch = db.query(models.LedgerBuildBatch).filter(
+            models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+            models.LedgerBuildBatch.stage == FUTURE_SUPPLY_CAPTURE_STAGE,
+        ).one_or_none()
+        metrics = dict(batch.metrics or {}) if batch is not None else {}
+        current_belongs_to_target = current_rows and all(
+            int(row.source_generation_id) == int(target.id)
+            for row in current_rows
+        )
+        if current_belongs_to_target or (
+            not current_rows and int(metrics.get("rows", -1)) == 0
+        ):
+            return {
+                "generation_id": int(target.id),
+                "rows": int(metrics.get("rows", 0)),
+                "current_identities": tuple(
+                    sorted(str(row.current_identity) for row in current_rows)
+                ),
+            }
+        if int(metrics.get("rows", -1)) != 0:
+            raise FutureSupplyCaptureError(
+                "future supply current publication staging is missing"
+            )
+        # A valid empty capture is allowed to close the previous current
+        # contour on its first publication; continue through the normal close
+        # path below.  It is not treated as a retry of another generation.
     identities = [str(row.current_identity or "") for row in rows]
     if any(not identity for identity in identities):
         raise FutureSupplyCaptureError(
@@ -868,6 +909,14 @@ def publish_current_future_supply(
         current = current_by_identity.get(identity)
         if current is not None:
             if _current_business_payload(current) == payload:
+                # A physical refresh may change only cutoff/provenance.  Move
+                # the owner to the new accepted generation without emitting a
+                # semantic change audit event.
+                current.source_generation_id = int(target.id)
+                current.source_capture_batch_id = int(source.capture_batch_id)
+                current.source_updated_at = source.source_updated_at
+                current.capture_cutoff = source.capture_cutoff
+                current.source_content_hash = source.source_content_hash
                 continue
             db.add(models.LedgerFutureSupplyCurrentChange(
                 current_identity=identity,
@@ -924,6 +973,14 @@ def publish_current_future_supply(
             source_content_hash=str(current.source_content_hash),
         ))
         db.delete(current)
+    db.flush()
+    # The accepted current owner is now durable in this transaction.  Remove
+    # per-generation evidence only after that publication has succeeded; a
+    # rollback consequently preserves both the previous current owner and the
+    # BUILDING/accepted staging needed for retry and forensic restore.
+    db.query(models.LedgerFutureSupply).filter(
+        models.LedgerFutureSupply.ledger_generation_id == int(target.id)
+    ).delete(synchronize_session=False)
     db.flush()
     return {
         "generation_id": int(target.id),

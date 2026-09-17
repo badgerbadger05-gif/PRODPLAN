@@ -1,7 +1,8 @@
-"""Crash-resumable physical refresh followed by one atomic planning publish."""
+"""Crash-resumable physical refresh with bounded current-owner publication."""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -17,7 +18,6 @@ from ..planning_pool_resolver import (
     effective_planning_pool_by_warehouse,
     validate_future_supply_destinations,
 )
-from .generation_lifecycle import accept_generation_build
 from .historical_bootstrap_phase0 import (
     BalanceConvergenceResult,
     evaluate_physical_refresh_balance_convergence,
@@ -40,7 +40,6 @@ from .physical import (
     canonical_content_hash,
     guard_physical_batch_writer,
     physical_sequence_lock_context,
-    rebuild_running_balance,
 )
 from .physical_visibility import visible_sle_query
 from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
@@ -48,9 +47,17 @@ from .physical_refresh_import import (
     PhysicalRefreshImportResult,
     run_physical_recorder_audit,
 )
+from .r3_contract import business_identity_for_cutoff_balance_adjustment
 from .physical_refresh_generation import fork_physical_refresh_generation
+from .physical_refresh_discard import discard_physical_refresh_candidate
 from .output_repair_gate import assert_output_repair_allows
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
+from .physical_refresh_current_publish import (
+    ForwardPhysicalRefreshUnavailable,
+    physical_refresh_last_failure_status,
+    physical_refresh_phase_status,
+    publish_forward_physical_refresh_current,
+)
 
 
 PHYSICAL_REFRESH_LOCK_KEY = PHYSICAL_SEQUENCE_LOCK_KEY
@@ -69,6 +76,121 @@ class PhysicalRefreshBalanceConvergenceError(PhysicalRefreshOrchestratorError):
         super().__init__(message)
 
 
+def _physical_refresh_evidence(
+    physical_import: Any,
+    recorder_audit: Any,
+    *,
+    database_ledger_rows: int,
+) -> dict[str, Any]:
+    """Return bounded delta evidence from durable import/audit checkpoints."""
+    inserted_rows = int(getattr(physical_import, "movements_inserted", 0) or 0)
+    changed_recorders = int(getattr(recorder_audit, "changed_recorders", 0) or 0)
+    backdated_rows = int(getattr(recorder_audit, "backdated_recorders", 0) or 0)
+    revised_rows = int(getattr(recorder_audit, "revised_recorders", 0) or 0)
+    vanished_rows = int(getattr(recorder_audit, "vanished_recorders", 0) or 0)
+    return {
+        "input_delta_rows": max(
+            inserted_rows,
+            changed_recorders,
+            backdated_rows + revised_rows + vanished_rows,
+        ),
+        "affected_scopes": (),
+        "backdated": bool(backdated_rows),
+        "database_ledger_rows": int(database_ledger_rows),
+    }
+
+
+def _physical_refresh_delta_rows(
+    db: Session,
+    *,
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+    physical_import: Any,
+    recorder_audit: Any,
+) -> dict[str, Any]:
+    """Load only rows named by new import batches and supersession edges.
+
+    The batch interval is the durable import manifest.  Supersession edges add
+    the old row for a revision/vanish without comparing the accepted prefix.
+    Every query is therefore bounded by the refresh evidence rather than by
+    the size of the historical Ledger.
+    """
+    parent_batch_id = int(parent.physical_import_batch_id or 0)
+    terminal_ids = (
+        int(getattr(physical_import, "physical_import_batch_id", 0) or 0),
+        int(getattr(physical_import, "terminal_physical_import_batch_id", 0) or 0),
+        int(getattr(recorder_audit, "terminal_physical_import_batch_id", 0) or 0),
+        int(target.physical_import_batch_id or 0),
+    )
+    terminal_batch_id = max(terminal_ids)
+    if terminal_batch_id <= parent_batch_id:
+        return {
+            "rows": (), "new_rows": (), "supersessions": (),
+            "input_delta_rows": 0, "affected_scopes": (), "backdated": False,
+        }
+    new_rows = tuple(db.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id > parent_batch_id,
+        models.StockLedgerEntry.ingest_batch_id <= terminal_batch_id,
+    ).order_by(
+        models.StockLedgerEntry.posting_at.asc(), models.StockLedgerEntry.id.asc(),
+    ).all())
+    supersessions = tuple(db.query(models.StockLedgerFactSupersession).filter(
+        models.StockLedgerFactSupersession.import_batch_id > parent_batch_id,
+        models.StockLedgerFactSupersession.import_batch_id <= terminal_batch_id,
+    ).order_by(models.StockLedgerFactSupersession.id.asc()).all())
+    changed_ids = {int(row.id) for row in new_rows}
+    changed_ids.update(int(edge.old_sle_id) for edge in supersessions)
+    changed_ids.update(
+        int(edge.new_sle_id) for edge in supersessions if edge.new_sle_id is not None
+    )
+    rows = tuple(db.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.id.in_(sorted(changed_ids))
+    ).order_by(
+        models.StockLedgerEntry.posting_at.asc(), models.StockLedgerEntry.id.asc(),
+    ).all()) if changed_ids else ()
+    if len(rows) != len(changed_ids):
+        raise PhysicalRefreshOrchestratorError(
+            "physical refresh evidence references a missing StockLedgerEntry"
+        )
+    item_ids = sorted({int(row.item_id) for row in rows})
+    current = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.is_current.is_(True),
+        models.ReservationEntry.lifecycle_status == "active",
+        models.ReservationEntry.item_id.in_(item_ids) if item_ids else False,
+    ).all()
+    scopes: set[str] = set()
+    for row in rows:
+        mode = "make" if str(row.movement_kind or "") == "assembly_in" else "buy"
+        matches = [entry for entry in current
+                   if int(entry.item_id) == int(row.item_id)
+                   and ("make" if str(entry.realization_mode or "") == "rework"
+                        else str(entry.realization_mode or "")) == mode]
+        if matches:
+            scopes.update(
+                ":".join((
+                    str(int(entry.item_id)), str(entry.characteristic_ref or ""),
+                    str(entry.organization_ref or ""), str(entry.planning_stock_pool or ""),
+                    mode,
+                )) for entry in matches
+            )
+        else:
+            scopes.add(":".join((
+                str(int(row.item_id)), str(row.characteristic_ref or ""),
+                str(row.organization_ref or ""), str(row.warehouse_ref1c or ""), mode,
+            )))
+    return {
+        "rows": rows,
+        "new_rows": new_rows,
+        "supersessions": supersessions,
+        "input_delta_rows": len(rows),
+        "affected_scopes": tuple(sorted(scopes)),
+        "backdated": any(
+            _utc(row.posting_at, "physical posting_at") <= _utc(parent.cutoff, "parent cutoff")
+            for row in rows
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class PhysicalRefreshOrchestrationResult:
     parent_generation_id: int
@@ -81,6 +203,15 @@ class PhysicalRefreshOrchestrationResult:
     candidate_run_ids: tuple[int, ...]
     published: bool
     opening_reconcile: OpeningBalanceReconcileResult | None = None
+    # Operational proof that a physical tick used the bounded path.  These
+    # fields are deliberately part of the result rather than log-only data so
+    # the acceptance gate can measure replay cost on a production-sized dump.
+    input_delta_rows: int = 0
+    replayed_rows: int = 0
+    affected_scopes: tuple[str, ...] = ()
+    duration_ms: int = 0
+    database_ledger_rows: int = 0
+    phase_timings: tuple[tuple[str, int], ...] = ()
 
 
 def _utc(value: datetime, field: str) -> datetime:
@@ -296,6 +427,15 @@ def _snap_balance_at_cutoff(
             models.StockLedgerEntry(
                 ingest_batch_id=int(batch.id),
                 source_content_hash=recorder_ref,
+                business_identity=business_identity_for_cutoff_balance_adjustment(
+                    recorder_ref,
+                    "0",
+                    item_id=key.item_id,
+                    characteristic_ref=key.characteristic_ref,
+                    organization_ref=key.organization_ref,
+                    warehouse_ref1c=key.warehouse_ref1c,
+                    snap_content_hash=content_hash,
+                ),
                 item_id=key.item_id,
                 characteristic_ref="",
                 organization_ref=key.organization_ref,
@@ -311,9 +451,6 @@ def _snap_balance_at_cutoff(
             )
         )
         db.flush()
-        rebuild_running_balance(
-            db, key, ledger_generation_id=int(generation.id), publish_current=False
-        )
 
     generation.physical_import_batch_id = int(batch.id)
     generation.source_watermarks = {
@@ -517,6 +654,161 @@ def _current_parent(db: Session) -> models.LedgerGeneration:
     return parent
 
 
+def _bounded_custody_tail_sle_ids(
+    db: Session,
+    *,
+    after_event_id: int,
+    parent_generation_id: int | None = None,
+    target_cutoff: datetime | None = None,
+) -> tuple[int, ...]:
+    """Validate and return the bounded physical identities behind an event tail.
+
+    A refresh can crash after its import checkpoint commits but before current
+    publication.  On the next launch those events are durable even though the
+    accepted manifest still points at the earlier watermark.  Accept only
+    events whose source SLE is either inside the accepted physical boundary or
+    belongs to a completed import batch after that boundary.  This is a
+    bounded recovery proof; it never discovers the historical event stream or
+    ledger prefix.
+
+    Local events, missing/inactive SLEs, incomplete batches, future postings,
+    duplicate source identities, and malformed batch lineage fail closed.
+    """
+    rows = (
+        db.query(
+            models.ProductionMaterialCustodyEvent.id,
+            models.ProductionMaterialCustodyEvent.source_sle_id,
+            models.ProductionMaterialCustodyEvent.component_item_id,
+        )
+        .filter(models.ProductionMaterialCustodyEvent.id > int(after_event_id))
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+        .all()
+    )
+    source_ids: list[int] = []
+    event_ids: list[int] = []
+    event_components: dict[int, int] = {}
+    event_by_source: dict[int, int] = {}
+    for event_id, source_sle_id, component_item_id in rows:
+        if source_sle_id is None:
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail contains a non-physical event "
+                f"(event_id={int(event_id)})"
+            )
+        event_ids.append(int(event_id))
+        source_ids.append(int(source_sle_id))
+        event_components[int(event_id)] = int(component_item_id)
+        event_by_source[int(source_sle_id)] = int(event_id)
+    if len(set(source_ids)) != len(source_ids):
+        raise PhysicalRefreshOrchestratorError(
+            "physical refresh custody tail contains duplicate source SLEs "
+            f"(events={event_ids}, source_sle_ids={source_ids})"
+        )
+    if not source_ids or parent_generation_id is None:
+        return tuple(source_ids)
+
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if parent is None or parent.physical_import_batch_id is None:
+        raise PhysicalRefreshOrchestratorError(
+            "physical refresh custody tail cannot resolve parent import boundary"
+        )
+    parent_batch_id = int(parent.physical_import_batch_id)
+    query = (
+        db.query(
+            models.StockLedgerEntry.id,
+            models.StockLedgerEntry.ingest_batch_id,
+            models.StockLedgerEntry.item_id,
+            models.StockLedgerEntry.movement_kind,
+            models.StockLedgerEntry.posting_at,
+            models.StockLedgerEntry.active,
+            models.PhysicalImportBatch.id,
+            models.PhysicalImportBatch.status,
+            models.PhysicalImportBatch.source_complete,
+            models.PhysicalImportBatch.cutoff,
+            models.PhysicalImportBatch.source_watermarks,
+        )
+        .join(
+            models.PhysicalImportBatch,
+            models.PhysicalImportBatch.id == models.StockLedgerEntry.ingest_batch_id,
+        )
+        .filter(models.StockLedgerEntry.id.in_(source_ids))
+    )
+    facts = query.all()
+    by_id = {int(row[0]): row for row in facts}
+    if set(by_id) != set(source_ids):
+        missing = sorted(set(source_ids) - set(by_id))
+        raise PhysicalRefreshOrchestratorError(
+            "physical refresh custody tail references missing SLEs "
+            f"(source_sle_ids={missing})"
+        )
+    cutoff = _utc(target_cutoff, "target cutoff") if target_cutoff is not None else None
+    for source_id in source_ids:
+        (
+            _sle_id,
+            ingest_batch_id,
+            sle_item_id,
+            movement_kind,
+            posting_at,
+            active,
+            batch_id,
+            batch_status,
+            source_complete,
+            batch_cutoff,
+            marks,
+        ) = by_id[int(source_id)]
+        if not bool(active):
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail references inactive SLE "
+                f"(source_sle_id={int(source_id)})"
+            )
+        event_id = event_by_source[int(source_id)]
+        if int(sle_item_id) != int(event_components[event_id]):
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail has foreign source item "
+                f"(event_id={event_id}, source_sle_id={int(source_id)}, "
+                f"event_item_id={event_components[event_id]}, sle_item_id={int(sle_item_id)})"
+            )
+        if str(movement_kind or "") not in {"transfer_in", "transfer_out"}:
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail has unsupported source movement "
+                f"(event_id={event_id}, source_sle_id={int(source_id)}, "
+                f"movement_kind={str(movement_kind or '')!r})"
+            )
+        if str(batch_status or "") != "completed" or not bool(source_complete):
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail references incomplete import batch "
+                f"(source_sle_id={int(source_id)}, batch_id={int(batch_id)})"
+            )
+        if cutoff is not None and _utc(posting_at, "custody source posting_at") > cutoff:
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail contains a future source SLE "
+                f"(source_sle_id={int(source_id)}, posting_at={posting_at!s})"
+            )
+        if batch_cutoff is not None and cutoff is not None:
+            if _utc(batch_cutoff, "custody import cutoff") > cutoff:
+                raise PhysicalRefreshOrchestratorError(
+                    "physical refresh custody tail references a future import batch "
+                    f"(source_sle_id={int(source_id)}, batch_id={int(batch_id)})"
+                )
+        if int(ingest_batch_id) <= parent_batch_id:
+            continue
+        batch_marks = dict(marks or {})
+        previous = batch_marks.get("previous_import_batch_id")
+        try:
+            previous_id = int(previous)
+        except (TypeError, ValueError):
+            previous_id = -1
+        # A post-parent batch is a recoverable retry delta only when its
+        # persisted lineage identifies the preceding physical boundary.  This
+        # excludes arbitrary completed batches from another source/process.
+        if previous_id < parent_batch_id:
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh custody tail has foreign batch lineage "
+                f"(source_sle_id={int(source_id)}, batch_id={int(batch_id)}, "
+                f"parent_batch_id={parent_batch_id}, previous_batch_id={previous_id})"
+            )
+    return tuple(source_ids)
+
+
 def run_physical_refresh(
     db: Session,
     *,
@@ -527,23 +819,25 @@ def run_physical_refresh(
     started_by: str = "auto-sync",
     window_size: timedelta = timedelta(days=1),
     max_windows: int | None = None,
-    discovery_lookback: timedelta | None = None,
-    audit_all_known_recorders: bool = True,
+    discovery_lookback: timedelta | None = timedelta(0),
+    audit_all_known_recorders: bool = False,
     opening_balance_loader: Callable[[datetime], Mapping[Any, Any]] | None = None,
     config_version_id: int | None = None,
     config_snapshot: Mapping[str, Any] | None = None,
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
+    database_ledger_rows: int | None = None,
 ) -> PhysicalRefreshOrchestrationResult:
     """Advance physical truth and publish refreshed planning snapshots.
 
-    Window imports are durable checkpoints.  The accepted pointer remains on
-    the parent until physical validation, full replay, and the existing
-    obligation-refresh publisher all succeed.
+    Window imports are durable checkpoints.  Routine refresh records only the
+    bounded post-cutoff physical delta and publishes proven forward facts into
+    compact current owners; equivalent imports keep the parent pointer.
 
     ``opening_balance_loader`` is called with the anchor instant and must return
     1C's Balance as of it.  Without it the opening balance is left as seeded,
     which leaves documents backdated behind the anchor permanently unaccounted.
     """
+    started_monotonic = time.monotonic()
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
@@ -570,6 +864,26 @@ def run_physical_refresh(
             actor=started_by,
         )
         parent = _current_parent(db)
+        parent_custody_manifest = db.get(
+            models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+        )
+        custody_event_start = int(
+            parent_custody_manifest.source_event_high_watermark_id
+            if parent_custody_manifest is not None
+            else 0
+        )
+        preexisting_custody_tail_sle_ids: tuple[int, ...] = ()
+        if parent_custody_manifest is not None:
+            # A previous process may have committed the import/custody event
+            # tail before crashing.  Validate that bounded tail now and carry
+            # it into the new current publication instead of rejecting a
+            # recoverable retry at startup.
+            preexisting_custody_tail_sle_ids = _bounded_custody_tail_sle_ids(
+                db,
+                after_event_id=custody_event_start,
+                parent_generation_id=int(parent.id),
+                target_cutoff=cutoff,
+            )
         pool_mapping = effective_planning_pool_by_warehouse(
             db,
             planning_pool_by_warehouse,
@@ -586,6 +900,7 @@ def run_physical_refresh(
             key,
             from_cutoff=from_cutoff,
             target_cutoff=cutoff,
+            lightweight=True,
         )
         recorder_audit = run_physical_recorder_audit(
             db,
@@ -610,11 +925,37 @@ def run_physical_refresh(
                 "physical refresh yielded before reaching target cutoff"
             )
 
-        convergence = evaluate_physical_refresh_balance_convergence(
-            db,
-            ledger_generation_id=int(fork.ledger_generation_id),
-            balance_snapshot=balance_snapshot,
+        physical_generation = db.get(
+            models.LedgerGeneration, int(fork.ledger_generation_id)
         )
+        if physical_generation is None:
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh generation disappeared before convergence"
+            )
+
+        # Resolve the bounded import manifest before convergence.  The
+        # convergence gate folds the parent's compact current StockBin plus
+        # these rows; it must not scan the accepted historical SLE prefix.
+        delta = _physical_refresh_delta_rows(
+            db,
+            parent=parent,
+            target=physical_generation,
+            physical_import=physical_import,
+            recorder_audit=recorder_audit,
+        )
+
+        def _bounded_convergence() -> BalanceConvergenceResult:
+            return evaluate_physical_refresh_balance_convergence(
+                db,
+                ledger_generation_id=int(fork.ledger_generation_id),
+                balance_snapshot=balance_snapshot,
+                base_generation_id=int(parent.id),
+                delta_rows=tuple(delta["rows"]),
+                new_rows=tuple(delta["new_rows"]),
+                supersession_edges=tuple(delta["supersessions"]),
+            )
+
+        convergence = _bounded_convergence()
         if not convergence.valid:
             physical_generation = db.get(
                 models.LedgerGeneration, int(fork.ledger_generation_id)
@@ -629,11 +970,17 @@ def run_physical_refresh(
                 convergence=convergence,
             )
             if snapped:
-                convergence = evaluate_physical_refresh_balance_convergence(
-                    db,
-                    ledger_generation_id=int(fork.ledger_generation_id),
-                    balance_snapshot=balance_snapshot,
+                physical_generation = db.get(
+                    models.LedgerGeneration, int(fork.ledger_generation_id)
                 )
+                delta = _physical_refresh_delta_rows(
+                    db,
+                    parent=parent,
+                    target=physical_generation,
+                    physical_import=physical_import,
+                    recorder_audit=recorder_audit,
+                )
+                convergence = _bounded_convergence()
         if not convergence.valid and opening_balance_loader is not None:
             remaining_keys = {
                 (
@@ -651,11 +998,17 @@ def run_physical_refresh(
                 only_keys=remaining_keys,
             )
             if opening_reconcile is not None and opening_reconcile.adjusted_keys:
-                convergence = evaluate_physical_refresh_balance_convergence(
-                    db,
-                    ledger_generation_id=int(fork.ledger_generation_id),
-                    balance_snapshot=balance_snapshot,
+                physical_generation = db.get(
+                    models.LedgerGeneration, int(fork.ledger_generation_id)
                 )
+                delta = _physical_refresh_delta_rows(
+                    db,
+                    parent=parent,
+                    target=physical_generation,
+                    physical_import=physical_import,
+                    recorder_audit=recorder_audit,
+                )
+                convergence = _bounded_convergence()
         # Retain the diagnostic and completed import even when convergence is
         # false; neither operation moves the public planning-truth pointer.
         db.commit()
@@ -673,31 +1026,181 @@ def run_physical_refresh(
             raise PhysicalRefreshOrchestratorError(
                 "physical refresh generation disappeared"
             )
-        marks = dict(physical_generation.source_watermarks or {})
-        try:
-            replay_from = datetime.fromisoformat(str(marks["replay_from"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PhysicalRefreshOrchestratorError(
-                "physical refresh lacks replay_from"
-            ) from exc
-
-        # Physical refresh changes facts, not frozen plan obligations.
-        # accept_generation_build rebuilds the generation-scoped reservation
-        # fold and immutable read snapshots for the existing fixed runs.  A
-        # second obligation refresh here used to re-explode every BOM and
-        # overwrite frozen net quantities with today's stock basis.
-        # The pointer is re-checked here, not only at the fork: the import
-        # window runs for minutes and commits repeatedly, so another publisher
-        # may have advanced truth in the meantime.  accept_generation_build
-        # compares-and-sets under the pointer row lock.
-        accept_generation_build(
-            db,
-            int(physical_generation.id),
-            replay_from=replay_from,
-            odata_client=client,
-            expected_parent_id=int(parent.id),
-            planning_pool_by_warehouse=pool_mapping,
+        # The recorder audit and import checkpoints are the durable delta
+        # manifest.  Do not derive a delta by comparing visible parent/target
+        # prefixes: that turns every refresh into O(history) work and cannot
+        # distinguish an ordinary tick from a correction without re-reading it.
+        # A prod-scale row count is preflight evidence, not part of the timed
+        # refresh transaction.  Import adapters may provide it from their
+        # persisted checkpoint; absent that evidence the acceptance evaluator
+        # fails closed rather than forcing a history scan here.
+        # The production-scale row count is supplied by a separate preflight
+        # or persisted adapter checkpoint.  Never count the historical Ledger
+        # inside this timed refresh transaction.
+        database_ledger_rows = int(
+            database_ledger_rows
+            if database_ledger_rows is not None
+            else (getattr(physical_import, "database_ledger_rows", 0) or 0)
         )
+        evidence = _physical_refresh_evidence(
+            physical_import,
+            recorder_audit,
+            database_ledger_rows=database_ledger_rows,
+        )
+        input_delta_rows = max(
+            int(evidence["input_delta_rows"]),
+            int(delta["input_delta_rows"]),
+        )
+        custody_source_sle_ids = tuple(dict.fromkeys(
+            preexisting_custody_tail_sle_ids
+            + _bounded_custody_tail_sle_ids(
+                db,
+                after_event_id=custody_event_start,
+                parent_generation_id=int(parent.id),
+                target_cutoff=cutoff,
+            )
+        ))
+        if not input_delta_rows and not custody_source_sle_ids:
+            # Equivalent imports have no successor in R3.  Discard the
+            # technical fork and keep the accepted pointer and every compact
+            # current owner untouched; even a provenance-only UPDATE would
+            # create needless WAL/audit churn.
+            physical_generation.source_watermarks = {
+                **dict(physical_generation.source_watermarks or {}),
+                "physical_refresh_delta": {
+                    "input_delta_rows": 0,
+                    "replayed_rows": 0,
+                    "affected_scopes": list(delta["affected_scopes"]),
+                    "backdated": bool(delta["backdated"]),
+                    "database_ledger_rows": database_ledger_rows,
+                    "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+                },
+            }
+            discard_physical_refresh_candidate(
+                db,
+                ledger_generation_id=int(physical_generation.id),
+                reason="no semantic physical delta",
+            )
+            db.commit()
+            fixed_run_ids = tuple(
+                int(run_id)
+                for (run_id,) in db.query(models.PlanningRun.run_id)
+                .filter(models.PlanningRun.status == "FIXED_SNAPSHOT")
+                .order_by(models.PlanningRun.run_id.asc())
+                .all()
+            )
+            return PhysicalRefreshOrchestrationResult(
+                parent_generation_id=int(parent.id),
+                physical_generation_id=int(physical_generation.id),
+                published_generation_id=int(parent.id),
+                cutoff=cutoff,
+                physical_import=physical_import,
+                recorder_audit=recorder_audit,
+                balance_convergence=convergence,
+                candidate_run_ids=fixed_run_ids,
+                published=False,
+                opening_reconcile=opening_reconcile,
+                input_delta_rows=0,
+                replayed_rows=0,
+                affected_scopes=(),
+                duration_ms=int((time.monotonic() - started_monotonic) * 1000),
+                database_ledger_rows=database_ledger_rows,
+            )
+        delta = _physical_refresh_delta_rows(
+            db,
+            parent=parent,
+            target=physical_generation,
+            physical_import=physical_import,
+            recorder_audit=recorder_audit,
+        )
+        delta_rows = tuple(delta["rows"])
+        affected_scopes = tuple(delta["affected_scopes"])
+        if (
+            len(delta_rows) != input_delta_rows
+            or delta["supersessions"]
+            or delta["backdated"]
+        ):
+            reason = (
+                "bounded physical delta manifest is incomplete; "
+                "correction/backdate requires explicit maintenance"
+            )
+            physical_generation.source_watermarks = {
+                **dict(physical_generation.source_watermarks or {}),
+                "physical_refresh_delta": {
+                    "input_delta_rows": input_delta_rows,
+                    "replayed_rows": 0,
+                    "affected_scopes": list(affected_scopes),
+                    "backdated": bool(delta["backdated"]),
+                    "database_ledger_rows": database_ledger_rows,
+                    "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+                },
+            }
+            discard_physical_refresh_candidate(
+                db,
+                ledger_generation_id=int(physical_generation.id),
+                reason=reason,
+            )
+            db.commit()
+            raise PhysicalRefreshOrchestratorError(reason)
+
+        try:
+            current_publish = publish_forward_physical_refresh_current(
+                db,
+                target_generation_id=int(physical_generation.id),
+                parent_generation_id=int(parent.id),
+                delta_manifest={
+                    "rows": delta_rows,
+                    "new_rows": tuple(delta["new_rows"]),
+                    "supersessions": tuple(delta["supersessions"]),
+                    "custody_source_sle_ids": custody_source_sle_ids,
+                },
+                odata_client=client,
+                source_revision=int(physical_generation.physical_import_batch_id),
+                planning_pool_by_warehouse=pool_mapping,
+                custody_source_sle_ids=custody_source_sle_ids,
+            )
+        except Exception as exc:
+            # The import/convergence checkpoint is already durable, but current
+            # publication is still caller-owned.  Roll it back first, then use
+            # the checked discard boundary in a separate recovery transaction.
+            db.rollback()
+            reason = str(exc)
+            try:
+                candidate = db.get(
+                    models.LedgerGeneration, int(fork.ledger_generation_id)
+                )
+                if candidate is not None and str(candidate.status or "") == "building":
+                    discard_physical_refresh_candidate(
+                        db,
+                        ledger_generation_id=int(candidate.id),
+                        reason=reason,
+                    )
+                    db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            if isinstance(exc, ForwardPhysicalRefreshUnavailable):
+                wrapped = PhysicalRefreshOrchestratorError(reason)
+                phase_failure = getattr(exc, "physical_refresh_phase_status", None)
+                if isinstance(phase_failure, dict):
+                    setattr(wrapped, "physical_refresh_phase_status", phase_failure)
+                raise wrapped from exc
+            raise
+
+        publish_duration_ms = int((time.monotonic() - started_monotonic) * 1000)
+        physical_generation.source_watermarks = {
+            **dict(physical_generation.source_watermarks or {}),
+            "physical_refresh_delta": {
+                "input_delta_rows": input_delta_rows,
+                "replayed_rows": int(current_publish.replayed_rows),
+                "affected_scopes": list(current_publish.affected_scopes),
+                "backdated": False,
+                "database_ledger_rows": database_ledger_rows,
+                "duration_ms": publish_duration_ms,
+                "phase_timings": dict(getattr(current_publish, "phase_timings", ()) or ()),
+            },
+        }
+        db.commit()
         fixed_run_ids = tuple(
             int(run_id)
             for (run_id,) in db.query(models.PlanningRun.run_id)
@@ -705,7 +1208,6 @@ def run_physical_refresh(
             .order_by(models.PlanningRun.run_id.asc())
             .all()
         )
-        db.commit()
         return PhysicalRefreshOrchestrationResult(
             parent_generation_id=int(parent.id),
             physical_generation_id=int(physical_generation.id),
@@ -717,6 +1219,12 @@ def run_physical_refresh(
             candidate_run_ids=fixed_run_ids,
             published=True,
             opening_reconcile=opening_reconcile,
+            input_delta_rows=int(current_publish.input_delta_rows),
+            replayed_rows=int(current_publish.replayed_rows),
+            affected_scopes=tuple(current_publish.affected_scopes),
+            duration_ms=publish_duration_ms,
+            database_ledger_rows=database_ledger_rows,
+            phase_timings=tuple(getattr(current_publish, "phase_timings", ()) or ()),
         )
     except Exception:
         db.rollback()

@@ -1517,40 +1517,28 @@ def _active_open_qty_by_requirement(
     return active_open
 
 
-def list_make_proposals(
+def _build_make_proposals_from_work_like(
     db: Session,
     *,
     ledger_generation_id: int,
-    accepted_run_ids: Sequence[int],
+    run_ids: Sequence[int],
+    work_items: Sequence[Any],
     readiness_pull_by_run_item: Mapping[Tuple[int, int], Mapping[str, Any]] | None = None,
+    shelf_by_item: Mapping[int, _ShelfPull] | None = None,
 ) -> List[Dict[str, Any]]:
-    """Project unmaterialized MAKE work items into the unified journal.
+    """Build canonical MAKE journal rows from work-shaped source DTOs.
 
-    These are saved MRP calculations, not executable ``ProductionOrder``
-    documents.  They stay read-only until the operator explicitly materializes
-    them; consequently product/order identifiers are absent and no 1C action is
-    performed while the Ledger candidate is built.
+    ``ReplenishmentWorkItem`` is only one source shape.  Physical refresh uses
+    the same builder with stable current reservation DTOs.  Keeping the
+    complete row construction here is important: units, dates, forecasts,
+    specs, workshop metadata, paint/weld rules and shelf netting must not drift
+    between the staged and compact paths.
     """
     generation_id = int(ledger_generation_id)
-    run_ids = sorted({int(value) for value in accepted_run_ids})
+    run_ids = sorted({int(value) for value in run_ids})
     if not run_ids:
         return []
     readiness_pull = readiness_pull_by_run_item or {}
-
-    query = (
-        db.query(ReplenishmentWorkItem)
-        .filter(
-            ReplenishmentWorkItem.ledger_generation_id == generation_id,
-            ReplenishmentWorkItem.run_id.in_(run_ids),
-            ReplenishmentWorkItem.replenishment_method == "make",
-            or_(
-                ReplenishmentWorkItem.replenishment_remaining_qty > 0,
-                tuple_(ReplenishmentWorkItem.run_id, ReplenishmentWorkItem.item_id).in_(list(readiness_pull)),
-            ),
-        )
-        .order_by(ReplenishmentWorkItem.run_id.asc(), ReplenishmentWorkItem.id.asc())
-    )
-    work_items = query.all()
     if not work_items:
         return []
 
@@ -1632,11 +1620,18 @@ def list_make_proposals(
         db,
         [items[item_id].unit for item_id in item_ids if item_id in items],
     )
-    shelf_by_item = _shelf_pull_by_item(
-        db,
-        ledger_generation_id=generation_id,
-        item_ids=item_ids,
-    )
+    if shelf_by_item is None:
+        shelf_by_item = _shelf_pull_by_item(
+            db,
+            ledger_generation_id=generation_id,
+            item_ids=item_ids,
+        )
+    else:
+        shelf_by_item = {
+            int(item_id): shelf
+            for item_id, shelf in shelf_by_item.items()
+            if int(item_id) in item_ids
+        }
     shelf_allowance = {
         item_id: float(pull.materialized_qty) for item_id, pull in shelf_by_item.items()
     }
@@ -1693,6 +1688,10 @@ def list_make_proposals(
             {
                 "journal_row_key": f"work-item:{int(work.id)}",
                 "work_item_id": int(work.id),
+                "reservation_id": (
+                    int(work.reservation_id)
+                    if getattr(work, "reservation_id", None) is not None else None
+                ),
                 "product_id": None,
                 "order_id": None,
                 "order_number": f"MRP-R-{int(requirement.id)}",
@@ -1754,6 +1753,41 @@ def list_make_proposals(
             }
         )
     return result
+
+
+def list_make_proposals(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    accepted_run_ids: Sequence[int],
+    readiness_pull_by_run_item: Mapping[Tuple[int, int], Mapping[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
+    """Project staged MAKE work items through the canonical row builder."""
+    generation_id = int(ledger_generation_id)
+    run_ids = sorted({int(value) for value in accepted_run_ids})
+    if not run_ids:
+        return []
+    readiness_pull = readiness_pull_by_run_item or {}
+    query = (
+        db.query(ReplenishmentWorkItem)
+        .filter(
+            ReplenishmentWorkItem.ledger_generation_id == generation_id,
+            ReplenishmentWorkItem.run_id.in_(run_ids),
+            ReplenishmentWorkItem.replenishment_method == "make",
+            or_(
+                ReplenishmentWorkItem.replenishment_remaining_qty > 0,
+                tuple_(ReplenishmentWorkItem.run_id, ReplenishmentWorkItem.item_id).in_(list(readiness_pull)),
+            ),
+        )
+        .order_by(ReplenishmentWorkItem.run_id.asc(), ReplenishmentWorkItem.id.asc())
+    )
+    return _build_make_proposals_from_work_like(
+        db,
+        ledger_generation_id=generation_id,
+        run_ids=run_ids,
+        work_items=query.all(),
+        readiness_pull_by_run_item=readiness_pull,
+    )
 
 
 # Terminal states that close a line: a remainder left un-produced here is never

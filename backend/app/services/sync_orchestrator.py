@@ -68,6 +68,8 @@ from .item_ledger.physical_refresh_discard import (
 )
 from .item_ledger.physical_refresh_orchestrator import (
     PhysicalRefreshBalanceConvergenceError,
+    physical_refresh_last_failure_status,
+    physical_refresh_phase_status,
     run_physical_refresh,
 )
 from .odata_client import get_stock_from_1c_odata
@@ -213,7 +215,7 @@ _PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
 #: дословно только когда повторяется одна и та же замороженная попытка.
 _STUCK_REFRESH_ATTEMPTS = 3
 _PHYSICAL_REFRESH_ENTITY = "AccumulationRegister_ЗапасыНаСкладах/Balance"
-_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK = timedelta(days=7)
+_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK = timedelta(0)
 _PHYSICAL_REFRESH_SETTLE_LAG = timedelta(minutes=5)
 # Signed bigint, stable across processes and deployments.
 _SYNC_ORCHESTRATOR_LOCK_KEY = 0x73796E632D6F7263  # 'sync-orc'
@@ -743,11 +745,9 @@ def _run_physical_refresh_job(
         # every historical recorder turned each hourly refresh into a
         # multi-hour historical replay. Full audit remains available only to
         # the explicit maintenance workflow.
-        # Keep automatic discovery bounded.  A full retained-history scan can
-        # classify thousands of old recorders as revised and turn this hourly
-        # maintenance path into the multi-hour historical replay it replaced.
-        # Explicitly queued recorders are still processed regardless of age;
-        # the bounded scan catches ordinary late/backdated operational changes.
+        # Routine sync has no retained-horizon discovery. Explicitly queued
+        # recorder identities are still processed regardless of age; historical
+        # discovery is an explicit maintenance operation.
         discovery_lookback=_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK,
         audit_all_known_recorders=False,
     )
@@ -765,6 +765,12 @@ def _run_physical_refresh_job(
                 if result.opening_reconcile is not None
                 else 0
             ),
+            "input_delta_rows": int(getattr(result, "input_delta_rows", 0) or 0),
+            "replayed_rows": int(getattr(result, "replayed_rows", 0) or 0),
+            "affected_scopes": list(getattr(result, "affected_scopes", ()) or ()),
+            "duration_ms": int(getattr(result, "duration_ms", 0) or 0),
+            "database_ledger_rows": int(getattr(result, "database_ledger_rows", 0) or 0),
+            "phase_timings": dict(getattr(result, "phase_timings", ()) or ()),
         },
     }
 
@@ -996,6 +1002,7 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 )
                 physical_state["last_status"] = "ok"
                 physical_state["last_error"] = None
+                physical_state["last_phase_failure"] = None
                 physical_state["failure_count"] = 0
                 physical_state["repeat_count"] = 0
                 physical_state["stuck_candidate_id"] = None
@@ -1065,12 +1072,20 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                     physical_state["stuck_candidate_id"] = None
                 physical_state["last_status"] = "error"
                 physical_state["last_error"] = signature
+                phase_failure = getattr(exc, "physical_refresh_phase_status", None)
+                if isinstance(phase_failure, dict):
+                    # Persist diagnostics in the scheduler state after the
+                    # candidate recovery transaction.  The publisher's live
+                    # registry is intentionally cleared on exit.
+                    physical_state["last_phase_failure"] = dict(phase_failure)
                 physical_state["failure_count"] = failures
                 physical_state["next_retry_at"] = (now + timedelta(seconds=backoff)).isoformat()
                 physical_state["last_attempt_at"] = now.isoformat()
                 physical_state["last_duration_ms"] = int((time.time() - started) * 1000)
                 physical_state["last_cutoff"] = _to_utc(now).isoformat()
                 result = {"status": "error", "job": "physicalRefresh", "error": str(exc)}
+                if isinstance(phase_failure, dict):
+                    result["phase_failure"] = dict(phase_failure)
                 if repeats >= _STUCK_REFRESH_ATTEMPTS:
                     released = _release_stuck_refresh_identity(
                         db, physical_state, now, repeats
@@ -1172,6 +1187,24 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
     if db is not None:
         physical_inventory = _physical_refresh_inventory(db, current_parent)
     physical_state = _physical_refresh_state(state)
+    # The publisher keeps progress in an in-memory registry so phase updates do
+    # not add writes to the caller-owned refresh transaction.  On the local
+    # one-worker path there must be exactly one recoverable BUILDING candidate;
+    # do not guess which phase belongs to a candidate when that invariant is
+    # not true (multi-worker/foreign candidates remain operator diagnostics).
+    live_phase = {}
+    if len(physical_inventory.get("recoverable", ())) == 1:
+        live_phase = physical_refresh_phase_status(
+            int(physical_inventory["recoverable"][0].id)
+        )
+    if not live_phase:
+        # A failed publication is recovered/discarded before status() runs, so
+        # there is no BUILDING candidate to key the live registry.  Surface the
+        # retained process-local failure snapshot until the next attempt, while
+        # the scheduler state below remains the durable copy.
+        live_phase = dict(physical_state.get("last_phase_failure") or {})
+    if not live_phase:
+        live_phase = physical_refresh_last_failure_status()
     if db is not None:
         block = _physical_refresh_block(
             terminal_preflight, physical_inventory, physical_state
@@ -1207,10 +1240,16 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "active_generation_key": _physical_refresh_state(state).get("active_generation_key"),
             "last_duration_ms": _physical_refresh_state(state).get("last_duration_ms"),
             "last_result": _physical_refresh_state(state).get("last_result"),
+            "last_phase_failure": physical_state.get("last_phase_failure"),
             "repeat_count": int(physical_state.get("repeat_count") or 0),
             "stuck_candidate_id": physical_state.get("stuck_candidate_id"),
             "last_release_at": physical_state.get("last_release_at"),
             "last_release_reason": physical_state.get("last_release_reason"),
+            "current_phase": live_phase.get("current_phase"),
+            "phase_elapsed_ms": live_phase.get("phase_elapsed_ms"),
+            "elapsed_ms": live_phase.get("elapsed_ms"),
+            "phase_timings": live_phase.get("phase_timings", {}),
+            "live_phase": live_phase or None,
             "building_inventory_total": int(physical_inventory["total"]),
             "recoverable_building_count": len(physical_inventory["recoverable"]),
             # Unpublishable by construction; an operator rolls them back.

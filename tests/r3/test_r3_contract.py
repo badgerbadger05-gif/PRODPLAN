@@ -5,6 +5,7 @@ import pytest
 from app import models
 from app.services.item_ledger.r3_contract import (
     ImportCompletenessError,
+    business_identity_for_cutoff_balance_adjustment,
     business_identity_for_movement,
     current_live_run,
     finalize_import,
@@ -16,6 +17,47 @@ def test_business_identity_is_stable_across_repeated_generation_rows():
     key = business_identity_for_movement("Документ", "ref-1", "7")
     assert key == business_identity_for_movement("Документ", "ref-1", "7")
     assert key != business_identity_for_movement("Документ", "ref-1", "8")
+
+
+def test_cutoff_adjustment_identity_includes_the_physical_cell():
+    first = business_identity_for_cutoff_balance_adjustment(
+        "snap-ref", "0", item_id=10, characteristic_ref="",
+        organization_ref="org-a", warehouse_ref1c="wh-a",
+        snap_content_hash="a" * 64,
+    )
+    second = business_identity_for_cutoff_balance_adjustment(
+        "snap-ref", "0", item_id=11, characteristic_ref="",
+        organization_ref="org-a", warehouse_ref1c="wh-a",
+        snap_content_hash="a" * 64,
+    )
+    assert first == business_identity_for_cutoff_balance_adjustment(
+        "snap-ref", "0", item_id=10, characteristic_ref="",
+        organization_ref="org-a", warehouse_ref1c="wh-a",
+        snap_content_hash="a" * 64,
+    )
+    assert first != second
+    later_snap = business_identity_for_cutoff_balance_adjustment(
+        "snap-ref", "0", item_id=10, characteristic_ref="",
+        organization_ref="org-a", warehouse_ref1c="wh-a",
+        snap_content_hash="b" * 64,
+    )
+    assert first != later_snap
+    assert first == business_identity_for_cutoff_balance_adjustment(
+        "snap-ref", "0", item_id=10, characteristic_ref="",
+        organization_ref="org-a", warehouse_ref1c="wh-a",
+        snap_content_hash="a" * 64,
+    )
+    assert len(first) <= 256
+    maximal = business_identity_for_cutoff_balance_adjustment(
+        "r" * 64,
+        "l" * 32,
+        item_id=10,
+        characteristic_ref="c" * 36,
+        organization_ref="o" * 36,
+        warehouse_ref1c="w" * 36,
+        snap_content_hash="h" * 64,
+    )
+    assert len(maximal) <= 256
 
 
 def test_partial_reordered_or_missing_pages_never_complete_import(db_session):

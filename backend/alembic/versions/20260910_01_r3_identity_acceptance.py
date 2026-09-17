@@ -58,14 +58,66 @@ def upgrade() -> None:
     op.create_index("ix_physical_import_page_batch", "physical_import_page", ["import_batch_id"])
 
     op.add_column("stock_ledger_entry", sa.Column("business_identity", sa.String(length=256), nullable=True))
-    op.execute(
-        sa.text(
-            "UPDATE stock_ledger_entry SET business_identity = "
-            "'movement:' || coalesce(recorder_type, '') || ':' || "
-            "coalesce(recorder_ref, '') || ':' || coalesce(line_no, '') "
-            "WHERE business_identity IS NULL"
+    bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        # The disposable schema-reproducibility database exercises this chain
+        # with SQLite. Keep the production PostgreSQL identity expression
+        # below unchanged, but use SQLite JSON1 and correlated UPDATE syntax
+        # here instead of PostgreSQL JSON operators/casts/functions.
+        missing_cutoff_hashes = bind.execute(sa.text(
+            "SELECT count(*) FROM stock_ledger_entry e "
+            "LEFT JOIN physical_import_batch b ON b.id = e.ingest_batch_id "
+            "WHERE e.recorder_type = 'cutoff_balance_adjustment' "
+            "AND nullif(json_extract(b.source_watermarks, '$.content_hash'), '') IS NULL"
+        )).scalar()
+    else:
+        missing_cutoff_hashes = bind.execute(
+            sa.text(
+                "SELECT count(*) FROM stock_ledger_entry e "
+                "LEFT JOIN physical_import_batch b ON b.id = e.ingest_batch_id "
+                "WHERE e.recorder_type = 'cutoff_balance_adjustment' "
+                "AND nullif(b.source_watermarks ->> 'content_hash', '') IS NULL"
+            )
+        ).scalar()
+    if int(missing_cutoff_hashes or 0):
+        raise RuntimeError(
+            "R3 migration refuses cutoff adjustments without physical snap "
+            f"content hash ({int(missing_cutoff_hashes)} rows)"
         )
-    )
+    if bind.dialect.name == "sqlite":
+        bind.execute(sa.text(
+            "UPDATE stock_ledger_entry "
+            "SET business_identity = CASE "
+            "WHEN recorder_type = 'cutoff_balance_adjustment' THEN "
+            "'movement:cutoff_balance_adjustment:snap:' || "
+            "coalesce((SELECT json_extract(b.source_watermarks, '$.content_hash') "
+            "FROM physical_import_batch b WHERE b.id = stock_ledger_entry.ingest_batch_id), '') || "
+            "':ref:' || coalesce(recorder_ref, '') || ':line:' || "
+            "coalesce(line_no, '') || ':cell:' || coalesce(item_id, '') || ':' || "
+            "coalesce(characteristic_ref, '') || ':' || coalesce(organization_ref, '') || ':' || "
+            "coalesce(warehouse_ref1c, '') "
+            "ELSE 'movement:' || coalesce(recorder_type, '') || ':' || "
+            "coalesce(recorder_ref, '') || ':' || coalesce(line_no, '') END "
+            "WHERE business_identity IS NULL"
+        ))
+    else:
+        op.execute(
+            sa.text(
+                "UPDATE stock_ledger_entry SET business_identity = CASE "
+                "WHEN recorder_type = 'cutoff_balance_adjustment' THEN "
+                "'movement:cutoff_balance_adjustment:snap:' || "
+                "coalesce(batch.source_watermarks ->> 'content_hash', '') || "
+                "':ref:' || coalesce(recorder_ref, '') || ':line:' || "
+                "coalesce(line_no, '') || ':cell:' || md5(concat_ws(chr(31), "
+                "coalesce(item_id::text, ''), coalesce(characteristic_ref, ''), "
+                "coalesce(organization_ref, ''), coalesce(warehouse_ref1c, ''))) "
+                "ELSE 'movement:' || coalesce(recorder_type, '') || ':' || "
+                "coalesce(recorder_ref, '') || ':' || coalesce(line_no, '') END "
+                "FROM physical_import_batch batch "
+                "WHERE stock_ledger_entry.ingest_batch_id = batch.id "
+                "AND stock_ledger_entry.business_identity IS NULL"
+            )
+        )
     duplicate = op.get_bind().execute(
         sa.text(
             "SELECT business_identity FROM stock_ledger_entry "

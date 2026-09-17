@@ -29,6 +29,7 @@ from .assembly_readiness_core import (
     ReplenishmentPolicy,
     allocate_readiness_curves,
 )
+from .future_supply_read import future_supply_model
 
 
 STAGE = "assembly_readiness"
@@ -48,10 +49,26 @@ def _physical_supplies(
     db: Session,
     generation_id: int,
     queue_rows: list[models.AssemblyQueueLine],
+    *,
+    current_owner: bool = False,
 ) -> tuple[ReadinessSupply, ...] | None:
-    if db.get(models.ProductionMaterialCustodyProjectionManifest, int(generation_id)) is None:
-        return None
-    custody = load_material_custody_projection(db, ledger_generation_id=int(generation_id))
+    if current_owner:
+        from app.services.production_material_custody_projection import (
+            load_compact_current_material_custody,
+        )
+
+        current_generation_id, custody = load_compact_current_material_custody(
+            db,
+            consumer="assembly_readiness.current_payload",
+        )
+        if int(current_generation_id) != int(generation_id):
+            raise ValueError(
+                "compact current custody does not match the accepted parent generation"
+            )
+    else:
+        if db.get(models.ProductionMaterialCustodyProjectionManifest, int(generation_id)) is None:
+            return None
+        custody = load_material_custody_projection(db, ledger_generation_id=int(generation_id))
     scope = planning_warehouse_scope(db)
     query = db.query(
         models.StockBin.item_id,
@@ -156,7 +173,7 @@ def _physical_supplies(
         nodes_by_run_item.setdefault(
             (int(node.run_id), int(node.item_id)), []
         ).append(node)
-    custody_rows = (
+    custody_query = (
         db.query(
             models.ProductionMaterialCustodyProjection,
             models.ProductionProduct.item_id.label("product_item_id"),
@@ -178,16 +195,24 @@ def _physical_supplies(
             models.ProductionProduct.order_id == models.ProductionOrder.order_id,
         )
         .filter(
-            models.ProductionMaterialCustodyProjection.ledger_generation_id
-            == int(generation_id),
             models.ProductionMaterialCustodyProjection.location_kind.in_(
                 ("workshop", "transit")
             ),
             models.ProductionMaterialCustodyProjection.reserved_qty > 0,
         )
-        .order_by(models.ProductionMaterialCustodyProjection.id)
-        .all()
     )
+    if current_owner:
+        custody_query = custody_query.filter(
+            models.ProductionMaterialCustodyProjection.is_current.is_(True)
+        )
+    else:
+        custody_query = custody_query.filter(
+            models.ProductionMaterialCustodyProjection.ledger_generation_id
+            == int(generation_id)
+        )
+    custody_rows = custody_query.order_by(
+        models.ProductionMaterialCustodyProjection.id
+    ).all()
     for custody_row, product_item_id, run_id, source_number in custody_rows:
         if run_id is None:
             continue
@@ -252,15 +277,16 @@ def _future_supplies(db: Session, generation_id: int) -> tuple[ReadinessSupply, 
             models.MrpRequirement.id, models.MrpRequirement.run_id
         ).all()
     }
+    future_supply = future_supply_model(db, int(generation_id))
     rows = (
-        db.query(models.LedgerFutureSupply)
+        db.query(future_supply)
         .filter(
-            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
-            models.LedgerFutureSupply.evidence_status == "exact",
-            models.LedgerFutureSupply.open_qty_at_cutoff > 0,
-            models.LedgerFutureSupply.eta_date.is_not(None),
+            future_supply.ledger_generation_id == int(generation_id),
+            future_supply.evidence_status == "exact",
+            future_supply.open_qty_at_cutoff > 0,
+            future_supply.eta_date.is_not(None),
         )
-        .order_by(models.LedgerFutureSupply.eta_date, models.LedgerFutureSupply.id)
+        .order_by(future_supply.eta_date, future_supply.id)
         .all()
     )
     return tuple(
@@ -419,6 +445,231 @@ def _curve_inputs(
         )
 
     return tuple(lines_list), tuple(edges_list), policies
+
+
+def build_assembly_readiness_payload_rows(
+    db: Session,
+    *,
+    generation_id: int,
+    queue_rows: list[models.AssemblyQueueLine],
+    current_owner: bool = False,
+    as_of: Any | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Compute readiness payloads without persisting staging rows.
+
+    ``queue_rows`` is deliberately duck-typed: the maintenance materializer
+    passes ORM ``AssemblyQueueLine`` rows while compact current publication
+    passes stable in-memory plan-line DTOs.  Both paths use the same frozen
+    BOM/readiness allocator and the same payload serialization.
+    """
+
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or generation.cutoff is None:
+        raise ValueError("assembly readiness payload requires a generation cutoff")
+    queue_rows = [
+        row for row in queue_rows if _d(row.assembly_remaining_qty) > 0
+    ]
+    lines, edges, policies = _curve_inputs(db, queue_rows)
+    physical = _physical_supplies(
+        db,
+        int(generation_id),
+        queue_rows,
+        current_owner=current_owner,
+    )
+    calculation_date = as_of or generation.cutoff.date()
+    results = allocate_readiness_curves(
+        lines,
+        edges,
+        tuple(physical or ()),
+        policies,
+        as_of=calculation_date,
+        global_unavailable_reasons=(
+            ("CUSTODY_SNAPSHOT_MISSING",) if physical is None else ()
+        ),
+        physical_material_gate=True,
+    )
+    item_ids = {
+        int(action.item_id)
+        for result in results
+        for point in result.points
+        for action in (*point.actions, *point.required_actions)
+    } | {
+        int(blocker.item_id)
+        for result in results
+        for point in result.points
+        for blocker in point.blockers
+    }
+    labels = {
+        int(row.item_id): row
+        for row in db.query(models.Item).filter(models.Item.item_id.in_(item_ids or {0})).all()
+    }
+    warehouse_refs = {
+        str(value).strip()
+        for result in results
+        for point in result.points
+        for action in (*point.actions, *point.required_actions)
+        for value in (action.source_warehouse_ref1c, action.destination_warehouse_ref1c)
+        if str(value or "").strip()
+    } | {
+        str(value).strip()
+        for result in results
+        for point in result.points
+        for blocker in point.blockers
+        for value in (
+            blocker.destination_warehouse_ref1c,
+            *(
+                ref
+                for source in blocker.coverage_sources
+                for ref in (source.warehouse_ref1c, source.destination_warehouse_ref1c)
+            ),
+        )
+        if str(value or "").strip()
+    }
+    warehouse_names = {
+        str(row.warehouse_ref1c): str(row.warehouse_name or "")
+        for row in db.query(models.StockWarehouse)
+        .filter(models.StockWarehouse.warehouse_ref1c.in_(warehouse_refs or {""}))
+        .all()
+    }
+    resource_ids = {
+        int(action.resource_id)
+        for result in results
+        for point in result.points
+        for action in (*point.actions, *point.required_actions)
+        if action.resource_id is not None
+    }
+    resource_names = {
+        int(row.resource_id): str(row.resource_name or "")
+        for row in db.query(models.ProductionResource)
+        .filter(models.ProductionResource.resource_id.in_(resource_ids or {0}))
+        .all()
+    }
+    queue_by_id = {int(row.id): row for row in queue_rows}
+
+    def action_payload(action: Any) -> dict[str, Any]:
+        item = labels.get(int(action.item_id))
+        return {
+            "action_kind": action.action_kind,
+            "item_id": int(action.item_id),
+            "item_code": str(item.item_code or "") if item is not None else "",
+            "item_article": str(item.item_article or "") if item is not None else "",
+            "item_name": str(item.item_name or "") if item is not None else "",
+            "qty": str(action.qty),
+            "available_date": action.available_date.isoformat() if action.available_date else None,
+            "confidence": action.confidence,
+            "source_key": action.source_key,
+            "source_warehouse_ref1c": action.source_warehouse_ref1c,
+            "source_warehouse_name": warehouse_names.get(str(action.source_warehouse_ref1c or ""), ""),
+            "destination_warehouse_ref1c": action.destination_warehouse_ref1c,
+            "destination_warehouse_name": warehouse_names.get(str(action.destination_warehouse_ref1c or ""), ""),
+            "resource_id": action.resource_id,
+            "resource_name": resource_names.get(int(action.resource_id), "") if action.resource_id is not None else "",
+            "path": list(action.path),
+        }
+
+    def blocker_payload(blocker: Any) -> dict[str, Any]:
+        item = labels.get(int(blocker.item_id))
+        return {
+            "item_id": int(blocker.item_id),
+            "item_code": str(item.item_code or "") if item is not None else "",
+            "item_article": str(item.item_article or "") if item is not None else "",
+            "item_name": str(item.item_name or "") if item is not None else "",
+            "required_qty": str(blocker.required_qty),
+            "available_qty": str(blocker.available_qty),
+            "shortage_qty": str(blocker.shortage_qty),
+            "reason": blocker.reason,
+            "destination_warehouse_ref1c": blocker.destination_warehouse_ref1c,
+            "destination_warehouse_name": warehouse_names.get(str(blocker.destination_warehouse_ref1c or ""), ""),
+            "path": list(blocker.path),
+            "point_of_use_qty": str(blocker.point_of_use_qty),
+            "custody_qty": str(blocker.custody_qty),
+            "transit_qty": str(blocker.transit_qty),
+            "wip_qty": str(blocker.wip_qty),
+            "supplier_qty": str(blocker.supplier_qty),
+            "other_stock_qty": str(blocker.other_stock_qty),
+            "coverage_sources": [
+                {
+                    "coverage_kind": source.coverage_kind,
+                    "qty": str(source.qty),
+                    "source_key": source.source_key,
+                    "warehouse_ref1c": source.warehouse_ref1c,
+                    "warehouse_name": warehouse_names.get(str(source.warehouse_ref1c or ""), ""),
+                    "destination_warehouse_ref1c": source.destination_warehouse_ref1c,
+                    "destination_warehouse_name": warehouse_names.get(str(source.destination_warehouse_ref1c or ""), ""),
+                    "available_date": source.available_date.isoformat() if source.available_date else None,
+                    "confidence": source.confidence,
+                    "source_kind": source.source_kind,
+                    "source_ref": source.source_ref,
+                }
+                for source in blocker.coverage_sources
+            ],
+        }
+
+    payload_rows: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    for result in results:
+        queue = queue_by_id.get(int(result.queue_line_id))
+        if queue is None:
+            raise ValueError(
+                f"readiness result has no queue owner {int(result.queue_line_id)}"
+            )
+        curve = [
+            {
+                "horizon": point.horizon,
+                "cumulative_qty": str(point.cumulative_qty),
+                "available_date": point.available_date.isoformat() if point.available_date else None,
+                "actions": [action_payload(action) for action in point.actions],
+                "required_actions": [action_payload(action) for action in point.required_actions],
+                "blockers": [blocker_payload(blocker) for blocker in point.blockers],
+            }
+            for point in result.points
+        ]
+        launch_point = result.points[-1]
+        manifest = [
+            action_payload(action)
+            for action in (*launch_point.actions, *launch_point.required_actions)
+        ]
+        blocker_manifest = [blocker_payload(blocker) for blocker in launch_point.blockers]
+        blocker_manifest.extend({"reason": reason} for reason in result.unavailable_reasons)
+        by_horizon = {point.horizon: point for point in result.points}
+        payload_rows.append({
+            "entity_kind": "assembly_readiness",
+            "business_identity": f"plan-line:{int(queue.plan_line_id)}",
+            "scope_key": "assembly:all-live-plans",
+            "payload": {
+                "queue_line_id": int(queue.id),
+                "plan_id": int(queue.plan_id),
+                "plan_line_id": int(queue.plan_line_id),
+                "run_id": int(queue.planning_run_id),
+                "item_id": int(queue.item_id),
+                "status": str(result.status),
+                "open_qty": str(result.open_qty),
+                "ready_qty": str(by_horizon["now"].cumulative_qty),
+                "transferable_qty": str(by_horizon["transfer"].cumulative_qty),
+                "kitting_qty": str(by_horizon["kitting"].cumulative_qty),
+                "committed_qty": str(by_horizon["committed"].cumulative_qty),
+                "launchable_qty": str(by_horizon["launch"].cumulative_qty),
+                "readiness_date": launch_point.available_date.isoformat() if launch_point.available_date else None,
+                "readiness_curve": curve,
+                "action_manifest": manifest,
+                "unavailable_reasons": list(result.unavailable_reasons),
+                "blocker_count": len(blocker_manifest),
+                "blocking_manifest": blocker_manifest,
+                "original_priority": list(queue.original_priority or []),
+            },
+        })
+        status_counts[str(result.status)] = status_counts.get(str(result.status), 0) + 1
+    metrics = {
+        "rows": len(results),
+        "ready_rows": status_counts.get("ready", 0),
+        "recoverable_rows": status_counts.get("recoverable", 0),
+        "partial_rows": status_counts.get("partial", 0),
+        "blocked_rows": status_counts.get("blocked", 0),
+        "unavailable_rows": status_counts.get("unavailable", 0),
+        "ready_qty": str(sum((row.points[0].cumulative_qty for row in results), Decimal("0"))),
+        "launchable_qty": str(sum((row.points[-1].cumulative_qty for row in results), Decimal("0"))),
+    }
+    return payload_rows, metrics
 
 
 def materialize_assembly_readiness(

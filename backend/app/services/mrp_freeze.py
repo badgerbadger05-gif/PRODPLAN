@@ -71,6 +71,7 @@ from .mrp_stock_helpers import (
     planning_stock_by_item,
     planning_warehouse_scope,
 )
+from .item_ledger.future_supply_read import future_supply_model
 from .planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -309,15 +310,16 @@ def build_shared_pools(
         else _ledger_stock_by_item_all(db, int(ledger_generation_id))
     )
     stock_initial = dict(stock)
+    future_supply = future_supply_model(db, int(ledger_generation_id))
     future_rows = (
-        db.query(LedgerFutureSupply)
-        .filter(LedgerFutureSupply.ledger_generation_id == int(ledger_generation_id))
-        .filter(LedgerFutureSupply.evidence_status == "exact")
-        .filter(LedgerFutureSupply.open_qty_at_cutoff > EPS)
+        db.query(future_supply)
+        .filter(future_supply.ledger_generation_id == int(ledger_generation_id))
+        .filter(future_supply.evidence_status == "exact")
+        .filter(future_supply.open_qty_at_cutoff > EPS)
         .order_by(
-            LedgerFutureSupply.item_id.asc(),
-            LedgerFutureSupply.eta_date.asc(),
-            LedgerFutureSupply.id.asc(),
+            future_supply.item_id.asc(),
+            future_supply.eta_date.asc(),
+            future_supply.id.asc(),
         )
         .all()
     )

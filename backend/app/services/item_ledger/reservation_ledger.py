@@ -38,8 +38,10 @@ from .reservation import (
     fold_reservation_entry,
     fold_reservation_events,
     freeze_reservation_amounts,
+    reservation_business_identity,
     replenishment_remaining,
 )
+from .future_supply_read import future_supply_model
 
 EPS = Decimal("1e-9")
 
@@ -234,6 +236,9 @@ def _get_or_create_entry(
         realized_qty=Decimal("0"),
         lifecycle_status="active",
         opened_at=_now(),
+        current_identity=reservation_business_identity(int(req.id), mode),
+        owner_kind="building",
+        is_current=False,
     )
     db.add(entry)
     db.flush()
@@ -407,24 +412,25 @@ def _ledger_incoming_by_generation(
     """
     if item_ids is not None and not item_ids:
         return {}
+    future_supply = future_supply_model(db, int(generation_id))
     query = (
         db.query(
-            models.LedgerFutureSupply.item_id,
-            models.LedgerFutureSupply.supply_kind,
-            func.sum(models.LedgerFutureSupply.open_qty_at_cutoff),
+            future_supply.item_id,
+            future_supply.supply_kind,
+            func.sum(future_supply.open_qty_at_cutoff),
         )
         .filter(
-            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
-            models.LedgerFutureSupply.evidence_status == "exact",
+            future_supply.ledger_generation_id == int(generation_id),
+            future_supply.evidence_status == "exact",
         )
     )
     if item_ids is not None:
         query = query.filter(
-            models.LedgerFutureSupply.item_id.in_(sorted(item_ids))
+            future_supply.item_id.in_(sorted(item_ids))
         )
     rows = query.group_by(
-        models.LedgerFutureSupply.item_id,
-        models.LedgerFutureSupply.supply_kind,
+        future_supply.item_id,
+        future_supply.supply_kind,
     ).all()
     incoming: Dict[int, Dict[str, float]] = {}
     for item_id, supply_kind, open_qty in rows:

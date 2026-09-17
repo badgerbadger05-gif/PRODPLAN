@@ -944,6 +944,63 @@ def get_shelf_projections(
     if current_scope is not None:
         if not bool(current_scope.result_ready):
             raise HTTPException(status_code=503, detail={"code": "shelf_projection_unavailable", "reason": "current shelf result is not ready"})
+        try:
+            truth = planning_truth.require_accepted_truth(
+                db,
+                "shelf_projection",
+                required_capabilities=(
+                    planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                    planning_truth.CAPABILITY_SHELF_PROJECTION,
+                ),
+            )
+        except planning_truth.PlanningTruthUnavailable as exc:
+            raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+        item_ids = {
+            int(row.payload.get("item_id"))
+            for row in current_rows
+            if row.payload.get("item_id") is not None
+        }
+        items = _items_by_id(db, item_ids)
+        ordered = sorted(
+            current_rows,
+            key=lambda row: (
+                str((row.payload or {}).get("first_shortage_date") or "9999-12-31"),
+                str((row.payload or {}).get("latest_start_date") or "9999-12-31"),
+                int((row.payload or {}).get("policy_id") or 0),
+                str(row.business_identity),
+            ),
+        )
+        rows = []
+        for row in ordered[offset:offset + limit]:
+            payload = dict(row.payload or {})
+            item = items.get(int(payload.get("item_id") or 0))
+            rows.append({
+                "policy_id": int(payload.get("policy_id") or 0),
+                "item_id": int(payload.get("item_id") or 0),
+                "item_code": str(item.item_code) if item is not None and item.item_code is not None else None,
+                "item_name": str(item.item_name) if item is not None and item.item_name is not None else None,
+                "warehouse_ref1c": str(payload.get("warehouse_ref1c") or ""),
+                "protection_until": str(payload.get("protection_until") or ""),
+                "target_qty": float(payload.get("target_qty") or 0),
+                "shelf_physical_qty": float(payload.get("shelf_physical_qty") or 0),
+                "other_stock_qty": float(payload.get("other_stock_qty") or 0),
+                "projected_qty": float(payload.get("projected_qty") or 0),
+                "gap_qty": float(payload.get("gap_qty") or 0),
+                "transfer_qty": float(payload.get("transfer_qty") or 0),
+                "unlaunched_mrp_qty": float(payload.get("unlaunched_mrp_qty") or 0),
+                "pull_qty": float(payload.get("pull_qty") or 0),
+                "materialized_qty": float(payload.get("materialized_qty") or 0),
+                "first_shortage_date": payload.get("first_shortage_date"),
+                "latest_start_date": payload.get("latest_start_date"),
+                "demand_manifest": list(payload.get("demand_manifest") or []),
+            })
+        return ShelfProjectionResponse.model_validate({
+            "rows": rows,
+            "total_rows": len(ordered),
+            "limit": limit,
+            "offset": offset,
+            "truth_meta": build_truth_meta(truth),
+        })
 class ProductionEmployeeOptionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1823,6 +1880,11 @@ def get_work_item_materials(
         if stored_qty is None or abs(float(stored_qty) - requested_qty) > 1e-6:
             raise CurrentExecutionUnavailable("current work-item material coverage is not persisted for requested quantity")
         persisted = dict(persisted_material)
+        # The API keeps the accepted-generation provenance field, but it is
+        # reconstructed from the current manifest at this read boundary.  It
+        # is intentionally absent from the nested persisted current payload
+        # so it cannot block generation GC.
+        persisted["ledger_generation_id"] = current_generation_id
         persisted["truth_status"] = "accepted"
         generation = db.get(models.LedgerGeneration, int(current_manifest.source_generation_id or 0))
         persisted["cutoff"] = generation.cutoff.isoformat() if generation and generation.cutoff else None

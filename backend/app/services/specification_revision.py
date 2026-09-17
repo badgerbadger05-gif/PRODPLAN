@@ -148,8 +148,19 @@ def record_specification_revisions(
             changed_refs.append(str(spec.spec_ref1c or ""))
     db.flush()
     if changed_refs:
+        import hashlib
+
         from .item_ledger.current_execution import invalidate_current_execution_scope
 
+        # The revision marker column is bounded (256 chars); a real import can
+        # change thousands of specifications at once.  A digest of the sorted
+        # ref set keeps the marker semantic (same set -> same revision) and short.
+        changed_digest = hashlib.sha256(
+            ",".join(sorted(changed_refs)).encode("utf-8")
+        ).hexdigest()
+        specification_revision_marker = (
+            f"specification:{len(changed_refs)}:sha256:{changed_digest}"
+        )
         for entity_kind, scope_key in (
             ("assembly_queue", "assembly:all-live-plans"),
             ("assembly_readiness", "assembly:all-live-plans"),
@@ -160,7 +171,7 @@ def record_specification_revisions(
                 db,
                 entity_kind=entity_kind,
                 scope_key=scope_key,
-                source_revision="specification:" + ",".join(sorted(changed_refs)),
+                source_revision=specification_revision_marker,
                 reason="specification_revision_changed",
             )
     return {

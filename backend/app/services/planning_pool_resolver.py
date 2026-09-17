@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from sqlalchemy.orm import Session
 
 from app import models
+from .item_ledger.future_supply_read import future_supply_model
 
 
 DEFAULT_STOCK_POOL = "default"
@@ -96,16 +97,17 @@ def validate_future_supply_destinations(
     mapping: Mapping[str, str],
 ) -> None:
     """Validate exact rows before a physical refresh carries them forward."""
+    future_supply = future_supply_model(db, int(ledger_generation_id))
     rows = (
         db.query(
-            models.LedgerFutureSupply.supply_kind,
-            models.LedgerFutureSupply.source_ref,
-            models.LedgerFutureSupply.destination_warehouse_ref1c,
+            future_supply.supply_kind,
+            future_supply.source_ref,
+            future_supply.destination_warehouse_ref1c,
         )
         .filter(
-            models.LedgerFutureSupply.ledger_generation_id
+            future_supply.ledger_generation_id
             == int(ledger_generation_id),
-            models.LedgerFutureSupply.evidence_status == "exact",
+            future_supply.evidence_status == "exact",
         )
         .all()
     )

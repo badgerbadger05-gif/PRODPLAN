@@ -216,3 +216,28 @@ def test_repo_root_cli_loads_application_model_inventory(tmp_path):
     manifest = json.loads(result.stdout)
     assert manifest["categories"]["preserve"]["items"]["row_count"] == 0
     assert "items" not in manifest["categories"]["unknown"]
+
+
+def test_file_cli_resolves_apply_publishers_without_pythonpath():
+    repo = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy; "
+                "module = runpy.run_path('tools/current_execution_migration.py'); "
+                "assert callable(module['publish_current_obligation_views_from_snapshots']); "
+                "assert callable(module['publish_current_execution_from_generation'])"
+            ),
+        ],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr

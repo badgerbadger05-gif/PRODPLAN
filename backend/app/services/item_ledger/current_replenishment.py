@@ -10,13 +10,14 @@ or copies a generation or snapshot.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Mapping
 
+from sqlalchemy import or_, and_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -31,6 +32,7 @@ from .historical_replay_core import (
     ReserveRealization,
     plan_allocation_changes,
 )
+from .reservation import reservation_business_identity
 
 
 WRITER_KEY = "current_replenishment"
@@ -54,12 +56,133 @@ class CurrentReplenishmentResult:
     idempotent: bool = False
 
 
+@dataclass(frozen=True)
+class BoundedMakeReplenishmentResult:
+    """Evidence returned by the bounded current-owner make adapter.
+
+    The adapter deliberately reports scope-bounded work separately from the
+    historical generation publisher.  ``scope_history_rows`` is the number of
+    visible ``assembly_in`` facts read across the requested distribution
+    scopes; it is never a count or scan of the whole physical ledger.
+    """
+
+    target_generation_id: int
+    parent_generation_id: int
+    source_revision: int
+    affected_scopes: tuple[DistributionScope, ...]
+    scope_history_rows: int
+    results: tuple[CurrentReplenishmentResult, ...]
+
+    @property
+    def fact_rows(self) -> int:
+        return int(self.scope_history_rows)
+
+    @property
+    def audit_events(self) -> int:
+        return sum(int(result.audit_events) for result in self.results)
+
+
+@dataclass(frozen=True)
+class BoundedBuyReplenishmentResult:
+    """Evidence returned by the bounded current BUY receipt adapter."""
+
+    target_generation_id: int
+    parent_generation_id: int
+    source_revision: int
+    affected_scopes: tuple[DistributionScope, ...]
+    delta_fact_rows: int
+    scope_replay_rows: int
+    results: tuple[CurrentReplenishmentResult, ...]
+
+    @property
+    def fact_rows(self) -> int:
+        return int(self.delta_fact_rows)
+
+    @property
+    def replayed_rows(self) -> int:
+        return int(self.scope_replay_rows)
+
+    @property
+    def audit_events(self) -> int:
+        return sum(int(result.audit_events) for result in self.results)
+
+
+@dataclass(frozen=True)
+class BoundedBuyReceiptDeltaManifest:
+    """Explicit typed BUY evidence for one bounded physical refresh."""
+
+    new_sle_ids: tuple[int, ...] = ()
+    receipt_facts: tuple[object, ...] = ()
+    # Corrections/returns may need the complete signed stream for the
+    # affected scope.  It is never discovered from a generation-wide query.
+    scope_receipt_facts: tuple[object, ...] = ()
+    supersession_edge_ids: tuple[int, ...] = ()
+    backdate_from: datetime | None = None
+
+
 def _decimal(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
 def _text(value: object) -> str:
     return str(value or "").strip()
+
+
+def _comparable_datetime(value: datetime | None) -> datetime | None:
+    """Compare DB/SQLite datetimes without changing their instant semantics.
+
+    SQLite returns ``DateTime(timezone=True)`` values as naive while PostgreSQL
+    returns aware UTC values.  Bounded validation must behave identically on
+    both backends; all boundaries are UTC source timestamps, so stripping only
+    the adapter-level timezone marker is safe here.
+    """
+
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+def _normalise_bounded_buy_manifest(
+    value: BoundedBuyReceiptDeltaManifest | Mapping[str, object],
+) -> BoundedBuyReceiptDeltaManifest:
+    if isinstance(value, BoundedBuyReceiptDeltaManifest):
+        result = value
+    elif isinstance(value, Mapping):
+        raw_backdate = value.get("backdate_from")
+        if raw_backdate not in (None, "") and not isinstance(raw_backdate, datetime):
+            try:
+                raw_backdate = datetime.fromisoformat(str(raw_backdate))
+            except ValueError as exc:
+                raise CurrentReplenishmentError(
+                    "bounded BUY backdate boundary is malformed"
+                ) from exc
+        try:
+            result = BoundedBuyReceiptDeltaManifest(
+                new_sle_ids=tuple(int(item) for item in value.get("new_sle_ids", ())),
+                receipt_facts=tuple(
+                    value.get("receipt_facts", value.get("delta_facts", ()))
+                ),
+                scope_receipt_facts=tuple(
+                    value.get("scope_receipt_facts", value.get("scope_facts", ()))
+                ),
+                supersession_edge_ids=tuple(
+                    int(item) for item in value.get("supersession_edge_ids", ())
+                ),
+                backdate_from=raw_backdate,
+            )
+        except (TypeError, ValueError) as exc:
+            raise CurrentReplenishmentError("bounded BUY manifest is malformed") from exc
+    else:
+        raise CurrentReplenishmentError("bounded BUY manifest is required")
+    if any(item <= 0 for item in result.new_sle_ids + result.supersession_edge_ids):
+        raise CurrentReplenishmentError("bounded BUY manifest IDs must be positive")
+    if len(set(result.new_sle_ids)) != len(result.new_sle_ids):
+        raise CurrentReplenishmentError("bounded BUY manifest has duplicate SLE IDs")
+    if len(set(result.supersession_edge_ids)) != len(result.supersession_edge_ids):
+        raise CurrentReplenishmentError(
+            "bounded BUY manifest has duplicate supersession IDs"
+        )
+    return result
 
 
 def _distribution_scope(value: Fact | Reserve) -> tuple[int, str, str, str, str]:
@@ -89,6 +212,16 @@ def _scope_key(scope: DistributionScope) -> str:
     return json.dumps(list(scope), ensure_ascii=False, separators=(",", ":"))
 
 
+def _reserve_business_identity(row: Reserve) -> str:
+    """Canonical identity used before ORM rows are available.
+
+    ReservationEntry.current_identity is populated from this exact contract;
+    using the same requirement/mode key in the source marker prevents a new
+    BUILDING physical id from changing an otherwise identical replay input.
+    """
+    return f"reservation:req:{int(row.requirement_id)}:mode:{_text(row.mode)}"
+
+
 def _input_checksum(
     facts: tuple[Fact, ...], reserves: tuple[Reserve, ...], scope_key: str
 ) -> str:
@@ -111,7 +244,7 @@ def _input_checksum(
         ],
         "reserves": [
             {
-                "id": str(row.reserve_id),
+                "id": _reserve_business_identity(row),
                 "item": int(row.item_id),
                 "mode": row.mode,
                 "qty": str(row.reserved_qty),
@@ -159,7 +292,7 @@ def _receipt_input_checksum(
         ],
         "reserves": [
             {
-                "id": str(row.reserve_id),
+                "id": _reserve_business_identity(row),
                 "qty": str(row.reserved_qty),
                 "due": row.due_date.isoformat(),
                 "requirement": int(row.requirement_id),
@@ -176,13 +309,16 @@ def _receipt_change_plan(
     previous_allocations: tuple[Allocation, ...],
     reserves: tuple[Reserve, ...],
     receipt_facts: tuple[object, ...],
+    reservation_identity_by_id: dict[str, str],
 ) -> AllocationChangePlan:
     """Adapt the canonical signed supplier replay to R4 persistence deltas."""
 
     after = tuple(
         Allocation(
             fact_id=str(row.fact.sle_id),
-            reserve_id=str(row.reservation.id),
+            reserve_id=reservation_identity_by_id.get(
+                str(int(row.reservation.id)), ""
+            ),
             qty=_decimal(row.qty),
             match_rule=(
                 row.match_rule
@@ -193,6 +329,10 @@ def _receipt_change_plan(
         )
         for row in replay.allocations
     )
+    if any(not row.reserve_id for row in after):
+        raise CurrentReplenishmentError(
+            "receipt replay references a reservation without stable current identity"
+        )
     before_by_key = {(row.fact_id, row.reserve_id): row for row in previous_allocations}
     after_by_key = {(row.fact_id, row.reserve_id): row for row in after}
     reserve_qty = {
@@ -228,10 +368,18 @@ def _receipt_change_plan(
     )
 
 
-def _as_allocation(row: models.ReservationConsumptionAllocation) -> Allocation:
+def _as_allocation(
+    row: models.ReservationConsumptionAllocation,
+    reservation_identity_by_id: dict[str, str],
+) -> Allocation:
+    identity = reservation_identity_by_id.get(str(int(row.reservation_id)))
+    if not identity:
+        raise CurrentReplenishmentError(
+            f"allocation references reservation {row.reservation_id} without stable current identity"
+        )
     return Allocation(
         fact_id=str(int(row.sle_id)),
-        reserve_id=str(int(row.reservation_id)),
+        reserve_id=identity,
         qty=_decimal(row.allocated_qty),
         match_rule=_text(row.match_rule),
         is_addressed=_text(row.match_rule) == "pegged",
@@ -492,6 +640,79 @@ def apply_current_replenishment(
         else []
     )
     allocation_entry_by_id = {str(int(row.id)): row for row in allocation_entries}
+    # R4 planning must compare reservations by their stable current owner,
+    # never by BUILDING staging ids.  A missing identity is only tolerated for
+    # old accepted compatibility fixtures; the live BUILDING path fails
+    # closed, because deriving an id there would hide a publication defect.
+    strict_identity = _text(generation.status) == "building"
+    reservation_identity_by_id: dict[str, str] = {}
+    entries_by_identity: dict[str, list[models.ReservationEntry]] = {}
+    for entry in allocation_entries:
+        physical_id = str(int(entry.id))
+        identity = _text(entry.current_identity)
+        if not identity:
+            if strict_identity:
+                raise CurrentReplenishmentError(
+                    f"reservation {physical_id} lacks stable current identity"
+                )
+            identity = f"reservation:req:{int(entry.requirement_id)}:mode:{_text(entry.realization_mode)}"
+        canonical_identity = reservation_business_identity(
+            int(entry.requirement_id), _text(entry.realization_mode)
+        )
+        if identity != canonical_identity:
+            raise CurrentReplenishmentError(
+                f"reservation {physical_id} has mismatched current identity"
+            )
+        reservation_identity_by_id[physical_id] = identity
+        entries_by_identity.setdefault(identity, []).append(entry)
+
+    # A normal refresh has one accepted owner plus its same-identity BUILDING
+    # replacement.  Other duplicate shapes are ambiguous and must fail
+    # closed.  Prefer the accepted owner for updates/deletes; a pure BUILDING
+    # scope uses its staging row.
+    entry_by_identity: dict[str, models.ReservationEntry] = {}
+    for identity, candidates in entries_by_identity.items():
+        current = [row for row in candidates if bool(row.is_current)]
+        building = [row for row in candidates if _text(row.owner_kind) == "building"]
+        if len(candidates) > 1 and not (len(current) == 1 and len(building) == 1):
+            raise CurrentReplenishmentError(
+                f"reservation current identity collision: {identity}"
+            )
+        entry_by_identity[identity] = (current or candidates)[0]
+
+    # Replace physical staging ids in the pure replay input with stable
+    # business identities.  DML below maps those identities back to the
+    # physical row selected by the current publication boundary.
+    stable_reserves: list[Reserve] = []
+    for reserve in reserve_rows:
+        physical_id = str(reserve.reserve_id)
+        identity = reservation_identity_by_id.get(physical_id)
+        if not identity:
+            raise CurrentReplenishmentError(
+                f"reservation {physical_id} is unavailable or lacks stable current identity"
+            )
+        stable_reserves.append(
+            Reserve(
+                reserve_id=identity,
+                item_id=reserve.item_id,
+                mode=reserve.mode,
+                reserved_qty=reserve.reserved_qty,
+                due_date=reserve.due_date,
+                plan_period_from=reserve.plan_period_from,
+                plan_period_to=reserve.plan_period_to,
+                run_id=reserve.run_id,
+                requirement_id=reserve.requirement_id,
+                bucket_date=reserve.bucket_date,
+                bucket_id=reserve.bucket_id,
+                characteristic_ref=reserve.characteristic_ref,
+                organization_ref=reserve.organization_ref,
+                planning_stock_pool=reserve.planning_stock_pool,
+                order_refs=reserve.order_refs,
+            )
+        )
+    reserve_rows_for_plan = tuple(stable_reserves)
+    if len({row.reserve_id for row in reserve_rows_for_plan}) != len(reserve_rows_for_plan):
+        raise CurrentReplenishmentError("complete scope contains colliding reservation identities")
     scoped_allocations = tuple(
         row
         for row in allocations
@@ -501,19 +722,22 @@ def apply_current_replenishment(
             row, allocation_entry_by_id[str(row.reservation_id)]
         ) == distribution_scope
     )
-    previous = tuple(_as_allocation(row) for row in scoped_allocations)
+    previous = tuple(
+        _as_allocation(row, reservation_identity_by_id) for row in scoped_allocations
+    )
     try:
         plan = (
             _receipt_change_plan(
                 receipt_replay,
                 previous,
-                reserve_rows,
+                reserve_rows_for_plan,
                 receipt_facts,
+                reservation_identity_by_id,
             )
             if receipt_replay is not None
             else plan_allocation_changes(
                 fact_rows,
-                reserve_rows,
+                reserve_rows_for_plan,
                 previous_allocations=previous,
             )
         )
@@ -523,24 +747,24 @@ def apply_current_replenishment(
     entries = allocation_entries
     entry_by_id = {str(int(row.id)): row for row in entries}
     fact_by_id = {str(row.fact_id): row for row in fact_rows}
-    reserve_by_id = {str(row.reserve_id): row for row in reserve_rows}
+    reserve_by_id = {str(row.reserve_id): row for row in reserve_rows_for_plan}
     basis_fact_ids = tuple(sorted({int(row.sle_id) for row in receipt_facts}))
     audit_reason = "r5_signed_replay" if receipt_replay is not None else "current_replay"
     if receipt_replay is not None and receipt_unmatched_return_qty > 0:
         audit_reason = "r5_signed_replay_unmatched_return"
     allocation_by_key = {
-        (str(int(row.sle_id)), str(int(row.reservation_id))): row for row in allocations
+        (str(int(row.sle_id)), reservation_identity_by_id[str(int(row.reservation_id))]): row for row in allocations
         if row in scoped_allocations
     }
     legacy_by_key = {
-        (str(int(row.sle_id)), str(int(row.reservation_id))): row
+        (str(int(row.sle_id)), reservation_identity_by_id.get(str(int(row.reservation_id)), "")): row
         for row in legacy_allocations
     }
     audit_events = 0
 
     for old in plan.deletions:
         row = allocation_by_key[(old.fact_id, old.reserve_id)]
-        entry = entry_by_id.get(old.reserve_id)
+        entry = entry_by_identity.get(old.reserve_id)
         if entry is None:
             raise CurrentReplenishmentError(
                 f"allocation references missing reservation {old.reserve_id}"
@@ -564,7 +788,7 @@ def apply_current_replenishment(
 
     for update in plan.updates:
         row = allocation_by_key[(update.before.fact_id, update.before.reserve_id)]
-        entry = entry_by_id.get(update.after.reserve_id)
+        entry = entry_by_identity.get(update.after.reserve_id)
         if entry is None:
             raise CurrentReplenishmentError(
                 f"allocation references missing reservation {update.after.reserve_id}"
@@ -591,7 +815,7 @@ def apply_current_replenishment(
     for insertion in plan.insertions:
         fact = fact_by_id.get(insertion.fact_id)
         reserve = reserve_by_id.get(insertion.reserve_id)
-        entry = entry_by_id.get(insertion.reserve_id)
+        entry = entry_by_identity.get(insertion.reserve_id)
         if fact is None or reserve is None or entry is None:
             raise CurrentReplenishmentError("allocation scope references unknown fact or reservation")
         key = (insertion.fact_id, insertion.reserve_id)
@@ -654,7 +878,7 @@ def apply_current_replenishment(
         for row in plan.result.realizations
     }
     for reserve_id, realized in realization_by_reserve.items():
-        entry = entry_by_id.get(reserve_id)
+        entry = entry_by_identity.get(reserve_id)
         reserve = reserve_by_id.get(reserve_id)
         if entry is None or reserve is None:
             raise CurrentReplenishmentError(f"realization references unknown reservation {reserve_id}")
@@ -702,6 +926,7 @@ def apply_current_receipt_replay(
     distribution_scope: DistributionScope | None = None,
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     allow_building: bool = False,
+    validated_visible_ids: Iterable[int] | None = None,
 ) -> CurrentReplenishmentResult:
     """Publish signed correction/return replay through the R4 current writer."""
 
@@ -716,7 +941,14 @@ def apply_current_receipt_replay(
     ids = [int(row.sle_id) for row in rows]
     if len(ids) != len(set(ids)):
         raise CurrentReplenishmentError("receipt correction source has duplicate sle_id")
-    visible_ids = {int(row.id) for row in visible_sles_for_generation(db, int(generation_id))}
+    visible_ids = (
+        {int(value) for value in validated_visible_ids}
+        if validated_visible_ids is not None
+        else {
+            int(row.id)
+            for row in visible_sles_for_generation(db, int(generation_id))
+        }
+    )
     missing = sorted(set(ids) - visible_ids)
     if missing:
         raise CurrentReplenishmentError(
@@ -917,14 +1149,40 @@ def apply_current_replenishment_for_accepted_generation(
         raise CurrentReplenishmentError(
             "current replenishment publication requires an accepted generation"
         )
-    reservations = tuple(
-        db.query(models.ReservationEntry)
-        .filter(
+    reservation_query = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.lifecycle_status == "active",
+        models.ReservationEntry.realization_mode == "buy",
+        models.ReservationEntry.replenishment_required_qty > 0,
+    )
+    if _text(generation.status) == "building":
+        reservation_query = reservation_query.filter(
             models.ReservationEntry.ledger_generation_id == int(generation_id),
-            models.ReservationEntry.lifecycle_status == "active",
-            models.ReservationEntry.realization_mode == "buy",
-            models.ReservationEntry.replenishment_required_qty > 0,
+            models.ReservationEntry.owner_kind == "building",
         )
+    else:
+        pointer = db.get(models.PlanningTruthState, 1)
+        if pointer is None or int(pointer.current_generation_id or 0) != int(generation_id):
+            # Pre-owner fixtures have no populated current_identity/is_current
+            # rows yet.  Once the owner migration has published any current
+            # row, an accepted generation must match the exact pointer.
+            if db.query(models.ReservationEntry.id).filter(
+                models.ReservationEntry.is_current.is_(True),
+            ).first() is not None:
+                raise CurrentReplenishmentError(
+                    "accepted reservation publication is not the exact planning truth pointer"
+                )
+        # Rows created before the owner migration have an empty identity.  This
+        # compatibility branch is removed by the migration backfill; it is not
+        # a runtime legacy fallback once current_identity is populated.
+        reservation_query = reservation_query.filter(or_(
+            models.ReservationEntry.is_current.is_(True),
+            and_(
+                models.ReservationEntry.current_identity == "",
+                models.ReservationEntry.ledger_generation_id == int(generation_id),
+            ),
+        ))
+    reservations = tuple(
+        reservation_query
         .order_by(models.ReservationEntry.id.asc())
         .all()
     )
@@ -1062,3 +1320,1004 @@ def apply_current_replenishment_for_accepted_generation(
             )
         )
     return tuple(result)
+
+
+def apply_current_replenishment_for_bounded_make_scopes(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    target_cutoff: datetime,
+    affected_scopes: Iterable[DistributionScope],
+    source_revision: int,
+) -> BoundedMakeReplenishmentResult:
+    """Apply bounded ``assembly_in`` facts to stable current MAKE owners.
+
+    This is intentionally a current-owner adapter, not a generation
+    publisher.  ``target_generation_id`` must still be BUILDING and is used
+    only as provenance for the current writer; no reservation, work-item, or
+    generation-scoped execution copy is created and the truth pointer is never
+    touched.  The allocator needs a complete reconciliation input, so the
+    query reads the complete visible physical history only for each requested
+    ``DistributionScope``'s item/characteristic/organization key.  It never
+    calls ``visible_sles_for_generation`` and never loads unrelated items.
+
+    All persistence is delegated to :func:`apply_current_replenishment`; the
+    caller owns the transaction and may roll it back if any affected scope
+    fails.  The preflight validates every visible ``assembly_in`` row before
+    applying the first scope, so an out-of-scope or ambiguous fact cannot
+    leave a partial bounded publication.
+    """
+
+    try:
+        revision = int(source_revision)
+    except (TypeError, ValueError) as exc:
+        raise CurrentReplenishmentError("source_revision must be an integer") from exc
+    if revision < 0:
+        raise CurrentReplenishmentError("source_revision must be non-negative")
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or _text(target.status) != "building":
+        raise CurrentReplenishmentError(
+            "bounded make publication requires a BUILDING target generation"
+        )
+    if parent is None or _text(parent.status) != "accepted":
+        raise CurrentReplenishmentError(
+            "bounded make publication requires an accepted parent generation"
+        )
+    if int(target.id) == int(parent.id):
+        raise CurrentReplenishmentError("bounded make target must differ from parent")
+    if target.physical_import_batch_id is None or parent.physical_import_batch_id is None:
+        raise CurrentReplenishmentError("bounded make generations require import batches")
+    if int(target.physical_import_batch_id) < int(parent.physical_import_batch_id):
+        raise CurrentReplenishmentError(
+            "bounded make target import batch is older than its parent"
+        )
+    if target_cutoff is None:
+        raise CurrentReplenishmentError("bounded make target cutoff is required")
+    if target.cutoff is not None:
+        target_value = target.cutoff
+        requested_value = target_cutoff
+        if target_value.tzinfo is not None and requested_value.tzinfo is None:
+            requested_value = requested_value.replace(tzinfo=timezone.utc)
+        elif target_value.tzinfo is None and requested_value.tzinfo is not None:
+            requested_value = requested_value.replace(tzinfo=None)
+        if target_value != requested_value:
+            raise CurrentReplenishmentError(
+                "bounded make target cutoff does not match generation cutoff"
+            )
+
+    scopes: list[DistributionScope] = []
+    seen_scopes: set[DistributionScope] = set()
+    for raw_scope in affected_scopes:
+        try:
+            values = tuple(raw_scope)
+            scope = (
+                int(values[0]),
+                _text(values[1]),
+                _text(values[2]),
+                _text(values[3]),
+                _text(values[4]),
+            )
+        except (TypeError, ValueError, IndexError) as exc:
+            raise CurrentReplenishmentError(
+                "bounded make affected scope is malformed"
+            ) from exc
+        if len(values) != 5 or scope[0] <= 0:
+            raise CurrentReplenishmentError("bounded make affected scope is malformed")
+        if scope[4] != "make":
+            raise CurrentReplenishmentError(
+                "bounded make publication supports only realization_mode=make"
+            )
+        if scope in seen_scopes:
+            raise CurrentReplenishmentError("bounded make affected scopes contain duplicates")
+        seen_scopes.add(scope)
+        scopes.append(scope)
+    if not scopes:
+        raise CurrentReplenishmentError("bounded make publication requires affected scopes")
+    scopes.sort()
+
+    # A physical SLE has no planning-pool column.  A requested item/key must
+    # therefore resolve to exactly one current pool; multiple pools would make
+    # attribution ambiguous and must fail closed rather than inventing one.
+    scope_by_physical_key: dict[tuple[int, str, str], list[DistributionScope]] = {}
+    for scope in scopes:
+        scope_by_physical_key.setdefault(scope[:3], []).append(scope)
+
+    from .physical_visibility import visible_sle_query
+    from .historical_replay_persistence import _identity_for_sle
+
+    physical_scope_predicate = or_(*(
+        and_(
+            models.StockLedgerEntry.item_id == scope[0],
+            models.StockLedgerEntry.characteristic_ref == scope[1],
+            models.StockLedgerEntry.organization_ref == scope[2],
+        )
+        for scope in scopes
+    ))
+    rows = (
+        visible_sle_query(
+            db,
+            physical_import_batch_id=int(target.physical_import_batch_id),
+            cutoff=target_cutoff,
+        )
+        .filter(
+            physical_scope_predicate,
+            models.StockLedgerEntry.movement_kind == "assembly_in",
+        )
+        .order_by(
+            models.StockLedgerEntry.posting_at.asc(),
+            models.StockLedgerEntry.id.asc(),
+        )
+        .all()
+    )
+    facts_by_scope: dict[DistributionScope, list[Fact]] = {
+        scope: [] for scope in scopes
+    }
+    for row in rows:
+        if _decimal(row.qty) <= 0:
+            raise CurrentReplenishmentError(
+                f"assembly_in fact {int(row.id)} has non-positive quantity"
+            )
+        physical_key = (
+            int(row.item_id),
+            _text(row.characteristic_ref),
+            _text(row.organization_ref),
+        )
+        candidates = scope_by_physical_key.get(physical_key, [])
+        if not candidates:
+            raise CurrentReplenishmentError(
+                f"assembly_in fact {int(row.id)} is outside affected make scope"
+            )
+        if len(candidates) != 1:
+            raise CurrentReplenishmentError(
+                f"assembly_in fact {int(row.id)} has ambiguous planning pool"
+            )
+        scope = candidates[0]
+        requirement_id, order_ref, ambiguous = _identity_for_sle(db, row)
+        if ambiguous:
+            raise CurrentReplenishmentError(
+                f"assembly_in fact {int(row.id)} has ambiguous production identity"
+            )
+        facts_by_scope[scope].append(
+            Fact(
+                fact_id=str(int(row.id)),
+                item_id=int(row.item_id),
+                mode="make",
+                qty=_decimal(row.qty),
+                posting_at=row.posting_at,
+                characteristic_ref=_text(row.characteristic_ref),
+                organization_ref=_text(row.organization_ref),
+                planning_stock_pool=scope[3],
+                requirement_id=requirement_id,
+                order_ref=order_ref,
+            )
+        )
+
+    # Preflight all owner scopes before the first write.  This keeps an
+    # out-of-scope/owner defect from producing a partial result even though
+    # transaction rollback remains the caller's responsibility.
+    reserves_by_scope: dict[DistributionScope, tuple[Reserve, ...]] = {}
+    for scope in scopes:
+        owners = (
+            db.query(models.ReservationEntry)
+            .filter(
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.lifecycle_status == "active",
+                models.ReservationEntry.current_identity != "",
+                models.ReservationEntry.item_id == scope[0],
+                models.ReservationEntry.characteristic_ref == scope[1],
+                models.ReservationEntry.organization_ref == scope[2],
+                models.ReservationEntry.planning_stock_pool == scope[3],
+                models.ReservationEntry.realization_mode == "make",
+            )
+            .order_by(models.ReservationEntry.id.asc())
+            .all()
+        )
+        if not owners:
+            raise CurrentReplenishmentError(
+                f"bounded make scope has no stable current reservation owners: {_scope_key(scope)}"
+            )
+        if len({str(row.current_identity) for row in owners}) != len(owners):
+            raise CurrentReplenishmentError(
+                f"bounded make scope has duplicate current reservation identities: {_scope_key(scope)}"
+            )
+        requirement_ids = sorted({int(row.requirement_id) for row in owners})
+        order_refs: dict[int, tuple[str, ...]] = {}
+        if requirement_ids:
+            linked = (
+                db.query(
+                    models.ProductionProduct.source_mrp_requirement_id,
+                    models.ProductionOrder.order_ref1c,
+                )
+                .join(
+                    models.ProductionOrder,
+                    models.ProductionOrder.order_id == models.ProductionProduct.order_id,
+                )
+                .filter(
+                    models.ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
+                    models.ProductionOrder.order_ref1c.isnot(None),
+                )
+                .all()
+            )
+            refs: dict[int, set[str]] = {}
+            for requirement_id, order_ref in linked:
+                if str(order_ref or "").strip():
+                    refs.setdefault(int(requirement_id), set()).add(str(order_ref))
+            order_refs = {
+                int(requirement_id): tuple(sorted(values))
+                for requirement_id, values in refs.items()
+            }
+        reserves_by_scope[scope] = tuple(
+            Reserve(
+                reserve_id=str(int(row.id)),
+                item_id=int(row.item_id),
+                mode="make",
+                reserved_qty=_decimal(row.replenishment_required_qty),
+                due_date=row.priority_period_to,
+                plan_period_from=row.priority_period_from,
+                plan_period_to=row.priority_period_to,
+                run_id=int(row.run_id or 0),
+                requirement_id=int(row.requirement_id),
+                bucket_date=None,
+                bucket_id=None,
+                characteristic_ref=_text(row.characteristic_ref),
+                organization_ref=_text(row.organization_ref),
+                planning_stock_pool=_text(row.planning_stock_pool),
+                order_refs=order_refs.get(int(row.requirement_id), ()),
+            )
+            for row in owners
+        )
+
+    results: list[CurrentReplenishmentResult] = []
+    for scope in scopes:
+        results.append(
+            apply_current_replenishment(
+                db,
+                generation_id=int(target.id),
+                source_key="physical-refresh:make",
+                source_revision=revision,
+                facts=tuple(facts_by_scope[scope]),
+                reserves=reserves_by_scope[scope],
+                complete_scope=True,
+                distribution_scope=scope,
+                allow_building=True,
+            )
+        )
+    return BoundedMakeReplenishmentResult(
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        source_revision=revision,
+        affected_scopes=tuple(scopes),
+        scope_history_rows=sum(len(rows) for rows in facts_by_scope.values()),
+        results=tuple(results),
+    )
+
+
+def _normalise_bounded_buy_scopes(
+    affected_scopes: Iterable[DistributionScope],
+) -> tuple[DistributionScope, ...]:
+    scopes: list[DistributionScope] = []
+    seen: set[DistributionScope] = set()
+    for raw in affected_scopes:
+        try:
+            values = tuple(raw)
+            scope = (
+                int(values[0]),
+                _text(values[1]),
+                _text(values[2]),
+                _text(values[3]),
+                _text(values[4]),
+            )
+        except (TypeError, ValueError, IndexError) as exc:
+            raise CurrentReplenishmentError("bounded BUY scope is malformed") from exc
+        if len(values) != 5 or scope[0] <= 0:
+            raise CurrentReplenishmentError("bounded BUY scope is malformed")
+        if scope[4] != "buy":
+            raise CurrentReplenishmentError(
+                "bounded BUY publication supports only realization_mode=buy"
+            )
+        if scope in seen:
+            raise CurrentReplenishmentError("bounded BUY scopes contain duplicates")
+        seen.add(scope)
+        scopes.append(scope)
+    if not scopes:
+        raise CurrentReplenishmentError("bounded BUY publication requires affected scopes")
+    return tuple(sorted(scopes))
+
+
+def _bounded_buy_fact_scope(
+    fact: object,
+    scopes_by_item_pool: dict[tuple[int, str], tuple[DistributionScope, ...]],
+) -> DistributionScope:
+    from .supplier_receipt_allocation import ReceiptFact
+
+    if not isinstance(fact, ReceiptFact):
+        raise CurrentReplenishmentError(
+            "bounded BUY manifest requires typed ReceiptFact evidence"
+        )
+    candidates = scopes_by_item_pool.get(
+        (int(fact.item_id), _text(fact.planning_stock_pool)), ()
+    )
+    if len(candidates) != 1:
+        raise CurrentReplenishmentError(
+            f"supplier receipt {int(fact.sle_id)} has ambiguous BUY distribution scope"
+        )
+    return candidates[0]
+
+
+def _bounded_buy_manifest_facts(
+    value: BoundedBuyReceiptDeltaManifest,
+    *,
+    scopes: tuple[DistributionScope, ...],
+    db: Session,
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+) -> tuple[
+    dict[DistributionScope, tuple[object, ...]],
+    dict[int, object],
+    set[int],
+]:
+    """Validate typed delta/full-scope facts and explicit supersession IDs."""
+
+    from .supplier_receipt_allocation import ReceiptFact
+
+    lower = int(parent.physical_import_batch_id)
+    upper = int(target.physical_import_batch_id)
+    scopes_by_item_pool: dict[tuple[int, str], tuple[DistributionScope, ...]] = {}
+    for scope in scopes:
+        key = (scope[0], scope[3])
+        scopes_by_item_pool[key] = (*scopes_by_item_pool.get(key, ()), scope)
+
+    delta_by_id: dict[int, object] = {}
+    if set(value.new_sle_ids) != {
+        int(getattr(row, "sle_id", -1)) for row in value.receipt_facts
+    }:
+        raise CurrentReplenishmentError(
+            "BUY manifest new_sle_ids must exactly match typed delta facts"
+        )
+    for fact in value.receipt_facts:
+        if not isinstance(fact, ReceiptFact):
+            raise CurrentReplenishmentError(
+                "bounded BUY manifest requires typed ReceiptFact evidence"
+            )
+        fact_id = int(fact.sle_id)
+        if fact_id in delta_by_id:
+            raise CurrentReplenishmentError("bounded BUY manifest has duplicate receipt fact")
+        delta_by_id[fact_id] = fact
+
+    declared_ids = set(delta_by_id)
+    if value.scope_receipt_facts and not declared_ids and not value.supersession_edge_ids:
+        raise CurrentReplenishmentError(
+            "BUY complete scope evidence requires an explicit delta or supersession edge"
+        )
+    persisted = {
+        int(row.id): row
+        for row in db.query(models.StockLedgerEntry)
+        .filter(
+            models.StockLedgerEntry.id.in_(sorted(declared_ids))
+            if declared_ids else models.StockLedgerEntry.id < 0
+        )
+        .all()
+    }
+    if set(persisted) != declared_ids:
+        raise CurrentReplenishmentError("BUY manifest references missing SLE")
+    for fact_id, fact in delta_by_id.items():
+        row = persisted[fact_id]
+        scope = _bounded_buy_fact_scope(fact, scopes_by_item_pool)
+        if (
+            int(row.item_id) != int(fact.item_id)
+            or _text(row.characteristic_ref) != scope[1]
+            or _text(row.organization_ref) != scope[2]
+            or _decimal(row.qty) != _decimal(fact.signed_qty)
+            or _comparable_datetime(row.posting_at)
+            != _comparable_datetime(fact.posting_at)
+        ):
+            raise CurrentReplenishmentError(
+                f"typed supplier receipt {fact_id} contradicts persisted SLE"
+            )
+        if not (lower < int(row.ingest_batch_id) <= upper):
+            raise CurrentReplenishmentError("BUY delta SLE is outside target import boundary")
+        if row.posting_at is None or _comparable_datetime(row.posting_at) > _comparable_datetime(target.cutoff):
+            raise CurrentReplenishmentError("BUY delta SLE is outside target cutoff")
+        if _comparable_datetime(row.posting_at) <= _comparable_datetime(parent.cutoff) and value.backdate_from is None:
+            raise CurrentReplenishmentError(
+                "BUY backdated delta requires explicit bounded scope evidence"
+            )
+        if value.backdate_from is not None and _comparable_datetime(row.posting_at) < _comparable_datetime(value.backdate_from):
+            raise CurrentReplenishmentError("BUY delta precedes declared backdate boundary")
+
+    edges = {
+        int(row.id): row
+        for row in db.query(models.StockLedgerFactSupersession)
+        .filter(
+            models.StockLedgerFactSupersession.id.in_(sorted(value.supersession_edge_ids))
+            if value.supersession_edge_ids else models.StockLedgerFactSupersession.id < 0
+        )
+        .all()
+    }
+    if set(edges) != set(value.supersession_edge_ids):
+        raise CurrentReplenishmentError("BUY manifest references missing supersession edge")
+    old_ids: set[int] = set()
+    for edge in edges.values():
+        if edge.old_sle_id is None or int(edge.old_sle_id) in old_ids:
+            raise CurrentReplenishmentError("BUY manifest has duplicate supersession basis")
+        old_ids.add(int(edge.old_sle_id))
+        old = db.get(models.StockLedgerEntry, int(edge.old_sle_id))
+        if old is None:
+            raise CurrentReplenishmentError("BUY supersession basis SLE is missing")
+        matching = [
+            scope for scope in scopes
+            if int(old.item_id) == scope[0]
+            and _text(old.characteristic_ref) == scope[1]
+            and _text(old.organization_ref) == scope[2]
+        ]
+        if len(matching) != 1:
+            raise CurrentReplenishmentError(
+                "BUY supersession basis is outside or ambiguous affected scope"
+            )
+        if not (lower < int(edge.import_batch_id) <= upper):
+            raise CurrentReplenishmentError("BUY supersession edge is outside target boundary")
+        if int(old.ingest_batch_id) > lower and int(old.id) not in declared_ids:
+            raise CurrentReplenishmentError("BUY supersession old delta SLE is missing")
+        if edge.new_sle_id is not None:
+            if int(edge.new_sle_id) not in declared_ids:
+                raise CurrentReplenishmentError("BUY supersession new SLE is missing typed evidence")
+            new = persisted.get(int(edge.new_sle_id)) or db.get(
+                models.StockLedgerEntry, int(edge.new_sle_id)
+            )
+            if new is None or (
+                _text(new.characteristic_ref) != _text(old.characteristic_ref)
+                or _text(new.organization_ref) != _text(old.organization_ref)
+                or int(new.item_id) != int(old.item_id)
+            ):
+                raise CurrentReplenishmentError("BUY supersession old/new keys differ")
+        prior = (
+            db.query(models.StockLedgerFactSupersession.id)
+            .filter(
+                models.StockLedgerFactSupersession.old_sle_id == int(old.id),
+                models.StockLedgerFactSupersession.import_batch_id <= lower,
+            )
+            .first()
+        )
+        if prior is not None:
+            raise CurrentReplenishmentError("BUY supersession basis was absent from parent")
+
+    scope_facts_by_scope: dict[DistributionScope, list[object]] = {
+        scope: [] for scope in scopes
+    }
+    scope_ids: set[int] = set()
+    for fact in value.scope_receipt_facts:
+        if not isinstance(fact, ReceiptFact):
+            raise CurrentReplenishmentError(
+                "bounded BUY scope evidence requires typed ReceiptFact rows"
+            )
+        fact_id = int(fact.sle_id)
+        if fact_id in scope_ids:
+            raise CurrentReplenishmentError("bounded BUY scope evidence has duplicate SLE")
+        scope_ids.add(fact_id)
+        scope = _bounded_buy_fact_scope(fact, scopes_by_item_pool)
+        row = db.get(models.StockLedgerEntry, fact_id)
+        if row is None or (
+            _decimal(row.qty) != _decimal(fact.signed_qty)
+            or int(row.item_id) != int(fact.item_id)
+            or _text(row.characteristic_ref) != scope[1]
+            or _text(row.organization_ref) != scope[2]
+            or _comparable_datetime(row.posting_at)
+            != _comparable_datetime(fact.posting_at)
+        ):
+            raise CurrentReplenishmentError("BUY scope evidence contradicts persisted SLE")
+        if int(row.ingest_batch_id) > upper or _comparable_datetime(row.posting_at) > _comparable_datetime(target.cutoff):
+            raise CurrentReplenishmentError("BUY scope evidence is outside target boundary")
+        if int(row.ingest_batch_id) > lower and fact_id not in declared_ids:
+            raise CurrentReplenishmentError(
+                "BUY scope evidence has undeclared target delta SLE"
+            )
+        scope_facts_by_scope[scope].append(fact)
+    if not declared_ids.issubset(scope_ids) and value.scope_receipt_facts:
+        raise CurrentReplenishmentError("BUY scope evidence omits a typed delta fact")
+    if (value.supersession_edge_ids or any(
+        _decimal(fact.signed_qty) < 0
+        or _comparable_datetime(fact.posting_at) <= _comparable_datetime(parent.cutoff)
+        for fact in value.receipt_facts
+    )) and not value.scope_receipt_facts:
+        raise CurrentReplenishmentError(
+            "BUY correction/return requires complete bounded scope evidence"
+        )
+    for fact_id in declared_ids:
+        fact = delta_by_id[fact_id]
+        scope = _bounded_buy_fact_scope(fact, scopes_by_item_pool)
+        if not value.scope_receipt_facts:
+            scope_facts_by_scope[scope].append(fact)
+    return (
+        {scope: tuple(rows) for scope, rows in scope_facts_by_scope.items()},
+        delta_by_id,
+        old_ids,
+    )
+
+
+def _bounded_current_buy_basis_facts(
+    db: Session,
+    *,
+    parent: models.LedgerGeneration,
+    scopes: tuple[DistributionScope, ...],
+    fallback_by_id: dict[int, object],
+) -> dict[DistributionScope, tuple[object, ...]]:
+    """Adapt stable current allocation IDs to typed parent receipt facts."""
+
+    from .supplier_receipt_allocation import ReceiptFact
+
+    item_ids = sorted({scope[0] for scope in scopes})
+    rows = (
+        db.query(models.ReservationConsumptionAllocation, models.ReservationEntry)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReservationConsumptionAllocation.reservation_id,
+        )
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.allocation_role
+            == "replenishment_receipt",
+            models.ReservationEntry.is_current.is_(True),
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.realization_mode == "buy",
+            models.ReservationEntry.item_id.in_(item_ids),
+        )
+        .with_for_update()
+        .all()
+        if item_ids else []
+    )
+    allocation_scope_by_id: dict[int, DistributionScope] = {}
+    for allocation, entry in rows:
+        scope = (
+            int(entry.item_id),
+            _text(entry.characteristic_ref),
+            _text(entry.organization_ref),
+            _text(entry.planning_stock_pool),
+            "buy",
+        )
+        if scope not in scopes:
+            raise CurrentReplenishmentError(
+                "current BUY allocation is outside affected scopes"
+            )
+        allocation_scope_by_id[int(allocation.sle_id)] = scope
+    sle_ids = sorted(allocation_scope_by_id)
+    if not sle_ids:
+        return {scope: () for scope in scopes}
+    sles = {
+        int(row.id): row
+        for row in db.query(models.StockLedgerEntry)
+        .filter(models.StockLedgerEntry.id.in_(sle_ids))
+        .all()
+    }
+    provenance_rows = (
+        db.query(models.StockLedgerSupplierReceiptProvenance)
+        .filter(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(sle_ids),
+            models.StockLedgerSupplierReceiptProvenance.operation_kind.in_(
+                ("supplier_receipt", "correction", "supplier_return")
+            ),
+            models.StockLedgerSupplierReceiptProvenance.match_status != "excluded_non_supplier",
+        )
+        .all()
+    )
+    provenance: dict[int, models.StockLedgerSupplierReceiptProvenance] = {}
+    for row in provenance_rows:
+        sle_id = int(row.stock_ledger_entry_id)
+        previous = provenance.get(sle_id)
+        if previous is not None:
+            signature = (
+                _text(row.receipt_doc_ref), _text(row.receipt_doc_line_no),
+                _text(row.supplier_order_ref), _text(row.supplier_order_line_no),
+                _text(row.operation_kind), _text(row.correction_receipt_ref),
+            )
+            previous_signature = (
+                _text(previous.receipt_doc_ref), _text(previous.receipt_doc_line_no),
+                _text(previous.supplier_order_ref), _text(previous.supplier_order_line_no),
+                _text(previous.operation_kind), _text(previous.correction_receipt_ref),
+            )
+            if signature != previous_signature:
+                raise CurrentReplenishmentError(
+                    "supplier evidence for one SLE is inconsistent across generations"
+                )
+            continue
+        provenance[sle_id] = row
+    by_scope: dict[DistributionScope, list[object]] = {scope: [] for scope in scopes}
+    for sle_id, scope in allocation_scope_by_id.items():
+        sle = sles.get(sle_id)
+        if sle is None:
+            raise CurrentReplenishmentError("current BUY allocation references missing SLE")
+        evidence = provenance.get(sle_id)
+        fallback = fallback_by_id.get(sle_id)
+        if evidence is None and isinstance(fallback, ReceiptFact):
+            fact = fallback
+        elif evidence is None:
+            raise CurrentReplenishmentError(
+                "current BUY allocation lacks typed parent supplier evidence"
+            )
+        else:
+            if str(evidence.match_status) in {"ambiguous", "excluded_non_supplier"}:
+                raise CurrentReplenishmentError(
+                    "current BUY allocation has ambiguous or excluded supplier evidence"
+                )
+            fact = ReceiptFact(
+                sle_id=sle_id,
+                posting_at=sle.posting_at,
+                known_at=getattr(sle, "known_at", None),
+                signed_qty=_decimal(sle.qty),
+                item_id=int(sle.item_id),
+                supplier_order_ref=_text(evidence.supplier_order_ref),
+                supplier_order_line_no=_text(evidence.supplier_order_line_no),
+                receipt_ref=_text(evidence.receipt_doc_ref),
+                receipt_line_no=_text(evidence.receipt_doc_line_no),
+                correction_receipt_ref=_text(evidence.correction_receipt_ref) or None,
+                planning_stock_pool=scope[3],
+            )
+        if not isinstance(fact, ReceiptFact) or int(fact.sle_id) != sle_id:
+            raise CurrentReplenishmentError("current BUY basis evidence is malformed")
+        by_scope[scope].append(fact)
+    return {scope: tuple(rows) for scope, rows in by_scope.items()}
+
+
+def _bounded_current_buy_reserves(
+    db: Session,
+    *,
+    scopes: tuple[DistributionScope, ...],
+) -> dict[DistributionScope, tuple[Reserve, ...]]:
+    owners = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.is_current.is_(True),
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.current_identity != "",
+            models.ReservationEntry.realization_mode == "buy",
+            models.ReservationEntry.item_id.in_(sorted({scope[0] for scope in scopes})),
+        )
+        .order_by(models.ReservationEntry.id.asc())
+        .all()
+    )
+    result: dict[DistributionScope, list[Reserve]] = {scope: [] for scope in scopes}
+    identities: dict[DistributionScope, set[str]] = {scope: set() for scope in scopes}
+    for row in owners:
+        scope = (
+            int(row.item_id),
+            _text(row.characteristic_ref),
+            _text(row.organization_ref),
+            _text(row.planning_stock_pool),
+            "buy",
+        )
+        if scope not in result:
+            continue
+        identity = _text(row.current_identity)
+        if identity in identities[scope]:
+            raise CurrentReplenishmentError(
+                f"bounded BUY scope has duplicate current reservation identity: {_scope_key(scope)}"
+            )
+        identities[scope].add(identity)
+        result[scope].append(
+            Reserve(
+                reserve_id=str(int(row.id)),
+                item_id=int(row.item_id),
+                mode="buy",
+                reserved_qty=_decimal(row.replenishment_required_qty),
+                due_date=row.priority_period_to,
+                plan_period_from=row.priority_period_from,
+                plan_period_to=row.priority_period_to,
+                run_id=int(row.run_id or 0),
+                requirement_id=int(row.requirement_id),
+                characteristic_ref=_text(row.characteristic_ref),
+                organization_ref=_text(row.organization_ref),
+                planning_stock_pool=_text(row.planning_stock_pool),
+            )
+        )
+    missing = [scope for scope in scopes if not result[scope]]
+    if missing:
+        raise CurrentReplenishmentError(
+            f"bounded BUY scope has no stable current reservation owners: {_scope_key(missing[0])}"
+        )
+    return {scope: tuple(rows) for scope, rows in result.items()}
+
+
+def _ensure_bounded_supplier_evidence(
+    db: Session,
+    *,
+    target: models.LedgerGeneration,
+    facts_by_id: dict[int, object],
+) -> None:
+    """Persist each new typed fact once; never clone existing evidence."""
+
+    from .supplier_receipt_allocation import ReceiptFact
+
+    if not facts_by_id:
+        return
+    existing_rows = (
+        db.query(models.StockLedgerSupplierReceiptProvenance)
+        .filter(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
+                sorted(facts_by_id)
+            ),
+            models.StockLedgerSupplierReceiptProvenance.operation_kind.in_(
+                ("supplier_receipt", "correction", "supplier_return")
+            ),
+        )
+        .all()
+    )
+    existing_by_id: dict[int, models.StockLedgerSupplierReceiptProvenance] = {}
+    for row in existing_rows:
+        sle_id = int(row.stock_ledger_entry_id)
+        previous = existing_by_id.get(sle_id)
+        if previous is not None:
+            signature = (
+                _text(row.receipt_doc_ref), _text(row.receipt_doc_line_no),
+                _text(row.supplier_order_ref), _text(row.supplier_order_line_no),
+                _text(row.operation_kind), _text(row.correction_receipt_ref),
+            )
+            previous_signature = (
+                _text(previous.receipt_doc_ref), _text(previous.receipt_doc_line_no),
+                _text(previous.supplier_order_ref), _text(previous.supplier_order_line_no),
+                _text(previous.operation_kind), _text(previous.correction_receipt_ref),
+            )
+            if signature != previous_signature:
+                raise CurrentReplenishmentError(
+                    f"typed supplier evidence conflicts across generations for SLE {sle_id}"
+                )
+            continue
+        existing_by_id[sle_id] = row
+    for fact_id, raw in facts_by_id.items():
+        if not isinstance(raw, ReceiptFact):
+            raise CurrentReplenishmentError("typed supplier evidence is malformed")
+        kind = (
+            "correction"
+            if raw.correction_receipt_ref
+            else "supplier_return"
+            if _decimal(raw.signed_qty) < 0
+            else "supplier_receipt"
+        )
+        expected_signature = (
+            _text(raw.receipt_ref), _text(raw.receipt_line_no),
+            _text(raw.supplier_order_ref), _text(raw.supplier_order_line_no),
+            kind, _text(raw.correction_receipt_ref),
+        )
+        existing = existing_by_id.get(int(fact_id))
+        if existing is not None:
+            if _text(existing.match_status) in {"ambiguous", "excluded_non_supplier"}:
+                raise CurrentReplenishmentError(
+                    f"typed supplier evidence for SLE {fact_id} is ambiguous or excluded"
+                )
+            actual_signature = (
+                _text(existing.receipt_doc_ref), _text(existing.receipt_doc_line_no),
+                _text(existing.supplier_order_ref), _text(existing.supplier_order_line_no),
+                _text(existing.operation_kind), _text(existing.correction_receipt_ref),
+            )
+            if actual_signature != expected_signature:
+                raise CurrentReplenishmentError(
+                    f"typed supplier evidence conflicts for SLE {fact_id}"
+                )
+            continue
+        payload = {
+            "receipt_doc_ref": _text(raw.receipt_ref)[:64] or f"sle:{fact_id}",
+            "receipt_doc_line_no": _text(raw.receipt_line_no)[:32] or "1",
+            "item_id": int(raw.item_id),
+            "signed_qty": str(raw.signed_qty),
+            "supplier_order_ref": _text(raw.supplier_order_ref)[:64],
+            "supplier_order_line_no": _text(raw.supplier_order_line_no)[:32],
+            "correction_receipt_ref": _text(raw.correction_receipt_ref)[:64] or None,
+        }
+        exact = bool(_text(raw.supplier_order_ref) and _text(raw.supplier_order_line_no))
+        db.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=int(target.id),
+            stock_ledger_entry_id=int(fact_id),
+            receipt_doc_type="bounded_physical_refresh",
+            receipt_doc_ref=payload["receipt_doc_ref"],
+            receipt_doc_line_no=payload["receipt_doc_line_no"],
+            supplier_order_ref=_text(raw.supplier_order_ref) or None,
+            supplier_order_line_no=_text(raw.supplier_order_line_no) or None,
+            operation_kind=kind,
+            operation_key="bounded_physical_refresh",
+            operation_name="bounded typed supplier evidence",
+            correction_receipt_ref=payload["correction_receipt_ref"],
+            evidence_hash=hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            evidence_payload=payload,
+            match_rule="bounded-typed",
+            match_status="exact" if exact else "unmatched",
+            ambiguity_count=0,
+            reason=None if exact else "typed evidence has no supplier order line",
+        ))
+    db.flush()
+
+
+def apply_current_replenishment_for_bounded_buy_scopes(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    target_cutoff: datetime,
+    affected_scopes: Iterable[DistributionScope],
+    source_revision: int,
+    delta_manifest: BoundedBuyReceiptDeltaManifest | Mapping[str, object],
+) -> BoundedBuyReplenishmentResult:
+    """Apply typed supplier receipts to stable current BUY owners only.
+
+    Forward receipts use the current allocation basis plus the explicit typed
+    delta.  Returns, corrections, supersessions and backdates must provide a
+    complete typed stream for the affected scope.  No generation-wide
+    visibility query or generation-scoped provenance copy is performed.
+    """
+
+    try:
+        revision = int(source_revision)
+    except (TypeError, ValueError) as exc:
+        raise CurrentReplenishmentError("source_revision must be an integer") from exc
+    if revision < 0:
+        raise CurrentReplenishmentError("source_revision must be non-negative")
+    scopes = _normalise_bounded_buy_scopes(affected_scopes)
+    manifest = _normalise_bounded_buy_manifest(delta_manifest)
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or _text(target.status) != "building":
+        raise CurrentReplenishmentError(
+            "bounded BUY publication requires a BUILDING target generation"
+        )
+    if parent is None or _text(parent.status) != "accepted":
+        raise CurrentReplenishmentError(
+            "bounded BUY publication requires an accepted parent generation"
+        )
+    if int(target.id) == int(parent.id):
+        raise CurrentReplenishmentError("bounded BUY target must differ from parent")
+    pointer = db.get(models.PlanningTruthState, 1)
+    if pointer is None or int(pointer.current_generation_id or -1) != int(parent.id):
+        raise CurrentReplenishmentError("bounded BUY parent is not current truth")
+    if target_cutoff is None or target.cutoff is None or parent.cutoff is None:
+        raise CurrentReplenishmentError("bounded BUY cutoffs are required")
+    requested_cutoff = target_cutoff
+    if target.cutoff.tzinfo is not None and requested_cutoff.tzinfo is None:
+        requested_cutoff = requested_cutoff.replace(tzinfo=timezone.utc)
+    elif target.cutoff.tzinfo is None and requested_cutoff.tzinfo is not None:
+        requested_cutoff = requested_cutoff.replace(tzinfo=None)
+    if _comparable_datetime(target.cutoff) != _comparable_datetime(requested_cutoff):
+        raise CurrentReplenishmentError("bounded BUY target cutoff mismatch")
+    if _comparable_datetime(target.cutoff) < _comparable_datetime(parent.cutoff):
+        raise CurrentReplenishmentError("bounded BUY target cutoff precedes parent")
+    if target.physical_import_batch_id is None or parent.physical_import_batch_id is None:
+        raise CurrentReplenishmentError("bounded BUY generations require import batches")
+    if int(target.physical_import_batch_id) < int(parent.physical_import_batch_id):
+        raise CurrentReplenishmentError("bounded BUY target import boundary precedes parent")
+    from .physical_visibility import PhysicalVisibilityError, require_import_batch
+
+    try:
+        parent_batch = require_import_batch(db, int(parent.physical_import_batch_id))
+        target_batch = require_import_batch(db, int(target.physical_import_batch_id))
+    except PhysicalVisibilityError as exc:
+        raise CurrentReplenishmentError(str(exc)) from exc
+    if (
+        _comparable_datetime(parent_batch.cutoff) != _comparable_datetime(parent.cutoff)
+        or _comparable_datetime(target_batch.cutoff) != _comparable_datetime(target.cutoff)
+    ):
+        raise CurrentReplenishmentError("BUY generation cutoff does not match import boundary")
+
+    if not (
+        manifest.new_sle_ids
+        or manifest.receipt_facts
+        or manifest.scope_receipt_facts
+        or manifest.supersession_edge_ids
+    ):
+        return BoundedBuyReplenishmentResult(
+            target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id),
+            source_revision=revision,
+            affected_scopes=scopes,
+            delta_fact_rows=0,
+            scope_replay_rows=0,
+            results=(),
+        )
+
+    scope_facts, delta_by_id, _old_ids = _bounded_buy_manifest_facts(
+        manifest,
+        scopes=scopes,
+        db=db,
+        parent=parent,
+        target=target,
+    )
+    _ensure_bounded_supplier_evidence(
+        db,
+        target=target,
+        facts_by_id=delta_by_id,
+    )
+    reserves_by_scope = _bounded_current_buy_reserves(db, scopes=scopes)
+    basis_by_scope = _bounded_current_buy_basis_facts(
+        db,
+        parent=parent,
+        scopes=scopes,
+        fallback_by_id=delta_by_id,
+    )
+    from .supplier_receipt_allocation import _exact_allocation_caps_by_order_line
+
+    exact_caps = _exact_allocation_caps_by_order_line(
+        db,
+        ledger_generation_id=int(parent.id),
+        item_ids={scope[0] for scope in scopes},
+        current_owner_ids={
+            int(reserve.reserve_id)
+            for reserves in reserves_by_scope.values()
+            for reserve in reserves
+        },
+    )
+    scopes_by_item_pool: dict[tuple[int, str], tuple[DistributionScope, ...]] = {}
+    for candidate in scopes:
+        key = (candidate[0], candidate[3])
+        scopes_by_item_pool[key] = (*scopes_by_item_pool.get(key, ()), candidate)
+    delta_scopes = {
+        _bounded_buy_fact_scope(fact, scopes_by_item_pool)
+        for fact in manifest.receipt_facts
+    }
+    results: list[CurrentReplenishmentResult] = []
+    replay_rows = 0
+    for scope in scopes:
+        explicit = tuple(scope_facts[scope])
+        if not explicit and scope not in delta_scopes:
+            # A declared scope may legitimately have no semantic input in a
+            # multi-scope manifest.  Do not touch its marker or allocations.
+            continue
+        if manifest.scope_receipt_facts:
+            baseline_ids = {int(fact.sle_id) for fact in basis_by_scope[scope]}
+            explicit_ids = {int(fact.sle_id) for fact in explicit}
+            if not baseline_ids.issubset(explicit_ids):
+                raise CurrentReplenishmentError(
+                    "BUY complete scope evidence omits current allocation basis"
+                )
+            full_facts = explicit
+        else:
+            full_by_id = {int(fact.sle_id): fact for fact in basis_by_scope[scope]}
+            for fact in explicit:
+                existing = full_by_id.get(int(fact.sle_id))
+                if existing is not None and existing != fact:
+                    raise CurrentReplenishmentError(
+                        "BUY current basis and delta evidence disagree"
+                    )
+                full_by_id[int(fact.sle_id)] = fact
+            full_facts = tuple(full_by_id.values())
+        if not full_facts:
+            continue
+        # SQLite strips timezone markers from persisted SLE timestamps while
+        # typed import evidence commonly arrives as aware UTC.  The allocator
+        # sorts the complete bounded stream, so keep its timestamp axis
+        # homogeneous without changing the represented source instant.
+        full_facts = tuple(
+            replace(
+                fact,
+                posting_at=_comparable_datetime(fact.posting_at),
+                known_at=_comparable_datetime(fact.known_at),
+            )
+            for fact in full_facts
+        )
+        replay_rows += len(full_facts)
+        visible_ids = {int(fact.sle_id) for fact in full_facts}
+        results.append(
+            apply_current_receipt_replay(
+                db,
+                generation_id=int(target.id),
+                source_key="physical-refresh:buy",
+                source_revision=revision,
+                receipt_facts=full_facts,
+                reserves=reserves_by_scope[scope],
+                complete_scope=True,
+                distribution_scope=scope,
+                exact_allocation_caps=exact_caps,
+                history_mode="as_occurred",
+                allow_building=True,
+                validated_visible_ids=visible_ids,
+            )
+        )
+    return BoundedBuyReplenishmentResult(
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        source_revision=revision,
+        affected_scopes=scopes,
+        delta_fact_rows=len(delta_by_id),
+        scope_replay_rows=replay_rows,
+        results=tuple(results),
+    )

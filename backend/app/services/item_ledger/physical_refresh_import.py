@@ -479,10 +479,10 @@ def run_physical_recorder_audit(
     ledger_generation_id: int,
     parent_generation_id: int,
     client: Any,
-    discovery_lookback: timedelta | None = None,
+    discovery_lookback: timedelta | None = timedelta(0),
     discovery_window_size: timedelta = DISCOVERY_WINDOW_SIZE,
     discovery_page_size: int = DISCOVERY_PAGE_SIZE,
-    audit_all_known_recorders: bool = True,
+    audit_all_known_recorders: bool = False,
 ) -> PhysicalRefreshImportResult:
     """Run recorder-audit refresh for one physical-refresh BUILDING generation.
 
@@ -534,19 +534,26 @@ def run_physical_recorder_audit(
         )
     _assert_global_terminal(db, start_boundary_id)
 
-    # Discovery precedes the known set: a recorder that only 1C knows about must
-    # join this audit, otherwise it can never enter the ledger at all.
-    # Keep the complete parent identity set even on the incremental path.  The
-    # light-weight historical scan below is specifically meant to find a
-    # recorder that 1C posted today with an old document Period.  Comparing it
-    # only with the due queue made every historical identity look "new" and
-    # turned the incremental refresh back into a full recorder audit.
-    visible_states = _visible_recorder_states(
-        db, int(parent_generation_id)
+    # Routine refreshes are driven only by explicitly queued recorder
+    # identities.  Building the complete accepted-prefix recorder state here
+    # is itself an O(history) scan and was the hidden source of the old full
+    # replay.  Parent-state comparison is reserved for explicit maintenance
+    # (full audit or a requested historical discovery window).
+    needs_parent_state = (
+        audit_all_known_recorders
+        or discovery_lookback is None
+        or discovery_lookback > timedelta(0)
+    )
+    visible_states = (
+        _visible_recorder_states(db, int(parent_generation_id))
+        if needs_parent_state else {}
     )
     all_known_recorders = tuple(sorted(visible_states))
     due_recorders = _collect_due_recorder_identities(db)
-    pull_state_drift = _collect_pull_state_drift_identities(db, visible_states)
+    pull_state_drift = (
+        _collect_pull_state_drift_identities(db, visible_states)
+        if needs_parent_state else ()
+    )
     audit_recorders = (
         _merge_recorder_identities(
             all_known_recorders,

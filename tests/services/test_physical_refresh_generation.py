@@ -138,6 +138,39 @@ def test_create_physical_refresh_generation_reuses_current_accepted_prefix(db_se
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
 
+def test_lightweight_refresh_fork_does_not_clone_bins_or_provenance(db_session):
+    parent, physical = _accepted_parent(db_session, key="lightweight")
+    _supplier_provenance(db_session, parent, physical)
+    before_bins = db_session.query(models.StockBin).count()
+    before_provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).count()
+
+    result = fork_physical_refresh_generation(
+        db_session,
+        parent.id,
+        "lightweight-refresh",
+        from_cutoff=parent.cutoff,
+        target_cutoff=parent.cutoff + timedelta(days=1),
+        lightweight=True,
+    )
+    candidate_bins = db_session.query(models.StockBin).filter(
+        models.StockBin.ledger_generation_id == result.ledger_generation_id
+    ).count()
+    candidate_provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter(
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+        == result.ledger_generation_id,
+    ).count()
+    assert db_session.query(models.StockBin).count() == before_bins
+    assert db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).count() == before_provenance
+    assert candidate_bins == 0
+    assert candidate_provenance == 0
+
+
 def test_retry_is_idempotent_for_exact_candidate(db_session):
     parent, _ = _accepted_parent(db_session)
     from_cutoff = parent.cutoff

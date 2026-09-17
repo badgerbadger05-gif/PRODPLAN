@@ -279,7 +279,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
         call_order.append("refresh")
         assert kwargs["generation_key"].startswith(f"physical-refresh:{parent.id}:")
         assert kwargs["target_cutoff"].tzinfo is not None
-        assert kwargs["discovery_lookback"] == timedelta(days=7)
+        assert kwargs["discovery_lookback"] == timedelta(0)
         assert kwargs["audit_all_known_recorders"] is False
         assert kwargs["opening_balance_loader"](opening_at) == {}
         result = Result()
@@ -592,6 +592,47 @@ def test_physical_refresh_recovers_building_generation_when_state_is_lost(
     assert result["job"] == "physicalRefresh"
     assert seen["key"] == candidate.generation_key
     assert seen["cutoff"] == cutoff.replace(tzinfo=timezone.utc)
+
+
+def test_status_surfaces_live_phase_for_single_recoverable_candidate(
+    db_session, monkeypatch
+):
+    parent = _accepted_parent_fixture(db_session)
+    candidate = models.LedgerGeneration(
+        generation_key="physical-refresh:live-phase",
+        status="building",
+        cutoff=parent.cutoff + timedelta(hours=1),
+        source_watermarks={
+            "generation_kind": "physical_refresh",
+            "parent_generation_id": int(parent.id),
+        },
+        capabilities={},
+        physical_import_batch_id=parent.physical_import_batch_id,
+        algorithm_version="ledger-physical-refresh-generation/1",
+    )
+    db_session.add(candidate)
+    db_session.commit()
+    seen = []
+
+    def _live_phase(generation_id):
+        seen.append(int(generation_id))
+        return {
+            "target_generation_id": int(generation_id),
+            "current_phase": "production_payload",
+            "phase_elapsed_ms": 123,
+            "elapsed_ms": 456,
+            "phase_timings": {"stock": 17},
+        }
+
+    monkeypatch.setattr(orch, "physical_refresh_phase_status", _live_phase)
+    snapshot = orch.status(db_session)
+    physical = snapshot["physical_refresh"]
+    assert seen == [int(candidate.id)]
+    assert physical["current_phase"] == "production_payload"
+    assert physical["phase_elapsed_ms"] == 123
+    assert physical["elapsed_ms"] == 456
+    assert physical["phase_timings"] == {"stock": 17}
+    assert physical["live_phase"]["target_generation_id"] == candidate.id
 
 
 @pytest.mark.parametrize(

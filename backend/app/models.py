@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from sqlalchemy import Column, Integer, BigInteger, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint, Index
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
@@ -159,11 +159,11 @@ class LedgerBuildBatch(Base):
     ledger_generation = relationship("LedgerGeneration")
 
 class LedgerFutureSupply(Base):
-    """Immutable, generation-scoped snapshot of supply available after cutoff.
+    """Bounded BUILDING staging of supply available after cutoff.
 
-    This is deliberately a captured source fact, not an MRP proposal.  Future
-    WIP and supplier-order coverage therefore remains auditable against the
-    precise Ledger generation which consumed it.
+    Publication moves the accepted contour into ``LedgerFutureSupplyCurrent``
+    and removes these staging rows in the same transaction.  This is
+    deliberately a captured source fact, not an MRP proposal.
     """
 
     __tablename__ = "ledger_future_supply"
@@ -271,9 +271,9 @@ class LedgerFutureSupply(Base):
 class LedgerFutureSupplyCurrent(Base):
     """One stable current row per supplier/WIP source identity.
 
-    ``LedgerFutureSupply`` remains the immutable generation capture/staging
-    surface.  This compact table is the only current quantity owner; refreshes
-    update the same row and retain before/after evidence in the change table.
+    ``LedgerFutureSupply`` is bounded BUILDING staging.  This compact table is
+    the only current quantity owner; refreshes update the same row and retain
+    before/after evidence in the change table.
     """
 
     __tablename__ = "ledger_future_supply_current"
@@ -334,6 +334,13 @@ class LedgerFutureSupplyCurrent(Base):
     reason = Column(TEXT, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    # Read-contract aliases shared with BUILDING staging.  Consumers must use
+    # the canonical future-supply source selector; these aliases keep their
+    # generation/capture predicates identical while the accepted owner uses
+    # provenance column names.
+    ledger_generation_id = synonym("source_generation_id")
+    capture_batch_id = synonym("source_capture_batch_id")
 
     source_generation = relationship("LedgerGeneration", foreign_keys=[source_generation_id])
     source_capture_batch = relationship("LedgerBuildBatch", foreign_keys=[source_capture_batch_id])
@@ -3932,6 +3939,17 @@ class ReservationEntry(Base):
         ),
         Index("ix_reservation_entry_run_version", "run_id", "freeze_version"),
         Index("ix_reservation_entry_requirement", "requirement_id"),
+        Index(
+            "ux_reservation_entry_current_identity",
+            "current_identity",
+            unique=True,
+            postgresql_where=text("is_current = true AND current_identity <> ''"),
+            sqlite_where=text("is_current = 1 AND current_identity <> ''"),
+        ),
+        CheckConstraint(
+            "owner_kind IN ('building', 'current', 'legacy')",
+            name="ck_reservation_entry_owner_kind",
+        ),
     )
 
     def __init__(self, **kwargs):
@@ -3992,6 +4010,11 @@ class ReservationEntry(Base):
     opened_at = Column(TIMESTAMP, nullable=True)
     closed_at = Column(TIMESTAMP, nullable=True)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
+    # A requirement identity is stable across physical refresh generations.
+    # Generation remains provenance/staging scope; it is never current identity.
+    current_identity = Column(String(256), nullable=False, server_default="")
+    owner_kind = Column(String(16), nullable=False, server_default="building")
+    is_current = Column(Boolean, nullable=False, default=False, server_default="false")
 
     item = relationship("Item")
     run = relationship("PlanningRun")
@@ -4020,6 +4043,17 @@ class ReservationEvent(Base):
             "planning_stock_pool",
         ),
         Index("ix_reservation_event_sle", "sle_id"),
+        Index(
+            "ux_reservation_event_current_identity",
+            "event_identity",
+            unique=True,
+            postgresql_where=text("event_identity <> '' AND is_current = true"),
+            sqlite_where=text("event_identity <> '' AND is_current = 1"),
+        ),
+        CheckConstraint(
+            "origin_kind IN ('obligation', 'factual', 'correction', 'replay', 'legacy')",
+            name="ck_reservation_event_origin_kind",
+        ),
     )
 
     id = Column(BigIntPK, primary_key=True, index=True)
@@ -4048,10 +4082,83 @@ class ReservationEvent(Base):
     idempotency_key = Column(String(120), nullable=False)
     event_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    # Stable semantic identity excludes generation/cycle/idempotency.  During a
+    # BUILDING replay this is populated only after the event has been validated;
+    # technical replay rows are not current audit.
+    event_identity = Column(String(320), nullable=False, server_default="")
+    origin_kind = Column(String(16), nullable=False, server_default="obligation")
+    is_current = Column(Boolean, nullable=False, default=False, server_default="false")
 
     reservation = relationship("ReservationEntry")
     item = relationship("Item")
     ledger_generation = relationship("LedgerGeneration")
+
+
+class ReservationCurrentChange(Base):
+    """Append-only semantic changes of the stable current reservation owner."""
+
+    __tablename__ = "reservation_current_change"
+    __table_args__ = (
+        Index("ix_reservation_current_change_identity", "current_identity"),
+        CheckConstraint(
+            "operation IN ('insert', 'update', 'close', 'reopen')",
+            name="ck_reservation_current_change_operation",
+        ),
+        CheckConstraint(
+            "origin_kind IN ('obligation', 'factual', 'correction')",
+            name="ck_reservation_current_change_origin_kind",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    current_identity = Column(String(256), nullable=False)
+    reservation_id = Column(
+        BigInteger, ForeignKey("reservation_entry.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    source_generation_id = Column(
+        # Provenance scalar only: future GC must be able to reclaim accepted
+        # generations without an audit FK keeping them alive.
+        BigInteger, nullable=False, index=True,
+    )
+    operation = Column(String(16), nullable=False)
+    origin_kind = Column(String(16), nullable=False)
+    before_payload = Column(CrossPlatformJSON, nullable=True)
+    after_payload = Column(CrossPlatformJSON, nullable=True)
+    source_event_identity = Column(String(320), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ReservationEventArchive(Base):
+    """Legacy event provenance retained outside the runtime current fold.
+
+    Rows are written only by the set-based current-owner migration when an
+    event cannot be proven to belong to the accepted current obligation owner.
+    The archive is never a runtime fallback or quantity source.
+    """
+
+    __tablename__ = "reservation_event_archive"
+    __table_args__ = (
+        UniqueConstraint(
+            "business_identity", "event_identity",
+            name="uq_reservation_event_archive_identity",
+        ),
+        Index("ix_reservation_event_archive_identity", "business_identity"),
+        Index("ix_reservation_event_archive_source_generation", "source_generation_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    # Provenance scalar only: the compact archive must not keep accepted
+    # ledger generations alive and is never a runtime truth source.
+    source_generation_id = Column(BigInteger, nullable=False, index=True)
+    source_reservation_id = Column(BigInteger, nullable=False, index=True)
+    business_identity = Column(String(256), nullable=False)
+    event_identity = Column(String(320), nullable=False)
+    origin_kind = Column(String(16), nullable=False, server_default="legacy")
+    occurrence_count = Column(BigInteger, nullable=False, server_default="1")
+    first_source_generation_id = Column(BigInteger, nullable=True, index=True)
+    last_source_generation_id = Column(BigInteger, nullable=True, index=True)
+    archived_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ReservationConsumptionAllocation(Base):

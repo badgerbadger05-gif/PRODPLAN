@@ -287,6 +287,114 @@ def test_physical_refresh_balance_convergence_passes_and_persists_metadata(db_se
     assert convergence["physical_import_batch_id"] == created.physical_import_batch_id
 
 
+def test_physical_refresh_bounded_convergence_uses_current_stock_bin_not_history(
+    db_session, monkeypatch
+):
+    created = _generation(db_session, "phase0-phys-refresh-bounded")
+    generation = db_session.get(models.LedgerGeneration, created.ledger_generation_id)
+    generation.source_watermarks = {
+        "generation_kind": "physical_refresh",
+        "historical_import_completed_through": created.cutoff.replace(
+            tzinfo=timezone.utc
+        ).isoformat(),
+    }
+    item = _item(db_session, "PH0-PH-BOUNDED")
+    db_session.add(models.StockBin(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-1",
+        on_hand=Decimal("2"),
+        is_current=True,
+    ))
+    db_session.commit()
+    monkeypatch.setattr(
+        "app.services.item_ledger.historical_bootstrap_phase0._aggregate_sles_for_convergence",
+        lambda *args, **kwargs: pytest.fail("bounded convergence scanned historical SLE"),
+    )
+
+    checked = evaluate_physical_refresh_balance_convergence(
+        db_session,
+        ledger_generation_id=generation.id,
+        balance_snapshot={LedgerKey(item.item_id, "", "", "WH-1"): Decimal("2")},
+        base_generation_id=generation.id,
+    )
+    assert checked.valid is True
+    assert checked.mismatched == 0
+
+
+def test_bounded_convergence_subtracts_same_window_superseded_fact_once(db_session):
+    cutoff = datetime(2026, 7, 31, 23, 59, 59, tzinfo=timezone.utc)
+    parent_batch = models.PhysicalImportBatch(
+        batch_key="phase0-bounded-parent-batch", status="completed",
+        cutoff=cutoff, source_watermarks={}, completed_at=cutoff,
+    )
+    parent = models.LedgerGeneration(
+        generation_key="phase0-bounded-parent", status="accepted", cutoff=cutoff,
+        source_watermarks={"replay_from": "2026-07-01T00:00:00+00:00"},
+        capabilities={"physical_ledger": True}, physical_import_batch=parent_batch,
+        algorithm_version="test", accepted_at=cutoff,
+    )
+    batch_one = models.PhysicalImportBatch(
+        batch_key="phase0-bounded-window-one", status="completed",
+        cutoff=cutoff, source_watermarks={}, completed_at=cutoff,
+    )
+    batch_two = models.PhysicalImportBatch(
+        batch_key="phase0-bounded-window-two", status="completed",
+        cutoff=cutoff, source_watermarks={}, completed_at=cutoff,
+    )
+    target = models.LedgerGeneration(
+        generation_key="phase0-bounded-target", status="building", cutoff=cutoff,
+        source_watermarks={"generation_kind": "physical_refresh"}, capabilities={},
+        physical_import_batch=batch_two, algorithm_version="test",
+    )
+    item = _item(db_session, "PH0-SAME-WINDOW-REVISION")
+    db_session.add_all([parent_batch, parent, batch_one, batch_two, target])
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    db_session.add(models.StockBin(
+        ledger_generation_id=parent.id, item_id=item.item_id,
+        characteristic_ref="", organization_ref="", warehouse_ref1c="WH-1",
+        on_hand=Decimal("0"), is_current=True,
+    ))
+    old = models.StockLedgerEntry(
+        ingest_batch_id=batch_one.id, source_content_hash="same-window-old",
+        business_identity="same-window-business", item_id=item.item_id,
+        characteristic_ref="", organization_ref="", warehouse_ref1c="WH-1",
+        qty=Decimal("5"), posting_at=cutoff, record_type="Receipt",
+        movement_kind="assembly_in", recorder_type="Production",
+        recorder_ref="same-window", line_no="1", ingest_source="pull",
+    )
+    replacement = models.StockLedgerEntry(
+        ingest_batch_id=batch_two.id, source_content_hash="same-window-new",
+        business_identity="same-window-business", item_id=item.item_id,
+        characteristic_ref="", organization_ref="", warehouse_ref1c="WH-1",
+        qty=Decimal("7"), posting_at=cutoff, record_type="Receipt",
+        movement_kind="assembly_in", recorder_type="Production",
+        recorder_ref="same-window", line_no="1", ingest_source="pull",
+    )
+    db_session.add_all([old, replacement])
+    db_session.flush()
+    edge = models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=replacement.id, import_batch_id=batch_two.id,
+    )
+    db_session.add(edge)
+    db_session.commit()
+
+    checked = evaluate_physical_refresh_balance_convergence(
+        db_session,
+        ledger_generation_id=target.id,
+        balance_snapshot={LedgerKey(item.item_id, "", "", "WH-1"): Decimal("7")},
+        base_generation_id=parent.id,
+        delta_rows=(old, replacement),
+        new_rows=(old, replacement),
+        supersession_edges=(edge,),
+    )
+    assert checked.valid is True
+    assert checked.deltas[0].ledger_qty == "7"
+
+
 def test_physical_refresh_balance_convergence_detects_mismatch_and_marks_invalid(
     db_session,
 ):

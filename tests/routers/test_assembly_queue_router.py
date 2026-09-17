@@ -1075,6 +1075,51 @@ def test_current_drum_get_returns_persisted_excluded_rows(db_session):
     assert response.excluded[0].plan_line_id == 10
 
 
+def test_current_shelf_get_returns_persisted_empty_or_nonempty_scope(db_session):
+    generation, _ = _accepted_generation(db_session)
+    item = models.Item(item_code="SHELF-1", item_name="Shelf item")
+    db_session.add(item)
+    db_session.flush()
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    publish_current_execution_scope(
+        db_session,
+        source_revision="accepted:r11-shelf",
+        source_generation_id=int(generation.id),
+        scope_key="shelf:all-live-mrps",
+        entity_kinds=("shelf_projection",),
+        rows=[{
+            "entity_kind": "shelf_projection",
+            "business_identity": "shelf-policy:1",
+            "scope_key": "shelf:all-live-mrps",
+            "payload": {
+                "policy_id": 1,
+                "item_id": int(item.item_id),
+                "warehouse_ref1c": "WH-1",
+                "protection_until": "2026-08-10",
+                "target_qty": "4",
+                "shelf_physical_qty": "1",
+                "other_stock_qty": "0",
+                "projected_qty": "1",
+                "gap_qty": "3",
+                "transfer_qty": "0",
+                "unlaunched_mrp_qty": "3",
+                "pull_qty": "3",
+                "materialized_qty": "0",
+                "first_shortage_date": "2026-08-05",
+                "latest_start_date": "2026-08-01",
+                "demand_manifest": [],
+            },
+        }],
+    )
+    db_session.commit()
+
+    response = get_shelf_projections(limit=10, offset=0, db=db_session)
+    assert response.total_rows == 1
+    assert response.rows[0].item_code == "SHELF-1"
+    assert response.rows[0].gap_qty == 3.0
+
+
 def test_drum_router_pages_slots_and_reports_totals(client, db_session):
     generation, cutoff = _accepted_generation(db_session)
     _drum_schedule_with_slots(db_session, generation, cutoff, slot_count=5)

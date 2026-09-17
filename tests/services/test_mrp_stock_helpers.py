@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pytest
+from sqlalchemy import event
 
 from app import models
 from app.models import (
@@ -167,6 +168,84 @@ def test_planning_stock_is_empty_when_warehouse_policy_selects_nothing(
         db_session,
         int(building_ledger_generation.id),
     ) == {}
+
+
+def test_planning_stock_allows_parent_and_bounded_building_child_provenance(
+    db_session, building_ledger_generation,
+):
+    parent = building_ledger_generation
+    parent.status = "accepted"
+    parent.cutoff = datetime(2026, 7, 26)
+    parent.accepted_at = parent.cutoff
+    child_batch = models.PhysicalImportBatch(
+        batch_key="stock-provenance-child", status="completed",
+        source_watermarks={}, cutoff=datetime(2026, 7, 27),
+    )
+    child = models.LedgerGeneration(
+        generation_key="stock-provenance-child", status="building",
+        cutoff=datetime(2026, 7, 27), source_watermarks={
+            "parent_generation_id": int(parent.id),
+        }, capabilities={}, physical_import_batch=child_batch,
+        algorithm_version="test",
+    )
+    first = _mk_item(db_session, code="STK-PARENT-OWNER")
+    second = _mk_item(db_session, code="STK-CHILD-OWNER")
+    db_session.add(child)
+    db_session.flush()
+    db_session.add_all([
+        models.StockBin(
+            ledger_generation_id=parent.id, item_id=first.item_id,
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH-PARENT", on_hand=3, is_current=True,
+        ),
+        models.StockBin(
+            ledger_generation_id=child.id, item_id=second.item_id,
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH-CHILD", on_hand=4, is_current=True,
+        ),
+    ])
+    db_session.flush()
+
+    assert planning_stock_by_item(db_session, int(parent.id)) == {
+        first.item_id: 3.0, second.item_id: 4.0,
+    }
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = child.id
+    child.status = "accepted"
+    child.accepted_at = child.cutoff
+    db_session.flush()
+    assert planning_stock_by_item(db_session, int(child.id)) == {
+        first.item_id: 3.0, second.item_id: 4.0,
+    }
+
+
+def test_planning_stock_lineage_validation_is_cached_per_session(db_session, building_ledger_generation):
+    generation = building_ledger_generation
+    item = _mk_item(db_session, code="STK-LINEAGE-CACHE")
+    db_session.add(models.StockBin(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-CACHE",
+        on_hand=2,
+        is_current=True,
+    ))
+    db_session.flush()
+    db_session.expire_all()
+    statements = []
+    connection = db_session.connection()
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if "ledger_generation" in statement.lower():
+            statements.append(statement)
+
+    event.listen(connection, "before_cursor_execute", capture)
+    try:
+        for _ in range(8):
+            assert planning_stock_by_item(db_session, int(generation.id))[item.item_id] == 2.0
+    finally:
+        event.remove(connection, "before_cursor_execute", capture)
+    assert len(statements) <= 2
 
 
 def test_effective_stock_fails_closed_without_published_ledger(db_session):

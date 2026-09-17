@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from app import models
 
 from .reservation import replenishment_remaining
 from .shelf_projection_core import ShelfDemand, ShelfReceipt, project_shelf
+from .future_supply_read import future_supply_model
 
 
 STAGE = "shelf_projection"
@@ -184,28 +186,243 @@ def _confirmed_receipts(
     """Read dated WIP receipts only from this generation's sealed capture."""
     if not requirement_ids:
         return ()
+    future_supply = future_supply_model(db, int(generation_id))
     rows = (
         db.query(
-            models.LedgerFutureSupply.eta_date,
-            models.LedgerFutureSupply.open_qty_at_cutoff,
+            future_supply.eta_date,
+            future_supply.open_qty_at_cutoff,
         )
         .filter(
-            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
-            models.LedgerFutureSupply.supply_kind == "wip_order",
-            models.LedgerFutureSupply.evidence_status == "exact",
-            models.LedgerFutureSupply.item_id == int(item_id),
-            models.LedgerFutureSupply.source_requirement_id.in_(requirement_ids),
-            models.LedgerFutureSupply.destination_warehouse_ref1c
+            future_supply.ledger_generation_id == int(generation_id),
+            future_supply.supply_kind == "wip_order",
+            future_supply.evidence_status == "exact",
+            future_supply.item_id == int(item_id),
+            future_supply.source_requirement_id.in_(requirement_ids),
+            future_supply.destination_warehouse_ref1c
             == str(warehouse_ref1c),
-            models.LedgerFutureSupply.open_qty_at_cutoff > 0,
-            models.LedgerFutureSupply.eta_date.is_not(None),
+            future_supply.open_qty_at_cutoff > 0,
+            future_supply.eta_date.is_not(None),
         )
-        .order_by(models.LedgerFutureSupply.eta_date, models.LedgerFutureSupply.id)
+        .order_by(future_supply.eta_date, future_supply.id)
         .all()
     )
     return tuple(
         ShelfReceipt(available_from=eta_date, qty=_d(open_qty))
         for eta_date, open_qty in rows
+    )
+
+
+@dataclass(frozen=True)
+class CompactShelfProjectionPayload:
+    """Full current shelf scope built without ShelfProjection staging rows."""
+
+    target_generation_id: int
+    parent_generation_id: int
+    rows: tuple[dict[str, Any], ...]
+    metrics: dict[str, Any]
+
+
+def _open_current_mrp(
+    db: Session,
+    item_id: int,
+) -> tuple[Decimal, list[int]]:
+    rows = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.item_id == int(item_id),
+            models.ReservationEntry.is_current.is_(True),
+            models.ReservationEntry.owner_kind == "current",
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.realization_mode == "make",
+        )
+        .order_by(models.ReservationEntry.priority_period_from, models.ReservationEntry.id)
+        .all()
+    )
+    return (
+        sum(
+            (
+                replenishment_remaining(
+                    row.replenishment_required_qty,
+                    row.replenishment_received_qty,
+                )
+                for row in rows
+            ),
+            Decimal("0"),
+        ),
+        [int(row.requirement_id) for row in rows],
+    )
+
+
+def _confirmed_current_receipts(
+    db: Session,
+    parent_generation_id: int,
+    item_id: int,
+    requirement_ids: list[int],
+    warehouse_ref1c: str,
+) -> tuple[ShelfReceipt, ...]:
+    if not requirement_ids:
+        return ()
+    future_supply = future_supply_model(
+        db,
+        int(parent_generation_id),
+        allow_building_read=False,
+    )
+    rows = (
+        db.query(future_supply.eta_date, future_supply.open_qty_at_cutoff)
+        .filter(
+            future_supply.supply_kind == "wip_order",
+            future_supply.evidence_status == "exact",
+            future_supply.item_id == int(item_id),
+            future_supply.source_requirement_id.in_(requirement_ids),
+            future_supply.destination_warehouse_ref1c == str(warehouse_ref1c),
+            future_supply.open_qty_at_cutoff > 0,
+            future_supply.eta_date.is_not(None),
+        )
+        .order_by(future_supply.eta_date, future_supply.id)
+        .all()
+    )
+    return tuple(
+        ShelfReceipt(available_from=eta_date, qty=_d(open_qty))
+        for eta_date, open_qty in rows
+    )
+
+
+def build_compact_current_shelf_payload(
+    db: Session,
+    *,
+    target_generation_id: int,
+    parent_generation_id: int,
+    drum_payload: Any,
+) -> CompactShelfProjectionPayload:
+    """Build shelf projection from compact drum DTOs and current owners."""
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if target is None or str(target.status or "") != "building":
+        raise ValueError("compact shelf payload requires a BUILDING target")
+    if parent is None or str(parent.status or "") != "accepted":
+        raise ValueError("compact shelf payload requires an accepted parent")
+    if target.cutoff is None or int(target.id) == int(parent.id):
+        raise ValueError("compact shelf payload target boundary is invalid")
+
+    policies = (
+        db.query(models.ShelfPolicy)
+        .filter(models.ShelfPolicy.active.is_(True))
+        .order_by(models.ShelfPolicy.item_id, models.ShelfPolicy.id)
+        .all()
+    )
+    policy_by_item = {int(row.item_id): row for row in policies}
+    demand_by_policy: dict[int, list[dict[str, Any]]] = {
+        int(row.id): [] for row in policies
+    }
+    raw_rows = list(getattr(drum_payload, "rows", ()) or ())
+    slot_rows = [
+        row for row in raw_rows
+        if isinstance(row, Mapping) and str(row.get("entity_kind")) == "drum_slot"
+    ]
+    root_ids = {int((row.get("payload") or {}).get("item_id")) for row in slot_rows}
+    run_ids = {int((row.get("payload") or {}).get("run_id")) for row in slot_rows}
+    component_item_ids = set(policy_by_item)
+    components: dict[tuple[int, int, int], list[Any]] = {}
+    if root_ids and run_ids and component_item_ids:
+        rows = (
+            db.query(models.MrpFreezeComponentCumulative, models.PlanningRun)
+            .join(
+                models.PlanningRun,
+                models.PlanningRun.run_id == models.MrpFreezeComponentCumulative.run_id,
+            )
+            .filter(
+                models.MrpFreezeComponentCumulative.run_id.in_(sorted(run_ids)),
+                models.MrpFreezeComponentCumulative.root_item_id.in_(sorted(root_ids)),
+                models.MrpFreezeComponentCumulative.component_item_id.in_(sorted(component_item_ids)),
+                models.MrpFreezeComponentCumulative.freeze_version
+                == models.PlanningRun.active_freeze_version,
+            )
+            .all()
+        )
+        for component, run in rows:
+            components.setdefault(
+                (int(run.run_id), int(component.root_item_id), int(component.component_item_id)),
+                [],
+            ).append(component)
+    for raw in slot_rows:
+        payload = raw.get("payload") or {}
+        run_id = int(payload.get("run_id") or 0)
+        root_item_id = int(payload.get("item_id") or 0)
+        slot_qty = _d(payload.get("slot_qty"))
+        slot_date = datetime.fromisoformat(str(payload["slot_date"])).date()
+        for component_item_id, policy in policy_by_item.items():
+            for component in components.get((run_id, root_item_id, component_item_id), []):
+                qty = slot_qty * _d(component.cumulative_norm_qty_per_root_unit)
+                if qty <= 0:
+                    continue
+                demand_by_policy[int(policy.id)].append({
+                    "need_date": slot_date,
+                    "qty": qty,
+                    "priority": tuple(payload.get("original_priority") or ()),
+                    "planning_run_id": run_id,
+                    "plan_id": int(payload.get("plan_id") or 0),
+                    "plan_line_id": int(payload.get("plan_line_id") or 0),
+                    "drum_slot_identity": str(raw.get("business_identity") or ""),
+                    "freeze_component_id": int(component.id),
+                    "root_item_id": root_item_id,
+                    "component_cumulative_norm": str(_d(component.cumulative_norm_qty_per_root_unit)),
+                })
+
+    ignored_warehouses = _ignored_warehouses(db)
+    created: list[dict[str, Any]] = []
+    for policy in policies:
+        manifest = demand_by_policy[int(policy.id)]
+        open_qty, requirement_ids = _open_current_mrp(db, int(policy.item_id))
+        shelf_qty, other_qty = _stock(
+            db, int(parent.id), int(policy.item_id), str(policy.warehouse_ref1c), ignored_warehouses
+        )
+        result = project_shelf(
+            tuple(ShelfDemand(row["need_date"], row["qty"], row["priority"]) for row in manifest),
+            as_of=target.cutoff.date(),
+            replenishment_time_days=int(policy.replenishment_time_days),
+            review_cycle_days=int(policy.review_cycle_days),
+            safety_days=int(policy.safety_days),
+            batch_multiple=_d(policy.batch_multiple),
+            open_mrp_qty=open_qty,
+            shelf_physical_qty=shelf_qty,
+            other_stock_qty=other_qty,
+            confirmed_receipts=_confirmed_current_receipts(
+                db, int(parent.id), int(policy.item_id), requirement_ids, str(policy.warehouse_ref1c)
+            ),
+        )
+        created.append({
+            "entity_kind": "shelf_projection",
+            "business_identity": f"shelf-policy:{int(policy.id)}",
+            "scope_key": "shelf:all-live-mrps",
+            "payload": {
+                "policy_id": int(policy.id), "item_id": int(policy.item_id),
+                "warehouse_ref1c": str(policy.warehouse_ref1c),
+                "as_of_date": target.cutoff.date().isoformat(),
+                "protection_until": result.protection_until.isoformat(),
+                "target_qty": str(result.target_qty),
+                "shelf_physical_qty": str(result.shelf_physical_qty),
+                "other_stock_qty": str(result.other_stock_qty),
+                "confirmed_open_production_qty": str(result.confirmed_open_production_qty),
+                "projected_qty": str(result.projected_qty), "gap_qty": str(result.gap_qty),
+                "transfer_qty": str(result.transfer_qty),
+                "unlaunched_mrp_qty": str(result.unlaunched_mrp_qty),
+                "pull_qty": str(result.pull_qty), "materialized_qty": str(result.materialized_qty),
+                "first_shortage_date": result.first_shortage_date.isoformat() if result.first_shortage_date else None,
+                "latest_start_date": result.latest_start_date.isoformat() if result.latest_start_date else None,
+                "demand_manifest": [
+                    {
+                        **{key: value for key, value in demand.items() if key != "priority"},
+                        "need_date": demand["need_date"].isoformat(),
+                        "qty": str(demand["qty"]), "priority": list(demand["priority"]),
+                    }
+                    for demand in manifest
+                ],
+            },
+        })
+    return CompactShelfProjectionPayload(
+        target_generation_id=int(target.id), parent_generation_id=int(parent.id),
+        rows=tuple(created), metrics={"projection_rows": len(created)},
     )
 
 

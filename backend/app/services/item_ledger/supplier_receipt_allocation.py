@@ -108,6 +108,26 @@ class ReceiptFact:
 
 
 @dataclass(frozen=True)
+class NormalizedSupplierReceiptFact:
+    """One canonical evidence-to-SLE normalization result.
+
+    The matcher is read-only and deliberately returns the status alongside
+    the allocator fact.  Callers must not infer ``exact`` from the raw
+    supplier-order reference: a document line ``0`` is exact only when the
+    canonical order lookup resolves one positive order line.
+    """
+
+    fact: ReceiptFact
+    evidence: SupplierDocumentEvidence
+    operation: str
+    match_status: str
+    canonical_line_no: str | None
+    match_rule: str
+    ambiguity_count: int
+    reason: str | None
+
+
+@dataclass(frozen=True)
 class CoverageAllocation:
     fact: ReceiptFact
     reservation: models.ReservationEntry
@@ -297,8 +317,87 @@ def _buy_reservations_for_item(
 def _exact_allocation_caps_by_order_line(
     db: Session,
     ledger_generation_id: int,
+    item_ids: Iterable[int] | None = None,
+    current_owner_ids: Iterable[int] | None = None,
 ) -> dict[tuple[int, str, str], dict[int, Decimal]]:
-    rows = (
+    """Return exact supplier-order caps for legacy or stable current owners.
+
+    Historical callers retain the generation-scoped query.  The compact R4
+    path passes stable current reservation IDs instead: generation is
+    provenance there, not owner identity.  Export rows are grouped per source
+    generation; identical repeated copies are deduplicated and conflicting
+    copies fail closed rather than silently inflating an exact cap.
+    """
+
+    if current_owner_ids is not None:
+        owner_ids = sorted({int(value) for value in current_owner_ids})
+        if not owner_ids:
+            return {}
+        rows = (
+            db.query(
+                models.ReservationEntry.item_id,
+                models.PurchaseExportObligationAllocation.supplier_order_ref,
+                models.PurchaseExportObligationAllocation.supplier_order_line_no,
+                models.PurchaseExportObligationAllocation.reservation_id,
+                models.PurchaseExportObligationAllocation.ledger_generation_id,
+                func.sum(models.PurchaseExportObligationAllocation.allocated_qty),
+            )
+            .join(
+                models.ReservationEntry,
+                models.ReservationEntry.id
+                == models.PurchaseExportObligationAllocation.reservation_id,
+            )
+            .filter(
+                models.PurchaseExportObligationAllocation.reservation_id.in_(owner_ids),
+                models.ReservationEntry.id.in_(owner_ids),
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.planning_stock_pool == "default",
+                models.ReservationEntry.realization_mode == "buy",
+                models.ReservationEntry.lifecycle_status == "active",
+            )
+        )
+        if item_ids is not None:
+            rows = rows.filter(
+                models.ReservationEntry.item_id.in_(
+                    sorted({int(value) for value in item_ids})
+                )
+            )
+        grouped = rows.group_by(
+            models.ReservationEntry.item_id,
+            models.PurchaseExportObligationAllocation.supplier_order_ref,
+            models.PurchaseExportObligationAllocation.supplier_order_line_no,
+            models.PurchaseExportObligationAllocation.reservation_id,
+            models.PurchaseExportObligationAllocation.ledger_generation_id,
+        ).all()
+        values_by_key: dict[tuple[int, str, str, int], set[Decimal]] = {}
+        for (
+            item_id,
+            supplier_order_ref,
+            supplier_order_line_no,
+            reservation_id,
+            _source_generation_id,
+            total,
+        ) in grouped:
+            key = (
+                int(item_id),
+                _text(supplier_order_ref),
+                _text(supplier_order_line_no),
+                int(reservation_id),
+            )
+            values_by_key.setdefault(key, set()).add(_decimal(total))
+        caps: dict[tuple[int, str, str], dict[int, Decimal]] = {}
+        for (item_id, order_ref, line_no, reservation_id), values in values_by_key.items():
+            if len(values) != 1:
+                raise SupplierReceiptEvidenceError(
+                    "conflicting exact supplier-order caps across current-owner generations"
+                )
+            key = _order_line_key(item_id, order_ref, line_no)
+            if key is None:
+                continue
+            caps.setdefault(key, {})[reservation_id] = next(iter(values))
+        return caps
+
+    query = (
         db.query(
             models.ReservationEntry.item_id,
             models.PurchaseExportObligationAllocation.supplier_order_ref,
@@ -318,6 +417,11 @@ def _exact_allocation_caps_by_order_line(
             models.ReservationEntry.realization_mode == "buy",
             models.ReservationEntry.lifecycle_status == "active",
         )
+    )
+    if item_ids is not None:
+        query = query.filter(models.ReservationEntry.item_id.in_(sorted({int(value) for value in item_ids})))
+    rows = (
+        query
         .group_by(
             models.ReservationEntry.item_id,
             models.PurchaseExportObligationAllocation.supplier_order_ref,
@@ -705,6 +809,126 @@ def _candidate_order_lines(
     ).all()
 
 
+def normalize_supplier_receipt_evidence(
+    db: Session,
+    *,
+    explicit_sles: Iterable[models.StockLedgerEntry],
+    evidence: Iterable[SupplierDocumentEvidence],
+) -> tuple[NormalizedSupplierReceiptFact, ...]:
+    """Match typed supplier evidence to an explicit SLE set, read-only.
+
+    This is the one evidence -> physical-row seam shared by the historical
+    generation rebuild and bounded physical refresh.  ``explicit_sles`` is
+    never expanded: no visible-generation query or lineage traversal occurs.
+    One document line may legitimately represent several SLE rows when their
+    aggregate signed quantity equals the normalized document quantity.
+    """
+
+    sle_rows = tuple(explicit_sles)
+    by_identity: dict[tuple[str, str, str], list[models.StockLedgerEntry]] = {}
+    for sle in sle_rows:
+        by_identity.setdefault(
+            (_text(sle.recorder_type), _text(sle.recorder_ref), _text(sle.line_no)),
+            [],
+        ).append(sle)
+
+    evidence_by_identity: dict[tuple[str, str, str], SupplierDocumentEvidence] = {}
+    for row in evidence:
+        operation = _operation_prefix(row)
+        if operation == TRANSFER_OPERATION:
+            continue
+        identity = (
+            _text(row.receipt_doc_type),
+            _text(row.receipt_doc_ref),
+            _text(row.receipt_doc_line_no),
+        )
+        previous = evidence_by_identity.get(identity)
+        if previous is not None and previous != row:
+            raise SupplierReceiptEvidenceError(
+                f"conflicting evidence for {row.receipt_doc_ref}/{row.receipt_doc_line_no}"
+            )
+        evidence_by_identity[identity] = row
+
+    normalized: list[NormalizedSupplierReceiptFact] = []
+    for identity, row in sorted(evidence_by_identity.items()):
+        operation = _operation_prefix(row)
+        matched_sles = tuple(
+            sorted(by_identity.get(identity, ()), key=lambda sle: int(sle.id))
+        )
+        if not matched_sles:
+            raise SupplierReceiptEvidenceError(
+                f"evidence {row.receipt_doc_ref}/{row.receipt_doc_line_no} "
+                "has no explicit physical Ledger row"
+            )
+        if any(
+            int(sle.item_id) != int(row.item_id)
+            or (
+                _text(row.warehouse_ref1c)
+                and _text(sle.warehouse_ref1c) != _text(row.warehouse_ref1c)
+            )
+            for sle in matched_sles
+        ) or sum((_decimal(sle.qty) for sle in matched_sles), Decimal("0")) != _decimal(row.signed_qty):
+            raise SupplierReceiptEvidenceError(
+                "evidence assertions contradict explicit Ledger rows for "
+                f"{row.receipt_doc_ref}/{row.receipt_doc_line_no}"
+            )
+
+        candidates = _candidate_order_lines(db, row)
+        exact_candidate = (
+            candidates[0]
+            if len(candidates) == 1
+            and candidates[0].line_number is not None
+            and int(candidates[0].line_number) > 0
+            else None
+        )
+        status = (
+            "exact" if exact_candidate is not None
+            else "ambiguous" if len(candidates) > 1
+            else "unmatched"
+        )
+        canonical_line_no = (
+            str(exact_candidate.line_number)
+            if exact_candidate is not None else None
+        )
+        reason = None if status == "exact" else (
+            "multiple exact supplier order lines"
+            if status == "ambiguous"
+            else "no exact typed supplier order line"
+        )
+        operation_rule = {
+            RECEIPT_OPERATION: "supplier-receipt-exact-line",
+            CORRECTION_OPERATION: "supplier-receipt-correction",
+            SUPPLIER_RETURN_OPERATION: "supplier-return-exact-line",
+        }[operation]
+        # An ambiguous or unmatched raw order reference must never reach the
+        # allocator as if it were an exact line.  The immutable evidence and
+        # status remain available to provenance writers for diagnostics.
+        supplier_order_ref = _text(row.supplier_order_ref) if status == "exact" else ""
+        supplier_order_line_no = canonical_line_no if status == "exact" else "0"
+        for sle in matched_sles:
+            normalized.append(NormalizedSupplierReceiptFact(
+                fact=ReceiptFact(
+                    sle_id=int(sle.id),
+                    posting_at=sle.posting_at,
+                    signed_qty=_decimal(sle.qty),
+                    item_id=int(row.item_id),
+                    supplier_order_ref=supplier_order_ref,
+                    supplier_order_line_no=supplier_order_line_no,
+                    receipt_ref=_text(row.receipt_doc_ref),
+                    receipt_line_no=_text(row.receipt_doc_line_no),
+                    correction_receipt_ref=_text(row.correction_receipt_ref) or None,
+                ),
+                evidence=row,
+                operation=operation,
+                match_status=status,
+                canonical_line_no=canonical_line_no,
+                match_rule=operation_rule,
+                ambiguity_count=len(candidates) if status == "ambiguous" else 0,
+                reason=reason,
+            ))
+    return tuple(normalized)
+
+
 def _rebuild_supplier_receipt_coverage_unsafe(
     db: Session,
     *,
@@ -734,12 +958,11 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             "supplier receipt rebuild requires a completed physical boundary"
         )
     visible = visible_sles_for_generation(db, ledger_generation_id)
-    by_identity: dict[tuple[str, str, str], list[models.StockLedgerEntry]] = {}
-    for sle in visible:
-        by_identity.setdefault(
-            (_text(sle.recorder_type), _text(sle.recorder_ref), _text(sle.line_no)),
-            [],
-        ).append(sle)
+    normalized_rows = normalize_supplier_receipt_evidence(
+        db,
+        explicit_sles=visible,
+        evidence=rows,
+    )
 
     provenance_by_entry = {
         int(row.stock_ledger_entry_id): row
@@ -750,53 +973,20 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     touched_provenance_entry_ids: set[int] = set()
 
     facts: list[ReceiptFact] = []
-    exact_fact_count = 0
     provenance_count = 0
-    for row in rows:
-        operation = _operation_prefix(row)
-        if operation == TRANSFER_OPERATION:
-            continue
-        matched_sles = by_identity.get((
-            _text(row.receipt_doc_type),
-            _text(row.receipt_doc_ref),
-            _text(row.receipt_doc_line_no),
-        ), [])
-        if not matched_sles:
-            raise SupplierReceiptEvidenceError(
-                f"evidence {row.receipt_doc_ref}/{row.receipt_doc_line_no} "
-                "has no visible physical Ledger row"
-            )
-        if any(
-            sle.item_id != row.item_id
-            or _text(sle.warehouse_ref1c) != _text(row.warehouse_ref1c)
-            for sle in matched_sles
-        ) or sum((_decimal(sle.qty) for sle in matched_sles), Decimal("0")) != _decimal(row.signed_qty):
-            raise SupplierReceiptEvidenceError(
-                f"evidence assertions contradict Ledger for "
-                f"{row.receipt_doc_ref}/{row.receipt_doc_line_no}"
-            )
-        candidates = _candidate_order_lines(db, row)
-        exact_candidate = (
-            candidates[0]
-            if len(candidates) == 1
-            and candidates[0].line_number is not None
-            and int(candidates[0].line_number) > 0
-            else None
+    exact_fact_count = len({
+        (
+            _text(normalized.evidence.receipt_doc_type),
+            _text(normalized.evidence.receipt_doc_ref),
+            _text(normalized.evidence.receipt_doc_line_no),
         )
-        status = "exact" if exact_candidate is not None else (
-            "ambiguous" if len(candidates) > 1 else "unmatched"
-        )
-        if status == "exact":
-            exact_fact_count += 1
-        reason = None if status == "exact" else (
-            "multiple exact supplier order lines" if status == "ambiguous"
-            else "no exact typed supplier order line"
-        )
-        operation_rule = {
-            RECEIPT_OPERATION: "supplier-receipt-exact-line",
-            CORRECTION_OPERATION: "supplier-receipt-correction",
-            SUPPLIER_RETURN_OPERATION: "supplier-return-exact-line",
-        }[operation]
+        for normalized in normalized_rows
+        if normalized.match_status == "exact"
+    })
+    for normalized in normalized_rows:
+        row = normalized.evidence
+        operation = normalized.operation
+        matched_sle_id = int(normalized.fact.sle_id)
         evidence_payload = {
             "receipt_doc_type": _text(row.receipt_doc_type)[:64],
             "receipt_doc_ref": _text(row.receipt_doc_ref)[:64],
@@ -815,71 +1005,50 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             ),
         }
         evidence_hash = canonical_content_hash(evidence_payload)
-        canonical_line_no = (
-            str(exact_candidate.line_number)
-            if exact_candidate is not None else None
-        )
-        for sle in matched_sles:
-            matched_sle_id = int(sle.id)
-            touched_provenance_entry_ids.add(matched_sle_id)
-            provenance = provenance_by_entry.get(matched_sle_id)
-            supplier_order_line_no = (
-                canonical_line_no if status == "exact" else _text(row.supplier_order_line_no)
+        touched_provenance_entry_ids.add(matched_sle_id)
+        provenance = provenance_by_entry.get(matched_sle_id)
+        if provenance is None:
+            provenance = models.StockLedgerSupplierReceiptProvenance(
+                ledger_generation_id=ledger_generation_id,
+                stock_ledger_entry_id=matched_sle_id,
+                receipt_doc_type=_text(row.receipt_doc_type),
+                receipt_doc_ref=_text(row.receipt_doc_ref),
+                receipt_doc_line_no=_text(row.receipt_doc_line_no),
+                supplier_order_ref=normalized.fact.supplier_order_ref,
+                supplier_order_line_no=normalized.fact.supplier_order_line_no,
+                operation_kind=_OPERATION_KINDS[operation],
+                operation_key=evidence_payload["operation_key"],
+                operation_name=evidence_payload["operation_name"],
+                correction_receipt_ref=evidence_payload["correction_receipt_ref"],
+                evidence_hash=evidence_hash,
+                evidence_payload=evidence_payload,
+                match_rule=normalized.match_rule,
+                match_status=normalized.match_status,
+                ambiguity_count=normalized.ambiguity_count,
+                reason=normalized.reason,
             )
-            if provenance is None:
-                provenance = models.StockLedgerSupplierReceiptProvenance(
-                    ledger_generation_id=ledger_generation_id,
-                    stock_ledger_entry_id=matched_sle_id,
-                    receipt_doc_type=_text(row.receipt_doc_type),
-                    receipt_doc_ref=_text(row.receipt_doc_ref),
-                    receipt_doc_line_no=_text(row.receipt_doc_line_no),
-                    supplier_order_ref=_text(row.supplier_order_ref),
-                    supplier_order_line_no=supplier_order_line_no,
-                    operation_kind=_OPERATION_KINDS[operation],
-                    operation_key=evidence_payload["operation_key"],
-                    operation_name=evidence_payload["operation_name"],
-                    correction_receipt_ref=evidence_payload["correction_receipt_ref"],
-                    evidence_hash=evidence_hash,
-                    evidence_payload=evidence_payload,
-                    match_rule=operation_rule,
-                    match_status=status,
-                    ambiguity_count=len(candidates) if status == "ambiguous" else 0,
-                    reason=reason,
-                )
-                db.add(provenance)
-                provenance_by_entry[matched_sle_id] = provenance
-            else:
-                provenance.ledger_generation_id = ledger_generation_id
-                provenance.stock_ledger_entry_id = matched_sle_id
-                provenance.receipt_doc_type = _text(row.receipt_doc_type)
-                provenance.receipt_doc_ref = _text(row.receipt_doc_ref)
-                provenance.receipt_doc_line_no = _text(row.receipt_doc_line_no)
-                provenance.supplier_order_ref = _text(row.supplier_order_ref)
-                provenance.supplier_order_line_no = supplier_order_line_no
-                provenance.operation_kind = _OPERATION_KINDS[operation]
-                provenance.operation_key = evidence_payload["operation_key"]
-                provenance.operation_name = evidence_payload["operation_name"]
-                provenance.correction_receipt_ref = evidence_payload["correction_receipt_ref"]
-                provenance.evidence_hash = evidence_hash
-                provenance.evidence_payload = evidence_payload
-                provenance.match_rule = operation_rule
-                provenance.match_status = status
-                provenance.ambiguity_count = len(candidates) if status == "ambiguous" else 0
-                provenance.reason = reason
-            provenance_count += 1
-            facts.append(ReceiptFact(
-                sle_id=sle.id,
-                posting_at=sle.posting_at,
-                signed_qty=_decimal(sle.qty),
-                item_id=int(row.item_id),
-                supplier_order_ref=_text(row.supplier_order_ref),
-                supplier_order_line_no=(
-                    str(canonical_line_no) if status == "exact" else _text(row.supplier_order_line_no)
-                ),
-                receipt_ref=_text(row.receipt_doc_ref),
-                receipt_line_no=_text(row.receipt_doc_line_no),
-                correction_receipt_ref=_text(row.correction_receipt_ref) or None,
-            ))
+            db.add(provenance)
+            provenance_by_entry[matched_sle_id] = provenance
+        else:
+            provenance.ledger_generation_id = ledger_generation_id
+            provenance.stock_ledger_entry_id = matched_sle_id
+            provenance.receipt_doc_type = _text(row.receipt_doc_type)
+            provenance.receipt_doc_ref = _text(row.receipt_doc_ref)
+            provenance.receipt_doc_line_no = _text(row.receipt_doc_line_no)
+            provenance.supplier_order_ref = normalized.fact.supplier_order_ref
+            provenance.supplier_order_line_no = normalized.fact.supplier_order_line_no
+            provenance.operation_kind = _OPERATION_KINDS[operation]
+            provenance.operation_key = evidence_payload["operation_key"]
+            provenance.operation_name = evidence_payload["operation_name"]
+            provenance.correction_receipt_ref = evidence_payload["correction_receipt_ref"]
+            provenance.evidence_hash = evidence_hash
+            provenance.evidence_payload = evidence_payload
+            provenance.match_rule = normalized.match_rule
+            provenance.match_status = normalized.match_status
+            provenance.ambiguity_count = normalized.ambiguity_count
+            provenance.reason = normalized.reason
+        provenance_count += 1
+        facts.append(normalized.fact)
 
     for stale_entry_id, stale_provenance in provenance_by_entry.items():
         if stale_entry_id not in touched_provenance_entry_ids:

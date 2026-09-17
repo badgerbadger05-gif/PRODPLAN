@@ -446,12 +446,56 @@ def evaluate_physical_refresh_balance_convergence(
     checked_at: datetime | None = None,
     eps: Decimal = EPS,
     commit: bool = False,
+    base_generation_id: int | None = None,
+    delta_rows: tuple[models.StockLedgerEntry, ...] = (),
+    new_rows: tuple[models.StockLedgerEntry, ...] = (),
+    supersession_edges: tuple[models.StockLedgerFactSupersession, ...] = (),
 ) -> BalanceConvergenceResult:
-    """Compare Balance without adjustments and persist a deterministic diagnostic."""
+    """Compare Balance and persist a deterministic diagnostic.
+
+    Physical refreshes pass the accepted parent plus the bounded import
+    manifest.  That path folds the parent's compact current StockBin and only
+    the new/superseded facts; it never resolves the historical SLE prefix.
+    Bootstrap callers retain the legacy full-prefix behavior by omitting the
+    bounded arguments.
+    """
     generation = _assert_physical_refresh_building_generation(db, ledger_generation_id)
     normalized_snapshot = _aggregate_snapshot(balance_snapshot)
     content_hash = _snapshot_convergence_content_hash(normalized_snapshot)
-    visible = _aggregate_sles_for_convergence(db, generation)
+    if base_generation_id is None:
+        visible = _aggregate_sles_for_convergence(db, generation)
+    else:
+        current_rows = db.query(
+            models.StockBin.item_id,
+            models.StockBin.organization_ref,
+            models.StockBin.warehouse_ref1c,
+            func.sum(models.StockBin.on_hand),
+        ).filter(
+            models.StockBin.is_current.is_(True),
+        ).group_by(
+            models.StockBin.item_id,
+            models.StockBin.organization_ref,
+            models.StockBin.warehouse_ref1c,
+        ).all()
+        visible = {
+            (int(item_id), str(organization_ref or ""), str(warehouse_ref1c or "")):
+            _dec(quantity)
+            for item_id, organization_ref, warehouse_ref1c, quantity in current_rows
+        }
+        # Visibility is batch-boundary based, not the mutable `active` flag.
+        # New rows are added once; a supersession removes its old row once.
+        # The old row may itself have been imported earlier in this same
+        # refresh window, so the subtraction must not be limited to the
+        # parent's batch boundary.
+        for row in new_rows:
+            key = (int(row.item_id), str(row.organization_ref or ""), str(row.warehouse_ref1c or ""))
+            visible[key] = visible.get(key, Decimal("0")) + _dec(row.qty)
+        rows_by_id = {int(row.id): row for row in delta_rows}
+        for edge in supersession_edges:
+            old = rows_by_id.get(int(edge.old_sle_id))
+            if old is not None:
+                key = (int(old.item_id), str(old.organization_ref or ""), str(old.warehouse_ref1c or ""))
+                visible[key] = visible.get(key, Decimal("0")) - _dec(old.qty)
 
     deltas: list[BalanceConvergenceDelta] = []
     compared = 0
