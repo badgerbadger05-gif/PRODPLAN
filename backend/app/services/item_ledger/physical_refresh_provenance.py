@@ -10,11 +10,13 @@ subsequent publisher step fails.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.production_material_custody_projection import _same_1c_timestamp
 
 
 class PhysicalRefreshProvenanceUnavailable(ValueError):
@@ -157,6 +159,15 @@ def handoff_current_future_supply_provenance(
         future_supply_idempotent=False,
         custody_idempotent=False,
     )
+
+
+def _ordered_1c_timestamps(
+    left: datetime, right: datetime
+) -> tuple[datetime, datetime]:
+    """Normalise one 1C wall-clock pair exactly as the custody gate compares it."""
+    if left.tzinfo is None or right.tzinfo is None:
+        return left.replace(tzinfo=None), right.replace(tzinfo=None)
+    return left, right
 
 
 def _custody_event_watermark(db: Session) -> int:
@@ -349,6 +360,17 @@ def handoff_current_material_custody_provenance(
             raise PhysicalRefreshProvenanceUnavailable(
                 "custody target manifest watermark is stale"
             )
+        if (
+            target_manifest.cutoff is None
+            or target.cutoff is None
+            or not _same_1c_timestamp(target_manifest.cutoff, target.cutoff)
+        ):
+            # The canonical custody gate compares these two values on every
+            # later candidate.  A retry must not certify a manifest the gate
+            # would reject.
+            raise PhysicalRefreshProvenanceUnavailable(
+                "custody target manifest cutoff mismatches its Ledger generation"
+            )
         if any(int(row.ledger_generation_id) != int(target.id) for row in current_rows):
             raise PhysicalRefreshProvenanceUnavailable(
                 "custody current projection provenance is mixed or stale"
@@ -394,12 +416,43 @@ def handoff_current_material_custody_provenance(
         raise PhysicalRefreshProvenanceUnavailable(
             "custody current projection provenance is mixed or stale"
         )
+    if any(
+        int(row.source_event_high_watermark_id or 0) != watermark
+        for row in current_rows
+    ):
+        # Cells and manifest are one compact owner: every reader checks that
+        # the rows were folded exactly to the watermark the manifest states.
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody current projection watermark is mixed or stale"
+        )
+    if target.cutoff is None:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody handoff requires a target generation cutoff"
+        )
+    if parent_manifest.cutoff is not None:
+        manifest_cutoff, target_cutoff = _ordered_1c_timestamps(
+            parent_manifest.cutoff, target.cutoff
+        )
+        if target_cutoff < manifest_cutoff:
+            raise PhysicalRefreshProvenanceUnavailable(
+                "custody manifest cutoff cannot move backwards"
+            )
     # Update projection rows before moving the manifest PK.  This preserves
     # row ids and quantities while making the temporary parent-read break
     # explicit: the caller must commit only together with the target pointer.
     for row in current_rows:
         row.ledger_generation_id = int(target.id)
     parent_manifest.ledger_generation_id = int(target.id)
+    # The manifest states the boundary of the generation it belongs to, so the
+    # moved owner takes the target cutoff.  Carrying the parent's cutoff left
+    # every later candidate failing the canonical gate
+    # ``_require_manifest_cutoff`` — the compact owner then looked like a
+    # snapshot of an older window and no new generation could resolve it as a
+    # baseline.  The watermark is deliberately kept: it is the point the
+    # compact cells were folded to, and the gate above proves it is the whole
+    # event stream.  Lowering it to the cutoff-bounded watermark would hide a
+    # local post-cutoff event that the cells already carry.
+    parent_manifest.cutoff = target.cutoff
     parent_manifest.baseline_generation_id = (
         int(parent_manifest.baseline_generation_id)
         if parent_manifest.baseline_generation_id is not None
