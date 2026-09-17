@@ -95,6 +95,50 @@ def _publish_current(db, generation):
     db.commit()
 
 
+def _publish_readiness_owners(db, generation, plan_lines, *, revision="accepted:readiness"):
+    """Publish the readiness current rows that own the drum rows' curves.
+
+    A drum row stores no copy of the curve; it links to the readiness row of
+    the same plan line.  A drum scope without those owners is incomplete and
+    the reader fails closed, so every drum fixture must publish them too.
+    """
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    publish_current_execution_scope(
+        db,
+        source_revision=revision,
+        source_generation_id=int(generation.id),
+        scope_key="assembly:all-live-plans",
+        entity_kinds=("assembly_readiness",),
+        rows=[
+            {
+                "entity_kind": "assembly_readiness",
+                "business_identity": f"plan-line:{int(plan_line)}",
+                "scope_key": "assembly:all-live-plans",
+                "payload": {
+                    "queue_line_id": 9000 + int(plan_line),
+                    "plan_id": 1,
+                    "plan_line_id": int(plan_line),
+                    "run_id": 11,
+                    "item_id": 100,
+                    "status": str(payload.get("status", "blocked")),
+                    "open_qty": "10",
+                    "ready_qty": "0",
+                    "readiness_date": payload.get("readiness_date"),
+                    "readiness_curve": list(payload.get("readiness_curve") or []),
+                    "action_manifest": list(payload.get("action_manifest") or []),
+                    "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
+                    "blocker_count": len(list(payload.get("blocking_manifest") or [])),
+                    "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                    "original_priority": [],
+                },
+            }
+            for plan_line, payload in dict(plan_lines).items()
+        ],
+    )
+    db.flush()
+
+
 def test_assembly_readiness_reads_only_the_accepted_generation(client, db_session):
     generation, _ = _accepted_generation(db_session)
     item = models.Item(item_code="FG-READY", item_name="Ready machine")
@@ -663,6 +707,33 @@ def test_drum_tile_move_is_persisted_and_audited(client, db_session):
     )
     db_session.add(queue)
     db_session.flush()
+    db_session.add(
+        models.AssemblyReadiness(
+            ledger_generation_id=generation.id,
+            assembly_queue_line_id=queue.id,
+            status="ready",
+            open_qty=1,
+            ready_qty=1,
+            transferable_qty=1,
+            kitting_qty=1,
+            committed_qty=1,
+            launchable_qty=1,
+            readiness_date=source,
+            readiness_curve=[{
+                "horizon": "now",
+                "cumulative_qty": "1",
+                "available_date": source.isoformat(),
+                "actions": [],
+                "required_actions": [],
+                "blockers": [],
+            }],
+            action_manifest=[],
+            unavailable_reasons=[],
+            blocker_count=0,
+            blocking_manifest=[],
+            evidence_signature="m" * 64,
+        )
+    )
     schedule = models.DrumSchedule(
         ledger_generation_id=generation.id,
         status="completed",
@@ -1011,6 +1082,7 @@ def test_current_drum_get_sorts_persisted_slots_by_date_resource_priority_and_or
         ],
     )
     db_session.flush()
+    _publish_readiness_owners(db_session, generation, {10: {}, 20: {}})
 
     response = get_drum_schedule(limit=10, offset=0, db=db_session)
     assert [slot.plan_line_id for slot in response.slots] == [20, 10]
@@ -1055,24 +1127,175 @@ def test_current_drum_get_returns_persisted_excluded_rows(db_session):
                     "accepted_plan_output_qty": "2",
                     "assembly_remaining_qty": "10",
                     "reason": "ASSEMBLY_RATE_MISSING",
-                    "readiness_status": "blocked",
-                    "readiness_date": None,
-                    "readiness_curve": [],
-                    "action_manifest": [],
-                    "unavailable_reasons": ["ASSEMBLY_RATE_MISSING"],
-                    "blocking_manifest": [{"reason": "LEAD_TIME_MISSING"}],
                     "original_priority": ["2026-09-10", 1, 10],
                 },
             },
         ],
     )
     db_session.flush()
+    _publish_readiness_owners(db_session, generation, {10: {
+        "status": "blocked",
+        "unavailable_reasons": ["ASSEMBLY_RATE_MISSING"],
+        "blocking_manifest": [{"reason": "LEAD_TIME_MISSING"}],
+    }})
 
     response = get_drum_schedule(limit=10, offset=0, db=db_session)
     assert response.total_excluded == 1
     assert response.total_excluded_open_qty == 10.0
     assert len(response.excluded) == 1
     assert response.excluded[0].plan_line_id == 10
+    # The excluded row shows the readiness owner's explanation, not its own copy.
+    assert response.excluded[0].readiness_status == "blocked"
+    assert response.excluded[0].unavailable_reasons == ["ASSEMBLY_RATE_MISSING"]
+    assert [b.reason for b in response.excluded[0].blocking_manifest] == ["LEAD_TIME_MISSING"]
+
+
+def _action(qty, *, item_id=55, available_date="2026-09-12"):
+    return {
+        "action_kind": "transfer",
+        "item_id": item_id,
+        "item_code": "C-55",
+        "item_article": "A-55",
+        "item_name": "Component 55",
+        "qty": qty,
+        "available_date": available_date,
+        "confidence": "physical",
+        "source_key": "WH-SRC",
+        "source_warehouse_ref1c": "WH-SRC",
+        "destination_warehouse_ref1c": "WH-POU",
+        "path": [],
+    }
+
+
+def _publish_drum_slot_with_stale_copies(db, generation, *, embedded):
+    """Publish one drum slot, optionally still carrying the old embedded copies."""
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    scope = "drum:all-live-plans"
+    payload = {
+        "queue_line_id": 9010,
+        "readiness_ref": "plan-line:10",
+        "plan_id": 1,
+        "plan_line_id": 10,
+        "item_id": 100,
+        "resource_id": 7,
+        "slot_date": "2026-09-11",
+        "slot_ordinal": 0,
+        "slot_qty": "2",
+        "original_priority": [1, 10],
+        "readiness_phase": "transfer",
+    }
+    payload.update(embedded)
+    publish_current_execution_scope(
+        db,
+        source_revision="accepted:r8-readiness-ref",
+        source_generation_id=int(generation.id),
+        scope_key=scope,
+        entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
+        rows=[
+            {
+                "entity_kind": "drum_schedule",
+                "business_identity": scope,
+                "scope_key": scope,
+                "payload": {
+                    "schedule_from": "2026-09-10",
+                    "schedule_to": "2026-09-12",
+                    "working_days": ["2026-09-10", "2026-09-11", "2026-09-12"],
+                    "metrics": {"total_open_qty": "2", "total_slot_qty": "2", "total_gap_qty": "0"},
+                },
+            },
+            {
+                "entity_kind": "drum_slot",
+                "business_identity": "slot:plan-line:10:ordinal:0",
+                "scope_key": scope,
+                "payload": payload,
+            },
+        ],
+    )
+    db.flush()
+
+
+_CURVE_OWNER = {
+    "status": "partial",
+    "readiness_date": "2026-09-12",
+    "readiness_curve": [
+        {
+            "horizon": "now",
+            "cumulative_qty": "0",
+            "available_date": "2026-09-10",
+            "actions": [],
+            "required_actions": [],
+            "blockers": [],
+        },
+        {
+            "horizon": "transfer",
+            "cumulative_qty": "4",
+            "available_date": "2026-09-12",
+            "actions": [_action("8")],
+            "required_actions": [_action("8")],
+            "blockers": [{"item_id": 55, "reason": "SHORTAGE", "shortage_qty": "8"}],
+        },
+    ],
+    "action_manifest": [_action("8")],
+    "unavailable_reasons": ["TRANSFER_PENDING"],
+    "blocking_manifest": [{"item_id": 55, "reason": "SHORTAGE", "shortage_qty": "8"}],
+}
+
+
+def test_current_drum_get_resolves_the_curve_from_the_readiness_owner(db_session):
+    generation, _ = _accepted_generation(db_session)
+    _publish_drum_slot_with_stale_copies(db_session, generation, embedded={})
+    _publish_readiness_owners(db_session, generation, {10: _CURVE_OWNER})
+
+    slot = get_drum_schedule(limit=10, offset=0, db=db_session).slots[0]
+    # The tile owns a bucket quantity; the line-level explanations come from
+    # the readiness row verbatim.
+    assert [(point.horizon, point.cumulative_qty) for point in slot.readiness_curve] == [
+        ("now", "0"), ("transfer", "2"),
+    ]
+    assert [action.qty for action in slot.readiness_curve[1].actions] == ["8"]
+    assert [blocker.item_id for blocker in slot.readiness_curve[1].blockers] == [55]
+    # The slot takes 2 of the 4 units the transfer horizon unlocks, so it is
+    # accountable for half of that horizon's 8-unit transfer.
+    assert [action.qty for action in slot.action_manifest] == ["4.000"]
+    assert slot.readiness_date == "2026-09-12"
+    assert slot.unavailable_reasons == ["TRANSFER_PENDING"]
+    assert [blocker.item_id for blocker in slot.blocking_manifest] == [55]
+
+
+def test_current_drum_get_ignores_embedded_copies_left_by_an_older_publication(db_session):
+    """Migration tolerance: no alembic step rewrites already published rows."""
+    generation, _ = _accepted_generation(db_session)
+    _publish_drum_slot_with_stale_copies(db_session, generation, embedded={
+        "readiness_date": "2000-01-01",
+        "readiness_curve": [{
+            "horizon": "now", "cumulative_qty": "999", "available_date": "2000-01-01",
+            "actions": [], "required_actions": [], "blockers": [],
+        }],
+        "action_manifest": [_action("999", available_date="2000-01-01")],
+        "unavailable_reasons": ["STALE_REASON"],
+        "blocking_manifest": [{"item_id": 999, "reason": "STALE"}],
+    })
+    _publish_readiness_owners(db_session, generation, {10: _CURVE_OWNER})
+
+    slot = get_drum_schedule(limit=10, offset=0, db=db_session).slots[0]
+    assert [point.horizon for point in slot.readiness_curve] == ["now", "transfer"]
+    assert slot.readiness_date == "2026-09-12"
+    assert slot.unavailable_reasons == ["TRANSFER_PENDING"]
+    assert [blocker.item_id for blocker in slot.blocking_manifest] == [55]
+
+
+def test_current_drum_get_fails_closed_without_a_readiness_owner(db_session):
+    generation, _ = _accepted_generation(db_session)
+    _publish_drum_slot_with_stale_copies(db_session, generation, embedded={})
+    # A readiness scope that covers a different plan line is still no owner.
+    _publish_readiness_owners(db_session, generation, {11: _CURVE_OWNER})
+
+    with pytest.raises(HTTPException) as failure:
+        get_drum_schedule(limit=10, offset=0, db=db_session)
+    assert failure.value.status_code == 503
+    assert failure.value.detail["code"] == "drum_schedule_unavailable"
+    assert "readiness owner" in failure.value.detail["reason"]
 
 
 def test_current_shelf_get_returns_persisted_empty_or_nonempty_scope(db_session):

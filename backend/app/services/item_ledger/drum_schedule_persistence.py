@@ -392,6 +392,160 @@ def _compact_slot_readiness_payload(
     return current_date, tile_curve, actions
 
 
+# --------------------------------------------------------------------------
+# One owner for the readiness curve
+# --------------------------------------------------------------------------
+#
+# A drum tile is a *bucket of a queue line*: a date, a resource, a quantity, an
+# ordinal and the readiness phase the scheduler placed it in.  Everything that
+# explains *why* that phase holds — the readiness curve, the blockers, the
+# required actions and the unavailable reasons — belongs to the readiness row
+# of the same ``plan_line_id`` and is owned there.
+#
+# Until now every drum current row carried its own copy of that explanation.
+# Measured on a production-size copy, the 205 accepted drum current rows
+# carried 92.9 MB of JSON of which 99.98 % was those copies, re-published on
+# every hourly refresh.  Worse, a drum row whose business fields did not change
+# keeps its saved payload, so its embedded copy silently aged out of step with
+# the readiness row the operator reads on the neighbouring screen: on that same
+# copy 112 of the 205 rows were already showing an older readiness state than
+# /assembly-readiness did.
+#
+# The drum row therefore stores only its own business fields plus
+# ``readiness_ref``/``plan_line_id``, and the presentation view below is
+# resolved from the readiness current row at read time.  There is exactly one
+# projection formula (``_compact_slot_readiness_payload``) and exactly one
+# stored copy of the curve.
+
+DRUM_READINESS_VIEW_KEYS: dict[str, tuple[str, ...]] = {
+    "drum_slot": (
+        "readiness_date", "readiness_curve", "action_manifest",
+        "unavailable_reasons", "blocking_manifest",
+    ),
+    "drum_gap": (
+        "readiness_date", "readiness_curve", "action_manifest",
+        "unavailable_reasons", "blocking_manifest",
+    ),
+    "drum_excluded": (
+        "readiness_status", "readiness_date", "readiness_curve",
+        "action_manifest", "unavailable_reasons", "blocking_manifest",
+    ),
+}
+
+_DRUM_READINESS_QTY_KEY = {"drum_slot": "slot_qty", "drum_gap": "gap_qty"}
+
+
+class DrumReadinessLinkMissing(LookupError):
+    """The readiness current row that owns a drum row's curve is absent."""
+
+
+def readiness_ref_for_plan_line(plan_line_id: int) -> str:
+    """Stable link from a drum row to its readiness current row."""
+
+    return f"plan-line:{int(plan_line_id)}"
+
+
+def drum_readiness_view(
+    readiness: Mapping[str, Any] | None,
+    *,
+    entity_kind: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a drum row's readiness presentation from its readiness owner.
+
+    ``readiness`` is the ``assembly_readiness`` current payload of the same
+    ``plan_line_id``.  A missing owner is fail-closed (R8): an empty curve is
+    never fabricated, because "nothing blocks this tile" and "we do not know
+    what blocks this tile" are different answers.
+    """
+
+    kind = str(entity_kind)
+    if kind not in DRUM_READINESS_VIEW_KEYS:
+        raise ValueError(f"unknown drum entity kind: {kind or '<missing>'}")
+    if readiness is None:
+        raise DrumReadinessLinkMissing(
+            "drum row has no assembly readiness owner for plan line "
+            f"{payload.get('plan_line_id')}"
+        )
+    if kind == "drum_excluded":
+        # A queue line without a takt never enters the calendar, so it has no
+        # tile bucket to prorate: it shows the line-level readiness verbatim.
+        return {
+            "readiness_status": str(readiness.get("status") or "unavailable"),
+            "readiness_date": readiness.get("readiness_date"),
+            "readiness_curve": list(readiness.get("readiness_curve") or []),
+            "action_manifest": list(readiness.get("action_manifest") or []),
+            "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
+            "blocking_manifest": list(readiness.get("blocking_manifest") or []),
+        }
+    qty = _d(payload.get(_DRUM_READINESS_QTY_KEY[kind]))
+    readiness_date, curve, actions = _compact_slot_readiness_payload(
+        readiness, str(payload.get("readiness_phase") or ""), qty
+    )
+    return {
+        "readiness_date": readiness_date.isoformat() if readiness_date else None,
+        "readiness_curve": curve,
+        "action_manifest": actions,
+        "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
+        "blocking_manifest": list(readiness.get("blocking_manifest") or []),
+    }
+
+
+def published_readiness_plan_lines(
+    db: Session, *, scope_key: str = "assembly:all-live-plans"
+) -> set[int]:
+    """Plan lines that have an accepted readiness current row, identities only.
+
+    Deliberately not a payload read: the whole-scope fail-closed check must not
+    drag the heavy curves of every line through the GET.
+    """
+
+    rows = db.query(models.CurrentExecutionRow.business_identity).filter(
+        models.CurrentExecutionRow.entity_kind == "assembly_readiness",
+        models.CurrentExecutionRow.scope_key == str(scope_key),
+        models.CurrentExecutionRow.result_status == "accepted",
+        models.CurrentExecutionRow.result_ready.is_(True),
+    ).all()
+    plan_lines: set[int] = set()
+    for (identity,) in rows:
+        text = str(identity or "")
+        if not text.startswith("plan-line:"):
+            continue
+        try:
+            plan_lines.add(int(text.split(":", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return plan_lines
+
+
+def load_readiness_payloads(
+    db: Session,
+    plan_line_ids: Any,
+    *,
+    scope_key: str = "assembly:all-live-plans",
+) -> dict[int, dict[str, Any]]:
+    """Read the readiness current payloads of exactly the requested plan lines."""
+
+    wanted = sorted({int(value) for value in plan_line_ids})
+    if not wanted:
+        return {}
+    identities = [readiness_ref_for_plan_line(value) for value in wanted]
+    rows = db.query(models.CurrentExecutionRow).filter(
+        models.CurrentExecutionRow.entity_kind == "assembly_readiness",
+        models.CurrentExecutionRow.scope_key == str(scope_key),
+        models.CurrentExecutionRow.result_status == "accepted",
+        models.CurrentExecutionRow.result_ready.is_(True),
+        models.CurrentExecutionRow.business_identity.in_(identities),
+    ).all()
+    resolved: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row.payload or {})
+        if payload.get("plan_line_id") is None:
+            continue
+        resolved[int(payload["plan_line_id"])] = payload
+    return resolved
+
+
 @dataclass(frozen=True)
 class CompactDrumSchedulePayload:
     """Validated drum DTOs with stable plan-line identities and no staging ids."""
@@ -534,13 +688,10 @@ def build_compact_current_drum_payload(
     }
     for slot in plan.slots:
         line = int(slot.plan_line_id)
-        readiness = readiness_by_line[line]
-        readiness_date, curve, actions = _compact_slot_readiness_payload(
-            readiness, slot.readiness_phase, slot.slot_qty
-        )
         identity = f"slot:plan-line:{line}:ordinal:{int(slot.slot_ordinal)}"
         payload = {
             "queue_owner_identity": f"plan-line:{line}",
+            "readiness_ref": readiness_ref_for_plan_line(line),
             "plan_id": int(slot.plan_id), "plan_line_id": line,
             "run_id": int(queue_by_line[line]["run_id"]),
             "item_id": int(slot.item_id), "resource_id": int(slot.resource_id),
@@ -551,10 +702,6 @@ def build_compact_current_drum_payload(
             "assembly_remaining_qty": str(slot.assembly_remaining_qty),
             "slot_ordinal": int(slot.slot_ordinal),
             "readiness_phase": str(slot.readiness_phase),
-            "readiness_date": readiness_date.isoformat() if readiness_date else None,
-            "readiness_curve": curve, "action_manifest": actions,
-            "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
-            "blocking_manifest": list(readiness.get("blocking_manifest") or []),
             "original_priority": list(slot.original_priority),
         }
         manual = manual_rows.get(identity)
@@ -570,38 +717,31 @@ def build_compact_current_drum_payload(
         })
     for gap in plan.gaps:
         line = int(gap.plan_line_id)
-        readiness = readiness_by_line[line]
-        readiness_date, curve, actions = _compact_slot_readiness_payload(
-            readiness, gap.readiness_phase, gap.gap_qty
-        )
         rows.append({
             "entity_kind": "drum_gap",
             "business_identity": f"gap:plan-line:{line}:date:{gap.gap_date.isoformat()}",
             "scope_key": "drum:all-live-plans",
             "payload": {
                 "queue_owner_identity": f"plan-line:{line}",
+                "readiness_ref": readiness_ref_for_plan_line(line),
                 "plan_id": int(gap.plan_id), "plan_line_id": line,
                 "run_id": int(queue_by_line[line]["run_id"]),
                 "item_id": int(gap.item_id), "resource_id": int(gap.resource_id),
                 "gap_date": gap.gap_date.isoformat(), "required_qty": str(gap.required_qty),
                 "available_capacity": str(gap.available_capacity), "gap_qty": str(gap.gap_qty),
                 "readiness_phase": str(gap.readiness_phase),
-                "readiness_date": readiness_date.isoformat() if readiness_date else None,
-                "readiness_curve": curve, "action_manifest": actions,
-                "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
-                "blocking_manifest": list(readiness.get("blocking_manifest") or []),
                 "original_priority": list(gap.original_priority),
             },
         })
     for queue in excluded:
         line = int(queue.plan_line_id)
-        readiness = readiness_by_line[line]
         rows.append({
             "entity_kind": "drum_excluded",
             "business_identity": f"excluded:plan-line:{line}",
             "scope_key": "drum:all-live-plans",
             "payload": {
                 "queue_owner_identity": f"plan-line:{line}",
+                "readiness_ref": readiness_ref_for_plan_line(line),
                 "plan_id": int(queue.plan_id), "plan_line_id": line,
                 "run_id": int(queue_by_line[line]["run_id"]), "item_id": int(queue.item_id),
                 "period_from": str(queue_by_line[line]["period_from"]),
@@ -610,12 +750,6 @@ def build_compact_current_drum_payload(
                 "accepted_plan_output_qty": str(queue.accepted_plan_output_qty),
                 "assembly_remaining_qty": str(queue.assembly_remaining_qty),
                 "reason": "ASSEMBLY_RATE_MISSING",
-                "readiness_status": str(readiness.get("status") or "unavailable"),
-                "readiness_date": readiness.get("readiness_date"),
-                "readiness_curve": list(readiness.get("readiness_curve") or []),
-                "action_manifest": list(readiness.get("action_manifest") or []),
-                "unavailable_reasons": list(readiness.get("unavailable_reasons") or []),
-                "blocking_manifest": list(readiness.get("blocking_manifest") or []),
                 "original_priority": list(queue.original_priority),
             },
         })

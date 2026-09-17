@@ -230,6 +230,151 @@ def test_compact_drum_payload_is_deterministic_and_has_no_staging_ids(db_session
     assert db_session.query(models.DrumCapacityGap).count() == 0
 
 
+_READINESS_COPY_KEYS = {
+    "readiness_curve",
+    "action_manifest",
+    "blocking_manifest",
+    "unavailable_reasons",
+    "readiness_date",
+    "readiness_status",
+}
+
+
+def _with_takt(db, root):
+    """Give the root a takt so the drum produces a real slot, not only exclusions."""
+    resource = models.ProductionResource(
+        resource_name="Compact drum resource", planning_range=3, capacity=Decimal("5")
+    )
+    root.optimal_batch = Decimal("1")
+    db.add(resource)
+    db.flush()
+    db.add(models.AssemblyRate(
+        resource_id=resource.resource_id,
+        item_id=root.item_id,
+        qty_per_capacity=Decimal("1"),
+    ))
+    db.flush()
+    return resource
+
+
+def _restate_readiness_explanations(assembly):
+    """Return the same assembly payload with only its *explanations* rewritten.
+
+    Quantities, statuses and curve horizons are untouched, so the drum plan is
+    the same plan; only the human-facing blockers and actions differ.
+    """
+    from copy import deepcopy
+
+    rows = []
+    for raw in assembly.readiness_rows:
+        row = deepcopy(dict(raw))
+        payload = dict(row["payload"])
+        payload["blocking_manifest"] = [{"reason": "RESTATED_BLOCKER"}]
+        payload["action_manifest"] = [{"action_kind": "make", "item_id": 1, "qty": "1"}]
+        payload["unavailable_reasons"] = ["RESTATED_REASON"]
+        payload["readiness_curve"] = [
+            {**dict(point), "blockers": [{"reason": "RESTATED_BLOCKER"}],
+             "actions": [{"action_kind": "make", "item_id": 1, "qty": "1"}],
+             "required_actions": [{"action_kind": "make", "item_id": 1, "qty": "1"}]}
+            for point in list(payload.get("readiness_curve") or [])
+        ]
+        row["payload"] = payload
+        rows.append(row)
+    return type(assembly)(
+        **{
+            **{
+                field: getattr(assembly, field)
+                for field in assembly.__dataclass_fields__
+            },
+            "readiness_rows": tuple(rows),
+        }
+    )
+
+
+def test_compact_drum_rows_link_to_readiness_instead_of_copying_it(db_session):
+    parent, target, root, _child, _line = _world(db_session)
+    _with_takt(db_session, root)
+    assembly = _build(db_session, parent, target, root)
+    drum = build_compact_current_drum_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload=assembly,
+    )
+    business_rows = [row for row in drum.rows if row["entity_kind"] != "drum_schedule"]
+    assert business_rows, "the fixture must produce at least one drum row"
+    for row in business_rows:
+        payload = row["payload"]
+        assert not (_READINESS_COPY_KEYS & set(payload)), (
+            f"{row['entity_kind']} still copies {_READINESS_COPY_KEYS & set(payload)}"
+        )
+        assert payload["readiness_ref"] == f"plan-line:{int(payload['plan_line_id'])}"
+
+
+def test_readiness_only_change_does_not_move_the_drum_rows(db_session):
+    parent, target, root, _child, _line = _world(db_session)
+    _with_takt(db_session, root)
+    assembly = _build(db_session, parent, target, root)
+
+    def drum_for(payload):
+        return build_compact_current_drum_payload(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            assembly_payload=payload,
+        )
+
+    before = drum_for(assembly)
+    after = drum_for(_restate_readiness_explanations(assembly))
+    assert before.rows == after.rows
+
+
+def test_readiness_only_change_writes_no_drum_change_rows(db_session):
+    from app.services.item_ledger.current_execution import publish_current_execution_scope
+
+    parent, target, root, _child, _line = _world(db_session)
+    _with_takt(db_session, root)
+    assembly = _build(db_session, parent, target, root)
+    drum_kinds = ("drum_schedule", "drum_slot", "drum_gap", "drum_excluded")
+
+    def publish(payload, revision):
+        drum = build_compact_current_drum_payload(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            assembly_payload=payload,
+        )
+        publish_current_execution_scope(
+            db_session,
+            source_revision=revision,
+            source_generation_id=int(parent.id),
+            scope_key="assembly:all-live-plans",
+            entity_kinds=("assembly_readiness",),
+            rows=[dict(row, scope_key="assembly:all-live-plans")
+                  for row in payload.readiness_rows],
+        )
+        publish_current_execution_scope(
+            db_session,
+            source_revision=revision,
+            source_generation_id=int(parent.id),
+            scope_key="drum:all-live-plans",
+            entity_kinds=drum_kinds,
+            rows=list(drum.rows),
+        )
+        db_session.flush()
+
+    publish(assembly, "physical:g1")
+    baseline = db_session.query(models.CurrentExecutionChange).count()
+    publish(_restate_readiness_explanations(assembly), "physical:g2")
+
+    new_changes = db_session.query(models.CurrentExecutionChange).order_by(
+        models.CurrentExecutionChange.id.asc(),
+    ).all()[baseline:]
+    assert new_changes, "the readiness change itself must still be audited"
+    assert {row.entity_kind for row in new_changes} == {"assembly_readiness"}
+    assert not [row for row in new_changes if row.entity_kind in drum_kinds]
+
+
 def test_compact_queue_owner_resolution_passes_schedule_and_resolves_dependents(db_session):
     db_session.add(models.CurrentExecutionRow(
         entity_kind="assembly_queue",

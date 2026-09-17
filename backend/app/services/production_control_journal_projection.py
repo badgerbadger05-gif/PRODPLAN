@@ -29,6 +29,10 @@ from app.services.production_control_live_launch import (
     overlay_launch_facts,
     route_sheets_after_cutoff,
 )
+from app.services.item_ledger.drum_schedule_persistence import (
+    DrumReadinessLinkMissing,
+    drum_readiness_view,
+)
 from app.services.item_ledger.future_supply_capture import verify_future_supply_capture
 from app.services.item_ledger.reservation import (
     replenishment_remaining,
@@ -1061,6 +1065,20 @@ def build_compact_current_production_control_payload(
                 "compact shelf payload contains duplicate item"
             )
         shelf_by_item[shelf_item_id] = shelf
+    # A drum tile no longer carries its own copy of the readiness explanation:
+    # the ``assembly_readiness`` row of the same plan line owns it, and the
+    # tile projection is applied from there through the single drum helper.
+    readiness_by_plan_line: dict[int, Mapping[str, Any]] = {}
+    for raw in (
+        (assembly_payload.get("readiness_rows", ()) if isinstance(assembly_payload, Mapping)
+         else getattr(assembly_payload, "readiness_rows", ())) or ()
+    ):
+        payload = raw.get("payload") if isinstance(raw, Mapping) else None
+        if not isinstance(payload, Mapping) or payload.get("plan_line_id") is None:
+            raise ProductionControlJournalPromotionError(
+                "compact assembly readiness row is malformed"
+            )
+        readiness_by_plan_line[int(payload["plan_line_id"])] = payload
     readiness_pull: dict[tuple[int, int], dict[str, Any]] = {}
     for raw in drum_rows:
         if not isinstance(raw, Mapping) or str(raw.get("entity_kind")) != "drum_slot":
@@ -1077,7 +1095,15 @@ def build_compact_current_production_control_payload(
             raise ProductionControlJournalPromotionError(
                 "compact drum payload identity is malformed"
             )
-        for action in list(payload.get("action_manifest") or []):
+        try:
+            slot_view = drum_readiness_view(
+                readiness_by_plan_line.get(int(payload.get("plan_line_id") or 0)),
+                entity_kind="drum_slot",
+                payload=payload,
+            )
+        except DrumReadinessLinkMissing as exc:
+            raise ProductionControlJournalPromotionError(str(exc)) from exc
+        for action in list(slot_view.get("action_manifest") or []):
             if not isinstance(action, Mapping):
                 raise ProductionControlJournalPromotionError(
                     "compact drum action is malformed"

@@ -79,6 +79,10 @@ from ..services.item_ledger.drum_saved_calendar import (
 )
 from ..services.item_ledger.drum_schedule_persistence import (
     ALGORITHM_VERSION as DRUM_SCHEDULE_ALGORITHM_VERSION,
+    DrumReadinessLinkMissing,
+    drum_readiness_view,
+    load_readiness_payloads,
+    published_readiness_plan_lines,
 )
 from .production_control_settings import router as settings_router
 
@@ -740,6 +744,56 @@ def get_drum_schedule(
                 str(row.business_identity),
             ),
         )
+        # The readiness curve, blockers, required actions and unavailable
+        # reasons are owned by the assembly_readiness current row of the same
+        # plan line; a drum row only links to it.  Resolve them once for this
+        # scope instead of storing (and ageing) a copy per drum row.
+        #
+        # The whole-scope check is identity-only, so a missing owner is caught
+        # fail-closed for every drum row, while the heavy payloads are read
+        # only for the plan lines this page actually renders.
+        drum_plan_lines = {
+            int(row.payload.get("plan_line_id"))
+            for row in (*slots, *gaps, *excluded_rows)
+            if (row.payload or {}).get("plan_line_id") is not None
+        }
+        readiness_owners = published_readiness_plan_lines(db)
+        orphaned = sorted(drum_plan_lines - readiness_owners)
+        if orphaned:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "drum_schedule_unavailable",
+                    "reason": (
+                        "current drum rows have no assembly readiness owner for "
+                        f"plan lines {orphaned[:20]}"
+                    ),
+                },
+            )
+        page_plan_lines = {
+            int(row.payload.get("plan_line_id"))
+            for row in (
+                *slots[offset:offset + limit],
+                *gaps[offset:offset + limit],
+                *excluded_rows[offset:offset + limit],
+            )
+            if (row.payload or {}).get("plan_line_id") is not None
+        }
+        readiness_payloads = load_readiness_payloads(db, page_plan_lines)
+
+        def _readiness_view(entity_kind: str, payload: dict) -> dict:
+            try:
+                return drum_readiness_view(
+                    readiness_payloads.get(int(payload.get("plan_line_id") or 0)),
+                    entity_kind=entity_kind,
+                    payload=payload,
+                )
+            except DrumReadinessLinkMissing as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "drum_schedule_unavailable", "reason": str(exc)},
+                ) from exc
+
         item_ids = {
             int(row.payload.get("item_id"))
             for row in (*slots, *gaps, *excluded_rows)
@@ -783,11 +837,7 @@ def get_drum_schedule(
                 "source_revision": str(row.source_revision),
                 "slot_ordinal": int(payload.get("slot_ordinal") or 0),
                 "readiness_phase": str(payload.get("readiness_phase") or "unavailable"),
-                "readiness_date": payload.get("readiness_date"),
-                "readiness_curve": list(payload.get("readiness_curve") or []),
-                "action_manifest": list(payload.get("action_manifest") or []),
-                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
-                "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                **_readiness_view("drum_slot", payload),
                 "manual_override": bool(row.manual_input),
                 "manual_moved_at": row.manual_input.get("moved_at") if row.manual_input else None,
                 "manual_moved_by": row.manual_input.get("moved_by") if row.manual_input else None,
@@ -819,11 +869,7 @@ def get_drum_schedule(
                 "current_identity": str(row.business_identity),
                 "source_revision": str(row.source_revision),
                 "readiness_phase": str(payload.get("readiness_phase") or "unavailable"),
-                "readiness_date": payload.get("readiness_date"),
-                "readiness_curve": list(payload.get("readiness_curve") or []),
-                "action_manifest": list(payload.get("action_manifest") or []),
-                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
-                "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                **_readiness_view("drum_gap", payload),
                 "original_priority": list(payload.get("original_priority") or []),
             })
         excluded_response_rows = []
@@ -844,12 +890,7 @@ def get_drum_schedule(
                 "accepted_plan_output_qty": float(payload.get("accepted_plan_output_qty") or 0),
                 "assembly_remaining_qty": float(payload.get("assembly_remaining_qty") or 0),
                 "reason": str(payload.get("reason") or "ASSEMBLY_RATE_MISSING"),
-                "readiness_status": str(payload.get("readiness_status") or "unavailable"),
-                "readiness_date": payload.get("readiness_date"),
-                "readiness_curve": list(payload.get("readiness_curve") or []),
-                "action_manifest": list(payload.get("action_manifest") or []),
-                "unavailable_reasons": list(payload.get("unavailable_reasons") or []),
-                "blocking_manifest": list(payload.get("blocking_manifest") or []),
+                **_readiness_view("drum_excluded", payload),
                 "original_priority": list(payload.get("original_priority") or []),
             })
         return DrumScheduleResponse.model_validate({

@@ -1277,6 +1277,7 @@ def publish_current_execution_from_generation(
     db: Session,
     generation_id: int,
 ) -> dict[str, CurrentExecutionPublishResult]:
+    from .drum_schedule_persistence import readiness_ref_for_plan_line
     """Promote the four staged R8 contours at the accepted publication boundary."""
 
     generation = db.get(models.LedgerGeneration, int(generation_id))
@@ -1456,11 +1457,10 @@ def publish_current_execution_from_generation(
                 "assembly_remaining_qty": str(slot.assembly_remaining_qty) if slot.assembly_remaining_qty is not None else None,
                 "slot_ordinal": int(slot.slot_ordinal),
                 "readiness_phase": str(slot.readiness_phase),
-                "readiness_date": slot.readiness_date.isoformat() if slot.readiness_date else None,
-                "readiness_curve": list(slot.readiness_curve or []),
-                "action_manifest": list(slot.action_manifest or []),
-                "unavailable_reasons": list(slot.unavailable_reasons or []),
-                "blocking_manifest": list(slot.blocking_manifest or []),
+                # One owner per value (decision §38): readiness curve and
+                # manifests live on the assembly_readiness row of this plan
+                # line; the drum row only references it.
+                "readiness_ref": readiness_ref_for_plan_line(int(slot.plan_line_id)),
                 "original_priority": list(slot.original_priority or []),
             }
             if manual:
@@ -1516,11 +1516,7 @@ def publish_current_execution_from_generation(
                     "available_capacity": str(gap.available_capacity),
                     "gap_qty": str(gap.gap_qty),
                     "readiness_phase": str(gap.readiness_phase),
-                    "readiness_date": gap.readiness_date.isoformat() if gap.readiness_date else None,
-                    "readiness_curve": list(gap.readiness_curve or []),
-                    "action_manifest": list(gap.action_manifest or []),
-                    "unavailable_reasons": list(gap.unavailable_reasons or []),
-                    "blocking_manifest": list(gap.blocking_manifest or []),
+                    "readiness_ref": readiness_ref_for_plan_line(int(gap.plan_line_id)),
                     "original_priority": list(gap.original_priority or []),
                 },
             })
@@ -1562,12 +1558,7 @@ def publish_current_execution_from_generation(
                     "accepted_plan_output_qty": str(queue.accepted_plan_output_qty),
                     "assembly_remaining_qty": str(queue.assembly_remaining_qty),
                     "reason": "ASSEMBLY_RATE_MISSING",
-                    "readiness_status": str(readiness.status),
-                    "readiness_date": readiness.readiness_date.isoformat() if readiness.readiness_date else None,
-                    "readiness_curve": list(readiness.readiness_curve or []),
-                    "action_manifest": list(readiness.action_manifest or []),
-                    "unavailable_reasons": list(readiness.unavailable_reasons or []),
-                    "blocking_manifest": list(readiness.blocking_manifest or []),
+                    "readiness_ref": readiness_ref_for_plan_line(int(queue.plan_line_id)),
                     "original_priority": list(queue.original_priority or []),
                 },
             })
