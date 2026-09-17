@@ -499,6 +499,128 @@ def _hash(payload: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _canonical_encoding(value: Any) -> bytes:
+    return json.dumps(
+        _jsonable(value), sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+
+
+# --------------------------------------------------------------------------
+# Compact audit payloads
+# --------------------------------------------------------------------------
+#
+# ``CurrentExecutionRow.payload`` stays complete: the screens read it.  The
+# change audit answers a different question — *what became different and when*
+# — and it does not need a second and a third verbatim copy of the heavy
+# derived presentation sub-objects that every readiness reallocation rebuilds
+# wholesale.  Readiness is a global consume-once allocation, so any stock move
+# legitimately re-derives every line; at the hourly cadence the verbatim
+# before/after copies of those sub-objects alone are of the order of a
+# gigabyte a day.
+#
+# For the execution/read-model kinds below the audit therefore keeps every
+# scalar and small business field verbatim (status, quantities, dates,
+# blocker_count, priority, identities, reasons, plan/run/line ids) and stores
+# each heavy derived sub-object as a digest marker
+# ``{"__digest": "sha256:<hex>", "__bytes": <n>}``.  The digest is taken over
+# the same canonical JSON form used by the semantic hash, so "this part
+# changed" stays provable (the digest differs) and "this part did not change"
+# stays provable too (the digest is equal), without storing the content twice.
+#
+# Rules of the table below:
+#
+# * ``_AUDIT_HEAVY_KEYS`` — top-level keys that are always digested when
+#   present, because they are derived presentation payloads by construction.
+# * ``_AUDIT_HEAVY_KEYS_WHEN_LARGE`` — top-level keys that carry business
+#   codes in the normal case and only grow into a derived blob occasionally;
+#   they are digested only above ``AUDIT_LARGE_VALUE_BYTES``.
+# * An entity kind that is absent here, or a payload in which no heavy key was
+#   actually replaced, is written to the audit exactly as before.
+# * Business-decision audits of the reservation / replenishment / future
+#   supply owners live in their own tables and are untouched by this policy.
+#
+# A new entity kind is added here deliberately and never by default: the
+# safe direction is to keep a payload verbatim until its heavy derived keys
+# are named.
+
+AUDIT_DIGEST_KEY = "__digest"
+AUDIT_DIGEST_BYTES_KEY = "__bytes"
+AUDIT_LARGE_VALUE_BYTES = 2048
+
+_AUDIT_HEAVY_KEYS: dict[str, frozenset[str]] = {
+    "assembly_readiness": frozenset({
+        "readiness_curve", "blocking_manifest", "action_manifest",
+    }),
+    "drum_slot": frozenset({
+        "readiness_curve", "blocking_manifest", "action_manifest",
+    }),
+    "drum_gap": frozenset({
+        "readiness_curve", "blocking_manifest", "action_manifest",
+    }),
+    "drum_excluded": frozenset({
+        "readiness_curve", "blocking_manifest", "action_manifest",
+    }),
+    "production_control_journal": frozenset({
+        "_route_sheet_snapshot", "material_coverage_snapshot",
+    }),
+    "purchase_control_journal": frozenset({
+        "horizon_buckets", "slices", "materialization_input",
+    }),
+    "period_plan_execution": frozenset({"queue_links"}),
+}
+
+_AUDIT_HEAVY_KEYS_WHEN_LARGE: dict[str, frozenset[str]] = {
+    "assembly_readiness": frozenset({"unavailable_reasons"}),
+    "drum_slot": frozenset({"unavailable_reasons"}),
+    "drum_gap": frozenset({"unavailable_reasons"}),
+    "drum_excluded": frozenset({"unavailable_reasons"}),
+}
+
+
+def audit_digest_marker(value: Any) -> dict[str, Any]:
+    """Return the short marker that stands for a heavy sub-object in the audit."""
+
+    encoded = _canonical_encoding(value)
+    return {
+        AUDIT_DIGEST_KEY: "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        AUDIT_DIGEST_BYTES_KEY: len(encoded),
+    }
+
+
+def compact_audit_payload(
+    payload: Mapping[str, Any] | None, entity_kind: str
+) -> dict[str, Any] | None:
+    """Return the audit form of a current execution payload.
+
+    Everything that a business decision is made on is kept verbatim; the heavy
+    derived sub-objects declared for ``entity_kind`` are replaced by their
+    digest marker.  A payload without such keys is returned unchanged.
+    """
+
+    if payload is None:
+        return None
+    kind = str(entity_kind)
+    always = _AUDIT_HEAVY_KEYS.get(kind, frozenset())
+    when_large = _AUDIT_HEAVY_KEYS_WHEN_LARGE.get(kind, frozenset())
+    if not always and not when_large:
+        return _jsonable(dict(payload))
+    compacted: dict[str, Any] = {}
+    replaced = False
+    for key, value in payload.items():
+        name = str(key)
+        if name in always or (
+            name in when_large
+            and len(_canonical_encoding(value)) > AUDIT_LARGE_VALUE_BYTES
+        ):
+            compacted[name] = audit_digest_marker(value)
+            replaced = True
+            continue
+        compacted[name] = value
+    if not replaced:
+        return _jsonable(dict(payload))
+    return _jsonable(compacted)
+
+
 QUANTITY_SCALE = 3
 _QUANTITY_QUANTUM = Decimal("0.001")
 # Only a literal decimal fraction is a quantity here.  Zero-padded integer
@@ -791,8 +913,8 @@ def publish_current_execution_scope(
             source_revision=revision,
             operation=operation,
             reason="recalculation",
-            before_payload=before,
-            after_payload=_jsonable(payload),
+            before_payload=compact_audit_payload(before, key[0]),
+            after_payload=compact_audit_payload(payload, key[0]),
         ))
         changed += 1
 
@@ -814,7 +936,7 @@ def publish_current_execution_scope(
                 source_revision=revision,
                 operation="close",
                 reason="scope_rebuild",
-                before_payload=before,
+                before_payload=compact_audit_payload(before, str(row.entity_kind)),
                 after_payload=None,
             ))
             closed += 1
