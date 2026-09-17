@@ -114,6 +114,7 @@ def _backfill_current_owner(bind) -> None:
           JOIN planning_truth_state AS pts ON pts.id = 1
          WHERE {_accepted_scope('lfs')}
            AND trim(coalesce(lfs.current_identity, '')) <> ''
+           AND lfs.evidence_status = 'exact'
         """
     ))
 
