@@ -1882,3 +1882,256 @@ def test_separate_documents_never_net_against_each_other(db_session):
     )
     assert queue.accepted_plan_output_qty == Decimal("12")
     assert queue.assembly_remaining_qty == Decimal("0")
+
+
+def test_bounded_output_without_live_plan_owner_is_surplus_not_a_failure(db_session):
+    """Production posts output that no live plan line can claim.
+
+    CANON "Атрибуция фактов" records such a fact as surplus (fact = allocated +
+    surplus) and forbids attributing it to an arbitrary order.  The bounded
+    hourly refresh must reach the same decision: failing here stalled physical
+    truth for the whole scope on the production stand (candidate 1352).
+    """
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="surplus-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="surplus-target", cutoff=cutoff)
+    unowned = _item(db_session, "ASM-SURPLUS-UNOWNED")
+    owned = _item(db_session, "ASM-SURPLUS-OTHER")
+    _, _, other_line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=owned,
+        qty=Decimal("5"),
+    )
+    sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=unowned,
+        qty="3",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="surplus-output",
+        content_hash="d" * 64,
+    )
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="surplus-batch",
+    )
+
+    assert result.idempotent is False
+    assert result.allocation_signature == ()
+    assert [row["decision_status"] for row in result.fact_signature] == ["allocatable"]
+    assert Decimal(result.fact_signature[0]["surplus_qty"]) == Decimal("3")
+    assert Decimal(str(result.metrics["fact_qty"])) == Decimal("3")
+    assert Decimal(str(result.metrics["allocated_qty"])) == Decimal("0")
+    assert Decimal(str(result.metrics["surplus_total"])) == Decimal("3")
+    # No owner or current row is touched by a surplus decision.
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 0
+    assert db_session.query(models.AssemblyOutputAllocation).count() == 0
+    assert db_session.query(models.AssemblyOutputFactDecision).count() == 0
+    db_session.refresh(other_line)
+    assert Decimal(str(other_line.accepted_output_qty)) == Decimal("0")
+    assert Decimal(str(other_line.remaining_output_qty)) == Decimal("5")
+    root = db_session.query(models.MrpRunRoot).one()
+    assert Decimal(str(root.accepted_qty)) == Decimal("0")
+    assert Decimal(str(root.remaining_qty)) == Decimal("5")
+
+
+def test_bounded_output_mixes_owned_allocation_with_unowned_surplus(db_session):
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="mixed-surplus-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="mixed-surplus-target", cutoff=cutoff)
+    owned = _item(db_session, "ASM-MIXED-OWNED")
+    unowned = _item(db_session, "ASM-MIXED-UNOWNED")
+    _, _, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=owned,
+        qty=Decimal("5"),
+    )
+    owned_sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=owned,
+        qty="3",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="mixed-owned",
+        content_hash="e" * 64,
+    )
+    unowned_sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=unowned,
+        qty="2",
+        at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        recorder="mixed-unowned",
+        content_hash="f" * 64,
+    )
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(owned_sle.id), int(unowned_sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="mixed-batch",
+    )
+
+    surplus_by_sle = {
+        int(row["stock_ledger_entry_id"]): Decimal(row["surplus_qty"])
+        for row in result.fact_signature
+    }
+    assert surplus_by_sle[int(owned_sle.id)] == Decimal("0")
+    assert surplus_by_sle[int(unowned_sle.id)] == Decimal("2")
+    assert [int(row["stock_ledger_entry_id"]) for row in result.allocation_signature] == [
+        int(owned_sle.id),
+    ]
+    assert Decimal(str(result.metrics["allocated_qty"])) == Decimal("3")
+    assert Decimal(str(result.metrics["surplus_total"])) == Decimal("2")
+    assert Decimal(str(result.metrics["fact_qty"])) == Decimal("5")
+    db_session.refresh(line)
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("3")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("2")
+    facts = db_session.query(models.ProductionPlanExecutionFact).all()
+    assert [int(row.stock_ledger_entry_id) for row in facts] == [int(owned_sle.id)]
+
+
+def test_bounded_output_fails_closed_when_owner_pair_has_no_run_root(db_session):
+    """Absent ownership is surplus; inconsistent ownership is still a failure."""
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="broken-owner-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="broken-owner-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BROKEN-OWNER")
+    _, run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+    )
+    db_session.query(models.MrpRunRoot).filter_by(run_id=int(run.run_id)).delete()
+    db_session.flush()
+    sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="broken-owner-output",
+        content_hash="a" * 64,
+    )
+
+    with pytest.raises(ValueError, match="incomplete current owner"):
+        apply_bounded_assembly_output_plan_execution(
+            db_session,
+            target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id),
+            affected_sle_ids=[int(sle.id)],
+            earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            source_revision="broken-owner-batch",
+        )
+    db_session.rollback()
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 0
+
+
+def test_bounded_output_of_closed_plan_run_is_surplus_not_a_failure(db_session):
+    """Exact manufacture provenance whose plan line is no longer live.
+
+    This is the second face of the same production state: the output was made
+    for a plan whose run has since been closed, so no live plan line may claim
+    it.  The canonical path records surplus with reason "top-level MRP
+    requirement has no eligible live plan line"; the bounded path must not turn
+    that into a refresh failure.
+    """
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="closed-run-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="closed-run-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-CLOSED-RUN")
+    plan, run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="draft",
+        item=item,
+        qty=Decimal("5"),
+    )
+    requirement = models.MrpRequirement(
+        run_id=int(run.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+        status="open",
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    order = models.ProductionOrder(
+        order_number="MRP-CLOSED-RUN",
+        order_date=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        source="mrp",
+        source_run_id=int(run.run_id),
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = models.ProductionProduct(
+        order_id=int(order.order_id),
+        item_id=int(item.item_id),
+        line_number=1,
+        quantity=Decimal("3"),
+        produced_qty=Decimal("0"),
+        remaining_qty=Decimal("3"),
+        source_mrp_requirement_id=int(requirement.id),
+        ledger_generation_id=int(parent.id),
+    )
+    db_session.add(product)
+    db_session.flush()
+    recorder = "closed-run-recorder"
+    db_session.add(
+        models.ProductionManufacture(
+            product_id=int(product.product_id),
+            order_id=int(order.order_id),
+            qty=Decimal("3"),
+            status="exported",
+            exported_ref1c=recorder,
+        )
+    )
+    db_session.flush()
+    sle = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder=recorder,
+        content_hash="9" * 64,
+    )
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(sle.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="closed-run-batch",
+    )
+
+    assert result.allocation_signature == ()
+    decision = result.fact_signature[0]
+    assert decision["reason"] == "top-level MRP requirement has no eligible live plan line"
+    assert Decimal(decision["surplus_qty"]) == Decimal("3")
+    assert Decimal(str(result.metrics["fact_qty"])) == (
+        Decimal(str(result.metrics["allocated_qty"]))
+        + Decimal(str(result.metrics["surplus_total"]))
+    )
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 0
+    db_session.refresh(line)
+    assert Decimal(str(line.accepted_output_qty)) == Decimal("0")
+    assert Decimal(str(line.remaining_output_qty)) == Decimal("5")

@@ -288,6 +288,20 @@ def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandida
     return tuple(candidates)
 
 
+# The canonical decision path records these outcomes as surplus (see
+# ``allocate_output_fact`` and the conservation check ``fact = allocated +
+# surplus``): the output exists, but no live plan line may claim it.  The
+# bounded publisher must not turn that ordinary business state into a refresh
+# failure.  Contradictory evidence — several exact products, a missing product
+# or requirement, an item mismatch, several exact candidate lines — keeps
+# failing closed, because it is broken provenance rather than absent ownership.
+_NO_LIVE_OWNER_REASONS = frozenset({
+    "top-level MRP requirement has no eligible live plan line",
+    "exact plan line is not in the live-plan scope",
+    "exact plan lines are not in the live-plan scope",
+})
+
+
 def _fact_provenance(
     db: Session,
     facts: tuple[_OutputFact, ...],
@@ -940,10 +954,14 @@ def _bounded_candidates(
     parent_generation_id: int,
     item_ids: set[int],
     *,
-    require_owner: bool = True,
     owner_run_by_line: dict[int, int] | None = None,
 ) -> tuple[QueueCandidate, ...]:
-    """Read current plan owners, never generation-local queue staging."""
+    """Read current plan owners, never generation-local queue staging.
+
+    An empty result is a legitimate answer: the affected items simply have no
+    live plan line to claim the output.  Attribution of such a fact is decided
+    by the canonical allocator, not here.
+    """
 
     rows = _build_rows_by_scope(db, int(parent_generation_id), include_zero=True)
     stable_owner_runs = owner_run_by_line or {}
@@ -1028,10 +1046,12 @@ def _bounded_candidates(
                 eligible_from=payload.get("eligible_from"),
             )
         )
-    if require_owner and not candidates and item_ids:
-        # An output with no live owner is not silently treated as surplus: the
-        # current publisher must fail closed before changing any owner rows.
-        raise ValueError("bounded assembly output has no live plan owner")
+    # CANON «Атрибуция фактов» and «Запрещено: приписывать физический факт
+    # произвольному заказу»: an output that no live plan line can claim is a
+    # surplus decision (fact = allocated + surplus), never a failure and never
+    # a reassignment.  Production routinely posts such facts — output made
+    # outside any fixed plan, or after that plan's run was closed — so failing
+    # here stalled the hourly refresh for the whole scope forever.
     return tuple(candidates)
 
 
@@ -1440,7 +1460,6 @@ def apply_bounded_assembly_output_plan_execution(
             db,
             int(parent.id),
             item_ids,
-            require_owner=True,
             owner_run_by_line=stable_owner_runs,
         )
         if new_facts
@@ -1450,11 +1469,16 @@ def apply_bounded_assembly_output_plan_execution(
     fact_signature, allocation_signature, metrics, _ = _expected_signatures(
         new_facts, candidates, provenance
     )
-    if any(
-        _text(row["decision_status"]) in {"ambiguous", "invalid"}
-        for row in fact_signature
-    ):
-        raise ValueError("bounded assembly output has ambiguous or unmatched provenance")
+    blocking = [
+        row for row in fact_signature
+        if _text(row["decision_status"]) in {"ambiguous", "invalid"}
+        and _text(row["reason"]) not in _NO_LIVE_OWNER_REASONS
+    ]
+    if blocking:
+        raise ValueError(
+            "bounded assembly output has ambiguous or unmatched provenance "
+            + str([int(row["stock_ledger_entry_id"]) for row in blocking])
+        )
     _persist_bounded_owner_rows(db, target, allocation_signature)
     retained_signature = _bounded_allocation_signature(retained_existing)
     combined_allocation_signature = sorted(
