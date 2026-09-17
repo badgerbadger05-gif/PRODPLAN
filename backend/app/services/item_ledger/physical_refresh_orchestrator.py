@@ -185,7 +185,7 @@ def _physical_refresh_delta_rows(
         "input_delta_rows": len(rows),
         "affected_scopes": tuple(sorted(scopes)),
         "backdated": any(
-            _utc(row.posting_at, "physical posting_at") <= _utc(parent.cutoff, "parent cutoff")
+            _posting_at_utc(row.posting_at, "physical posting_at") <= _utc(parent.cutoff, "parent cutoff")
             for row in rows
         ),
     }
@@ -214,9 +214,23 @@ class PhysicalRefreshOrchestrationResult:
     phase_timings: tuple[tuple[str, int], ...] = ()
 
 
+_LEDGER_LOCAL_TZ = ZoneInfo("Europe/Moscow")
+
 def _utc(value: datetime, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _posting_at_utc(value: datetime, field: str) -> datetime:
+    """Ledger ``posting_at`` is a naive Europe/Moscow timestamp (see ingest).
+
+    Treating it as UTC shifts every fact by three hours: facts posted within
+    three hours before the cutoff look like the future and genuinely
+    backdated facts look current.  Localise naive values first.
+    """
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=_LEDGER_LOCAL_TZ).astimezone(timezone.utc)
     return value.astimezone(timezone.utc)
 
 
@@ -778,7 +792,7 @@ def _bounded_custody_tail_sle_ids(
                 "physical refresh custody tail references incomplete import batch "
                 f"(source_sle_id={int(source_id)}, batch_id={int(batch_id)})"
             )
-        if cutoff is not None and _utc(posting_at, "custody source posting_at") > cutoff:
+        if cutoff is not None and _posting_at_utc(posting_at, "custody source posting_at") > _utc(cutoff, "target cutoff"):
             raise PhysicalRefreshOrchestratorError(
                 "physical refresh custody tail contains a future source SLE "
                 f"(source_sle_id={int(source_id)}, posting_at={posting_at!s})"

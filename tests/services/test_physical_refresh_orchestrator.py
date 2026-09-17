@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import event
@@ -87,6 +88,22 @@ def test_lifecycle_guard_skips_nested_sequence_advisory_lock_only_in_context():
     with physical_sequence_lock_context():
         guard_physical_batch_writer(db)
     assert events == ["execute"]
+
+
+def _moscow_naive(instant):
+    """Convert a UTC instant into the ledger's canonical naive Europe/Moscow
+    local wall-clock form (see ingest._posting_at_local /
+    physical_refresh_orchestrator._posting_at_utc).
+
+    ``instant`` may itself be naive: after a commit, SQLAlchemy expires and
+    reloads DateTime(timezone=True) attributes from SQLite without tzinfo,
+    but the reloaded wall-clock digits are still the original UTC ones (e.g.
+    ``LedgerGeneration.cutoff``). Naive input is therefore treated as UTC
+    before converting to Moscow local time.
+    """
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
 
 
 def _accepted_parent(db_session, *, generation_key="accepted-parent"):
@@ -690,7 +707,7 @@ def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
         ingest_batch_id=forked_batch.id, source_content_hash="physical-delta-sle",
         business_identity="physical-delta-business", item_id=item.item_id,
         characteristic_ref="", organization_ref="", warehouse_ref1c="",
-        qty=Decimal("2"), posting_at=parent.cutoff + timedelta(hours=1),
+        qty=Decimal("2"), posting_at=_moscow_naive(parent.cutoff + timedelta(hours=1)),
         record_type="Receipt", movement_kind="assembly_in",
         recorder_type="Production", recorder_ref="physical-delta-rec", line_no="1",
         ingest_source="pull",
@@ -1017,7 +1034,7 @@ def test_publisher_failure_rolls_back_and_discards_candidate(
         ingest_batch_id=batch.id, source_content_hash="publisher-failure-sle",
         business_identity="publisher-failure-sle", item_id=item.item_id,
         characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
-        qty=Decimal("1"), posting_at=parent.cutoff + timedelta(hours=1),
+        qty=Decimal("1"), posting_at=_moscow_naive(parent.cutoff + timedelta(hours=1)),
         record_type="Receipt", movement_kind="transfer_out", recorder_type="Document_Transfer",
         recorder_ref="publisher-failure", line_no="1", ingest_source="pull",
     )
