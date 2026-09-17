@@ -29,6 +29,7 @@ from .assembly_readiness_core import (
     ReplenishmentPolicy,
     allocate_readiness_curves,
 )
+from .current_execution import canonical_quantity_text
 from .future_supply_read import future_supply_model
 
 
@@ -38,6 +39,22 @@ ALGORITHM_VERSION = "assembly-readiness/12-physical-material-gate"
 
 def _d(value: Any) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value or 0))
+
+
+def _qty(value: Any) -> str:
+    """Serialize a readiness action quantity in its one canonical text.
+
+    Blockers, coverage sources and curve points already leave the allocator
+    through ``_q``/``_root_q``, so their text is canonical.  An action quantity
+    is the raw ``needed``/``take``: it inherits the Decimal scale of every
+    frozen norm on the BOM path, so the same four pieces are written as
+    ``4.000000`` by one build and as ``4.000000000000000000000000`` by the
+    next.  Republishing an unchanged result must not create a change row (R8),
+    and the drum tiles copy this payload verbatim, so the canonical text is
+    produced here, at the source.
+    """
+
+    return canonical_quantity_text(_d(value))
 
 
 def _signature(value: Any) -> str:
@@ -554,7 +571,7 @@ def build_assembly_readiness_payload_rows(
             "item_code": str(item.item_code or "") if item is not None else "",
             "item_article": str(item.item_article or "") if item is not None else "",
             "item_name": str(item.item_name or "") if item is not None else "",
-            "qty": str(action.qty),
+            "qty": _qty(action.qty),
             "available_date": action.available_date.isoformat() if action.available_date else None,
             "confidence": action.confidence,
             "source_key": action.source_key,

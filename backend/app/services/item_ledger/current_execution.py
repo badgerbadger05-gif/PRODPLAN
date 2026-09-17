@@ -13,6 +13,7 @@ from datetime import date
 from decimal import Decimal
 import hashlib
 import json
+import re
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
@@ -498,11 +499,53 @@ def _hash(payload: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+QUANTITY_SCALE = 3
+_QUANTITY_QUANTUM = Decimal("0.001")
+# Only a literal decimal fraction is a quantity here.  Zero-padded integer
+# sort keys, item codes and refs never carry a decimal point, so they keep
+# their exact saved text and their ordering semantics.
+_DECIMAL_TEXT = re.compile(r"^-?\d+\.\d+$")
+
+
+def canonical_quantity_text(value: Any) -> str:
+    """Return the one canonical text of a saved quantity.
+
+    Decimal arithmetic over frozen norms produces an unbounded scale: the same
+    four pieces are serialized as ``4.000000`` by one build and as
+    ``4.000000000000000000000000`` by the next.  That is transport noise, not a
+    business change, and R8 forbids it from creating a row/audit churn.  The
+    canonical form keeps the exact numeric value and only fixes its
+    representation: trailing zeros are dropped and the value is padded back to
+    the canonical ``Decimal(15,3)`` scale whenever it fits into it.
+    """
+
+    number = value if isinstance(value, Decimal) else Decimal(str(value))
+    number = number.normalize()
+    if number == 0:
+        number = Decimal("0")
+    exponent = number.as_tuple().exponent
+    if isinstance(exponent, int) and exponent > -QUANTITY_SCALE:
+        number = number.quantize(_QUANTITY_QUANTUM)
+    return format(number, "f")
+
+
+def _canonical_scalar(value: Any) -> Any:
+    """Collapse a quantity to its canonical text for the comparison view."""
+
+    if isinstance(value, Decimal):
+        return canonical_quantity_text(value)
+    if isinstance(value, str) and _DECIMAL_TEXT.match(value):
+        return canonical_quantity_text(value)
+    return value
+
+
 def _drop_semantic_neutral_fields(value: Any, *, entity_kind: str, path: tuple[str, ...] = ()) -> Any:
     """Return the business comparison view of a current execution payload.
 
     Generation refreshes legitimately rebuild compatibility DTOs.  Only the
-    explicitly technical fields below are ignored; quantities, identities and
+    explicitly technical fields below are ignored, and every quantity is read
+    through its canonical text so that a wider Decimal scale is not mistaken
+    for a new business value; quantities themselves, identities, list order and
     other business evidence remain part of the comparison.
     """
     if isinstance(value, dict):
@@ -541,7 +584,7 @@ def _drop_semantic_neutral_fields(value: Any, *, entity_kind: str, path: tuple[s
             _drop_semantic_neutral_fields(child, entity_kind=entity_kind, path=path)
             for child in value
         )
-    return value
+    return _canonical_scalar(value)
 
 
 def _semantic_payload(row: dict[str, Any], existing_manual: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
