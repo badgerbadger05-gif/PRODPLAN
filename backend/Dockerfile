@@ -19,4 +19,8 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# --timeout-worker-healthcheck: the multiprocess supervisor kills a worker that
+# misses its liveness ping (default 5s). A single slow/blocking request must not
+# be able to take a worker down mid-transaction, as the auto-sync tick once did.
+# Requires uvicorn >= 0.37 (see requirements.txt).
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--timeout-worker-healthcheck", "120"]

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 from typing import List
@@ -21,6 +22,7 @@ from ..services.operations_sync import sync_operations_from_odata, OperationsSyn
 from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
 from ..services.employee_sync import sync_employees_from_odata
 from ..services import sync_orchestrator
+from ..services import sync_tick_runner
 from ..services.odata_config import resolve_config_secrets
 
 from .. import models
@@ -519,14 +521,25 @@ def sync_production_kinds_odata(payload: ODataSyncRequest, db: Session = Depends
 
 
 @router.post("/auto/tick", response_model=dict)
-def sync_auto_tick(db: Session = Depends(get_db)):
+async def sync_auto_tick(db: Session = Depends(get_db)):
     """
     Выполнить не более одного «просроченного» job автоматической синхронизации.
     Вызывается воркером каждые ~2 минуты: один job за тик, поэтому нагрузка на 1С
     размазана по времени, без пиков и параллельных запусков. Read-only к 1С.
     """
+    # Работа тика идёт в отдельном процессе (`app.services.sync_tick_runner`):
+    # ограниченное обновление физической правды десятки секунд держит GIL, и
+    # HTTP-воркер uvicorn переставал отвечать на liveness-пинг супервизора —
+    # тот убивал воркер прямо посреди транзакции, и так на каждом тике. Здесь
+    # обработчик только ждёт дочерний процесс, не блокируя event loop; семантика
+    # тика (один job за тик, advisory-lock, форма JSON) не меняется.
+    # Описание эндпоинта в OpenAPI намеренно оставлено прежним — docs/api/openapi.json
+    # и сгенерированные типы фронта не должны меняться от внутренней правки.
     try:
-        return sync_orchestrator.tick(db)
+        if sync_tick_runner.inprocess_enabled():
+            # SYNC_TICK_INPROCESS=1 — старый путь для тестов и отладки.
+            return await run_in_threadpool(sync_orchestrator.tick, db)
+        return await run_in_threadpool(sync_tick_runner.run_tick_subprocess)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync tick error: {e}")
 

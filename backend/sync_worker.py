@@ -8,6 +8,12 @@ is never more than one OData pull in flight, so the 1C server is not hammered.
 Dependency-free (stdlib only) so it runs on the plain backend image. The tick is
 idempotent and self-throttling (per-job intervals), so an occasional double-fire
 or a missed tick is harmless.
+
+The backend runs the tick's work in a child process (`app.services.sync_tick_runner`)
+and returns its JSON unchanged, so nothing here changes: same URL, same response
+shape, same statuses. `SYNC_TICK_TIMEOUT_SECONDS` stays the read timeout for this
+POST — if it fires, the child keeps running to completion and the next tick simply
+reports `busy` on the orchestrator's advisory lock, exactly as before.
 """
 from __future__ import annotations
 
