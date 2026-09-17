@@ -396,14 +396,29 @@ def apply_bounded_current_stock_bins(
         )
         if row_key in current_rows_by_key:
             current_rows_by_key[row_key].append(row)
+    # A bounded refresh rewrites only the affected keys, so an untouched
+    # current owner legitimately keeps the provenance of the accepted
+    # generation that last changed it.  Only a row owned by a generation that
+    # is neither this candidate nor an accepted generation is stale.
+    owner_generation_ids = {
+        int(row.ledger_generation_id) for row in current_rows
+    } - {int(parent.id), int(target.id)}
+    accepted_owner_ids: set[int] = set()
+    if owner_generation_ids:
+        accepted_owner_ids = {
+            int(value) for (value,) in db.query(models.LedgerGeneration.id).filter(
+                models.LedgerGeneration.id.in_(sorted(owner_generation_ids)),
+                models.LedgerGeneration.status == "accepted",
+            ).all()
+        }
     for key in keys:
         matching_rows = current_rows_by_key[key]
         if len(matching_rows) > 1:
             raise BoundedStockBinRefreshError("current StockBin owner is ambiguous")
         current = matching_rows[0] if matching_rows else None
-        if current is not None and int(current.ledger_generation_id) not in {
-            int(parent.id), int(target.id)
-        }:
+        if current is not None and int(current.ledger_generation_id) not in (
+            {int(parent.id), int(target.id)} | accepted_owner_ids
+        ):
             raise BoundedStockBinRefreshError("current StockBin owner is stale")
         current_by_key[key] = current
         if current is not None and current.last_entry_id is not None:
