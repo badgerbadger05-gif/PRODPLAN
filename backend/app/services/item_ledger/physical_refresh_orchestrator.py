@@ -125,8 +125,9 @@ def _physical_refresh_delta_rows(
     terminal_batch_id = max(terminal_ids)
     if terminal_batch_id <= parent_batch_id:
         return {
-            "rows": (), "new_rows": (), "supersessions": (),
+            "rows": (), "new_rows": (), "new_row_ids": (), "supersessions": (),
             "input_delta_rows": 0, "affected_scopes": (), "backdated": False,
+            "backdate_from": None,
         }
     new_rows = tuple(db.query(models.StockLedgerEntry).filter(
         models.StockLedgerEntry.ingest_batch_id > parent_batch_id,
@@ -178,16 +179,44 @@ def _physical_refresh_delta_rows(
                 str(int(row.item_id)), str(row.characteristic_ref or ""),
                 str(row.organization_ref or ""), str(row.warehouse_ref1c or ""), mode,
             )))
+    parent_cutoff = _utc(parent.cutoff, "parent cutoff")
+    rows_by_id = {int(row.id): row for row in rows}
+    new_row_ids = {int(row.id) for row in new_rows}
+    # The earliest changed boundary is the canonical start of a bounded scoped
+    # replay (CANON "Объём вычислений штатного физического refresh", §37): the
+    # oldest posting among newly imported backdated facts and among the facts a
+    # supersession removed from the accepted basis.  It is kept on the raw
+    # ``posting_at`` axis because every bounded consumer compares it against
+    # persisted ``posting_at`` values, not against the generation cutoff.
+    boundary_candidates = [
+        row.posting_at
+        for row in new_rows
+        if _posting_at_utc(row.posting_at, "physical posting_at") <= parent_cutoff
+    ]
+    for edge in supersessions:
+        old = rows_by_id.get(int(edge.old_sle_id))
+        if old is None:
+            raise PhysicalRefreshOrchestratorError(
+                "physical refresh supersession references a missing superseded fact "
+                f"(edge_id={int(edge.id)}, old_sle_id={int(edge.old_sle_id)})"
+            )
+        boundary_candidates.append(old.posting_at)
+    backdate_from = (
+        min(boundary_candidates, key=lambda value: _naive(value))
+        if boundary_candidates else None
+    )
     return {
         "rows": rows,
         "new_rows": new_rows,
+        "new_row_ids": tuple(sorted(new_row_ids)),
         "supersessions": supersessions,
         "input_delta_rows": len(rows),
         "affected_scopes": tuple(sorted(scopes)),
         "backdated": any(
-            _posting_at_utc(row.posting_at, "physical posting_at") <= _utc(parent.cutoff, "parent cutoff")
+            _posting_at_utc(row.posting_at, "physical posting_at") <= parent_cutoff
             for row in rows
         ),
+        "backdate_from": backdate_from,
     }
 
 
@@ -220,6 +249,18 @@ def _utc(value: datetime, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _naive(value: datetime | None) -> datetime | None:
+    """Drop only the adapter timezone marker for same-axis comparisons.
+
+    ``posting_at`` boundaries travel to the bounded stock/replenishment writers
+    unchanged; those modules compare them against persisted ``posting_at``
+    columns, so the boundary must never be shifted onto another axis here.
+    """
+    if value is None:
+        return None
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
 
 
 def _posting_at_utc(value: datetime, field: str) -> datetime:
@@ -1128,12 +1169,17 @@ def run_physical_refresh(
             recorder_audit=recorder_audit,
         )
         delta_rows = tuple(delta["rows"])
+        window_rows = tuple(delta["new_rows"])
+        window_row_ids = set(delta["new_row_ids"])
+        basis_rows = tuple(
+            row for row in delta_rows if int(row.id) not in window_row_ids
+        )
         affected_scopes = tuple(delta["affected_scopes"])
-        if (
-            len(delta_rows) != input_delta_rows
-            or delta["supersessions"]
-            or delta["backdated"]
-        ):
+        backdate_from = delta["backdate_from"]
+        if len(delta_rows) != input_delta_rows:
+            # The durable import/audit checkpoints name more changed facts than
+            # the manifest can resolve.  A backdate or correction is handled by
+            # the bounded scoped replay below; an unaccounted delta is not.
             reason = (
                 "bounded physical delta manifest is incomplete; "
                 "correction/backdate requires explicit maintenance"
@@ -1163,9 +1209,10 @@ def run_physical_refresh(
                 target_generation_id=int(physical_generation.id),
                 parent_generation_id=int(parent.id),
                 delta_manifest={
-                    "rows": delta_rows,
-                    "new_rows": tuple(delta["new_rows"]),
+                    "rows": window_rows,
+                    "basis_rows": basis_rows,
                     "supersessions": tuple(delta["supersessions"]),
+                    "backdate_from": backdate_from,
                     "custody_source_sle_ids": custody_source_sle_ids,
                 },
                 odata_client=client,
@@ -1208,7 +1255,11 @@ def run_physical_refresh(
                 "input_delta_rows": input_delta_rows,
                 "replayed_rows": int(current_publish.replayed_rows),
                 "affected_scopes": list(current_publish.affected_scopes),
-                "backdated": False,
+                "backdated": bool(delta["backdated"]),
+                "backdate_from": (
+                    _naive(backdate_from).isoformat()
+                    if backdate_from is not None else None
+                ),
                 "database_ledger_rows": database_ledger_rows,
                 "duration_ms": publish_duration_ms,
                 "phase_timings": dict(getattr(current_publish, "phase_timings", ()) or ()),

@@ -2215,7 +2215,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
             results=(),
         )
 
-    scope_facts, delta_by_id, _old_ids = _bounded_buy_manifest_facts(
+    scope_facts, delta_by_id, superseded_ids = _bounded_buy_manifest_facts(
         manifest,
         scopes=scopes,
         db=db,
@@ -2258,12 +2258,20 @@ def apply_current_replenishment_for_bounded_buy_scopes(
     replay_rows = 0
     for scope in scopes:
         explicit = tuple(scope_facts[scope])
-        if not explicit and scope not in delta_scopes:
+        retired_here = {
+            int(fact.sle_id) for fact in basis_by_scope[scope]
+        } & set(superseded_ids)
+        if not explicit and scope not in delta_scopes and not retired_here:
             # A declared scope may legitimately have no semantic input in a
             # multi-scope manifest.  Do not touch its marker or allocations.
             continue
         if manifest.scope_receipt_facts:
-            baseline_ids = {int(fact.sle_id) for fact in basis_by_scope[scope]}
+            # A superseded fact is deliberately absent from the replacement
+            # stream: the correction removes it from the basis, and its current
+            # assignment is retired by this very replay.
+            baseline_ids = {
+                int(fact.sle_id) for fact in basis_by_scope[scope]
+            } - set(superseded_ids)
             explicit_ids = {int(fact.sle_id) for fact in explicit}
             if not baseline_ids.issubset(explicit_ids):
                 raise CurrentReplenishmentError(
@@ -2280,7 +2288,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
                     )
                 full_by_id[int(fact.sle_id)] = fact
             full_facts = tuple(full_by_id.values())
-        if not full_facts:
+        if not full_facts and not retired_here:
             continue
         # SQLite strips timezone markers from persisted SLE timestamps while
         # typed import evidence commonly arrives as aware UTC.  The allocator

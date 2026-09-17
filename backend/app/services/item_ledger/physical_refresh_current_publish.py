@@ -245,8 +245,8 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _rows(delta_manifest: Mapping[str, Any]) -> tuple[Any, ...]:
-    rows = tuple(delta_manifest.get("rows") or ())
+def _rows(delta_manifest: Mapping[str, Any], name: str = "rows") -> tuple[Any, ...]:
+    rows = tuple(delta_manifest.get(name) or ())
     by_id: set[int] = set()
     for row in rows:
         try:
@@ -257,6 +257,27 @@ def _rows(delta_manifest: Mapping[str, Any]) -> tuple[Any, ...]:
             raise ForwardPhysicalRefreshUnavailable("physical delta contains duplicate row ids")
         by_id.add(row_id)
     return rows
+
+
+def _backdate_boundary(delta_manifest: Mapping[str, Any]) -> datetime | None:
+    """Read the declared earliest changed boundary of a bounded replay.
+
+    A boundary is the operator-visible proof that this refresh knows how far
+    back the correction reaches.  Without it a backdated fact or a supersession
+    stays fail-closed: the bounded writers would otherwise fold a delta onto a
+    basis that never contained the affected prefix.
+    """
+    raw = delta_manifest.get("backdate_from")
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    try:
+        return datetime.fromisoformat(str(raw))
+    except ValueError as exc:
+        raise ForwardPhysicalRefreshUnavailable(
+            "physical delta backdate boundary is malformed"
+        ) from exc
 
 
 def _comparable(value: datetime) -> datetime:
@@ -281,6 +302,7 @@ def _persisted_rows(
     *,
     parent: models.LedgerGeneration,
     target: models.LedgerGeneration,
+    backdate_from: datetime | None = None,
 ) -> tuple[Any, ...]:
     ids = tuple(int(row.id) for row in rows)
     persisted = tuple(db.query(models.StockLedgerEntry).filter(
@@ -301,35 +323,101 @@ def _persisted_rows(
         if not lower < batch_id <= upper:
             raise ForwardPhysicalRefreshUnavailable("physical delta row is outside target import boundary")
         if _comparable(posting_at) <= _comparable(parent.cutoff):
-            raise ForwardPhysicalRefreshUnavailable("incremental physical refresh supports forward facts only; backdate requires maintenance")
+            if backdate_from is None:
+                raise ForwardPhysicalRefreshUnavailable("incremental physical refresh supports forward facts only; backdate requires maintenance")
+            if _comparable(posting_at) < _comparable(backdate_from):
+                raise ForwardPhysicalRefreshUnavailable(
+                    f"physical delta row {int(row.id)} precedes the declared bounded "
+                    "backdate boundary"
+                )
         if _comparable(posting_at) > _comparable(target.cutoff):
             raise ForwardPhysicalRefreshUnavailable("physical delta row is after target cutoff")
     return tuple(sorted(persisted, key=lambda row: int(row.id)))
 
 
-def _assert_forward_only(
+def _persisted_basis_rows(
+    db: Session,
+    rows: Sequence[Any],
+    *,
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+    supersessions: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Resolve accepted facts that this refresh removes from the basis.
+
+    Only a fact named as the ``old_sle_id`` of a declared supersession edge may
+    enter the bounded scope derivation from outside the target import window.
+    Anything else would silently widen the replay beyond the proven manifest.
+    """
+    if not rows:
+        return ()
+    if not supersessions:
+        raise ForwardPhysicalRefreshUnavailable(
+            "physical delta basis rows require declared supersession edges"
+        )
+    old_ids = {int(edge.old_sle_id) for edge in supersessions if edge.old_sle_id is not None}
+    ids = tuple(int(row.id) for row in rows)
+    foreign = sorted(set(ids) - old_ids)
+    if foreign:
+        raise ForwardPhysicalRefreshUnavailable(
+            "physical delta basis row is not a declared superseded fact "
+            f"(sle_ids={foreign})"
+        )
+    persisted = tuple(db.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.id.in_(ids),
+    ).all())
+    if {int(row.id) for row in persisted} != set(ids):
+        raise ForwardPhysicalRefreshUnavailable(
+            "physical delta references a missing superseded SLE"
+        )
+    lower = int(parent.physical_import_batch_id or 0)
+    for row in persisted:
+        if row.posting_at is None:
+            raise ForwardPhysicalRefreshUnavailable(
+                "superseded fact has no posting boundary"
+            )
+        if int(row.ingest_batch_id or 0) > lower:
+            raise ForwardPhysicalRefreshUnavailable(
+                "superseded fact outside the parent basis must travel as a delta row"
+            )
+        if _comparable(row.posting_at) > _comparable(target.cutoff):
+            raise ForwardPhysicalRefreshUnavailable(
+                "superseded fact is after target cutoff"
+            )
+    return tuple(sorted(persisted, key=lambda row: int(row.id)))
+
+
+# These are ordinary stock movements.  Only the canonical supplier document
+# types enter an R4 allocation writer.
+_SUPPORTED_MOVEMENT_KINDS = frozenset({
+    "assembly_in", "assembly_out", "transfer_in", "transfer_out",
+    "receipt", "expense",
+})
+
+
+def _assert_supported_delta(
     rows: Sequence[Any],
     *,
     parent_cutoff: datetime,
     target_cutoff: datetime,
-    supersessions: Sequence[Any],
+    backdate_from: datetime | None,
 ) -> None:
-    if supersessions:
-        raise ForwardPhysicalRefreshUnavailable(
-            "incremental physical refresh supports forward facts only; supersession requires maintenance"
-        )
-    # These are ordinary forward stock movements.  Only the first and
-    # canonical supplier document types below enter an R4 allocation writer.
-    supported = {
-        "assembly_in", "assembly_out", "transfer_in", "transfer_out",
-        "receipt", "expense",
-    }
     for row in rows:
         posting_at = getattr(row, "posting_at", None)
-        if posting_at is None or _comparable(posting_at) <= _comparable(parent_cutoff):
+        if posting_at is None:
             raise ForwardPhysicalRefreshUnavailable(
-                "incremental physical refresh supports forward facts only; backdate requires maintenance"
+                "physical delta row is inactive or has no posting boundary"
             )
+        if _comparable(posting_at) <= _comparable(parent_cutoff):
+            if backdate_from is None:
+                raise ForwardPhysicalRefreshUnavailable(
+                    "incremental physical refresh supports forward facts only; backdate requires maintenance"
+                )
+            if _comparable(posting_at) < _comparable(backdate_from):
+                raise ForwardPhysicalRefreshUnavailable(
+                    f"physical delta row {int(row.id)} precedes the declared bounded "
+                    "backdate boundary"
+                )
         kind = _text(getattr(row, "movement_kind", ""))
         if kind == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE:
             if not (
@@ -341,9 +429,73 @@ def _assert_forward_only(
                     "cutoff balance adjustment does not match the canonical source"
                 )
             continue
-        if kind not in supported:
+        if kind not in _SUPPORTED_MOVEMENT_KINDS:
             raise ForwardPhysicalRefreshUnavailable(
                 f"incremental physical refresh movement kind is unsupported: {kind or '<empty>'}"
+            )
+
+
+def _assert_supported_basis(rows: Sequence[Any]) -> None:
+    """A removed accepted fact must still be a kind this refresh can scope."""
+    for row in rows:
+        kind = _text(getattr(row, "movement_kind", ""))
+        if kind == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE:
+            continue
+        if kind not in _SUPPORTED_MOVEMENT_KINDS:
+            raise ForwardPhysicalRefreshUnavailable(
+                "superseded fact movement kind is unsupported: "
+                f"{kind or '<empty>'} (sle_id={int(row.id)})"
+            )
+
+
+def _assert_superseded_scopes_are_resolvable(
+    db: Session,
+    *,
+    basis_rows: Sequence[Any],
+    scopes: Sequence[tuple[int, str, str, str, str]],
+) -> None:
+    """Fail closed when a correction removes an allocation we cannot scope.
+
+    A superseded fact that still carries a current replenishment assignment
+    must fall inside a derived distribution scope, otherwise the bounded
+    replay would leave an orphaned assignment behind while reporting success.
+    """
+    ids = [int(row.id) for row in basis_rows]
+    if not ids:
+        return
+    known = set(scopes)
+    rows = (
+        db.query(
+            models.ReservationConsumptionAllocation.sle_id,
+            models.ReservationEntry.item_id,
+            models.ReservationEntry.characteristic_ref,
+            models.ReservationEntry.organization_ref,
+            models.ReservationEntry.planning_stock_pool,
+            models.ReservationEntry.realization_mode,
+        )
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReservationConsumptionAllocation.reservation_id,
+        )
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.sle_id.in_(sorted(ids)),
+        )
+        .all()
+    )
+    for sle_id, item_id, characteristic, organization, pool, mode in rows:
+        realization = _text(mode)
+        scope = (
+            int(item_id), _text(characteristic), _text(organization), _text(pool),
+            "make" if realization == "rework" else realization,
+        )
+        if scope not in known:
+            raise ForwardPhysicalRefreshUnavailable(
+                "supersession of allocated fact "
+                f"{int(sle_id)} has no resolvable distribution scope "
+                f"({':'.join(str(part) for part in scope)}); "
+                "explicit maintenance replay is required"
             )
 
 
@@ -619,18 +771,36 @@ def _publish_forward_physical_refresh_current(
             "empty physical delta is a no-op; discard the candidate without publication"
         )
     supersessions = tuple(delta_manifest.get("supersessions") or ())
-    rows = _persisted_rows(db, rows, parent=parent, target=target) if rows else ()
-    if supersessions:
+    backdate_from = _backdate_boundary(delta_manifest)
+    if supersessions and backdate_from is None:
         raise ForwardPhysicalRefreshUnavailable(
             "incremental physical refresh supports forward facts only; supersession requires maintenance"
         )
+    rows = (
+        _persisted_rows(
+            db, rows, parent=parent, target=target, backdate_from=backdate_from,
+        )
+        if rows else ()
+    )
+    basis_rows = _persisted_basis_rows(
+        db,
+        _rows(delta_manifest, "basis_rows"),
+        parent=parent,
+        target=target,
+        supersessions=supersessions,
+    )
     if rows:
-        _assert_forward_only(
+        _assert_supported_delta(
             rows,
             parent_cutoff=parent.cutoff,
             target_cutoff=target.cutoff,
-            supersessions=supersessions,
+            backdate_from=backdate_from,
         )
+    _assert_supported_basis(basis_rows)
+    # The bounded replay scope must cover both the facts this refresh adds and
+    # the accepted facts it removes; folding only the former would leave the
+    # removed fact's key and assignments behind.
+    scoped_rows = tuple(rows) + tuple(basis_rows)
     if _phase_tracker is not None:
         _phase_tracker.complete("validation")
         _phase_tracker.begin("custody")
@@ -648,14 +818,17 @@ def _publish_forward_physical_refresh_current(
     if _phase_tracker is not None:
         _phase_tracker.complete("custody")
         _phase_tracker.begin("scope")
-    keys = _affected_keys(rows)
+    keys = _affected_keys(scoped_rows)
     current_owners = _current_owner_rows(
-        db, rows, planning_pool_by_warehouse=planning_pool_by_warehouse,
+        db, scoped_rows, planning_pool_by_warehouse=planning_pool_by_warehouse,
     )
     scopes = _current_scopes(
-        rows,
+        scoped_rows,
         planning_pool_by_warehouse=planning_pool_by_warehouse,
         current_owners=current_owners,
+    )
+    _assert_superseded_scopes_are_resolvable(
+        db, basis_rows=basis_rows, scopes=scopes,
     )
     revision = int(source_revision)
     target_batch = int(target.physical_import_batch_id or 0)
@@ -672,7 +845,8 @@ def _publish_forward_physical_refresh_current(
         affected_physical_keys=keys,
         delta_manifest=BoundedPhysicalDeltaManifest(
             new_sle_ids=tuple(int(row.id) for row in rows),
-            supersession_edge_ids=(),
+            supersession_edge_ids=tuple(int(edge.id) for edge in supersessions),
+            backdate_from=backdate_from,
         ),
     )
     phase("stock")
@@ -700,9 +874,12 @@ def _publish_forward_physical_refresh_current(
         current_owners=current_owners,
     )
     supplier_ids = tuple(int(row.id) for row in supplier_rows)
+    superseded_supplier_ids = tuple(
+        int(row.id) for row in basis_rows if _is_supplier_receipt(row)
+    )
     buy_manifest = BoundedBuyReceiptDeltaManifest()
     buy_result = None
-    if supplier_ids:
+    if buy_scopes and (supplier_ids or superseded_supplier_ids):
         start_phase("supplier_manifest")
         if phase_hook is not None:
             phase_hook("supplier_manifest")
@@ -714,6 +891,9 @@ def _publish_forward_physical_refresh_current(
             odata_client=odata_client,
             changed_sle_ids=supplier_ids,
             affected_scopes=buy_scopes,
+            backdate_from=backdate_from,
+            supersession_edge_ids=tuple(int(edge.id) for edge in supersessions),
+            planning_pool_by_warehouse=planning_pool_by_warehouse,
         )
         if _phase_tracker is not None:
             _phase_tracker.complete("supplier_manifest")
@@ -736,9 +916,15 @@ def _publish_forward_physical_refresh_current(
         db,
         target_generation_id=int(target.id),
         parent_generation_id=int(parent.id),
-        affected_sle_ids=tuple(int(row.id) for row in rows if _text(row.movement_kind) == "assembly_in"),
+        affected_sle_ids=tuple(
+            int(row.id) for row in rows if _text(row.movement_kind) == "assembly_in"
+        ),
         affected_physical_scopes=tuple((key[0], key[1], key[2]) for key in keys),
-        earliest_posting_at=min((row.posting_at for row in rows), default=None),
+        # A backdated or superseded output moves the earliest boundary back so
+        # the canonical document netting still sees the complete document.
+        earliest_posting_at=min(
+            (row.posting_at for row in scoped_rows), default=None,
+        ),
         source_revision=str(revision),
     )
     phase("assembly_output")
@@ -780,7 +966,7 @@ def _publish_forward_physical_refresh_current(
         drum_payload=drum_payload,
         shelf_payload=shelf_payload,
         accepted_run_ids=run_ids,
-        affected_item_ids=tuple(sorted({int(row.item_id) for row in rows})),
+        affected_item_ids=tuple(sorted({int(row.item_id) for row in scoped_rows})),
     )
     if _phase_tracker is not None:
         _phase_tracker.complete("production_payload")
@@ -802,7 +988,7 @@ def _publish_forward_physical_refresh_current(
     phase("payloads")
 
     replayed_rows = (
-        len(rows)
+        len(scoped_rows)
         + int(custody_event_rows)
         + int(getattr(make_result, "fact_rows", 0) or 0)
         + int(getattr(buy_result, "replayed_rows", 0) or 0)
@@ -829,6 +1015,11 @@ def _publish_forward_physical_refresh_current(
             "input_delta_rows": len(rows),
             "replayed_rows": replayed_rows,
             "affected_scopes": [":".join(str(part) for part in scope) for scope in scopes],
+            "backdate_from": (
+                _comparable(backdate_from).isoformat()
+                if backdate_from is not None else None
+            ),
+            "superseded_facts": len(basis_rows),
         },
     }
     target.status = "accepted"

@@ -1483,3 +1483,122 @@ def test_balance_snap_refuses_wholesale_divergence(db_session):
         workflow._snap_balance_at_cutoff(
             db_session, generation=generation, convergence=convergence,
         )
+
+
+def test_backdated_and_superseded_delta_is_replayed_not_rejected(db_session, monkeypatch):
+    """A correction no longer stops the hourly refresh.
+
+    92% of the production stand's newly imported rows are posted behind the
+    accepted cutoff, so rejecting every such candidate froze physical truth.
+    The candidate must instead travel with an explicit bounded replay boundary.
+    """
+    parent, parent_batch = _accepted_parent(db_session, generation_key="bounded-backdate")
+    target_cutoff = parent.cutoff + timedelta(days=1)
+    forked_batch = models.PhysicalImportBatch(
+        batch_key="bounded-backdate-target", status="completed", source_complete=True,
+        cutoff=target_cutoff, source_watermarks={}, completed_at=target_cutoff,
+    )
+    physical = models.LedgerGeneration(
+        generation_key="bounded-backdate-fork", status="building", cutoff=target_cutoff,
+        source_watermarks={"parent_generation_id": parent.id}, capabilities={},
+        physical_import_batch=forked_batch, algorithm_version="test",
+        replay_version="test",
+    )
+    item = models.Item(item_code="BOUNDED-BACKDATE-ORCH", item_name="Backdate")
+    db_session.add_all([forked_batch, physical, item])
+    db_session.flush()
+    superseded_at = _moscow_naive(parent.cutoff - timedelta(days=2))
+    old = models.StockLedgerEntry(
+        ingest_batch_id=parent_batch.id, source_content_hash="orch-old",
+        business_identity="orch-superseded", item_id=item.item_id,
+        characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+        qty=Decimal("1"), posting_at=superseded_at, record_type="Receipt",
+        movement_kind="assembly_in", recorder_type="Production",
+        recorder_ref="orch-old-rec", line_no="1", ingest_source="pull",
+    )
+    db_session.add(old)
+    db_session.flush()
+    old.active = False
+    db_session.flush()
+    replacement = models.StockLedgerEntry(
+        ingest_batch_id=forked_batch.id, source_content_hash="orch-new",
+        business_identity="orch-superseded", item_id=item.item_id,
+        characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+        qty=Decimal("2"), posting_at=superseded_at, record_type="Receipt",
+        movement_kind="assembly_in", recorder_type="Production",
+        recorder_ref="orch-old-rec", line_no="1", ingest_source="pull",
+    )
+    forward = models.StockLedgerEntry(
+        ingest_batch_id=forked_batch.id, source_content_hash="orch-forward",
+        business_identity="orch-forward", item_id=item.item_id,
+        characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+        qty=Decimal("4"), posting_at=_moscow_naive(parent.cutoff + timedelta(hours=6)),
+        record_type="Receipt", movement_kind="assembly_in",
+        recorder_type="Production", recorder_ref="orch-fwd-rec", line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add_all([replacement, forward])
+    db_session.flush()
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=replacement.id, import_batch_id=forked_batch.id,
+    ))
+    db_session.commit()
+
+    fork_result = physical_refresh_generation.PhysicalRefreshGenerationResult(
+        ledger_generation_id=physical.id, generation_key=physical.generation_key,
+        physical_import_batch_id=forked_batch.id, cutoff=target_cutoff,
+        from_cutoff=parent.cutoff, created=True,
+    )
+    import_result = importer.HistoricalImportResult(
+        ledger_generation_id=physical.id, from_exclusive=parent.cutoff,
+        cutoff=target_cutoff, completed_through=target_cutoff, windows_completed=1,
+        windows_resumed=0, recorders_pulled=0, movements_inserted=2, complete=True,
+        physical_import_batch_id=forked_batch.id,
+    )
+    balance_result = bootstrap.BalanceConvergenceResult(
+        ledger_generation_id=physical.id, cutoff=target_cutoff.isoformat(),
+        checked_at=target_cutoff.isoformat(), valid=True, content_hash="hash",
+        compared=0, mismatched=0, matched=0, terminal_batch_id=forked_batch.id,
+        deltas=(),
+    )
+    monkeypatch.setattr(workflow, "_acquire_lifecycle_lock", lambda db: True)
+    monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
+    monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
+    monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
+    monkeypatch.setattr(
+        workflow, "evaluate_physical_refresh_balance_convergence",
+        lambda *a, **k: balance_result,
+    )
+    observed = {}
+
+    def _publish(db, **kwargs):
+        observed.update(kwargs["delta_manifest"])
+        candidate = db.get(models.LedgerGeneration, physical.id)
+        candidate.status = "accepted"
+        db.get(models.PlanningTruthState, 1).current_generation_id = physical.id
+        return SimpleNamespace(
+            input_delta_rows=2, replayed_rows=3, affected_scopes=(), phase_timings=(),
+        )
+
+    monkeypatch.setattr(workflow, "publish_forward_physical_refresh_current", _publish)
+
+    result = workflow.run_physical_refresh(
+        db_session, generation_key=physical.generation_key,
+        target_cutoff=target_cutoff, client=object(), balance_snapshot={},
+    )
+
+    assert result.published is True
+    assert result.published_generation_id == physical.id
+    # Only the target-window rows enter the current writers; the superseded
+    # accepted fact travels separately as replay basis.
+    assert {int(row.id) for row in observed["rows"]} == {
+        int(replacement.id), int(forward.id),
+    }
+    assert [int(row.id) for row in observed["basis_rows"]] == [int(old.id)]
+    assert len(observed["supersessions"]) == 1
+    assert workflow._naive(observed["backdate_from"]) == workflow._naive(superseded_at)
+    watermark = db_session.get(
+        models.LedgerGeneration, physical.id
+    ).source_watermarks["physical_refresh_delta"]
+    assert watermark["backdated"] is True
+    assert watermark["backdate_from"] == workflow._naive(superseded_at).isoformat()
