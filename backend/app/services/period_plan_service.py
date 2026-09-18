@@ -2192,8 +2192,11 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
             raise ValueError("closed planning run has no immutable Ledger anchor")
         active_reservations = db.query(ReservationEntry.id).filter(
             ReservationEntry.run_id == int(run.run_id),
-            ReservationEntry.ledger_generation_id == int(anchor_generation_id),
             ReservationEntry.lifecycle_status == "active",
+            or_(
+                ReservationEntry.is_current.is_(True),
+                ReservationEntry.ledger_generation_id == int(anchor_generation_id),
+            ),
         ).count()
         if active_reservations:
             raise ValueError(

@@ -717,6 +717,69 @@ def test_compact_current_production_control_payload_uses_stable_reservation_not_
     assert db_session.query(models.ReplenishmentWorkItem).count() == 0
 
 
+def test_compact_make_proposal_keeps_only_its_row_root_membership(db_session):
+    parent = _building_generation(db_session, "production-journal-compact-row-roots-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run, work = _make_proposal(db_session, parent, tag="-row-roots")
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = f"reservation:req:{reservation.requirement_id}:mode:make"
+    db_session.delete(work)
+    second_root = models.Item(
+        item_code="SNAP-MAKE-SECOND-ROOT",
+        item_name="Second root",
+        item_article="SNAP-SECOND-ROOT",
+        unit="шт",
+        status="active",
+    )
+    db_session.add(second_root)
+    db_session.flush()
+    db_session.add(models.ProductionPlanLine(
+        plan_id=int(run.source_plan_id),
+        item_id=int(second_root.item_id),
+        bucket_date=parent.cutoff.date(),
+        qty=3,
+    ))
+    db_session.flush()
+    target = _building_generation(db_session, "production-journal-compact-row-roots-target")
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={
+            "queue_rows": [
+                {
+                    "entity_kind": "assembly_queue",
+                    "business_identity": "plan-line:first-root",
+                    "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
+                },
+                {
+                    "entity_kind": "assembly_queue",
+                    "business_identity": "plan-line:second-root",
+                    "payload": {"run_id": run.run_id, "item_id": second_root.item_id},
+                },
+            ],
+        },
+        drum_payload={"rows": []},
+        shelf_payload={"rows": [{
+            "entity_kind": "shelf_projection",
+            "payload": {
+                "item_id": reservation.item_id,
+                "materialized_qty": 4,
+                "pull_qty": 4,
+                "warehouse_ref1c": "WH",
+            },
+        }]},
+        accepted_run_ids=[run.run_id],
+    )
+    row = next(row for row in payload["rows"] if row.get("product_id") is None)
+    assert row["root_item_ids"] == [reservation.item_id]
+
+
 def test_compact_make_coverage_uses_one_bulk_fold_not_per_row_preview(
     db_session, monkeypatch
 ):

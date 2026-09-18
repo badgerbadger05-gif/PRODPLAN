@@ -14,6 +14,7 @@ resume.
 
 from datetime import date, datetime as dt, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -182,3 +183,55 @@ def test_close_fixed_plan_resumes_after_a_fault_at_every_stage(
     assert db_session.query(models.LedgerGeneration).filter_by(
         status="accepted"
     ).count() == 3
+
+
+def test_closed_retry_checks_stable_current_reservation_owner(
+    db_session, monkeypatch
+):
+    accepted, item = _accepted_world(db_session)
+    plan, run = _fixed_plan_with_run(db_session, item, name="closed retry owner")
+    old_generation_id = int(run.ledger_generation_id)
+    replacement = models.LedgerGeneration(
+        generation_key="closed-retry-current-owner",
+        status="accepted",
+        cutoff=accepted.cutoff,
+        accepted_at=accepted.cutoff,
+        source_watermarks={"parent_generation_id": old_generation_id},
+        capabilities=dict(accepted.capabilities or {}),
+        physical_import_batch_id=int(accepted.physical_import_batch_id),
+        algorithm_version="test",
+    )
+    db_session.add(replacement)
+    db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = int(replacement.id)
+    run.status = "CLOSED"
+    plan.status = "closed"
+    old_reservations = db_session.query(models.ReservationEntry).filter_by(
+        run_id=int(run.run_id)
+    ).all()
+    assert old_reservations
+    owner = old_reservations[0]
+    db_session.query(models.ReservationEntry).filter_by(run_id=int(run.run_id)).update({
+        "ledger_generation_id": int(replacement.id),
+        "lifecycle_status": "active",
+        "owner_kind": "current",
+        "is_current": True,
+        "current_identity": (
+            f"reservation:req:{int(owner.requirement_id)}:mode:{owner.realization_mode}"
+        ),
+    }, synchronize_session=False)
+    db_session.flush()
+    assert int(replacement.id) != old_generation_id
+    assert db_session.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.run_id == int(run.run_id),
+        models.ReservationEntry.ledger_generation_id == old_generation_id,
+        models.ReservationEntry.lifecycle_status == "active",
+    ).count() == 0
+    monkeypatch.setattr(
+        "app.services.period_plan_service._latest_closed_plan_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(
+            ledger_generation_id=old_generation_id, payload={}
+        ),
+    )
+    with pytest.raises(ValueError, match="текущем planning truth"):
+        close_fixed_plan(db_session, int(run.run_id))

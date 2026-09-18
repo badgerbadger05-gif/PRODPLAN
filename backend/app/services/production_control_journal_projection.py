@@ -1010,33 +1010,6 @@ def build_compact_current_production_control_payload(
             direct["_route_sheet_snapshot"] = deepcopy(snapshot)
         direct_rows.append(direct)
 
-    queue_rows = list(
-        (assembly_payload.get("queue_rows", ()) if isinstance(assembly_payload, Mapping)
-         else getattr(assembly_payload, "queue_rows", ())) or ()
-    )
-    root_by_run: dict[int, set[int]] = {}
-    for raw in queue_rows:
-        if not isinstance(raw, Mapping):
-            raise ProductionControlJournalPromotionError(
-                "compact assembly queue row is malformed"
-            )
-        payload = raw.get("payload")
-        if not isinstance(payload, Mapping):
-            raise ProductionControlJournalPromotionError(
-                "compact assembly queue row payload is malformed"
-            )
-        try:
-            run_id = int(payload.get("run_id") or 0)
-            item_id = int(payload.get("item_id") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ProductionControlJournalPromotionError(
-                "compact assembly queue row identity is malformed"
-            ) from exc
-        if run_id <= 0 or item_id <= 0:
-            raise ProductionControlJournalPromotionError(
-                "compact assembly queue row identity is malformed"
-            )
-        root_by_run.setdefault(run_id, set()).add(item_id)
     drum_rows = list(
         (drum_payload.get("rows", ()) if isinstance(drum_payload, Mapping)
          else getattr(drum_payload, "rows", ())) or []
@@ -1257,6 +1230,27 @@ def build_compact_current_production_control_payload(
         canonical_proposals,
         ledger_generation_id=int(parent.id),
     )
+    # Preserve the same row-level BOM membership used by ordinary production
+    # lines.  A run may have multiple roots; assigning the complete run root
+    # set to every MAKE proposal makes a component appear under unrelated
+    # products.  The synthetic proposal keeps the stable item/run fields, so
+    # the canonical mapper can resolve only the roots containing that item.
+    proposal_root_rows = []
+    proposal_root_keys: dict[int, str] = {}
+    for proposal in canonical_proposals:
+        synthetic_id = int(proposal["work_item_id"])
+        row_key = str(proposal.get("journal_row_key") or f"make:{synthetic_id}")
+        proposal_root_keys[synthetic_id] = row_key
+        proposal_root_rows.append({
+            "journal_row_key": row_key,
+            "source_run_id": proposal.get("source_run_id"),
+            "item_id": proposal.get("item_id"),
+        })
+    roots_by_proposal = _root_membership_by_row(
+        db,
+        rows=proposal_root_rows,
+        accepted_run_ids=run_ids,
+    )
     for proposal in canonical_proposals:
         synthetic_id = int(proposal["work_item_id"])
         reservation = reservation_by_work_id[synthetic_id]
@@ -1264,7 +1258,7 @@ def build_compact_current_production_control_payload(
         proposal["current_identity"] = f"mrp-reservation:{source_identity}"
         proposal["reservation_id"] = int(reservation.id)
         proposal["root_item_ids"] = sorted(
-            root_by_run.get(int(proposal.get("source_run_id") or 0), set())
+            roots_by_proposal.get(proposal_root_keys[synthetic_id], set())
         )
         proposal.pop("work_item_id", None)
         proposal.pop("journal_row_key", None)
