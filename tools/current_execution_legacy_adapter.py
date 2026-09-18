@@ -97,6 +97,37 @@ def _snapshot(
     return dict(row) if row is not None else None
 
 
+def _latest_snapshot(
+    session: Session,
+    snapshots: Table,
+    *,
+    consumer: str,
+    key: str,
+) -> dict[str, Any] | None:
+    """Resolve one consumer/key to its newest accepted evidence, any generation.
+
+    This is the legacy reader's own semantics.  A run's snapshot stays at the
+    generation that fixed it, while a later obligation refresh re-anchors
+    ``planning_run.ledger_generation_id`` to the newest obligation generation,
+    so the run row cannot locate its own evidence.  Ordering by generation (and
+    then by id) picks the last published copy of that exact business key.
+    """
+
+    row = session.execute(
+        select(snapshots)
+        .where(and_(
+            snapshots.c.consumer == str(consumer),
+            snapshots.c.snapshot_key == str(key),
+            snapshots.c.truth_status == "accepted",
+        ))
+        .order_by(
+            snapshots.c.ledger_generation_id.desc(),
+            snapshots.c.id.desc(),
+        )
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
 def _rows_for_snapshot(
     session: Session,
     rows_table: Table,
@@ -448,17 +479,15 @@ def publish_current_obligation_views_from_snapshots(
     else:
         for run in fixed_runs:
             run_id = int(run["run_id"])
-            run_generation = int(run.get("ledger_generation_id") or generation_id)
-            snapshot = _snapshot(
-                session, snapshots, consumer="mrp_result", key=f"run:{run_id}",
-                generation_id=run_generation,
+            snapshot = _latest_snapshot(
+                session, snapshots, consumer="mrp_result", key=f"run:{run_id}"
             )
             if snapshot is None:
-                # The same rule the preflight enforces: MRP evidence lives at
-                # the generation that fixed the run, never at a later pointer.
+                # Only a run with no accepted evidence anywhere is a blocker.
+                # An accepted snapshot that carries no rows is legitimate: old
+                # fixed plans read empty through the legacy reader too.
                 raise LegacyEvidenceConflict(
-                    f"migration MRP snapshot evidence is missing for fixed run {run_id} "
-                    f"(generation {run_generation})"
+                    f"migration MRP snapshot evidence is missing for fixed run {run_id}"
                 )
             mrp_payloads[str(run_id)] = _mrp_payload(
                 session, snapshot, rows_table, roots_table, run_id=run_id
@@ -493,21 +522,18 @@ def publish_current_obligation_views_from_snapshots(
     ).mappings():
         key, payload = _period_payload(snapshot)
         period_payloads[key] = payload
-    # Fixed runs anchored to an older obligation generation keep their period
-    # evidence there; a physical pointer never re-publishes it.
+    # A fixed run whose period evidence the pointer never republished keeps it
+    # at the generation that published it last.
     for run in fixed_runs:
         plan_id = run.get("source_plan_id")
         if plan_id is None:
             continue
         run_id = int(run["run_id"])
-        run_generation = int(run.get("ledger_generation_id") or generation_id)
-        if run_generation == int(generation_id):
-            continue
         if f"plan:{int(plan_id)}:run:{run_id}" in period_payloads:
             continue
-        snapshot = _snapshot(
+        snapshot = _latest_snapshot(
             session, snapshots, consumer="period_plan_execution",
-            key=f"plan={int(plan_id)};run={run_id}", generation_id=run_generation,
+            key=f"plan={int(plan_id)};run={run_id}",
         )
         if snapshot is None:
             # The canonical publisher already fails closed for a live run that

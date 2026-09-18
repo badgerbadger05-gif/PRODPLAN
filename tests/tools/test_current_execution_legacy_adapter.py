@@ -248,19 +248,24 @@ def test_empty_purchase_evidence_with_live_buy_owners_fails_closed(db_session, m
         publish_current_obligation_views_from_snapshots(db_session, pointer.id)
 
 
-def test_mrp_rows_are_published_for_runs_bound_to_an_older_obligation_generation(
+def test_mrp_evidence_is_the_latest_accepted_snapshot_not_the_runs_anchor(
     db_session, monkeypatch
 ):
-    """The pointer is a physical refresh; fixed runs stay at their own generation."""
+    """The stand's shape: every fixed run is re-anchored to the newest
+    obligation generation, while each run's own ``mrp_result`` snapshot stays
+    at the generation that fixed that run."""
 
     _create_legacy_read_tables(db_session)
+    fixing = _generation(db_session, "adapter-fixing")
+    republished = _generation(db_session, "adapter-republished")
     obligation = _generation(db_session, "adapter-obligation")
     pointer = _generation(db_session, "adapter-physical-pointer")
     db_session.add(models.PlanningTruthState(id=1, current_generation_id=pointer.id))
-    db_session.add(models.PlanningRun(
-        run_id=513, source_plan_id=7, ledger_generation_id=obligation.id,
-        status="FIXED_SNAPSHOT", config_snapshot={}, started_at=_STAMP,
-    ))
+    for run_id, plan_id in ((393, 6), (513, 7)):
+        db_session.add(models.PlanningRun(
+            run_id=run_id, source_plan_id=plan_id, ledger_generation_id=obligation.id,
+            status="FIXED_SNAPSHOT", config_snapshot={}, started_at=_STAMP,
+        ))
     db_session.add(models.PlanningRun(
         run_id=99, source_plan_id=9, ledger_generation_id=obligation.id,
         status="CLOSED", config_snapshot={}, started_at=_STAMP,
@@ -276,39 +281,60 @@ def test_mrp_rows_are_published_for_runs_bound_to_an_older_obligation_generation
         db_session, 2, "purchase_control_journal", "journal:v1", pointer.id,
         {"meta": {}, "rows": [{"row_key": "buy:501", "item_id": 1001}]},
     )
-    # MRP evidence exists only at the obligation generation that fixed the run.
-    _snapshot(db_session, 3, "mrp_result", "run:513", obligation.id, {"summary": {}})
+    # Run 513 was fixed long ago and republished once; the newest copy wins.
+    _snapshot(db_session, 3, "mrp_result", "run:513", fixing.id, {"origin": "fixing"})
     _read_row(
-        db_session, 3, 3, row_key="mrp:1", row_kind="purchase", sort_key="2026-09-11|1001",
+        db_session, 3, 3, row_key="mrp:stale", row_kind="purchase", sort_key="2026-01-01|1001",
+        payload={"item_id": 1002, "source_mrp_requirement_id": 999, "bucket_date": "2026-01-01"},
+    )
+    _snapshot(db_session, 4, "mrp_result", "run:513", republished.id, {"origin": "republished"})
+    _read_row(
+        db_session, 4, 4, row_key="mrp:1", row_kind="purchase", sort_key="2026-09-11|1001",
         payload={"item_id": 1001, "source_mrp_requirement_id": 501, "bucket_date": "2026-09-11"},
     )
+    # Run 393 is an old fixed plan: accepted evidence with no rows at all.
+    _snapshot(db_session, 5, "mrp_result", "run:393", fixing.id, {"origin": "fixing"})
     # A CLOSED run must not be published even though its snapshot exists.
-    _snapshot(db_session, 4, "mrp_result", "run:99", obligation.id, {"summary": {}})
-    # Period evidence exists at both generations; the pointer's copy wins.
+    _snapshot(db_session, 6, "mrp_result", "run:99", obligation.id, {"summary": {}})
+    # Period evidence exists at the pointer and elsewhere; the pointer wins.
+    for run_id, plan_id in ((393, 6), (513, 7)):
+        _snapshot(
+            db_session, 100 + run_id, "period_plan_execution",
+            f"plan={plan_id};run={run_id}", pointer.id,
+            {
+                "plan": {"id": plan_id}, "run_id": run_id, "rows": [],
+                "plan_output_rows": [], "origin": "pointer",
+            },
+        )
     _snapshot(
-        db_session, 5, "period_plan_execution", "plan=7;run=513", pointer.id,
-        {"plan": {"id": 7}, "run_id": 513, "rows": [], "plan_output_rows": [], "origin": "pointer"},
-    )
-    _snapshot(
-        db_session, 6, "period_plan_execution", "plan=7;run=513", obligation.id,
-        {"plan": {"id": 7}, "run_id": 513, "rows": [], "plan_output_rows": [], "origin": "obligation"},
+        db_session, 300, "period_plan_execution", "plan=7;run=513", fixing.id,
+        {"plan": {"id": 7}, "run_id": 513, "rows": [], "plan_output_rows": [], "origin": "fixing"},
     )
     db_session.flush()
 
     captured = _capture_publisher(monkeypatch)
     publish_current_obligation_views_from_snapshots(db_session, pointer.id)
 
-    assert set(captured["mrp_payloads"]) == {"513"}
+    assert set(captured["mrp_payloads"]) == {"393", "513"}
     mrp = captured["mrp_payloads"]["513"]
+    assert mrp["origin"] == "republished"
     assert mrp["run_id"] == 513
     assert mrp["row_counts"]["purchase"] == 1
     assert len(mrp["rows"]) == 1
     assert mrp["rows"][0]["current_identity"].startswith("mrp-run:513:purchase:")
+    assert mrp["rows"][0]["payload"]["item_id"] == 1001
+    # An accepted but empty per-run payload is legitimate evidence.
+    empty = captured["mrp_payloads"]["393"]
+    assert empty["rows"] == []
+    assert empty["row_counts"] == {
+        "production": 0, "purchase": 0, "rework": 0, "capacity": 0
+    }
     assert captured["period_payloads"]["plan:7:run:513"]["origin"] == "pointer"
 
 
-def test_period_evidence_falls_back_to_the_run_generation(db_session, monkeypatch):
+def test_period_evidence_falls_back_to_the_latest_accepted_snapshot(db_session, monkeypatch):
     _create_legacy_read_tables(db_session)
+    fixing = _generation(db_session, "adapter-period-fixing")
     obligation = _generation(db_session, "adapter-period-obligation")
     pointer = _generation(db_session, "adapter-period-pointer")
     db_session.add(models.PlanningTruthState(id=1, current_generation_id=pointer.id))
@@ -326,9 +352,9 @@ def test_period_evidence_falls_back_to_the_run_generation(db_session, monkeypatc
         db_session, 2, "purchase_control_journal", "journal:v1", pointer.id,
         {"meta": {}, "rows": [{"row_key": "buy:501", "item_id": 1001}]},
     )
-    _snapshot(db_session, 3, "mrp_result", "run:513", obligation.id, {"summary": {}})
+    _snapshot(db_session, 3, "mrp_result", "run:513", fixing.id, {"summary": {}})
     _snapshot(
-        db_session, 4, "period_plan_execution", "plan=7;run=513", obligation.id,
+        db_session, 4, "period_plan_execution", "plan=7;run=513", fixing.id,
         {"plan": {"id": 7}, "run_id": 513, "rows": [], "plan_output_rows": [], "origin": "obligation"},
     )
     db_session.flush()

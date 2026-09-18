@@ -390,10 +390,18 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
 
     Empty *rows* are valid input, but an absent/unaccepted source snapshot is
     not.  Fixed runs are selected by status alone, exactly as the runtime
-    publisher does: a run stays anchored to the obligation refresh that fixed
-    it, while the truth pointer moves on with every physical refresh.  Binding
-    the selection to the pointer generation made every stand with a physical
-    pointer report "no fixed runs" and publish an empty ``mrp_result`` scope.
+    publisher does: binding the selection to the pointer generation made every
+    stand with a physical pointer report "no fixed runs" and publish an empty
+    ``mrp_result`` scope.
+
+    Per-run evidence is then resolved the way the legacy reader resolves it:
+    the newest accepted snapshot for that exact business key, across all
+    generations.  ``planning_run.ledger_generation_id`` cannot locate it —
+    an obligation refresh re-anchors every fixed run to the newest obligation
+    generation, while each run's ``mrp_result`` snapshot stays at the
+    generation that fixed that run.  An accepted snapshot carrying no rows is
+    legitimate evidence: old fixed plans read empty today too.
+
     The small policy-test schema without ``planning_run`` instead must provide
     at least one accepted source snapshot for each consumer.
     """
@@ -411,28 +419,49 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
                 "WHERE status = 'FIXED_SNAPSHOT' ORDER BY run_id"
             )).mappings().all()]
 
-        generations = sorted({int(generation_id)} | {
-            int(row["ledger_generation_id"])
-            for row in fixed_runs
-            if row.get("ledger_generation_id") is not None
-        })
-        statement = text(
+        pointer_rows = connection.execute(text(
             "SELECT id, consumer, snapshot_key, truth_status, ledger_generation_id "
-            "FROM planning_read_snapshot WHERE ledger_generation_id IN :generations "
+            "FROM planning_read_snapshot WHERE ledger_generation_id = :generation_id "
             "ORDER BY consumer, snapshot_key, id"
-        ).bindparams(bindparam("generations", expanding=True))
-        all_rows = connection.execute(
-            statement, {"generations": generations}
-        ).mappings().all()
+        ), {"generation_id": int(generation_id)}).mappings().all()
 
-    accepted = [row for row in all_rows if str(row.get("truth_status") or "") == "accepted"]
+        run_keys = [f"run:{int(row['run_id'])}" for row in fixed_runs]
+        plan_keys = sorted({
+            f"plan={int(row['source_plan_id'])};run={int(row['run_id'])}"
+            for row in fixed_runs
+            if row.get("source_plan_id") is not None
+        })
+        keyed_rows: list[dict[str, Any]] = []
+        if run_keys or plan_keys:
+            # Scoped to the exact business keys in play, never a whole-corpus
+            # scan: the legacy snapshot table is one of the largest here.
+            statement = text(
+                "SELECT id, consumer, snapshot_key, truth_status, ledger_generation_id "
+                "FROM planning_read_snapshot "
+                "WHERE (consumer = 'mrp_result' AND snapshot_key IN :run_keys) "
+                "   OR (consumer = 'period_plan_execution' AND snapshot_key IN :plan_keys) "
+                "ORDER BY consumer, snapshot_key, ledger_generation_id, id"
+            ).bindparams(
+                bindparam("run_keys", expanding=True),
+                bindparam("plan_keys", expanding=True),
+            )
+            keyed_rows = [dict(row) for row in connection.execute(statement, {
+                "run_keys": run_keys or [""],
+                "plan_keys": plan_keys or [""],
+            }).mappings().all()]
+
+    def _accepted(rows) -> list[dict[str, Any]]:
+        return [
+            dict(row) for row in rows
+            if str(row.get("truth_status") or "") == "accepted"
+        ]
+
     by_consumer: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in accepted:
-        by_consumer[str(row["consumer"])].append(dict(row))
-
-    def _run_generation(run: dict[str, Any]) -> int:
-        value = run.get("ledger_generation_id")
-        return int(value) if value is not None else int(generation_id)
+    for row in _accepted(pointer_rows):
+        by_consumer[str(row["consumer"])].append(row)
+    by_key: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in _accepted(keyed_rows):
+        by_key[(str(row["consumer"]), str(row["snapshot_key"]))].append(row)
 
     def _matches(consumer: str, snapshot_key: str, at_generation: int) -> list[dict[str, Any]]:
         return [
@@ -440,6 +469,15 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
             if str(row.get("snapshot_key") or "") == snapshot_key
             and int(row.get("ledger_generation_id") or 0) == int(at_generation)
         ]
+
+    def _latest(consumer: str, snapshot_key: str) -> dict[str, Any] | None:
+        candidates = by_key.get((consumer, snapshot_key), [])
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda row: (int(row["ledger_generation_id"]), int(row["id"])),
+        )
 
     evidence: dict[str, Any] = {}
 
@@ -473,41 +511,55 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
             "snapshot_ids": [int(candidates[0]["id"])],
         }
 
-    def require_per_run(
+    def require_per_key(
         consumer: str,
-        keyed: list[tuple[str, tuple[int, ...]]],
+        keys: list[str],
+        *,
+        prefer_pointer: bool = False,
     ) -> None:
-        """Require one accepted snapshot per key, at the first allowed generation."""
+        """Require one accepted snapshot per business key, newest wins.
 
-        if not keyed:
+        ``prefer_pointer`` keeps the period rule: the pointer generation's own
+        copy is the preferred evidence, and only a key it never republished
+        falls back to the newest accepted copy elsewhere.
+        """
+
+        if not keys:
             # A database with no fixed runs/plans has a legitimately empty
             # obligation scope; no fabricated empty source is accepted.
-            evidence[consumer] = {"applicable": [], "snapshot_ids": []}
+            evidence[consumer] = {
+                "applicable": [], "snapshot_ids": [], "snapshot_generations": {},
+            }
             return
         selected: list[dict[str, Any]] = []
+        generations: dict[str, int] = {}
         missing: list[str] = []
-        for key, allowed in keyed:
+        for key in keys:
             chosen: dict[str, Any] | None = None
-            ambiguous = False
-            for at_generation in allowed:
-                matches = _matches(consumer, key, at_generation)
-                if len(matches) > 1:
-                    ambiguous = True
-                    break
-                if matches:
-                    chosen = matches[0]
-                    break
-            if ambiguous or chosen is None:
-                missing.append(f"{key}@{'/'.join(str(value) for value in allowed)}")
+            if prefer_pointer:
+                at_pointer = _matches(consumer, key, int(generation_id))
+                if len(at_pointer) == 1:
+                    chosen = at_pointer[0]
+                elif len(at_pointer) > 1:
+                    raise PreflightBlocked(
+                        f"source evidence for {consumer}/{key} is ambiguous at the "
+                        f"pointer generation (accepted matches={len(at_pointer)})"
+                    )
+            if chosen is None:
+                chosen = _latest(consumer, key)
+            if chosen is None:
+                missing.append(key)
             else:
                 selected.append(chosen)
+                generations[key] = int(chosen["ledger_generation_id"])
         if missing:
             raise PreflightBlocked(
-                f"source evidence for {consumer} is missing or ambiguous for {missing}"
+                f"source evidence for {consumer} has no accepted snapshot for {missing}"
             )
         evidence[consumer] = {
-            "applicable": [key for key, _ in keyed],
+            "applicable": list(keys),
             "snapshot_ids": sorted(int(row["id"]) for row in selected),
+            "snapshot_generations": generations,
         }
 
     if "planning_run" not in table_names:
@@ -516,22 +568,8 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
         require_single_unscoped("mrp_result")
         require_single_unscoped("period_plan_execution")
     else:
-        # MRP evidence lives at the run's own generation; period evidence is
-        # republished by the pointer generation and falls back to the run's.
-        run_keys = [
-            (f"run:{int(row['run_id'])}", (_run_generation(row),))
-            for row in fixed_runs
-        ]
-        plan_keys = sorted({
-            (
-                f"plan={int(row['source_plan_id'])};run={int(row['run_id'])}",
-                (int(generation_id), _run_generation(row)),
-            )
-            for row in fixed_runs
-            if row.get("source_plan_id") is not None
-        })
-        require_per_run("mrp_result", run_keys)
-        require_per_run("period_plan_execution", plan_keys)
+        require_per_key("mrp_result", run_keys)
+        require_per_key("period_plan_execution", plan_keys, prefer_pointer=True)
 
     return {
         "status": "ready",

@@ -427,18 +427,27 @@ def test_empty_mrp_scope_with_fixed_runs_blocks_postflight(monkeypatch):
         apply_current_obligation_migration(engine, writers_stopped=True)
 
 
-def test_fixed_runs_from_an_older_generation_still_require_their_evidence(monkeypatch):
-    """The pointer is a physical refresh; the fixed run stays at generation 6."""
+def test_mrp_evidence_is_the_latest_accepted_snapshot_not_the_runs_anchor(monkeypatch):
+    """The stand's shape: the run is re-anchored to a newer obligation
+    generation (9) while its own ``mrp_result`` snapshot stays at the
+    generation that fixed it (6), plus a newer republished copy at 8."""
 
     engine = _engine()
     _schema(engine)
     _seed_truth(engine)
     with engine.begin() as connection:
-        connection.execute(text("INSERT INTO ledger_generation (id, status) VALUES (6, 'accepted')"))
-        connection.execute(text("UPDATE planning_run SET ledger_generation_id = 6 WHERE run_id = 41"))
         connection.execute(text(
-            "UPDATE planning_read_snapshot SET ledger_generation_id = 6 "
-            "WHERE consumer IN ('mrp_result', 'period_plan_execution')"
+            "INSERT INTO ledger_generation (id, status) VALUES "
+            "(6, 'accepted'), (8, 'accepted'), (9, 'accepted')"
+        ))
+        connection.execute(text("UPDATE planning_run SET ledger_generation_id = 9 WHERE run_id = 41"))
+        connection.execute(text(
+            "UPDATE planning_read_snapshot SET ledger_generation_id = 6 WHERE consumer = 'mrp_result'"
+        ))
+        connection.execute(text(
+            "INSERT INTO planning_read_snapshot "
+            "(id, consumer, snapshot_key, ledger_generation_id, truth_status) "
+            "VALUES (11, 'mrp_result', 'run:41', 8, 'accepted')"
         ))
     monkeypatch.setattr(
         "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
@@ -446,9 +455,36 @@ def test_fixed_runs_from_an_older_generation_still_require_their_evidence(monkey
     )
 
     report = apply_current_obligation_migration(engine, writers_stopped=True)
+    mrp = report["source_evidence"]["consumers"]["mrp_result"]
     assert report["source_evidence"]["fixed_run_ids"] == [41]
-    assert report["source_evidence"]["consumers"]["mrp_result"]["applicable"] == ["run:41"]
+    assert mrp["applicable"] == ["run:41"]
+    # The newest accepted copy wins, and the report says where it came from.
+    assert mrp["snapshot_ids"] == [11]
+    assert mrp["snapshot_generations"] == {"run:41": 8}
+    # The pointer's own period copy stays preferred.
+    period = report["source_evidence"]["consumers"]["period_plan_execution"]
+    assert period["snapshot_generations"] == {"plan=7;run=41": 7}
     assert report["postflight"]["row_counts"]["mrp_result"] == 1
+
+
+def test_fixed_run_without_any_accepted_mrp_snapshot_blocks(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE planning_read_snapshot SET truth_status = 'superseded' "
+            "WHERE consumer = 'mrp_result'"
+        ))
+    called = []
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
+        lambda session, generation_id: called.append(generation_id),
+    )
+
+    with pytest.raises(PreflightBlocked, match=r"no accepted snapshot for \['run:41'\]"):
+        apply_current_obligation_migration(engine, writers_stopped=True)
+    assert called == []
 
 
 def test_wrong_purchase_export_snapshot_rolls_back_publication_and_anchor(monkeypatch):
