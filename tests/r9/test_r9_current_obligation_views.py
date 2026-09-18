@@ -11,7 +11,13 @@ from app.services.item_ledger.current_execution import (
     publish_current_obligation_views_from_generation,
     require_current_execution_scope,
 )
-from app.routers.production_control import get_orders_journal, list_root_products, get_order_line_materials
+from app.routers.production_control import (
+    OrdersFromWorkItemsPayload,
+    get_orders_journal,
+    list_root_products,
+    get_order_line_materials,
+    post_orders_from_work_items,
+)
 from app.routers.purchase_control import (
     PurchaseControlSelectionSummaryRequest,
     summarize_purchase_control_selection,
@@ -217,6 +223,110 @@ def test_r9_production_current_identity_filters_before_pagination(db_session):
     )
     assert missing.total == 0
     assert missing.rows == []
+
+
+def test_r9_production_get_resolves_work_item_through_stable_reservation_owner(
+    db_session,
+):
+    old_generation = _accepted_generation(db_session)
+    target = models.LedgerGeneration(
+        generation_key="r9-production-current-target",
+        status="accepted",
+        cutoff=old_generation.cutoff,
+        source_watermarks={"parent_generation_id": old_generation.id},
+        capabilities=dict(old_generation.capabilities or {}),
+        algorithm_version="r9-test-target",
+        replay_version="r9-test-target",
+        accepted_at=old_generation.cutoff,
+        physical_import_batch_id=old_generation.physical_import_batch_id,
+    )
+    db_session.add(target)
+    db_session.flush()
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = target.id
+    item = models.Item(item_code="R9-CURRENT-WORK", item_name="Current work", status="active")
+    plan = models.ProductionPlanHeader(
+        name="R9 current work plan", status="fixed",
+        period_from=old_generation.cutoff.date(), period_to=old_generation.cutoff.date(),
+    )
+    db_session.add_all([item, plan])
+    db_session.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", source_plan_id=plan.id,
+        ledger_generation_id=old_generation.id,
+        period_from=plan.period_from, period_to=plan.period_to,
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+    requirement = models.MrpRequirement(
+        run_id=run.run_id, item_id=item.item_id,
+        total_required_qty=5, net_required_qty=5,
+        period_from=plan.period_from, period_to=plan.period_to,
+        bom_level=0, freeze_version=1,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=target.id, item_id=item.item_id, run_id=run.run_id,
+        requirement_id=requirement.id, priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to, realization_mode="make",
+        reserved_qty=5, replenishment_required_qty=5,
+        owner_kind="current", is_current=True,
+        current_identity=f"reservation:req:{requirement.id}:mode:make",
+    )
+    db_session.add(reservation)
+    db_session.flush()
+    old_work = models.ReplenishmentWorkItem(
+        ledger_generation_id=old_generation.id, reservation_id=reservation.id,
+        plan_id=plan.id, run_id=run.run_id, requirement_id=requirement.id,
+        item_id=item.item_id, replenishment_method="make",
+        replenishment_required_qty=5, replenishment_remaining_qty=5,
+    )
+    db_session.add(old_work)
+    db_session.flush()
+    revision = "accepted:r9-current-target"
+    db_session.add(models.CurrentExecutionScope(
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+        source_revision=revision, source_generation_id=target.id,
+        result_ready=True, content_hash="a" * 64, summary={},
+    ))
+    db_session.add(models.CurrentExecutionRow(
+        entity_kind="production_control_journal",
+        business_identity="mrp-reservation:stable",
+        scope_key="production:all-live-orders",
+        source_revision=revision, source_generation_id=target.id,
+        result_status="accepted", result_ready=True, content_hash="b" * 64,
+        payload={
+            "journal_row_key": "work-item:stable", "item_id": item.item_id,
+            "source_mrp_requirement_id": requirement.id,
+            "source_mrp_allocation_key": "stable", "order_source": "mrp",
+            "source": "mrp", "quantity": 5, "remaining_qty": 5,
+            "order_number": "MRP-STABLE", "item_code": item.item_code,
+            "item_name": item.item_name, "item_article": "R9-ARTICLE",
+            "unit": "шт", "produced_qty": 0,
+            "status": "shortage", "coverage_status": "shortage",
+            "coverage_label": "Дефицит", "issue_status": "not_issued",
+            "issue_count": 0, "comment": "",
+        },
+    ))
+    db_session.commit()
+
+    result = get_orders_journal(
+        planning_contour=None, launch_source=None, db=db_session
+    )
+    assert result.total == 1
+    assert result.rows[0].work_item_id == old_work.id
+    with pytest.raises(Exception) as caught:
+        post_orders_from_work_items(
+            OrdersFromWorkItemsPayload(
+                work_item_ids=[old_work.id + 1000],
+                current_identities=["mrp-reservation:stable"],
+                expected_source_revision=revision,
+            ),
+            db=db_session,
+        )
+    assert getattr(caught.value, "status_code", None) == 409
 
 
 def test_r9_root_products_read_current_production_rows(db_session):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Annotated, List, Literal, Optional, Union
+from typing import Annotated, Any, List, Literal, Optional, Sequence, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -1377,6 +1377,69 @@ def _require_current_production_identities(
     return manifest, rows
 
 
+def _current_make_work_item_ids(
+    db: Session,
+    *,
+    generation_id: int,
+    rows: Sequence[Any],
+) -> dict[tuple[int, int], int]:
+    """Resolve compatibility work-item locators through stable reservations.
+
+    ``ledger_generation_id`` on a work item is provenance.  The current
+    reservation owner is the semantic join key after a physical fork.  A
+    locator is returned only when that owner has exactly one MAKE work item;
+    ambiguity remains unavailable rather than being resolved by max/latest.
+    """
+    from ..services.item_ledger.reservation_current import current_reservation_query
+
+    keys = {
+        (int(req_id), int(item_id))
+        for row in rows
+        for req_id, item_id in [
+            (
+                (row.payload if hasattr(row, "payload") else row).get("source_mrp_requirement_id"),
+                (row.payload if hasattr(row, "payload") else row).get("item_id"),
+            )
+        ]
+        if req_id not in (None, "") and item_id not in (None, "")
+    }
+    if not keys:
+        return {}
+    requirement_ids = sorted({req_id for req_id, _item_id in keys})
+    item_ids = sorted({item_id for _req_id, item_id in keys})
+    reservations = current_reservation_query(
+        db, generation_id=int(generation_id)
+    ).filter(
+        models.ReservationEntry.requirement_id.in_(requirement_ids),
+        models.ReservationEntry.item_id.in_(item_ids),
+        models.ReservationEntry.realization_mode == "make",
+        models.ReservationEntry.lifecycle_status == "active",
+    ).all()
+    owners = {
+        (int(row.requirement_id), int(row.item_id)): row
+        for row in reservations
+        if (int(row.requirement_id), int(row.item_id)) in keys
+    }
+    if len(owners) != len(keys):
+        return {}
+    work_rows = db.query(models.ReplenishmentWorkItem).filter(
+        models.ReplenishmentWorkItem.reservation_id.in_(
+            [int(row.id) for row in owners.values()]
+        ),
+        models.ReplenishmentWorkItem.replenishment_method == "make",
+    ).all()
+    grouped: dict[int, list[models.ReplenishmentWorkItem]] = {}
+    for work in work_rows:
+        grouped.setdefault(int(work.reservation_id), []).append(work)
+    result: dict[tuple[int, int], int] = {}
+    for key, owner in owners.items():
+        matches = grouped.get(int(owner.id), [])
+        if len(matches) != 1:
+            continue
+        result[key] = int(matches[0].id)
+    return result
+
+
 class AssembleMaterialIssuePayload(BaseModel):
     # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
@@ -1660,12 +1723,11 @@ def get_orders_journal(
                 current_row for current_row in current_records
                 if str(current_row.business_identity) == target_identity
             ]
-        current_work_items = {
-            (int(work.requirement_id), int(work.item_id)): int(work.id)
-            for work in db.query(models.ReplenishmentWorkItem).filter(
-                models.ReplenishmentWorkItem.ledger_generation_id == int(current_manifest.source_generation_id or 0),
-            ).all()
-        }
+        current_work_items = _current_make_work_item_ids(
+            db,
+            generation_id=int(current_manifest.source_generation_id or 0),
+            rows=current_records,
+        )
         rows = []
         for current_row in current_records:
             payload = dict(current_row.payload or {})
@@ -2230,6 +2292,11 @@ def post_orders_from_work_items(
         )
         if len(current_rows) != len(set(selected_ids)):
             raise CurrentExecutionUnavailable("current MRP proposal identities are incomplete")
+        current_work_items = _current_make_work_item_ids(
+            db,
+            generation_id=int(manifest.source_generation_id or 0),
+            rows=current_rows,
+        )
         current_work_ids: set[int] = set()
         for current_row in current_rows:
             row_payload = current_row.payload or {}
@@ -2237,14 +2304,10 @@ def post_orders_from_work_items(
             item_id = row_payload.get("item_id")
             if requirement_id in (None, "") or item_id in (None, ""):
                 raise CurrentExecutionUnavailable("current MRP proposal provenance is missing")
-            matches = db.query(models.ReplenishmentWorkItem).filter(
-                models.ReplenishmentWorkItem.ledger_generation_id == int(manifest.source_generation_id or 0),
-                models.ReplenishmentWorkItem.requirement_id == int(requirement_id),
-                models.ReplenishmentWorkItem.item_id == int(item_id),
-            ).all()
-            if len(matches) != 1:
+            work_id = current_work_items.get((int(requirement_id), int(item_id)))
+            if work_id is None:
                 raise CurrentExecutionUnavailable("current MRP proposal locator is missing or ambiguous")
-            current_work_ids.add(int(matches[0].id))
+            current_work_ids.add(int(work_id))
         if current_work_ids != set(selected_ids):
             raise HTTPException(status_code=409, detail={"code": "production_current_locator_stale"})
         return materialize_make_work_items(
