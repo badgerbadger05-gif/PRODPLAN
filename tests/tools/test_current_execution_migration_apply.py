@@ -70,6 +70,11 @@ def _schema(engine):
             "planning_read_snapshot_id INTEGER, current_execution_scope_id INTEGER, "
             "current_execution_source_revision TEXT, idempotency_key TEXT NOT NULL)"
         ))
+        connection.execute(text(
+            "CREATE TABLE reservation_entry ("
+            "id INTEGER PRIMARY KEY, is_current BOOLEAN NOT NULL, owner_kind TEXT NOT NULL, "
+            "lifecycle_status TEXT NOT NULL, realization_mode TEXT NOT NULL)"
+        ))
 
 
 def _seed_truth(engine, *, generation_id=7, status="accepted", pointer=None):
@@ -108,7 +113,17 @@ def _seed_truth(engine, *, generation_id=7, status="accepted", pointer=None):
         ), {"generation_id": generation_id})
 
 
-def _publish_all(session, generation_id: int, *, duplicate=False):
+def _seed_live_buy_owner(engine):
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO reservation_entry "
+            "(id, is_current, owner_kind, lifecycle_status, realization_mode) "
+            "VALUES (1, 1, 'current', 'active', 'buy')"
+        ))
+
+
+def _publish_all(session, generation_id: int, *, duplicate=False, empty_consumers=()):
+    empty = set(empty_consumers)
     for index, (consumer, scope_key, entity_kind) in enumerate(EXPECTED_CURRENT_SCOPES, start=1):
         revision = f"accepted:g{generation_id}:{consumer}"
         session.execute(text(
@@ -119,6 +134,8 @@ def _publish_all(session, generation_id: int, *, duplicate=False):
             "id": index, "kind": entity_kind, "scope": scope_key,
             "generation": generation_id, "revision": revision,
         })
+        if consumer in empty:
+            continue
         for row_offset, suffix in enumerate(
             ("a", "a") if duplicate and index == 1 else ("a",),
             start=1,
@@ -354,6 +371,84 @@ def test_apply_migrates_purchase_export_anchor_and_retry_is_noop(monkeypatch):
     assert second["postflight"]["purchase_export_anchors"] == {"legacy": 0, "current": 1}
     with engine.connect() as connection:
         assert connection.execute(text("SELECT count(*) FROM current_execution_change")).scalar_one() == change_count
+
+
+def test_empty_purchase_scope_with_live_buy_owners_blocks_postflight(monkeypatch):
+    """A ready manifest over an empty scope is the silent failure to catch."""
+
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    _seed_live_buy_owner(engine)
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
+        lambda session, generation_id: _publish_all(
+            session, generation_id, empty_consumers=("purchase_control_journal",)
+        ),
+    )
+
+    with pytest.raises(PostflightBlocked, match="active current BUY owners"):
+        apply_current_obligation_migration(engine, writers_stopped=True)
+
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM current_execution_scope")).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM current_execution_row")).scalar_one() == 0
+
+
+def test_empty_purchase_scope_without_buy_owners_stays_ready(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
+        lambda session, generation_id: _publish_all(
+            session, generation_id, empty_consumers=("purchase_control_journal",)
+        ),
+    )
+
+    report = apply_current_obligation_migration(engine, writers_stopped=True)
+    assert report["status"] == "ready"
+    assert report["postflight"]["row_counts"]["purchase_control_journal"] == 0
+    assert report["postflight"]["row_counts"]["mrp_result"] == 1
+
+
+def test_empty_mrp_scope_with_fixed_runs_blocks_postflight(monkeypatch):
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
+        lambda session, generation_id: _publish_all(
+            session, generation_id, empty_consumers=("mrp_result",)
+        ),
+    )
+
+    with pytest.raises(PostflightBlocked, match="fixed runs exist"):
+        apply_current_obligation_migration(engine, writers_stopped=True)
+
+
+def test_fixed_runs_from_an_older_generation_still_require_their_evidence(monkeypatch):
+    """The pointer is a physical refresh; the fixed run stays at generation 6."""
+
+    engine = _engine()
+    _schema(engine)
+    _seed_truth(engine)
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO ledger_generation (id, status) VALUES (6, 'accepted')"))
+        connection.execute(text("UPDATE planning_run SET ledger_generation_id = 6 WHERE run_id = 41"))
+        connection.execute(text(
+            "UPDATE planning_read_snapshot SET ledger_generation_id = 6 "
+            "WHERE consumer IN ('mrp_result', 'period_plan_execution')"
+        ))
+    monkeypatch.setattr(
+        "tools.current_execution_migration.publish_current_obligation_views_from_snapshots",
+        _publish_all,
+    )
+
+    report = apply_current_obligation_migration(engine, writers_stopped=True)
+    assert report["source_evidence"]["fixed_run_ids"] == [41]
+    assert report["source_evidence"]["consumers"]["mrp_result"]["applicable"] == ["run:41"]
+    assert report["postflight"]["row_counts"]["mrp_result"] == 1
 
 
 def test_wrong_purchase_export_snapshot_rolls_back_publication_and_anchor(monkeypatch):

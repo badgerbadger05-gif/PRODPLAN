@@ -1450,6 +1450,26 @@ def _load_parent_compact_purchase_rows(
     return rows, dict(cards) if isinstance(cards, Mapping) else {}
 
 
+def _has_active_current_buy_owners(db: Session, *, run_ids: Sequence[int]) -> bool:
+    """Does any live BUY owner exist that the purchase scope must describe?
+
+    This is the same owner predicate the ordinary builder selects rows from;
+    it is only asked to distinguish "the parent scope is legitimately empty"
+    from "the parent scope lost its rows".
+    """
+
+    if not run_ids:
+        return False
+    return db.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.is_current.is_(True),
+        models.ReservationEntry.owner_kind == "current",
+        models.ReservationEntry.lifecycle_status == "active",
+        models.ReservationEntry.realization_mode == _BUY_MODE,
+        models.ReservationEntry.current_identity != "",
+        models.ReservationEntry.run_id.in_(tuple(int(value) for value in run_ids)),
+    ).first() is not None
+
+
 def validate_compact_current_purchase_control_payload(
     payload: Mapping[str, Any],
     target_generation: models.LedgerGeneration,
@@ -1553,6 +1573,7 @@ def build_compact_current_purchase_control_payload(
     parent_rows: list[dict[str, Any]] = []
     parent_cards: dict[str, Any] = {}
     reused_row_count = 0
+    bootstrap = False
     if reuse_parent_current:
         if scopes is None:
             raise PurchaseControlCompactPayloadError(
@@ -1561,10 +1582,21 @@ def build_compact_current_purchase_control_payload(
         parent_rows, parent_cards = _load_parent_compact_purchase_rows(
             db, parent_generation_id=int(parent.id)
         )
+        if not parent_rows and _has_active_current_buy_owners(db, run_ids=run_ids):
+            # The parent manifest is empty while live BUY owners exist: reusing
+            # it would republish that emptiness for every later refresh.  A
+            # migrated/repaired stand starts exactly here, so recompute the
+            # complete scope once through the ordinary builder instead of
+            # propagating the hole.
+            bootstrap = True
+            reuse_parent_current = False
+            scopes = None
+            parent_rows = []
+            parent_cards = {}
         # A stock-only physical delta has no BUY scope.  Preserve the accepted
         # complete purchase payload without touching ReservationEvent,
         # custody, or future-supply history.
-        if not scopes:
+        elif not scopes:
             rows = list(parent_rows)
             rows.sort(
                 key=lambda row: (
@@ -1587,6 +1619,7 @@ def build_compact_current_purchase_control_payload(
                     "affected_scopes": [],
                     "row_count": len(rows),
                     "bounded_reuse": True,
+                    "bootstrap": False,
                     "recomputed_scope_count": 0,
                     "reused_row_count": len(rows),
                 },
@@ -1829,6 +1862,7 @@ def build_compact_current_purchase_control_payload(
             "affected_scopes": [list(scope) for scope in scopes] if scopes else None,
             "row_count": len(rows),
             "bounded_reuse": bool(reuse_parent_current),
+            "bootstrap": bool(bootstrap),
             "recomputed_scope_count": len(scopes or ()) if reuse_parent_current else None,
             "reused_row_count": reused_row_count,
         },

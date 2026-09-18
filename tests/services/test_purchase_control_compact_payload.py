@@ -500,3 +500,114 @@ def test_compact_purchase_validator_rejects_staged_work_identity(db_session):
     payload["rows"][0]["slices"][0]["work_item_id"] = -999
     with pytest.raises(PurchaseControlCompactPayloadError, match="staged work"):
         validate_compact_current_purchase_control_payload(payload, target)
+
+
+def _publish_empty_parent_scope(db_session, parent, template):
+    """Publish a complete-but-empty accepted purchase scope, as a migration did."""
+
+    empty = deepcopy(template)
+    empty["rows"] = []
+    empty["cards"] = {}
+    empty["meta"] = {**empty["meta"], "row_count": 0}
+    empty["summary"] = {"total_rows": 0, "to_order": 0, "fact_status": "available"}
+    publish_current_purchase_control_from_payload(db_session, parent.id, empty)
+    db_session.flush()
+    assert load_current_execution_rows(
+        db_session,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    ) == []
+
+
+def test_bounded_purchase_bootstraps_complete_scope_when_parent_scope_is_empty(db_session):
+    """A migrated stand starts with an empty parent scope and live BUY owners."""
+
+    parent, target1, target2, rows = _world(db_session, item_count=2)
+    complete = _build(db_session, parent, target1, rows)
+    _publish_empty_parent_scope(db_session, parent, complete)
+
+    scope = (rows[0][0].item_id, "", "", "default", "buy")
+    payload = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=target2.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[run.run_id for _item, run, _reservation, _capture in rows],
+        affected_scopes=(scope,),
+        reuse_parent_current=True,
+    )
+
+    assert payload["meta"]["bootstrap"] is True
+    assert payload["meta"]["bounded_reuse"] is False
+    assert payload["meta"]["reused_row_count"] == 0
+    # The complete scope is rebuilt, not the single affected BUY scope.
+    assert {int(row["item_id"]) for row in payload["rows"]} == {
+        rows[0][0].item_id, rows[1][0].item_id
+    }
+    assert [row["row_key"] for row in payload["rows"]] == [
+        row["row_key"] for row in complete["rows"]
+    ]
+    validate_compact_current_purchase_control_payload(payload, target2)
+
+
+def test_repair_path_bootstraps_empty_parent_scope_without_affected_scopes(db_session):
+    """``repair_current_execution_scopes_from_pointer`` calls the same builder."""
+
+    parent, target1, target2, rows = _world(db_session, item_count=2)
+    complete = _build(db_session, parent, target1, rows)
+    _publish_empty_parent_scope(db_session, parent, complete)
+
+    payload = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=target2.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[run.run_id for _item, run, _reservation, _capture in rows],
+        affected_scopes=(),
+        reuse_parent_current=True,
+    )
+
+    assert payload["meta"]["bootstrap"] is True
+    assert payload["meta"]["bounded_reuse"] is False
+    assert len(payload["rows"]) == len(complete["rows"])
+    validate_compact_current_purchase_control_payload(payload, target2)
+
+
+def test_empty_parent_scope_without_live_buy_owners_is_reused_not_bootstrapped(db_session):
+    parent, target1, target2, rows = _world(db_session)
+    complete = _build(db_session, parent, target1, rows)
+    _publish_empty_parent_scope(db_session, parent, complete)
+    for _item, _run, reservation, _capture in rows:
+        reservation.lifecycle_status = "closed"
+    db_session.flush()
+
+    payload = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=target2.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[rows[0][1].run_id],
+        affected_scopes=(),
+        reuse_parent_current=True,
+    )
+
+    assert payload["meta"]["bootstrap"] is False
+    assert payload["meta"]["bounded_reuse"] is True
+    assert payload["rows"] == []
+
+
+def test_bounded_purchase_with_populated_parent_scope_still_reuses(db_session):
+    parent, target1, target2, rows = _world(db_session)
+    initial = _build(db_session, parent, target1, rows)
+    publish_current_purchase_control_from_payload(db_session, parent.id, initial)
+    db_session.flush()
+
+    payload = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=target2.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[rows[0][1].run_id],
+        affected_scopes=(),
+        reuse_parent_current=True,
+    )
+
+    assert payload["meta"]["bootstrap"] is False
+    assert payload["meta"]["bounded_reuse"] is True
+    assert payload["meta"]["reused_row_count"] == len(payload["rows"]) > 0

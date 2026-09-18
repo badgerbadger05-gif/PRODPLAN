@@ -16,7 +16,7 @@ from collections import defaultdict
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import bindparam, create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -72,10 +72,16 @@ if _BACKEND_ROOT.is_dir() and str(_BACKEND_ROOT) not in sys.path:
 # not turn an import regression into a misleading "publisher unavailable"
 # apply response; fail at startup with the real traceback instead.
 from tools.current_execution_legacy_adapter import (
+    active_current_buy_owner_count,
+    fixed_planning_runs,
+    legacy_journal_row_count,
     publish_current_obligation_views_from_snapshots,
 )
 from app.services.item_ledger.current_execution import (
     publish_current_execution_from_generation,
+)
+from app.services.item_ledger.current_replenishment import (
+    apply_current_replenishment_for_accepted_generation,
 )
 
 
@@ -383,9 +389,13 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
     """Verify legacy obligation evidence before invoking the current writer.
 
     Empty *rows* are valid input, but an absent/unaccepted source snapshot is
-    not.  MRP and period evidence is scoped to fixed runs/plans when those
-    tables are available; the small policy-test schema instead must provide at
-    least one accepted source snapshot for each consumer.
+    not.  Fixed runs are selected by status alone, exactly as the runtime
+    publisher does: a run stays anchored to the obligation refresh that fixed
+    it, while the truth pointer moves on with every physical refresh.  Binding
+    the selection to the pointer generation made every stand with a physical
+    pointer report "no fixed runs" and publish an empty ``mrp_result`` scope.
+    The small policy-test schema without ``planning_run`` instead must provide
+    at least one accepted source snapshot for each consumer.
     """
 
     inspector = inspect(engine)
@@ -394,32 +404,47 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
         raise PreflightBlocked("legacy obligation source planning_read_snapshot is absent")
 
     with engine.connect() as connection:
-        all_rows = connection.execute(text(
-            "SELECT id, consumer, snapshot_key, truth_status "
-            "FROM planning_read_snapshot WHERE ledger_generation_id = :generation_id "
-            "ORDER BY consumer, snapshot_key, id"
-        ), {"generation_id": int(generation_id)}).mappings().all()
-
         fixed_runs: list[dict[str, Any]] = []
         if "planning_run" in table_names:
             fixed_runs = [dict(row) for row in connection.execute(text(
-                "SELECT run_id, source_plan_id FROM planning_run "
-                "WHERE ledger_generation_id = :generation_id AND status = 'FIXED_SNAPSHOT' "
-                "ORDER BY run_id"
-            ), {"generation_id": int(generation_id)}).mappings().all()]
+                "SELECT run_id, source_plan_id, ledger_generation_id FROM planning_run "
+                "WHERE status = 'FIXED_SNAPSHOT' ORDER BY run_id"
+            )).mappings().all()]
+
+        generations = sorted({int(generation_id)} | {
+            int(row["ledger_generation_id"])
+            for row in fixed_runs
+            if row.get("ledger_generation_id") is not None
+        })
+        statement = text(
+            "SELECT id, consumer, snapshot_key, truth_status, ledger_generation_id "
+            "FROM planning_read_snapshot WHERE ledger_generation_id IN :generations "
+            "ORDER BY consumer, snapshot_key, id"
+        ).bindparams(bindparam("generations", expanding=True))
+        all_rows = connection.execute(
+            statement, {"generations": generations}
+        ).mappings().all()
 
     accepted = [row for row in all_rows if str(row.get("truth_status") or "") == "accepted"]
     by_consumer: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in accepted:
         by_consumer[str(row["consumer"])].append(dict(row))
 
+    def _run_generation(run: dict[str, Any]) -> int:
+        value = run.get("ledger_generation_id")
+        return int(value) if value is not None else int(generation_id)
+
+    def _matches(consumer: str, snapshot_key: str, at_generation: int) -> list[dict[str, Any]]:
+        return [
+            row for row in by_consumer.get(consumer, [])
+            if str(row.get("snapshot_key") or "") == snapshot_key
+            and int(row.get("ledger_generation_id") or 0) == int(at_generation)
+        ]
+
     evidence: dict[str, Any] = {}
 
     def require_exact(consumer: str, snapshot_key: str) -> None:
-        matches = [
-            row for row in by_consumer.get(consumer, [])
-            if str(row.get("snapshot_key") or "") == snapshot_key
-        ]
+        matches = _matches(consumer, snapshot_key, int(generation_id))
         if len(matches) != 1:
             raise PreflightBlocked(
                 f"source evidence for {consumer}/{snapshot_key} is missing or ambiguous "
@@ -433,65 +458,85 @@ def _source_evidence_report(engine: Engine, generation_id: int) -> dict[str, Any
     require_exact("production_control_journal", "journal:v1")
     require_exact("purchase_control_journal", "journal:v1")
 
-    def require_scoped(consumer: str, applicable: list[str] | None) -> None:
+    def require_single_unscoped(consumer: str) -> None:
+        # A minimal policy schema has no run/plan catalog from which to
+        # derive applicability.  It must still provide one unambiguous
+        # accepted source rather than allowing an empty publisher result.
         candidates = by_consumer.get(consumer, [])
-        if applicable is None:
-            # A minimal policy schema has no run/plan catalog from which to
-            # derive applicability.  It must still provide one unambiguous
-            # accepted source rather than allowing an empty publisher result.
-            if len(candidates) != 1:
-                raise PreflightBlocked(
-                    f"source evidence for {consumer} is missing or ambiguous "
-                    f"(accepted matches={len(candidates)})"
-                )
-            evidence[consumer] = {
-                "applicable": [str(candidates[0]["snapshot_key"])],
-                "snapshot_ids": [int(candidates[0]["id"])],
-            }
-            return
-        if not applicable:
+        if len(candidates) != 1:
+            raise PreflightBlocked(
+                f"source evidence for {consumer} is missing or ambiguous "
+                f"(accepted matches={len(candidates)})"
+            )
+        evidence[consumer] = {
+            "applicable": [str(candidates[0]["snapshot_key"])],
+            "snapshot_ids": [int(candidates[0]["id"])],
+        }
+
+    def require_per_run(
+        consumer: str,
+        keyed: list[tuple[str, tuple[int, ...]]],
+    ) -> None:
+        """Require one accepted snapshot per key, at the first allowed generation."""
+
+        if not keyed:
             # A database with no fixed runs/plans has a legitimately empty
             # obligation scope; no fabricated empty source is accepted.
             evidence[consumer] = {"applicable": [], "snapshot_ids": []}
             return
         selected: list[dict[str, Any]] = []
         missing: list[str] = []
-        for key in applicable:
-            matches = [
-                row for row in candidates
-                if str(row.get("snapshot_key") or "") == key
-            ]
-            if len(matches) != 1:
-                missing.append(key)
+        for key, allowed in keyed:
+            chosen: dict[str, Any] | None = None
+            ambiguous = False
+            for at_generation in allowed:
+                matches = _matches(consumer, key, at_generation)
+                if len(matches) > 1:
+                    ambiguous = True
+                    break
+                if matches:
+                    chosen = matches[0]
+                    break
+            if ambiguous or chosen is None:
+                missing.append(f"{key}@{'/'.join(str(value) for value in allowed)}")
             else:
-                selected.append(matches[0])
+                selected.append(chosen)
         if missing:
             raise PreflightBlocked(
                 f"source evidence for {consumer} is missing or ambiguous for {missing}"
             )
         evidence[consumer] = {
-            "applicable": list(applicable),
+            "applicable": [key for key, _ in keyed],
             "snapshot_ids": sorted(int(row["id"]) for row in selected),
         }
 
     if "planning_run" not in table_names:
         # Minimal policy schemas must explicitly stub evidence rather than
         # allowing a publisher to manufacture empty current scopes.
-        require_scoped("mrp_result", None)
-        require_scoped("period_plan_execution", None)
+        require_single_unscoped("mrp_result")
+        require_single_unscoped("period_plan_execution")
     else:
-        run_keys = [f"run:{int(row['run_id'])}" for row in fixed_runs]
+        # MRP evidence lives at the run's own generation; period evidence is
+        # republished by the pointer generation and falls back to the run's.
+        run_keys = [
+            (f"run:{int(row['run_id'])}", (_run_generation(row),))
+            for row in fixed_runs
+        ]
         plan_keys = sorted({
-            f"plan={int(row['source_plan_id'])};run={int(row['run_id'])}"
+            (
+                f"plan={int(row['source_plan_id'])};run={int(row['run_id'])}",
+                (int(generation_id), _run_generation(row)),
+            )
             for row in fixed_runs
             if row.get("source_plan_id") is not None
         })
-        require_scoped("mrp_result", run_keys)
-        require_scoped("period_plan_execution", plan_keys)
+        require_per_run("mrp_result", run_keys)
+        require_per_run("period_plan_execution", plan_keys)
 
     return {
         "status": "ready",
         "generation_id": int(generation_id),
+        "fixed_run_ids": sorted(int(row["run_id"]) for row in fixed_runs),
         "consumers": evidence,
     }
 
@@ -617,8 +662,23 @@ def _execution_contour_mode(session: Session) -> str:
     return "full"
 
 
+def _current_scope_row_count(session: Session, *, entity_kind: str, scope_key: str) -> int:
+    """Count the rows a reader would actually see in one published scope."""
+
+    return int(session.execute(text(
+        "SELECT count(*) FROM current_execution_row "
+        "WHERE entity_kind = :entity_kind AND scope_key = :scope_key "
+        "AND result_status = 'accepted' AND result_ready"
+    ), {"entity_kind": str(entity_kind), "scope_key": str(scope_key)}).scalar_one() or 0)
+
+
 def _postflight_on_session(session: Session, generation_id: int) -> dict[str, Any]:
-    """Validate current scopes/rows while the publication transaction is held."""
+    """Validate current scopes/rows while the publication transaction is held.
+
+    A ready manifest is not enough: an empty scope published over live
+    business owners is the silent failure this postflight exists to catch, so
+    emptiness is checked against the owners that must be described.
+    """
 
     scopes: dict[str, dict[str, Any]] = {}
     for consumer, scope_key, entity_kind in EXPECTED_CURRENT_SCOPES:
@@ -644,7 +704,39 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
             "source_generation_id": int(row["source_generation_id"]),
             "source_revision": str(row["source_revision"]),
             "result_ready": bool(row["result_ready"]),
+            "row_count": _current_scope_row_count(
+                session, entity_kind=entity_kind, scope_key=scope_key
+            ),
         }
+
+    # An empty scope is legitimate only when nothing owns it.  Each check
+    # names the live owner set the scope failed to describe.
+    if not scopes["purchase_control_journal"]["row_count"]:
+        buy_owners = active_current_buy_owner_count(session)
+        if buy_owners:
+            raise PostflightBlocked(
+                "purchase current scope has 0 rows while "
+                f"{buy_owners} active current BUY owners exist"
+            )
+    if not scopes["production_control_journal"]["row_count"]:
+        production_evidence = legacy_journal_row_count(
+            session,
+            consumer="production_control_journal",
+            key="journal:v1",
+            generation_id=int(generation_id),
+        )
+        if production_evidence:
+            raise PostflightBlocked(
+                "production current scope has 0 rows while the legacy production "
+                f"snapshot carried {production_evidence} rows"
+            )
+    if not scopes["mrp_result"]["row_count"]:
+        fixed_runs = fixed_planning_runs(session)
+        if fixed_runs:
+            raise PostflightBlocked(
+                "mrp_result current scope has 0 rows while "
+                f"{len(fixed_runs)} fixed runs exist"
+            )
 
     execution_scopes: dict[str, dict[str, Any]] = {}
     if _execution_contour_mode(session) == "full":
@@ -670,6 +762,9 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
                 "source_generation_id": int(row["source_generation_id"]),
                 "source_revision": str(row["source_revision"]),
                 "result_ready": bool(row["result_ready"]),
+                "row_count": _current_scope_row_count(
+                    session, entity_kind=entity_kind, scope_key=scope_key
+                ),
             }
 
     duplicates = session.execute(text(
@@ -726,6 +821,9 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
         "generation_id": int(generation_id),
         "scopes": scopes,
         "execution_scopes": execution_scopes,
+        "row_counts": {
+            consumer: int(scope["row_count"]) for consumer, scope in scopes.items()
+        },
         "unique_identities": True,
         "purchase_export_anchors": purchase_export_anchors,
     }
@@ -815,6 +913,144 @@ def apply_current_obligation_migration(
     }
 
 
+def _exact_supplier_provenance_owners(session: Session) -> list[dict[str, int]]:
+    rows = session.execute(text(
+        "SELECT ledger_generation_id AS generation_id, count(*) AS row_count "
+        "FROM stock_ledger_supplier_receipt_provenance "
+        "WHERE match_status = 'exact' "
+        "GROUP BY ledger_generation_id ORDER BY ledger_generation_id"
+    )).mappings().all()
+    return [
+        {"generation_id": int(row["generation_id"]), "row_count": int(row["row_count"])}
+        for row in rows
+    ]
+
+
+def _exact_supplier_provenance_with_qty(session: Session, generation_id: int) -> int:
+    """Count exact supplier provenance rows whose fact still carries quantity."""
+
+    columns = {
+        str(column["name"])
+        for column in inspect(session.connection()).get_columns("stock_ledger_entry")
+    }
+    clauses = [
+        "p.ledger_generation_id = :generation_id",
+        "p.match_status = 'exact'",
+        "e.qty <> 0",
+    ]
+    if "active" in columns:
+        clauses.append("e.active")
+    return int(session.execute(text(
+        "SELECT count(*) FROM stock_ledger_supplier_receipt_provenance p "
+        "JOIN stock_ledger_entry e ON e.id = p.stock_ledger_entry_id "
+        "WHERE " + " AND ".join(clauses)
+    ), {"generation_id": int(generation_id)}).scalar_one() or 0)
+
+
+def _current_allocations_by_role(session: Session) -> dict[str, int]:
+    rows = session.execute(text(
+        "SELECT allocation_role, count(*) AS row_count "
+        "FROM reservation_consumption_allocation WHERE is_current "
+        "GROUP BY allocation_role ORDER BY allocation_role"
+    )).mappings().all()
+    return {str(row["allocation_role"]): int(row["row_count"]) for row in rows}
+
+
+def _replenishment_bootstrap_on_session(
+    session: Session, generation_id: int
+) -> dict[str, Any]:
+    """Build the complete R4 current replenishment state for the pointer.
+
+    The bounded physical path only replays the BUY scopes a delta touched, so
+    a freshly migrated database has no current replenishment state at all.
+    The accepted-generation writer is the one canonical owner of that state;
+    this phase only calls it and refuses to report success on an empty result.
+    """
+
+    names = set(inspect(session.connection()).get_table_names())
+    for required in (
+        "stock_ledger_supplier_receipt_provenance",
+        "current_replenishment_state",
+        "reservation_consumption_allocation",
+    ):
+        if required not in names:
+            raise PreflightBlocked(
+                f"current replenishment bootstrap requires table {required}"
+            )
+
+    owners = _exact_supplier_provenance_owners(session)
+    owned_here = next(
+        (row["row_count"] for row in owners if row["generation_id"] == int(generation_id)),
+        0,
+    )
+    if not owned_here and owners:
+        # Provenance stays at the generation that computed it; a bounded
+        # physical refresh never re-tags it.  Running the writer against a
+        # later pointer would silently build state with zero allocations.
+        detail = ", ".join(
+            f"g{row['generation_id']}({row['row_count']} rows)" for row in owners
+        )
+        raise PreflightBlocked(
+            f"accepted pointer generation {int(generation_id)} owns no exact supplier "
+            f"receipt provenance; it is owned by {detail}"
+        )
+
+    exact_with_qty = _exact_supplier_provenance_with_qty(session, int(generation_id))
+    results = apply_current_replenishment_for_accepted_generation(
+        session, generation_id=int(generation_id)
+    )
+    session.flush()
+
+    changed_pairs = sum(int(result.changed_pairs) for result in results)
+    allocations = _current_allocations_by_role(session)
+    total_allocations = sum(allocations.values())
+    state_rows = int(session.execute(text(
+        "SELECT count(*) FROM current_replenishment_state"
+    )).scalar_one() or 0)
+    if not total_allocations and exact_with_qty:
+        raise PostflightBlocked(
+            "current replenishment bootstrap produced 0 current allocations while "
+            f"{exact_with_qty} exact supplier receipt provenance rows with quantity "
+            f"exist at generation {int(generation_id)}"
+        )
+    return {
+        "phase": "replenishment-bootstrap",
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "exact_provenance_rows": int(owned_here),
+        "exact_provenance_rows_with_qty": int(exact_with_qty),
+        "scopes": len(results),
+        "changed_pairs": int(changed_pairs),
+        "inserted": sum(int(result.inserted) for result in results),
+        "updated": sum(int(result.updated) for result in results),
+        "deleted": sum(int(result.deleted) for result in results),
+        "current_replenishment_state": state_rows,
+        "reservation_consumption_allocation_current": {
+            "total": int(total_allocations),
+            "by_allocation_role": allocations,
+        },
+        "idempotent": changed_pairs == 0,
+    }
+
+
+def apply_current_replenishment_bootstrap(
+    engine: Engine, *, writers_stopped: bool
+) -> dict[str, Any]:
+    """Run the R4 current replenishment bootstrap in one transaction.
+
+    Operationally this phase runs after the schema is at alembic head and
+    before generation GC: it needs the accepted pointer generation to still
+    own its ``stock_ledger_supplier_receipt_provenance`` rows.
+    """
+
+    if not writers_stopped:
+        raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+    generation_id = _accepted_truth_generation(engine)
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        with session.begin():
+            return _replenishment_bootstrap_on_session(session, int(generation_id))
+
+
 def _assert_local_database_url(database_url: str) -> None:
     parsed = urlparse(database_url)
     if parsed.scheme.startswith("sqlite"):
@@ -829,14 +1065,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument(
         "--phase",
-        choices=("preflight", "apply", "postflight"),
+        choices=("preflight", "apply", "postflight", "replenishment-bootstrap"),
         default="preflight",
-        help="read-only manifest, atomic current publication, or read-only postflight",
+        help=(
+            "read-only manifest, atomic current publication, read-only postflight, "
+            "or the one-off R4 current replenishment bootstrap"
+        ),
     )
     parser.add_argument(
         "--writers-stopped",
         action="store_true",
-        help="explicit acknowledgement required by --phase apply",
+        help="explicit acknowledgement required by --phase apply/replenishment-bootstrap",
     )
     parser.add_argument("--generation-id", type=int)
     parser.add_argument("--fault-after-consumer")
@@ -856,6 +1095,10 @@ def main(argv: list[str] | None = None) -> int:
                 engine,
                 writers_stopped=args.writers_stopped,
                 fault_after_consumer=args.fault_after_consumer,
+            )
+        elif args.phase == "replenishment-bootstrap":
+            report = apply_current_replenishment_bootstrap(
+                engine, writers_stopped=args.writers_stopped
             )
         else:
             generation_id = args.generation_id
