@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from threading import RLock
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -690,6 +691,13 @@ def _publish_assembly_current(
     revision: str,
 ) -> tuple[int, int]:
     queue_rows = tuple(_member(assembly_payload, "queue_rows") or ())
+    total_queue_qty = sum(
+        (
+            Decimal(str(_member(row, "payload", {}).get("assembly_remaining_qty") or "0"))
+            for row in queue_rows
+        ),
+        Decimal("0"),
+    )
     queue_result = publish_current_execution_scope(
         db,
         source_revision=revision,
@@ -697,7 +705,10 @@ def _publish_assembly_current(
         scope_key="assembly:all-live-plans",
         rows=queue_rows,
         entity_kinds=("assembly_queue",),
-        summary={"total_rows": len(queue_rows)},
+        summary={
+            "total_rows": len(queue_rows),
+            "total_queue_qty": str(total_queue_qty),
+        },
     )
     readiness_rows = resolve_compact_queue_owner_ids(
         db, tuple(_member(assembly_payload, "readiness_rows") or ())
