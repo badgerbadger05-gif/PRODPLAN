@@ -8,8 +8,9 @@ CANON: «Факт выпуска — считанный назад резуль�
 (`production_order_sync.sync_production_facts`).
 
 Второго канала факта нет: документы 1С здесь не читаются. В расчёт входят
-только видимые в границе импорта поколения положительные `assembly_in`
-StockLedgerEntry (`physical_visibility.visible_sle_query`).
+чистый выпуск документов из видимых в границе импорта поколения
+StockLedgerEntry (`physical_visibility.visible_sle_query`), рассчитанный
+каноническим `document_net_output` без повторного зачёта внутренних перемещений.
 
 Идентичность факта до заказа/строки — тот же материал, что и у
 `historical_replay_persistence._identity_for_sle`, но с точностью до строки:
@@ -40,11 +41,11 @@ from sqlalchemy.orm import Session
 
 from app import models
 
+from .document_net_output import NETTED_MOVEMENT_KINDS, net_document_output_qty
 from .physical_visibility import PhysicalVisibilityError, visible_sle_query
 from .recorder_identity import build_recorder_identity_index
 
 
-ASSEMBLY_MOVEMENT_KIND = "assembly_in"
 ZERO = Decimal("0")
 
 
@@ -90,8 +91,7 @@ def _visible_assembly_facts(
             cutoff=cutoff,
         )
         .filter(
-            models.StockLedgerEntry.movement_kind == ASSEMBLY_MOVEMENT_KIND,
-            models.StockLedgerEntry.qty > 0,
+            models.StockLedgerEntry.movement_kind.in_(NETTED_MOVEMENT_KINDS),
         )
         .order_by(
             models.StockLedgerEntry.posting_at.asc(),
@@ -196,6 +196,7 @@ def derive_production_output(
         physical_import_batch_id=int(generation.physical_import_batch_id),
         cutoff=effective_cutoff,
     )
+    net_output = net_document_output_qty(rows)
     index = build_recorder_identity_index(db, [_norm(row.recorder_ref) for row in rows])
     line_cache: dict[tuple[int, int], list[models.ProductionProduct]] = {}
 
@@ -211,7 +212,7 @@ def derive_production_output(
     surplus_qty = ZERO
 
     for row in rows:
-        qty = _dec(row.qty)
+        qty = net_output.get(int(row.id), ZERO)
         if qty <= ZERO:
             continue
         facts += 1
