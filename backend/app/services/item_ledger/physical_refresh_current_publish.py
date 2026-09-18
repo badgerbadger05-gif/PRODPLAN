@@ -23,9 +23,9 @@ from app.services.item_ledger.assembly_output_persistence import (
 )
 from app.services.item_ledger.current_execution import (
     build_compact_current_assembly_payload,
+    get_current_execution_scope,
     publish_current_execution_scope,
-    publish_current_purchase_control_from_payload,
-    publish_current_production_control_from_payload,
+    publish_current_obligation_views_from_generation,
     resolve_compact_queue_owner_ids,
 )
 from app.services.item_ledger.current_replenishment import (
@@ -49,6 +49,7 @@ from app.services.item_ledger.physical_refresh_supplier_evidence import (
     build_bounded_supplier_receipt_manifest,
     is_supplier_document_type,
 )
+from app.services.mrp_result_projection import build_mrp_result_current_payload
 from app.services.planning_truth import publish_generation
 from app.services.item_ledger.shelf_projection_persistence import (
     build_compact_current_shelf_payload,
@@ -628,6 +629,53 @@ def _fixed_run_ids(db: Session) -> tuple[int, ...]:
     ).order_by(models.PlanningRun.run_id.asc()).all())
 
 
+def build_period_plan_execution_current_payloads(
+    db: Session,
+    *,
+    generation_id: int,
+    run_ids: Sequence[int],
+) -> Mapping[str, Any]:
+    """Build the canonical period-execution current payloads for one generation.
+
+    ``period_plan_service`` imports the ledger publishers, so this module-level
+    seam keeps the canonical builder reachable (and patchable in tests) without
+    creating an import cycle.
+    """
+    from app.services.period_plan_service import (
+        build_period_plan_execution_current_payloads_for_generation,
+    )
+
+    return build_period_plan_execution_current_payloads_for_generation(
+        db,
+        int(generation_id),
+        run_ids=tuple(int(value) for value in run_ids),
+    )
+
+
+def _build_obligation_view_payloads(
+    db: Session,
+    *,
+    generation_id: int,
+    run_ids: Sequence[int],
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    """Build the MRP and period current payloads with the canonical builders.
+
+    The bounded refresh advances the accepted pointer, and the current readers
+    of ``mrp_result``/``period_plan_execution`` require their manifest to match
+    that pointer exactly.  Republishing them from the same canonical builders
+    used by the full accept path is therefore part of every publication, not an
+    optional extra.
+    """
+    mrp_payloads = {
+        str(run_id): build_mrp_result_current_payload(db, int(run_id))
+        for run_id in sorted({int(value) for value in run_ids})
+    }
+    period_payloads = build_period_plan_execution_current_payloads(
+        db, generation_id=int(generation_id), run_ids=run_ids,
+    )
+    return mrp_payloads, period_payloads
+
+
 def _member(value: Any, name: str, default: Any = ()) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
@@ -985,6 +1033,15 @@ def _publish_forward_physical_refresh_current(
     )
     if _phase_tracker is not None:
         _phase_tracker.complete("purchase_payload")
+    # Build the obligation view payloads while the pointer still names the
+    # parent: their canonical builders read the current manifests, which are
+    # only coherent before this publication starts advancing them.
+    start_phase("obligation_view_payload")
+    mrp_payloads, period_payloads = _build_obligation_view_payloads(
+        db, generation_id=int(target.id), run_ids=run_ids,
+    )
+    if _phase_tracker is not None:
+        _phase_tracker.complete("obligation_view_payload")
     phase("payloads")
 
     replayed_rows = (
@@ -1056,8 +1113,21 @@ def _publish_forward_physical_refresh_current(
     )
     phase("dependents")
     start_phase("obligations")
-    production_result = publish_current_production_control_from_payload(db, int(target.id), production_payload)
-    purchase_result = publish_current_purchase_control_from_payload(db, int(target.id), purchase_payload)
+    # One canonical obligation-view publisher owns all four manifests.  A
+    # bounded refresh that advanced only production/purchase left mrp_result
+    # and period_plan_execution pinned to the previous generation, and every
+    # reader of those two scopes fails closed against the advanced pointer.
+    obligation_results = publish_current_obligation_views_from_generation(
+        db,
+        int(target.id),
+        purchase_payload=purchase_payload,
+        production_payload=production_payload,
+        mrp_payloads=mrp_payloads,
+        period_payloads=period_payloads,
+        period_run_ids=run_ids,
+    )
+    production_result = obligation_results["production_control_journal"]
+    purchase_result = obligation_results["purchase_control_journal"]
     phase("obligations")
 
     # CAS pointer switch is deliberately the last business mutation.
@@ -1077,10 +1147,217 @@ def _publish_forward_physical_refresh_current(
     )
 
 
+# The complete set of compact current scopes owned by one accepted pointer.
+CURRENT_EXECUTION_SCOPE_KEYS: tuple[tuple[str, str], ...] = (
+    ("assembly_queue", "assembly:all-live-plans"),
+    ("assembly_readiness", "assembly:all-live-plans"),
+    ("drum_schedule", "drum:all-live-plans"),
+    ("drum_slot", "drum:all-live-plans"),
+    ("drum_gap", "drum:all-live-plans"),
+    ("drum_excluded", "drum:all-live-plans"),
+    ("shelf_projection", "shelf:all-live-mrps"),
+    ("production_control_journal", "production:all-live-orders"),
+    ("purchase_control_journal", "purchase:all-live-plans"),
+    ("mrp_result", "mrp:all-live-plans"),
+    ("period_plan_execution", "period-plan:all-live-plans"),
+)
+
+
+@dataclass(frozen=True)
+class CurrentExecutionScopeRepairResult:
+    pointer_generation_id: int
+    repaired_scopes: tuple[str, ...]
+    changed_rows: int
+    closed_rows: int
+
+
+def current_execution_scopes_needing_repair(
+    db: Session,
+    *,
+    pointer_generation_id: int,
+) -> tuple[str, ...]:
+    """Name every current scope a reader would reject for the accepted pointer.
+
+    Reference writers (specification import, calendar, rates, resources,
+    custody) deliberately invalidate their manifests and rely on the worker to
+    republish.  A refresh that publishes nothing therefore has to answer this
+    question itself, otherwise an invalidated scope stays fail-closed until the
+    next semantic physical delta happens to arrive.
+    """
+    stale: list[str] = []
+    for entity_kind, scope_key in CURRENT_EXECUTION_SCOPE_KEYS:
+        manifest = get_current_execution_scope(
+            db, entity_kind=entity_kind, scope_key=scope_key,
+        )
+        if manifest is None:
+            # Never published in this contour; a repair cannot invent the
+            # missing publication history, so leave it fail-closed.
+            continue
+        if (
+            not bool(manifest.result_ready)
+            or int(manifest.source_generation_id or 0) != int(pointer_generation_id)
+        ):
+            stale.append(f"{entity_kind}:{scope_key}")
+    return tuple(stale)
+
+
+def repair_current_execution_scopes_from_pointer(
+    db: Session,
+    *,
+    pointer_generation_id: int,
+    payload_boundary_generation_id: int,
+    source_revision: int | str,
+) -> CurrentExecutionScopeRepairResult | None:
+    """Republish stale/not-ready current scopes from the accepted pointer.
+
+    This is the no-op refresh counterpart of the bounded publisher: the exact
+    same compact payload builders and the same canonical publishers, run
+    against the accepted pointer generation instead of a new one.  Nothing is
+    accepted, no generation is created and the pointer is not moved, so an
+    unchanged result is a true no-op for rows and audit.
+
+    ``payload_boundary_generation_id`` is the technical BUILDING candidate the
+    refresh already forked.  It contributes only the ``as_of`` cutoff that
+    readiness, drum and shelf evaluate against; it is never published and the
+    caller discards it as usual.  The legacy per-generation publisher must not
+    be used here: a bounded candidate has no staged queue/readiness/drum/shelf
+    rows, so that reader would publish an empty scope and close every current
+    row.
+    """
+    pointer = db.get(models.PlanningTruthState, 1)
+    generation = db.get(models.LedgerGeneration, int(pointer_generation_id))
+    if pointer is None or int(pointer.current_generation_id or -1) != int(pointer_generation_id):
+        raise ForwardPhysicalRefreshUnavailable(
+            "current execution repair requires the accepted truth pointer"
+        )
+    if generation is None or _text(generation.status) != "accepted":
+        raise ForwardPhysicalRefreshUnavailable(
+            "current execution repair requires an accepted pointer generation"
+        )
+    stale = current_execution_scopes_needing_repair(
+        db, pointer_generation_id=int(generation.id),
+    )
+    if not stale:
+        return None
+    boundary = db.get(models.LedgerGeneration, int(payload_boundary_generation_id))
+    if boundary is None or _text(boundary.status) != "building":
+        raise ForwardPhysicalRefreshUnavailable(
+            "current execution repair requires a BUILDING payload boundary"
+        )
+    if (
+        boundary.cutoff is None
+        or generation.cutoff is None
+        or _comparable(boundary.cutoff) < _comparable(generation.cutoff)
+    ):
+        raise ForwardPhysicalRefreshUnavailable(
+            "current execution repair boundary is invalid"
+        )
+    if int(boundary.id) == int(generation.id):
+        raise ForwardPhysicalRefreshUnavailable(
+            "current execution repair boundary must differ from the pointer"
+        )
+
+    lock_current_custody_marker(db)
+    run_ids = _fixed_run_ids(db)
+    assembly_payload = build_compact_current_assembly_payload(
+        db,
+        target_generation_id=int(boundary.id),
+        parent_generation_id=int(generation.id),
+        affected_physical_keys=(),
+    )
+    drum_payload = build_compact_current_drum_payload(
+        db,
+        target_generation_id=int(boundary.id),
+        parent_generation_id=int(generation.id),
+        assembly_payload=assembly_payload,
+    )
+    shelf_payload = build_compact_current_shelf_payload(
+        db,
+        target_generation_id=int(boundary.id),
+        parent_generation_id=int(generation.id),
+        drum_payload=drum_payload,
+    )
+    production_payload = build_compact_current_production_control_payload(
+        db,
+        target_generation_id=int(boundary.id),
+        parent_generation_id=int(generation.id),
+        assembly_payload=assembly_payload,
+        drum_payload=drum_payload,
+        shelf_payload=shelf_payload,
+        accepted_run_ids=run_ids,
+        affected_item_ids=(),
+    )
+    purchase_payload = build_compact_current_purchase_control_payload(
+        db,
+        target_generation_id=int(boundary.id),
+        parent_generation_id=int(generation.id),
+        accepted_run_ids=run_ids,
+        affected_scopes=(),
+        reuse_parent_current=True,
+    )
+    mrp_payloads, period_payloads = _build_obligation_view_payloads(
+        db, generation_id=int(generation.id), run_ids=run_ids,
+    )
+
+    revision = f"repair:g{int(generation.id)}:{source_revision}"
+    changed = 0
+    closed = 0
+    queue_changed, readiness_changed = _publish_assembly_current(
+        db,
+        target_id=int(generation.id),
+        assembly_payload=assembly_payload,
+        revision=revision,
+    )
+    changed += int(queue_changed) + int(readiness_changed)
+    drum_rows = resolve_compact_queue_owner_ids(
+        db, tuple(_member(drum_payload, "rows") or ())
+    )
+    drum_result = publish_current_execution_scope(
+        db,
+        source_revision=revision,
+        source_generation_id=int(generation.id),
+        scope_key="drum:all-live-plans",
+        rows=drum_rows,
+        entity_kinds=("drum_schedule", "drum_slot", "drum_gap", "drum_excluded"),
+        summary=dict(_member(drum_payload, "metrics", {}) or {}),
+    )
+    shelf_result = publish_current_execution_scope(
+        db,
+        source_revision=revision,
+        source_generation_id=int(generation.id),
+        scope_key="shelf:all-live-mrps",
+        rows=tuple(_member(shelf_payload, "rows") or ()),
+        entity_kinds=("shelf_projection",),
+        summary=dict(_member(shelf_payload, "metrics", {}) or {}),
+    )
+    obligation_results = publish_current_obligation_views_from_generation(
+        db,
+        int(generation.id),
+        purchase_payload=purchase_payload,
+        production_payload=production_payload,
+        mrp_payloads=mrp_payloads,
+        period_payloads=period_payloads,
+        period_run_ids=run_ids,
+    )
+    for result in (drum_result, shelf_result, *obligation_results.values()):
+        changed += int(result.changed_rows)
+        closed += int(result.closed_rows)
+    return CurrentExecutionScopeRepairResult(
+        pointer_generation_id=int(generation.id),
+        repaired_scopes=stale,
+        changed_rows=changed,
+        closed_rows=closed,
+    )
+
+
 __all__ = [
+    "CURRENT_EXECUTION_SCOPE_KEYS",
+    "CurrentExecutionScopeRepairResult",
     "ForwardPhysicalRefreshUnavailable",
     "PhysicalRefreshCurrentPublishResult",
+    "current_execution_scopes_needing_repair",
     "physical_refresh_last_failure_status",
     "physical_refresh_phase_status",
     "publish_forward_physical_refresh_current",
+    "repair_current_execution_scopes_from_pointer",
 ]

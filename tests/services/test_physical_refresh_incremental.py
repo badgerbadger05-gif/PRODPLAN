@@ -396,10 +396,16 @@ def _patch_payloads(monkeypatch, *, evidence=()):
         publisher, "resolve_compact_queue_owner_ids", lambda db, rows, **kw: tuple(rows),
     )
     monkeypatch.setattr(
-        publisher, "publish_current_production_control_from_payload", lambda *a, **kw: Result(),
+        publisher, "_build_obligation_view_payloads", lambda *a, **kw: ({}, {}),
     )
     monkeypatch.setattr(
-        publisher, "publish_current_purchase_control_from_payload", lambda *a, **kw: Result(),
+        publisher, "publish_current_obligation_views_from_generation",
+        lambda *a, **kw: {
+            "production_control_journal": Result(),
+            "purchase_control_journal": Result(),
+            "mrp_result": Result(),
+            "period_plan_execution": Result(),
+        },
     )
     monkeypatch.setattr(publisher, "publish_generation", lambda db, target, **kw: None)
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: ())

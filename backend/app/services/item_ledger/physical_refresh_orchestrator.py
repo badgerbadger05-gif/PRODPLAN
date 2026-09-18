@@ -57,6 +57,7 @@ from .physical_refresh_current_publish import (
     physical_refresh_last_failure_status,
     physical_refresh_phase_status,
     publish_forward_physical_refresh_current,
+    repair_current_execution_scopes_from_pointer,
 )
 
 
@@ -241,6 +242,9 @@ class PhysicalRefreshOrchestrationResult:
     duration_ms: int = 0
     database_ledger_rows: int = 0
     phase_timings: tuple[tuple[str, int], ...] = ()
+    # Current scopes a no-op refresh had to republish because a reference
+    # writer had invalidated them since the last publication.
+    repaired_scopes: tuple[str, ...] = ()
 
 
 _LEDGER_LOCAL_TZ = ZoneInfo("Europe/Moscow")
@@ -1120,6 +1124,44 @@ def run_physical_refresh(
             # technical fork and keep the accepted pointer and every compact
             # current owner untouched; even a provenance-only UPDATE would
             # create needless WAL/audit churn.
+            #
+            # "Untouched" is only correct while the current scopes are still
+            # ready.  Reference writers (specification import, calendar,
+            # rates, resources, custody) invalidate their manifests and rely on
+            # this worker to republish them; without the repair below an
+            # overnight specification import left queue/readiness/drum/shelf
+            # fail-closed until a real delta happened to arrive.
+            try:
+                repair = repair_current_execution_scopes_from_pointer(
+                    db,
+                    pointer_generation_id=int(parent.id),
+                    payload_boundary_generation_id=int(physical_generation.id),
+                    source_revision=int(
+                        physical_generation.physical_import_batch_id or 0
+                    ),
+                )
+            except Exception as exc:
+                # The repair is caller-owned like the bounded publication:
+                # roll it back whole, then release the technical candidate in
+                # its own recovery transaction so the next tick is not blocked.
+                db.rollback()
+                reason = f"current execution scope repair failed: {exc}"
+                try:
+                    candidate = db.get(
+                        models.LedgerGeneration, int(fork.ledger_generation_id)
+                    )
+                    if candidate is not None and str(candidate.status or "") == "building":
+                        discard_physical_refresh_candidate(
+                            db,
+                            ledger_generation_id=int(candidate.id),
+                            reason=reason,
+                        )
+                        db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                raise PhysicalRefreshOrchestratorError(reason) from exc
+            repaired_scopes = tuple(repair.repaired_scopes) if repair is not None else ()
             physical_generation.source_watermarks = {
                 **dict(physical_generation.source_watermarks or {}),
                 "physical_refresh_delta": {
@@ -1129,6 +1171,7 @@ def run_physical_refresh(
                     "backdated": bool(delta["backdated"]),
                     "database_ledger_rows": database_ledger_rows,
                     "duration_ms": int((time.monotonic() - started_monotonic) * 1000),
+                    "repaired_scopes": list(repaired_scopes),
                 },
             }
             discard_physical_refresh_candidate(
@@ -1160,6 +1203,7 @@ def run_physical_refresh(
                 affected_scopes=(),
                 duration_ms=int((time.monotonic() - started_monotonic) * 1000),
                 database_ledger_rows=database_ledger_rows,
+                repaired_scopes=repaired_scopes,
             )
         delta = _physical_refresh_delta_rows(
             db,

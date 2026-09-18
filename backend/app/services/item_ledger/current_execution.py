@@ -863,10 +863,7 @@ def publish_current_execution_scope(
                 "payload": _semantic_view(payload, key[0]),
                 "manual_input": manual,
             })
-        if row is not None and (
-            str(row.result_status) == "accepted"
-            and bool(row.result_ready)
-        ):
+        if row is not None and str(row.result_status) == "accepted":
             # A deployment may introduce a stricter semantic normalizer.  Do
             # not rewrite every row merely to migrate its hash: compare the
             # persisted payload through the new view and preserve the legacy
@@ -877,6 +874,13 @@ def publish_current_execution_scope(
                 "manual_input": existing_manual,
             })
             if str(row.content_hash) == content_hash or content_hash == existing_semantic_hash:
+                # A reference writer may have marked this row unavailable until
+                # the worker republished it.  Recomputing the same business
+                # payload answers that invalidation, so restore readiness only;
+                # treating it as an update would churn every row and its audit
+                # each time a specification import touched the current scope.
+                if not bool(row.result_ready):
+                    row.result_ready = True
                 continue
         if row is None:
             row = models.CurrentExecutionRow(
@@ -1273,6 +1277,62 @@ def build_compact_current_assembly_payload(
     )
 
 
+_GENERATION_STAGED_ENTITY_KINDS = (
+    "assembly_queue",
+    "assembly_readiness",
+    "drum_schedule",
+    "drum_slot",
+    "drum_gap",
+    "drum_excluded",
+    "shelf_projection",
+)
+
+
+def _assert_generation_staging_is_publishable(
+    db: Session,
+    generation: models.LedgerGeneration,
+) -> None:
+    """Refuse to close a live R8 scope from a generation that staged nothing.
+
+    This publisher reads per-generation staging rows, so it is only valid for a
+    generation kind that materializes them.  A bounded physical refresh builds
+    its compact payloads directly and stages none, which made this reader
+    publish an empty complete scope and close every current queue, readiness,
+    drum and shelf row instead of failing closed.
+    """
+    staged = (
+        db.query(models.AssemblyQueueLine.id)
+        .filter(models.AssemblyQueueLine.ledger_generation_id == int(generation.id))
+        .first()
+        or db.query(models.AssemblyReadiness.id)
+        .filter(models.AssemblyReadiness.ledger_generation_id == int(generation.id))
+        .first()
+        or db.query(models.DrumSchedule.id)
+        .filter(models.DrumSchedule.ledger_generation_id == int(generation.id))
+        .first()
+        or db.query(models.ShelfProjection.id)
+        .filter(models.ShelfProjection.ledger_generation_id == int(generation.id))
+        .first()
+    )
+    if staged is not None:
+        return
+    live = (
+        db.query(models.CurrentExecutionRow.id)
+        .filter(
+            models.CurrentExecutionRow.entity_kind.in_(_GENERATION_STAGED_ENTITY_KINDS),
+            models.CurrentExecutionRow.result_status == "accepted",
+            models.CurrentExecutionRow.result_ready.is_(True),
+        )
+        .first()
+    )
+    if live is not None:
+        raise CurrentExecutionUnavailable(
+            f"ledger generation {int(generation.id)} staged no assembly queue, "
+            "readiness, drum or shelf rows; refusing to close the live current "
+            "execution scope from it"
+        )
+
+
 def publish_current_execution_from_generation(
     db: Session,
     generation_id: int,
@@ -1283,6 +1343,7 @@ def publish_current_execution_from_generation(
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None or str(generation.status or "") != "accepted":
         raise CurrentExecutionUnavailable("current execution requires an accepted generation")
+    _assert_generation_staging_is_publishable(db, generation)
     revision = f"accepted:g{int(generation.id)}"
 
     queue_rows = db.query(models.AssemblyQueueLine).filter(
