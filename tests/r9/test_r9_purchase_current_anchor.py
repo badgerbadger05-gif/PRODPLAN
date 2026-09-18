@@ -88,7 +88,7 @@ def test_purchase_get_normalizes_ready_accepted_scope_truth(monkeypatch):
         source_generation_id=42,
         source_revision="accepted:g42:purchase_control_journal",
         result_ready=True,
-        summary={"truth_status": "building", "total_rows": 1},
+        summary={"truth_status": "building", "summary": {"total_rows": 1}},
     )
     row = SimpleNamespace(
         business_identity="purchase:req:ready",
