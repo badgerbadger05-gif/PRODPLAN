@@ -82,6 +82,28 @@ def test_purchase_get_attaches_manifest_revision_to_stable_row(monkeypatch):
     assert result["source_revision"] == "accepted:g42-noop-2"
 
 
+def test_purchase_get_normalizes_ready_accepted_scope_truth(monkeypatch):
+    manifest = SimpleNamespace(
+        id=17,
+        source_generation_id=42,
+        source_revision="accepted:g42:purchase_control_journal",
+        result_ready=True,
+        summary={"truth_status": "building", "total_rows": 1},
+    )
+    row = SimpleNamespace(
+        business_identity="purchase:req:ready",
+        source_revision="accepted:g42:purchase_control_journal",
+        payload={"row_key": "buy:ready", "remaining_qty": 2},
+    )
+    monkeypatch.setattr(current_execution, "require_current_execution_scope", lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(current_execution, "load_current_execution_rows", lambda *args, **kwargs: [row])
+
+    result = get_orders(db=object(), horizon_period_to=None, limit=100, offset=0)
+
+    assert result["truth_status"] == "accepted"
+    assert result["ledger_generation_id"] == 42
+
+
 def test_purchase_current_identity_filters_before_pagination(monkeypatch):
     manifest = SimpleNamespace(
         id=17,

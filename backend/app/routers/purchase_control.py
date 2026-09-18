@@ -263,6 +263,15 @@ def get_orders(
         effective_offset = max(0, int(offset or 0))
         saved = dict(current_manifest.summary or {})
         saved.pop("snapshot_id", None)
+        # The projection builder keeps ``truth_status=building`` in its
+        # internal purchase payload while it stages rows.  Once that payload
+        # has been published as a ready accepted current scope, the public
+        # current-owner contract must expose accepted truth.
+        if (
+            bool(getattr(current_manifest, "result_ready", False))
+            and str(current_manifest.source_revision or "").startswith("accepted:g")
+        ):
+            saved["truth_status"] = "accepted"
         saved["current_scope_id"] = int(current_manifest.id)
         saved["source_revision"] = str(current_manifest.source_revision)
         saved["current_execution_scope_id"] = int(current_manifest.id)
