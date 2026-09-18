@@ -53,11 +53,13 @@ CAPABILITIES = {
 def test_public_journal_row_strips_internal_material_snapshot():
     source = {
         "product_id": 7,
+        "reservation_id": 11838054,
         "material_coverage_snapshot": {"components": [{"item_id": 9}]},
         "_route_sheet_snapshot": {"version": 1},
     }
 
     assert _public_journal_row(source) == {"product_id": 7}
+    assert source["reservation_id"] == 11838054
     assert "material_coverage_snapshot" in source
     assert "_route_sheet_snapshot" in source
 

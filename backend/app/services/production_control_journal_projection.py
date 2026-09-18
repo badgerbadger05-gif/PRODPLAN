@@ -99,6 +99,10 @@ def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     row = dict(payload)
     row.pop("material_coverage_snapshot", None)
     row.pop("_route_sheet_snapshot", None)
+    # reservation_id is an internal compatibility locator.  It remains in
+    # the saved/current payload for mutation resolution, but is not part of
+    # the public journal DTO (which deliberately forbids extra fields).
+    row.pop("reservation_id", None)
     return row
 
 

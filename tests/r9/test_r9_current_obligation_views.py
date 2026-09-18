@@ -201,6 +201,7 @@ def test_r9_production_current_identity_filters_before_pagination(db_session):
                 "quantity": 5, "produced_qty": 0, "remaining_qty": 5, "status": "open",
                 "coverage_status": "unavailable", "coverage_label": "Нет",
                 "issue_status": "not_issued", "issue_count": 0, "comment": "",
+                "reservation_id": 11838054,
             }},
         ],
     )
@@ -216,6 +217,7 @@ def test_r9_production_current_identity_filters_before_pagination(db_session):
     assert result.total == 1
     assert result.rows[0].current_identity == "order:2"
     assert result.rows[0].item_id == 11
+    assert "reservation_id" not in result.rows[0].model_dump()
 
     missing = get_orders_journal(
         current_identity="order:missing", planning_contour=None, launch_source=None,
