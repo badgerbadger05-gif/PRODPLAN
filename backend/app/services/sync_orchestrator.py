@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from ..schemas import ODataSyncRequest
@@ -82,6 +82,22 @@ STATE_PATH = Path("config") / "sync_schedule.json"
 
 # Only one job may run at a time across the process.
 _run_lock = threading.Lock()
+
+
+def _measure_database_ledger_rows(db: Session) -> tuple[int, float]:
+    """Measure the production-scale ledger cardinality before timed refresh.
+
+    This is bounded acceptance evidence, separate from incremental replay
+    metrics.  The exact count is deliberately outside ``run_physical_refresh``
+    so the refresh path never scans historical rows as part of its timing.
+    Database errors propagate to the normal tick recovery path.
+    """
+    started = time.perf_counter()
+    count = db.execute(
+        select(func.count()).select_from(models.StockLedgerEntry)
+    ).scalar_one()
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return int(count), elapsed_ms
 
 # Categories need an explicit projection (mirrors routers/sync.py).
 _CATEGORY_SELECT = [
@@ -729,6 +745,7 @@ def _run_physical_refresh_job(
         return build_balance_snapshot(db, balance_rows, strict=True)
 
     balance_snapshot = _balance_snapshot_at(target_cutoff)
+    database_ledger_rows, database_ledger_rows_count_ms = _measure_database_ledger_rows(db)
 
     result = run_physical_refresh(
         db,
@@ -750,6 +767,7 @@ def _run_physical_refresh_job(
         # discovery is an explicit maintenance operation.
         discovery_lookback=_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK,
         audit_all_known_recorders=False,
+        database_ledger_rows=database_ledger_rows,
     )
     return {
         "parent_generation_id": result.parent_generation_id,
@@ -770,6 +788,7 @@ def _run_physical_refresh_job(
             "affected_scopes": list(getattr(result, "affected_scopes", ()) or ()),
             "duration_ms": int(getattr(result, "duration_ms", 0) or 0),
             "database_ledger_rows": int(getattr(result, "database_ledger_rows", 0) or 0),
+            "database_ledger_rows_count_ms": round(database_ledger_rows_count_ms, 3),
             "phase_timings": dict(getattr(result, "phase_timings", ()) or ()),
         },
     }
