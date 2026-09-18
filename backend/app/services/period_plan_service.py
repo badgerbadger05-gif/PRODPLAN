@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
-from sqlalchemy import func, text
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import Session
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; runtime import is mrp_freeze→here
@@ -40,7 +41,6 @@ from ..models import (
     SupplierOrder,
     ReservationEntry,
     ReservationEvent,
-    ReplenishmentWorkItem,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
@@ -3269,6 +3269,88 @@ def _execution_obligation_links(
     return links_by_requirement, ordered_by_requirement
 
 
+def _reservation_truth_criteria(db: Session, generation_id: int):
+    """Return the (entry, event) criteria that own reservation truth here.
+
+    R11: the reservation current owner is ``is_current``; the stable identity
+    is the requirement, and ``ledger_generation_id`` is provenance of the last
+    publication, never the identity of the pair.  A BUILDING generation that
+    still holds its own staged reservations reads that staging; every other
+    context reads the stable owner.  Rows written before the owner bootstrap
+    carry an empty identity and are still addressed by their build generation;
+    that compatibility branch is not a fallback for rows the bootstrap has
+    already published.
+    """
+    generation = db.get(LedgerGeneration, int(generation_id))
+    if generation is not None and str(generation.status or "") == "building":
+        staged = (
+            db.query(ReservationEntry.id)
+            .filter(
+                ReservationEntry.ledger_generation_id == int(generation_id),
+                ReservationEntry.owner_kind == "building",
+            )
+            .first()
+        )
+        if staged is not None:
+            return (
+                and_(
+                    ReservationEntry.ledger_generation_id == int(generation_id),
+                    ReservationEntry.owner_kind == "building",
+                ),
+                ReservationEvent.ledger_generation_id == int(generation_id),
+            )
+    entry_criterion = or_(
+        ReservationEntry.is_current.is_(True),
+        and_(
+            ReservationEntry.owner_kind != "legacy",
+            ReservationEntry.current_identity == "",
+            ReservationEntry.ledger_generation_id == int(generation_id),
+        ),
+    )
+    event_criterion = or_(
+        ReservationEvent.is_current.is_(True),
+        and_(
+            ReservationEvent.event_identity == "",
+            ReservationEvent.ledger_generation_id == int(generation_id),
+        ),
+    )
+    return entry_criterion, event_criterion
+
+
+def _execution_evidence_generation(db: Session, generation_id: int) -> int:
+    """Resolve the generation whose saved owners hold this payload's evidence.
+
+    An obligation build (and the accept path of that same build) owns the
+    reservation rows it staged or published, so it reads itself.  A bounded
+    physical refresh stages no obligation rows at all: it advances physical
+    facts onto the stable current owners while the accepted pointer still names
+    its parent, so the readable truth is that pointer.  Resolving this once
+    keeps reservations, reservation events and future supply on a single
+    coherent boundary instead of a dead per-generation anchor.
+    """
+    generation = db.get(LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError("execution snapshot references missing LedgerGeneration")
+    if str(generation.status or "") != "building":
+        return int(generation_id)
+    owns_reservations = (
+        db.query(ReservationEntry.id)
+        .filter(
+            ReservationEntry.ledger_generation_id == int(generation_id),
+            ReservationEntry.owner_kind.in_(("building", "current")),
+        )
+        .first()
+    )
+    if owns_reservations is not None:
+        return int(generation_id)
+    pointer = db.get(PlanningTruthState, 1)
+    if pointer is None or pointer.current_generation_id is None:
+        raise ValueError(
+            "period execution payload requires an accepted planning truth pointer"
+        )
+    return int(pointer.current_generation_id)
+
+
 def _build_execution_snapshot_rows(
     db: Session,
     run: PlanningRun,
@@ -3307,6 +3389,9 @@ def _build_execution_snapshot_rows(
         requirement_id_by_item=requirement_id_by_item,
     )
 
+    reservation_criterion, event_criterion = _reservation_truth_criteria(
+        db, int(generation_id)
+    )
     reservation_rows = (
         db.query(
             ReservationEntry.id,
@@ -3317,25 +3402,47 @@ def _build_execution_snapshot_rows(
                 ReservationEntry.replenishment_received_qty,
         )
         .filter(
-            ReservationEntry.ledger_generation_id == int(generation_id),
+            reservation_criterion,
             ReservationEntry.requirement_id.in_(req_ids),
         )
         .all()
     )
-    buy_entries = (
-        db.query(ReplenishmentWorkItem, ReservationEntry, Item)
-        .join(
-            ReservationEntry,
-            ReservationEntry.id == ReplenishmentWorkItem.reservation_id,
+    # Open supplier coverage is allocated across every live BUY reserve, not
+    # only this run's.  ``ReplenishmentWorkItem`` is a persisted projection of
+    # the same reservation fold, so the fold itself is read here: a bounded
+    # physical refresh never rematerializes work items, and reading them by
+    # generation silently dropped the whole coverage input.
+    buy_entries = [
+        (
+            SimpleNamespace(
+                id=-int(reservation.id),
+                reservation_id=int(reservation.id),
+                item_id=int(reservation.item_id),
+                requirement_id=int(reservation.requirement_id),
+                run_id=int(reservation.run_id) if reservation.run_id is not None else None,
+                replenishment_method="buy",
+                replenishment_required_qty=reservation.replenishment_required_qty or 0,
+                replenishment_fulfilled_qty=reservation.replenishment_received_qty or 0,
+                replenishment_remaining_qty=replenishment_remaining(
+                    reservation.replenishment_required_qty or 0,
+                    reservation.replenishment_received_qty or 0,
+                ),
+            ),
+            reservation,
+            item,
         )
-        .join(Item, Item.item_id == ReplenishmentWorkItem.item_id)
-        .filter(
-            ReplenishmentWorkItem.ledger_generation_id == int(generation_id),
-            ReplenishmentWorkItem.replenishment_method == "buy",
-            ReservationEntry.lifecycle_status == "active",
+        for reservation, item in (
+            db.query(ReservationEntry, Item)
+            .join(Item, Item.item_id == ReservationEntry.item_id)
+            .filter(
+                reservation_criterion,
+                ReservationEntry.realization_mode == "buy",
+                ReservationEntry.lifecycle_status == "active",
+            )
+            .order_by(ReservationEntry.id.asc())
+            .all()
         )
-        .all()
-    )
+    ]
     from .purchase_control_projection import open_supplier_coverage_by_reservation
 
     open_purchase_by_reservation, _open_purchase_slices = (
@@ -3388,7 +3495,7 @@ def _build_execution_snapshot_rows(
         for event, req_id in (
             db.query(ReservationEvent, ReservationEntry.requirement_id.label("requirement_id"))
             .join(ReservationEntry, ReservationEvent.reservation_id == ReservationEntry.id)
-            .filter(ReservationEvent.ledger_generation_id == int(generation_id))
+            .filter(event_criterion)
             .filter(ReservationEvent.reservation_id.in_(reservation_ids))
             .all()
         ):
@@ -3798,19 +3905,16 @@ def build_period_plan_execution_payload(
         .filter(MrpRunRoot.run_id == int(run.run_id))
         .scalar()
     )
-    # The run owns its persisted replenishment execution.  Use the run's
-    # immutable anchor rather than the current technical generation so a
-    # retained run is found after fact-only refreshes while stale carry-forward
-    # copies remain excluded.
-    reservation_generation_id = (
-        int(run.ledger_generation_id)
-        if run.ledger_generation_id is not None
-        else int(generation_id)
-    )
+    # The run owns its persisted replenishment execution through the stable
+    # reservation owner.  The requirement identity already scopes the read to
+    # this run, so no generation anchor is involved: once per-generation copies
+    # were replaced by one compact owner, anchoring this probe to a generation
+    # answered "no execution" for every retained run and blanked its journal.
+    run_reservation_criterion, _ = _reservation_truth_criteria(db, int(generation_id))
     has_replenishment_execution = (
         db.query(ReservationEntry.id)
         .filter(
-            ReservationEntry.ledger_generation_id == reservation_generation_id,
+            run_reservation_criterion,
             ReservationEntry.run_id == int(run.run_id),
             ReservationEntry.replenishment_received_qty > 0,
         )
@@ -3875,22 +3979,19 @@ def build_period_plan_execution_current_payload(
     snapshot; the caller publishes the returned payload into the compact
     current owner
     in the same transaction as the generation.
-    Retained runs are evaluated at their immutable obligation anchor, while
-    candidate runs use the target generation's reservation fold.
+    Every run — retained or candidate — is evaluated against the one boundary
+    that actually owns reservation truth for this publication; a run's old
+    obligation generation is provenance and holds no rows of its own.
     """
     plan = _get_plan(db, int(plan_id))
     run = _resolve_execution_run(db, plan, int(run_id), allow_building=True)
-    anchor_generation_id = (
-        int(run.ledger_generation_id)
-        if run.ledger_generation_id is not None
-        else int(generation_id)
-    )
+    evidence_generation_id = _execution_evidence_generation(db, int(generation_id))
     try:
         payload = build_period_plan_execution_payload(
             db,
             int(plan.id),
             run_id=int(run.run_id),
-            generation_id=anchor_generation_id,
+            generation_id=evidence_generation_id,
             allow_building=True,
         )
     except ValueError as exc:

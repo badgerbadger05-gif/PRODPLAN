@@ -751,6 +751,126 @@ def test_replacement_mrp_journal_exposes_own_receipts_before_root_output(
     assert line.remaining_output_qty == Decimal("2")
 
 
+def test_bounded_publish_keeps_period_rows_for_unchanged_plan(db_session):
+    """A bounded physical refresh must not blank an unchanged plan's journal.
+
+    The bounded publisher builds this payload while the accepted pointer still
+    names the parent and the target is BUILDING with no obligation rows of its
+    own.  Reservation truth then lives in the stable current owner, whose
+    generation is provenance of the last publication and not the run's old
+    obligation anchor.  Reading that anchor found nothing and the replacement
+    guard emptied the whole journal.
+    """
+    item = _make_purchased_item(db_session, "BOUNDED-REFRESH-JOURNAL")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=12.0)
+    line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id).one()
+    line.accepted_output_qty = Decimal("10")
+    line.remaining_output_qty = Decimal("2")
+    obligation_anchor_id = int(
+        db_session.query(PlanningTruthState.current_generation_id).scalar()
+    )
+    anchor = db_session.get(LedgerGeneration, obligation_anchor_id)
+    published = LedgerGeneration(
+        generation_key="period-plan-published",
+        status="accepted",
+        cutoff=anchor.cutoff + datetime.timedelta(hours=1),
+        accepted_at=anchor.cutoff + datetime.timedelta(hours=1),
+        source_watermarks={"parent_generation_id": obligation_anchor_id},
+        capabilities=dict(anchor.capabilities or {}),
+        physical_import_batch_id=int(anchor.physical_import_batch_id),
+        algorithm_version="test",
+    )
+    db_session.add(published)
+    db_session.flush()
+    target = LedgerGeneration(
+        generation_key="period-plan-bounded-target",
+        status="building",
+        cutoff=anchor.cutoff + datetime.timedelta(hours=2),
+        source_watermarks={"parent_generation_id": int(published.id)},
+        capabilities=dict(anchor.capabilities or {}),
+        physical_import_batch_id=int(anchor.physical_import_batch_id),
+        algorithm_version="test",
+    )
+    db_session.add(target)
+    db_session.flush()
+    pointer = db_session.get(PlanningTruthState, 1)
+    pointer.current_generation_id = int(published.id)
+
+    prior = PlanningRun(
+        status="CLOSED",
+        source_plan_id=plan.id,
+        ledger_generation_id=obligation_anchor_id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(prior)
+    db_session.flush()
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        prior_run_id=prior.run_id,
+        ledger_generation_id=obligation_anchor_id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(models.MrpRunRoot(
+        run_id=run.run_id,
+        plan_line_id=line.id,
+        planned_qty=Decimal("2"),
+        accepted_qty=Decimal("0"),
+        remaining_qty=Decimal("2"),
+    ))
+    requirement = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=2,
+        net_required_qty=2,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    # The compact owner after the cutover: stable requirement identity, with
+    # the last publication as provenance only.
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=int(published.id),
+        run_id=run.run_id,
+        requirement_id=requirement.id,
+        item_id=item.item_id,
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="buy",
+        reserved_qty=2,
+        replenishment_required_qty=2,
+        replenishment_received_qty=1,
+        current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
+        owner_kind="current",
+        is_current=True,
+    ))
+    db_session.flush()
+
+    payload = period_plan_service.build_period_plan_execution_current_payload(
+        db_session,
+        int(plan.id),
+        run_id=int(run.run_id),
+        generation_id=int(target.id),
+    )
+
+    assert len(payload["rows"]) == 1
+    row = payload["rows"][0]
+    assert row["req_id"] == int(requirement.id)
+    assert row["execution_available"] is True
+    assert row["completed_qty"] == 1
+    assert row["remaining_qty"] == 1
+    assert row["status"] == "partial"
+    # Evidence is read at the boundary that owns it: the accepted parent, not
+    # the run's obligation anchor and not the still-BUILDING target.
+    assert payload["truth_generation_id"] == int(published.id)
+
+
 def test_period_plan_detail_and_matrix_read_saved_plan_output_projection(db_session):
     item = _make_purchased_item(db_session, "MATRIX-SAVED-OUTPUT")
     plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
