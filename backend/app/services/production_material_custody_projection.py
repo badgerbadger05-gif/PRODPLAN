@@ -1380,6 +1380,7 @@ def lock_current_custody_marker(db: Session) -> models.PlanningTruthState | None
     return (
         db.query(models.PlanningTruthState)
         .filter(models.PlanningTruthState.id == 1)
+        .populate_existing()
         .with_for_update()
         .one_or_none()
     )

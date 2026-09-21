@@ -189,6 +189,10 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
     )
     db.add(recovery_target)
     db.flush()
+    sealed_rows = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == int(sealed_source.id),
+        models.ReservationEntry.run_id == int(run.run_id),
+    ).populate_existing().order_by(models.ReservationEntry.id.asc()).all()
     carried_recovery = carry_forward_retained_reservations(
         db, parent_generation_id=int(parent.id),
         target_generation_id=int(recovery_target.id),
@@ -197,8 +201,7 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
         recovery_source_generations={int(run.run_id): int(sealed_source.id)},
         expected_source_fingerprints={
             int(run.run_id): (
-                _current_reservation_owner_fingerprint(reservation),
-                _current_reservation_owner_fingerprint(second_reservation),
+                *(_current_reservation_owner_fingerprint(row) for row in sealed_rows),
             )
         },
     )

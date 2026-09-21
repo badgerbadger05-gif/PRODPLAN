@@ -431,7 +431,7 @@ def carry_forward_retained_reservations(
                     if source_map[run_id] < 0
                     else models.ReservationEntry.ledger_generation_id == source_map[run_id]
                 ),
-            ).order_by(models.ReservationEntry.id.asc()).all()
+            ).populate_existing().order_by(models.ReservationEntry.id.asc()).all()
             if source_map[run_id] < 0 and any(
                 db.get(models.LedgerGeneration, int(row.ledger_generation_id)).status != "accepted"
                 for row in rows

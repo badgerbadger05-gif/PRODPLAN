@@ -815,7 +815,7 @@ def run_obligation_refresh(
             db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
         locked_pointer = db.query(models.PlanningTruthState).filter(
             models.PlanningTruthState.id == 1
-        ).with_for_update().one_or_none()
+        ).populate_existing().with_for_update().one_or_none()
         if (
             locked_pointer is None
             or int(locked_pointer.current_generation_id or -1) != int(parent_generation_id)
