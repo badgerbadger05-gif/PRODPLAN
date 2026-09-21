@@ -891,6 +891,8 @@ def _merge_chain_payloads(
     for idx, row in enumerate(rows, start=1):
         row["LineNumber"] = idx
     combined["Операции"] = rows
+    combined["ПоложениеЗаказаНаПроизводство"] = "ВТабличнойЧасти"
+    combined["ПоложениеСтруктурнойЕдиницы"] = "ВТабличнойЧасти"
 
     has_row_executor = any(_clean_ref1c(row.get("Исполнитель")) for row in rows)
     if has_row_executor:
