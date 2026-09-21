@@ -17,9 +17,12 @@ from app.services.item_ledger.current_replenishment import (
     CurrentReplenishmentError,
     apply_current_replenishment,
     apply_current_replenishment_for_accepted_generation,
+    apply_current_receipt_replay,
     reject_legacy_supplier_receipt_writer,
     read_current_replenishment,
 )
+from app.services.item_ledger import physical_visibility
+from app.services.item_ledger.supplier_receipt_allocation import ReceiptFact
 
 
 def _world(db, *, prefix=None):
@@ -806,6 +809,167 @@ def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_
     assert read_current_replenishment(
         db_session, generation_id=generation_id, item_id=item_id
     )
+
+
+def test_accepted_adapter_reuses_one_validated_visible_prefix_for_all_scopes(
+    db_session,
+    monkeypatch,
+):
+    generation_id, item_id, reservations, facts = _world(
+        db_session, prefix="adapter-prefix-once"
+    )
+    generation = db_session.get(models.LedgerGeneration, generation_id)
+    _add_supplier_provenance(
+        db_session, generation_id, facts, prefix="adapter-prefix-first"
+    )
+
+    second_item = models.Item(
+        item_code=f"R4-SECOND-{uuid4().hex[:12]}",
+        item_name="R4 second item",
+    )
+    second_run = models.PlanningRun(
+        status="BUILDING_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation_id,
+        ledger_cutoff=generation.cutoff,
+        source_plan_id=None,
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        active_freeze_version=1,
+    )
+    db_session.add_all([second_item, second_run])
+    db_session.flush()
+    second_requirement = models.MrpRequirement(
+        run_id=int(second_run.run_id),
+        item_id=int(second_item.item_id),
+        total_required_qty=Decimal("3"),
+        net_required_qty=Decimal("3"),
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        bom_level=0,
+        planning_stock_pool="selected",
+        characteristic_ref="",
+        organization_ref="",
+        freeze_version=1,
+    )
+    db_session.add(second_requirement)
+    db_session.flush()
+    second_reservation = models.ReservationEntry(
+        ledger_generation_id=generation_id,
+        item_id=int(second_item.item_id),
+        run_id=int(second_run.run_id),
+        freeze_version=1,
+        requirement_id=int(second_requirement.id),
+        priority_period_from=date(2026, 9, 1),
+        priority_period_to=date(2026, 9, 30),
+        realization_mode="buy",
+        reserved_qty=Decimal("3"),
+        replenishment_required_qty=Decimal("3"),
+        lifecycle_status="active",
+    )
+    second_sle = models.StockLedgerEntry(
+        ingest_batch_id=int(generation.physical_import_batch_id),
+        source_content_hash="adapter-prefix-second".ljust(64, "0"),
+        business_identity=f"r4:{uuid4().hex}:second",
+        item_id=int(second_item.item_id),
+        qty=Decimal("3"),
+        qty_after=Decimal("3"),
+        posting_at=generation.cutoff,
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Doc",
+        recorder_ref="SECOND",
+        line_no="1",
+        ingest_source="seed",
+    )
+    db_session.add_all([second_reservation, second_sle])
+    db_session.flush()
+    second_fact = Fact(
+        fact_id=str(second_sle.id),
+        item_id=int(second_item.item_id),
+        mode="buy",
+        qty=Decimal("3"),
+        posting_at=second_sle.posting_at,
+        requirement_id=int(second_requirement.id),
+    )
+    _add_supplier_provenance(
+        db_session,
+        generation_id,
+        (second_fact,),
+        prefix="adapter-prefix-second",
+    )
+
+    original_visible = physical_visibility.visible_sles_for_generation
+    visibility_calls = []
+
+    def count_visible(db, requested_generation_id):
+        visibility_calls.append(int(requested_generation_id))
+        return original_visible(db, requested_generation_id)
+
+    monkeypatch.setattr(
+        physical_visibility,
+        "visible_sles_for_generation",
+        count_visible,
+    )
+
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session,
+        generation_id=generation_id,
+    )
+
+    allocated_by_item: dict[int, Decimal] = {}
+    for row in (
+        db_session.query(models.ReservationConsumptionAllocation)
+        .filter(models.ReservationConsumptionAllocation.is_current.is_(True))
+        .all()
+    ):
+        row_item_id = int(row.item_id)
+        allocated_by_item[row_item_id] = allocated_by_item.get(
+            row_item_id, Decimal("0")
+        ) + Decimal(str(row.allocated_qty))
+    assert len(results) == 2
+    assert visibility_calls == [generation_id]
+    assert allocated_by_item[item_id] == Decimal("10")
+    assert allocated_by_item[int(second_item.item_id)] == Decimal("3")
+    assert reservations[0].replenishment_received_qty == Decimal("8")
+    assert second_reservation.replenishment_received_qty == Decimal("3")
+
+
+def test_validated_visible_prefix_still_rejects_missing_receipt(db_session):
+    generation_id, item_id, _reservations, facts = _world(
+        db_session, prefix="adapter-prefix-missing"
+    )
+    fact = facts[0]
+    with pytest.raises(
+        CurrentReplenishmentError,
+        match="receipt correction source is unavailable in accepted Ledger",
+    ):
+        apply_current_receipt_replay(
+            db_session,
+            generation_id=generation_id,
+            source_key="accepted-physical-receipts",
+            source_revision=int(
+                db_session.get(
+                    models.LedgerGeneration, generation_id
+                ).physical_import_batch_id
+            ),
+            receipt_facts=(
+                ReceiptFact(
+                    sle_id=int(fact.fact_id),
+                    posting_at=fact.posting_at,
+                    signed_qty=Decimal(str(fact.qty)),
+                    item_id=item_id,
+                    supplier_order_ref="",
+                    supplier_order_line_no="",
+                    receipt_ref="missing",
+                    receipt_line_no="1",
+                ),
+            ),
+            reserves=(),
+            complete_scope=True,
+            history_mode="as_occurred",
+            validated_visible_ids=(),
+        )
 
 
 def test_accepted_adapter_rebinds_same_physical_revision_and_recomputes_allocations(

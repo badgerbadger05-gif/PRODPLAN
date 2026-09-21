@@ -1461,6 +1461,7 @@ def apply_current_replenishment_for_accepted_generation(
                 exact_allocation_caps=exact_caps,
                 history_mode="as_occurred",
                 allow_building=allow_building,
+                validated_visible_ids=visible.keys(),
                 _accepted_generation_proof=source_proof,
             )
         )
