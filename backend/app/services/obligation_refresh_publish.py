@@ -25,6 +25,7 @@ from app.services.production_control_journal_projection import (
     validate_candidate_payload as validate_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (
+    publish_current_material_custody,
     validate_material_custody_projection,
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
@@ -1034,6 +1035,14 @@ def publish_obligation_refresh_batch(
     target.status = "accepted"
     target.accepted_at = accepted_at
     target.capabilities = capability_snapshot
+    # Obligation refresh builds a generation-bound custody projection before
+    # publication.  Promote that validated compact snapshot in the same
+    # transaction as the truth pointer; otherwise the pointer advances while
+    # ``is_current`` still names the parent generation and every custody
+    # reader fails closed on provenance.
+    publish_current_material_custody(
+        db, ledger_generation_id=int(target.id)
+    )
     pointer.current_generation_id = int(target.id)
     from .item_ledger.current_execution import publish_current_execution_from_generation
     publish_current_execution_from_generation(

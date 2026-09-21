@@ -14,6 +14,7 @@ from app.services.item_ledger.generation_lifecycle import (
 from app.services.item_ledger.obligation_generation import ObligationGenerationError
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
+from app.services import obligation_refresh_publish as refresh_publish
 from app.services.planning_pool_resolver import PlanningPoolConfigurationError
 
 
@@ -625,6 +626,31 @@ def test_obligation_refresh_publishes_purchase_current_without_purchase_snapshot
     ).one()
     assert manifest.source_generation_id == target.id
     assert manifest.source_revision == f"accepted:g{target.id}:purchase_control_journal"
+
+
+def test_obligation_refresh_promotes_validated_custody_snapshot_before_pointer(
+    db_session, monkeypatch
+):
+    accepted, plan, _line, _item, _parent, _cutoff = _world(
+        db_session, with_parent=False
+    )
+    promoted: list[tuple[int, int]] = []
+
+    def record_promotion(db, *, ledger_generation_id):
+        promoted.append(
+            (
+                int(ledger_generation_id),
+                int(db.get(models.PlanningTruthState, 1).current_generation_id),
+            )
+        )
+        return 0
+
+    monkeypatch.setattr(
+        refresh_publish, "publish_current_material_custody", record_promotion
+    )
+    result = _run(db_session, accepted, "orch-custody-current", add=[plan.id])
+
+    assert promoted == [(int(result.target_generation_id), int(accepted.id))]
 
 
 def test_single_stage_reuses_execution_batch_with_reservation_consumption_algorithm_version(
