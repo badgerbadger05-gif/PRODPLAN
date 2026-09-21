@@ -100,6 +100,106 @@ class PlanningTruthPublishConflict(RuntimeError):
     code = "planning_truth_publish_conflict"
 
 
+class PlanningTruthVerificationConflict(RuntimeError):
+    """A no-op freshness proof no longer matches the current truth pointer."""
+
+
+def record_verified_noop(
+    db: Session,
+    *,
+    generation_id: int,
+    physical_import_batch_id: int,
+    verified_through: datetime,
+    convergence_hash: str,
+    recorder_audit_checksum: str,
+    physical_import_batch_key: str | None = None,
+    source_batch_hash: str | None = None,
+    verified_at: datetime | None = None,
+) -> models.PlanningTruthVerification:
+    """Persist a complete zero-delta source proof for the exact pointer.
+
+    This is deliberately narrower than publication: it never changes the
+    accepted generation, cutoff, accepted timestamp, pointer, or business
+    payload.  The caller must have completed the recorder/import poll and
+    balance convergence before entering this CAS-protected boundary.
+    """
+    target_id = int(generation_id)
+    batch_id = int(physical_import_batch_id)
+    through = _as_utc(verified_through)
+    checked_at = _as_utc(verified_at or datetime.now(timezone.utc))
+    if through > checked_at:
+        raise ValueError("verified_through cannot be after verified_at")
+    convergence = str(convergence_hash or "").strip()
+    audit = str(recorder_audit_checksum or "").strip()
+    if not convergence or not audit:
+        raise ValueError("verified no-op requires convergence and recorder audit checksums")
+
+    pointer = db.execute(
+        select(models.PlanningTruthState)
+        .where(models.PlanningTruthState.id == 1)
+        .with_for_update(),
+    ).scalar_one_or_none()
+    if pointer is None or int(pointer.current_generation_id or 0) != target_id:
+        raise PlanningTruthVerificationConflict(
+            f"current generation is {getattr(pointer, 'current_generation_id', None)}, "
+            f"expected {target_id}"
+        )
+    generation = db.get(models.LedgerGeneration, target_id)
+    batch = db.get(models.PhysicalImportBatch, batch_id)
+    if generation is None or str(generation.status or "") != "accepted":
+        raise PlanningTruthVerificationConflict("verification generation is not accepted")
+    if batch is None or str(batch.status or "") != "completed" or not bool(batch.source_complete):
+        raise ValueError("verified no-op requires a completed source batch")
+    if batch.cutoff is None or _as_utc(batch.cutoff) < through:
+        raise ValueError("verified no-op source batch does not cover verified_through")
+    batch_key = str(physical_import_batch_key or batch.batch_key or "").strip()
+    batch_hash = str(
+        source_batch_hash
+        or dict(batch.source_watermarks or {}).get("content_hash")
+        or dict(batch.source_watermarks or {}).get("scan_checksum")
+        or dict(batch.source_watermarks or {}).get("pull_checksum")
+        or ""
+    ).strip()
+    if not batch_key or not batch_hash:
+        raise ValueError("verified no-op requires source batch identity and evidence hash")
+
+    existing = db.execute(
+        select(models.PlanningTruthVerification)
+        .where(models.PlanningTruthVerification.ledger_generation_id == target_id)
+        .with_for_update(),
+    ).scalar_one_or_none()
+    if existing is None:
+        existing = models.PlanningTruthVerification(
+            ledger_generation_id=target_id,
+            physical_import_batch_id=batch_id,
+            physical_import_batch_key=batch_key,
+            source_batch_hash=batch_hash,
+            verified_through=through,
+            verified_at=checked_at,
+            source_complete=True,
+            input_delta_rows=0,
+            replayed_rows=0,
+            convergence_hash=convergence,
+            recorder_audit_checksum=audit,
+        )
+        db.add(existing)
+    else:
+        if _as_utc(existing.verified_through) > through:
+            return existing
+        existing.physical_import_batch_id = batch_id
+        existing.physical_import_batch_key = batch_key
+        existing.source_batch_hash = batch_hash
+        existing.verified_through = through
+        existing.verified_at = checked_at
+        existing.source_complete = True
+        existing.input_delta_rows = 0
+        existing.replayed_rows = 0
+        existing.convergence_hash = convergence
+        existing.recorder_audit_checksum = audit
+    db.flush()
+    return existing
+
+
 def _serialize_publication(db: Session) -> None:
     """Make every publisher contend for one lock, not two disjoint ones.
 
@@ -181,6 +281,18 @@ def get_readiness(
             _as_utc(generation.cutoff),
             _as_utc(generation.accepted_at),
         )
+        verification = db.execute(
+            select(models.PlanningTruthVerification)
+            .where(models.PlanningTruthVerification.ledger_generation_id == int(generation.id))
+        ).scalar_one_or_none()
+        if verification is not None and bool(verification.source_complete):
+            verified_at = _as_utc(verification.verified_at)
+            verified_through = _as_utc(verification.verified_through)
+            # Never let a future-dated receipt make truth fresh.  A valid
+            # source proof may advance freshness only up to the observation
+            # time and never changes the generation's business cutoff.
+            if verified_at <= checked_at and verified_through <= checked_at:
+                freshness_reference = max(freshness_reference, verified_through)
         age = checked_at - freshness_reference
         if age > freshness_limit:
             status = "stale"

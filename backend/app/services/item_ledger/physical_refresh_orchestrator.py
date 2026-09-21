@@ -59,6 +59,7 @@ from .physical_refresh_current_publish import (
     publish_forward_physical_refresh_current,
     repair_current_execution_scopes_from_pointer,
 )
+from ..planning_truth import record_verified_noop
 
 
 PHYSICAL_REFRESH_LOCK_KEY = PHYSICAL_SEQUENCE_LOCK_KEY
@@ -1140,12 +1141,26 @@ def run_physical_refresh(
                         physical_generation.physical_import_batch_id or 0
                     ),
                 )
+                # A complete recorder/import poll with valid balance
+                # convergence is useful freshness evidence even when it has
+                # no semantic delta.  Keep it inside the same recovery guard
+                # so an invalid/partial receipt cannot leave a BUILDING fork.
+                record_verified_noop(
+                    db,
+                    generation_id=int(parent.id),
+                    physical_import_batch_id=int(physical_generation.physical_import_batch_id),
+                    verified_through=cutoff,
+                    convergence_hash=str(convergence.content_hash or ""),
+                    recorder_audit_checksum=str(
+                        getattr(recorder_audit, "recorder_audit_checksum", "") or ""
+                    ),
+                )
             except Exception as exc:
                 # The repair is caller-owned like the bounded publication:
                 # roll it back whole, then release the technical candidate in
                 # its own recovery transaction so the next tick is not blocked.
                 db.rollback()
-                reason = f"current execution scope repair failed: {exc}"
+                reason = f"current execution scope repair/freshness verification failed: {exc}"
                 try:
                     candidate = db.get(
                         models.LedgerGeneration, int(fork.ledger_generation_id)

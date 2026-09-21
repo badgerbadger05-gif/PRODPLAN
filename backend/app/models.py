@@ -390,6 +390,53 @@ class PlanningTruthState(Base):
     current_generation = relationship("LedgerGeneration")
 
 
+class PlanningTruthVerification(Base):
+    """Verified source freshness for an unchanged accepted generation.
+
+    A physical no-op does not create a business generation, but a complete
+    source poll still proves that the accepted generation was checked through
+    a newer source cutoff.  Keeping that proof separate from the generation
+    preserves its business cutoff and accepted timestamp while binding the
+    freshness claim to the exact generation and import batch that proved it.
+    """
+
+    __tablename__ = "planning_truth_verification"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            name="uq_planning_truth_verification_generation",
+        ),
+        CheckConstraint(
+            "input_delta_rows = 0 AND replayed_rows = 0",
+            name="ck_planning_truth_verification_noop",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    physical_import_batch_id = Column(
+        BigInteger,
+        nullable=False,
+        index=True,
+    )
+    physical_import_batch_key = Column(String(128), nullable=False)
+    source_batch_hash = Column(String(64), nullable=False)
+    verified_through = Column(DateTime(timezone=True), nullable=False)
+    verified_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    source_complete = Column(Boolean, nullable=False)
+    input_delta_rows = Column(Integer, nullable=False, server_default="0")
+    replayed_rows = Column(Integer, nullable=False, server_default="0")
+    convergence_hash = Column(String(64), nullable=False)
+    recorder_audit_checksum = Column(String(64), nullable=False)
+
+    ledger_generation = relationship("LedgerGeneration")
+
+
 class ClosedPlanSnapshot(Base):
     """Immutable execution payload captured at explicit plan closure."""
 

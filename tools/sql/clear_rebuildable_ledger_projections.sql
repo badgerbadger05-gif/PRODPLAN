@@ -201,6 +201,7 @@ TRUNCATE
     current_execution_change,
     current_execution_row,
     current_execution_scope,
+    planning_truth_verification,
     ledger_future_supply,
     production_material_custody_projection,
     production_material_custody_projection_manifest,
