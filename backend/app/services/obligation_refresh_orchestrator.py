@@ -449,7 +449,7 @@ def run_obligation_refresh(
         raise ObligationRefreshOrchestratorError(
             "recovery requires exact owner fingerprints and source generations"
         )
-    if db.get_bind().dialect.name == "postgresql":
+    if db.get_bind().dialect.name == "postgresql" and not recovery_source_current:
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
     assert_output_repair_allows(
         db,
@@ -574,6 +574,32 @@ def run_obligation_refresh(
             raise ObligationRefreshOrchestratorError(
                 "recovery source generation set must equal the accepted manifest retain set"
             )
+        recovery_runs = {
+            int(row.run_id): row
+            for row in db.query(models.PlanningRun).filter(
+                models.PlanningRun.run_id.in_(retained_run_ids)
+            ).all()
+        }
+        if set(recovery_runs) != set(retained_run_ids) or any(
+            str(row.status) != "FIXED_SNAPSHOT" for row in recovery_runs.values()
+        ):
+            raise ObligationRefreshOrchestratorError(
+                "recovery retain set contains a non-fixed or missing planning run"
+            )
+        for run_id, source_generation_id in recovery_source_generations.items():
+            source_generation_id = int(source_generation_id)
+            run = recovery_runs[int(run_id)]
+            if source_generation_id == -1:
+                continue
+            source_generation = db.get(models.LedgerGeneration, source_generation_id)
+            if (
+                source_generation is None
+                or str(source_generation.status) != "accepted"
+                or int(run.ledger_generation_id or -1) != source_generation_id
+            ):
+                raise ObligationRefreshOrchestratorError(
+                    f"recovery source generation is not the sealed accepted lineage for run {run_id}"
+                )
     # Retained obligations are stable business rows, but the target generation
     # must still contain their obligation basis before replay and current-owner
     # publication.  Otherwise publication sees only replacement candidates and
@@ -766,6 +792,32 @@ def run_obligation_refresh(
         raise ObligationRefreshOrchestratorError(
             f"obligation refresh candidate is structurally invalid: {exc}"
         ) from exc
+    if recovery_source_current:
+        # Recovery deliberately does not hold the global lock over the long
+        # replay.  Take it only at the publication boundary and re-check the
+        # pointer plus the exact source-owner proof immediately before CAS.
+        if db.get_bind().dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
+        locked_pointer = db.query(models.PlanningTruthState).filter(
+            models.PlanningTruthState.id == 1
+        ).with_for_update().one_or_none()
+        if (
+            locked_pointer is None
+            or int(locked_pointer.current_generation_id or -1) != int(parent_generation_id)
+        ):
+            raise ObligationRefreshOrchestratorError(
+                "recovery parent changed before final publication"
+            )
+        carry_forward_retained_reservations(
+            db,
+            parent_generation_id=int(parent_generation_id),
+            target_generation_id=target_id,
+            retained_run_ids=retained_run_ids,
+            preserve_realization=False,
+            source_current=True,
+            expected_source_fingerprints=recovery_owner_fingerprints,
+            recovery_source_generations=recovery_source_generations,
+        )
     published = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),

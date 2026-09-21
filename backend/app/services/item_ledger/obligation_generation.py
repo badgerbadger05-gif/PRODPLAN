@@ -432,6 +432,13 @@ def carry_forward_retained_reservations(
                     else models.ReservationEntry.ledger_generation_id == source_map[run_id]
                 ),
             ).order_by(models.ReservationEntry.id.asc()).all()
+            if source_map[run_id] < 0 and any(
+                db.get(models.LedgerGeneration, int(row.ledger_generation_id)).status != "accepted"
+                for row in rows
+            ):
+                raise ObligationGenerationError(
+                    f"current recovery owner for run {run_id} is not anchored in an accepted generation"
+                )
             source_by_id.extend(rows)
         source_entries = source_by_id
     else:

@@ -25,6 +25,7 @@ from app.services.production_control_journal_projection import (
     validate_candidate_payload as validate_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (
+    lock_current_custody_marker,
     publish_current_material_custody,
     validate_material_custody_projection,
 )
@@ -1040,6 +1041,13 @@ def publish_obligation_refresh_batch(
     # transaction as the truth pointer; otherwise the pointer advances while
     # ``is_current`` still names the parent generation and every custody
     # reader fails closed on provenance.
+    # Serialize local custody-tail writers and revalidate the watermark while
+    # the marker is locked.  A candidate validated before this boundary must
+    # not publish over an event appended during the long build.
+    lock_current_custody_marker(db)
+    validate_material_custody_projection(
+        db, ledger_generation_id=int(target.id)
+    )
     publish_current_material_custody(
         db, ledger_generation_id=int(target.id)
     )
