@@ -46,6 +46,8 @@ from app.services.production_control_journal_projection import (
 )
 from app.services.production_material_custody_projection import (
     build_material_custody_projection,
+    lock_current_custody_marker,
+    validate_recovery_material_custody_full_tail,
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_projection import (
@@ -815,9 +817,7 @@ def run_obligation_refresh(
         # pointer plus the exact source-owner proof immediately before CAS.
         if db.get_bind().dialect.name == "postgresql":
             db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
-        locked_pointer = db.query(models.PlanningTruthState).filter(
-            models.PlanningTruthState.id == 1
-        ).populate_existing().with_for_update().one_or_none()
+        locked_pointer = lock_current_custody_marker(db)
         if (
             locked_pointer is None
             or int(locked_pointer.current_generation_id or -1) != int(parent_generation_id)
@@ -835,6 +835,13 @@ def run_obligation_refresh(
             expected_source_fingerprints=recovery_owner_fingerprints,
             recovery_source_generations=recovery_source_generations,
         )
+        try:
+            validate_recovery_material_custody_full_tail(
+                db,
+                ledger_generation_id=target_id,
+            )
+        except RuntimeError as exc:
+            raise ObligationRefreshOrchestratorError(str(exc)) from exc
     published = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),

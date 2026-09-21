@@ -1187,6 +1187,51 @@ def validate_material_custody_projection(
     }
 
 
+def validate_recovery_material_custody_full_tail(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+) -> dict[str, int]:
+    """Require a recovery candidate to cover the complete custody event stream.
+
+    Normal physical and obligation-refresh projections are immutable snapshots
+    at their generation cutoff.  Guarded recovery is different: it replaces the
+    already-live compact custody rows without advancing that cutoff.  Its caller
+    must therefore hold ``lock_current_custody_marker`` and prove that no local
+    operational event was appended after the candidate was built.  A writer
+    that reached the marker first is visible here and makes recovery fail; one
+    that reaches it later waits until the new current projection is published.
+    """
+    generation_id = int(ledger_generation_id)
+    manifest = _read_manifest(db, generation_id=generation_id)
+    if manifest is None or str(manifest.status) != "complete":
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=None if manifest is None else generation_id,
+            reason="recovery custody snapshot manifest is missing or incomplete",
+        )
+
+    projected_watermark = int(manifest.source_event_high_watermark_id)
+    full_stream_watermark = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0)).scalar()
+        or 0
+    )
+    if projected_watermark != full_stream_watermark:
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=generation_id,
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason=(
+                "recovery custody snapshot does not cover the full custody event stream"
+            ),
+        )
+    return {
+        "ledger_generation_id": generation_id,
+        "source_event_high_watermark_id": projected_watermark,
+        "full_stream_high_watermark_id": full_stream_watermark,
+    }
+
+
 def publish_current_material_custody(
     db: Session, *, ledger_generation_id: int
 ) -> int:

@@ -115,6 +115,136 @@ def _run(
     )
 
 
+def _seed_guarded_recovery_state(db, accepted, plan, item, parent, cutoff):
+    requirement = models.MrpRequirement(
+        run_id=int(parent.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+        status="open",
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    db.add(models.MrpFreezeBaseline(
+        run_id=int(parent.run_id),
+        freeze_version=1,
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        frozen_at=cutoff,
+        baseline_at=cutoff,
+        physical_import_batch_id=int(accepted.physical_import_batch_id),
+        frozen_basis_generation_id=int(accepted.id),
+        stock_qty=Decimal("0"),
+        produced_total=Decimal("0"),
+        received_total=Decimal("0"),
+        unit_coef=Decimal("1"),
+    ))
+    owner = models.ReservationEntry(
+        ledger_generation_id=int(accepted.id),
+        item_id=int(item.item_id),
+        run_id=int(parent.run_id),
+        freeze_version=1,
+        requirement_id=int(requirement.id),
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        reserved_qty=Decimal("5"),
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("5"),
+        replenishment_received_qty=Decimal("0"),
+        realized_qty=Decimal("0"),
+        lifecycle_status="active",
+        opened_at=cutoff,
+        current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
+        owner_kind="current",
+        is_current=True,
+    )
+    db.add(owner)
+    db.flush()
+    db.add(models.ReservationEvent(
+        ledger_generation_id=int(accepted.id),
+        reservation_id=int(owner.id),
+        item_id=int(item.item_id),
+        event_kind="open",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("0"),
+        cycle_id=f"parent-open:g{int(accepted.id)}",
+        idempotency_key=f"recovery-open-{int(owner.id)}",
+        event_identity=f"obligation:req:{int(requirement.id)}",
+        origin_kind="obligation",
+        event_at=cutoff,
+        is_current=True,
+    ))
+
+    order = models.ProductionOrder(
+        order_number="ORCH-CUSTODY-ORDER",
+        order_date=cutoff - timedelta(days=1),
+        source="1c",
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    product = models.ProductionProduct(
+        order_id=int(order.order_id),
+        item_id=int(item.item_id),
+        line_number=1,
+        quantity=Decimal("4"),
+        produced_qty=Decimal("0"),
+        remaining_qty=Decimal("4"),
+    )
+    db.add(product)
+    db.flush()
+    base_event = models.ProductionMaterialCustodyEvent(
+        product_id=int(product.product_id),
+        component_item_id=int(item.item_id),
+        source_kind="baseline",
+        effective_at=cutoff - timedelta(hours=1),
+        location_kind="workshop",
+        warehouse_ref1c="WH-OUT",
+        delta_qty=Decimal("4"),
+        idempotency_key="orch-recovery-custody-base",
+    )
+    db.add(base_event)
+    db.flush()
+    manifest = db.get(
+        models.ProductionMaterialCustodyProjectionManifest,
+        int(accepted.id),
+    )
+    manifest.source_event_high_watermark_id = int(base_event.id)
+    db.add(models.ProductionMaterialCustodyProjection(
+        ledger_generation_id=int(accepted.id),
+        product_id=int(product.product_id),
+        component_item_id=int(item.item_id),
+        location_kind="workshop",
+        warehouse_ref1c="WH-OUT",
+        reserved_qty=Decimal("4"),
+        source_event_high_watermark_id=int(base_event.id),
+        is_current=True,
+    ))
+    db.commit()
+    return owner, product, int(base_event.id)
+
+
+def _run_guarded_recovery(db, accepted, parent, owner, *, key):
+    return workflow.run_guarded_obligation_recovery(
+        db,
+        parent_generation_id=int(accepted.id),
+        generation_key=key,
+        source_generation_by_run={int(parent.run_id): -1},
+        owner_fingerprints={
+            int(parent.run_id): (_current_reservation_owner_fingerprint(owner),)
+        },
+        started_by="test",
+        accepted_at=accepted.cutoff,
+        config_snapshot={},
+    )
+
+
 def test_guarded_recovery_rejects_current_owner_outside_parent_lineage(db_session):
     accepted, plan, _line, item, parent, cutoff = _world(db_session)
     foreign = models.LedgerGeneration(
@@ -155,6 +285,111 @@ def test_guarded_recovery_rejects_current_owner_outside_parent_lineage(db_sessio
             recovery_source_generations={int(parent.run_id): -1},
             started_by="test", config_snapshot={}, accepted_at=cutoff,
         )
+
+
+def test_guarded_recovery_rejects_post_cutoff_custody_tail_before_publish(
+    db_session,
+    monkeypatch,
+):
+    accepted, plan, _line, item, parent, cutoff = _world(db_session)
+    owner, product, base_watermark = _seed_guarded_recovery_state(
+        db_session, accepted, plan, item, parent, cutoff
+    )
+    real_validate = workflow.validate_obligation_refresh_build
+
+    def append_operator_tail(db, generation_id):
+        result = real_validate(db, generation_id)
+        event = models.ProductionMaterialCustodyEvent(
+            product_id=int(product.product_id),
+            component_item_id=int(item.item_id),
+            source_kind="issue_created",
+            effective_at=cutoff + timedelta(minutes=1),
+            location_kind="workshop",
+            warehouse_ref1c="WH-OUT",
+            delta_qty=Decimal("2"),
+            idempotency_key="orch-recovery-custody-during-build",
+        )
+        db.add(event)
+        db.flush()
+        current = db.query(models.ProductionMaterialCustodyProjection).filter_by(
+            ledger_generation_id=int(accepted.id),
+            is_current=True,
+        ).one()
+        current.reserved_qty = Decimal("6")
+        current.source_event_high_watermark_id = int(event.id)
+        db.get(
+            models.ProductionMaterialCustodyProjectionManifest,
+            int(accepted.id),
+        ).source_event_high_watermark_id = int(event.id)
+        db.flush()
+        return result
+
+    monkeypatch.setattr(
+        workflow,
+        "validate_obligation_refresh_build",
+        append_operator_tail,
+    )
+
+    with pytest.raises(
+        workflow.ObligationRefreshOrchestratorError,
+        match="does not cover the full custody event stream",
+    ):
+        _run_guarded_recovery(
+            db_session,
+            accepted,
+            parent,
+            owner,
+            key="orch-recovery-custody-tail",
+        )
+
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    current = db_session.query(models.ProductionMaterialCustodyProjection).filter_by(
+        is_current=True
+    ).one()
+    current_owner = db_session.query(models.ReservationEntry).filter_by(
+        id=int(owner.id),
+        is_current=True,
+    ).one()
+    assert int(pointer.current_generation_id) == int(accepted.id)
+    assert int(current.ledger_generation_id) == int(accepted.id)
+    assert current.reserved_qty == Decimal("6")
+    assert int(current.source_event_high_watermark_id) > base_watermark
+    assert current_owner.reserved_qty == Decimal("5")
+    assert current_owner.replenishment_required_qty == Decimal("5")
+
+
+def test_guarded_recovery_publishes_when_custody_projection_covers_full_tail(
+    db_session,
+):
+    accepted, plan, _line, item, parent, cutoff = _world(db_session)
+    owner, _product, base_watermark = _seed_guarded_recovery_state(
+        db_session, accepted, plan, item, parent, cutoff
+    )
+
+    result = _run_guarded_recovery(
+        db_session,
+        accepted,
+        parent,
+        owner,
+        key="orch-recovery-custody-complete",
+    )
+
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    current = db_session.query(models.ProductionMaterialCustodyProjection).filter_by(
+        is_current=True
+    ).one()
+    recovered_owner = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+        run_id=int(parent.run_id),
+        lifecycle_status="active",
+    ).one()
+    assert result.published is True
+    assert int(pointer.current_generation_id) == int(result.target_generation_id)
+    assert int(current.ledger_generation_id) == int(result.target_generation_id)
+    assert current.reserved_qty == Decimal("4")
+    assert int(current.source_event_high_watermark_id) == base_watermark
+    assert recovered_owner.reserved_qty == Decimal("5")
+    assert recovered_owner.replenishment_required_qty == Decimal("5")
 
 
 def _accepted_physical_fork(db, parent, *, key):
