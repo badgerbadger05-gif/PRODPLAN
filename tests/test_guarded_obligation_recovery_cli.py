@@ -94,3 +94,33 @@ def test_execute_apply_commits_only_explicitly(monkeypatch):
     result = driver.execute(db, receipt, commit=True, started_by="operator")
     assert result["status"] == "applied"
     assert db.calls.count("commit") == 1
+
+
+def test_service_exception_rolls_back_without_commit(monkeypatch):
+    db = _FakeSession()
+    receipt = {
+        "parent_generation_id": 10,
+        "recovery_generation_key": "guarded-recovery:10:test",
+        "source_generation_by_run": {"1": -1},
+        "owner_fingerprints": {"1": ["fp"]},
+        "owner_fingerprint_sha256": driver.sha256_json({"1": ["fp"]}),
+    }
+    monkeypatch.setattr(driver, "verify_receipt", lambda _db, _receipt: ({1: -1}, {1: ["fp"]}))
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("service failure")
+    monkeypatch.setattr(driver, "run_guarded_obligation_recovery", fail)
+    with pytest.raises(RuntimeError, match="service failure"):
+        driver.execute(db, receipt, commit=True, started_by="test")
+    assert "commit" not in db.calls
+    assert db.calls.count("rollback") >= 2
+
+
+def test_receipt_verification_failure_precedes_service_call(monkeypatch):
+    db = _FakeSession()
+    receipt = {"database_name": "expected"}
+    called = []
+    monkeypatch.setattr(driver, "database_name", lambda _db: "actual")
+    monkeypatch.setattr(driver, "run_guarded_obligation_recovery", lambda *_a, **_k: called.append(True))
+    with pytest.raises(driver.RecoveryDriverError, match="another database"):
+        driver.verify_receipt(db, receipt)
+    assert called == []
