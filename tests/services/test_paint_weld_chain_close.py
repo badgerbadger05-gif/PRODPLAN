@@ -358,6 +358,36 @@ def test_combined_live_links_both_manufactures_without_touching_orders(db_sessio
     assert {link.target_ref_key for link in links} == {"pw-chain-ref"}
 
 
+def test_combined_preserves_orders_when_1c_normalizes_header_fields(db_session, monkeypatch):
+    class HeaderNormalizingClient(_FakeClient):
+        def post(self, entity, payload, **kwargs):
+            from copy import deepcopy
+            payload = deepcopy(payload)
+            for position, field in (
+                ("ПоложениеЗаказаНаПроизводство", "ЗаказНаПроизводство_Key"),
+                ("ПоложениеСтруктурнойЕдиницы", "СтруктурнаяЕдиница_Key"),
+            ):
+                if payload.get(position, "ВШапке") == "ВШапке":
+                    for row in payload["Операции"]:
+                        row[field] = payload.get(field)
+            return super().post(entity, payload, **kwargs)
+
+    ctx = _setup_chain(db_session)
+    fake = HeaderNormalizingClient()
+    _stub_live(monkeypatch, fake)
+    result = exporter.export_chain_piecework_to_1c(
+        db_session, weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
+        paint_manufacture_id=ctx["paint"]["m"].manufacture_id, dry_run=False,
+    )
+    assert result["status"] == "ok"
+    assert len(fake.posts) == 1
+    payload = fake.posts[0][1]
+    assert payload["ПоложениеСтруктурнойЕдиницы"] == "ВТабличнойЧасти"
+    assert {row["ЗаказНаПроизводство_Key"] for row in payload["Операции"]} == {
+        ctx[side]["order"].order_ref1c for side in ("weld", "paint")
+    }
+
+
 def test_combined_repeat_is_noop(db_session, monkeypatch):
     ctx = _setup_chain(db_session)
     fake = _FakeClient()
