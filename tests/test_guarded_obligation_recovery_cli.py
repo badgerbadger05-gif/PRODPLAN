@@ -26,6 +26,13 @@ def test_receipt_json_is_stable_and_does_not_contain_credentials(tmp_path):
     assert driver.sha256_json(value) == driver.sha256_json({"a": value["a"], "z": 1})
 
 
+def test_recovery_key_is_distinct_from_parent_key():
+    owner_hash = driver.sha256_json({"570": ["fp"]})
+    recovery_key = f"guarded-recovery:1713:{owner_hash[:24]}"
+    assert recovery_key != "parent-generation-key"
+    assert recovery_key.startswith("guarded-recovery:1713:")
+
+
 class _FakeSession:
     def __init__(self):
         self.calls = []
@@ -44,7 +51,7 @@ def test_execute_simulation_rolls_back_and_never_commits(monkeypatch):
     db = _FakeSession()
     receipt = {
         "parent_generation_id": 10,
-        "generation_key": "recovery-test",
+        "recovery_generation_key": "guarded-recovery:10:test",
         "source_generation_by_run": {"1": -1},
         "owner_fingerprints": {"1": ["fp"]},
         "owner_fingerprint_sha256": driver.sha256_json({"1": ["fp"]}),
@@ -65,7 +72,7 @@ def test_execute_apply_commits_only_explicitly(monkeypatch):
     db = _FakeSession()
     receipt = {
         "parent_generation_id": 10,
-        "generation_key": "recovery-test",
+        "recovery_generation_key": "guarded-recovery:10:test",
         "source_generation_by_run": {"1": -1},
         "owner_fingerprints": {"1": ["fp"]},
         "owner_fingerprint_sha256": driver.sha256_json({"1": ["fp"]}),

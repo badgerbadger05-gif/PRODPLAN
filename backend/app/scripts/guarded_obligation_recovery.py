@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from sqlalchemy import text
+
 from app import models
 from app.database import SessionLocal
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids, sealed_generation_lineage_ids
@@ -126,7 +128,19 @@ def _source_proof(db: Any, generation: models.LedgerGeneration, run_id: int, sou
     return {"row_count": len(rows), "fingerprints": fingerprints, "mode_counts": dict(sorted(modes.items()))}
 
 
-def build_receipt(db: Any, parent_generation_id: int, source_map: Mapping[int, int], fingerprints: Mapping[int, Sequence[str]]) -> dict[str, Any]:
+def database_name(db: Any) -> str:
+    """Return only the server database name; never expose the connection URL."""
+    try:
+        value = db.execute(text("SELECT current_database()")).scalar_one()
+    except Exception as exc:
+        raise RecoveryDriverError("could not verify target database identity") from exc
+    name = str(value or "").strip()
+    if not name or any(char in name for char in "\\/@:"):
+        raise RecoveryDriverError("database identity is malformed")
+    return name
+
+
+def build_receipt(db: Any, parent_generation_id: int, source_map: Mapping[int, int], fingerprints: Mapping[int, Sequence[str]], *, expected_database: str | None = None) -> dict[str, Any]:
     pointer = db.get(models.PlanningTruthState, 1)
     if pointer is None or pointer.current_generation_id is None:
         raise RecoveryDriverError("planning truth pointer is unavailable")
@@ -135,6 +149,9 @@ def build_receipt(db: Any, parent_generation_id: int, source_map: Mapping[int, i
     generation = db.get(models.LedgerGeneration, int(parent_generation_id))
     if generation is None or str(generation.status) != "accepted":
         raise RecoveryDriverError("parent generation is not accepted")
+    target_database = database_name(db)
+    if expected_database and target_database != expected_database:
+        raise RecoveryDriverError(f"database mismatch: expected {expected_database}, got {target_database}")
     retain = tuple(int(v) for v in live_plan_run_ids(db, generation))
     validate_source_inputs(retain, source_map, fingerprints)
     source_proofs: dict[str, Any] = {}
@@ -160,24 +177,30 @@ def build_receipt(db: Any, parent_generation_id: int, source_map: Mapping[int, i
         "source_proofs": source_proofs,
         "source_watermark_keys": sorted(str(key) for key in marks),
     }
+    owner_hash = sha256_json({str(k): sorted(v) for k, v in sorted(fingerprints.items())})
+    recovery_key = f"guarded-recovery:{int(parent_generation_id)}:{owner_hash[:24]}"
     return {
         "schema": "guarded_obligation_recovery_receipt/v1",
         "created_at": utc_now(),
         "parent_generation_id": int(parent_generation_id),
-        "generation_key": str(generation.generation_key),
+        "parent_generation_key": str(generation.generation_key),
+        "recovery_generation_key": recovery_key,
+        "database_name": target_database,
         "expected_pointer_generation_id": int(parent_generation_id),
         "source_generation_by_run": {str(k): int(v) for k, v in sorted(source_map.items())},
         "owner_fingerprints": {str(k): sorted(v) for k, v in sorted(fingerprints.items())},
-        "owner_fingerprint_sha256": sha256_json({str(k): sorted(v) for k, v in sorted(fingerprints.items())}),
+        "owner_fingerprint_sha256": owner_hash,
         "before": before,
         "status": "prepared",
     }
 
 
 def verify_receipt(db: Any, receipt: Mapping[str, Any]) -> tuple[dict[int, int], dict[int, list[str]]]:
+    if database_name(db) != str(receipt.get("database_name") or ""):
+        raise RecoveryDriverError("saved receipt is bound to another database")
     source_map = normalize_source_map(receipt.get("source_generation_by_run"))
     fingerprints = normalize_fingerprints(receipt.get("owner_fingerprints"))
-    current = build_receipt(db, int(receipt["parent_generation_id"]), source_map, fingerprints)
+    current = build_receipt(db, int(receipt["parent_generation_id"]), source_map, fingerprints, expected_database=str(receipt["database_name"]))
     if current["owner_fingerprint_sha256"] != receipt.get("owner_fingerprint_sha256"):
         raise RecoveryDriverError("saved owner fingerprint hash drift")
     return source_map, fingerprints
@@ -191,7 +214,7 @@ def execute(db: Any, receipt: Mapping[str, Any], *, commit: bool, started_by: st
         result = run_guarded_obligation_recovery(
             db,
             parent_generation_id=int(receipt["parent_generation_id"]),
-            generation_key=str(receipt["generation_key"]),
+            generation_key=str(receipt["recovery_generation_key"]),
             source_generation_by_run=source_map,
             owner_fingerprints=fingerprints,
             started_by=started_by,
@@ -215,10 +238,24 @@ def execute(db: Any, receipt: Mapping[str, Any], *, commit: bool, started_by: st
 
 def command_prepare(args: argparse.Namespace) -> dict[str, Any]:
     source_map = normalize_source_map(read_json(args.source_map))
-    fingerprints = normalize_fingerprints(read_json(args.fingerprints))
     db = SessionLocal()
     try:
-        receipt = build_receipt(db, int(args.parent_generation), source_map, fingerprints)
+        parent = db.get(models.LedgerGeneration, int(args.parent_generation))
+        if parent is None:
+            raise RecoveryDriverError("parent generation is unavailable")
+        retain = tuple(int(v) for v in live_plan_run_ids(db, parent))
+        if set(source_map) != set(retain):
+            raise RecoveryDriverError(f"source map run set mismatch: expected {sorted(retain)}, got {sorted(source_map)}")
+        if args.fingerprints:
+            fingerprints = normalize_fingerprints(read_json(args.fingerprints))
+        elif args.collect_fingerprints:
+            fingerprints = {
+                run_id: _source_proof(db, parent, run_id, source_map[run_id])["fingerprints"]
+                for run_id in retain
+            }
+        else:
+            raise RecoveryDriverError("--fingerprints or explicit --collect-fingerprints is required")
+        receipt = build_receipt(db, int(args.parent_generation), source_map, fingerprints, expected_database=args.expected_database)
     finally:
         db.rollback()
         db.close()
@@ -246,7 +283,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = sub.add_parser("prepare")
     prepare.add_argument("--parent-generation", required=True, type=int)
     prepare.add_argument("--source-map", required=True)
-    prepare.add_argument("--fingerprints", required=True)
+    prepare.add_argument("--fingerprints")
+    prepare.add_argument("--collect-fingerprints", action="store_true")
+    prepare.add_argument("--expected-database", required=True)
     prepare.add_argument("--receipt", required=True)
     simulate = sub.add_parser("simulate")
     simulate.add_argument("--receipt", required=True)
@@ -280,4 +319,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
