@@ -53,7 +53,7 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
     # A physical fact in the parent's import batch that backs the realization.
     sle = models.StockLedgerEntry(
         ingest_batch_id=int(physical.id), source_content_hash="cf-sle",
-        item_id=int(item.item_id), qty=Decimal("5"), qty_after=Decimal("5"),
+        item_id=int(item.item_id), qty=Decimal("4"), qty_after=Decimal("4"),
         posting_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
         movement_kind="assembly_in", record_type="Receipt", recorder_type="test",
         recorder_ref="cf-sle", line_no="1", ingest_source="test",
@@ -74,7 +74,7 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
     db.flush()
     requirement = models.MrpRequirement(
         run_id=int(run.run_id), item_id=int(item.item_id),
-        total_required_qty=Decimal("5"), net_required_qty=Decimal("5"),
+        total_required_qty=Decimal("10"), net_required_qty=Decimal("10"),
         period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
     )
     db.add(requirement)
@@ -83,9 +83,9 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
         ledger_generation_id=int(parent.id), item_id=int(item.item_id),
         run_id=int(run.run_id), freeze_version=1, requirement_id=int(requirement.id),
         priority_period_from=plan.period_from, priority_period_to=plan.period_to,
-        reserved_qty=Decimal("5"), covered_from_stock_at_freeze_qty=Decimal("0"),
-        replenishment_required_qty=Decimal("5"),
-        replenishment_received_qty=Decimal("5"), realized_qty=Decimal("5"),
+        reserved_qty=Decimal("10"), covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("10"),
+        replenishment_received_qty=Decimal("4"), realized_qty=Decimal("4"),
         lifecycle_status="active", opened_at=CUTOFF,
     )
     db.add(reservation)
@@ -95,14 +95,14 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
         models.ReservationEvent(
             ledger_generation_id=int(parent.id), reservation_id=int(reservation.id),
             item_id=int(item.item_id), event_kind="open",
-            reserved_delta=Decimal("5"), realized_delta=Decimal("0"), sle_id=None,
+            reserved_delta=Decimal("10"), realized_delta=Decimal("0"), sle_id=None,
             cycle_id=f"parent-open:g{int(parent.id)}",
             idempotency_key=f"p-open-{int(reservation.id)}", event_at=CUTOFF,
         ),
         models.ReservationEvent(
             ledger_generation_id=int(parent.id), reservation_id=int(reservation.id),
             item_id=int(item.item_id), event_kind="realize",
-            reserved_delta=Decimal("0"), realized_delta=Decimal("5"),
+            reserved_delta=Decimal("0"), realized_delta=Decimal("4"),
             sle_id=int(sle.id), fact_ref="cf-sle", match_rule="fifo",
             cycle_id=f"parent-realize:g{int(parent.id)}",
             idempotency_key=f"p-realize-{int(reservation.id)}", event_at=CUTOFF,
@@ -134,8 +134,12 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
     assert not any(_d(e.realized_delta) != 0 and e.sle_id is None for e in events)
     # The fold reconstructs the preserved caches exactly.
     (entry,) = entries
-    assert _d(entry.reserved_qty) == Decimal("5")
-    assert _d(entry.realized_qty) == Decimal("5")
+    assert _d(entry.reserved_qty) == Decimal("10")
+    assert _d(entry.realized_qty) == Decimal("4")
+    assert _d(entry.replenishment_required_qty) - _d(entry.replenishment_received_qty) == Decimal("6")
+    realized = [e for e in events if e.sle_id is not None]
+    assert len(realized) == 1
+    assert sum((_d(e.realized_delta) for e in realized), Decimal("0")) == Decimal("4")
     # The exact checkpoint that used to raise must now pass, counting one fact.
     visible = visible_sles_for_generation(db, int(target.id))
     assert _reservation_fact_conservation_checkpoint(events, visible) == 1
