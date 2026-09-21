@@ -474,6 +474,10 @@ def apply_current_replenishment(
     receipt_facts: tuple[object, ...] = (),
     history_mode: str = "as_occurred",
     receipt_unmatched_return_qty: Decimal = Decimal("0"),
+    # Recovery may rebind the same completed accepted physical prefix to a
+    # newer obligation generation.  This is opt-in; generic writers retain
+    # the strict combined-payload drift guard.
+    allow_same_revision_rebind: bool = False,
 ) -> CurrentReplenishmentResult:
     """Apply one complete accepted-fact scope atomically.
 
@@ -550,7 +554,26 @@ def apply_current_replenishment(
             )
         if revision == previous_revision:
             if _text(state.scope_checksum) != input_checksum:
-                raise CurrentReplenishmentError("same source revision has payload drift")
+                previous_generation = db.get(
+                    models.LedgerGeneration, int(state.ledger_generation_id)
+                )
+                physical_batch = db.get(models.PhysicalImportBatch, revision)
+                same_accepted_physical_batch = bool(
+                    allow_same_revision_rebind
+                    and _text(source_key) == "accepted-physical-receipts"
+                    and _text(state.status) == "completed"
+                    and previous_generation is not None
+                    and _text(previous_generation.status) == "accepted"
+                    and int(previous_generation.physical_import_batch_id or -1) == revision
+                    and int(generation.physical_import_batch_id or -1) == revision
+                    and physical_batch is not None
+                    and _text(physical_batch.status) == "completed"
+                    and bool(physical_batch.source_complete)
+                )
+                if not same_accepted_physical_batch:
+                    raise CurrentReplenishmentError(
+                        "same source revision has payload drift"
+                    )
             if _text(state.status) != "completed":
                 raise CurrentReplenishmentError("current source marker is still applying")
             generation_changed = int(state.ledger_generation_id) != int(generation.id)
@@ -927,6 +950,7 @@ def apply_current_receipt_replay(
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     allow_building: bool = False,
     validated_visible_ids: Iterable[int] | None = None,
+    allow_same_revision_rebind: bool = False,
 ) -> CurrentReplenishmentResult:
     """Publish signed correction/return replay through the R4 current writer."""
 
@@ -1053,6 +1077,7 @@ def apply_current_receipt_replay(
         receipt_facts=rows,
         history_mode=history_mode,
         receipt_unmatched_return_qty=replay.unmatched_return_qty,
+        allow_same_revision_rebind=allow_same_revision_rebind,
     )
 
 
@@ -1130,6 +1155,7 @@ def apply_current_replenishment_for_accepted_generation(
     generation_id: int,
     source_revision: int | None = None,
     allow_building: bool = False,
+    allow_same_revision_rebind: bool = False,
 ) -> tuple[CurrentReplenishmentResult, ...]:
     """Publish current supplier-receipt replenishment at physical acceptance.
 
@@ -1317,6 +1343,7 @@ def apply_current_replenishment_for_accepted_generation(
                 exact_allocation_caps=exact_caps,
                 history_mode="as_occurred",
                 allow_building=allow_building,
+                allow_same_revision_rebind=allow_same_revision_rebind,
             )
         )
     return tuple(result)

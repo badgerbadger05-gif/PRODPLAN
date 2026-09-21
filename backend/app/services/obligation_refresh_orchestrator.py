@@ -696,7 +696,10 @@ def run_obligation_refresh(
         writer_mode="current",
     )
     current_replenishment = apply_current_replenishment_for_accepted_generation(
-        db, generation_id=target_id, allow_building=True
+        db,
+        generation_id=target_id,
+        allow_building=True,
+        allow_same_revision_rebind=bool(recovery_source_current),
     )
     supplier_summary = {
         "provenance_count": supplier.provenance_count,
