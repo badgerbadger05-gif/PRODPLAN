@@ -240,9 +240,111 @@ def test_replacement_is_end_to_end_same_plan_saved_remainder_with_history_replay
         stage="snapshot_build",
     ).one()
     assert "assembly_queue_materialization_id" not in dict(snapshot_batch.metrics or {})
-    # Current refreshes must not invoke the legacy generation-copy writer;
-    # retained obligations stay anchored to their stable run identity.
-    assert preserve_flags == []
+    # The canonical carry boundary is invoked even when this replacement has
+    # no retained runs; it must be a no-op rather than a legacy copy.
+    assert preserve_flags == [False]
+
+
+def test_replacement_carries_retained_make_owner_into_work_items(
+    db_session,
+):
+    accepted, replaced_plan, _line, item, replaced_parent, cutoff = _world(
+        db_session, qty=5, replenishment_method="Производство"
+    )
+    retained_plan = models.ProductionPlanHeader(
+        name="retained make plan", status="fixed",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        fixed_at=cutoff,
+    )
+    db_session.add(retained_plan)
+    db_session.flush()
+    retained_line = models.ProductionPlanLine(
+        plan_id=retained_plan.id, item_id=item.item_id,
+        bucket_date=date(2026, 8, 1), qty=Decimal("7"),
+        accepted_output_qty=Decimal("0"), remaining_output_qty=Decimal("7"),
+    )
+    db_session.add(retained_line)
+    db_session.flush()
+    retained_parent = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
+        source_plan_id=retained_plan.id, period_from=retained_plan.period_from,
+        period_to=retained_plan.period_to, config_snapshot={},
+        started_at=cutoff, fixed_at=cutoff, finished_at=cutoff,
+        pinned=True, active_freeze_version=1, ledger_cutoff=cutoff,
+    )
+    db_session.add(retained_parent)
+    db_session.flush()
+    retained_line.locked_by_run_id = retained_parent.run_id
+    db_session.add(models.MrpRunRoot(
+        run_id=retained_parent.run_id, plan_line_id=retained_line.id,
+        planned_qty=Decimal("7"), accepted_qty=Decimal("0"),
+        remaining_qty=Decimal("7"),
+    ))
+    requirement = models.MrpRequirement(
+        run_id=retained_parent.run_id, item_id=item.item_id,
+        total_required_qty=Decimal("7"), net_required_qty=Decimal("7"),
+        period_from=retained_plan.period_from, period_to=retained_plan.period_to,
+        status="open", freeze_version=1,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    db_session.add(models.MrpFreezeBaseline(
+        run_id=retained_parent.run_id, freeze_version=1, item_id=item.item_id,
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        frozen_at=cutoff, baseline_at=cutoff,
+        physical_import_batch_id=accepted.physical_import_batch_id,
+        frozen_basis_generation_id=accepted.id,
+        stock_qty=Decimal("0"), produced_total=Decimal("0"),
+        received_total=Decimal("0"), unit_coef=Decimal("1"),
+    ))
+    owner = models.ReservationEntry(
+        ledger_generation_id=accepted.id, item_id=item.item_id,
+        run_id=retained_parent.run_id, freeze_version=1,
+        requirement_id=requirement.id, priority_period_from=retained_plan.period_from,
+        priority_period_to=retained_plan.period_to, realization_mode="make",
+        reserved_qty=Decimal("7"), replenishment_required_qty=Decimal("7"),
+        replenishment_received_qty=Decimal("0"), realized_qty=Decimal("0"),
+        lifecycle_status="active", current_identity=(
+            f"reservation:req:{requirement.id}:mode:make"
+        ), owner_kind="current", is_current=True,
+    )
+    db_session.add(owner)
+    db_session.flush()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=accepted.id, reservation_id=owner.id,
+        item_id=item.item_id, event_kind="open", reserved_delta=Decimal("7"),
+        realized_delta=Decimal("0"), cycle_id="test-retained",
+        idempotency_key="test-retained-open", event_identity=(
+            f"obligation:req:{requirement.id}"
+        ), origin_kind="obligation", is_current=True, event_at=cutoff,
+    ))
+    db_session.commit()
+
+    result = _run(
+        db_session, accepted, "orch-retained-make-owner", replace=[replaced_plan.id]
+    )
+
+    target = db_session.get(models.LedgerGeneration, result.target_generation_id)
+    carried = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=target.id, run_id=retained_parent.run_id,
+        lifecycle_status="active",
+    ).one()
+    retained_items = db_session.query(models.ReplenishmentWorkItem).filter_by(
+        ledger_generation_id=target.id, run_id=retained_parent.run_id,
+    ).all()
+    candidate_items = db_session.query(models.ReplenishmentWorkItem).filter(
+        models.ReplenishmentWorkItem.ledger_generation_id == target.id,
+        models.ReplenishmentWorkItem.run_id != retained_parent.run_id,
+    ).all()
+
+    assert result.published is True
+    assert carried.current_identity == owner.current_identity
+    assert carried.owner_kind == "building"
+    assert carried.is_current is False
+    assert len(retained_items) == 1
+    assert retained_items[0].replenishment_method == "make"
+    assert retained_items[0].replenishment_remaining_qty == Decimal("7")
+    assert candidate_items
 
 
 def test_replacement_uses_saved_remainder_through_multiple_accepted_fact_forks(db_session):
@@ -869,10 +971,12 @@ def test_add_retains_existing_fixed_obligation_without_refreeze(db_session):
         "reserved": retained_reservation.reserved_qty,
         "received": retained_reservation.replenishment_received_qty,
     } == retained_before
+    # Retained obligations are copied into the target BUILDING projection so
+    # replay and WI materialization cannot drop the existing fixed plan.
     assert db_session.query(models.ReservationEntry).filter(
         models.ReservationEntry.ledger_generation_id == int(result.target_generation_id),
         models.ReservationEntry.run_id == int(old.run_id),
-    ).count() == 0
+    ).count() == 1
 
 
 def test_failure_after_freeze_is_reversible_by_outer_transaction(db_session, monkeypatch):

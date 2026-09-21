@@ -548,11 +548,19 @@ def run_obligation_refresh(
         for entry in manifest.entries
         if entry.get("action") == "retain"
     ))
-    # Retained obligations are stable business rows anchored to their original
-    # run/generation lineage.  A replacement refresh must not copy or retarget
-    # them into the candidate generation; live-scope readers resolve the sealed
-    # lineage explicitly when they need the retained plan.
-    retained_reservation_count = 0
+    # Retained obligations are stable business rows, but the target generation
+    # must still contain their obligation basis before replay and current-owner
+    # publication.  Otherwise publication sees only replacement candidates and
+    # closes every retained current owner as "removed".  The carry helper copies
+    # only the immutable obligation/open event; physical realization is rebuilt
+    # by the generation-wide replay below.
+    retained_reservation_count = carry_forward_retained_reservations(
+        db,
+        parent_generation_id=int(parent_generation_id),
+        target_generation_id=target_id,
+        retained_run_ids=retained_run_ids,
+        preserve_realization=False,
+    )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
     execution_batch = _single_stage(db, target_id, "execution_allocation", key)
@@ -577,7 +585,6 @@ def run_obligation_refresh(
     )
     reservation_count = db.query(models.ReservationEntry.id).filter(
         models.ReservationEntry.ledger_generation_id == target_id,
-        models.ReservationEntry.run_id.in_(candidate_ids),
     ).count()
     reservation_consumption = materialize_reservation_consumption_allocations(
         db,
