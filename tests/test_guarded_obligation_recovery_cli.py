@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.scripts import guarded_obligation_recovery as driver
+from app.services.obligation_refresh_orchestrator import ObligationRefreshOrchestrationResult
 
 
 def test_source_inputs_are_canonical_and_reject_drift():
@@ -31,6 +32,13 @@ def test_recovery_key_is_distinct_from_parent_key():
     recovery_key = f"guarded-recovery:1713:{owner_hash[:24]}"
     assert recovery_key != "parent-generation-key"
     assert recovery_key.startswith("guarded-recovery:1713:")
+
+
+def test_driver_result_contract_matches_service_dataclass():
+    result = ObligationRefreshOrchestrationResult(10, 11, (570,), True)
+    assert result.target_generation_id == 11
+    assert result.published is True
+    assert list(result.candidate_run_ids) == [570]
 
 
 class _FakeSession:
