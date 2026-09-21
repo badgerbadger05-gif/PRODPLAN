@@ -1080,6 +1080,7 @@ def test_publisher_failure_rolls_back_and_discards_candidate(
 
 
 def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_session, monkeypatch):
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
     parent, _ = _accepted_parent(db_session, generation_key="noop-parent")
     target_cutoff = parent.cutoff + timedelta(days=1)
     batch = models.PhysicalImportBatch(

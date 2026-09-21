@@ -68,6 +68,7 @@ def _physical_supplies(
     queue_rows: list[models.AssemblyQueueLine],
     *,
     current_owner: bool = False,
+    allow_stale_parent: bool = False,
 ) -> tuple[ReadinessSupply, ...] | None:
     if current_owner:
         from app.services.production_material_custody_projection import (
@@ -77,6 +78,7 @@ def _physical_supplies(
         current_generation_id, custody = load_compact_current_material_custody(
             db,
             consumer="assembly_readiness.current_payload",
+            allow_stale_parent=allow_stale_parent,
         )
         if int(current_generation_id) != int(generation_id):
             raise ValueError(
@@ -470,6 +472,7 @@ def build_assembly_readiness_payload_rows(
     generation_id: int,
     queue_rows: list[models.AssemblyQueueLine],
     current_owner: bool = False,
+    allow_stale_parent: bool = False,
     as_of: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Compute readiness payloads without persisting staging rows.
@@ -492,6 +495,7 @@ def build_assembly_readiness_payload_rows(
         int(generation_id),
         queue_rows,
         current_owner=current_owner,
+        allow_stale_parent=allow_stale_parent,
     )
     calculation_date = as_of or generation.cutoff.date()
     results = allocate_readiness_curves(

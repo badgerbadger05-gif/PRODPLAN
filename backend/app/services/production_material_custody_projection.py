@@ -1661,6 +1661,7 @@ def load_compact_current_material_custody(
     db: Session,
     *,
     consumer: str,
+    allow_stale_parent: bool = False,
 ) -> tuple[int, MaterialCustodyState]:
     """Read the already-published compact custody projection only.
 
@@ -1672,7 +1673,16 @@ def load_compact_current_material_custody(
     """
     from .planning_truth import require_accepted_truth
 
-    truth = require_accepted_truth(db, consumer)
+    # The physical-refresh builder may need to rebuild a disposable candidate
+    # from the structurally accepted parent before it records the completed
+    # source-proof marker.  Public readers keep the default strict freshness
+    # guard; this explicit private flag does not skip pointer/manifest,
+    # provenance, or event-tail validation below.
+    truth = require_accepted_truth(
+        db,
+        consumer,
+        allow_stale=allow_stale_parent,
+    )
     generation_id = int(truth.generation_id)
     manifest = _read_manifest(db, generation_id=generation_id)
     if manifest is None or str(manifest.status) != "complete":

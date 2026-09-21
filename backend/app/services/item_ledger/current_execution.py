@@ -1265,6 +1265,7 @@ def build_compact_current_assembly_payload(
         generation_id=int(parent.id),
         queue_rows=queue_dtos,
         current_owner=True,
+        allow_stale_parent=True,
         as_of=target.cutoff.date(),
     )
     return CompactCurrentAssemblyPayload(
