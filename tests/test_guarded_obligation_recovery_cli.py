@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from app.scripts import guarded_obligation_recovery as driver
+
+
+def test_source_inputs_are_canonical_and_reject_drift():
+    source = driver.normalize_source_map({"571": 1713, "570": -1})
+    fingerprints = driver.normalize_fingerprints({"570": ["b", "a", "a"], "571": ["c"]})
+    assert source == {570: -1, 571: 1713}
+    assert fingerprints == {570: ["a", "b"], 571: ["c"]}
+    driver.validate_source_inputs((570, 571), source, fingerprints)
+    with pytest.raises(driver.RecoveryDriverError, match="run set mismatch"):
+        driver.validate_source_inputs((570, 571, 572), source, fingerprints)
+
+
+def test_receipt_json_is_stable_and_does_not_contain_credentials(tmp_path):
+    value = {"z": 1, "a": {"token": "must-not-be-added"}}
+    path = tmp_path / "receipt.json"
+    driver.write_json(path, value)
+    assert json.loads(path.read_text()) == value
+    assert driver.sha256_json(value) == driver.sha256_json({"a": value["a"], "z": 1})
+
+
+class _FakeSession:
+    def __init__(self):
+        self.calls = []
+
+    def rollback(self):
+        self.calls.append("rollback")
+
+    def begin(self):
+        self.calls.append("begin")
+
+    def commit(self):
+        self.calls.append("commit")
+
+
+def test_execute_simulation_rolls_back_and_never_commits(monkeypatch):
+    db = _FakeSession()
+    receipt = {
+        "parent_generation_id": 10,
+        "generation_key": "recovery-test",
+        "source_generation_by_run": {"1": -1},
+        "owner_fingerprints": {"1": ["fp"]},
+        "owner_fingerprint_sha256": driver.sha256_json({"1": ["fp"]}),
+    }
+    monkeypatch.setattr(driver, "verify_receipt", lambda _db, _receipt: ({1: -1}, {1: ["fp"]}))
+    monkeypatch.setattr(
+        driver,
+        "run_guarded_obligation_recovery",
+        lambda *_args, **_kwargs: SimpleNamespace(target_generation_id=11, published=True, candidate_run_ids=(1,)),
+    )
+    result = driver.execute(db, receipt, commit=False, started_by="test")
+    assert result["status"] == "simulated_rolled_back"
+    assert "commit" not in db.calls
+    assert db.calls.count("rollback") >= 2
+
+
+def test_execute_apply_commits_only_explicitly(monkeypatch):
+    db = _FakeSession()
+    receipt = {
+        "parent_generation_id": 10,
+        "generation_key": "recovery-test",
+        "source_generation_by_run": {"1": -1},
+        "owner_fingerprints": {"1": ["fp"]},
+        "owner_fingerprint_sha256": driver.sha256_json({"1": ["fp"]}),
+    }
+    monkeypatch.setattr(driver, "verify_receipt", lambda _db, _receipt: ({1: -1}, {1: ["fp"]}))
+    monkeypatch.setattr(
+        driver,
+        "run_guarded_obligation_recovery",
+        lambda *_args, **_kwargs: SimpleNamespace(target_generation_id=11, published=True, candidate_run_ids=(1,)),
+    )
+    result = driver.execute(db, receipt, commit=True, started_by="operator")
+    assert result["status"] == "applied"
+    assert db.calls.count("commit") == 1
