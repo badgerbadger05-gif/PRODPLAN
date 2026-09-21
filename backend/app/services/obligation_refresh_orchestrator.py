@@ -77,6 +77,7 @@ from app.services.item_ledger.future_supply_capture import (
 from app.services.item_ledger.shelf_projection_persistence import (
     materialize_shelf_projections,
 )
+from app.services.item_ledger.live_plan_scope import sealed_generation_lineage_ids
 from app.services.local_mrp_order_reconciliation import reconcile_local_mrp_orders
 
 
@@ -590,6 +591,20 @@ def run_obligation_refresh(
             source_generation_id = int(source_generation_id)
             run = recovery_runs[int(run_id)]
             if source_generation_id == -1:
+                current_rows = db.query(models.ReservationEntry).filter(
+                    models.ReservationEntry.run_id == int(run_id),
+                    models.ReservationEntry.is_current.is_(True),
+                ).all()
+                parent_lineage = set(
+                    sealed_generation_lineage_ids(db, parent)
+                )
+                if not current_rows or any(
+                    int(row.ledger_generation_id) not in parent_lineage
+                    for row in current_rows
+                ):
+                    raise ObligationRefreshOrchestratorError(
+                        f"current recovery owner for run {run_id} is outside the sealed parent lineage"
+                    )
                 continue
             source_generation = db.get(models.LedgerGeneration, source_generation_id)
             if (

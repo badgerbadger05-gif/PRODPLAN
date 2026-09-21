@@ -12,6 +12,7 @@ from app.services.item_ledger.generation_lifecycle import (
     RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
 )
 from app.services.item_ledger.obligation_generation import ObligationGenerationError
+from app.services.item_ledger.obligation_generation import _current_reservation_owner_fingerprint
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
 from app.services import obligation_refresh_publish as refresh_publish
@@ -112,6 +113,48 @@ def _run(
         planning_pool_by_warehouse=pool_mapping,
         accepted_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
+
+
+def test_guarded_recovery_rejects_current_owner_outside_parent_lineage(db_session):
+    accepted, plan, _line, item, parent, cutoff = _world(db_session)
+    foreign = models.LedgerGeneration(
+        generation_key="orch-recovery-foreign", status="accepted", cutoff=cutoff,
+        source_watermarks={}, capabilities={}, accepted_at=cutoff,
+        physical_import_batch_id=accepted.physical_import_batch_id,
+        algorithm_version="test",
+    )
+    db_session.add(foreign)
+    db_session.flush()
+    requirement = models.MrpRequirement(
+        run_id=int(parent.run_id), item_id=int(item.item_id),
+        total_required_qty=Decimal("5"), net_required_qty=Decimal("5"),
+        period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    owner = models.ReservationEntry(
+        ledger_generation_id=int(foreign.id), item_id=int(item.item_id),
+        run_id=int(parent.run_id), requirement_id=int(requirement.id),
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        reserved_qty=Decimal("5"), replenishment_required_qty=Decimal("5"),
+        covered_from_stock_at_freeze_qty=Decimal("0"), realized_qty=Decimal("0"),
+        replenishment_received_qty=Decimal("0"), lifecycle_status="active",
+        is_current=True, owner_kind="current", current_identity="recovery:foreign",
+        opened_at=cutoff,
+    )
+    db_session.add(owner)
+    db_session.flush()
+    with pytest.raises(workflow.ObligationRefreshOrchestratorError, match="outside the sealed parent lineage"):
+        workflow.run_obligation_refresh(
+            db_session, parent_generation_id=int(accepted.id),
+            generation_key="orch-recovery-foreign-owner",
+            recovery_source_current=True,
+            recovery_owner_fingerprints={
+                int(parent.run_id): (_current_reservation_owner_fingerprint(owner),)
+            },
+            recovery_source_generations={int(parent.run_id): -1},
+            started_by="test", config_snapshot={}, accepted_at=cutoff,
+        )
 
 
 def _accepted_physical_fork(db, parent, *, key):
