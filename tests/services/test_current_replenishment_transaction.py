@@ -143,6 +143,94 @@ def _reserves(reservations):
     )
 
 
+def _add_supplier_provenance(db, generation_id, facts, *, prefix):
+    for fact in facts:
+        db.add(
+            models.StockLedgerSupplierReceiptProvenance(
+                ledger_generation_id=int(generation_id),
+                stock_ledger_entry_id=int(fact.fact_id),
+                receipt_doc_type="Doc",
+                receipt_doc_ref=f"{prefix}-{fact.fact_id}",
+                receipt_doc_line_no="1",
+                supplier_order_ref="",
+                supplier_order_line_no="",
+                operation_kind="supplier_receipt",
+                evidence_hash=(f"{prefix}-{fact.fact_id}").ljust(64, "0")[:64],
+                evidence_payload={"item_id": int(fact.item_id)},
+                match_rule="fifo",
+                match_status="unmatched",
+                ambiguity_count=0,
+                reason="test FIFO supplier receipt",
+            )
+        )
+    db.flush()
+
+
+def _mark_reservations_current(db, reservations):
+    for row in reservations:
+        row.current_identity = (
+            f"reservation:req:{int(row.requirement_id)}:mode:buy"
+        )
+        row.owner_kind = "current"
+        row.is_current = True
+    db.flush()
+
+
+def _building_rebind_target(
+    db,
+    *,
+    parent_generation_id,
+    reservations,
+    quantities,
+    physical_batch=None,
+    sealed_parent_generation_id=None,
+):
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    target_batch = physical_batch or parent.physical_import_batch
+    target = models.LedgerGeneration(
+        generation_key=f"r4-rebind-target-{uuid4().hex[:12]}",
+        status="building",
+        cutoff=(parent.cutoff if physical_batch is None else target_batch.cutoff),
+        source_watermarks={
+            "parent_generation_id": int(
+                sealed_parent_generation_id
+                if sealed_parent_generation_id is not None
+                else parent.id
+            ),
+            "generation_kind": "obligation_refresh",
+        },
+        capabilities={"physical_ledger": True, "reservation_replay": True},
+        physical_import_batch=target_batch,
+        algorithm_version="r4-tests",
+    )
+    db.add(target)
+    db.flush()
+    target_reservations = []
+    for previous, quantity in zip(reservations, quantities, strict=True):
+        row = models.ReservationEntry(
+            ledger_generation_id=int(target.id),
+            item_id=int(previous.item_id),
+            run_id=int(previous.run_id),
+            freeze_version=int(previous.freeze_version),
+            requirement_id=int(previous.requirement_id),
+            priority_period_from=previous.priority_period_from,
+            priority_period_to=previous.priority_period_to,
+            realization_mode="buy",
+            reserved_qty=Decimal(quantity),
+            replenishment_required_qty=Decimal(quantity),
+            lifecycle_status="active",
+            current_identity=(
+                f"reservation:req:{int(previous.requirement_id)}:mode:buy"
+            ),
+            owner_kind="building",
+            is_current=False,
+        )
+        db.add(row)
+        target_reservations.append(row)
+    db.flush()
+    return target, target_reservations
+
+
 def test_current_application_requires_explicit_complete_scope(db_session):
     generation_id, _item_id, reservations, facts = _world(db_session)
     with pytest.raises(CurrentReplenishmentError, match="complete scope"):
@@ -698,8 +786,11 @@ def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_
             )
         )
     db_session.flush()
+    physical_revision = int(
+        db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id
+    )
     results = apply_current_replenishment_for_accepted_generation(
-        db_session, generation_id=generation_id, source_revision=9
+        db_session, generation_id=generation_id, source_revision=physical_revision
     )
     db_session.commit()
     assert results and results[0].inserted == 2
@@ -715,6 +806,324 @@ def test_accepted_physical_publication_uses_current_writer_and_retires_supplier_
     assert read_current_replenishment(
         db_session, generation_id=generation_id, item_id=item_id
     )
+
+
+def test_accepted_adapter_rebinds_same_physical_revision_and_recomputes_allocations(
+    db_session,
+):
+    generation_id, item_id, reservations, facts = _world(
+        db_session, prefix="same-physical-rebind"
+    )
+    _add_supplier_provenance(
+        db_session, generation_id, facts, prefix="parent-provenance"
+    )
+    physical_revision = int(
+        db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id
+    )
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id
+    )
+    _mark_reservations_current(db_session, reservations)
+    state = db_session.query(models.CurrentReplenishmentState).one()
+    previous_checksum = str(state.scope_checksum)
+    target, _target_reservations = _building_rebind_target(
+        db_session,
+        parent_generation_id=generation_id,
+        reservations=reservations,
+        quantities=("5", "10"),
+    )
+    _add_supplier_provenance(
+        db_session, target.id, facts, prefix="target-provenance"
+    )
+
+    result = apply_current_replenishment_for_accepted_generation(
+        db_session,
+        generation_id=int(target.id),
+        allow_building=True,
+    )
+    db_session.flush()
+
+    totals = {}
+    for reservation_id, quantity in (
+        db_session.query(
+            models.ReservationConsumptionAllocation.reservation_id,
+            models.ReservationConsumptionAllocation.allocated_qty,
+        )
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.item_id == item_id,
+        )
+        .all()
+    ):
+        reservation_id = int(reservation_id)
+        totals[reservation_id] = totals.get(reservation_id, Decimal("0")) + Decimal(
+            str(quantity)
+        )
+    assert result[0].changed_pairs > 0
+    assert totals == {
+        int(reservations[0].id): Decimal("5"),
+        int(reservations[1].id): Decimal("5"),
+    }
+    state = db_session.query(models.CurrentReplenishmentState).one()
+    assert int(state.source_revision) == physical_revision
+    assert int(state.ledger_generation_id) == int(target.id)
+    assert str(state.scope_checksum) != previous_checksum
+
+    audit_count = db_session.query(models.CurrentReplenishmentAudit).count()
+    retry = apply_current_replenishment_for_accepted_generation(
+        db_session,
+        generation_id=int(target.id),
+        allow_building=True,
+    )
+    assert retry[0].idempotent is True
+    assert retry[0].changed_pairs == 0
+    assert db_session.query(models.CurrentReplenishmentAudit).count() == audit_count
+    _target_reservations[0].reserved_qty = Decimal("6")
+    _target_reservations[0].replenishment_required_qty = Decimal("6")
+    db_session.flush()
+    with pytest.raises(CurrentReplenishmentError, match="payload drift"):
+        apply_current_replenishment_for_accepted_generation(
+            db_session,
+            generation_id=int(target.id),
+            allow_building=True,
+        )
+
+
+def test_generic_raw_facts_cannot_opt_into_same_revision_rebind(db_session):
+    generation_id, item_id, reservations, facts = _world(
+        db_session, prefix="raw-rebind-rejected"
+    )
+    _add_supplier_provenance(db_session, generation_id, facts, prefix="raw-parent")
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id
+    )
+    _mark_reservations_current(db_session, reservations)
+    target, target_reservations = _building_rebind_target(
+        db_session,
+        parent_generation_id=generation_id,
+        reservations=reservations,
+        quantities=("5", "10"),
+    )
+    revision = int(target.physical_import_batch_id)
+    pool = str(target_reservations[0].planning_stock_pool)
+    raw_facts = tuple(
+        Fact(
+            **{
+                **fact.__dict__,
+                "planning_stock_pool": pool,
+                "characteristic_ref": "",
+                "organization_ref": "",
+            }
+        )
+        for fact in facts
+    )
+    raw_reserves = tuple(
+        Reserve(**{**reserve.__dict__, "planning_stock_pool": pool})
+        for reserve in _reserves(target_reservations)
+    )
+    with pytest.raises(CurrentReplenishmentError, match="payload drift"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=int(target.id),
+            source_key="accepted-physical-receipts",
+            source_revision=revision,
+            facts=raw_facts,
+            reserves=raw_reserves,
+            complete_scope=True,
+            distribution_scope=(item_id, "", "", pool, "buy"),
+            allow_building=True,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=int(target.id),
+            source_key="accepted-physical-receipts",
+            source_revision=revision,
+            facts=raw_facts,
+            reserves=raw_reserves,
+            complete_scope=True,
+            distribution_scope=(item_id, "", "", pool, "buy"),
+            allow_building=True,
+            allow_same_revision_rebind=True,
+        )
+
+
+def test_identical_same_revision_cross_generation_rebind_keeps_assignments(
+    db_session,
+):
+    generation_id, _item_id, reservations, facts = _world(
+        db_session, prefix="identical-cross-generation"
+    )
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:identical-cross-generation",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    _mark_reservations_current(db_session, reservations)
+    before_ids = {
+        (int(row.sle_id), int(row.reservation_id)): int(row.id)
+        for row in db_session.query(models.ReservationConsumptionAllocation).all()
+    }
+    state = db_session.query(models.CurrentReplenishmentState).one()
+    before_checksum = str(state.scope_checksum)
+    parent = db_session.get(models.LedgerGeneration, generation_id)
+    target = models.LedgerGeneration(
+        generation_key=f"r4-identical-target-{uuid4().hex[:12]}",
+        status="building",
+        cutoff=parent.cutoff,
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities=dict(parent.capabilities or {}),
+        physical_import_batch_id=int(parent.physical_import_batch_id),
+        algorithm_version="r4-tests",
+    )
+    db_session.add(target)
+    db_session.flush()
+
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=int(target.id),
+        source_key="physical:identical-cross-generation",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+        allow_building=True,
+    )
+
+    after_ids = {
+        (int(row.sle_id), int(row.reservation_id)): int(row.id)
+        for row in db_session.query(models.ReservationConsumptionAllocation).all()
+    }
+    state = db_session.query(models.CurrentReplenishmentState).one()
+    assert result.changed_pairs == 0
+    assert result.idempotent is False
+    assert after_ids == before_ids
+    assert str(state.scope_checksum) == before_checksum
+    assert int(state.ledger_generation_id) == int(target.id)
+
+
+def test_same_batch_rebind_rejects_generation_outside_sealed_parent_lineage(
+    db_session,
+):
+    generation_id, _item_id, reservations, facts = _world(
+        db_session, prefix="unrelated-lineage"
+    )
+    _add_supplier_provenance(db_session, generation_id, facts, prefix="lineage-parent")
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id
+    )
+    _mark_reservations_current(db_session, reservations)
+    parent = db_session.get(models.LedgerGeneration, generation_id)
+    unrelated = models.LedgerGeneration(
+        generation_key=f"r4-unrelated-{uuid4().hex[:12]}",
+        status="accepted",
+        cutoff=parent.cutoff,
+        accepted_at=parent.cutoff,
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch_id=int(parent.physical_import_batch_id),
+        algorithm_version="r4-tests",
+    )
+    db_session.add(unrelated)
+    db_session.flush()
+    target, _target_reservations = _building_rebind_target(
+        db_session,
+        parent_generation_id=generation_id,
+        sealed_parent_generation_id=int(unrelated.id),
+        reservations=reservations,
+        quantities=("5", "10"),
+    )
+    _add_supplier_provenance(db_session, target.id, facts, prefix="lineage-target")
+    with pytest.raises(CurrentReplenishmentError, match="outside.*sealed parent lineage"):
+        apply_current_replenishment_for_accepted_generation(
+            db_session, generation_id=int(target.id), allow_building=True
+        )
+
+
+def test_accepted_adapter_rejects_incomplete_physical_pages(db_session):
+    generation_id, _item_id, _reservations, facts = _world(
+        db_session, prefix="incomplete-pages"
+    )
+    generation = db_session.get(models.LedgerGeneration, generation_id)
+    batch = generation.physical_import_batch
+    batch.expected_page_count = 2
+    batch.received_page_count = 1
+    db_session.add(
+        models.PhysicalImportPage(
+            import_batch_id=int(batch.id),
+            page_no=1,
+            page_token="r4-page-1",
+            content_hash="f" * 64,
+        )
+    )
+    _add_supplier_provenance(db_session, generation_id, facts, prefix="incomplete")
+    with pytest.raises(CurrentReplenishmentError, match="incomplete or reordered pages"):
+        apply_current_replenishment_for_accepted_generation(
+            db_session, generation_id=generation_id
+        )
+
+
+def test_accepted_adapter_uses_unsuperseded_fact_despite_mutable_active_flag(
+    db_session,
+):
+    generation_id, _item_id, _reservations, facts = _world(
+        db_session, prefix="inactive-visible"
+    )
+    sle_id = int(facts[0].fact_id)
+    generation = db_session.get(models.LedgerGeneration, generation_id)
+    generation.physical_import_batch.cutoff = None
+    db_session.get(models.StockLedgerEntry, sle_id).active = False
+    _add_supplier_provenance(db_session, generation_id, facts, prefix="inactive")
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id
+    )
+    assert results[0].changed_pairs > 0
+    assert db_session.query(models.ReservationConsumptionAllocation).filter(
+        models.ReservationConsumptionAllocation.sle_id == sle_id,
+        models.ReservationConsumptionAllocation.is_current.is_(True),
+    ).count() > 0
+
+
+def test_next_physical_batch_uses_normal_revision_advance(db_session):
+    generation_id, _item_id, reservations, facts = _world(
+        db_session, prefix="next-physical"
+    )
+    _add_supplier_provenance(db_session, generation_id, facts, prefix="next-parent")
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id
+    )
+    _mark_reservations_current(db_session, reservations)
+    next_batch = models.PhysicalImportBatch(
+        batch_key=f"r4-next-physical-{uuid4().hex[:12]}",
+        status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc),
+        source_watermarks={"next": True},
+        completed_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    db_session.add(next_batch)
+    db_session.flush()
+    target, _target_reservations = _building_rebind_target(
+        db_session,
+        parent_generation_id=generation_id,
+        reservations=reservations,
+        quantities=("5", "10"),
+        physical_batch=next_batch,
+    )
+    _add_supplier_provenance(db_session, target.id, facts, prefix="next-target")
+
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(target.id), allow_building=True
+    )
+
+    state = db_session.query(models.CurrentReplenishmentState).one()
+    assert results[0].changed_pairs > 0
+    assert int(state.source_revision) == int(next_batch.id)
+    assert int(state.ledger_generation_id) == int(target.id)
 
 
 def test_material_consumption_role_is_excluded_from_current_replenishment_reader(

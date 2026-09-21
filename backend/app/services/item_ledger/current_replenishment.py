@@ -120,6 +120,27 @@ class BoundedBuyReceiptDeltaManifest:
     backdate_from: datetime | None = None
 
 
+_ACCEPTED_GENERATION_PROOF_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _AcceptedGenerationSourceProof:
+    """Internal evidence for rebinding one canonical accepted physical prefix.
+
+    This is deliberately unavailable on the generic writer API.  Only the
+    accepted-generation adapter can mint it after checking the completed
+    physical batch and the target's sealed parent lineage.
+    """
+
+    token: object
+    scope_key: str
+    previous_generation_id: int
+    target_generation_id: int
+    physical_import_batch_id: int
+    previous_scope_checksum: str
+    input_checksum: str
+
+
 def _decimal(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
@@ -140,6 +161,83 @@ def _comparable_datetime(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+def _accepted_generation_source_proof(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    source_revision: int,
+    distribution_scope: DistributionScope,
+    receipt_facts: tuple[object, ...],
+    reserves: tuple[Reserve, ...],
+    history_mode: str,
+) -> _AcceptedGenerationSourceProof | None:
+    """Validate a same-physical-prefix logical-generation transition."""
+
+    scope_key = _scope_key(distribution_scope)
+    state = (
+        db.query(models.CurrentReplenishmentState)
+        .filter(models.CurrentReplenishmentState.scope_key == scope_key)
+        .populate_existing()
+        .one_or_none()
+    )
+    if state is None or int(state.source_revision) != int(source_revision):
+        return None
+    input_checksum = _receipt_input_checksum(
+        receipt_facts,
+        reserves,
+        scope_key,
+        history_mode,
+    )
+    if _text(state.scope_checksum) == input_checksum:
+        return None
+    previous_generation_id = int(state.ledger_generation_id)
+    if previous_generation_id == int(generation.id):
+        return None
+    if (
+        _text(generation.status) != "building"
+        or _text(state.status) != "completed"
+        or _text(state.source_key) != "accepted-physical-receipts"
+    ):
+        raise CurrentReplenishmentError(
+            "same physical revision rebind requires completed canonical BUILDING transition"
+        )
+    previous = db.get(models.LedgerGeneration, previous_generation_id)
+    if previous is None or _text(previous.status) != "accepted":
+        raise CurrentReplenishmentError(
+            "same physical revision rebind requires an accepted previous generation"
+        )
+    if (
+        int(previous.physical_import_batch_id or -1) != int(source_revision)
+        or int(generation.physical_import_batch_id or -1) != int(source_revision)
+        or _comparable_datetime(previous.cutoff)
+        != _comparable_datetime(generation.cutoff)
+    ):
+        raise CurrentReplenishmentError(
+            "same physical revision rebind changed the effective physical boundary"
+        )
+    from .live_plan_scope import sealed_generation_lineage_ids
+
+    try:
+        parent_lineage = sealed_generation_lineage_ids(db, generation)[1:]
+    except ValueError as exc:
+        raise CurrentReplenishmentError(
+            "same physical revision rebind has invalid sealed lineage"
+        ) from exc
+    if previous_generation_id not in parent_lineage:
+        raise CurrentReplenishmentError(
+            "previous current generation is outside the target sealed parent lineage"
+        )
+    return _AcceptedGenerationSourceProof(
+        token=_ACCEPTED_GENERATION_PROOF_TOKEN,
+        scope_key=scope_key,
+        previous_generation_id=previous_generation_id,
+        target_generation_id=int(generation.id),
+        physical_import_batch_id=int(source_revision),
+        previous_scope_checksum=_text(state.scope_checksum),
+        input_checksum=input_checksum,
+    )
 
 
 def _normalise_bounded_buy_manifest(
@@ -474,10 +572,7 @@ def apply_current_replenishment(
     receipt_facts: tuple[object, ...] = (),
     history_mode: str = "as_occurred",
     receipt_unmatched_return_qty: Decimal = Decimal("0"),
-    # Recovery may rebind the same completed accepted physical prefix to a
-    # newer obligation generation.  This is opt-in; generic writers retain
-    # the strict combined-payload drift guard.
-    allow_same_revision_rebind: bool = False,
+    _accepted_generation_proof: _AcceptedGenerationSourceProof | None = None,
 ) -> CurrentReplenishmentResult:
     """Apply one complete accepted-fact scope atomically.
 
@@ -525,6 +620,7 @@ def apply_current_replenishment(
         db.query(models.LedgerGeneration)
         .filter(models.LedgerGeneration.id == int(generation_id))
         .with_for_update()
+        .populate_existing()
         .one_or_none()
     )
     if generation is None:
@@ -538,6 +634,7 @@ def apply_current_replenishment(
         db.query(models.CurrentReplenishmentState)
         .filter(models.CurrentReplenishmentState.scope_key == canonical_scope_key)
         .with_for_update()
+        .populate_existing()
         .one_or_none()
     )
     if state is not None:
@@ -548,50 +645,53 @@ def apply_current_replenishment(
                 "source stream changed for canonical distribution scope"
             )
         previous_revision = int(state.source_revision)
+        payload_drift = False
         if revision < previous_revision:
             raise CurrentReplenishmentError(
                 f"stale source revision {revision}; current is {previous_revision}"
             )
         if revision == previous_revision:
+            generation_changed = int(state.ledger_generation_id) != int(generation.id)
+            valid_proof = bool(
+                _accepted_generation_proof is not None
+                and _accepted_generation_proof.token
+                is _ACCEPTED_GENERATION_PROOF_TOKEN
+                and _accepted_generation_proof.scope_key == canonical_scope_key
+                and _accepted_generation_proof.previous_generation_id
+                == int(state.ledger_generation_id)
+                and _accepted_generation_proof.target_generation_id
+                == int(generation.id)
+                and _accepted_generation_proof.physical_import_batch_id
+                == revision
+                and _accepted_generation_proof.previous_scope_checksum
+                == _text(state.scope_checksum)
+                and _accepted_generation_proof.input_checksum == input_checksum
+                and generation_changed
+            )
             if _text(state.scope_checksum) != input_checksum:
-                previous_generation = db.get(
-                    models.LedgerGeneration, int(state.ledger_generation_id)
-                )
-                physical_batch = db.get(models.PhysicalImportBatch, revision)
-                same_accepted_physical_batch = bool(
-                    allow_same_revision_rebind
-                    and _text(source_key) == "accepted-physical-receipts"
-                    and _text(state.status) == "completed"
-                    and previous_generation is not None
-                    and _text(previous_generation.status) == "accepted"
-                    and int(previous_generation.physical_import_batch_id or -1) == revision
-                    and int(generation.physical_import_batch_id or -1) == revision
-                    and physical_batch is not None
-                    and _text(physical_batch.status) == "completed"
-                    and bool(physical_batch.source_complete)
-                )
-                if not same_accepted_physical_batch:
+                if not valid_proof:
                     raise CurrentReplenishmentError(
                         "same source revision has payload drift"
                     )
+                payload_drift = True
             if _text(state.status) != "completed":
                 raise CurrentReplenishmentError("current source marker is still applying")
-            generation_changed = int(state.ledger_generation_id) != int(generation.id)
             if generation_changed:
                 state.ledger_generation_id = int(generation.id)
                 state.updated_at = datetime.now(timezone.utc)
                 db.flush()
-            return CurrentReplenishmentResult(
-                generation_id=int(generation.id),
-                source_key=_text(source_key),
-                source_revision=revision,
-                inserted=0,
-                updated=0,
-                deleted=0,
-                changed_pairs=0,
-                audit_events=0,
-                idempotent=not generation_changed,
-            )
+            if not payload_drift:
+                return CurrentReplenishmentResult(
+                    generation_id=int(generation.id),
+                    source_key=_text(source_key),
+                    source_revision=revision,
+                    inserted=0,
+                    updated=0,
+                    deleted=0,
+                    changed_pairs=0,
+                    audit_events=0,
+                    idempotent=not generation_changed,
+                )
     else:
         state = models.CurrentReplenishmentState(
             scope_key=canonical_scope_key,
@@ -950,7 +1050,7 @@ def apply_current_receipt_replay(
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     allow_building: bool = False,
     validated_visible_ids: Iterable[int] | None = None,
-    allow_same_revision_rebind: bool = False,
+    _accepted_generation_proof: _AcceptedGenerationSourceProof | None = None,
 ) -> CurrentReplenishmentResult:
     """Publish signed correction/return replay through the R4 current writer."""
 
@@ -1077,7 +1177,7 @@ def apply_current_receipt_replay(
         receipt_facts=rows,
         history_mode=history_mode,
         receipt_unmatched_return_qty=replay.unmatched_return_qty,
-        allow_same_revision_rebind=allow_same_revision_rebind,
+        _accepted_generation_proof=_accepted_generation_proof,
     )
 
 
@@ -1155,7 +1255,6 @@ def apply_current_replenishment_for_accepted_generation(
     generation_id: int,
     source_revision: int | None = None,
     allow_building: bool = False,
-    allow_same_revision_rebind: bool = False,
 ) -> tuple[CurrentReplenishmentResult, ...]:
     """Publish current supplier-receipt replenishment at physical acceptance.
 
@@ -1175,6 +1274,21 @@ def apply_current_replenishment_for_accepted_generation(
         raise CurrentReplenishmentError(
             "current replenishment publication requires an accepted generation"
         )
+    revision = int(generation.physical_import_batch_id or 0)
+    if source_revision is not None and int(source_revision) != revision:
+        raise CurrentReplenishmentError(
+            "source_revision must equal the generation physical_import_batch_id"
+        )
+    from .physical_visibility import (
+        PhysicalVisibilityError,
+        require_import_batch,
+        visible_sles_for_generation,
+    )
+
+    try:
+        require_import_batch(db, revision)
+    except PhysicalVisibilityError as exc:
+        raise CurrentReplenishmentError(str(exc)) from exc
     reservation_query = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.lifecycle_status == "active",
         models.ReservationEntry.realization_mode == "buy",
@@ -1233,13 +1347,13 @@ def apply_current_replenishment_for_accepted_generation(
     # Use the complete visible physical prefix, then restrict it by persisted
     # typed supplier provenance.  A raw positive ``receipt`` movement is not
     # sufficient: internal transfers and other receipt-like rows are not BUY.
-    from .physical_visibility import visible_sles_for_generation
-
-    visible = {
-        int(row.id): row
-        for row in visible_sles_for_generation(db, int(generation_id))
-        if bool(row.active)
-    }
+    try:
+        visible = {
+            int(row.id): row
+            for row in visible_sles_for_generation(db, int(generation_id))
+        }
+    except PhysicalVisibilityError as exc:
+        raise CurrentReplenishmentError(str(exc)) from exc
     provenance = (
         db.query(models.StockLedgerSupplierReceiptProvenance)
         .filter(
@@ -1294,11 +1408,6 @@ def apply_current_replenishment_for_accepted_generation(
                 correction_receipt_ref=_text(row.correction_receipt_ref) or None,
             )
         )
-    revision = int(
-        source_revision
-        if source_revision is not None
-        else generation.physical_import_batch_id
-    )
     result: list[CurrentReplenishmentResult] = []
     for item_id, scope_set in sorted(item_scopes.items()):
         scope = next(iter(scope_set))
@@ -1330,6 +1439,15 @@ def apply_current_replenishment_for_accepted_generation(
             for fact in typed_facts
             if int(fact.item_id) == item_id
         )
+        source_proof = _accepted_generation_source_proof(
+            db,
+            generation=generation,
+            source_revision=revision,
+            distribution_scope=scope,
+            receipt_facts=facts,
+            reserves=reserve_rows,
+            history_mode="as_occurred",
+        )
         result.append(
             apply_current_receipt_replay(
                 db,
@@ -1343,7 +1461,7 @@ def apply_current_replenishment_for_accepted_generation(
                 exact_allocation_caps=exact_caps,
                 history_mode="as_occurred",
                 allow_building=allow_building,
-                allow_same_revision_rebind=allow_same_revision_rebind,
+                _accepted_generation_proof=source_proof,
             )
         )
     return tuple(result)

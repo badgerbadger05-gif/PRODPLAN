@@ -699,7 +699,6 @@ def run_obligation_refresh(
         db,
         generation_id=target_id,
         allow_building=True,
-        allow_same_revision_rebind=bool(recovery_source_current),
     )
     supplier_summary = {
         "provenance_count": supplier.provenance_count,
