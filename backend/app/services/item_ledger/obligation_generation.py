@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -398,6 +398,8 @@ def carry_forward_retained_reservations(
     preserve_realization: bool = False,
     source_current: bool = False,
     preserve_realization_before: datetime | None = None,
+    expected_source_fingerprints: Mapping[int, Sequence[str]] | None = None,
+    recovery_source_generations: Mapping[int, int] | None = None,
 ) -> int:
     """Copy immutable retained obligations, but never carry physical realization.
 
@@ -414,22 +416,57 @@ def carry_forward_retained_reservations(
         models.ReservationEntry.ledger_generation_id == int(target_generation_id),
         models.ReservationEntry.run_id.in_(run_ids),
     ).count()
-    source_query = db.query(models.ReservationEntry).filter(
-        models.ReservationEntry.run_id.in_(run_ids),
-    )
-    if source_current:
+    if source_current and recovery_source_generations is not None:
+        source_by_id: list[models.ReservationEntry] = []
+        source_map = {int(key): int(value) for key, value in recovery_source_generations.items()}
+        if set(source_map) != set(run_ids):
+            raise ObligationGenerationError(
+                "recovery source generation map must equal the manifest retain set"
+            )
+        for run_id in run_ids:
+            rows = db.query(models.ReservationEntry).filter(
+                models.ReservationEntry.run_id == run_id,
+                (
+                    models.ReservationEntry.is_current.is_(True)
+                    if source_map[run_id] < 0
+                    else models.ReservationEntry.ledger_generation_id == source_map[run_id]
+                ),
+            ).order_by(models.ReservationEntry.id.asc()).all()
+            source_by_id.extend(rows)
+        source_entries = source_by_id
+    else:
+        source_query = db.query(models.ReservationEntry).filter(
+            models.ReservationEntry.run_id.in_(run_ids),
+        )
+        if source_current:
         # Physical refreshes carry the stable accepted owner forward.  Its
         # ledger_generation_id is provenance and may point at an older
         # physical fork, so selecting by the exact current marker is the only
         # safe way to find the owner after a no-op physical publication.
-        source_query = source_query.filter(
-            models.ReservationEntry.is_current.is_(True),
-        )
-    else:
-        source_query = source_query.filter(
-            models.ReservationEntry.ledger_generation_id == int(parent_generation_id),
-        )
-    source_entries = source_query.order_by(models.ReservationEntry.id.asc()).all()
+            source_query = source_query.filter(
+                models.ReservationEntry.is_current.is_(True),
+            )
+        else:
+            source_query = source_query.filter(
+                models.ReservationEntry.ledger_generation_id == int(parent_generation_id),
+            )
+        source_entries = source_query.order_by(models.ReservationEntry.id.asc()).all()
+    if source_current and expected_source_fingerprints is not None:
+        expected = {
+            int(key): tuple(sorted(str(value) for value in values))
+            for key, values in expected_source_fingerprints.items()
+        }
+        actual_by_run: dict[int, list[models.ReservationEntry]] = {}
+        for row in source_entries:
+            actual_by_run.setdefault(int(row.run_id), []).append(row)
+        actual = {
+            run_id: tuple(sorted(_current_reservation_owner_fingerprint(row) for row in rows))
+            for run_id, rows in actual_by_run.items()
+        }
+        if actual != expected:
+            raise ObligationGenerationError(
+                "recovery owner set does not match the exact current-owner fingerprint set"
+            )
     if existing_count:
         if existing_count != len(source_entries):
             raise ObligationGenerationError(
@@ -570,3 +607,22 @@ def carry_forward_retained_reservations(
             ))
     db.flush()
     return len(source_entries)
+
+
+def _current_reservation_owner_fingerprint(row: models.ReservationEntry) -> str:
+    """Stable identity/quantity proof for the explicit recovery boundary."""
+    payload = {
+        "run_id": int(row.run_id),
+        "current_identity": str(row.current_identity or "").strip(),
+        "item_id": int(row.item_id),
+        "requirement_id": int(row.requirement_id),
+        "reserved_qty": str(row.reserved_qty),
+        "replenishment_required_qty": str(row.replenishment_required_qty),
+        "owner_kind": str(row.owner_kind or "").strip(),
+        "is_current": bool(row.is_current),
+        "lifecycle_status": str(row.lifecycle_status or "").strip(),
+        "realization_mode": str(row.realization_mode or "").strip(),
+    }
+    return sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()

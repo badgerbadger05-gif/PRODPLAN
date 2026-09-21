@@ -17,6 +17,7 @@ from decimal import Decimal
 from app import models
 from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
+    _current_reservation_owner_fingerprint,
 )
 from app.services.item_ledger.generation_lifecycle import (
     _d,
@@ -147,3 +148,58 @@ def test_incremental_carry_forward_preserves_realization_against_visible_sle(
     assert all(
         e.cycle_id == f"obligation-carry:g{int(target.id)}" for e in events
     )
+
+    # Explicit recovery may select the stable current owner even when its
+    # provenance generation is older than the accepted parent.  The source
+    # map and fingerprint are mandatory, so this cannot widen normal refresh.
+    sealed_source = models.LedgerGeneration(
+        generation_key="cf-recovery-source", status="accepted", cutoff=CUTOFF,
+        source_watermarks={}, capabilities={},
+        physical_import_batch_id=int(physical.id), algorithm_version="test",
+        accepted_at=CUTOFF,
+    )
+    db.add(sealed_source)
+    db.flush()
+    reservation.ledger_generation_id = int(sealed_source.id)
+    second_item = models.Item(item_code="CF-ITEM-2", item_name="carry item 2", status="active")
+    db.add(second_item)
+    db.flush()
+    second_requirement = models.MrpRequirement(
+        run_id=int(run.run_id), item_id=int(second_item.item_id),
+        total_required_qty=Decimal("3"), net_required_qty=Decimal("3"),
+        period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+    )
+    db.add(second_requirement)
+    db.flush()
+    second_reservation = models.ReservationEntry(
+        ledger_generation_id=int(sealed_source.id), item_id=int(second_item.item_id),
+        run_id=int(run.run_id), freeze_version=1,
+        requirement_id=int(second_requirement.id),
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        reserved_qty=Decimal("3"), covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("3"), replenishment_received_qty=Decimal("0"),
+        realized_qty=Decimal("0"), lifecycle_status="active", opened_at=CUTOFF,
+    )
+    db.add(second_reservation)
+    db.flush()
+    recovery_target = models.LedgerGeneration(
+        generation_key="cf-recovery-target", status="building", cutoff=CUTOFF,
+        source_watermarks={}, capabilities={},
+        physical_import_batch_id=int(physical.id), algorithm_version="test",
+    )
+    db.add(recovery_target)
+    db.flush()
+    carried_recovery = carry_forward_retained_reservations(
+        db, parent_generation_id=int(parent.id),
+        target_generation_id=int(recovery_target.id),
+        retained_run_ids=(int(run.run_id),), preserve_realization=False,
+        source_current=True,
+        recovery_source_generations={int(run.run_id): int(sealed_source.id)},
+        expected_source_fingerprints={
+            int(run.run_id): (
+                _current_reservation_owner_fingerprint(reservation),
+                _current_reservation_owner_fingerprint(second_reservation),
+            )
+        },
+    )
+    assert carried_recovery == 2

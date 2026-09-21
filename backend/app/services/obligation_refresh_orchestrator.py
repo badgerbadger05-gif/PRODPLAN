@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -431,6 +431,9 @@ def run_obligation_refresh(
     explicit_make_transfer_recorders: set[str] | None = None,
     accepted_at: datetime | None = None,
     allow_stale_parent: bool = False,
+    recovery_source_current: bool = False,
+    recovery_owner_fingerprints: Mapping[int, Sequence[str]] | None = None,
+    recovery_source_generations: Mapping[int, int] | None = None,
 ) -> ObligationRefreshOrchestrationResult:
     """Build and atomically publish every refresh/add candidate.
 
@@ -440,6 +443,12 @@ def run_obligation_refresh(
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
+    if recovery_source_current and (
+        not recovery_owner_fingerprints or not recovery_source_generations
+    ):
+        raise ObligationRefreshOrchestratorError(
+            "recovery requires exact owner fingerprints and source generations"
+        )
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
     assert_output_repair_allows(
@@ -548,6 +557,23 @@ def run_obligation_refresh(
         for entry in manifest.entries
         if entry.get("action") == "retain"
     ))
+    if recovery_source_current:
+        # Recovery is an explicit, manifest-bound mode.  It may read the
+        # stable current ReservationEntry owner from an older generation, but
+        # it may not widen the accepted plan set or silently change normal
+        # refresh semantics.
+        if not recovery_owner_fingerprints or not recovery_source_generations:
+            raise ObligationRefreshOrchestratorError(
+                "recovery requires exact owner fingerprints and source generations"
+            )
+        if {int(key) for key in recovery_owner_fingerprints} != set(retained_run_ids):
+            raise ObligationRefreshOrchestratorError(
+                "recovery owner fingerprint set must equal the accepted manifest retain set"
+            )
+        if {int(key) for key in recovery_source_generations} != set(retained_run_ids):
+            raise ObligationRefreshOrchestratorError(
+                "recovery source generation set must equal the accepted manifest retain set"
+            )
     # Retained obligations are stable business rows, but the target generation
     # must still contain their obligation basis before replay and current-owner
     # publication.  Otherwise publication sees only replacement candidates and
@@ -560,6 +586,9 @@ def run_obligation_refresh(
         target_generation_id=target_id,
         retained_run_ids=retained_run_ids,
         preserve_realization=False,
+        source_current=bool(recovery_source_current),
+        expected_source_fingerprints=recovery_owner_fingerprints,
+        recovery_source_generations=recovery_source_generations,
     )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
@@ -755,4 +784,40 @@ def run_obligation_refresh(
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,
+    )
+
+
+def run_guarded_obligation_recovery(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    generation_key: str,
+    source_generation_by_run: Mapping[int, int],
+    owner_fingerprints: Mapping[int, Sequence[str]],
+    started_by: str | None = None,
+    accepted_at: datetime | None = None,
+    config_snapshot: Mapping[str, Any] | None = None,
+) -> ObligationRefreshOrchestrationResult:
+    """Recover retained owners from an accepted manifest, once, with proof.
+
+    A source value of ``-1`` means the exact ``is_current`` owner; any other
+    value is an exact sealed source generation (used for an accepted owner
+    whose current marker was not promoted).  This wrapper deliberately has no
+    add/replace/retire inputs: the accepted parent's retain manifest is the
+    complete business scope.  Normal refreshes never enter this mode.
+    """
+    if not source_generation_by_run or not owner_fingerprints:
+        raise ObligationRefreshOrchestratorError(
+            "guarded recovery requires a non-empty exact owner proof"
+        )
+    return run_obligation_refresh(
+        db,
+        parent_generation_id=int(parent_generation_id),
+        generation_key=generation_key,
+        started_by=started_by,
+        accepted_at=accepted_at,
+        config_snapshot=config_snapshot or {},
+        recovery_source_current=True,
+        recovery_owner_fingerprints=owner_fingerprints,
+        recovery_source_generations=source_generation_by_run,
     )
