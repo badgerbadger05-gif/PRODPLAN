@@ -675,6 +675,10 @@ def _buy_scope_for_receipt(
     if not _is_supplier_receipt(row):
         return None
     warehouse = _text(row.warehouse_ref1c)
+    # Only membership is used, never the mapped value: today every contour
+    # warehouse maps to the one canonical pool (``pool_key_for``), so the
+    # value would be redundant and comparing it would be a second rule.  It
+    # becomes meaningful again when multi-pool support widens that function.
     if not warehouse or not _text(planning_pool_by_warehouse.get(warehouse)):
         return None
     return _single_scope_or_fail(
@@ -1280,7 +1284,11 @@ def _publish_forward_physical_refresh_current(
     # physical quantity nobody can count - fail closed here rather than
     # publish coverage that silently drops to zero.
     uncovered = lost_supplier_receipt_provenance_sle_ids(
-        db, ledger_generation_id=int(target.id), limit=9
+        db,
+        ledger_generation_id=int(target.id),
+        rows=rows,
+        contour=planning_pool_by_warehouse,
+        limit=9,
     )
     if uncovered:
         raise ForwardPhysicalRefreshUnavailable(
@@ -1312,6 +1320,11 @@ def _publish_forward_physical_refresh_current(
     # delta because that is what this refresh is responsible for, and because
     # "produced no allocation" is not by itself a defect - a surplus output
     # beyond the open requirement legitimately allocates nothing.
+    # With both sides keyed through the canonical collapse, a fact whose item
+    # has a live MAKE owner always resolves to a scope - so this can only
+    # fire when the publisher and the writer disagree, i.e. when the scope
+    # plumbing between them drops a fact.  That is what it guards now, and it
+    # is the regression that produced 492 unrealized outputs on the stand.
     published_make_scopes = set(make_scopes)
     unscoped = tuple(
         int(row.id) for row in rows

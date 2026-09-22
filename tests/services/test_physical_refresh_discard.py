@@ -653,22 +653,30 @@ def test_retention_holds_only_the_provenance_table_while_evidence_is_missing(
         lambda db, gid: (False, "evidence is missing"),
     )
     executed = []
+    real_execute = db_session.execute
 
     class _Result:
         rowcount = 0
 
-    def _execute(statement, params=None):
-        executed.append(str(statement).split("DELETE FROM", 1)[1].split()[0])
+    def _execute(statement, *args, **kwargs):
+        rendered = str(statement)
+        if "DELETE FROM" not in rendered:
+            return real_execute(statement, *args, **kwargs)
+        executed.append(rendered.split("DELETE FROM", 1)[1].split()[0])
         return _Result()
 
+    parent, _candidate, _kept, _item = _world(db_session)
     monkeypatch.setattr(db_session, "execute", _execute)
 
-    removed = retention.prune_retired_execution_projections(db_session, 1)
+    removed = retention.prune_retired_execution_projections(db_session, int(parent.id))
 
     assert "stock_ledger_supplier_receipt_provenance" not in executed
     assert "replenishment_work_item" in executed
     assert "assembly_readiness" in executed
     assert removed["stock_ledger_supplier_receipt_provenance"] == 0
-    assert removed[
-        "stock_ledger_supplier_receipt_provenance_retained_reason"
-    ] == "evidence is missing"
+    # The hold is visible: logged, and recorded on the generation itself.
+    generation = db_session.get(models.LedgerGeneration, int(parent.id))
+    assert dict(generation.source_watermarks or {})[retention.RETENTION_HOLD_KEY] == {
+        "table": "stock_ledger_supplier_receipt_provenance",
+        "reason": "evidence is missing",
+    }

@@ -1307,3 +1307,59 @@ def test_historical_untyped_receipt_does_not_block_a_later_refresh(
 
     assert result.target_generation_id == target.id
     db_session.rollback()
+
+
+def test_second_refresh_over_a_rework_owner_keeps_one_allocation(
+    db_session, monkeypatch,
+):
+    """A rework owner's allocation must be visible to the next replay.
+
+    Rework owners are realized inside the MAKE scope, but the existing
+    allocations were selected by ``realization_mode == scope[4]`` - so a
+    rework owner's allocation was invisible to every later refresh, which
+    re-inserted it each time: duplicated current basis, coverage counted
+    twice, and an IntegrityError on the partial current index.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-REWORK-TWICE")
+    owner, requirement = _make_owner(db_session, parent, item, required="10")
+    owner.realization_mode = "rework"
+    owner.current_identity = f"reservation:req:{int(requirement.id)}:mode:rework"
+    owner.organization_ref = ""
+    db_session.flush()
+    output = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов",
+        ref="rework-twice",
+    )
+    db_session.commit()
+
+    def _publish(revision):
+        _patch_payloads(monkeypatch, evidence=())
+        return publisher.publish_forward_physical_refresh_current(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            delta_manifest={"rows": (output,), "supersessions": ()},
+            odata_client=object(),
+            source_revision=revision,
+            planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        )
+
+    _publish(target_batch.id)
+    # The pointer moved on the first publication; put it back so the same
+    # bounded refresh can be replayed, which is what a retry does.
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = parent.id
+    target.status = "building"
+    db_session.flush()
+    _publish(target_batch.id + 1)
+
+    allocations = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, sle_id=output.id,
+    ).all()
+    assert [row.allocated_qty for row in allocations] == [Decimal("4.000")]
+    assert {int(row.reservation_id) for row in allocations} == {int(owner.id)}
+    db_session.refresh(owner)
+    # Coverage counted once, not twice.
+    assert owner.replenishment_received_qty == Decimal("4.000")
+    db_session.rollback()

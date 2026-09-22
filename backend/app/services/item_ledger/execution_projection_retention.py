@@ -10,10 +10,14 @@ generation is never touched.
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import models
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionProjectionRetentionError(RuntimeError):
@@ -208,7 +212,7 @@ def _provenance_prune_is_safe(db: Session, generation_id: int) -> tuple[bool, st
     lost = lost_supplier_receipt_provenance_sle_ids(
         db,
         ledger_generation_id=int(generation_id),
-        planning_pool_by_warehouse=mapping,
+        contour=mapping,
         limit=9,
     )
     if not lost:
@@ -218,6 +222,35 @@ def _provenance_prune_is_safe(db: Session, generation_id: int) -> tuple[bool, st
         "provenance for its visible supplier facts "
         f"(first uncovered sle_ids={[int(value) for value in lost[:8]]})"
     )
+
+
+_PROVENANCE_TABLE = "stock_ledger_supplier_receipt_provenance"
+#: Watermark key naming the table this publication could not prune yet.
+RETENTION_HOLD_KEY = "retention_hold"
+
+
+def _record_retention_hold(db: Session, generation_id: int, reason: str) -> None:
+    """Make the hold visible instead of returning it into a dropped value.
+
+    Both callers discarded the reason, so a stand could keep its supplier
+    provenance unpruned for ever with nothing in the sync status or the
+    generation manifest to say so.  The hold now lands in the accepted
+    generation's own watermarks and in the log.
+    """
+    logger.warning(
+        "retention hold: %s not pruned at generation %s: %s",
+        _PROVENANCE_TABLE, int(generation_id), reason,
+    )
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        return
+    marks = dict(generation.source_watermarks or {})
+    marks[RETENTION_HOLD_KEY] = {
+        "table": _PROVENANCE_TABLE,
+        "reason": str(reason)[:500],
+    }
+    generation.source_watermarks = marks
+    db.flush()
 
 
 def prune_retired_execution_projections(
@@ -239,18 +272,18 @@ def prune_retired_execution_projections(
     removed: dict[str, int] = {}
     for statement in _RETENTION_STATEMENTS:
         table = statement.split("DELETE FROM", 1)[1].split()[0]
-        if table == "stock_ledger_supplier_receipt_provenance" and not provenance_safe:
+        if table == _PROVENANCE_TABLE and not provenance_safe:
             removed[table] = 0
-            removed["stock_ledger_supplier_receipt_provenance_retained_reason"] = (
-                provenance_reason
-            )
             continue
         result = db.execute(text(statement), params)
         removed[table] = int(result.rowcount or 0)
+    if not provenance_safe:
+        _record_retention_hold(db, current_id, provenance_reason)
     return removed
 
 
 __all__ = [
     "ExecutionProjectionRetentionError",
+    "RETENTION_HOLD_KEY",
     "prune_retired_execution_projections",
 ]

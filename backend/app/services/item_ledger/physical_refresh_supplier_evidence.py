@@ -73,7 +73,8 @@ def lost_supplier_receipt_provenance_sle_ids(
     db: Session,
     *,
     ledger_generation_id: int,
-    planning_pool_by_warehouse: Mapping[str, str] | None = None,
+    rows: Sequence[models.StockLedgerEntry] | None = None,
+    contour: Mapping[str, str] | None = None,
     limit: int = 0,
 ) -> tuple[int, ...]:
     """Visible supplier facts this generation lost the typed evidence of.
@@ -94,10 +95,18 @@ def lost_supplier_receipt_provenance_sle_ids(
     the writer looked at the fact and typed it, which is what ownership means
     here.  ``limit`` bounds the diagnostic, never the verdict.
 
-    ``planning_pool_by_warehouse`` restricts the verdict to the live planning
-    contour.  A fact on a warehouse that has since left the contour is no
-    longer a planning receipt at all, so its missing evidence cannot make a
-    planning quantity uncountable and must not block publication for ever.
+    ``contour`` restricts the verdict to the live planning contour.  A fact on
+    a warehouse that has since left it is no longer a planning receipt at all,
+    so its missing evidence cannot make a planning quantity uncountable and
+    must not block publication for ever.
+
+    ``rows`` restricts it to an explicit fact set.  A publication passes its
+    own delta - CANON "Объём вычислений штатного физического refresh" makes
+    that the unit of work, and history the refresh did not touch is not its
+    verdict to give.  Maintenance (the repair phase, the GC probe) passes
+    ``None`` and stays prefix-wide on purpose, because repairing history is
+    exactly its job; both still pass the contour.  One function, two explicit
+    arguments, so the two cannot drift apart.
     """
     owned_here = exists().where(and_(
         models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
@@ -120,10 +129,10 @@ def lost_supplier_receipt_provenance_sle_ids(
         .with_entities(models.StockLedgerEntry.id)
         .order_by(models.StockLedgerEntry.id.asc())
     )
-    if planning_pool_by_warehouse is not None:
+    if contour is not None:
         warehouses = [
             str(key).strip()
-            for key, value in dict(planning_pool_by_warehouse).items()
+            for key, value in dict(contour).items()
             if str(key or "").strip() and str(value or "").strip()
         ]
         if not warehouses:
@@ -131,6 +140,11 @@ def lost_supplier_receipt_provenance_sle_ids(
         query = query.filter(
             models.StockLedgerEntry.warehouse_ref1c.in_(sorted(warehouses))
         )
+    if rows is not None:
+        row_ids = sorted({int(row.id) for row in rows})
+        if not row_ids:
+            return ()
+        query = query.filter(models.StockLedgerEntry.id.in_(row_ids))
     if limit and int(limit) > 0:
         query = query.limit(int(limit))
     return tuple(int(value) for (value,) in query.all())

@@ -716,108 +716,163 @@ def _current_scope_row_count(session: Session, *, entity_kind: str, scope_key: s
     ), {"entity_kind": str(entity_kind), "scope_key": str(scope_key)}).scalar_one() or 0)
 
 
-def _pre_deploy_backlog(session: Session, generation_id: int) -> dict[str, Any]:
-    """What the bounded refresh gates would see, counted before the deploy.
+def _owner_index(
+    session: Session,
+) -> dict[tuple[int, str], set[tuple[int, str, str, str, str]]]:
+    """Current owners indexed by ``(item_id, scope_mode)``, read once.
 
-    Report only.  Both counts are produced by the publication's own resolvers
-    (``physical_refresh_current_publish._buy_scope_for_receipt`` and
-    ``_make_scopes_for_assembly_row``), never by a second predicate written
-    here - two predicates would drift and this report would stop describing
-    the gate it is about.
-
-    The gates themselves are bounded to a refresh's delta; this is the
-    historical view over the whole visible prefix, which is exactly the part
-    the gates deliberately do not judge.
+    The backlog used to resolve every fact against the whole owner list,
+    which is quadratic on a real stand.  Owners are collapsed to their
+    canonical scope key here, so each fact below is a dict lookup.
     """
+    from app import models
+    from app.services.item_ledger.current_replenishment import scope_mode_for_owner
+    from app.services.mrp_freeze import distribution_scope_for
+
+    index: dict[tuple[int, str], set[tuple[int, str, str, str, str]]] = {}
+    for owner in session.query(models.ReservationEntry).filter(
+        models.ReservationEntry.is_current.is_(True),
+        models.ReservationEntry.owner_kind == "current",
+        models.ReservationEntry.lifecycle_status == "active",
+    ).all():
+        scope_mode = scope_mode_for_owner(str(owner.realization_mode or ""))
+        key = (int(owner.item_id), scope_mode)
+        index.setdefault(key, set()).add(distribution_scope_for(
+            int(owner.item_id),
+            str(owner.characteristic_ref or ""),
+            str(owner.organization_ref or ""),
+            mode=scope_mode,
+        ))
+    return index
+
+
+def _backlog_rows(
+    facts: list[Any],
+    index: dict[tuple[int, str], set[tuple[int, str, str, str, str]]],
+    scope_mode: str,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Owed facts, plus the ambiguous ones listed instead of raising.
+
+    A fact whose item resolves to more than one distribution pool is exactly
+    what the publication gates refuse, but a *report* that raised on it would
+    hide every other number it was asked for.  It is listed as a row.
+    """
+    owed: list[int] = []
+    ambiguous: list[dict[str, Any]] = []
+    for row in facts:
+        scopes = index.get((int(row.item_id), scope_mode))
+        if not scopes:
+            continue
+        if len(scopes) > 1:
+            ambiguous.append({
+                "stock_ledger_entry_id": int(row.id),
+                "item_id": int(row.item_id),
+                "scopes": sorted(list(scope) for scope in scopes),
+            })
+            continue
+        owed.append(int(row.id))
+    return owed, ambiguous
+
+
+def pre_deploy_backlog(engine: Engine) -> dict[str, Any]:
+    """Read-only report of what the bounded refresh gates would see.
+
+    Its own phase and its own session: it is bounded but not free, and the
+    postflight holds a publication transaction open while it runs.
+
+    The gates themselves judge only a refresh's delta; this is the historical
+    view over the whole visible prefix, which is the part they deliberately
+    do not judge.  Both counts use the publication's own canonical scope key,
+    never a second predicate written here.
+    """
+    generation_id = _accepted_truth_generation(engine)
     empty: dict[str, Any] = {
+        "phase": "pre-deploy-backlog",
+        "generation_id": int(generation_id),
         "untyped_buy_owed_receipts": None,
         "unallocated_make_owed_outputs": None,
         "evaluated": False,
     }
-    names = set(inspect(session.connection()).get_table_names())
-    if not {
-        "stock_ledger_entry", "stock_ledger_supplier_receipt_provenance",
-        "reservation_entry", "reservation_consumption_allocation",
-        "stock_warehouses", "ledger_generation",
-    }.issubset(names):
-        return {**empty, "reason": "schema does not carry the physical contour"}
-    try:
-        from app import models
-        from app.services.item_ledger.physical_refresh_current_publish import (
-            _buy_scope_for_receipt,
-            _make_scopes_for_assembly_row,
-        )
-        from app.services.item_ledger.physical_visibility import (
-            visible_sle_query_for_generation,
-        )
-        from app.services.item_ledger.physical_refresh_supplier_evidence import (
-            supplier_document_type_filter,
-        )
-        from app.services.planning_pool_resolver import (
-            resolve_planning_pool_by_warehouse,
-        )
-        from sqlalchemy import exists as _exists, and_ as _and, or_ as _or
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        names = set(inspect(session.connection()).get_table_names())
+        if not {
+            "stock_ledger_entry", "stock_ledger_supplier_receipt_provenance",
+            "reservation_entry", "reservation_consumption_allocation",
+            "stock_warehouses", "ledger_generation",
+        }.issubset(names):
+            return {
+                **empty, "status": "ready",
+                "reason": "schema does not carry the physical contour",
+            }
+        try:
+            from app import models
+            from app.services.item_ledger.physical_refresh_supplier_evidence import (
+                supplier_document_type_filter,
+            )
+            from app.services.item_ledger.physical_visibility import (
+                visible_sle_query_for_generation,
+            )
+            from app.services.planning_pool_resolver import (
+                resolve_planning_pool_by_warehouse,
+            )
+            from sqlalchemy import and_ as _and, exists as _exists
 
-        mapping = resolve_planning_pool_by_warehouse(session)
-        owners = tuple(session.query(models.ReservationEntry).filter(
-            models.ReservationEntry.is_current.is_(True),
-            models.ReservationEntry.owner_kind == "current",
-            models.ReservationEntry.lifecycle_status == "active",
-        ).all())
+            contour = sorted(resolve_planning_pool_by_warehouse(session))
+            index = _owner_index(session)
 
-        typed = _exists().where(
-            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
-            == models.StockLedgerEntry.id
-        )
-        receipts = (
-            visible_sle_query_for_generation(session, int(generation_id))
-            .filter(supplier_document_type_filter(
-                models.StockLedgerEntry.recorder_type
+            typed = _exists().where(
+                models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+                == models.StockLedgerEntry.id
+            )
+            receipts = (
+                visible_sle_query_for_generation(session, int(generation_id))
+                .filter(supplier_document_type_filter(
+                    models.StockLedgerEntry.recorder_type
+                ))
+                .filter(models.StockLedgerEntry.movement_kind.in_(
+                    ("receipt", "supplier_receipt")
+                ))
+                .filter(models.StockLedgerEntry.active.is_(True))
+                .filter(models.StockLedgerEntry.qty != 0)
+                .filter(models.StockLedgerEntry.warehouse_ref1c.in_(contour))
+                .filter(~typed)
+                .order_by(None)
+                .all()
+            )
+            untyped_buy, buy_ambiguous = _backlog_rows(receipts, index, "buy")
+
+            allocated = _exists().where(_and(
+                models.ReservationConsumptionAllocation.sle_id
+                == models.StockLedgerEntry.id,
+                models.ReservationConsumptionAllocation.is_current.is_(True),
             ))
-            .filter(models.StockLedgerEntry.movement_kind.in_(
-                ("receipt", "supplier_receipt")
-            ))
-            .filter(models.StockLedgerEntry.active.is_(True))
-            .filter(models.StockLedgerEntry.qty != 0)
-            .filter(~typed)
-            .order_by(None)
-            .all()
-        )
-        untyped_buy = [
-            int(row.id) for row in receipts
-            if _buy_scope_for_receipt(
-                row,
-                planning_pool_by_warehouse=mapping,
-                current_owners=owners,
-            ) is not None
-        ]
-
-        allocated = _exists().where(_and(
-            models.ReservationConsumptionAllocation.sle_id
-            == models.StockLedgerEntry.id,
-            models.ReservationConsumptionAllocation.is_current.is_(True),
-        ))
-        outputs = (
-            visible_sle_query_for_generation(session, int(generation_id))
-            .filter(models.StockLedgerEntry.movement_kind == "assembly_in")
-            .filter(models.StockLedgerEntry.active.is_(True))
-            .filter(models.StockLedgerEntry.qty != 0)
-            .filter(models.StockLedgerEntry.warehouse_ref1c.in_(sorted(mapping)))
-            .filter(~allocated)
-            .order_by(None)
-            .all()
-        )
-        unallocated_make = [
-            int(row.id) for row in outputs
-            if _make_scopes_for_assembly_row(row, owners)
-        ]
-    except Exception as exc:  # noqa: BLE001 - a report may not fail the phase
-        return {**empty, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+            outputs = (
+                visible_sle_query_for_generation(session, int(generation_id))
+                .filter(models.StockLedgerEntry.movement_kind == "assembly_in")
+                .filter(models.StockLedgerEntry.active.is_(True))
+                .filter(models.StockLedgerEntry.qty != 0)
+                .filter(models.StockLedgerEntry.warehouse_ref1c.in_(contour))
+                .filter(~allocated)
+                .order_by(None)
+                .all()
+            )
+            make_owed, make_ambiguous = _backlog_rows(outputs, index, "make")
+        except Exception as exc:  # noqa: BLE001 - a report may not fail the phase
+            return {
+                **empty, "status": "ready",
+                "reason": f"{type(exc).__name__}: {exc}"[:200],
+            }
+        session.rollback()
     return {
+        "phase": "pre-deploy-backlog",
+        "status": "ready",
+        "generation_id": int(generation_id),
         "untyped_buy_owed_receipts": len(untyped_buy),
         "untyped_buy_owed_receipt_sample": untyped_buy[:8],
-        "unallocated_make_owed_outputs": len(unallocated_make),
-        "unallocated_make_owed_output_sample": unallocated_make[:8],
+        "unallocated_make_owed_outputs": len(make_owed),
+        "unallocated_make_owed_output_sample": make_owed[:8],
+        "ambiguous_distribution_pools": buy_ambiguous[:8] + make_ambiguous[:8],
+        "ambiguous_distribution_pool_count": len(buy_ambiguous) + len(make_ambiguous),
         "evaluated": True,
     }
 
@@ -976,9 +1031,6 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
         },
         "unique_identities": True,
         "purchase_export_anchors": purchase_export_anchors,
-        # Report only: the bounded refresh gates are fail-closed, so this says
-        # up front whether the first refresh after the deploy would block.
-        "pre_deploy_backlog": _pre_deploy_backlog(session, int(generation_id)),
     }
 
 
@@ -1408,6 +1460,7 @@ def main(argv: list[str] | None = None) -> int:
             "postflight",
             "replenishment-bootstrap",
             "supplier-provenance-repair",
+            "pre-deploy-backlog",
         ),
         default="preflight",
         help=(
@@ -1442,6 +1495,8 @@ def main(argv: list[str] | None = None) -> int:
                 writers_stopped=args.writers_stopped,
                 fault_after_consumer=args.fault_after_consumer,
             )
+        elif args.phase == "pre-deploy-backlog":
+            report = pre_deploy_backlog(engine)
         elif args.phase == "supplier-provenance-repair":
             report = apply_supplier_provenance_repair(
                 engine, writers_stopped=bool(args.writers_stopped)

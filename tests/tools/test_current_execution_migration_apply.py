@@ -338,16 +338,9 @@ def test_postflight_reports_expected_scope_anchor_and_revision():
     assert report["status"] == "ready"
     assert report["generation_id"] == 7
     assert report["scopes"]["production_control_journal"]["source_revision"] == "accepted:g7:production_control_journal"
-    # The pre-deploy backlog is always reported, and says so when the reduced
-    # fixture schema cannot answer instead of claiming a zero.
-    backlog = report["pre_deploy_backlog"]
-    assert set(backlog) >= {
-        "untyped_buy_owed_receipts", "unallocated_make_owed_outputs", "evaluated",
-    }
-    if not backlog["evaluated"]:
-        assert backlog["untyped_buy_owed_receipts"] is None
-        assert backlog["unallocated_make_owed_outputs"] is None
-        assert backlog["reason"]
+    # The backlog is its own read-only phase now: the postflight holds a
+    # publication transaction open and must not carry that scan.
+    assert "pre_deploy_backlog" not in report
 
 
 def test_apply_migrates_purchase_export_anchor_and_retry_is_noop(monkeypatch):

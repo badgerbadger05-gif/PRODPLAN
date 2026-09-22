@@ -208,3 +208,28 @@ def test_repair_reports_facts_nobody_ever_typed_and_does_not_invent_them():
             "SELECT count(*) FROM stock_ledger_supplier_receipt_provenance "
             "WHERE ledger_generation_id = :g"
         ), {"g": old_id}).scalar_one() == 2
+
+
+def test_pre_deploy_backlog_is_its_own_read_only_phase():
+    """Reported, never blocking, and out of the publication transaction."""
+    from tools.current_execution_migration import pre_deploy_backlog
+
+    engine = _engine()
+    _world(engine, receipts=2)
+
+    report = pre_deploy_backlog(engine)
+
+    assert report["phase"] == "pre-deploy-backlog"
+    assert report["status"] == "ready"
+    assert set(report) >= {
+        "untyped_buy_owed_receipts",
+        "unallocated_make_owed_outputs",
+        "evaluated",
+    }
+    if report["evaluated"]:
+        # No BUY owners in this fixture, so nothing is owed to one.
+        assert report["untyped_buy_owed_receipts"] == 0
+        assert report["unallocated_make_owed_outputs"] == 0
+        assert report["ambiguous_distribution_pool_count"] == 0
+    else:
+        assert report["reason"]

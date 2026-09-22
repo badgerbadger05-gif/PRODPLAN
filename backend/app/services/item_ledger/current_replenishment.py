@@ -215,16 +215,43 @@ def _distribution_scope(value: Fact | Reserve) -> tuple[int, str, str, str, str]
     )
 
 
+def scope_modes(scope_mode: str) -> tuple[str, ...]:
+    """The realization modes one distribution scope owns.
+
+    A MAKE scope owns ``rework`` as well.  Canon §18: an accepted
+    ``assembly_in`` closes a rework reserve as much as a make one, and it is
+    the same physical fact, so both kinds of owner take part in the same
+    replay - which means the replay must also *see and own* the allocations
+    of both.  Selecting existing allocations by mode equality hid a rework
+    owner's allocation from every later refresh, so each refresh re-inserted
+    it: a duplicate current basis, double coverage, and an IntegrityError on
+    ``uq_res_consumption_current_sle_reservation`` where that index exists.
+    """
+    return ("make", "rework") if scope_mode == "make" else (scope_mode,)
+
+
+def scope_mode_for_owner(realization_mode: str) -> str:
+    """Which scope mode an owner of this realization mode belongs to."""
+    mode = _text(realization_mode)
+    return "make" if mode in {"make", "rework"} else mode
+
+
 def _allocation_scope(
     row: models.ReservationConsumptionAllocation,
     entry: models.ReservationEntry,
 ) -> tuple[int, str, str, str, str]:
+    """The scope an existing allocation belongs to.
+
+    The allocation keeps its owner's real mode through the reservation it
+    points at; this answers the different question of which *scope* replays
+    it, so a rework owner's allocation is claimed by the MAKE scope.
+    """
     return (
         int(row.item_id),
         _text(row.characteristic_ref),
         _text(row.organization_ref),
         _text(row.planning_stock_pool),
-        _text(entry.realization_mode),
+        scope_mode_for_owner(entry.realization_mode),
     )
 
 
@@ -625,7 +652,9 @@ def apply_current_replenishment(
             models.ReservationConsumptionAllocation.characteristic_ref == distribution_scope[1],
             models.ReservationConsumptionAllocation.organization_ref == distribution_scope[2],
             models.ReservationConsumptionAllocation.planning_stock_pool == distribution_scope[3],
-            models.ReservationEntry.realization_mode == distribution_scope[4],
+            models.ReservationEntry.realization_mode.in_(
+                scope_modes(distribution_scope[4])
+            ),
         )
         .with_for_update()
         .order_by(models.ReservationConsumptionAllocation.id.asc())
@@ -648,7 +677,9 @@ def apply_current_replenishment(
             models.ReservationConsumptionAllocation.characteristic_ref == distribution_scope[1],
             models.ReservationConsumptionAllocation.organization_ref == distribution_scope[2],
             models.ReservationConsumptionAllocation.planning_stock_pool == distribution_scope[3],
-            models.ReservationEntry.realization_mode == distribution_scope[4],
+            models.ReservationEntry.realization_mode.in_(
+                scope_modes(distribution_scope[4])
+            ),
         )
         .with_for_update()
         .all()
@@ -1332,8 +1363,17 @@ def apply_current_replenishment_for_accepted_generation(
         lost_supplier_receipt_provenance_sle_ids,
     )
 
+    from app.services.planning_pool_resolver import (
+        PlanningPoolConfigurationError,
+        resolve_planning_pool_by_warehouse,
+    )
+
+    try:
+        contour = resolve_planning_pool_by_warehouse(db)
+    except PlanningPoolConfigurationError:
+        contour = None
     lost = lost_supplier_receipt_provenance_sle_ids(
-        db, ledger_generation_id=int(generation_id)
+        db, ledger_generation_id=int(generation_id), contour=contour,
     )
     if lost:
         raise CurrentReplenishmentError(
@@ -1648,7 +1688,9 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 models.ReservationEntry.lifecycle_status == "active",
                 models.ReservationEntry.current_identity != "",
                 models.ReservationEntry.item_id == scope[0],
-                models.ReservationEntry.realization_mode.in_(("make", "rework")),
+                models.ReservationEntry.realization_mode.in_(
+                    scope_modes(scope[4])
+                ),
             )
             .order_by(models.ReservationEntry.id.asc())
             .all()
