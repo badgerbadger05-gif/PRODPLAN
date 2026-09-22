@@ -873,3 +873,120 @@ def test_untyped_delta_receipt_owed_to_a_buy_owner_is_refused(db_session, monkey
             planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
         )
     db_session.rollback()
+
+
+def _make_owner(db_session, parent, item, *, required="10"):
+    """A live MAKE owner whose demand an assembly output must extinguish."""
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, ledger_generation_id=parent.id,
+        ledger_cutoff=parent.cutoff, period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30), active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+    requirement = models.MrpRequirement(
+        run_id=run.run_id, item_id=item.item_id, total_required_qty=Decimal(required),
+        net_required_qty=Decimal(required), period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30), bom_level=0, planning_stock_pool="default",
+        characteristic_ref="", organization_ref="", freeze_version=1,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    owner = models.ReservationEntry(
+        ledger_generation_id=parent.id, item_id=item.item_id, run_id=run.run_id,
+        freeze_version=1, requirement_id=requirement.id,
+        priority_period_from=date(2026, 9, 1), priority_period_to=date(2026, 9, 30),
+        realization_mode="make", planning_stock_pool="default",
+        reserved_qty=Decimal(required), replenishment_required_qty=Decimal(required),
+        lifecycle_status="active",
+        current_identity="reservation:req:{0}:mode:make".format(requirement.id),
+        owner_kind="current", is_current=True,
+    )
+    db_session.add(owner)
+    db_session.flush()
+    return owner, requirement
+
+
+def test_delta_assembly_output_reaches_its_make_owner_despite_the_1c_organization(
+    db_session, monkeypatch,
+):
+    """The MAKE mirror of the supplier-receipt defect.
+
+    ``_current_scopes`` compared the owner's organization with the fact's, so
+    a bounded refresh produced no MAKE scope at all and the assembly outputs
+    were never offered to the R4 writer: their demand stayed open.  On the
+    stand that was 492 visible ``assembly_in`` facts for items with a live
+    MAKE owner.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-MAKE-ORG")
+    owner, _requirement = _make_owner(db_session, parent, item, required="10")
+    owner.organization_ref = ""
+    db_session.flush()
+    output = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов", ref="assembly-org",
+    )
+    output.organization_ref = "c78bcd0e-81f0-11ee-9ce5-9ee51454587f"
+    db_session.flush()
+    db_session.commit()
+
+    _patch_payloads(monkeypatch, evidence=())
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (output,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    # The output reached a MAKE scope, and the scope carries the owner's
+    # (empty) organization rather than the document's 1C GUID.
+    assert result.affected_scopes == (f"{item.item_id}:::default:make",)
+    # The current-owner representation of a realized MAKE fact on this line is
+    # the R4 allocation plus the owner's received quantity; there is no
+    # separate MAKE allocation role.
+    allocations = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, reservation_id=owner.id, sle_id=output.id,
+    ).all()
+    assert [row.allocated_qty for row in allocations] == [Decimal("4.000")]
+    assert {str(row.allocation_role) for row in allocations} == {"replenishment_receipt"}
+    db_session.refresh(owner)
+    assert owner.replenishment_received_qty == Decimal("4.000")
+    db_session.rollback()
+
+
+def test_assembly_output_outside_every_make_scope_is_refused(db_session, monkeypatch):
+    """The gate: an output owed to a live MAKE owner may not be published unscoped."""
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-MAKE-UNSCOPED")
+    owner, _requirement = _make_owner(db_session, parent, item, required="10")
+    # An owner with no planning pool cannot form a scope, so the fact would be
+    # published without ever being offered to the writer.
+    owner.organization_ref = ""
+    owner.planning_stock_pool = ""
+    db_session.flush()
+    output = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов",
+        ref="assembly-unscoped",
+    )
+    db_session.commit()
+
+    _patch_payloads(monkeypatch, evidence=())
+    with pytest.raises(
+        publisher.ForwardPhysicalRefreshUnavailable,
+        match="outside every MAKE scope",
+    ):
+        publisher.publish_forward_physical_refresh_current(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            delta_manifest={"rows": (output,), "supersessions": ()},
+            odata_client=object(),
+            source_revision=target_batch.id,
+            planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        )
+    db_session.rollback()

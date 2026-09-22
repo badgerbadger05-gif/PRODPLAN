@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -31,6 +31,7 @@ def publish_current_reservations(
     db: Session,
     *,
     generation_id: int,
+    retire_run_ids: Iterable[int] | None = None,
 ) -> dict[str, int]:
     """Atomically publish target BUILDING reservations into stable owners.
 
@@ -38,14 +39,30 @@ def publish_current_reservations(
     bounded compatibility path for unit tests; it is not used for production
     data migration.  The caller owns the transaction and publishes the truth
     pointer only after this function returns.
+
+    ``retire_run_ids`` bounds which owners this publication may close.  The
+    genesis path stages every live obligation, so "absent from staging" is a
+    safe definition of removed there and the default ``None`` keeps it.  An
+    obligation refresh does not: a ``retain`` entry means the run's
+    obligations are unchanged and deliberately stay anchored to the
+    generation that froze them, so they are never staged.  Closing them
+    because they are absent retired every live obligation the refresh did not
+    recompute - on the stand one specification rebase closed 8923 owners and
+    inserted 691, and the production journal fell from 2959 rows to 319.  A
+    refresh therefore passes the runs it actually replaced or closed, and
+    nothing else may be retired.
     """
     generation_id = int(generation_id)
     generation = db.get(models.LedgerGeneration, generation_id)
     if generation is None or str(generation.status) != "building":
         raise ReservationCurrentError("reservation current publication requires BUILDING generation")
+    retire_scope = (
+        None if retire_run_ids is None
+        else sorted({int(value) for value in retire_run_ids})
+    )
 
     if _dialect(db) != "postgresql":
-        return _publish_sqlite_bounded(db, generation_id)
+        return _publish_sqlite_bounded(db, generation_id, retire_scope)
 
     occupied_owner = db.execute(text("""
         SELECT 1
@@ -105,6 +122,10 @@ def publish_current_reservations(
           JOIN reservation_publish_map AS map
             ON map.stage_id = event.reservation_id
     """))
+    removed_scope_sql = (
+        "" if retire_scope is None
+        else " AND owner.run_id = ANY(:retire_run_ids)"
+    )
     db.execute(text("""
         CREATE TEMP TABLE reservation_publish_removed ON COMMIT DROP AS
         SELECT owner.id, owner.current_identity, owner.reserved_qty,
@@ -116,7 +137,9 @@ def publish_current_reservations(
                SELECT 1 FROM reservation_publish_map AS map
                 WHERE map.owner_id = owner.id
            )
-    """))
+    """ + removed_scope_sql), (
+        {} if retire_scope is None else {"retire_run_ids": retire_scope}
+    ))
 
     # Classify target events while they are still BUILDING.  This does not
     # touch is_current, so the partial current-identity index cannot collide.
@@ -415,7 +438,11 @@ def publish_current_reservations(
     ), {"id": generation_id}).scalar() or 0)}
 
 
-def _publish_sqlite_bounded(db: Session, generation_id: int) -> dict[str, int]:
+def _publish_sqlite_bounded(
+    db: Session,
+    generation_id: int,
+    retire_scope: list[int] | None = None,
+) -> dict[str, int]:
     """Small compatibility path for ephemeral tests; never used by prod migration."""
     rows = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.ledger_generation_id == generation_id,
@@ -594,6 +621,12 @@ def _publish_sqlite_bounded(db: Session, generation_id: int) -> dict[str, int]:
         models.ReservationEntry.is_current.is_(True),
     ).all():
         if str(owner.current_identity or "") in staged_identities:
+            continue
+        # Same bound as the PostgreSQL path: a refresh retires only the runs
+        # it replaced or closed, never the ones it retained.
+        if retire_scope is not None and (
+            owner.run_id is None or int(owner.run_id) not in set(retire_scope)
+        ):
             continue
         if str(owner.lifecycle_status) != "closed":
             before = _payload(owner)

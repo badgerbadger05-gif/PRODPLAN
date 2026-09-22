@@ -722,9 +722,29 @@ def _replenishment_work_item_checkpoint(
         raise GenerationValidationError(
             "replenishment work-item batch is not completed"
         )
+    # The journal must describe every live obligation, not only the ones this
+    # generation re-froze.  A retained run's owners stay anchored to the
+    # generation that froze them, so they are not in ``entries``; the builder
+    # covers them by live run scope and this proof has to use the same scope,
+    # otherwise it would demand exactly the truncated journal that left the
+    # stand with 264 work items instead of 7489.
+    scope_entries = {int(entry.id): entry for entry in entries}
+    from .live_plan_scope import live_plan_run_ids
+
+    try:
+        live_run_ids = tuple(live_plan_run_ids(db, generation))
+    except ValueError:
+        live_run_ids = ()
+    if live_run_ids:
+        for entry in db.query(models.ReservationEntry).filter(
+            models.ReservationEntry.run_id.in_(sorted(live_run_ids)),
+            models.ReservationEntry.is_current.is_(True),
+            models.ReservationEntry.lifecycle_status == "active",
+        ).all():
+            scope_entries.setdefault(int(entry.id), entry)
     expected = {
         int(entry.id): entry
-        for entry in entries
+        for entry in scope_entries.values()
         if str(entry.lifecycle_status) == "active"
         and entry.run_id is not None
         and _d(entry.replenishment_required_qty) > 0
@@ -956,6 +976,42 @@ def _reservation_owner_promotion_checkpoint(
             f"{staged} BUILDING reservation owners were never published; "
             "publish_current_reservations must run before acceptance"
         )
+    # A refresh retires only the runs it replaced or closed.  If this very
+    # generation closed owners of a run that is still live, the retirement
+    # scope was wrong - that is how one specification rebase closed 8923
+    # owners and left the production journal with 319 rows instead of 2959.
+    # Asking it of this generation's own change log keeps the check free of
+    # false positives from runs that never had a current owner to begin with.
+    from .live_plan_scope import live_plan_run_ids
+
+    try:
+        live_run_ids = tuple(live_plan_run_ids(db, generation))
+    except ValueError as exc:
+        raise GenerationValidationError(
+            f"live-plan scope is unreadable for generation {int(generation.id)}: {exc}"
+        ) from exc
+    if live_run_ids:
+        closed_live_runs = {
+            int(value)
+            for (value,) in db.query(models.ReservationEntry.run_id)
+            .join(
+                models.ReservationCurrentChange,
+                models.ReservationCurrentChange.reservation_id
+                == models.ReservationEntry.id,
+            )
+            .filter(
+                models.ReservationCurrentChange.source_generation_id
+                == int(generation.id),
+                models.ReservationCurrentChange.operation == "close",
+                models.ReservationEntry.run_id.in_(sorted(live_run_ids)),
+            )
+            .distinct()
+        }
+        if closed_live_runs:
+            raise GenerationValidationError(
+                "publication retired current reservation owners of live runs: "
+                + ", ".join(str(value) for value in sorted(closed_live_runs)[:8])
+            )
     return int(db.query(models.ReservationEntry.id).filter(
         models.ReservationEntry.ledger_generation_id == int(generation.id),
         models.ReservationEntry.is_current.is_(True),

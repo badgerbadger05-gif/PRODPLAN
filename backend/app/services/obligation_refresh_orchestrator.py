@@ -551,6 +551,15 @@ def run_obligation_refresh(
         for entry in manifest.entries
         if entry.get("action") == "retain"
     ))
+    # The runs this refresh actually supersedes: a replaced parent and a
+    # retired plan's parent.  Only their owners may be retired at publication;
+    # a retained run's obligations are unchanged and stay live.
+    retire_run_ids = tuple(sorted({
+        int(entry["parent_run_id"])
+        for entry in manifest.entries
+        if entry.get("action") in {"replace", "retire"}
+        and entry.get("parent_run_id") is not None
+    }))
     # Retained obligations are stable business rows anchored to their original
     # run/generation lineage.  A replacement refresh must not copy or retarget
     # them into the candidate generation; live-scope readers resolve the sealed
@@ -641,6 +650,11 @@ def run_obligation_refresh(
         db,
         target_id,
         int(replenishment_batch.id),
+        # Retained obligations are never staged at the candidate generation,
+        # so a generation-scoped selection sees only the runs this refresh
+        # recomputed: on the stand that published 264 work items in place of
+        # 7489.  The live run scope is what the journals must describe.
+        run_ids=(*candidate_ids, *retained_run_ids),
     )
     _complete(replenishment_batch, replenishment_summary)
     assembly_outputs = materialize_assembly_output_allocations(db, target_id)
@@ -669,7 +683,7 @@ def run_obligation_refresh(
     # the journals below reference owners that still exist after acceptance;
     # the caller-owned transaction keeps it atomic with the pointer switch.
     reservation_current_publish = publish_current_reservations(
-        db, generation_id=target_id
+        db, generation_id=target_id, retire_run_ids=retire_run_ids
     )
     mrp_payloads = {
         str(run_id): build_mrp_result_current_payload(db, int(run_id))

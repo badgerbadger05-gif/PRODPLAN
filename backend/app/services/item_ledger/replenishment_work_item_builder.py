@@ -13,8 +13,9 @@ from __future__ import annotations
 from decimal import Decimal
 from hashlib import sha256
 import json
-from typing import Any
+from typing import Any, Iterable
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -64,19 +65,50 @@ def _run_plan_ids(db: Session, run_ids: set[int]) -> dict[int, int]:
     return {int(run_id): int(plan_id) for run_id, plan_id in runs}
 
 
+def _reservation_scope(
+    generation: models.LedgerGeneration,
+    run_ids: tuple[int, ...] | None,
+) -> Any:
+    """Which obligations this build has to describe.
+
+    Generation-scoped by default: the genesis path stages every live run at
+    the generation it is building.  An obligation refresh does not - a
+    retained run's obligations deliberately stay anchored to the generation
+    that froze them and are never re-staged - so it names its live run scope
+    instead, and the rows are taken from the staged candidates plus the
+    stable current owners of the runs it kept.  Selecting by generation there
+    described only the runs the refresh had recomputed: on the stand 264 work
+    items in place of 7489, and the production journal fell to 319 rows.
+    """
+    base = and_(
+        models.ReservationEntry.lifecycle_status == "active",
+        models.ReservationEntry.run_id.isnot(None),
+        models.ReservationEntry.replenishment_required_qty > 0,
+    )
+    if run_ids is None:
+        return and_(
+            base,
+            models.ReservationEntry.ledger_generation_id == int(generation.id),
+        )
+    return and_(
+        base,
+        models.ReservationEntry.run_id.in_(sorted(run_ids) or [0]),
+        or_(
+            models.ReservationEntry.ledger_generation_id == int(generation.id),
+            models.ReservationEntry.is_current.is_(True),
+        ),
+    )
+
+
 def _build_rows(
     db: Session,
     generation: models.LedgerGeneration,
     plan_by_run: dict[int, int],
+    run_ids: tuple[int, ...] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int]:
     reservations = (
         db.query(models.ReservationEntry)
-        .filter(
-            models.ReservationEntry.ledger_generation_id == int(generation.id),
-            models.ReservationEntry.lifecycle_status == "active",
-            models.ReservationEntry.run_id.isnot(None),
-            models.ReservationEntry.replenishment_required_qty > 0,
-        )
+        .filter(_reservation_scope(generation, run_ids))
         .order_by(models.ReservationEntry.id.asc())
         .all()
     )
@@ -211,6 +243,8 @@ def materialize_replenishment_work_items(
     db: Session,
     ledger_generation_id: int,
     build_batch_id: int,
+    *,
+    run_ids: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     generation = db.get(models.LedgerGeneration, int(ledger_generation_id))
     if generation is None or str(generation.status) != "building":
@@ -227,21 +261,21 @@ def materialize_replenishment_work_items(
             "work-item build batch must be BUILDING or its own COMPLETED batch"
         )
 
+    scope = (
+        None if run_ids is None
+        else tuple(sorted({int(value) for value in run_ids}))
+    )
     run_by_plan = _run_plan_ids(
         db,
         {
             int(value[0])
             for value in db.query(models.ReservationEntry.run_id)
-            .filter(
-                models.ReservationEntry.ledger_generation_id == int(generation.id),
-                models.ReservationEntry.lifecycle_status == "active",
-                models.ReservationEntry.run_id.isnot(None),
-            )
+            .filter(_reservation_scope(generation, scope))
             .all()
         },
     )
 
-    payload, source_rows = _build_rows(db, generation, run_by_plan)
+    payload, source_rows = _build_rows(db, generation, run_by_plan, scope)
     rows = payload["rows"]
     method_counts = payload["method_counts"]
     required_sum = sum((row["replenishment_required_qty"] for row in rows), Decimal("0"))

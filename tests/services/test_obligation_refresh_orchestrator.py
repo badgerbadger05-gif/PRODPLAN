@@ -1,6 +1,7 @@
 """End-to-end contract tests for the caller-owned refresh orchestrator."""
 
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from decimal import Decimal
 
 import pytest
@@ -1185,7 +1186,7 @@ def test_refresh_that_skips_the_promotion_is_rejected_before_acceptance(
     monkeypatch.setattr(
         workflow,
         "publish_current_reservations",
-        lambda db, *, generation_id: {},
+        lambda db, **kwargs: {},
         raising=False,
     )
 
@@ -1194,3 +1195,135 @@ def test_refresh_that_skips_the_promotion_is_rejected_before_acceptance(
         match="publish_current_reservations must run",
     ):
         _run(db_session, accepted, "orch-skip-promotion", replace=[plan.id])
+
+
+def _extra_fixed_plan(db, accepted, cutoff, *, name, code, qty=3):
+    """A second live plan with its own fixed run, owner and work item."""
+    item = models.Item(
+        item_code=code, item_name=name, replenishment_method="Покупка",
+    )
+    db.add(item)
+    db.flush()
+    plan = models.ProductionPlanHeader(
+        name=name, status="fixed", period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31), fixed_at=cutoff,
+    )
+    db.add(plan)
+    db.flush()
+    line = models.ProductionPlanLine(
+        plan_id=plan.id, item_id=item.item_id,
+        bucket_date=date(2026, 8, 1), qty=Decimal(str(qty)),
+        accepted_output_qty=Decimal("0"), remaining_output_qty=Decimal(str(qty)),
+    )
+    db.add(line)
+    db.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
+        source_plan_id=plan.id, period_from=plan.period_from,
+        period_to=plan.period_to, config_snapshot={}, started_at=cutoff,
+        fixed_at=cutoff, finished_at=cutoff, pinned=True,
+        active_freeze_version=1, ledger_cutoff=cutoff,
+    )
+    db.add(run)
+    db.flush()
+    line.locked_by_run_id = int(run.run_id)
+    db.add(models.MrpRunRoot(
+        run_id=int(run.run_id), plan_line_id=int(line.id),
+        planned_qty=Decimal(str(qty)), accepted_qty=Decimal("0"),
+        remaining_qty=Decimal(str(qty)),
+    ))
+    requirement = models.MrpRequirement(
+        run_id=int(run.run_id), item_id=item.item_id,
+        total_required_qty=Decimal(str(qty)), net_required_qty=Decimal(str(qty)),
+        period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+        planning_stock_pool="selected", characteristic_ref="",
+        organization_ref="", freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    owner = models.ReservationEntry(
+        ledger_generation_id=accepted.id, item_id=item.item_id,
+        characteristic_ref="", organization_ref="", planning_stock_pool="selected",
+        run_id=int(run.run_id), freeze_version=1, requirement_id=requirement.id,
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        realization_mode="buy", reserved_qty=Decimal(str(qty)),
+        replenishment_required_qty=Decimal(str(qty)),
+        replenishment_received_qty=Decimal("0"), lifecycle_status="active",
+        owner_kind="current", is_current=True,
+        current_identity=f"reservation:req:{requirement.id}:mode:buy",
+    )
+    db.add(owner)
+    db.flush()
+    return SimpleNamespace(plan=plan, run=run, owner=owner, item=item)
+
+
+def test_replacing_one_plan_keeps_the_other_live_runs_owners_and_work_items(
+    db_session,
+):
+    """A retained run is untouched: a refresh retires only what it replaced.
+
+    ``publish_current_reservations`` defined "removed" as every current owner
+    absent from this generation's staging, and an obligation refresh never
+    stages a retained run - its obligations deliberately stay anchored to the
+    generation that froze them.  So one specification rebase closed every
+    owner it had not recomputed: on the stand 8923 closes against 691
+    inserts, and the production journal fell from 2959 rows to 319.
+    """
+    accepted, plan, _line, _item, parent, cutoff = _world(db_session, qty=5)
+    kept_a = _extra_fixed_plan(
+        db_session, accepted, cutoff, name="retained A", code="ORCH-RETAIN-A",
+    )
+    kept_b = _extra_fixed_plan(
+        db_session, accepted, cutoff, name="retained B", code="ORCH-RETAIN-B",
+    )
+    db_session.commit()
+
+    result = _run(db_session, accepted, "orch-retain-owners", replace=[plan.id])
+    assert result.published is True
+
+    for kept in (kept_a, kept_b):
+        db_session.refresh(kept.owner)
+        assert bool(kept.owner.is_current) is True
+        assert str(kept.owner.owner_kind) == "current"
+        assert str(kept.owner.lifecycle_status) == "active"
+    # ...and the journals still describe them.
+    work_item_runs = {
+        int(row.run_id)
+        for row in db_session.query(models.ReplenishmentWorkItem).filter_by(
+            ledger_generation_id=int(result.target_generation_id)
+        )
+    }
+    assert {int(kept_a.run.run_id), int(kept_b.run.run_id)} <= work_item_runs
+    purchase_items = {
+        int(row.payload["item_id"])
+        for row in db_session.query(models.CurrentExecutionRow).filter_by(
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
+        )
+        if (row.payload or {}).get("item_id") is not None
+    }
+    assert {int(kept_a.item.item_id), int(kept_b.item.item_id)} <= purchase_items
+
+
+def test_closing_a_plan_retires_only_that_plans_owners(db_session):
+    """The retirement scope is the runs the refresh actually superseded."""
+    accepted, plan, _line, _item, parent, cutoff = _world(db_session, qty=5)
+    closing = _extra_fixed_plan(
+        db_session, accepted, cutoff, name="closing", code="ORCH-CLOSE",
+    )
+    kept = _extra_fixed_plan(
+        db_session, accepted, cutoff, name="kept", code="ORCH-KEEP",
+    )
+    db_session.commit()
+
+    result = _run(
+        db_session, accepted, "orch-close-one", retire=[closing.plan.id]
+    )
+    assert result.published is True
+
+    db_session.refresh(closing.owner)
+    db_session.refresh(kept.owner)
+    assert str(closing.owner.lifecycle_status) == "closed"
+    assert bool(closing.owner.is_current) is False
+    assert str(kept.owner.lifecycle_status) == "active"
+    assert bool(kept.owner.is_current) is True

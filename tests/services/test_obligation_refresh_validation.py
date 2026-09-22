@@ -355,8 +355,8 @@ def test_orchestrator_refuses_stale_work_items_after_replay(
     )
     real_builder = workflow.materialize_replenishment_work_items
 
-    def corrupt_after_build(db, generation_id, batch_id):
-        result = real_builder(db, generation_id, batch_id)
+    def corrupt_after_build(db, generation_id, batch_id, **kwargs):
+        result = real_builder(db, generation_id, batch_id, **kwargs)
         row = (
             db.query(models.ReplenishmentWorkItem)
             .filter_by(ledger_generation_id=int(generation_id))

@@ -716,6 +716,108 @@ def _current_scope_row_count(session: Session, *, entity_kind: str, scope_key: s
     ), {"entity_kind": str(entity_kind), "scope_key": str(scope_key)}).scalar_one() or 0)
 
 
+def _pre_deploy_backlog(session: Session, generation_id: int) -> dict[str, Any]:
+    """What the first bounded refresh would refuse to publish, counted now.
+
+    Report only.  The migration pointer comes from the old code, which typed
+    every supplier receipt and is not expected to carry a backlog - but the
+    two acceptance gates in ``physical_refresh_current_publish`` are
+    fail-closed, so a stand that does carry one would block on its first
+    refresh with no warning.  Counting it here turns that into something the
+    deploy can see beforehand.
+
+    Same predicates as the gates: a supplier receipt inside the planning
+    contour whose item has an active current BUY owner and no typed evidence,
+    and an assembly output inside the contour whose item has an active
+    current MAKE owner and no current allocation.  Any failure to evaluate is
+    reported as such rather than as a zero.
+    """
+    empty: dict[str, Any] = {
+        "untyped_buy_owed_receipts": None,
+        "unallocated_make_owed_outputs": None,
+        "evaluated": False,
+    }
+    names = set(inspect(session.connection()).get_table_names())
+    if not {
+        "stock_ledger_entry", "stock_ledger_supplier_receipt_provenance",
+        "reservation_entry", "reservation_consumption_allocation",
+        "stock_warehouses", "ledger_generation",
+    }.issubset(names):
+        return {**empty, "reason": "schema does not carry the physical contour"}
+    try:
+        from app.services.item_ledger.physical_refresh_supplier_evidence import (
+            untyped_supplier_receipt_rows_in_contour,
+        )
+        from app.services.planning_pool_resolver import (
+            resolve_planning_pool_by_warehouse,
+        )
+        from app import models
+
+        mapping = resolve_planning_pool_by_warehouse(session)
+        receipts = untyped_supplier_receipt_rows_in_contour(
+            session,
+            ledger_generation_id=int(generation_id),
+            planning_pool_by_warehouse=mapping,
+        )
+        owned_items = {
+            int(value)
+            for (value,) in session.query(models.ReservationEntry.item_id).filter(
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.owner_kind == "current",
+                models.ReservationEntry.lifecycle_status == "active",
+                models.ReservationEntry.realization_mode == "buy",
+            ).distinct()
+        }
+        untyped_buy = [
+            int(row.id) for row in receipts if int(row.item_id) in owned_items
+        ]
+
+        from app.services.item_ledger.physical_visibility import (
+            visible_sle_query_for_generation,
+        )
+        from sqlalchemy import exists as _exists, and_ as _and
+
+        make_items = {
+            int(value)
+            for (value,) in session.query(models.ReservationEntry.item_id).filter(
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.owner_kind == "current",
+                models.ReservationEntry.lifecycle_status == "active",
+                models.ReservationEntry.realization_mode.in_(("make", "rework")),
+            ).distinct()
+        }
+        allocated = _exists().where(_and(
+            models.ReservationConsumptionAllocation.sle_id
+            == models.StockLedgerEntry.id,
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+        ))
+        outputs = (
+            visible_sle_query_for_generation(session, int(generation_id))
+            .filter(models.StockLedgerEntry.movement_kind == "assembly_in")
+            .filter(models.StockLedgerEntry.active.is_(True))
+            .filter(models.StockLedgerEntry.qty != 0)
+            .filter(models.StockLedgerEntry.warehouse_ref1c.in_(sorted(mapping)))
+            .filter(~allocated)
+            .order_by(None)
+            .with_entities(
+                models.StockLedgerEntry.id, models.StockLedgerEntry.item_id
+            )
+            .all()
+        )
+        unallocated_make = [
+            int(sle_id) for sle_id, item_id in outputs if int(item_id) in make_items
+        ]
+    except Exception as exc:  # noqa: BLE001 - a report may not fail the phase
+        return {**empty, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+    return {
+        "untyped_buy_owed_receipts": len(untyped_buy),
+        "untyped_buy_owed_receipt_sample": untyped_buy[:8],
+        "unallocated_make_owed_outputs": len(unallocated_make),
+        "unallocated_make_owed_output_sample": unallocated_make[:8],
+        "evaluated": True,
+    }
+
+
 def _postflight_on_session(session: Session, generation_id: int) -> dict[str, Any]:
     """Validate current scopes/rows while the publication transaction is held.
 
@@ -870,6 +972,9 @@ def _postflight_on_session(session: Session, generation_id: int) -> dict[str, An
         },
         "unique_identities": True,
         "purchase_export_anchors": purchase_export_anchors,
+        # Report only: the bounded refresh gates are fail-closed, so this says
+        # up front whether the first refresh after the deploy would block.
+        "pre_deploy_backlog": _pre_deploy_backlog(session, int(generation_id)),
     }
 
 

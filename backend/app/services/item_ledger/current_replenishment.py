@@ -1512,9 +1512,17 @@ def apply_current_replenishment_for_bounded_make_scopes(
     # A physical SLE has no planning-pool column.  A requested item/key must
     # therefore resolve to exactly one current pool; multiple pools would make
     # attribution ambiguous and must fail closed rather than inventing one.
-    scope_by_physical_key: dict[tuple[int, str, str], list[DistributionScope]] = {}
+    #
+    # The key is item + characteristic only.  A scope's organization is the
+    # planning organization of its MAKE owner, while the physical row carries
+    # the 1C organization that posted the document; the publisher that built
+    # these scopes already refused to equate the two
+    # (``physical_refresh_current_publish._make_scopes_for_assembly_row``), so
+    # matching on it here would select no rows at all and silently realize
+    # nothing.
+    scope_by_physical_key: dict[tuple[int, str], list[DistributionScope]] = {}
     for scope in scopes:
-        scope_by_physical_key.setdefault(scope[:3], []).append(scope)
+        scope_by_physical_key.setdefault(scope[:2], []).append(scope)
 
     from .physical_visibility import visible_sle_query
     from .historical_replay_persistence import _identity_for_sle
@@ -1523,7 +1531,6 @@ def apply_current_replenishment_for_bounded_make_scopes(
         and_(
             models.StockLedgerEntry.item_id == scope[0],
             models.StockLedgerEntry.characteristic_ref == scope[1],
-            models.StockLedgerEntry.organization_ref == scope[2],
         )
         for scope in scopes
     ))
@@ -1554,7 +1561,6 @@ def apply_current_replenishment_for_bounded_make_scopes(
         physical_key = (
             int(row.item_id),
             _text(row.characteristic_ref),
-            _text(row.organization_ref),
         )
         candidates = scope_by_physical_key.get(physical_key, [])
         if not candidates:
@@ -1578,8 +1584,12 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 mode="make",
                 qty=_decimal(row.qty),
                 posting_at=row.posting_at,
-                characteristic_ref=_text(row.characteristic_ref),
-                organization_ref=_text(row.organization_ref),
+                characteristic_ref=scope[1],
+                # Attribution keys come from the scope, exactly as the BUY
+                # path takes its pool from the scope: the distribution scope
+                # is a property of the owner, and a fact carries neither the
+                # planning pool nor the planning organization.
+                organization_ref=scope[2],
                 planning_stock_pool=scope[3],
                 requirement_id=requirement_id,
                 order_ref=order_ref,

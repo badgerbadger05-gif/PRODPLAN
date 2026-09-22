@@ -555,25 +555,7 @@ def _current_scopes(
     )
     if assembly_rows:
         for row in assembly_rows:
-            matching_owners = tuple(
-                owner for owner in current_owners
-                if int(owner.item_id) == int(row.item_id)
-                and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
-                and _text(owner.organization_ref) == _text(row.organization_ref)
-                and _text(owner.realization_mode) in {"make", "rework"}
-            )
-            # An assembly fact without a current MAKE owner is a valid
-            # stock/output-only fact.  Do not invent a pool from the physical
-            # warehouse and do not invoke the R4 writer for it.
-            scopes.update(
-                (
-                    int(row.item_id), _text(row.characteristic_ref),
-                    _text(row.organization_ref), _text(owner.planning_stock_pool),
-                    "make",
-                )
-                for owner in matching_owners
-                if _text(owner.planning_stock_pool)
-            )
+            scopes.update(_make_scopes_for_assembly_row(row, current_owners))
 
     # Supplier receipts enter BUY only when the physical warehouse is inside
     # the configured planning contour.  Unmapped warehouses are legitimate
@@ -587,6 +569,41 @@ def _current_scopes(
         if scope is not None:
             scopes.add(scope)
     return tuple(sorted(scopes))
+
+
+def _make_scopes_for_assembly_row(
+    row: Any,
+    current_owners: Sequence[models.ReservationEntry],
+) -> tuple[tuple[int, str, str, str, str], ...]:
+    """The MAKE scopes one ``assembly_in`` fact realizes, if any.
+
+    An assembly fact without a current MAKE owner is a valid stock/output-only
+    fact: no pool is invented from the physical warehouse and the R4 writer is
+    not invoked for it.
+
+    Item and characteristic are the row's own; the organization comes from the
+    owner.  This used to compare the two, and on real data they never agree -
+    every frozen reservation owner carries an empty organization while every
+    physical fact carries the 1C GUID that posted the document.  The bounded
+    refresh therefore produced no MAKE scope at all and
+    ``apply_current_replenishment_for_bounded_make_scopes`` never ran: on the
+    stand, 492 visible ``assembly_in`` facts for items with a live MAKE owner
+    went unrealized since the migration, leaving their demand open.  It is the
+    same defect, and the same correction, as the BUY side in
+    :func:`_buy_scope_for_receipt`.
+    """
+    return tuple(
+        (
+            int(row.item_id), _text(row.characteristic_ref),
+            _text(owner.organization_ref), _text(owner.planning_stock_pool),
+            "make",
+        )
+        for owner in current_owners
+        if int(owner.item_id) == int(row.item_id)
+        and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
+        and _text(owner.realization_mode) in {"make", "rework"}
+        and _text(owner.planning_stock_pool)
+    )
 
 
 def _buy_scope_for_receipt(
@@ -1254,6 +1271,31 @@ def _publish_forward_physical_refresh_current(
             f"generation {int(target.id)} leaves {len(unallocatable)} supplier "
             "receipts untyped although their items have an active current BUY "
             f"owner; first sle_ids={list(unallocatable[:8])}"
+        )
+    # The MAKE mirror.  An accepted assembly output is a receipt into stock and
+    # it extinguishes demand; a delta output whose item has a live MAKE owner
+    # but which this refresh never placed in a MAKE scope was never offered to
+    # the writer at all, so its demand silently stays open.  Scoped to the
+    # delta because that is what this refresh is responsible for, and because
+    # "produced no allocation" is not by itself a defect - a surplus output
+    # beyond the open requirement legitimately allocates nothing.
+    unscoped = tuple(
+        int(row.id) for row in rows
+        if _text(row.movement_kind) == "assembly_in"
+        and _text(row.warehouse_ref1c)
+        and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
+        and any(
+            int(owner.item_id) == int(row.item_id)
+            and _text(owner.realization_mode) in {"make", "rework"}
+            for owner in current_owners
+        )
+        and not _make_scopes_for_assembly_row(row, current_owners)
+    )
+    if unscoped:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"generation {int(target.id)} leaves {len(unscoped)} assembly "
+            "outputs outside every MAKE scope although their items have an "
+            f"active current MAKE owner; first sle_ids={list(unscoped[:8])}"
         )
 
     # CAS pointer switch is deliberately the last business mutation.
