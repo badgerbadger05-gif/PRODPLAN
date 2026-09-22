@@ -990,3 +990,141 @@ def test_assembly_output_outside_every_make_scope_is_refused(db_session, monkeyp
             planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
         )
     db_session.rollback()
+
+
+def _fixed_plan_line(db, parent, item, *, qty="5"):
+    """A live fixed plan line with open remaining output."""
+    plan = models.ProductionPlanHeader(
+        name=f"plan-{item.item_code}", period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30), status="fixed",
+        fixed_at=parent.cutoff,
+    )
+    db.add(plan)
+    db.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={},
+        ledger_generation_id=int(parent.id), ledger_cutoff=parent.cutoff,
+        active_freeze_version=1, source_plan_id=int(plan.id),
+        period_from=plan.period_from, period_to=plan.period_to,
+        fixed_at=parent.cutoff,
+    )
+    db.add(run)
+    db.flush()
+    line = models.ProductionPlanLine(
+        plan_id=int(plan.id), item_id=int(item.item_id),
+        bucket_date=plan.period_from, qty=Decimal(qty),
+        accepted_output_qty=Decimal("0"), remaining_output_qty=Decimal(qty),
+        locked_by_run_id=int(run.run_id),
+    )
+    db.add(line)
+    db.flush()
+    db.add(models.MrpRunRoot(
+        run_id=int(run.run_id), plan_line_id=int(line.id),
+        planned_qty=Decimal(qty), accepted_qty=Decimal("0"),
+        remaining_qty=Decimal(qty),
+    ))
+    db.flush()
+    return plan, run, line
+
+
+def test_bounded_refresh_moves_the_plan_line_when_its_output_is_received(
+    db_session, monkeypatch,
+):
+    """A received assembly output must move "выполнено" in the same refresh.
+
+    Canon: the fact of production is the receipt into stock, and it
+    extinguishes the demand.  This pins the whole bounded publication path -
+    not just the allocator - so an output for a live fixed plan line cannot
+    stop producing its execution fact unnoticed.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-PLAN-OUTPUT")
+    _plan, _run, line = _fixed_plan_line(db_session, parent, item, qty="5")
+    output = _sle(
+        db_session, target_batch, item, qty="3", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов",
+        ref="assembly-plan-output",
+    )
+    db_session.commit()
+
+    # Everything is stubbed except the writer under test.
+    real_output = publisher.apply_bounded_assembly_output_plan_execution
+    _patch_payloads(monkeypatch, evidence=())
+    monkeypatch.setattr(
+        publisher, "apply_bounded_assembly_output_plan_execution", real_output,
+    )
+    publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (output,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    facts = db_session.query(models.ProductionPlanExecutionFact).filter_by(
+        stock_ledger_entry_id=int(output.id), plan_line_id=int(line.id),
+    ).all()
+    assert [row.allocated_qty for row in facts] == [Decimal("3.000")]
+    db_session.refresh(line)
+    assert line.accepted_output_qty == Decimal("3.000")
+    assert line.remaining_output_qty == Decimal("2.000")
+    db_session.rollback()
+
+
+def test_bounded_refresh_counts_one_document_output_once(db_session, monkeypatch):
+    """The two legs of one assembly document are one output, not two.
+
+    A document that produces an item at one warehouse and re-produces it at
+    another carries two ``assembly_in`` rows for the same item; canon nets
+    them inside the document, so only the net reaches the plan line.  This is
+    why an ``assembly_in`` row without an execution fact is not by itself
+    evidence of a defect - which is what kept the MAKE gate from asserting
+    on execution facts.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-PLAN-INTERNAL")
+    _plan, _run, line = _fixed_plan_line(db_session, parent, item, qty="10")
+    first_leg = _sle(
+        db_session, target_batch, item, qty="2", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-MOVE", recorder_type="Document_СборкаЗапасов",
+        ref="assembly-two-legs", line_no="1",
+    )
+    consumed = _sle(
+        db_session, target_batch, item, qty="-2", at=FORWARD_AT,
+        kind="assembly_out", warehouse="WH-MOVE",
+        recorder_type="Document_СборкаЗапасов", ref="assembly-two-legs",
+        line_no="2",
+    )
+    second_leg = _sle(
+        db_session, target_batch, item, qty="2", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов",
+        ref="assembly-two-legs", line_no="3",
+    )
+    db_session.commit()
+
+    real_output = publisher.apply_bounded_assembly_output_plan_execution
+    _patch_payloads(monkeypatch, evidence=())
+    monkeypatch.setattr(
+        publisher, "apply_bounded_assembly_output_plan_execution", real_output,
+    )
+    publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={
+            "rows": (first_leg, consumed, second_leg), "supersessions": (),
+        },
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    facts = db_session.query(models.ProductionPlanExecutionFact).filter_by(
+        plan_line_id=int(line.id),
+    ).all()
+    assert sum((row.allocated_qty for row in facts), Decimal("0")) == Decimal("2.000")
+    db_session.refresh(line)
+    assert line.accepted_output_qty == Decimal("2.000")
+    db_session.rollback()
