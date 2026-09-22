@@ -48,6 +48,7 @@ from app.services.item_ledger.physical_refresh_stock_bin import (
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
 from app.services.item_ledger.physical_refresh_supplier_evidence import (
     lost_supplier_receipt_provenance_sle_ids,
+    untyped_supplier_receipt_rows_in_contour,
     build_bounded_supplier_receipt_manifest,
     is_supplier_document_type,
 )
@@ -578,26 +579,111 @@ def _current_scopes(
     # the configured planning contour.  Unmapped warehouses are legitimate
     # stock-only receipts (for example surplus outside the planning contour).
     for row in rows:
-        if not _is_supplier_receipt(row):
-            continue
-        warehouse = _text(row.warehouse_ref1c)
-        pool = _text(planning_pool_by_warehouse.get(warehouse)) if warehouse else ""
-        if not pool:
-            continue
-        if not any(
-            int(owner.item_id) == int(row.item_id)
-            and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
-            and _text(owner.organization_ref) == _text(row.organization_ref)
-            and _text(owner.planning_stock_pool) == pool
-            and _text(owner.realization_mode) == "buy"
-            for owner in current_owners
-        ):
-            continue
-        scopes.add((
-            int(row.item_id), _text(row.characteristic_ref),
-            _text(row.organization_ref), pool, "buy",
-        ))
+        scope = _buy_scope_for_receipt(
+            row,
+            planning_pool_by_warehouse=planning_pool_by_warehouse,
+            current_owners=current_owners,
+        )
+        if scope is not None:
+            scopes.add(scope)
     return tuple(sorted(scopes))
+
+
+def _buy_scope_for_receipt(
+    row: Any,
+    *,
+    planning_pool_by_warehouse: Mapping[str, str],
+    current_owners: Sequence[models.ReservationEntry],
+) -> tuple[int, str, str, str, str] | None:
+    """The BUY distribution scope one supplier receipt belongs to, if any.
+
+    Two rules, and only one of them looks at the physical row.  The warehouse
+    decides *whether* the receipt is planning-relevant at all: outside the
+    configured contour it is a legitimate stock-only receipt.  The scope
+    itself comes from the current BUY owner of the item, exactly as the
+    canonical generation-wide writer resolves it
+    (``current_replenishment.apply_current_replenishment_for_accepted_generation``,
+    which attaches receipts to reservations by item and states the reason: a
+    physical receipt carries no pool identity).
+
+    Item, characteristic and pool are still matched against the owner; only
+    ``organization_ref`` is taken from the owner instead of being compared.
+    The organization on a physical row is the 1C organization that posted the
+    document, not the planning organization of an obligation, and on real
+    data the two never agree: every frozen reservation owner carries an empty
+    organization while every physical fact carries the 1C GUID.  Comparing
+    them meant the bounded refresh produced no BUY scope at all - it typed no
+    supplier receipt and allocated nothing for five consecutive accepted
+    refreshes.
+
+    Ambiguity fails closed with the same verdict the canonical writer gives:
+    one item cannot be fanned out to several distribution pools.
+    """
+    if not _is_supplier_receipt(row):
+        return None
+    warehouse = _text(row.warehouse_ref1c)
+    if not warehouse or not _text(planning_pool_by_warehouse.get(warehouse)):
+        return None
+    pool = _text(planning_pool_by_warehouse.get(warehouse))
+    owner_scopes = {
+        (
+            int(owner.item_id), _text(owner.characteristic_ref),
+            _text(owner.organization_ref), _text(owner.planning_stock_pool),
+            "buy",
+        )
+        for owner in current_owners
+        if int(owner.item_id) == int(row.item_id)
+        and _text(owner.realization_mode) == "buy"
+        and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
+        and _text(owner.planning_stock_pool) == pool
+    }
+    if not owner_scopes:
+        return None
+    if len(owner_scopes) > 1:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"receipt facts for item {int(row.item_id)} have ambiguous "
+            "distribution pools"
+        )
+    return next(iter(owner_scopes))
+
+
+def _untyped_buy_owned_receipt_ids(
+    db: Session,
+    *,
+    target_generation_id: int,
+    planning_pool_by_warehouse: Mapping[str, str],
+) -> tuple[int, ...]:
+    """Supplier receipts owed to a current BUY order that nothing has typed.
+
+    Uses the same resolver as the delta itself, so the gate cannot disagree
+    with the publisher about which receipts belong to a BUY scope.
+    """
+    candidates = untyped_supplier_receipt_rows_in_contour(
+        db,
+        ledger_generation_id=int(target_generation_id),
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    )
+    if not candidates:
+        return ()
+    owners = tuple(db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.item_id.in_(
+            sorted({int(row.item_id) for row in candidates})
+        ),
+        models.ReservationEntry.realization_mode == "buy",
+        models.ReservationEntry.lifecycle_status == "active",
+        models.ReservationEntry.owner_kind == "current",
+        models.ReservationEntry.is_current.is_(True),
+    ).all())
+    if not owners:
+        return ()
+    return tuple(
+        int(row.id) for row in candidates
+        if _buy_scope_for_receipt(
+            row,
+            planning_pool_by_warehouse=planning_pool_by_warehouse,
+            current_owners=owners,
+        ) is not None
+    )
 
 
 def _mapped_supplier_rows(
@@ -606,23 +692,15 @@ def _mapped_supplier_rows(
     planning_pool_by_warehouse: Mapping[str, str],
     current_owners: Sequence[models.ReservationEntry],
 ) -> tuple[Any, ...]:
-    """Return only supplier receipts in the configured planning contour."""
-    result = []
-    for row in rows:
-        if not _is_supplier_receipt(row):
-            continue
-        warehouse = _text(row.warehouse_ref1c)
-        pool = _text(planning_pool_by_warehouse.get(warehouse)) if warehouse else ""
-        if pool and any(
-            int(owner.item_id) == int(row.item_id)
-            and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
-            and _text(owner.organization_ref) == _text(row.organization_ref)
-            and _text(owner.planning_stock_pool) == pool
-            and _text(owner.realization_mode) == "buy"
-            for owner in current_owners
-        ):
-            result.append(row)
-    return tuple(result)
+    """Return only supplier receipts that resolve to a current BUY scope."""
+    return tuple(
+        row for row in rows
+        if _buy_scope_for_receipt(
+            row,
+            planning_pool_by_warehouse=planning_pool_by_warehouse,
+            current_owners=current_owners,
+        ) is not None
+    )
 
 
 def _fixed_run_ids(db: Session) -> tuple[int, ...]:
@@ -1160,6 +1238,22 @@ def _publish_forward_physical_refresh_current(
             f"generation {int(target.id)} does not own supplier receipt "
             f"provenance for its visible supplier facts; first uncovered "
             f"sle_ids={list(uncovered[:8])}"
+        )
+    # A supplier receipt inside the planning contour for an item that has an
+    # active current BUY owner is a receipt against that order.  Untyped, it
+    # is counted by nobody: the purchase journal never sees it arrive.  This
+    # is the second half of the same gate - the first half catches evidence
+    # the system lost, this one catches evidence it never wrote.
+    unallocatable = _untyped_buy_owned_receipt_ids(
+        db,
+        target_generation_id=int(target.id),
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    )
+    if unallocatable:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"generation {int(target.id)} leaves {len(unallocatable)} supplier "
+            "receipts untyped although their items have an active current BUY "
+            f"owner; first sle_ids={list(unallocatable[:8])}"
         )
 
     # CAS pointer switch is deliberately the last business mutation.

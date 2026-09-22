@@ -941,3 +941,116 @@ def test_normalized_evidence_is_flushed_before_supplier_fifo(
         evidence=[_evidence(RECEIPT_OPERATION, 3)],
         cycle_id="test",
     )
+
+
+def _exclusion_row(db, generation, sle_id):
+    """What ``_persist_non_supplier_receipt_rows`` writes for a ruled-out fact."""
+    row = models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=generation.id,
+        stock_ledger_entry_id=int(sle_id),
+        receipt_doc_type="Document_Receipt",
+        receipt_doc_ref="doc-excluded",
+        receipt_doc_line_no="1",
+        supplier_order_ref=None,
+        supplier_order_line_no=None,
+        operation_kind="non_supplier_expense",
+        operation_key="op-excluded",
+        operation_name="Прочий расход",
+        evidence_hash="e".ljust(64, "0"),
+        evidence_payload={"signed_qty": "1"},
+        match_rule="non-supplier",
+        match_status="excluded_non_supplier",
+        ambiguity_count=0,
+        reason="operation is not a supplier receipt",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_rebuild_keeps_the_exclusions_it_was_never_given(db_session):
+    """An obligation refresh must not lose the record of what it ruled out.
+
+    ``rebuild_supplier_receipt_coverage_from_persisted_provenance`` filters
+    ``excluded_non_supplier`` rows out of its input - a non-supplier expense
+    has no supplier evidence to rebuild from - so they can never be touched.
+    The stale sweep then deleted them as untouched, and every obligation
+    refresh silently dropped them: on the stand 341 of the pointer's 2157
+    rows, leaving the candidate without the record that its writer had looked
+    at those facts and ruled them out.
+    """
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    other = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="x" * 64,
+        item_id=db_session.query(models.Item).one().item_id,
+        characteristic_ref="",
+        warehouse_ref1c="wh",
+        qty=Decimal("1"),
+        posting_at=datetime.datetime(2026, 7, 3),
+        record_type="Expense",
+        movement_kind="expense",
+        recorder_type="Document_Receipt",
+        recorder_ref="doc-excluded",
+        line_no="1",
+    )
+    db_session.add(other)
+    db_session.flush()
+    _exclusion_row(db_session, generation, other.id)
+    db_session.commit()
+
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 1
+
+    rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    statuses = {
+        str(row.match_status): int(row.stock_ledger_entry_id)
+        for row in db_session.query(models.StockLedgerSupplierReceiptProvenance)
+        .filter_by(ledger_generation_id=generation.id)
+    }
+    assert statuses.get("excluded_non_supplier") == int(other.id)
+    assert "exact" in statuses
+
+
+def test_rebuild_still_removes_a_stale_supplier_row(db_session):
+    """The sweep keeps its job for the rows this rebuild is authoritative for."""
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    stale = models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=generation.id,
+        stock_ledger_entry_id=999999,
+        receipt_doc_type="Document_Receipt",
+        receipt_doc_ref="doc-stale",
+        receipt_doc_line_no="1",
+        supplier_order_ref="order-1",
+        supplier_order_line_no="1",
+        operation_kind="supplier_receipt",
+        operation_key="op",
+        operation_name="Приобретение у поставщика",
+        evidence_hash="s".ljust(64, "0"),
+        evidence_payload={"signed_qty": "1"},
+        match_rule="exact",
+        match_status="exact",
+        ambiguity_count=0,
+    )
+    db_session.add(stale)
+    db_session.commit()
+
+    rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    assert db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(stock_ledger_entry_id=999999).count() == 0

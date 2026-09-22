@@ -1051,8 +1051,24 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         facts.append(normalized.fact)
 
     for stale_entry_id, stale_provenance in provenance_by_entry.items():
-        if stale_entry_id not in touched_provenance_entry_ids:
-            db.delete(stale_provenance)
+        if stale_entry_id in touched_provenance_entry_ids:
+            continue
+        # The sweep may only remove what this rebuild is authoritative for.
+        # ``excluded_non_supplier`` rows are outside its input by construction
+        # - ``rebuild_supplier_receipt_coverage_from_persisted_provenance``
+        # filters them out before normalizing, and a non-supplier expense has
+        # no supplier evidence to rebuild from - so they can never be
+        # "touched" and were deleted as stale on every obligation refresh.
+        # On the stand that silently dropped 341 of 2157 rows per refresh; the
+        # candidate then no longer owned the record that its writer had looked
+        # at those facts and ruled them out.  They belong to
+        # ``generation_lifecycle._persist_non_supplier_receipt_rows``, which is
+        # the only writer of that status.  A fact that is genuinely
+        # reclassified as a supplier receipt arrives through the touch branch
+        # above and is updated in place, not deleted here.
+        if _text(stale_provenance.match_status) == "excluded_non_supplier":
+            continue
+        db.delete(stale_provenance)
 
     # Make the normalized, generation-scoped evidence durable inside the
     # current savepoint before FIFO is evaluated.  A later allocation failure

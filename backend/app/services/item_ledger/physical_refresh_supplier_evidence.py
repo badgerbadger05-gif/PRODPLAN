@@ -152,6 +152,55 @@ def untyped_supplier_receipt_sle_ids(
     return tuple(int(value) for (value,) in query.all())
 
 
+def untyped_supplier_receipt_rows_in_contour(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    planning_pool_by_warehouse: Mapping[str, str],
+    limit: int = 0,
+) -> tuple[models.StockLedgerEntry, ...]:
+    """Candidate rows for the "typed nothing" verdict, not the verdict itself.
+
+    Visible supplier receipts inside the caller's planning contour that this
+    generation holds no provenance for.  Whether such a row is actually owed
+    to a BUY order is decided by the one scope resolver in
+    ``physical_refresh_current_publish``, which is also what the publisher
+    uses to build the delta - asking the question twice in two places is how
+    the two answers drift apart.
+
+    The contour is the caller's resolved mapping, never re-derived here.
+    """
+    warehouses = [
+        str(key).strip()
+        for key, value in dict(planning_pool_by_warehouse or {}).items()
+        if str(key or "").strip() and str(value or "").strip()
+    ]
+    if not warehouses:
+        return ()
+    owned_here = exists().where(and_(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        == models.StockLedgerEntry.id,
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+        == int(ledger_generation_id),
+    ))
+    query = (
+        visible_sle_query_for_generation(db, int(ledger_generation_id))
+        .filter(supplier_document_type_filter(models.StockLedgerEntry.recorder_type))
+        .filter(models.StockLedgerEntry.movement_kind.in_(
+            ("receipt", "supplier_receipt")
+        ))
+        .filter(models.StockLedgerEntry.active.is_(True))
+        .filter(models.StockLedgerEntry.qty != 0)
+        .filter(models.StockLedgerEntry.warehouse_ref1c.in_(sorted(warehouses)))
+        .filter(~owned_here)
+        .order_by(None)
+        .order_by(models.StockLedgerEntry.id.asc())
+    )
+    if limit and int(limit) > 0:
+        query = query.limit(int(limit))
+    return tuple(query.all())
+
+
 _FORWARD_OPERATION = RECEIPT_OPERATION
 _REJECTED_DELTA_MESSAGE = "complete affected-scope evidence required"
 
@@ -235,12 +284,20 @@ def _scope_for_row(
     row: models.StockLedgerEntry,
     scopes: tuple[DistributionScope, ...],
 ) -> DistributionScope:
+    """Place one physical row in the BUY scope the publisher resolved for it.
+
+    Item and characteristic are the row's own; the organization is the
+    scope's.  The organization on a physical row is the 1C organization that
+    posted the document, not the planning organization of an obligation - the
+    publisher already refused to compare the two when it built these scopes
+    (``physical_refresh_current_publish._buy_scope_for_receipt``), and
+    comparing them again here would reject every row it just accepted.
+    """
     candidates = tuple(
         scope
         for scope in scopes
         if int(row.item_id) == int(scope[0])
         and _text(row.characteristic_ref) == scope[1]
-        and _text(row.organization_ref) == scope[2]
     )
     if len(candidates) != 1:
         raise BoundedSupplierEvidenceError(
@@ -706,6 +763,7 @@ __all__ = [
     "is_supplier_document_type",
     "supplier_document_type_filter",
     "lost_supplier_receipt_provenance_sle_ids",
+    "untyped_supplier_receipt_rows_in_contour",
     "untyped_supplier_receipt_sle_ids",
     "validate_bounded_supplier_receipt_manifest",
 ]

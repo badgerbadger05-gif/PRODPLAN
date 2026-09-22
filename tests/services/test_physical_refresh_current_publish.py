@@ -382,6 +382,23 @@ def test_mapped_supplier_receipt_uses_exact_current_buy_owner(db_session, monkey
         recorder_ref="cp13", line_no="1", ingest_source="test",
     )
     db_session.add(row)
+    db_session.flush()
+    # The real bounded path types this receipt at the target; the pipeline is
+    # stubbed here, so stand in for it - an untyped receipt owed to a BUY
+    # order is refused by the acceptance gate on purpose.
+    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=target.id,
+        stock_ledger_entry_id=row.id,
+        receipt_doc_type="Document_ПриходнаяНакладная",
+        receipt_doc_ref="cp13", receipt_doc_line_no="1",
+        supplier_order_ref=None, supplier_order_line_no=None,
+        operation_kind="supplier_receipt", operation_key="test",
+        operation_name="bounded typed supplier evidence",
+        evidence_hash="cp13".ljust(64, "0"),
+        evidence_payload={"signed_qty": "1", "item_id": int(item.item_id)},
+        match_rule="bounded-typed", match_status="unmatched", ambiguity_count=0,
+        reason="typed evidence has no supplier order line",
+    ))
     db_session.commit()
     phases = []
     _patch_safe_pipeline(monkeypatch, phases)

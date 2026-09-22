@@ -1797,10 +1797,17 @@ def _bounded_buy_manifest_facts(
     for fact_id, fact in delta_by_id.items():
         row = persisted[fact_id]
         scope = _bounded_buy_fact_scope(fact, scopes_by_item_pool)
+        # Organization is deliberately absent from this comparison.  The scope
+        # carries the planning organization of the BUY owner while the row
+        # carries the 1C organization that posted the document; the publisher
+        # that built this scope already refused to equate the two, and the
+        # manifest builder places rows by item and characteristic for the same
+        # reason.  Everything that is genuinely the same fact on both sides -
+        # item, characteristic, signed quantity and posting instant - is still
+        # compared.
         if (
             int(row.item_id) != int(fact.item_id)
             or _text(row.characteristic_ref) != scope[1]
-            or _text(row.organization_ref) != scope[2]
             or _decimal(row.qty) != _decimal(fact.signed_qty)
             or _comparable_datetime(row.posting_at)
             != _comparable_datetime(fact.posting_at)

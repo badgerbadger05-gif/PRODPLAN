@@ -770,3 +770,106 @@ def test_forward_only_delta_declares_no_backdate_boundary(db_session):
     )
     assert delta["backdate_from"] is None
     assert delta["backdated"] is False
+
+
+def test_delta_receipt_is_typed_and_allocated_when_the_fact_carries_the_1c_organization(
+    db_session, monkeypatch,
+):
+    """The shape the stand actually has: owner org empty, fact org a 1C GUID.
+
+    The bounded scope resolver compared the two and never matched, so five
+    consecutive accepted refreshes produced no BUY scope, typed no supplier
+    receipt and allocated nothing - while the generation-wide writer, which
+    attaches receipts to reservations by item, had typed every one of them.
+    Organization now comes from the owner instead of being compared; item,
+    characteristic and pool are still matched.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-ORG-MISMATCH")
+    owner, _requirement = _buy_owner(db_session, parent, item)
+    # The frozen obligation owner carries no organization at all.
+    owner.organization_ref = ""
+    db_session.flush()
+    receipt = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="receipt",
+        warehouse="WH-BUY", recorder_type="Document_ПриходнаяНакладная",
+        ref="receipt-org",
+    )
+    # ...while the physical fact carries the 1C organization that posted it.
+    receipt.organization_ref = "c78bcd0e-81f0-11ee-9ce5-9ee51454587f"
+    db_session.flush()
+    db_session.commit()
+
+    _patch_payloads(
+        monkeypatch, evidence=(_receipt_evidence(receipt, ref="receipt-org", qty="4"),),
+    )
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (receipt,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    # The receipt reached a BUY scope, and the scope carries the owner's
+    # organization rather than the document's.
+    assert result.affected_scopes
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(
+        ledger_generation_id=target.id, stock_ledger_entry_id=receipt.id
+    ).one()
+    assert str(provenance.operation_kind) == "supplier_receipt"
+    allocations = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True,
+        allocation_role="replenishment_receipt",
+        reservation_id=owner.id,
+        sle_id=receipt.id,
+    ).all()
+    assert [row.allocated_qty for row in allocations] == [Decimal("4.000")]
+    db_session.refresh(owner)
+    assert owner.replenishment_received_qty == Decimal("4.000")
+    db_session.rollback()
+
+
+def test_untyped_delta_receipt_owed_to_a_buy_owner_is_refused(db_session, monkeypatch):
+    """The gate: a receipt against a live order may not be published untyped."""
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-UNTYPED-BUY")
+    owner, _requirement = _buy_owner(db_session, parent, item)
+    owner.organization_ref = ""
+    db_session.flush()
+    receipt = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="receipt",
+        warehouse="WH-BUY", recorder_type="Document_ПриходнаяНакладная",
+        ref="receipt-untyped",
+    )
+    db_session.commit()
+
+    _patch_payloads(monkeypatch, evidence=())
+    # The typing step produces nothing for this receipt.
+    monkeypatch.setattr(
+        publisher, "build_bounded_supplier_receipt_manifest",
+        lambda *a, **kw: publisher.BoundedBuyReceiptDeltaManifest(),
+    )
+    monkeypatch.setattr(
+        publisher, "apply_current_replenishment_for_bounded_buy_scopes",
+        lambda *a, **kw: SimpleNamespace(replayed_rows=0),
+    )
+
+    with pytest.raises(
+        publisher.ForwardPhysicalRefreshUnavailable,
+        match="untyped although their items have an active current BUY owner",
+    ):
+        publisher.publish_forward_physical_refresh_current(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            delta_manifest={"rows": (receipt,), "supersessions": ()},
+            odata_client=object(),
+            source_revision=target_batch.id,
+            planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        )
+    db_session.rollback()
