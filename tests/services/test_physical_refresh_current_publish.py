@@ -9,6 +9,8 @@ import pytest
 
 from app import models
 from app.services.item_ledger import assembly_output_persistence as output_persistence
+from app.services import planning_truth
+from app.services.item_ledger import current_execution
 from app.services.item_ledger import physical_refresh_current_publish as publisher
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
 
@@ -673,3 +675,174 @@ def test_bounded_owner_missing_required_identity_has_diagnostic():
                 "match_rule": "fifo",
             }],
         )
+
+
+def _stale_pointer_generations(db_session, *, pointer_age_days=3):
+    """Same shape as ``_generations``, with an accepted pointer N days old."""
+    parent, target = _generations(db_session)
+    now = datetime.now(timezone.utc)
+    parent_cutoff = now - timedelta(days=int(pointer_age_days))
+    target_cutoff = now - timedelta(minutes=5)
+    parent.cutoff = parent_cutoff
+    parent.accepted_at = parent_cutoff
+    parent.capabilities = {
+        "physical_ledger": True,
+        "execution_allocations": True,
+        "planning_snapshots": True,
+    }
+    parent.physical_import_batch.cutoff = parent_cutoff
+    parent.physical_import_batch.completed_at = parent_cutoff
+    target.cutoff = target_cutoff
+    target_batch = db_session.get(
+        models.PhysicalImportBatch, int(target.physical_import_batch_id)
+    )
+    target_batch.cutoff = target_cutoff
+    target_batch.completed_at = target_cutoff
+    db_session.flush()
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=parent.id,
+        ledger_cutoff=parent.cutoff,
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.commit()
+    return parent, target, run
+
+
+def test_bounded_publish_survives_a_pointer_older_than_the_freshness_limit(
+    db_session, monkeypatch
+):
+    """A stand quiet for three days must still be able to refresh itself.
+
+    The obligation-view builders ran inside the publication behind the same
+    age gate the publication exists to clear, so every candidate raised
+    ``PlanningTruthUnavailable`` and was discarded: the only mechanism that
+    makes truth fresh refused to run on stale truth.
+    """
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    parent, target, run = _stale_pointer_generations(db_session)
+    item = models.Item(item_code="CP-STALE", item_name="Stale pointer item")
+    db_session.add(item)
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="stale-pointer-sle", business_identity="stale-pointer-sle",
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="wh", qty=Decimal("2"),
+        posting_at=target.cutoff - timedelta(hours=1), record_type="Receipt",
+        movement_kind="transfer_out", recorder_type="Document_Transfer",
+        recorder_ref="cp-stale", line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.commit()
+
+    # Keep the canonical obligation-view builder in place; only the period
+    # payload seam and the surrounding pipeline are stubbed.
+    real_obligation_views = publisher._build_obligation_view_payloads
+    phases = []
+    _patch_safe_pipeline(monkeypatch, phases)
+    monkeypatch.setattr(
+        publisher, "_build_obligation_view_payloads", real_obligation_views
+    )
+    monkeypatch.setattr(
+        publisher, "build_period_plan_execution_current_payloads",
+        lambda *a, **kw: {},
+    )
+    monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: (int(run.run_id),))
+    # Real pointer switch: the whole point is that the published generation is
+    # the one that becomes fresh truth.
+    monkeypatch.setattr(
+        publisher, "publish_generation", planning_truth.publish_generation
+    )
+
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (sle,), "supersessions": ()},
+        odata_client=None,
+        source_revision=target.physical_import_batch_id,
+        planning_pool_by_warehouse={"wh": "pool"},
+    )
+
+    assert result.target_generation_id == target.id
+    accepted = db_session.get(models.LedgerGeneration, target.id)
+    assert str(accepted.status) == "accepted"
+    # The publication is what restored freshness: the new pointer is young.
+    db_session.expire_all()
+    readiness = planning_truth.get_readiness(db_session)
+    assert readiness.ready is True
+    assert readiness.ledger_generation == target.id
+    db_session.rollback()
+
+
+def _queue_row(plan_line_id, remaining):
+    return {
+        "entity_kind": "assembly_queue",
+        "business_identity": f"plan-line:{plan_line_id}",
+        "scope_key": "assembly:all-live-plans",
+        "payload": {
+            "plan_id": 1,
+            "plan_line_id": plan_line_id,
+            "run_id": 1,
+            "item_id": 1,
+            "bucket_date": "2026-09-01",
+            "period_from": "2026-09-01",
+            "period_to": "2026-09-30",
+            "planned_output_qty": "10",
+            "accepted_plan_output_qty": "0",
+            "assembly_remaining_qty": str(remaining),
+            "eligible_from": None,
+            "original_priority": [],
+            "sort_key": f"{plan_line_id:012d}",
+        },
+    }
+
+
+def test_bounded_publish_keeps_the_whole_assembly_queue_summary(db_session):
+    """The bounded republish must not shrink the scope's summary contract.
+
+    ``assembly_queue`` has one summary the reader requires in full; the
+    bounded publisher wrote ``total_rows`` alone, so ``total_queue_qty``
+    disappeared on every physical tick and the queue answered
+    ``assembly_queue_unavailable: current queue summary is missing`` until the
+    next full accept.
+    """
+    parent, target = _generations(db_session)
+    queue_rows = (_queue_row(1, "4.500"), _queue_row(2, "1.500"))
+
+    # The full accept path publishes the complete summary first.
+    publisher.publish_current_execution_scope(
+        db_session,
+        source_revision="accept:1",
+        source_generation_id=int(parent.id),
+        scope_key="assembly:all-live-plans",
+        rows=queue_rows,
+        entity_kinds=("assembly_queue",),
+        summary=current_execution.assembly_queue_scope_summary(queue_rows),
+    )
+    db_session.flush()
+
+    # Then a bounded physical refresh republishes the same scope.
+    target.status = "accepted"
+    target.accepted_at = target.cutoff
+    db_session.flush()
+    publisher._publish_assembly_current(
+        db_session,
+        target_id=int(target.id),
+        assembly_payload={"queue_rows": queue_rows, "readiness_rows": (), "readiness_metrics": {}},
+        revision=f"physical:{int(target.id)}",
+    )
+    db_session.flush()
+
+    manifest = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="assembly_queue", scope_key="assembly:all-live-plans",
+    ).one()
+    summary = dict(manifest.summary or {})
+    # Exactly what the reader requires before it will answer at all.
+    assert "total_rows" in summary and "total_queue_qty" in summary
+    assert int(summary["total_rows"]) == 2
+    assert float(summary["total_queue_qty"]) == pytest.approx(6.0)
+    db_session.rollback()

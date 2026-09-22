@@ -16,6 +16,11 @@ the rows they retired inactive *and* unsuperseded, so the next re-pull believes
 there is nothing to retire, inserts a fresh revision, and both stay visible.  The
 ledger then double-counts every recorder the candidate had touched.
 
+The candidate's custody events leave a second mark outside the physical
+tables: they invalidate the current execution manifests in their own committed
+transaction, so removing them has to re-open exactly the results they closed.
+See ``_restore_manifests_invalidated_by``.
+
 This module performs the whole rollback as one checked unit and refuses to
 commit anything it cannot prove: the accepted parent's visible truth must come
 out byte-identical, the rollback must not leave a single recorder line with more
@@ -54,6 +59,14 @@ DOCUMENT_PULL_SOURCE = "document_pull"
 REJECTED_STATUS = "rejected"
 REASON_KEY = "rejected_reason"
 DISCARDED_BOUNDARY_KEY = "rejected_physical_import_batch_id"
+ORIGIN_KEY = "rejected_origin"
+#: An operator pressed the discard button: the candidate is abandoned on
+#: purpose and whatever retry backoff it earned is no longer meaningful.
+DISCARD_ORIGIN_OPERATOR = "operator"
+#: The pipeline rejected its own candidate after a failure.  The failure is
+#: still a failure: the scheduler must keep counting it.
+DISCARD_ORIGIN_AUTOMATIC = "automatic"
+DISCARD_ORIGINS = frozenset({DISCARD_ORIGIN_OPERATOR, DISCARD_ORIGIN_AUTOMATIC})
 
 
 class PhysicalRefreshDiscardError(RuntimeError):
@@ -72,6 +85,9 @@ class PhysicalRefreshDiscardResult:
     deleted_anchors: int
     deleted_custody_events: int
     deleted_generation_rows: dict[str, int]
+    #: ``entity_kind:scope_key`` of every manifest whose only reason to be
+    #: unavailable was a custody event this rollback removed.
+    restored_current_execution_scopes: tuple[str, ...]
     reactivated_entries: int
     parent_fingerprint: tuple[int, str]
     #: Damage that predates this candidate: not repaired, never hidden.
@@ -163,6 +179,83 @@ def _live_revision_conflicts(db: Session) -> int:
     ), {"document_pull": DOCUMENT_PULL_SOURCE}).scalar() or 0)
 
 
+def _restore_manifests_invalidated_by(
+    db: Session,
+    discarded_custody: list[Any],
+) -> tuple[str, ...]:
+    """Re-open the current results whose only blocker this rollback removed.
+
+    The import checkpoint commits before publication, and a custody writer
+    invalidates the manifests it affects inside that same committed
+    transaction — which is what canon R8 requires of it: the invalidation is
+    a property of the custody write, not of a publication that may never
+    happen.  So the invalidation must be *undone* by whoever undoes the
+    custody write, and nothing else can do it: after the events are deleted
+    the database holds no trace of why ``assembly_readiness``,
+    ``drum_schedule`` and ``shelf_projection`` are unavailable, and every
+    reader fails closed until some later refresh happens to publish.  Moving
+    the invalidation into the publication transaction was the other option;
+    it was rejected because it would let a committed custody change sit
+    behind a manifest still advertising a result computed without it.
+
+    Restoration is deliberately narrow.  A manifest is re-opened only when
+    its recorded ``source_revision`` names a custody event this rollback just
+    deleted, which means nothing has invalidated it since.  For the
+    workshop-transfer marker (``custody:transfer:<recorder_ref>``, shared by
+    every event of one recorder) the marker counts only if no event of that
+    recorder survived: a surviving sibling is an invalidating cause that is
+    still true.
+
+    Bounded residual: an invalidation of an already-closed manifest is a no-op
+    by design, so a second cause arriving between the candidate's custody
+    write and this rollback leaves no trace to read and the restored result
+    can be one republish behind it.  That window is the refresh's own failure
+    handling, and the worker's next publication closes it; it is strictly
+    smaller than the alternative, which was a manifest closed forever with no
+    cause in the database at all.
+    """
+    revisions: set[str] = set()
+    transfer_refs: set[str] = set()
+    for event_id, source_ref2c in discarded_custody:
+        revisions.add(f"custody:event:{int(event_id)}")
+        ref = str(source_ref2c or "").strip()
+        if ref:
+            transfer_refs.add(ref)
+    if transfer_refs:
+        surviving = {
+            str(ref or "").strip()
+            for (ref,) in db.query(
+                models.ProductionMaterialCustodyEvent.source_ref2c
+            ).filter(
+                models.ProductionMaterialCustodyEvent.source_ref2c.in_(
+                    sorted(transfer_refs)
+                )
+            ).distinct().all()
+        }
+        revisions.update(
+            f"custody:transfer:{ref}"
+            for ref in sorted(transfer_refs - surviving)
+        )
+    if not revisions:
+        return ()
+
+    manifests = db.query(models.CurrentExecutionScope).filter(
+        models.CurrentExecutionScope.result_ready.is_(False),
+        models.CurrentExecutionScope.source_revision.in_(sorted(revisions)),
+    ).with_for_update().all()
+    restored: list[str] = []
+    for manifest in manifests:
+        manifest.result_ready = True
+        db.query(models.CurrentExecutionRow).filter(
+            models.CurrentExecutionRow.entity_kind == str(manifest.entity_kind),
+            models.CurrentExecutionRow.scope_key == str(manifest.scope_key),
+            models.CurrentExecutionRow.result_status == "accepted",
+        ).update({"result_ready": True}, synchronize_session=False)
+        restored.append(f"{manifest.entity_kind}:{manifest.scope_key}")
+    db.flush()
+    return tuple(sorted(restored))
+
+
 def _generation_scoped_tables() -> list[Any]:
     """Mapped classes carrying ``ledger_generation_id``, child tables first."""
     scoped = {
@@ -234,16 +327,30 @@ def discard_physical_refresh_candidate(
     *,
     ledger_generation_id: int,
     reason: str,
+    origin: str = DISCARD_ORIGIN_AUTOMATIC,
 ) -> PhysicalRefreshDiscardResult:
     """Roll one unpublishable candidate back to its accepted parent's boundary.
 
     Deliberately does not commit: a destructive operation should leave the
     caller in charge of the transaction.  Every check runs before returning, so
     a raised error means nothing was proved and the caller must roll back.
+
+    ``origin`` records who abandoned the candidate, because the scheduler has
+    to tell the two apart: an operator discard retires the retry identity
+    *and* its backoff, while an automatic rejection retires only the identity
+    — the failure that caused it still counts.  The default is the
+    conservative one; a caller that clears backoff has to say so.
     """
     text_reason = str(reason or "").strip()
     if not text_reason:
         raise ValueError("reason is required when discarding a candidate")
+    text_origin = str(origin or "").strip()
+    if text_origin not in DISCARD_ORIGINS:
+        raise ValueError(
+            "discard origin must be "
+            + " or ".join(sorted(DISCARD_ORIGINS))
+            + f"; got {origin!r}"
+        )
 
     # Take the physical-sequence lock before reading anything: a refresh may be
     # building right now, and deleting its rows underneath it made SQLAlchemy
@@ -270,6 +377,7 @@ def discard_physical_refresh_candidate(
     generation.source_watermarks = {
         **dict(generation.source_watermarks or {}),
         REASON_KEY: text_reason,
+        ORIGIN_KEY: text_origin,
         DISCARDED_BOUNDARY_KEY: boundary_before,
         "rejected_at": datetime.now(timezone.utc).isoformat(),
         "rejected_algorithm_version": ALGORITHM_VERSION,
@@ -284,6 +392,16 @@ def discard_physical_refresh_candidate(
     # the pair on the next import, because it still recognises the orphan by its
     # stable physical identity.  That is how one rolled-back candidate silently
     # blocked every launch with a negative workshop reservation.
+    doomed_custody = db.query(
+        models.ProductionMaterialCustodyEvent.id,
+        models.ProductionMaterialCustodyEvent.source_ref2c,
+    ).filter(
+        models.ProductionMaterialCustodyEvent.source_sle_id.in_(
+            db.query(models.StockLedgerEntry.id).filter(
+                models.StockLedgerEntry.ingest_batch_id > cut
+            )
+        )
+    ).all()
     deleted_custody_events = db.query(
         models.ProductionMaterialCustodyEvent
     ).filter(
@@ -293,6 +411,8 @@ def discard_physical_refresh_candidate(
             )
         )
     ).delete(synchronize_session=False)
+    db.flush()
+    restored_scopes = _restore_manifests_invalidated_by(db, doomed_custody)
 
     # Physical rows, referenced side first.
     deleted_anchors = db.query(models.StockLedgerAnchor).filter(
@@ -357,6 +477,7 @@ def discard_physical_refresh_candidate(
         deleted_anchors=int(deleted_anchors),
         deleted_custody_events=int(deleted_custody_events),
         deleted_generation_rows=deleted_generation_rows,
+        restored_current_execution_scopes=restored_scopes,
         reactivated_entries=int(reactivated),
         parent_fingerprint=fingerprint,
         preexisting_live_revision_conflicts=int(conflicts),

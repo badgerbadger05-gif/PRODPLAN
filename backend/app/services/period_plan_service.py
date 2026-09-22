@@ -52,7 +52,11 @@ from .mrp_stock_helpers import (
     consume_wip_detailed as _consume_wip_detailed,
     effective_stock_by_item_all as _effective_stock_by_item_all,
 )
-from .planning_run_candidate import _resolve_parent_generation_id
+from .item_ledger.live_plan_scope import DuplicateLivePlanRunError
+from .planning_run_candidate import (
+    _resolve_parent_generation_id,
+    current_live_plan_run_ids,
+)
 from .forecast import forecast_payload as _forecast_payload
 from .item_ledger.live_plan_scope import live_plan_run_ids
 from .item_ledger.r3_contract import current_live_run
@@ -1284,6 +1288,18 @@ def create_mrp_snapshot_from_period_plan(
         cfg_id, cfg = get_active_planning_config(db)
     except Exception:
         cfg_id, cfg = None, dict(DEFAULT_PLANNING_CONFIG)
+    # "Does this plan already have a current fixed snapshot" has exactly one
+    # owner - the sealed live scope that the refresh manifest itself uses.
+    # Resolve it once here so this gate and the manifest cannot disagree.
+    try:
+        live_run_ids = current_live_plan_run_ids(db, parent)
+    except DuplicateLivePlanRunError as exc:
+        # The sealed scope itself found the plan poisoned by the old fixation
+        # race.  Keep the operator-facing wording the repair endpoint is
+        # documented with.
+        raise ValueError(
+            "План имеет несколько текущих зафиксированных MRP-снимков"
+        ) from exc
     current_run: PlanningRun | None = None
     for current in (
         db.query(PlanningRun)
@@ -1293,8 +1309,7 @@ def create_mrp_snapshot_from_period_plan(
         )
         .all()
     ):
-        resolved_parent_generation_id = _resolve_parent_generation_id(db, current)
-        if resolved_parent_generation_id == int(parent.id):
+        if int(current.run_id) in live_run_ids:
             if current_run is not None:
                 raise ValueError(
                     "План имеет несколько текущих зафиксированных MRP-снимков"
@@ -1455,12 +1470,17 @@ def repair_duplicate_plan_snapshots(
         .order_by(PlanningRun.run_id.asc())
         .all()
     )
+    # Same single source as the snapshot gate above: a duplicate is repaired
+    # against the sealed live scope, not against a generation id stamp.  This
+    # is the one caller that must survive a scope reporting two live runs for
+    # the plan - repairing that is its whole job - so it falls back to ranking
+    # every fixed run of the plan.
+    try:
+        live_run_ids = current_live_plan_run_ids(db, parent)
+    except DuplicateLivePlanRunError:
+        live_run_ids = frozenset()
     current_run_ids = {
-        int(run.run_id)
-        for run in runs
-        if _resolve_parent_generation_id(
-            db, run, current_generation_id=int(parent.id)
-        ) == int(parent.id)
+        int(run.run_id) for run in runs if int(run.run_id) in live_run_ids
     }
     if len(runs) <= 1:
         return {

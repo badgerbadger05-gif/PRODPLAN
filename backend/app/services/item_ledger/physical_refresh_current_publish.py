@@ -22,6 +22,7 @@ from app.services.item_ledger.assembly_output_persistence import (
     apply_bounded_assembly_output_plan_execution,
 )
 from app.services.item_ledger.current_execution import (
+    assembly_queue_scope_summary,
     build_compact_current_assembly_payload,
     get_current_execution_scope,
     publish_current_execution_scope,
@@ -665,9 +666,20 @@ def _build_obligation_view_payloads(
     that pointer exactly.  Republishing them from the same canonical builders
     used by the full accept path is therefore part of every publication, not an
     optional extra.
+
+    Those builders read the pointer truth with the age gate dropped.  The
+    physical refresh is the only mechanism that makes the pointer fresh, so
+    refusing to build on an old pointer is a self-deadlock: after a gap longer
+    than ``PLANNING_TRUTH_MAX_AGE_SECONDS`` the builder raised, the
+    orchestrator discarded the candidate, and the stand could never recover on
+    its own.  Coherence with the exact pointer, its capabilities and any
+    operator invalidation are still enforced; only the clock is ignored, and
+    only here.
     """
     mrp_payloads = {
-        str(run_id): build_mrp_result_current_payload(db, int(run_id))
+        str(run_id): build_mrp_result_current_payload(
+            db, int(run_id), ignore_freshness_limit=True
+        )
         for run_id in sorted({int(value) for value in run_ids})
     }
     period_payloads = build_period_plan_execution_current_payloads(
@@ -697,7 +709,11 @@ def _publish_assembly_current(
         scope_key="assembly:all-live-plans",
         rows=queue_rows,
         entity_kinds=("assembly_queue",),
-        summary={"total_rows": len(queue_rows)},
+        # The scope has one summary contract, owned by
+        # ``assembly_queue_scope_summary``.  Writing a partial one here
+        # overwrote ``total_queue_qty`` on every bounded refresh and the
+        # reader - which requires it - 503'd until the next full accept.
+        summary=assembly_queue_scope_summary(queue_rows),
     )
     readiness_rows = resolve_compact_queue_owner_ids(
         db, tuple(_member(assembly_payload, "readiness_rows") or ())

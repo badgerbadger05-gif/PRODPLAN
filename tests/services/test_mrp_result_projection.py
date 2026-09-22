@@ -10,6 +10,10 @@ import pytest
 from app import models
 from app.routers import plan as plan_router
 from app.services import mrp_result_projection
+from app.services.planning_truth import (
+    PlanningTruthUnavailable,
+    require_accepted_truth,
+)
 from app.services.mrp_result_projection import (
     build_mrp_result_current_payload,
     read_mrp_result_manifest,
@@ -1126,3 +1130,87 @@ def test_read_mrp_result_rows_supports_category_filters_and_missing_category(
     assert ref_rows["rows"][0]["item_name"] == "Category B"
     assert missing_category_rows["total"] == 1
     assert missing_category_rows["rows"][0]["item_name"] == "Missing category"
+
+
+def _stale_fixed_run(db_session):
+    """An accepted pointer far older than any sane freshness threshold."""
+    generation = _accepted_generation(db_session)
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+    return generation, run
+
+
+def test_http_reader_gate_still_rejects_truth_older_than_the_freshness_limit(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    _generation, run = _stale_fixed_run(db_session)
+
+    with pytest.raises(PlanningTruthUnavailable, match="freshness threshold"):
+        build_mrp_result_current_payload(db_session, run.run_id)
+
+
+def test_publication_builder_ignores_the_age_gate_it_is_there_to_clear(
+    db_session, monkeypatch
+):
+    """The self-deadlock: only a refresh makes truth fresh, so it cannot need fresh truth.
+
+    After a gap longer than the threshold the builder raised inside the
+    bounded publication, the orchestrator discarded the candidate, and no
+    refresh could ever succeed again.
+    """
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    generation, run = _stale_fixed_run(db_session)
+
+    payload = build_mrp_result_current_payload(
+        db_session, run.run_id, ignore_freshness_limit=True
+    )
+
+    assert int(payload["meta"]["run_id"]) == int(run.run_id)
+    assert int(generation.id) == int(
+        db_session.get(models.PlanningTruthState, 1).current_generation_id
+    )
+
+
+def test_ignoring_the_age_gate_does_not_revive_an_invalidated_generation(
+    db_session, monkeypatch
+):
+    """Dropping the clock is not dropping fail-closed.
+
+    Only the age is ignored.  An operator invalidation, a structurally
+    incomplete generation and a missing capability all still stop the
+    consumer, so the publication path cannot be used to read past a pointer
+    somebody deliberately closed.
+    """
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    generation, _run = _stale_fixed_run(db_session)
+    generation.status = "stale"
+    generation.reason = "operator invalidated the physical prefix"
+    db_session.flush()
+
+    with pytest.raises(PlanningTruthUnavailable) as excinfo:
+        require_accepted_truth(
+            db_session,
+            "mrp_result",
+            required_capabilities=(),
+            ignore_freshness_limit=True,
+        )
+    assert "invalidated" in str(excinfo.value)
+
+    generation.status = "accepted"
+    generation.reason = None
+    db_session.flush()
+    with pytest.raises(PlanningTruthUnavailable, match="lacks capabilities"):
+        require_accepted_truth(
+            db_session,
+            "mrp_result",
+            required_capabilities=("future_supply",),
+            ignore_freshness_limit=True,
+        )

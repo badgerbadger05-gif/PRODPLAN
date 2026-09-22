@@ -146,8 +146,16 @@ def get_readiness(
     db: Session,
     *,
     now: datetime | None = None,
+    apply_freshness_limit: bool = True,
 ) -> PlanningTruthReadiness:
-    """Return current truth state without guessing or consulting legacy facts."""
+    """Return current truth state without guessing or consulting legacy facts.
+
+    ``apply_freshness_limit=False`` drops only the age gate.  Every structural
+    rule and an explicit operator invalidation still decide the status, so a
+    generation invalidated to ``stale``/``rejected`` stays unavailable.  It
+    exists for the publications that are themselves the mechanism restoring
+    freshness; see ``require_accepted_truth``.
+    """
     pointer = db.get(models.PlanningTruthState, 1)
     generation = pointer.current_generation if pointer is not None else None
     if generation is None:
@@ -174,7 +182,7 @@ def get_readiness(
     reason = generation.reason
     if status == "accepted" and not structurally_accepted:
         reason = reason or "Accepted generation is missing cutoff or accepted_at"
-    freshness_limit = _configured_max_age()
+    freshness_limit = _configured_max_age() if apply_freshness_limit else None
     if structurally_accepted and freshness_limit is not None:
         checked_at = _as_utc(now or datetime.now(timezone.utc))
         freshness_reference = min(
@@ -226,9 +234,22 @@ def require_accepted_truth(
     required_capabilities: Iterable[str] = (),
     *,
     allow_stale: bool = False,
+    ignore_freshness_limit: bool = False,
 ) -> PlanningTruthReadiness:
-    """Fail closed for a named report, planner, DBR or mutation consumer."""
-    readiness = get_truth_state(db)
+    """Fail closed for a named report, planner, DBR or mutation consumer.
+
+    ``ignore_freshness_limit`` is only for a consumer running *inside* the
+    publication that restores freshness.  A physical refresh is the sole
+    mechanism that makes the accepted pointer young again, so gating its own
+    canonical builders on the pointer's age is a deadlock: once the stand has
+    been quiet for longer than the threshold, every refresh fails on staleness
+    and no refresh can ever clear it.  The flag drops the age gate and nothing
+    else - structural validity, capabilities and operator invalidation still
+    apply, and HTTP readers keep the gate.
+    """
+    readiness = get_readiness(
+        db, apply_freshness_limit=not bool(ignore_freshness_limit)
+    )
     stale_but_explicitly_allowed = (
         bool(allow_stale) and str(readiness.truth_status) == "stale"
     )

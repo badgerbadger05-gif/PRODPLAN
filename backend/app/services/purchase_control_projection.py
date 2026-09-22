@@ -1409,8 +1409,13 @@ def _load_parent_compact_purchase_rows(
             if requirement_id not in reservation_by_requirement
         ]
         if missing:
+            # Report the full size first: the truncated head alone made an
+            # operator read a whole-scope promotion failure as a handful of
+            # stragglers.  The head stays for a directly actionable example.
+            elision = " ..." if len(missing) > 8 else ""
             raise PurchaseControlCompactPayloadError(
                 f"current BUY owner is missing for requirements {missing[:8]}"
+                f"{elision} ({len(missing)} total)"
             )
         normalised_rows: list[dict[str, Any]] = []
         for row in rows:

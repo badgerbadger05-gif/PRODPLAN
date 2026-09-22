@@ -100,21 +100,35 @@ def visible_sles(
     ).all()
 
 
-def visible_sles_for_generation(
+def visible_sle_query_for_generation(
     db: Session,
     ledger_generation_id: int,
-) -> list[models.StockLedgerEntry]:
-    """Resolve the immutable physical prefix named by one Ledger generation."""
+) -> Query:
+    """Query form of the prefix named by one Ledger generation.
+
+    Same single visibility rule as :func:`visible_sles_for_generation`; the
+    query form exists so a caller that only needs a bounded count or a typed
+    subset does not have to materialise the whole prefix, and never so that a
+    second visibility rule can be written in SQL somewhere else.
+    """
     generation = db.get(models.LedgerGeneration, int(ledger_generation_id))
     if generation is None:
         raise PhysicalVisibilityError(
             f"Ledger generation {ledger_generation_id} does not exist"
         )
-    return visible_sles(
+    return visible_sle_query(
         db,
         physical_import_batch_id=int(generation.physical_import_batch_id),
         cutoff=generation.cutoff,
     )
+
+
+def visible_sles_for_generation(
+    db: Session,
+    ledger_generation_id: int,
+) -> list[models.StockLedgerEntry]:
+    """Resolve the immutable physical prefix named by one Ledger generation."""
+    return visible_sle_query_for_generation(db, int(ledger_generation_id)).all()
 
 
 def import_batch_provenance(

@@ -61,6 +61,7 @@ from ..services.item_ledger.historical_bootstrap_phase0 import (
 )
 from ..services.item_ledger.physical_refresh_discard import (
     PhysicalRefreshDiscardError,
+    DISCARD_ORIGIN_OPERATOR,
     discard_physical_refresh_candidate,
 )
 from ..services.item_ledger.physical import (
@@ -513,6 +514,9 @@ def discard_physical_refresh(
             db,
             ledger_generation_id=payload.ledger_generation_id,
             reason=payload.reason,
+            # An operator abandoned this candidate on purpose, so the
+            # scheduler may drop the retry backoff it earned.
+            origin=DISCARD_ORIGIN_OPERATOR,
         )
         db.commit()
     except (ValueError, PhysicalRefreshDiscardError) as exc:
@@ -534,6 +538,9 @@ def discard_physical_refresh(
         "deleted_anchors": result.deleted_anchors,
         "deleted_custody_events": result.deleted_custody_events,
         "deleted_generation_rows": result.deleted_generation_rows,
+        "restored_current_execution_scopes": list(
+            result.restored_current_execution_scopes
+        ),
         "reactivated_entries": result.reactivated_entries,
         "parent_fingerprint": {
             "rows": result.parent_fingerprint[0],

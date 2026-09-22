@@ -446,3 +446,189 @@ def test_discard_takes_the_candidate_custody_events_with_it(db_session):
 
     assert result.deleted_custody_events == 1
     assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 0
+
+
+CUSTODY_SCOPES = (
+    ("assembly_readiness", "assembly:all-live-plans"),
+    ("drum_schedule", "drum:all-live-plans"),
+    ("shelf_projection", "shelf:all-live-mrps"),
+)
+
+
+def _manifest(db_session, entity_kind, scope_key, *, source_revision, generation):
+    """A published-then-invalidated current result, manifest plus one row."""
+    db_session.add(models.CurrentExecutionScope(
+        entity_kind=entity_kind,
+        scope_key=scope_key,
+        source_revision=source_revision,
+        source_generation_id=int(generation.id),
+        result_ready=False,
+        content_hash="c" * 64,
+        summary={},
+    ))
+    db_session.add(models.CurrentExecutionRow(
+        entity_kind=entity_kind,
+        scope_key=scope_key,
+        business_identity=f"{entity_kind}:row-1",
+        source_revision=source_revision,
+        source_generation_id=int(generation.id),
+        result_status="accepted",
+        result_ready=False,
+        content_hash="r" * 64,
+        payload={"kind": entity_kind},
+    ))
+    db_session.flush()
+
+
+def _custody_event(db_session, *, item, source_sle_id, recorder_ref, key):
+    event = models.ProductionMaterialCustodyEvent(
+        issue_id=None,
+        product_id=int(item.item_id),
+        component_item_id=int(item.item_id),
+        source_kind="transfer_posted",
+        source_sle_id=source_sle_id,
+        effective_at=CUTOFF,
+        location_kind="workshop",
+        warehouse_ref1c="WH",
+        source_ref1c=None,
+        source_ref2c=recorder_ref,
+        delta_qty=Decimal("1"),
+        idempotency_key=key,
+    )
+    db_session.add(event)
+    db_session.flush()
+    return event
+
+
+def _scope_state(db_session):
+    return {
+        (row.entity_kind, row.scope_key): bool(row.result_ready)
+        for row in db_session.query(models.CurrentExecutionScope).all()
+    }
+
+
+def test_discard_reopens_the_results_its_own_custody_events_closed(db_session):
+    """The candidate's import closed the current results; its rollback must re-open them.
+
+    The import checkpoint commits before publication and the custody writer
+    invalidates in that same committed transaction.  Once the events are
+    deleted no row in the database explains why the manifests are unavailable,
+    so every reader failed closed until some later refresh happened to publish.
+    """
+    _parent, candidate, _kept, item = _world(db_session)
+    candidate_batch = db_session.get(
+        models.PhysicalImportBatch, int(candidate.physical_import_batch_id)
+    )
+    candidate_sle = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id == int(candidate_batch.id)
+    ).one()
+    _custody_event(
+        db_session,
+        item=item,
+        source_sle_id=int(candidate_sle.id),
+        recorder_ref="transfer-doc-1",
+        key="candidate-transfer-1",
+    )
+    for entity_kind, scope_key in CUSTODY_SCOPES:
+        _manifest(
+            db_session,
+            entity_kind,
+            scope_key,
+            source_revision="custody:transfer:transfer-doc-1",
+            generation=_parent,
+        )
+    db_session.commit()
+
+    result = discard_physical_refresh_candidate(
+        db_session,
+        ledger_generation_id=int(candidate.id),
+        reason="convergence failed",
+    )
+    db_session.commit()
+
+    assert result.deleted_custody_events == 1
+    assert result.restored_current_execution_scopes == (
+        "assembly_readiness:assembly:all-live-plans",
+        "drum_schedule:drum:all-live-plans",
+        "shelf_projection:shelf:all-live-mrps",
+    )
+    assert all(_scope_state(db_session).values())
+    assert all(
+        bool(row.result_ready)
+        for row in db_session.query(models.CurrentExecutionRow).all()
+    )
+
+
+def test_discard_reopens_only_the_scopes_its_candidate_invalidated(db_session):
+    """Every other cause of unavailability survives the rollback untouched.
+
+    Three controls: a manifest closed by something that is not custody at all,
+    a manifest closed by a transfer marker whose recorder still has a live
+    event below the boundary, and a manifest closed by a custody event that
+    this candidate did not create.
+    """
+    parent, candidate, _kept, item = _world(db_session)
+    candidate_batch = db_session.get(
+        models.PhysicalImportBatch, int(candidate.physical_import_batch_id)
+    )
+    parent_batch = db_session.get(
+        models.PhysicalImportBatch, int(parent.physical_import_batch_id)
+    )
+    candidate_sle = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id == int(candidate_batch.id)
+    ).one()
+    parent_sle = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id == int(parent_batch.id)
+    ).order_by(models.StockLedgerEntry.id.asc()).first()
+
+    doomed = _custody_event(
+        db_session,
+        item=item,
+        source_sle_id=int(candidate_sle.id),
+        recorder_ref="shared-transfer",
+        key="candidate-shared",
+    )
+    # Same recorder, but imported at/below the retained boundary: the rollback
+    # does not remove it, so its invalidating cause is still true.
+    survivor = _custody_event(
+        db_session,
+        item=item,
+        source_sle_id=int(parent_sle.id),
+        recorder_ref="shared-transfer",
+        key="parent-shared",
+    )
+
+    _manifest(
+        db_session, "assembly_readiness", "assembly:all-live-plans",
+        source_revision=f"custody:event:{int(doomed.id)}", generation=parent,
+    )
+    _manifest(
+        db_session, "drum_schedule", "drum:all-live-plans",
+        source_revision="custody:transfer:shared-transfer", generation=parent,
+    )
+    _manifest(
+        db_session, "shelf_projection", "shelf:all-live-mrps",
+        source_revision=f"custody:event:{int(survivor.id)}", generation=parent,
+    )
+    _manifest(
+        db_session, "drum_slot", "drum:all-live-plans",
+        source_revision="calendar:2026-09-20", generation=parent,
+    )
+    db_session.commit()
+
+    result = discard_physical_refresh_candidate(
+        db_session,
+        ledger_generation_id=int(candidate.id),
+        reason="convergence failed",
+    )
+    db_session.commit()
+
+    assert result.restored_current_execution_scopes == (
+        "assembly_readiness:assembly:all-live-plans",
+    )
+    assert _scope_state(db_session) == {
+        ("assembly_readiness", "assembly:all-live-plans"): True,
+        ("drum_schedule", "drum:all-live-plans"): False,
+        ("shelf_projection", "shelf:all-live-mrps"): False,
+        ("drum_slot", "drum:all-live-plans"): False,
+    }

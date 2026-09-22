@@ -474,6 +474,7 @@ def apply_current_replenishment(
     receipt_facts: tuple[object, ...] = (),
     history_mode: str = "as_occurred",
     receipt_unmatched_return_qty: Decimal = Decimal("0"),
+    confirmed_empty_reason: str = "",
 ) -> CurrentReplenishmentResult:
     """Apply one complete accepted-fact scope atomically.
 
@@ -482,6 +483,13 @@ def apply_current_replenishment(
     allocation rows before checking the source marker, which serializes two
     imports for the same allocation scope.  A stale revision is rejected and
     the exact same revision is an idempotent no-op.
+
+    ``confirmed_empty_reason`` is the explicit R4 acknowledgement that the
+    receipt fact set for this scope is provably empty.  Without it the writer
+    refuses to reduce a populated complete scope to zero allocations, and it
+    is only authoritative for the reserves it was handed.  The reason is
+    stamped on every basis-change audit row the clear-out produces, so the
+    emptiness always has a recorded cause in the database.
     """
 
     fact_rows = tuple(facts)
@@ -713,6 +721,33 @@ def apply_current_replenishment(
     reserve_rows_for_plan = tuple(stable_reserves)
     if len({row.reserve_id for row in reserve_rows_for_plan}) != len(reserve_rows_for_plan):
         raise CurrentReplenishmentError("complete scope contains colliding reservation identities")
+    # The "before" set is only the part of the locked scope this replay is
+    # authoritative for: the reserves it was actually handed, by stable
+    # identity or by physical row.  Taking the whole 5-key distribution scope
+    # made a BUILDING staging replay (``allow_building``) plan a deletion for
+    # every allocation of the stable current owners it had never seen — an
+    # obligation refresh renumbers requirements, so none of the accepted
+    # identities appear in the staging reserve set and the accepted current
+    # assignment was wiped inside a transaction that had not published yet.
+    # Owners the refresh drops are closed by ``publish_current_reservations``
+    # and keep their historical basis; retiring them is not this writer's job.
+    confirmed_empty = bool(_text(confirmed_empty_reason))
+    replayed_identities = {str(row.reserve_id) for row in reserve_rows_for_plan}
+    replayed_reservation_ids = {int(row.reserve_id) for row in reserve_rows}
+    # Canon R4: an empty complete scope is a statement about the whole scope,
+    # so it keeps the whole scope as its "before" set.  Whether it may then be
+    # cleared is decided by the fail-closed guard below, not by quietly
+    # narrowing the set to nothing.
+    authoritative_for_whole_scope = not reserve_rows
+
+    def _is_replayed(row: models.ReservationConsumptionAllocation) -> bool:
+        if authoritative_for_whole_scope:
+            return True
+        if int(row.reservation_id) in replayed_reservation_ids:
+            return True
+        identity = reservation_identity_by_id.get(str(int(row.reservation_id)), "")
+        return bool(identity) and identity in replayed_identities
+
     scoped_allocations = tuple(
         row
         for row in allocations
@@ -721,6 +756,7 @@ def apply_current_replenishment(
         and _allocation_scope(
             row, allocation_entry_by_id[str(row.reservation_id)]
         ) == distribution_scope
+        and _is_replayed(row)
     )
     previous = tuple(
         _as_allocation(row, reservation_identity_by_id) for row in scoped_allocations
@@ -744,6 +780,20 @@ def apply_current_replenishment(
     except (TypeError, ValueError) as exc:
         raise CurrentReplenishmentError(str(exc)) from exc
 
+    # Fail closed on a silent wipe.  A complete-scope replay that deletes every
+    # current allocation it owns while producing none is either a genuinely
+    # empty fact set — which the caller must name — or a defect upstream of the
+    # writer (missing supplier provenance, an unpublished obligation refresh).
+    # An unproven empty input is never allowed to publish as emptiness.
+    if complete_scope and previous and not plan.result.allocations and not confirmed_empty:
+        raise CurrentReplenishmentError(
+            "complete-scope replay would delete all "
+            f"{len(previous)} current replenishment allocations of scope "
+            f"{canonical_scope_key} while producing none; pass "
+            "confirmed_empty_reason to record why the receipt fact set is "
+            "provably empty"
+        )
+
     entries = allocation_entries
     entry_by_id = {str(int(row.id)): row for row in entries}
     fact_by_id = {str(row.fact_id): row for row in fact_rows}
@@ -752,6 +802,10 @@ def apply_current_replenishment(
     audit_reason = "r5_signed_replay" if receipt_replay is not None else "current_replay"
     if receipt_replay is not None and receipt_unmatched_return_qty > 0:
         audit_reason = "r5_signed_replay_unmatched_return"
+    if confirmed_empty:
+        # The recorded cause of the emptiness, durable next to every basis
+        # change it authorises.
+        audit_reason = f"confirmed_empty:{_text(confirmed_empty_reason)}"[:128]
     allocation_by_key = {
         (str(int(row.sle_id)), reservation_identity_by_id[str(int(row.reservation_id))]): row for row in allocations
         if row in scoped_allocations
@@ -927,6 +981,7 @@ def apply_current_receipt_replay(
     fail_after: Literal["assignments", "execution", "marker"] | None = None,
     allow_building: bool = False,
     validated_visible_ids: Iterable[int] | None = None,
+    confirmed_empty_reason: str = "",
 ) -> CurrentReplenishmentResult:
     """Publish signed correction/return replay through the R4 current writer."""
 
@@ -1053,6 +1108,7 @@ def apply_current_receipt_replay(
         receipt_facts=rows,
         history_mode=history_mode,
         receipt_unmatched_return_qty=replay.unmatched_return_qty,
+        confirmed_empty_reason=confirmed_empty_reason,
     )
 
 
@@ -1227,6 +1283,27 @@ def apply_current_replenishment_for_accepted_generation(
         .order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.asc())
         .all()
     )
+    if not provenance:
+        # No provenance is only "no supplier receipts" when the generation
+        # also has no supplier document behind it.  When it does, the typing
+        # step never ran (or never committed) and every BUY scope would be
+        # published empty: the receipt facts vanish, the replay deletes the
+        # whole current assignment and coverage silently drops to zero.  That
+        # is an upstream defect, not an empty fact set.
+        from .physical_refresh_supplier_evidence import is_supplier_document_type
+
+        untyped = sorted(
+            int(row.id)
+            for row in visible.values()
+            if is_supplier_document_type(row.recorder_type)
+            and _decimal(row.qty) != 0
+        )
+        if untyped:
+            raise CurrentReplenishmentError(
+                f"generation {int(generation_id)} has {len(untyped)} visible "
+                "supplier-receipt ledger rows but no supplier receipt "
+                f"provenance; first sle_ids={untyped[:8]}"
+            )
     from .supplier_receipt_allocation import (
         ReceiptFact,
         _exact_allocation_caps_by_order_line,

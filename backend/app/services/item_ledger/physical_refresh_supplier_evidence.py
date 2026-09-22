@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -57,6 +57,15 @@ _SUPPLIER_DOCUMENT_TYPES = frozenset({
 def is_supplier_document_type(value: object) -> bool:
     """Return whether a recorder type is a canonical supplier document."""
     return _text(value) in _SUPPLIER_DOCUMENT_TYPES
+
+
+def supplier_document_type_filter(column: Any) -> Any:
+    """SQL form of :func:`is_supplier_document_type` over the same one set.
+
+    A caller that has to count supplier rows instead of iterating them must
+    not restate the document list in its own query.
+    """
+    return column.in_(sorted(_SUPPLIER_DOCUMENT_TYPES))
 _FORWARD_OPERATION = RECEIPT_OPERATION
 _REJECTED_DELTA_MESSAGE = "complete affected-scope evidence required"
 
@@ -609,5 +618,6 @@ __all__ = [
     "BoundedSupplierEvidenceSummary",
     "build_bounded_supplier_receipt_manifest",
     "is_supplier_document_type",
+    "supplier_document_type_filter",
     "validate_bounded_supplier_receipt_manifest",
 ]

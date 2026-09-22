@@ -10,7 +10,6 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -28,17 +27,54 @@ def _as_utc(value: datetime | None, field: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def current_live_plan_run_ids(
+    db: Session,
+    current: models.LedgerGeneration,
+) -> frozenset[int]:
+    """The one answer to "which runs are live for this accepted generation".
+
+    Canon §27 and ``.docs/planning-truth-contract.md`` give that question a
+    single owner: the sealed ``parent_generation_id`` chain resolved in
+    ``live_plan_scope.py``.  Deciding it anywhere else by comparing a run's or
+    a reservation's ``ledger_generation_id`` with the accepted pointer is the
+    defect the contract names explicitly - a fact-only fork never re-anchors
+    an obligation, so such a reader goes silent after the first physical
+    refresh.
+
+    A broken lineage raises: an unreadable scope is unavailable, never an
+    empty one.  ``DuplicateLivePlanRunError`` is the one failure a caller may
+    catch, because the duplicate-snapshot repair has to work on exactly that
+    state.
+    """
+    from .item_ledger.live_plan_scope import live_plan_run_ids
+
+    return frozenset(int(value) for value in live_plan_run_ids(db, current))
+
+
 def _resolve_parent_generation_id(
     db: Session,
     parent: models.PlanningRun,
     *,
     current_generation_id: int | None = None,
+    live_run_ids: frozenset[int] | None = None,
 ) -> int | None:
-    """Resolve a parent generation from direct lineage or reservation replay.
+    """Resolve the accepted generation whose live scope contains ``parent``.
 
-    Legacy historical FIXED_SNAPSHOT rows occasionally arrive with
-    ``ledger_generation_id`` cleared; in that case their lineage is inferred
-    from reservation replay rows for the same run.
+    Returns the accepted generation id when the run is live for it, otherwise
+    the run's own sealed anchor (it is an obligation of an older generation,
+    not of this one), otherwise ``None``.
+
+    Liveness is not decided here: it is read from the sealed lineage through
+    :func:`current_live_plan_run_ids`.  This function used to answer it from
+    ``PlanningRun.ledger_generation_id`` and ``ReservationEntry`` replay rows,
+    which is a second formula for the same entity.  After the compact-owner
+    cutover the two disagreed in production: the owners keep the generation of
+    their last publication while the pointer advances with every physical
+    refresh, so this gate reported "no current snapshot" for a plan whose
+    refresh manifest then refused with "add plan already has current
+    FIXED_SNAPSHOT" - a 400 on every MRP recalculation.
+
+    ``live_run_ids`` lets a caller resolve many runs against one lineage walk.
     """
     run_id = int(parent.run_id)
     if current_generation_id is None:
@@ -52,68 +88,22 @@ def _resolve_parent_generation_id(
     else:
         current_generation_id = int(current_generation_id)
 
-    if (
-        parent.ledger_generation_id is not None
-        and int(parent.ledger_generation_id) == current_generation_id
-    ):
-        return current_generation_id
-
     current = db.get(models.LedgerGeneration, current_generation_id)
     if current is None or str(current.status) != "accepted":
         return None
 
-    def _is_matching_run(entry: models.ReservationEntry) -> bool:
-        if entry.ledger_generation_id is None:
-            return False
-        if int(entry.ledger_generation_id) != current_generation_id:
-            return False
-        if entry.run_id == run_id:
-            return True
-        if entry.run_id is not None:
-            return False
-        if entry.requirement is not None and int(entry.requirement.run_id) == run_id:
-            return True
-        if entry.requirement_id is None:
-            return False
-        return db.query(models.MrpRequirement.run_id).filter(
-            models.MrpRequirement.id == int(entry.requirement_id)
-        ).scalar() == run_id
-
-    if any(_is_matching_run(entry) for entry in list(db.new) if isinstance(entry, models.ReservationEntry)):
+    if live_run_ids is None:
+        live_run_ids = current_live_plan_run_ids(db, current)
+    if run_id in live_run_ids:
         return current_generation_id
 
-    pending = db.query(models.ReservationEntry.run_id).filter(
-        and_(
-            models.ReservationEntry.ledger_generation_id == current_generation_id,
-            models.ReservationEntry.run_id == run_id,
-        )
-    ).limit(1).scalar()
-    if pending is not None:
-        return current_generation_id
-
-    persisted = (
-        db.query(models.ReservationEntry.run_id)
-        .join(
-            models.MrpRequirement,
-            models.ReservationEntry.requirement_id == models.MrpRequirement.id,
-        )
-        .filter(
-            and_(
-                models.ReservationEntry.ledger_generation_id == current_generation_id,
-                models.MrpRequirement.run_id == run_id,
-                models.ReservationEntry.run_id.is_(None),
-            )
-        )
-        .limit(1)
-        .scalar()
-    )
-    if persisted is not None:
-        return current_generation_id
-    # A direct lineage remains authoritative only when the current generation
-    # has not replayed this run. Physical-refresh generations deliberately
-    # reuse frozen run headers while rebuilding their reservations.
+    # Anchored, but outside this generation's live scope: the run is the
+    # obligation of the generation that sealed it.
     if parent.ledger_generation_id is not None:
         return int(parent.ledger_generation_id)
+    # An unanchored FIXED_SNAPSHOT cannot be live in any sealed lineage.  It is
+    # a pre-anchor row shape the contract does not allow, and
+    # ``_current_parents`` rejects it by name before any refresh is built.
     return None
 
 
@@ -143,25 +133,29 @@ def _require_added_plan_and_target(
         raise PlanningRunCandidateError("current Ledger generation is not accepted")
 
     # A plan that already has a published snapshot on the current truth
-    # generation is a refresh, never another add.  Historical/superseded runs
-    # deliberately do not participate in this decision unless lineage proves
-    # they belong to the same accepted generation.
-    current_fixed = db.query(models.PlanningRun).filter(
-        models.PlanningRun.ledger_generation_id == int(accepted.id),
+    # generation is a refresh, never another add.  "Already has" is the sealed
+    # live scope, the same source the refresh manifest uses; matching
+    # ``ledger_generation_id`` against the pointer made this gate and that one
+    # disagree after every physical refresh.
+    live_run_ids = current_live_plan_run_ids(db, accepted)
+    fixed_runs = db.query(models.PlanningRun).filter(
         models.PlanningRun.source_plan_id == int(plan.id),
         models.PlanningRun.status == "FIXED_SNAPSHOT",
     ).all()
-    legacy_fixed = db.query(models.PlanningRun).filter(
-        models.PlanningRun.source_plan_id == int(plan.id),
-        models.PlanningRun.status == "FIXED_SNAPSHOT",
-        models.PlanningRun.ledger_generation_id.is_(None),
-    ).all()
-    if (
-        current_fixed
-        or any(_resolve_parent_generation_id(db, row) == int(accepted.id) for row in legacy_fixed)
-    ):
+    if any(int(row.run_id) in live_run_ids for row in fixed_runs):
         raise PlanningRunCandidateError(
             "source production plan already has a FIXED_SNAPSHOT on current Ledger generation"
+        )
+    # An unanchored fixed run cannot be placed in any sealed lineage, so it can
+    # neither be proved live nor proved dead.  That is unavailable, not
+    # permission to add a second snapshot for the same plan.
+    unanchored = [
+        int(row.run_id) for row in fixed_runs if row.ledger_generation_id is None
+    ]
+    if unanchored:
+        raise PlanningRunCandidateError(
+            "source production plan already has a FIXED_SNAPSHOT without a "
+            f"Ledger generation anchor: run {min(unanchored)}"
         )
 
     target = db.get(models.LedgerGeneration, int(target_generation_id))

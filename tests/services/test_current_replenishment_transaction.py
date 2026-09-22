@@ -591,6 +591,20 @@ def test_verified_empty_scope_clears_only_that_distribution_scope(db_session):
             reserves=(),
             complete_scope=True,
         )
+    # An unproven empty input never publishes as emptiness: clearing a
+    # populated scope has to name the reason the fact set is empty.
+    with pytest.raises(CurrentReplenishmentError, match="confirmed_empty_reason"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="physical:r4",
+            source_revision=2,
+            facts=(),
+            reserves=(),
+            distribution_scope=(item_id, "", "", "selected", "buy"),
+            complete_scope=True,
+        )
+    db_session.rollback()
     result = apply_current_replenishment(
         db_session,
         generation_id=generation_id,
@@ -600,9 +614,19 @@ def test_verified_empty_scope_clears_only_that_distribution_scope(db_session):
         reserves=(),
         distribution_scope=(item_id, "", "", "selected", "buy"),
         complete_scope=True,
+        confirmed_empty_reason="verified empty supplier stream for the scope",
     )
     db_session.commit()
     assert result.deleted == 1
+    cleared_audit = db_session.query(models.CurrentReplenishmentAudit).filter_by(
+        operation="delete", source_revision=2
+    ).all()
+    assert cleared_audit
+    assert all(
+        row.reason
+        == "confirmed_empty:verified empty supplier stream for the scope"
+        for row in cleared_audit
+    )
     assert db_session.get(models.ReservationConsumptionAllocation, foreign_row.id) is not None
     assert db_session.get(models.ReservationConsumptionAllocation, foreign_row.id).is_current is True
 
@@ -736,3 +760,193 @@ def test_material_consumption_role_is_excluded_from_current_replenishment_reader
     db_session.commit()
     rows = read_current_replenishment(db_session, generation_id=generation_id, item_id=item_id)
     assert all(row["id"] != material.id for row in rows)
+
+
+SUPPLIER_RECORDER_TYPE = "Document_ПриходнаяНакладная"
+
+
+def _promote_to_current_owners(db, reservations):
+    """Mark the frozen reservations as the stable current owners."""
+    for row in reservations:
+        row.owner_kind = "current"
+        row.is_current = True
+        row.current_identity = (
+            f"reservation:req:{int(row.requirement_id)}:mode:{row.realization_mode}"
+        )
+    db.flush()
+
+
+def _building_staging_reserve(db, *, generation_id, item_id, quantity="4"):
+    """One BUILDING staging reservation of a brand-new obligation refresh.
+
+    An obligation refresh renumbers requirements, so the staging reserve never
+    shares an identity with the accepted owners it runs beside.
+    """
+    accepted = db.get(models.LedgerGeneration, int(generation_id))
+    staging_generation = models.LedgerGeneration(
+        generation_key=f"r4-staging-{uuid4().hex[:12]}",
+        status="building",
+        cutoff=accepted.cutoff,
+        source_watermarks={},
+        capabilities={"physical_ledger": True, "reservation_replay": True},
+        physical_import_batch_id=int(accepted.physical_import_batch_id),
+        algorithm_version="r4-tests",
+    )
+    db.add(staging_generation)
+    db.flush()
+    run = models.PlanningRun(
+        status="BUILDING_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=staging_generation.id,
+        ledger_cutoff=staging_generation.cutoff,
+        source_plan_id=None,
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        active_freeze_version=1,
+    )
+    db.add(run)
+    db.flush()
+    requirement = models.MrpRequirement(
+        run_id=run.run_id,
+        item_id=int(item_id),
+        total_required_qty=Decimal(quantity),
+        net_required_qty=Decimal(quantity),
+        period_from=date(2026, 9, 1),
+        period_to=date(2026, 9, 30),
+        bom_level=0,
+        planning_stock_pool="selected",
+        characteristic_ref="",
+        organization_ref="",
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    entry = models.ReservationEntry(
+        ledger_generation_id=staging_generation.id,
+        item_id=int(item_id),
+        run_id=run.run_id,
+        freeze_version=1,
+        requirement_id=requirement.id,
+        priority_period_from=date(2026, 9, 1),
+        priority_period_to=date(2026, 9, 30),
+        realization_mode="buy",
+        reserved_qty=Decimal(quantity),
+        replenishment_required_qty=Decimal(quantity),
+        lifecycle_status="active",
+        owner_kind="building",
+        is_current=False,
+        current_identity=f"reservation:req:{requirement.id}:mode:buy",
+    )
+    db.add(entry)
+    db.flush()
+    return staging_generation, entry
+
+
+def test_building_staging_replay_keeps_the_stable_current_owners_allocations(db_session):
+    """A BUILDING replay owns its staging reserves, not the whole pool.
+
+    Selecting the "before" set by distribution scope alone made this replay
+    plan a deletion for every allocation of the accepted current owners it had
+    never been handed - inside a transaction that had not published anything
+    yet.  Those owners are closed by the reservation publisher when the
+    refresh lands; retiring their basis is not this writer's job.
+    """
+    generation_id, item_id, reservations, facts = _world(db_session, prefix="staging")
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical:r4",
+        source_revision=1,
+        facts=facts,
+        reserves=_reserves(reservations),
+        complete_scope=True,
+    )
+    _promote_to_current_owners(db_session, reservations)
+    db_session.commit()
+    accepted_allocations = {
+        int(row.id)
+        for row in db_session.query(models.ReservationConsumptionAllocation).filter_by(
+            is_current=True
+        )
+    }
+    assert len(accepted_allocations) == 2
+
+    staging_generation, staging_reserve = _building_staging_reserve(
+        db_session, generation_id=generation_id, item_id=item_id
+    )
+    staging_fact = Fact(
+        fact_id=str(facts[0].fact_id),
+        item_id=int(item_id),
+        mode="buy",
+        qty=Decimal("4"),
+        posting_at=facts[0].posting_at,
+    )
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=int(staging_generation.id),
+        source_key="physical:r4",
+        source_revision=2,
+        facts=(staging_fact,),
+        reserves=(
+            Reserve(
+                reserve_id=str(staging_reserve.id),
+                item_id=int(item_id),
+                mode="buy",
+                reserved_qty=Decimal("4"),
+                due_date=staging_reserve.priority_period_to,
+                plan_period_from=staging_reserve.priority_period_from,
+                plan_period_to=staging_reserve.priority_period_to,
+                run_id=int(staging_reserve.run_id),
+                requirement_id=int(staging_reserve.requirement_id),
+            ),
+        ),
+        complete_scope=True,
+        allow_building=True,
+    )
+    db_session.commit()
+
+    assert result.deleted == 0
+    surviving = {
+        int(row.id)
+        for row in db_session.query(models.ReservationConsumptionAllocation).filter_by(
+            is_current=True
+        )
+    }
+    assert accepted_allocations <= surviving
+
+
+def test_supplier_facts_without_any_provenance_fail_closed(db_session):
+    """Zero provenance rows is only "no receipts" when there are no supplier facts.
+
+    With supplier documents in the visible prefix and nothing typed, every BUY
+    scope was published empty: the receipt facts disappeared, coverage dropped
+    to zero and the emptiness had no recorded cause anywhere.
+    """
+    generation_id, _item_id, _reservations, facts = _world(db_session, prefix="untyped")
+    for fact in facts:
+        sle = db_session.get(models.StockLedgerEntry, int(fact.fact_id))
+        sle.recorder_type = SUPPLIER_RECORDER_TYPE
+        sle.active = True
+    db_session.flush()
+
+    with pytest.raises(
+        CurrentReplenishmentError, match="no supplier receipt provenance"
+    ) as excinfo:
+        apply_current_replenishment_for_accepted_generation(
+            db_session, generation_id=generation_id, source_revision=9
+        )
+    assert str(generation_id) in str(excinfo.value)
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+
+
+def test_no_supplier_documents_and_no_provenance_publishes_an_empty_scope(db_session):
+    """The control: a generation with no supplier document is legitimately empty."""
+    generation_id, _item_id, _reservations, _facts = _world(db_session, prefix="nosup")
+
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=generation_id, source_revision=9
+    )
+    db_session.commit()
+
+    assert results
+    assert all(result.inserted == 0 for result in results)

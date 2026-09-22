@@ -611,3 +611,46 @@ def test_bounded_purchase_with_populated_parent_scope_still_reuses(db_session):
     assert payload["meta"]["bootstrap"] is False
     assert payload["meta"]["bounded_reuse"] is True
     assert payload["meta"]["reused_row_count"] == len(payload["rows"]) > 0
+
+
+def test_parent_buy_rows_without_current_owner_report_the_full_missing_count(
+    db_session,
+):
+    """A whole-scope promotion failure must not read as a handful of stragglers.
+
+    The bounded reuse path resolves every parent BUY row back to its stable
+    current owner.  When an obligation refresh has not promoted those owners
+    yet, *every* requirement is missing; the message used to print only the
+    first eight with no size, so the operator triaged a scope-wide hole as a
+    local one.
+    """
+    parent, _target1, target2, rows = _world(db_session, item_count=10)
+    initial = _build(db_session, parent, _target1, rows)
+    publish_current_purchase_control_from_payload(db_session, parent.id, initial)
+    db_session.flush()
+
+    requirement_ids = sorted(
+        int(reservation.requirement_id)
+        for _item, _run, reservation, _capture in rows
+    )
+    for _item, _run, reservation, _capture in rows:
+        reservation.is_current = False
+        reservation.owner_kind = "building"
+    db_session.flush()
+
+    with pytest.raises(PurchaseControlCompactPayloadError) as excinfo:
+        build_compact_current_purchase_control_payload(
+            db_session,
+            target_generation_id=target2.id,
+            parent_generation_id=parent.id,
+            accepted_run_ids=[run.run_id for _item, run, _res, _cap in rows],
+            affected_scopes=(),
+            reuse_parent_current=True,
+        )
+
+    message = str(excinfo.value)
+    assert "current BUY owner is missing for requirements" in message
+    assert f"({len(requirement_ids)} total)" in message
+    # The head stays truncated at eight, so the scope-wide size is only
+    # reachable through the reported total.
+    assert f"{requirement_ids[:8]} ... ({len(requirement_ids)} total)" in message

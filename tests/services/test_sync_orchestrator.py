@@ -496,6 +496,9 @@ def test_physical_refresh_drops_identity_of_discarded_candidate(
             source_watermarks={
                 "generation_kind": "physical_refresh",
                 "parent_generation_id": parent.id,
+                # An operator pressed discard: the attempt was abandoned on
+                # purpose, so its backoff is no longer meaningful.
+                "rejected_origin": "operator",
             },
             capabilities={},
             algorithm_version="ledger-physical-refresh-generation/1",
@@ -1267,3 +1270,80 @@ def test_a_different_error_starts_the_count_over(tmp_state, db_session, monkeypa
     assert state["repeat_count"] == 1
     assert state["active_generation_key"] is not None
     assert state["last_release_at"] is None
+
+
+def test_automatic_rejection_keeps_the_backoff_it_earned(
+    tmp_state, db_session, monkeypatch
+):
+    """The pipeline rejecting its own candidate is still a failure.
+
+    The dead-identity cleanup reset ``failure_count``/``next_retry_at``
+    whenever the retry candidate had left BUILDING - which is always true
+    after ``discard_physical_refresh_candidate``.  So the exponential backoff
+    never engaged for automatic rejections and a doomed refresh re-read 1C on
+    every tick, ~3.5 minutes at a time.
+    """
+    parent = _accepted_parent_fixture(db_session)
+    monkeypatch.setattr(
+        orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"}
+    )
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0},
+    )
+    monkeypatch.setattr(orch, "_due_jobs", lambda state, current: [])
+
+    class DummyClient:
+        base_url = "https://example.local/odata"
+        username = None
+        password = None
+        token = None
+
+    monkeypatch.setattr(orch, "_build_client", lambda: DummyClient())
+
+    def _reject_own_candidate(db, target_cutoff, generation_key):
+        """What the orchestrator does: reject the candidate, then raise."""
+        db.add(
+            models.LedgerGeneration(
+                generation_key=generation_key,
+                status="rejected",
+                cutoff=target_cutoff,
+                physical_import_batch_id=parent.physical_import_batch_id,
+                source_watermarks={
+                    "generation_kind": "physical_refresh",
+                    "parent_generation_id": parent.id,
+                    "rejected_origin": "automatic",
+                    "rejected_reason": "balance convergence failed",
+                },
+                capabilities={},
+                algorithm_version="ledger-physical-refresh-generation/1",
+            )
+        )
+        db.commit()
+        raise RuntimeError("Balance convergence failed: 3 mismatches")
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _reject_own_candidate)
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    first = orch.tick(db=db_session, now=now)
+    assert first["status"] == "error"
+    after_first = orch.status()["physical_refresh"]
+    assert after_first["failure_count"] == 1
+    first_retry_at = datetime.fromisoformat(after_first["next_retry_at"])
+    assert first_retry_at > now
+
+    # Before the backoff expires the slot must stay closed, even though the
+    # rejected candidate no longer occupies the retry identity.
+    assert orch.tick(
+        db=db_session, now=now + timedelta(seconds=1)
+    )["status"] == "idle"
+
+    second = orch.tick(db=db_session, now=first_retry_at + timedelta(seconds=1))
+    assert second["status"] == "error"
+    after_second = orch.status()["physical_refresh"]
+    assert after_second["failure_count"] == 2
+    assert after_second["next_retry_at"] is not None
+    second_retry_at = datetime.fromisoformat(after_second["next_retry_at"])
+    # The wait grew: the backoff is engaging, not restarting.
+    assert (second_retry_at - first_retry_at) > (first_retry_at - now)

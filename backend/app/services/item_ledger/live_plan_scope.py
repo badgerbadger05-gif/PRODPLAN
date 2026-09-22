@@ -113,6 +113,16 @@ class RunAnchorError(ValueError):
     """A planning run is not a live obligation of the given Ledger generation."""
 
 
+class DuplicateLivePlanRunError(ValueError):
+    """One plan has two live runs in the same sealed scope.
+
+    A distinct type because it is the one lineage failure a caller may
+    legitimately handle: the duplicate-snapshot repair exists precisely for
+    this state and must still be able to read the scope around it.  Every
+    other lineage failure stays an ordinary fail-closed ``ValueError``.
+    """
+
+
 def current_live_run_ids(
     db: Session,
     *,
@@ -208,7 +218,7 @@ def _inherited_run_ids(
             continue
         plan_id = int(source_plan_id)
         if plan_id in by_plan:
-            raise ValueError(
+            raise DuplicateLivePlanRunError(
                 f"live-plan scope has two live runs for plan {plan_id}: "
                 f"{by_plan[plan_id]} and {int(run_id)}"
             )

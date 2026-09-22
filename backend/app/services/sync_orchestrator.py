@@ -64,6 +64,9 @@ from .item_ledger.physical_refresh_candidacy import (
     classify_physical_refresh_candidate,
 )
 from .item_ledger.physical_refresh_discard import (
+    ORIGIN_KEY as DISCARD_ORIGIN_KEY,
+    REJECTED_STATUS,
+    DISCARD_ORIGIN_OPERATOR,
     discard_physical_refresh_candidate,
 )
 from .item_ledger.physical_refresh_orchestrator import (
@@ -897,6 +900,19 @@ def pull_queue_health(db: Optional[Session]) -> Dict[str, int]:
 
 # --- Public API --------------------------------------------------------------
 
+def _is_automatic_rejection(generation: models.LedgerGeneration) -> bool:
+    """Was this candidate rejected by the pipeline rather than by an operator?
+
+    Unknown provenance counts as automatic: a rejected candidate with no
+    recorded origin predates the marker, and keeping the backoff is the safe
+    side of the guess.
+    """
+    if str(generation.status) != REJECTED_STATUS:
+        return False
+    marks = dict(generation.source_watermarks or {})
+    return str(marks.get(DISCARD_ORIGIN_KEY) or "") != DISCARD_ORIGIN_OPERATOR
+
+
 def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Run at most one due sync job. Designed to be called frequently (~2 min) by a
@@ -945,6 +961,14 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         # Clear that dead identity before evaluating retry readiness; otherwise
         # the supported discard path leaves current truth stale until the old
         # candidate's timeout expires.
+        #
+        # The backoff is a separate decision from the identity.  Resetting it
+        # whenever the candidate had left BUILDING cleared it after *every*
+        # automatic rejection, because the pipeline rejects its own candidate
+        # on failure — so the exponential backoff never engaged and a doomed
+        # refresh re-read 1C on every tick.  Only an operator's discard
+        # abandons the attempt on purpose; the pipeline's own rejection is
+        # still the failure that earned the wait.
         persisted_active_key = str(
             physical_state.get("active_generation_key") or ""
         ).strip()
@@ -960,8 +984,9 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             ):
                 physical_state["active_cutoff"] = None
                 physical_state["active_generation_key"] = None
-                physical_state["next_retry_at"] = None
-                physical_state["failure_count"] = 0
+                if not _is_automatic_rejection(persisted_candidate):
+                    physical_state["next_retry_at"] = None
+                    physical_state["failure_count"] = 0
 
         # The physical slot competes with the reference schedule; both the
         # "queue has work" and the "interval elapsed" reasons must respect the

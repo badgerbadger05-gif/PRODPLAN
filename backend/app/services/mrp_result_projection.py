@@ -240,12 +240,19 @@ def _row_specs(
 def build_mrp_result_current_payload(
     db: Session,
     run_id: int,
+    *,
+    ignore_freshness_limit: bool = False,
 ) -> dict[str, Any]:
     """Build the direct current-owner payload for one MRP run.
 
     This is a pure candidate builder: it reads the canonical planning
     projection and returns a validated manifest/row payload for the compact
     current execution owner.
+
+    ``ignore_freshness_limit`` is passed only by a physical-refresh
+    publication, which is the operation that makes the accepted pointer fresh
+    again; gating it on that pointer's age deadlocks the stand.  Coherence
+    with the exact pointer is still required either way.
     """
     run = db.get(models.PlanningRun, int(run_id))
     if run is None:
@@ -275,6 +282,7 @@ def build_mrp_result_current_payload(
             db,
             CONSUMER,
             required_capabilities=REQUIRED_CAPABILITIES,
+            ignore_freshness_limit=bool(ignore_freshness_limit),
         )
         current_generation = _accepted_generation(db, int(truth.generation_id))
         sealed_run_anchor(db, run, current_generation)

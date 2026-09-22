@@ -418,6 +418,32 @@ class CompactCurrentAssemblyPayload:
     readiness_metrics: dict[str, Any]
 
 
+def assembly_queue_scope_summary(
+    queue_payload: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """The one summary contract of the ``assembly_queue`` current scope.
+
+    The reader requires both keys and fails closed without them, so every
+    publisher of this scope has to produce the same summary from the same
+    rows.  Two publishers writing it by hand is how a bounded physical
+    refresh came to overwrite the full summary with ``total_rows`` alone and
+    503 the assembly queue after every tick.
+    """
+    rows = list(queue_payload)
+    return {
+        "total_rows": len(rows),
+        "total_queue_qty": str(sum(
+            (
+                Decimal(str(
+                    (row.get("payload") or {}).get("assembly_remaining_qty") or "0"
+                ))
+                for row in rows
+            ),
+            Decimal("0"),
+        )),
+    }
+
+
 def drum_slot_identity(plan_line_id: int, slot_ordinal: int) -> str:
     return f"slot:plan-line:{int(plan_line_id)}:ordinal:{int(slot_ordinal)}"
 
@@ -1383,16 +1409,7 @@ def publish_current_execution_from_generation(
         scope_key="assembly:all-live-plans",
         rows=queue_payload,
         entity_kinds=("assembly_queue",),
-        summary={
-            "total_rows": len(queue_payload),
-            "total_queue_qty": str(sum(
-                (
-                    Decimal(str(row["payload"].get("assembly_remaining_qty") or "0"))
-                    for row in queue_payload
-                ),
-                Decimal("0"),
-            )),
-        },
+        summary=assembly_queue_scope_summary(queue_payload),
     )
     # Readiness and drum are generation-scoped staging tables, but their
     # current payload must never expose those staging row ids.  Resolve the

@@ -83,6 +83,12 @@ from app.services.item_ledger.current_execution import (
 from app.services.item_ledger.current_replenishment import (
     apply_current_replenishment_for_accepted_generation,
 )
+from app.services.item_ledger.physical_refresh_supplier_evidence import (
+    supplier_document_type_filter,
+)
+from app.services.item_ledger.physical_visibility import (
+    visible_sle_query_for_generation,
+)
 
 
 _PRESERVE_REASONS = {
@@ -985,6 +991,35 @@ def _exact_supplier_provenance_with_qty(session: Session, generation_id: int) ->
     ), {"generation_id": int(generation_id)}).scalar_one() or 0)
 
 
+def _provenance_rows_at_generation(session: Session, generation_id: int) -> int:
+    """Every supplier provenance row the pointer generation owns, not just exact."""
+
+    return int(session.execute(text(
+        "SELECT count(*) FROM stock_ledger_supplier_receipt_provenance "
+        "WHERE ledger_generation_id = :generation_id"
+    ), {"generation_id": int(generation_id)}).scalar_one() or 0)
+
+
+def _visible_supplier_receipt_sle_count(session: Session, generation_id: int) -> int:
+    """Supplier-document ledger rows visible at the pointer generation.
+
+    Same visibility helper and same document-type predicate the provenance
+    writer uses, counted in SQL so the preflight does not materialise the
+    whole physical prefix.
+    """
+
+    from app import models
+
+    return int(
+        visible_sle_query_for_generation(session, int(generation_id))
+        .filter(supplier_document_type_filter(models.StockLedgerEntry.recorder_type))
+        .filter(models.StockLedgerEntry.active.is_(True))
+        .filter(models.StockLedgerEntry.qty != 0)
+        .order_by(None)
+        .count()
+    )
+
+
 def _current_allocations_by_role(session: Session) -> dict[str, int]:
     rows = session.execute(text(
         "SELECT allocation_role, count(*) AS row_count "
@@ -1033,6 +1068,24 @@ def _replenishment_bootstrap_on_session(
             f"receipt provenance; it is owned by {detail}"
         )
 
+    # ``owned_here == 0 and owners`` only catches provenance that moved to
+    # another generation.  On a stand whose provenance table is empty the
+    # preflight passed, the writer saw no receipts, and the phase reported
+    # success having published zero allocations over live supplier facts.
+    provenance_rows_at_pointer = _provenance_rows_at_generation(
+        session, int(generation_id)
+    )
+    supplier_receipt_sle_visible = _visible_supplier_receipt_sle_count(
+        session, int(generation_id)
+    )
+    if not provenance_rows_at_pointer and supplier_receipt_sle_visible:
+        raise PreflightBlocked(
+            f"accepted pointer generation {int(generation_id)} has "
+            f"{supplier_receipt_sle_visible} visible supplier-receipt ledger "
+            "rows but no supplier receipt provenance rows; type the supplier "
+            "evidence before bootstrapping current replenishment"
+        )
+
     exact_with_qty = _exact_supplier_provenance_with_qty(session, int(generation_id))
     results = apply_current_replenishment_for_accepted_generation(
         session, generation_id=int(generation_id)
@@ -1057,6 +1110,8 @@ def _replenishment_bootstrap_on_session(
         "generation_id": int(generation_id),
         "exact_provenance_rows": int(owned_here),
         "exact_provenance_rows_with_qty": int(exact_with_qty),
+        "provenance_rows_at_pointer": int(provenance_rows_at_pointer),
+        "supplier_receipt_sle_visible": int(supplier_receipt_sle_visible),
         "scopes": len(results),
         "changed_pairs": int(changed_pairs),
         "inserted": sum(int(result.inserted) for result in results),
