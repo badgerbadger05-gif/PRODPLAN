@@ -404,6 +404,65 @@ def _dependency_blockers(
     return blockers, unknown
 
 
+def _pointer_provenance_blockers(engine: Engine, current_id: int | None) -> list[dict[str, Any]]:
+    """Refuse to drop other generations' evidence while the pointer lacks its own.
+
+    GC already preserves the pointer generation itself, but the evidence it
+    removes from every other generation is the only copy of anything the
+    pointer does not own.  Deleting it is a cleanup only once the pointer owns
+    its complete typed set; before that it is the step that destroys the last
+    record of an accepted supplier receipt.
+    """
+    if current_id is None:
+        return []
+    try:
+        from sqlalchemy.orm import Session as _Session
+
+        from app.services.item_ledger.physical_refresh_supplier_evidence import (
+            lost_supplier_receipt_provenance_sle_ids,
+        )
+    except Exception:  # pragma: no cover - standalone CLI without the backend
+        return []
+    # The probe reads the canonical physical prefix, so it needs the real
+    # schema.  A reduced fixture schema cannot be asked this question at all;
+    # say nothing rather than guess, and let the apply-side guards speak.
+    required = {
+        "stock_ledger_supplier_receipt_provenance",
+        "stock_ledger_entry",
+        "stock_ledger_fact_supersession",
+        "physical_import_batch",
+        "ledger_generation",
+    }
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        if not required.issubset(set(inspector.get_table_names())):
+            return []
+        generation_columns = {
+            str(column["name"])
+            for column in inspector.get_columns("ledger_generation")
+        }
+        if not {"physical_import_batch_id", "cutoff"}.issubset(generation_columns):
+            return []
+    with _Session(engine) as session:
+        lost = lost_supplier_receipt_provenance_sle_ids(
+            session, ledger_generation_id=int(current_id), limit=9
+        )
+    if not lost:
+        return []
+    return [{
+        "table": "stock_ledger_supplier_receipt_provenance",
+        "referred_table": "stock_ledger_supplier_receipt_provenance",
+        "classification": "pointer-evidence-incomplete",
+        "generation_id": int(current_id),
+        "reason": (
+            f"pointer generation {int(current_id)} does not own supplier "
+            "receipt provenance for its visible supplier facts; repair it "
+            "before any generation evidence is removed"
+        ),
+        "sample_stock_ledger_entry_ids": [int(value) for value in lost[:8]],
+    }]
+
+
 def build_gc_manifest(engine: Engine, *, retain_accepted: int = DEFAULT_RETAIN_ACCEPTED) -> dict[str, Any]:
     if int(retain_accepted) < 0:
         raise ValueError("retain_accepted must be non-negative")
@@ -449,6 +508,10 @@ def build_gc_manifest(engine: Engine, *, retain_accepted: int = DEFAULT_RETAIN_A
             item for item in unknown
             if str(item.get("referred_table")) not in {"ledger_generation", ""}
         )
+    pointer_blockers = _pointer_provenance_blockers(engine, current_id)
+    with engine.connect() as connection:
+        blockers = list(blockers) + pointer_blockers
+        evidence_blockers = list(evidence_blockers) + pointer_blockers
         metadata_by_generation: dict[int, list[dict[str, Any]]] = {}
         evidence_by_table_generation: dict[str, set[int]] = {}
         for item in metadata_blockers:

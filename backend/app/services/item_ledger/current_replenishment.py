@@ -1283,15 +1283,29 @@ def apply_current_replenishment_for_accepted_generation(
         .order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.asc())
         .all()
     )
-    if not provenance:
-        # No provenance is only "no supplier receipts" when the generation
-        # also has no supplier document behind it.  When it does, the typing
-        # step never ran (or never committed) and every BUY scope would be
-        # published empty: the receipt facts vanish, the replay deletes the
-        # whole current assignment and coverage silently drops to zero.  That
-        # is an upstream defect, not an empty fact set.
-        from .physical_refresh_supplier_evidence import is_supplier_document_type
+    # Two different failures hide behind "no rows here", and each has its own
+    # guard.  This one is the degenerate case: the generation owns no typed
+    # evidence at all while supplier documents are visible, so the typing step
+    # never ran or never committed and every BUY scope would publish empty -
+    # the receipt facts vanish, the replay deletes the whole current
+    # assignment and coverage silently drops to zero.  The other case, a fact
+    # this system typed once and then stopped owning, is caught earlier by
+    # ``lost_supplier_receipt_provenance_sle_ids`` at the acceptance gate.
+    from .physical_refresh_supplier_evidence import (
+        is_supplier_document_type,
+        lost_supplier_receipt_provenance_sle_ids,
+    )
 
+    lost = lost_supplier_receipt_provenance_sle_ids(
+        db, ledger_generation_id=int(generation_id)
+    )
+    if lost:
+        raise CurrentReplenishmentError(
+            f"generation {int(generation_id)} lost supplier receipt provenance "
+            f"for {len(lost)} visible supplier facts it does not own; first "
+            f"sle_ids={list(lost[:8])}"
+        )
+    if not provenance:
         untyped = sorted(
             int(row.id)
             for row in visible.values()

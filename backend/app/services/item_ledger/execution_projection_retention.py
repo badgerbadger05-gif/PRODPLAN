@@ -178,6 +178,25 @@ def _assert_current_execution_coverage(db: Session, generation_id: int) -> None:
             "current execution coverage is incomplete: "
             + ", ".join(f"{kind}/{scope}" for kind, scope in missing)
         )
+    # The prune below removes every other generation's supplier provenance.
+    # That is only a cleanup if the pointer already owns its own complete set;
+    # otherwise it is the step that destroys the last typed evidence of
+    # accepted receipts.  It ran that way for months: a lightweight fork left
+    # its provenance at the parent and the next publication deleted it.
+    from .physical_refresh_supplier_evidence import (
+        lost_supplier_receipt_provenance_sle_ids,
+    )
+
+    uncovered = lost_supplier_receipt_provenance_sle_ids(
+        db, ledger_generation_id=int(generation_id), limit=9
+    )
+    if uncovered:
+        raise ExecutionProjectionRetentionError(
+            f"generation {int(generation_id)} does not own supplier receipt "
+            "provenance for its visible supplier facts; pruning the other "
+            "generations would destroy the last typed evidence "
+            f"(first uncovered sle_ids={list(uncovered[:8])})"
+        )
 
 
 def prune_retired_execution_projections(

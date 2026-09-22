@@ -345,11 +345,23 @@ def fork_physical_refresh_generation(
     db.add(candidate)
     db.flush()
     if lightweight:
-        # Automatic refresh first proves whether there is a semantic delta.
-        # Do not clone 11k stock bins or supplier provenance merely to discard
-        # an equivalent import; explicit maintenance/acceptance keeps the
-        # normal materialized fork below.
-        provenance = _provenance_summary(_provenance_rows(db, int(parent.id)))
+        # Automatic refresh first proves whether there is a semantic delta, so
+        # it does not clone 11k stock bins merely to discard an equivalent
+        # import; the bounded publisher materialises the bins it touches.
+        #
+        # Supplier provenance is NOT in that category and used to be skipped
+        # here with it.  A lightweight candidate is accepted and becomes the
+        # pointer, and the accepted pointer is the only generation the current
+        # replenishment reader looks at: leaving its provenance behind at the
+        # parent made every earlier supplier receipt untyped the moment the
+        # refresh published, and the retention prune then deleted the parent's
+        # copy for good.  Carrying it is a few thousand rows; not carrying it
+        # makes accepted physical facts uncountable.
+        provenance = _clone_supplier_receipt_provenance(
+            db,
+            parent_generation_id=int(parent.id),
+            target_generation_id=int(candidate.id),
+        )
     else:
         materialize_generation_stock_bins(db, int(candidate.id), publish_current=False)
         provenance = _clone_supplier_receipt_provenance(

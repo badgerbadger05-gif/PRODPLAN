@@ -950,3 +950,125 @@ def test_no_supplier_documents_and_no_provenance_publishes_an_empty_scope(db_ses
 
     assert results
     assert all(result.inserted == 0 for result in results)
+
+
+def _supplier_typed_world(db, *, prefix):
+    """An accepted generation that owns typed evidence for its supplier facts."""
+    generation_id, item_id, reservations, facts = _world(db, prefix=prefix)
+    for fact in facts:
+        sle = db.get(models.StockLedgerEntry, int(fact.fact_id))
+        sle.recorder_type = SUPPLIER_RECORDER_TYPE
+        sle.active = True
+        db.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=int(generation_id),
+            stock_ledger_entry_id=int(sle.id),
+            receipt_doc_type=SUPPLIER_RECORDER_TYPE,
+            receipt_doc_ref=f"receipt-{int(sle.id)}",
+            receipt_doc_line_no="1",
+            supplier_order_ref=None,
+            supplier_order_line_no=None,
+            operation_kind="supplier_receipt",
+            operation_key="test",
+            operation_name="test supplier receipt",
+            evidence_hash=f"hash:{int(sle.id)}".ljust(64, "0"),
+            evidence_payload={"signed_qty": str(sle.qty), "item_id": int(sle.item_id)},
+            match_rule="bounded-typed",
+            match_status="unmatched",
+            ambiguity_count=0,
+            reason="no exact typed supplier order line",
+        ))
+    for row in reservations:
+        row.owner_kind = "current"
+        row.is_current = True
+        row.current_identity = (
+            f"reservation:req:{int(row.requirement_id)}:mode:{row.realization_mode}"
+        )
+    db.flush()
+    return generation_id, item_id, reservations, facts
+
+
+def _successor_over_the_same_prefix(db, parent, *, key):
+    """A later accepted generation over the parent's own physical prefix."""
+    successor = models.LedgerGeneration(
+        generation_key=f"{key}-{int(parent.id)}",
+        status="accepted",
+        cutoff=parent.cutoff,
+        accepted_at=parent.cutoff,
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities=dict(parent.capabilities or {}),
+        physical_import_batch_id=int(parent.physical_import_batch_id),
+        algorithm_version="r4-tests",
+    )
+    db.add(successor)
+    db.flush()
+    pointer = db.get(models.PlanningTruthState, 1)
+    if pointer is None:
+        db.add(models.PlanningTruthState(id=1, current_generation_id=int(successor.id)))
+    else:
+        pointer.current_generation_id = int(successor.id)
+    db.flush()
+    return successor
+
+
+def test_a_generation_that_lost_its_typed_evidence_is_rejected(db_session):
+    """The defect the lightweight fork used to create, seen from the reader.
+
+    The facts are accepted and visible, the typing exists - at another
+    generation.  Reading the pointer then sees no receipts at all and would
+    publish every BUY scope empty, which is an accepted physical quantity made
+    uncountable.
+    """
+    generation_id, _item_id, _reservations, facts = _supplier_typed_world(
+        db_session, prefix="lost"
+    )
+    # A later generation over the same prefix that did not carry the evidence.
+    parent = db_session.get(models.LedgerGeneration, int(generation_id))
+    successor = _successor_over_the_same_prefix(
+        db_session, parent, key="lost-successor"
+    )
+
+    with pytest.raises(
+        CurrentReplenishmentError, match="lost supplier receipt provenance"
+    ) as excinfo:
+        apply_current_replenishment_for_accepted_generation(
+            db_session, generation_id=int(successor.id), source_revision=11
+        )
+    assert str(len(facts)) in str(excinfo.value)
+
+
+def test_a_generation_that_carried_its_typed_evidence_is_accepted(db_session):
+    """The same successor, forked the way the fix forks: evidence carried."""
+    from app.services.item_ledger.physical_refresh_generation import (
+        _clone_supplier_receipt_provenance,
+    )
+
+    generation_id, item_id, _reservations, facts = _supplier_typed_world(
+        db_session, prefix="carried"
+    )
+    parent = db_session.get(models.LedgerGeneration, int(generation_id))
+    successor = _successor_over_the_same_prefix(
+        db_session, parent, key="carried-successor"
+    )
+    _clone_supplier_receipt_provenance(
+        db_session,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(successor.id),
+    )
+
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(successor.id), source_revision=11
+    )
+    db_session.commit()
+
+    assert results
+    carried = db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+        ledger_generation_id=int(successor.id)
+    ).count()
+    assert carried == len(facts)
+    # The receipts are countable again: the replay assigned them.
+    assert db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, allocation_role="replenishment_receipt",
+    ).count() > 0
+    assert read_current_replenishment(
+        db_session, generation_id=int(successor.id), item_id=item_id
+    )

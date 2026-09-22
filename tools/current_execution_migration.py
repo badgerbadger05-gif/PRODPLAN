@@ -1126,6 +1126,141 @@ def _replenishment_bootstrap_on_session(
     }
 
 
+def _provenance_source_generations(
+    session: Session, pointer_generation_id: int
+) -> list[int]:
+    """Every other generation that still owns typed evidence, newest first."""
+
+    rows = session.execute(text(
+        "SELECT DISTINCT ledger_generation_id "
+        "FROM stock_ledger_supplier_receipt_provenance "
+        "WHERE ledger_generation_id <> :pointer "
+        "ORDER BY ledger_generation_id DESC"
+    ), {"pointer": int(pointer_generation_id)}).scalars().all()
+    return [int(value) for value in rows]
+
+
+def _supplier_provenance_repair_on_session(
+    session: Session, generation_id: int
+) -> dict[str, Any]:
+    """Give the accepted pointer back the typed evidence of its own prefix.
+
+    A lightweight physical refresh used to fork without carrying supplier
+    provenance, and the retention prune then deleted the parent's copy at the
+    next publication.  The facts stayed accepted and visible; only the typing
+    that says which supplier order they belong to was left behind at an older
+    generation.  This phase re-owns what still exists, newest source first.
+
+    It does not invent typing.  A visible supplier fact that no generation
+    ever typed is reported and left alone - that is the ordinary "outside the
+    planning contour" case, not damage.  A database in which nothing is typed
+    at all cannot be repaired by re-owning anything, so it fails closed and
+    the ledger rebuild runbook applies.
+    """
+
+    from app.services.item_ledger.physical_refresh_generation import (
+        _provenance_rows,
+        _provenance_value,
+    )
+    from app.services.item_ledger.physical_refresh_supplier_evidence import (
+        lost_supplier_receipt_provenance_sle_ids,
+        untyped_supplier_receipt_sle_ids,
+    )
+    from app import models
+
+    names = set(inspect(session.connection()).get_table_names())
+    for required in (
+        "stock_ledger_supplier_receipt_provenance",
+        "stock_ledger_entry",
+        "ledger_generation",
+    ):
+        if required not in names:
+            raise PreflightBlocked(
+                f"supplier provenance repair requires table {required}"
+            )
+
+    def _owned_here() -> int:
+        return int(session.execute(text(
+            "SELECT count(*) FROM stock_ledger_supplier_receipt_provenance "
+            "WHERE ledger_generation_id = :generation_id"
+        ), {"generation_id": int(generation_id)}).scalar_one() or 0)
+
+    owned_before = _owned_here()
+    lost_before = lost_supplier_receipt_provenance_sle_ids(
+        session, ledger_generation_id=int(generation_id)
+    )
+    untyped_anywhere = untyped_supplier_receipt_sle_ids(
+        session, ledger_generation_id=int(generation_id)
+    )
+    sources = _provenance_source_generations(session, int(generation_id))
+
+    if not owned_before and not lost_before and untyped_anywhere:
+        raise PreflightBlocked(
+            f"pointer generation {int(generation_id)} owns no supplier receipt "
+            f"provenance and {len(untyped_anywhere)} visible supplier facts are "
+            "typed nowhere in this database; the ledger rebuild runbook applies"
+        )
+
+    reowned = 0
+    if lost_before:
+        wanted = {int(value) for value in lost_before}
+        for source_id in sources:
+            if not wanted:
+                break
+            for source in _provenance_rows(session, int(source_id)):
+                sle_id = int(source.stock_ledger_entry_id)
+                if sle_id not in wanted:
+                    continue
+                # One row per (generation, SLE): a fact already owned here is
+                # never duplicated, and a superseded revision keeps its own
+                # row instead of inheriting its predecessor's.
+                session.add(models.StockLedgerSupplierReceiptProvenance(
+                    ledger_generation_id=int(generation_id),
+                    **_provenance_value(source),
+                ))
+                wanted.discard(sle_id)
+                reowned += 1
+        session.flush()
+
+    lost_after = lost_supplier_receipt_provenance_sle_ids(
+        session, ledger_generation_id=int(generation_id)
+    )
+    if lost_after:
+        raise PostflightBlocked(
+            f"supplier provenance repair re-owned {reowned} rows but generation "
+            f"{int(generation_id)} still lacks evidence for {len(lost_after)} "
+            "visible supplier facts (first sle_ids="
+            f"{[int(value) for value in lost_after[:8]]})"
+        )
+    return {
+        "phase": "supplier-provenance-repair",
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "source_generation_ids": [int(value) for value in sources],
+        "provenance_rows_before": owned_before,
+        "provenance_rows_after": _owned_here(),
+        "reowned_rows": int(reowned),
+        "lost_before": len(lost_before),
+        "lost_after": 0,
+        # Reported, never repaired: a supplier document nobody ever typed.
+        "untyped_anywhere": len(untyped_anywhere),
+        "idempotent": reowned == 0,
+    }
+
+
+def apply_supplier_provenance_repair(
+    engine: Engine, *, writers_stopped: bool
+) -> dict[str, Any]:
+    """Run the supplier-provenance repair in one transaction."""
+
+    if not writers_stopped:
+        raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+    generation_id = _accepted_truth_generation(engine)
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        with session.begin():
+            return _supplier_provenance_repair_on_session(session, int(generation_id))
+
+
 def apply_current_replenishment_bootstrap(
     engine: Engine, *, writers_stopped: bool
 ) -> dict[str, Any]:
@@ -1158,7 +1293,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument(
         "--phase",
-        choices=("preflight", "apply", "postflight", "replenishment-bootstrap"),
+        choices=(
+            "preflight",
+            "apply",
+            "postflight",
+            "replenishment-bootstrap",
+            "supplier-provenance-repair",
+        ),
         default="preflight",
         help=(
             "read-only manifest, atomic current publication, read-only postflight, "
@@ -1168,7 +1309,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--writers-stopped",
         action="store_true",
-        help="explicit acknowledgement required by --phase apply/replenishment-bootstrap",
+        help=(
+            "explicit acknowledgement required by --phase apply/"
+            "replenishment-bootstrap/supplier-provenance-repair"
+        ),
     )
     parser.add_argument("--generation-id", type=int)
     parser.add_argument("--fault-after-consumer")
@@ -1188,6 +1332,10 @@ def main(argv: list[str] | None = None) -> int:
                 engine,
                 writers_stopped=args.writers_stopped,
                 fault_after_consumer=args.fault_after_consumer,
+            )
+        elif args.phase == "supplier-provenance-repair":
+            report = apply_supplier_provenance_repair(
+                engine, writers_stopped=bool(args.writers_stopped)
             )
         elif args.phase == "replenishment-bootstrap":
             report = apply_current_replenishment_bootstrap(

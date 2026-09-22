@@ -138,13 +138,25 @@ def test_create_physical_refresh_generation_reuses_current_accepted_prefix(db_se
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
 
-def test_lightweight_refresh_fork_does_not_clone_bins_or_provenance(db_session):
+def test_lightweight_refresh_fork_skips_bins_but_carries_provenance(db_session):
+    """The two are not the same kind of copy.
+
+    Bins are rebuilt by the bounded publisher for the keys it touches, so
+    cloning 11k of them to maybe discard the candidate is waste.  Supplier
+    provenance is not rebuilt by anything: a lightweight candidate is accepted
+    and becomes the pointer, the current replenishment reader looks only at
+    the pointer, and the retention prune then deletes the parent's copy.
+    Skipping it made every earlier supplier receipt untyped on publication.
+    """
     parent, physical = _accepted_parent(db_session, key="lightweight")
     _supplier_provenance(db_session, parent, physical)
     before_bins = db_session.query(models.StockBin).count()
-    before_provenance = db_session.query(
+    parent_provenance = db_session.query(
         models.StockLedgerSupplierReceiptProvenance
+    ).filter(
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id == parent.id,
     ).count()
+    assert parent_provenance
 
     result = fork_physical_refresh_generation(
         db_session,
@@ -164,11 +176,8 @@ def test_lightweight_refresh_fork_does_not_clone_bins_or_provenance(db_session):
         == result.ledger_generation_id,
     ).count()
     assert db_session.query(models.StockBin).count() == before_bins
-    assert db_session.query(
-        models.StockLedgerSupplierReceiptProvenance
-    ).count() == before_provenance
     assert candidate_bins == 0
-    assert candidate_provenance == 0
+    assert candidate_provenance == parent_provenance
 
 
 def test_retry_is_idempotent_for_exact_candidate(db_session):

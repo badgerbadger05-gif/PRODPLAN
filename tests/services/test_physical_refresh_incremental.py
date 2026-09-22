@@ -505,6 +505,11 @@ def _superseded_receipt_world(db_session, *, warehouse="WH-BUY"):
         ref="receipt-other",
     )
     _provenance(db_session, parent, other_row, ref="receipt-other")
+    # The fork carries the parent's typed evidence onto the candidate, so the
+    # generation that is about to become the pointer owns it.  Without this the
+    # world is the very defect the acceptance gate now refuses to publish.
+    _provenance(db_session, target, old, ref="receipt-1")
+    _provenance(db_session, target, other_row, ref="receipt-other")
     other_allocation = _allocation(
         db_session, parent, other_owner, other_requirement, other_row, qty="2",
     )

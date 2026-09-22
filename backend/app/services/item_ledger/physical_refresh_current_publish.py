@@ -47,6 +47,7 @@ from app.services.item_ledger.physical_refresh_stock_bin import (
 )
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
 from app.services.item_ledger.physical_refresh_supplier_evidence import (
+    lost_supplier_receipt_provenance_sle_ids,
     build_bounded_supplier_receipt_manifest,
     is_supplier_document_type,
 )
@@ -1145,6 +1146,21 @@ def _publish_forward_physical_refresh_current(
     production_result = obligation_results["production_control_journal"]
     purchase_result = obligation_results["purchase_control_journal"]
     phase("obligations")
+
+    # The generation about to become the pointer must own the complete typed
+    # evidence of its own visible prefix.  The current replenishment reader
+    # looks only at the pointer, so an uncovered supplier fact is an accepted
+    # physical quantity nobody can count - fail closed here rather than
+    # publish coverage that silently drops to zero.
+    uncovered = lost_supplier_receipt_provenance_sle_ids(
+        db, ledger_generation_id=int(target.id), limit=9
+    )
+    if uncovered:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"generation {int(target.id)} does not own supplier receipt "
+            f"provenance for its visible supplier facts; first uncovered "
+            f"sle_ids={list(uncovered[:8])}"
+        )
 
     # CAS pointer switch is deliberately the last business mutation.
     start_phase("pointer")

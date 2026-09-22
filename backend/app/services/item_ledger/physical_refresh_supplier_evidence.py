@@ -16,7 +16,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, exists, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -32,6 +32,7 @@ from .physical_visibility import (
     PhysicalVisibilityError,
     require_import_batch,
     visible_sle_query,
+    visible_sle_query_for_generation,
 )
 from .supplier_receipt_allocation import (
     CORRECTION_OPERATION,
@@ -66,6 +67,91 @@ def supplier_document_type_filter(column: Any) -> Any:
     not restate the document list in its own query.
     """
     return column.in_(sorted(_SUPPLIER_DOCUMENT_TYPES))
+
+
+def lost_supplier_receipt_provenance_sle_ids(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    limit: int = 0,
+) -> tuple[int, ...]:
+    """Visible supplier facts this generation lost the typed evidence of.
+
+    A fact counts as lost when some generation holds a provenance row for it
+    and this one does not.  That is deliberately narrower than "has no row":
+    a supplier document outside the planning contour is never typed by
+    anybody and is not evidence loss, while a fact the system already typed
+    once and then stopped owning is exactly the defect - the accepted pointer
+    is the only generation the current replenishment reader looks at, so its
+    missing row makes an accepted physical quantity uncountable.
+    ``planning-truth-contract.md`` forbids that in as many words ("Provenance
+    не может сделать принятое физическое количество неучитываемым"), and
+    ``item_ledger.md`` lists "отказ учитывать принятый факт из-за provenance"
+    among the outright prohibitions.
+
+    A row in any status counts as owned, ``excluded_non_supplier`` included:
+    the writer looked at the fact and typed it, which is what ownership means
+    here.  ``limit`` bounds the diagnostic, never the verdict.
+    """
+    owned_here = exists().where(and_(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        == models.StockLedgerEntry.id,
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+        == int(ledger_generation_id),
+    ))
+    owned_elsewhere = exists().where(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        == models.StockLedgerEntry.id
+    )
+    query = (
+        visible_sle_query_for_generation(db, int(ledger_generation_id))
+        .filter(supplier_document_type_filter(models.StockLedgerEntry.recorder_type))
+        .filter(models.StockLedgerEntry.active.is_(True))
+        .filter(models.StockLedgerEntry.qty != 0)
+        .filter(~owned_here)
+        .filter(owned_elsewhere)
+        .order_by(None)
+        .with_entities(models.StockLedgerEntry.id)
+        .order_by(models.StockLedgerEntry.id.asc())
+    )
+    if limit and int(limit) > 0:
+        query = query.limit(int(limit))
+    return tuple(int(value) for (value,) in query.all())
+
+
+def untyped_supplier_receipt_sle_ids(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    limit: int = 0,
+) -> tuple[int, ...]:
+    """Visible supplier facts no generation has ever typed.
+
+    Distinct from :func:`lost_supplier_receipt_provenance_sle_ids`: this is
+    not evidence loss.  A supplier document outside the planning contour is
+    never typed by design, so these are reported, never repaired and never
+    invented.  The one case where they are a verdict is a database in which
+    *nothing* is typed at all, which no re-own can fix.
+    """
+    owned_anywhere = exists().where(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        == models.StockLedgerEntry.id
+    )
+    query = (
+        visible_sle_query_for_generation(db, int(ledger_generation_id))
+        .filter(supplier_document_type_filter(models.StockLedgerEntry.recorder_type))
+        .filter(models.StockLedgerEntry.active.is_(True))
+        .filter(models.StockLedgerEntry.qty != 0)
+        .filter(~owned_anywhere)
+        .order_by(None)
+        .with_entities(models.StockLedgerEntry.id)
+        .order_by(models.StockLedgerEntry.id.asc())
+    )
+    if limit and int(limit) > 0:
+        query = query.limit(int(limit))
+    return tuple(int(value) for (value,) in query.all())
+
+
 _FORWARD_OPERATION = RECEIPT_OPERATION
 _REJECTED_DELTA_MESSAGE = "complete affected-scope evidence required"
 
@@ -619,5 +705,7 @@ __all__ = [
     "build_bounded_supplier_receipt_manifest",
     "is_supplier_document_type",
     "supplier_document_type_filter",
+    "lost_supplier_receipt_provenance_sle_ids",
+    "untyped_supplier_receipt_sle_ids",
     "validate_bounded_supplier_receipt_manifest",
 ]
