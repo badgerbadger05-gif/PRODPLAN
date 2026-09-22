@@ -2320,38 +2320,66 @@ def _ensure_bounded_supplier_evidence(
                 raise CurrentReplenishmentError(
                     f"typed supplier evidence conflicts for SLE {fact_id}"
                 )
-            continue
-        payload = {
-            "receipt_doc_ref": _text(raw.receipt_ref)[:64] or f"sle:{fact_id}",
-            "receipt_doc_line_no": _text(raw.receipt_line_no)[:32] or "1",
-            "item_id": int(raw.item_id),
-            "signed_qty": str(raw.signed_qty),
-            "supplier_order_ref": _text(raw.supplier_order_ref)[:64],
-            "supplier_order_line_no": _text(raw.supplier_order_line_no)[:32],
-            "correction_receipt_ref": _text(raw.correction_receipt_ref)[:64] or None,
-        }
+            from .supplier_receipt_allocation import (
+                resolves_to_documented_operation,
+            )
+
+            if resolves_to_documented_operation(
+                _text(existing.operation_key), _text(existing.operation_name)
+            ):
+                continue
+            # A row written before the one-row contract names its writer
+            # instead of a 1C operation, so nothing can rebuild from it.  The
+            # fact and its typing are unchanged - only the row's own evidence
+            # is brought up to the contract - so this is a repair on write,
+            # idempotent, and it is why no data migration is needed.
+        from .supplier_receipt_allocation import (
+            build_supplier_receipt_provenance,
+            canonical_operation_for_kind,
+        )
+
         exact = bool(_text(raw.supplier_order_ref) and _text(raw.supplier_order_line_no))
-        db.add(models.StockLedgerSupplierReceiptProvenance(
+        sle = db.get(models.StockLedgerEntry, int(fact_id))
+        operation_key, operation_name = canonical_operation_for_kind(kind)
+        upgraded = build_supplier_receipt_provenance(
             ledger_generation_id=int(target.id),
             stock_ledger_entry_id=int(fact_id),
-            receipt_doc_type="bounded_physical_refresh",
-            receipt_doc_ref=payload["receipt_doc_ref"],
-            receipt_doc_line_no=payload["receipt_doc_line_no"],
-            supplier_order_ref=_text(raw.supplier_order_ref) or None,
-            supplier_order_line_no=_text(raw.supplier_order_line_no) or None,
+            # One row contract: the same builder the canonical writer uses, so
+            # both stores are filled the same way and an obligation refresh can
+            # rebuild from a row the bounded path wrote.
+            receipt_doc_type=(
+                getattr(sle, "recorder_type", "") if sle is not None
+                else "bounded_physical_refresh"
+            ),
+            receipt_doc_ref=_text(raw.receipt_ref) or f"sle:{fact_id}",
+            receipt_doc_line_no=_text(raw.receipt_line_no) or "1",
+            # The operation is the documented one for this kind, not a marker
+            # naming the writer: the rebuild resolves a row back to its
+            # operation from these two fields.
             operation_kind=kind,
-            operation_key="bounded_physical_refresh",
-            operation_name="bounded typed supplier evidence",
-            correction_receipt_ref=payload["correction_receipt_ref"],
-            evidence_hash=hashlib.sha256(
-                json.dumps(payload, sort_keys=True).encode("utf-8")
-            ).hexdigest(),
-            evidence_payload=payload,
+            operation_key=operation_key,
+            operation_name=operation_name,
+            item_id=int(raw.item_id),
+            signed_qty=raw.signed_qty,
             match_rule="bounded-typed",
             match_status="exact" if exact else "unmatched",
+            supplier_order_ref=raw.supplier_order_ref,
+            supplier_order_line_no=raw.supplier_order_line_no,
+            characteristic_ref=getattr(sle, "characteristic_ref", "") if sle else "",
+            warehouse_ref1c=getattr(sle, "warehouse_ref1c", "") if sle else "",
+            correction_receipt_ref=raw.correction_receipt_ref,
             ambiguity_count=0,
             reason=None if exact else "typed evidence has no supplier order line",
-        ))
+        )
+        if existing is not None:
+            for field in (
+                "receipt_doc_type", "receipt_doc_ref", "receipt_doc_line_no",
+                "operation_key", "operation_name", "evidence_hash",
+                "evidence_payload", "match_rule",
+            ):
+                setattr(existing, field, getattr(upgraded, field))
+        else:
+            db.add(upgraded)
     db.flush()
 
 

@@ -68,6 +68,38 @@ _OPERATION_KINDS = {
     TRANSFER_OPERATION: "transfer",
 }
 
+#: One canonical ``(operation_key, operation_name)`` per kind, for a writer
+#: that determined the operation itself instead of copying it off a 1C
+#: document line.  The normalizer resolves a row back to its operation from
+#: exactly these two fields, so a writer that invents its own marker produces
+#: a row nothing can rebuild - which is what "unsupported supplier document
+#: operation 'bounded_physical_refresh'" meant.
+_CANONICAL_OPERATION_BY_KIND = {
+    "supplier_receipt": (RECEIPT_OPERATION, "приобретение у поставщика"),
+    "correction": (CORRECTION_OPERATION, "корректировка приобретения"),
+    "supplier_return": (SUPPLIER_RETURN_OPERATION, "возврат поставщику"),
+}
+
+
+def resolves_to_documented_operation(operation_key: str, operation_name: str) -> bool:
+    """Whether this key/name pair names one documented 1C operation."""
+    key = str(operation_key or "").strip().lower()
+    name = " ".join(str(operation_name or "").strip().lower().split())
+    return sum(
+        1 for prefix, names in _OPERATION_NAMES.items()
+        if key.startswith(prefix) and name in names
+    ) == 1
+
+
+def canonical_operation_for_kind(kind: str) -> tuple[str, str]:
+    """The documented operation key/name for one supplier operation kind."""
+    try:
+        return _CANONICAL_OPERATION_BY_KIND[str(kind)]
+    except KeyError as exc:
+        raise SupplierReceiptEvidenceError(
+            f"unsupported supplier operation kind {kind!r}"
+        ) from exc
+
 
 class SupplierReceiptEvidenceError(ValueError):
     """Normalized evidence is unsupported or contradicts the physical Ledger."""
@@ -987,46 +1019,36 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         row = normalized.evidence
         operation = normalized.operation
         matched_sle_id = int(normalized.fact.sle_id)
-        evidence_payload = {
-            "receipt_doc_type": _text(row.receipt_doc_type)[:64],
-            "receipt_doc_ref": _text(row.receipt_doc_ref)[:64],
-            "receipt_doc_line_no": _text(row.receipt_doc_line_no)[:32],
-            "operation_key": _text(row.operation_key)[:128],
-            "operation_name": _text(row.operation_name)[:128],
-            "supplier_order_type": _normalized_type(row.supplier_order_type)[:64],
-            "supplier_order_ref": _text(row.supplier_order_ref)[:64],
-            "supplier_order_line_no": _text(row.supplier_order_line_no)[:32],
-            "item_id": int(row.item_id),
-            "characteristic_ref": _text(row.characteristic_ref)[:64],
-            "warehouse_ref1c": _text(row.warehouse_ref1c)[:64],
-            "signed_qty": canonical_decimal(row.signed_qty),
-            "correction_receipt_ref": (
-                _text(row.correction_receipt_ref)[:64] or None
-            ),
-        }
-        evidence_hash = canonical_content_hash(evidence_payload)
+        built = build_supplier_receipt_provenance(
+            ledger_generation_id=ledger_generation_id,
+            stock_ledger_entry_id=matched_sle_id,
+            receipt_doc_type=row.receipt_doc_type,
+            receipt_doc_ref=row.receipt_doc_ref,
+            receipt_doc_line_no=row.receipt_doc_line_no,
+            operation_kind=_OPERATION_KINDS[operation],
+            operation_key=row.operation_key,
+            operation_name=row.operation_name,
+            item_id=row.item_id,
+            signed_qty=row.signed_qty,
+            match_rule=normalized.match_rule,
+            match_status=normalized.match_status,
+            supplier_order_type=row.supplier_order_type,
+            supplier_order_ref=row.supplier_order_ref,
+            supplier_order_line_no=row.supplier_order_line_no,
+            characteristic_ref=row.characteristic_ref,
+            warehouse_ref1c=row.warehouse_ref1c,
+            correction_receipt_ref=row.correction_receipt_ref,
+            ambiguity_count=normalized.ambiguity_count,
+            reason=normalized.reason,
+        )
+        evidence_payload = dict(built.evidence_payload)
+        evidence_hash = built.evidence_hash
         touched_provenance_entry_ids.add(matched_sle_id)
         provenance = provenance_by_entry.get(matched_sle_id)
         if provenance is None:
-            provenance = models.StockLedgerSupplierReceiptProvenance(
-                ledger_generation_id=ledger_generation_id,
-                stock_ledger_entry_id=matched_sle_id,
-                receipt_doc_type=_text(row.receipt_doc_type),
-                receipt_doc_ref=_text(row.receipt_doc_ref),
-                receipt_doc_line_no=_text(row.receipt_doc_line_no),
-                supplier_order_ref=normalized.fact.supplier_order_ref,
-                supplier_order_line_no=normalized.fact.supplier_order_line_no,
-                operation_kind=_OPERATION_KINDS[operation],
-                operation_key=evidence_payload["operation_key"],
-                operation_name=evidence_payload["operation_name"],
-                correction_receipt_ref=evidence_payload["correction_receipt_ref"],
-                evidence_hash=evidence_hash,
-                evidence_payload=evidence_payload,
-                match_rule=normalized.match_rule,
-                match_status=normalized.match_status,
-                ambiguity_count=normalized.ambiguity_count,
-                reason=normalized.reason,
-            )
+            built.supplier_order_ref = normalized.fact.supplier_order_ref
+            built.supplier_order_line_no = normalized.fact.supplier_order_line_no
+            provenance = built
             db.add(provenance)
             provenance_by_entry[matched_sle_id] = provenance
         else:
@@ -1133,6 +1155,94 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     )
 
 
+#: Every supplier-receipt provenance row carries the same evidence payload
+#: keys, whoever wrote it.  Two writers with two shapes is how 26 rows ended
+#: up unreadable by the rebuild that an obligation refresh runs.
+SUPPLIER_PROVENANCE_PAYLOAD_KEYS = (
+    "receipt_doc_type",
+    "receipt_doc_ref",
+    "receipt_doc_line_no",
+    "operation_key",
+    "operation_name",
+    "supplier_order_type",
+    "supplier_order_ref",
+    "supplier_order_line_no",
+    "item_id",
+    "characteristic_ref",
+    "warehouse_ref1c",
+    "signed_qty",
+    "correction_receipt_ref",
+)
+
+
+def build_supplier_receipt_provenance(
+    *,
+    ledger_generation_id: int,
+    stock_ledger_entry_id: int,
+    receipt_doc_type: object,
+    receipt_doc_ref: object,
+    receipt_doc_line_no: object,
+    operation_kind: str,
+    operation_key: object,
+    operation_name: object,
+    item_id: int,
+    signed_qty: object,
+    match_rule: str,
+    match_status: str,
+    supplier_order_type: object = "",
+    supplier_order_ref: object = "",
+    supplier_order_line_no: object = "",
+    characteristic_ref: object = "",
+    warehouse_ref1c: object = "",
+    correction_receipt_ref: object = None,
+    ambiguity_count: int = 0,
+    reason: str | None = None,
+) -> models.StockLedgerSupplierReceiptProvenance:
+    """Build one provenance row: the columns and the payload, together.
+
+    The typed fields are the relational store - the model gives each of them
+    its own column - and the payload additionally carries the few facts that
+    have no column (item, characteristic, warehouse, signed quantity and the
+    supplier order type) so a rebuild can reconstruct the evidence without
+    re-reading 1C.  Both stores are filled here, once, so a row cannot be
+    half-written by whichever writer happened to create it.
+    """
+    payload = {
+        "receipt_doc_type": _text(receipt_doc_type)[:64],
+        "receipt_doc_ref": _text(receipt_doc_ref)[:64],
+        "receipt_doc_line_no": _text(receipt_doc_line_no)[:32],
+        "operation_key": _text(operation_key)[:128],
+        "operation_name": _text(operation_name)[:128],
+        "supplier_order_type": _normalized_type(supplier_order_type)[:64],
+        "supplier_order_ref": _text(supplier_order_ref)[:64],
+        "supplier_order_line_no": _text(supplier_order_line_no)[:32],
+        "item_id": int(item_id),
+        "characteristic_ref": _text(characteristic_ref)[:64],
+        "warehouse_ref1c": _text(warehouse_ref1c)[:64],
+        "signed_qty": canonical_decimal(signed_qty),
+        "correction_receipt_ref": _text(correction_receipt_ref)[:64] or None,
+    }
+    return models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=int(ledger_generation_id),
+        stock_ledger_entry_id=int(stock_ledger_entry_id),
+        receipt_doc_type=_text(receipt_doc_type),
+        receipt_doc_ref=_text(receipt_doc_ref),
+        receipt_doc_line_no=_text(receipt_doc_line_no),
+        supplier_order_ref=_text(supplier_order_ref) or None,
+        supplier_order_line_no=_text(supplier_order_line_no) or None,
+        operation_kind=str(operation_kind),
+        operation_key=payload["operation_key"],
+        operation_name=payload["operation_name"],
+        correction_receipt_ref=payload["correction_receipt_ref"],
+        evidence_hash=canonical_content_hash(payload),
+        evidence_payload=payload,
+        match_rule=str(match_rule),
+        match_status=str(match_status),
+        ambiguity_count=int(ambiguity_count),
+        reason=reason,
+    )
+
+
 def rebuild_supplier_receipt_coverage(
     db: Session,
     *,
@@ -1190,24 +1300,48 @@ def rebuild_supplier_receipt_coverage_from_persisted_provenance(
     evidence: list[SupplierDocumentEvidence] = []
     for row in rows:
         payload = dict(row.evidence_payload or {})
+        # ``operation_kind`` is a column and is the typed classification the
+        # writer already made, so it - not a marker string - decides which
+        # documented operation this row replays as.  Rows written before the
+        # one-row contract carry a writer-name in ``operation_key`` ("26 rows
+        # with 'bounded_physical_refresh'"); they are readable from their own
+        # kind without a data migration.
+        stored_key = _text(row.operation_key)
+        stored_name = _text(row.operation_name)
+        if resolves_to_documented_operation(stored_key, stored_name):
+            operation_key, operation_name = stored_key, stored_name
+        else:
+            operation_key, operation_name = canonical_operation_for_kind(
+                _text(row.operation_kind)
+            )
         try:
+            # Typed fields come from the columns, which are the relational
+            # store every writer fills; the payload supplies only what has no
+            # column.  Reading them from the payload made the rebuild depend
+            # on one writer's payload shape, and rows written by the bounded
+            # typing - which fills the columns - were rejected as incomplete.
             evidence.append(SupplierDocumentEvidence(
-                receipt_doc_type=str(payload["receipt_doc_type"]),
-                receipt_doc_ref=str(payload["receipt_doc_ref"]),
-                receipt_doc_line_no=str(payload["receipt_doc_line_no"]),
-                operation_key=str(payload["operation_key"]),
-                operation_name=str(payload["operation_name"]),
+                receipt_doc_type=_text(row.receipt_doc_type)
+                or str(payload.get("receipt_doc_type") or ""),
+                receipt_doc_ref=_text(row.receipt_doc_ref)
+                or str(payload.get("receipt_doc_ref") or ""),
+                receipt_doc_line_no=_text(row.receipt_doc_line_no)
+                or str(payload.get("receipt_doc_line_no") or ""),
+                operation_key=operation_key,
+                operation_name=operation_name,
                 supplier_order_type=str(payload.get("supplier_order_type") or ""),
-                supplier_order_ref=str(payload.get("supplier_order_ref") or ""),
-                supplier_order_line_no=str(payload.get("supplier_order_line_no") or ""),
+                supplier_order_ref=_text(row.supplier_order_ref)
+                or str(payload.get("supplier_order_ref") or ""),
+                supplier_order_line_no=_text(row.supplier_order_line_no)
+                or str(payload.get("supplier_order_line_no") or ""),
                 item_id=int(payload["item_id"]),
                 characteristic_ref=str(payload.get("characteristic_ref") or ""),
                 warehouse_ref1c=str(payload.get("warehouse_ref1c") or ""),
                 signed_qty=_decimal(payload["signed_qty"]),
                 correction_receipt_ref=(
-                    str(payload["correction_receipt_ref"])
-                    if payload.get("correction_receipt_ref")
-                    else None
+                    _text(row.correction_receipt_ref)
+                    or str(payload.get("correction_receipt_ref") or "")
+                    or None
                 ),
             ))
         except (KeyError, TypeError, ValueError) as exc:

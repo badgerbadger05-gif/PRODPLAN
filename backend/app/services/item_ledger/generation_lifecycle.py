@@ -500,30 +500,27 @@ def _persist_non_supplier_receipt_rows(
         if entry_id in seen_ids:
             continue
         row = candidate_by_id[entry_id]
-        evidence_payload = {
-            "stock_ledger_entry_id": int(row.id),
-            "receipt_doc_type": str(row.recorder_type or ""),
-            "receipt_doc_ref": str(row.recorder_ref or ""),
-            "receipt_doc_line_no": str(row.line_no or ""),
-            "operation_key": operation_key,
-            "operation_name": operation_name,
-        }
-        db.add(models.StockLedgerSupplierReceiptProvenance(
+        # The same row builder as every other provenance writer, so an
+        # exclusion carries the same evidence payload shape as a receipt.
+        from .supplier_receipt_allocation import (
+            build_supplier_receipt_provenance,
+        )
+
+        db.add(build_supplier_receipt_provenance(
             ledger_generation_id=generation_id,
             stock_ledger_entry_id=int(row.id),
-            receipt_doc_type=str(row.recorder_type or ""),
-            receipt_doc_ref=str(row.recorder_ref or ""),
-            receipt_doc_line_no=str(row.line_no or ""),
-            supplier_order_ref=None,
-            supplier_order_line_no=None,
+            receipt_doc_type=row.recorder_type,
+            receipt_doc_ref=row.recorder_ref,
+            receipt_doc_line_no=row.line_no,
             operation_kind="non_supplier_expense",
             operation_key=operation_key,
             operation_name=operation_name,
-            correction_receipt_ref=None,
-            evidence_hash=canonical_content_hash(evidence_payload),
-            evidence_payload=evidence_payload,
+            item_id=int(row.item_id),
+            signed_qty=row.qty,
             match_rule="supplier-receipt-non-supplier-exclusion",
             match_status="excluded_non_supplier",
+            characteristic_ref=row.characteristic_ref,
+            warehouse_ref1c=row.warehouse_ref1c,
             ambiguity_count=0,
             reason="non-supplier expense operation",
         ))

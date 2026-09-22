@@ -5,6 +5,7 @@ import pytest
 
 from app.services.item_ledger import supplier_receipt_allocation as receipt_service
 from app.services.item_ledger.supplier_receipt_allocation import (
+    rebuild_supplier_receipt_coverage_from_persisted_provenance,
     CORRECTION_OPERATION,
     RECEIPT_OPERATION,
     SUPPLIER_RETURN_OPERATION,
@@ -1054,3 +1055,205 @@ def test_rebuild_still_removes_a_stale_supplier_row(db_session):
     assert db_session.query(
         models.StockLedgerSupplierReceiptProvenance
     ).filter_by(stock_ledger_entry_id=999999).count() == 0
+
+
+def _bounded_typed_row(db, generation, sle, *, order_ref="order-1", line_no="1"):
+    """What the bounded physical refresh writes for a typed receipt."""
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        build_supplier_receipt_provenance,
+    )
+
+    row = build_supplier_receipt_provenance(
+        ledger_generation_id=int(generation.id),
+        stock_ledger_entry_id=int(sle.id),
+        receipt_doc_type="Document_Receipt",
+        receipt_doc_ref="doc",
+        receipt_doc_line_no="1",
+        operation_kind="supplier_receipt",
+        operation_key=RECEIPT_OPERATION,
+        operation_name="приобретение у поставщика",
+        item_id=int(sle.item_id),
+        signed_qty=sle.qty,
+        match_rule="bounded-typed",
+        match_status="exact",
+        supplier_order_ref=order_ref,
+        supplier_order_line_no=line_no,
+        characteristic_ref=sle.characteristic_ref,
+        warehouse_ref1c=sle.warehouse_ref1c,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_a_bounded_typed_row_round_trips_through_the_rebuild(db_session):
+    """The obligation refresh must be able to rebuild from a bounded row.
+
+    The rebuild read ``receipt_doc_type``/``operation_key``/``operation_name``
+    out of ``evidence_payload``; the bounded writer put them only in the
+    columns.  All 26 ``bounded-typed`` rows on the clone were therefore
+    rejected as "persisted supplier receipt provenance is incomplete".
+    """
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    _bounded_typed_row(db_session, generation, sle)
+    db_session.commit()
+
+    result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db_session,
+        ledger_generation_id=generation.id,
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    assert result.provenance_count == 1
+    rebuilt = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    assert str(rebuilt.receipt_doc_type) == "Document_Receipt"
+    assert str(rebuilt.operation_key) == RECEIPT_OPERATION
+
+
+def test_a_row_whose_payload_predates_the_contract_is_still_readable(db_session):
+    """Rows already on disk stay readable: no data migration needed.
+
+    This is the shape the bounded writer produced before the fix - the typed
+    fields in the columns only - which is exactly what a migrated database
+    still carries.
+    """
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    row = _bounded_typed_row(db_session, generation, sle)
+    stripped = dict(row.evidence_payload)
+    for key in ("receipt_doc_type", "operation_key", "operation_name"):
+        stripped.pop(key, None)
+    row.evidence_payload = stripped
+    db_session.commit()
+
+    result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db_session,
+        ledger_generation_id=generation.id,
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    assert result.provenance_count == 1
+
+
+def test_both_writers_produce_the_same_payload_key_set(db_session):
+    """One row contract: the key set does not depend on who wrote the row."""
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        SUPPLIER_PROVENANCE_PAYLOAD_KEYS,
+        build_supplier_receipt_provenance,
+    )
+
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    bounded = _bounded_typed_row(db_session, generation, sle)
+
+    rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="canonical",
+        writer_mode="current",
+    )
+    db_session.flush()
+    canonical = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(match_rule="exact").first() or db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter(
+        models.StockLedgerSupplierReceiptProvenance.match_rule != "bounded-typed"
+    ).first()
+
+    assert canonical is not None
+    assert set(bounded.evidence_payload) == set(SUPPLIER_PROVENANCE_PAYLOAD_KEYS)
+    assert set(canonical.evidence_payload) == set(SUPPLIER_PROVENANCE_PAYLOAD_KEYS)
+    # The exclusion writer shares the contract too.
+    excluded = build_supplier_receipt_provenance(
+        ledger_generation_id=int(generation.id),
+        stock_ledger_entry_id=int(sle.id),
+        receipt_doc_type="Document_Receipt",
+        receipt_doc_ref="doc",
+        receipt_doc_line_no="1",
+        operation_kind="non_supplier_expense",
+        operation_key="op",
+        operation_name="Прочий расход",
+        item_id=int(sle.item_id),
+        signed_qty=sle.qty,
+        match_rule="supplier-receipt-non-supplier-exclusion",
+        match_status="excluded_non_supplier",
+        reason="non-supplier expense operation",
+    )
+    assert set(excluded.evidence_payload) == set(SUPPLIER_PROVENANCE_PAYLOAD_KEYS)
+
+
+def test_a_row_written_before_the_contract_is_readable_without_migration(db_session):
+    """The 26 rows already on the clone, written by hand exactly as they are.
+
+    They carry the writer's own marker in ``operation_key``/``operation_name``
+    and lack three payload keys, so the rebuild first called them incomplete
+    and then called their operation unsupported.  Their ``operation_kind``
+    column is the typed classification their writer already made; the next
+    bounded typing pass brings the row up to the contract from it, and the
+    rebuild then reads the typed fields from the columns.
+    """
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    payload = {
+        "receipt_doc_ref": "doc",
+        "receipt_doc_line_no": "1",
+        "item_id": int(sle.item_id),
+        "signed_qty": "3.000",
+        "supplier_order_ref": "order-1",
+        "supplier_order_line_no": "1",
+        "correction_receipt_ref": None,
+    }
+    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=int(generation.id),
+        stock_ledger_entry_id=int(sle.id),
+        receipt_doc_type="bounded_physical_refresh",
+        receipt_doc_ref="doc",
+        receipt_doc_line_no="1",
+        supplier_order_ref="order-1",
+        supplier_order_line_no="1",
+        operation_kind="supplier_receipt",
+        operation_key="bounded_physical_refresh",
+        operation_name="bounded typed supplier evidence",
+        correction_receipt_ref=None,
+        evidence_hash="legacy".ljust(64, "0"),
+        evidence_payload=payload,
+        match_rule="bounded-typed",
+        match_status="exact",
+        ambiguity_count=0,
+    ))
+    db_session.commit()
+    legacy = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        canonical_operation_for_kind,
+        resolves_to_documented_operation,
+    )
+
+    # Recognised as pre-contract, which is what makes the next bounded typing
+    # pass upgrade it in place instead of skipping it.
+    assert resolves_to_documented_operation(
+        legacy.operation_key, legacy.operation_name
+    ) is False
+
+    # Apply exactly what that upgrade writes...
+    key, name = canonical_operation_for_kind(str(legacy.operation_kind))
+    legacy.operation_key = key
+    legacy.operation_name = name
+    legacy.receipt_doc_type = "Document_Receipt"
+
+    result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db_session,
+        ledger_generation_id=generation.id,
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    assert result.provenance_count == 1
