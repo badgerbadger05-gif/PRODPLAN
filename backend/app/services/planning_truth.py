@@ -5,9 +5,12 @@ an accepted generation identity or stop their calculation with
 ``PlanningTruthUnavailable``.
 """
 
+import contextvars
+from contextlib import contextmanager
+from functools import wraps
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 import os
 from typing import Any, Mapping
 
@@ -119,6 +122,52 @@ def _serialize_publication(db: Session) -> None:
     db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
 
 
+_PUBLICATION_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "prodplan_inside_publication", default=False,
+)
+
+
+@contextmanager
+def publication_context() -> Iterator[None]:
+    """Mark the calling stack as the publication that restores freshness.
+
+    Decision §40.  A physical or obligation publication is the only thing
+    that makes the accepted pointer young again, so gating any part of it on
+    that pointer's age is a deadlock: once a stand has been quiet longer than
+    the threshold, every publication fails on staleness and nothing can
+    clear it.
+
+    The exemption is a property of the operation, not of one call, which is
+    why it lives here and not in a keyword threaded through the builders.
+    Two consumers were found by rehearsal alone - the MRP payload builder and
+    the readiness custody read - and a third would have been found the same
+    way.  Inside the context the *age* check is skipped and nothing else is:
+    pointer coherence, required capabilities and an operator invalidation all
+    still apply, and readers outside it keep the gate.
+    """
+    token = _PUBLICATION_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _PUBLICATION_CONTEXT.reset(token)
+
+
+def inside_publication() -> bool:
+    """Whether the caller runs inside a publication (see §40)."""
+    return bool(_PUBLICATION_CONTEXT.get())
+
+
+def as_publication(func):
+    """Declare a whole publication entry point, so its callees inherit §40."""
+
+    @wraps(func)
+    def _wrapped(*args, **kwargs):
+        with publication_context():
+            return func(*args, **kwargs)
+
+    return _wrapped
+
+
 def _configured_max_age() -> timedelta | None:
     raw = str(os.environ.get(TRUTH_MAX_AGE_SECONDS_ENV) or "").strip()
     if not raw:
@@ -150,11 +199,10 @@ def get_readiness(
 ) -> PlanningTruthReadiness:
     """Return current truth state without guessing or consulting legacy facts.
 
-    ``apply_freshness_limit=False`` drops only the age gate.  Every structural
-    rule and an explicit operator invalidation still decide the status, so a
-    generation invalidated to ``stale``/``rejected`` stays unavailable.  It
-    exists for the publications that are themselves the mechanism restoring
-    freshness; see ``require_accepted_truth``.
+    ``apply_freshness_limit=False`` drops only the age gate, and so does
+    running inside :func:`publication_context` (§40).  Every structural rule
+    and an explicit operator invalidation still decide the status, so a
+    generation invalidated to ``stale``/``rejected`` stays unavailable.
     """
     pointer = db.get(models.PlanningTruthState, 1)
     generation = pointer.current_generation if pointer is not None else None
@@ -182,7 +230,11 @@ def get_readiness(
     reason = generation.reason
     if status == "accepted" and not structurally_accepted:
         reason = reason or "Accepted generation is missing cutoff or accepted_at"
-    freshness_limit = _configured_max_age() if apply_freshness_limit else None
+    freshness_limit = (
+        _configured_max_age()
+        if apply_freshness_limit and not inside_publication()
+        else None
+    )
     if structurally_accepted and freshness_limit is not None:
         checked_at = _as_utc(now or datetime.now(timezone.utc))
         freshness_reference = min(
@@ -238,14 +290,13 @@ def require_accepted_truth(
 ) -> PlanningTruthReadiness:
     """Fail closed for a named report, planner, DBR or mutation consumer.
 
-    ``ignore_freshness_limit`` is only for a consumer running *inside* the
-    publication that restores freshness.  A physical refresh is the sole
-    mechanism that makes the accepted pointer young again, so gating its own
-    canonical builders on the pointer's age is a deadlock: once the stand has
-    been quiet for longer than the threshold, every refresh fails on staleness
-    and no refresh can ever clear it.  The flag drops the age gate and nothing
-    else - structural validity, capabilities and operator invalidation still
-    apply, and HTTP readers keep the gate.
+    ``ignore_freshness_limit`` is the same exemption as
+    :func:`publication_context` (§40), spelled for one call.  Prefer the
+    context: the exemption belongs to the operation, not to a call site, and
+    threading a keyword through every builder only finds the consumers
+    somebody happened to think of.  Either way it drops the age gate and
+    nothing else - structural validity, capabilities and operator
+    invalidation still apply, and HTTP readers keep the gate.
     """
     readiness = get_readiness(
         db, apply_freshness_limit=not bool(ignore_freshness_limit)

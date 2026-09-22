@@ -888,3 +888,170 @@ def test_bounded_publish_keeps_the_whole_assembly_queue_summary(db_session):
     assert int(summary["total_rows"]) == 2
     assert float(summary["total_queue_qty"]) == pytest.approx(6.0)
     db_session.rollback()
+
+
+def _stale_pointer_world(db_session, *, days=5):
+    """A pointer accepted ``days`` ago, with the capabilities the builders need."""
+    parent, target = _generations(db_session)
+    now = datetime.now(timezone.utc)
+    parent_cutoff = now - timedelta(days=int(days))
+    target_cutoff = now - timedelta(minutes=5)
+    parent.cutoff = parent_cutoff
+    parent.accepted_at = parent_cutoff
+    parent.capabilities = {
+        "physical_ledger": True,
+        "reservation_replay": True,
+        "execution_allocations": True,
+        "planning_snapshots": True,
+        "assembly_queue": True,
+        "assembly_readiness": True,
+        "drum_schedule": True,
+        "shelf_projection": True,
+        "future_supply": True,
+    }
+    parent.physical_import_batch.cutoff = parent_cutoff
+    parent.physical_import_batch.completed_at = parent_cutoff
+    target.cutoff = target_cutoff
+    target_batch = db_session.get(
+        models.PhysicalImportBatch, int(target.physical_import_batch_id)
+    )
+    target_batch.cutoff = target_cutoff
+    target_batch.completed_at = target_cutoff
+    db_session.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=parent.id,
+        cutoff=parent_cutoff,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=parent_cutoff,
+        built_at=parent_cutoff,
+    ))
+    db_session.flush()
+    return parent, target
+
+
+def test_bounded_publish_succeeds_with_the_real_builders_on_a_five_day_old_pointer(
+    db_session, monkeypatch,
+):
+    """§40 end to end, with the real assembly/readiness/custody/drum/shelf builders.
+
+    The age gate reached the publication through a second consumer - the
+    readiness payload's custody read - after the first one had been fixed by
+    a keyword.  The exemption is a property of the operation, so the
+    builders on the path to that gate are the real ones here: assembly,
+    readiness, custody, drum and shelf.  Any consumer of the gate under them
+    would fail this test.
+    """
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    parent, target = _stale_pointer_world(db_session, days=5)
+    item = models.Item(item_code="CP-STALE-REAL", item_name="Stale pointer item")
+    db_session.add(item)
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="stale-real-sle", business_identity="stale-real-sle",
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="wh", qty=Decimal("2"),
+        posting_at=target.cutoff - timedelta(hours=1), record_type="Receipt",
+        movement_kind="transfer_out", recorder_type="Document_Transfer",
+        recorder_ref="cp-stale-real", line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.commit()
+
+    # Only the obligation-view seam and the pointer switch are stubbed; every
+    # compact payload builder under the publication is the real one.
+    monkeypatch.setattr(
+        publisher, "_build_obligation_view_payloads", lambda *a, **kw: ({}, {}),
+    )
+    monkeypatch.setattr(
+        publisher, "publish_current_obligation_views_from_generation",
+        lambda *a, **kw: {
+            "production_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "purchase_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "mrp_result": SimpleNamespace(changed_rows=0, idempotent=True),
+            "period_plan_execution": SimpleNamespace(changed_rows=0, idempotent=True),
+        },
+    )
+    monkeypatch.setattr(
+        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+    )
+    # The two journal payloads need a live fixed run to describe, which this
+    # physical fixture has none of; they are not on the path to the gate.
+    # Everything that is - assembly, readiness, custody, drum, shelf - stays
+    # real, which is the whole point of this test.
+    monkeypatch.setattr(
+        publisher, "build_compact_current_production_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {}},
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_purchase_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {}},
+    )
+
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (sle,), "supersessions": ()},
+        odata_client=None,
+        source_revision=target.physical_import_batch_id,
+        planning_pool_by_warehouse={"wh": "default"},
+    )
+
+    assert result.target_generation_id == target.id
+    assert str(db_session.get(models.LedgerGeneration, target.id).status) == "accepted"
+    db_session.expire_all()
+    readiness = planning_truth.get_readiness(db_session)
+    assert readiness.ready is True
+    assert readiness.ledger_generation == target.id
+    db_session.rollback()
+
+
+def test_a_reader_outside_the_publication_still_fails_on_the_same_data(
+    db_session, monkeypatch,
+):
+    """The gate is unchanged for everyone who is not publishing."""
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    parent, _target = _stale_pointer_world(db_session, days=5)
+    db_session.commit()
+
+    assert planning_truth.inside_publication() is False
+    with pytest.raises(planning_truth.PlanningTruthUnavailable, match="freshness threshold"):
+        planning_truth.require_accepted_truth(db_session, "any.http.reader")
+    # ...and the same call inside a publication is allowed.
+    with planning_truth.publication_context():
+        assert planning_truth.require_accepted_truth(
+            db_session, "publication"
+        ).ledger_generation == parent.id
+    # The context does not leak out of its block.
+    assert planning_truth.inside_publication() is False
+    db_session.rollback()
+
+
+def test_the_publication_context_does_not_revive_an_invalidated_generation(
+    db_session, monkeypatch,
+):
+    """Only the clock is ignored, never an operator's decision."""
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    parent, _target = _stale_pointer_world(db_session, days=5)
+    parent.status = "stale"
+    parent.reason = "operator invalidated the physical prefix"
+    db_session.flush()
+
+    with planning_truth.publication_context():
+        with pytest.raises(planning_truth.PlanningTruthUnavailable) as excinfo:
+            planning_truth.require_accepted_truth(db_session, "publication")
+    assert "invalidated" in str(excinfo.value)
+
+    parent.status = "accepted"
+    parent.reason = None
+    db_session.flush()
+    with planning_truth.publication_context():
+        with pytest.raises(
+            planning_truth.PlanningTruthUnavailable, match="lacks capabilities"
+        ):
+            planning_truth.require_accepted_truth(
+                db_session, "publication", required_capabilities=("not_a_capability",),
+            )
+    db_session.rollback()

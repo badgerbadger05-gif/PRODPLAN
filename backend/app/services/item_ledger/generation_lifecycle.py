@@ -18,7 +18,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.planning_truth import publish_generation
+from app.services.planning_truth import as_publication, publish_generation
 
 from .generation_bootstrap import ALGORITHM_VERSION, _utc
 from .historical_obligations import (
@@ -1476,6 +1476,9 @@ def _publish_accepted_generation_current_state(
     # historical read-model rows for this consumer.
 
 
+# §40: accepting a build is a publication; its own builders must not be
+# gated on the age of the pointer this acceptance is about to replace.
+@as_publication
 def accept_generation_build(
     db: Session,
     generation_id: int,

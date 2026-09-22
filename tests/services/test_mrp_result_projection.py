@@ -1164,14 +1164,17 @@ def test_publication_builder_ignores_the_age_gate_it_is_there_to_clear(
 
     After a gap longer than the threshold the builder raised inside the
     bounded publication, the orchestrator discarded the candidate, and no
-    refresh could ever succeed again.
+    refresh could ever succeed again.  The exemption belongs to the
+    operation, so it is entered once (§40) rather than threaded through each
+    builder as a keyword.
     """
     monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
     generation, run = _stale_fixed_run(db_session)
 
-    payload = build_mrp_result_current_payload(
-        db_session, run.run_id, ignore_freshness_limit=True
-    )
+    from app.services.planning_truth import publication_context
+
+    with publication_context():
+        payload = build_mrp_result_current_payload(db_session, run.run_id)
 
     assert int(payload["meta"]["run_id"]) == int(run.run_id)
     assert int(generation.id) == int(

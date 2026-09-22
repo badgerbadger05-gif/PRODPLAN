@@ -52,7 +52,7 @@ from app.services.item_ledger.physical_refresh_supplier_evidence import (
     is_supplier_document_type,
 )
 from app.services.mrp_result_projection import build_mrp_result_current_payload
-from app.services.planning_truth import publish_generation
+from app.services.planning_truth import publication_context, publish_generation
 from app.services.item_ledger.shelf_projection_persistence import (
     build_compact_current_shelf_payload,
 )
@@ -562,7 +562,7 @@ def _current_scopes(
     for row in rows:
         scope = _buy_scope_for_receipt(
             row,
-            planning_pool_by_warehouse=planning_pool_by_warehouse,
+                planning_pool_by_warehouse=planning_pool_by_warehouse,
             current_owners=current_owners,
         )
         if scope is not None:
@@ -799,19 +799,15 @@ def _build_obligation_view_payloads(
     used by the full accept path is therefore part of every publication, not an
     optional extra.
 
-    Those builders read the pointer truth with the age gate dropped.  The
-    physical refresh is the only mechanism that makes the pointer fresh, so
-    refusing to build on an old pointer is a self-deadlock: after a gap longer
-    than ``PLANNING_TRUTH_MAX_AGE_SECONDS`` the builder raised, the
-    orchestrator discarded the candidate, and the stand could never recover on
-    its own.  Coherence with the exact pointer, its capabilities and any
+    Those builders run inside the publication context (§40), so the age gate
+    does not apply to them: the physical refresh is the only mechanism that
+    makes the pointer fresh, and refusing to build on an old pointer is a
+    self-deadlock.  Coherence with the exact pointer, its capabilities and any
     operator invalidation are still enforced; only the clock is ignored, and
-    only here.
+    only inside a publication.
     """
     mrp_payloads = {
-        str(run_id): build_mrp_result_current_payload(
-            db, int(run_id), ignore_freshness_limit=True
-        )
+        str(run_id): build_mrp_result_current_payload(db, int(run_id))
         for run_id in sorted({int(value) for value in run_ids})
     }
     period_payloads = build_period_plan_execution_current_payloads(
@@ -878,18 +874,21 @@ def publish_forward_physical_refresh_current(
     tracker = _PhaseTracker(int(target_generation_id))
     tracker.start()
     try:
-        result = _publish_forward_physical_refresh_current(
-            db,
-            target_generation_id=target_generation_id,
-            parent_generation_id=parent_generation_id,
-            delta_manifest=delta_manifest,
-            odata_client=odata_client,
-            source_revision=source_revision,
-            planning_pool_by_warehouse=planning_pool_by_warehouse,
-            custody_source_sle_ids=custody_source_sle_ids,
-            phase_hook=phase_hook,
-            _phase_tracker=tracker,
-        )
+        # §40: this publication is what makes the pointer fresh, so nothing
+        # inside it may be gated on the pointer's age.
+        with publication_context():
+            result = _publish_forward_physical_refresh_current(
+                db,
+                target_generation_id=target_generation_id,
+                parent_generation_id=parent_generation_id,
+                delta_manifest=delta_manifest,
+                odata_client=odata_client,
+                source_revision=source_revision,
+                planning_pool_by_warehouse=planning_pool_by_warehouse,
+                custody_source_sle_ids=custody_source_sle_ids,
+                phase_hook=phase_hook,
+                _phase_tracker=tracker,
+            )
         _clear_phase_failure(int(target_generation_id))
         return replace(result, phase_timings=tracker.timings())
     except Exception as exc:
@@ -1438,6 +1437,22 @@ def repair_current_execution_scopes_from_pointer(
     rows, so that reader would publish an empty scope and close every current
     row.
     """
+    with publication_context():
+        return _repair_current_execution_scopes_from_pointer(
+            db,
+            pointer_generation_id=int(pointer_generation_id),
+            payload_boundary_generation_id=int(payload_boundary_generation_id),
+            source_revision=source_revision,
+        )
+
+
+def _repair_current_execution_scopes_from_pointer(
+    db: Session,
+    *,
+    pointer_generation_id: int,
+    payload_boundary_generation_id: int,
+    source_revision: int | str,
+) -> CurrentExecutionScopeRepairResult | None:
     pointer = db.get(models.PlanningTruthState, 1)
     generation = db.get(models.LedgerGeneration, int(pointer_generation_id))
     if pointer is None or int(pointer.current_generation_id or -1) != int(pointer_generation_id):
