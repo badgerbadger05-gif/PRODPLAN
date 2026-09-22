@@ -178,25 +178,46 @@ def _assert_current_execution_coverage(db: Session, generation_id: int) -> None:
             "current execution coverage is incomplete: "
             + ", ".join(f"{kind}/{scope}" for kind, scope in missing)
         )
-    # The prune below removes every other generation's supplier provenance.
-    # That is only a cleanup if the pointer already owns its own complete set;
-    # otherwise it is the step that destroys the last typed evidence of
-    # accepted receipts.  It ran that way for months: a lightweight fork left
-    # its provenance at the parent and the next publication deleted it.
+
+def _provenance_prune_is_safe(db: Session, generation_id: int) -> tuple[bool, str]:
+    """May the other generations' supplier provenance be removed yet?
+
+    The prune removes every other generation's evidence, which is the only
+    copy of anything the pointer does not own.  That is a cleanup once the
+    pointer owns its complete typed set; before that it is the step that
+    destroys the last record of an accepted receipt, and it ran that way for
+    months.
+
+    Only this one statement waits.  Blocking the whole prune would stop the
+    projection growth the retention exists to bound - the stand reached 44 GB
+    that way - so every other table is still cleaned while the evidence is
+    repaired.
+    """
     from .physical_refresh_supplier_evidence import (
         lost_supplier_receipt_provenance_sle_ids,
     )
-
-    uncovered = lost_supplier_receipt_provenance_sle_ids(
-        db, ledger_generation_id=int(generation_id), limit=9
+    from app.services.planning_pool_resolver import (
+        PlanningPoolConfigurationError,
+        resolve_planning_pool_by_warehouse,
     )
-    if uncovered:
-        raise ExecutionProjectionRetentionError(
-            f"generation {int(generation_id)} does not own supplier receipt "
-            "provenance for its visible supplier facts; pruning the other "
-            "generations would destroy the last typed evidence "
-            f"(first uncovered sle_ids={list(uncovered[:8])})"
-        )
+
+    try:
+        mapping = resolve_planning_pool_by_warehouse(db)
+    except PlanningPoolConfigurationError:
+        mapping = None
+    lost = lost_supplier_receipt_provenance_sle_ids(
+        db,
+        ledger_generation_id=int(generation_id),
+        planning_pool_by_warehouse=mapping,
+        limit=9,
+    )
+    if not lost:
+        return True, ""
+    return False, (
+        f"generation {int(generation_id)} does not own supplier receipt "
+        "provenance for its visible supplier facts "
+        f"(first uncovered sle_ids={[int(value) for value in lost[:8]]})"
+    )
 
 
 def prune_retired_execution_projections(
@@ -213,11 +234,18 @@ def prune_retired_execution_projections(
 
     current_id = int(current_generation_id)
     _assert_current_execution_coverage(db, current_id)
+    provenance_safe, provenance_reason = _provenance_prune_is_safe(db, current_id)
     params = {"current_generation_id": current_id}
     removed: dict[str, int] = {}
     for statement in _RETENTION_STATEMENTS:
-        result = db.execute(text(statement), params)
         table = statement.split("DELETE FROM", 1)[1].split()[0]
+        if table == "stock_ledger_supplier_receipt_provenance" and not provenance_safe:
+            removed[table] = 0
+            removed["stock_ledger_supplier_receipt_provenance_retained_reason"] = (
+                provenance_reason
+            )
+            continue
+        result = db.execute(text(statement), params)
         removed[table] = int(result.rowcount or 0)
     return removed
 

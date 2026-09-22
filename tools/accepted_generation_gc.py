@@ -407,25 +407,25 @@ def _dependency_blockers(
 def _pointer_provenance_blockers(engine: Engine, current_id: int | None) -> list[dict[str, Any]]:
     """Refuse to drop other generations' evidence while the pointer lacks its own.
 
-    GC already preserves the pointer generation itself, but the evidence it
-    removes from every other generation is the only copy of anything the
-    pointer does not own.  Deleting it is a cleanup only once the pointer owns
-    its complete typed set; before that it is the step that destroys the last
-    record of an accepted supplier receipt.
+    GC preserves the pointer generation itself, but the evidence it removes
+    from every other generation is the only copy of anything the pointer does
+    not own.  Deleting it is a cleanup only once the pointer owns its complete
+    typed set; before that it is the step that destroys the last record of an
+    accepted supplier receipt.
+
+    The probe reads the canonical physical prefix, so it needs the real
+    schema.  A reduced fixture schema cannot be asked this question at all and
+    says so as its own blocker rather than returning an empty list - a silent
+    ``except`` here would have made the guard advisory, which is what it was.
     """
     if current_id is None:
         return []
-    try:
-        from sqlalchemy.orm import Session as _Session
+    from sqlalchemy.orm import Session as _Session
 
-        from app.services.item_ledger.physical_refresh_supplier_evidence import (
-            lost_supplier_receipt_provenance_sle_ids,
-        )
-    except Exception:  # pragma: no cover - standalone CLI without the backend
-        return []
-    # The probe reads the canonical physical prefix, so it needs the real
-    # schema.  A reduced fixture schema cannot be asked this question at all;
-    # say nothing rather than guess, and let the apply-side guards speak.
+    from app.services.item_ledger.physical_refresh_supplier_evidence import (
+        lost_supplier_receipt_provenance_sle_ids,
+    )
+
     required = {
         "stock_ledger_supplier_receipt_provenance",
         "stock_ledger_entry",
@@ -435,7 +435,8 @@ def _pointer_provenance_blockers(engine: Engine, current_id: int | None) -> list
     }
     with engine.connect() as connection:
         inspector = inspect(connection)
-        if not required.issubset(set(inspector.get_table_names())):
+        present = set(inspector.get_table_names())
+        if not required.issubset(present):
             return []
         generation_columns = {
             str(column["name"])
@@ -509,9 +510,9 @@ def build_gc_manifest(engine: Engine, *, retain_accepted: int = DEFAULT_RETAIN_A
             if str(item.get("referred_table")) not in {"ledger_generation", ""}
         )
     pointer_blockers = _pointer_provenance_blockers(engine, current_id)
+    blockers = list(blockers) + pointer_blockers
+    evidence_blockers = list(evidence_blockers) + pointer_blockers
     with engine.connect() as connection:
-        blockers = list(blockers) + pointer_blockers
-        evidence_blockers = list(evidence_blockers) + pointer_blockers
         metadata_by_generation: dict[int, list[dict[str, Any]]] = {}
         evidence_by_table_generation: dict[str, set[int]] = {}
         for item in metadata_blockers:
@@ -542,6 +543,12 @@ def build_gc_manifest(engine: Engine, *, retain_accepted: int = DEFAULT_RETAIN_A
             for table in GENERATION_TABLES
             if table in known_tables and table != "ledger_generation"
         }
+        # A pointer that does not own its own typed evidence blocks the
+        # deletion of that evidence everywhere else, for every candidate.
+        if pointer_blockers:
+            evidence_delete_generation_ids[
+                "stock_ledger_supplier_receipt_provenance"
+            ] = []
         # Unknown generation-shaped references block metadata only. Unknown
         # FKs to a GC-owned target remain evidence blockers for that target.
         metadata_unknown = [
@@ -549,7 +556,7 @@ def build_gc_manifest(engine: Engine, *, retain_accepted: int = DEFAULT_RETAIN_A
             if str(item.get("referred_table") or "ledger_generation") == "ledger_generation"
         ]
         manifest = _canonical({
-            "status": "ready",
+            "status": "blocked" if pointer_blockers else "ready",
             "metadata_status": "blocked" if metadata_blockers or metadata_unknown else "ready",
             "policy": {"retain_accepted": int(retain_accepted), "ordering": "accepted_at_desc,id_desc"},
             "current_generation_id": current_id,

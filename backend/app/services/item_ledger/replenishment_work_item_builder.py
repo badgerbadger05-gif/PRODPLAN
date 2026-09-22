@@ -106,12 +106,36 @@ def _build_rows(
     plan_by_run: dict[int, int],
     run_ids: tuple[int, ...] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int]:
-    reservations = (
+    selected = (
         db.query(models.ReservationEntry)
         .filter(_reservation_scope(generation, run_ids))
         .order_by(models.ReservationEntry.id.asc())
         .all()
     )
+    # One obligation, one work item.  A live run scope can see the same
+    # obligation twice while a refresh is building - its staged row at this
+    # generation and the stable owner it will be published into - and two
+    # rows for one requirement would offer the same replenishment for
+    # ordering twice.  The staged row at the target wins: it is what this
+    # build is publishing, and the promoter rebinds the work item onto the
+    # owner afterwards.
+    by_requirement: dict[tuple[int, str], models.ReservationEntry] = {}
+    for row in selected:
+        key = (int(row.requirement_id), _text(row.realization_mode))
+        previous = by_requirement.get(key)
+        if previous is None:
+            by_requirement[key] = row
+            continue
+        staged = int(row.ledger_generation_id or 0) == int(generation.id)
+        previously_staged = int(previous.ledger_generation_id or 0) == int(generation.id)
+        if staged and not previously_staged:
+            by_requirement[key] = row
+        elif staged == previously_staged and int(row.id) != int(previous.id):
+            raise ReplenishmentWorkItemBuilderError(
+                "two indistinguishable reservations for requirement "
+                f"{int(row.requirement_id)}: {int(previous.id)} and {int(row.id)}"
+            )
+    reservations = sorted(by_requirement.values(), key=lambda row: int(row.id))
 
     work_items: list[dict[str, Any]] = []
     method_counts = {"make": 0, "buy": 0}

@@ -632,3 +632,43 @@ def test_discard_reopens_only_the_scopes_its_candidate_invalidated(db_session):
         ("shelf_projection", "shelf:all-live-mrps"): False,
         ("drum_slot", "drum:all-live-plans"): False,
     }
+
+
+def test_retention_holds_only_the_provenance_table_while_evidence_is_missing(
+    db_session, monkeypatch,
+):
+    """A missing-evidence pointer must not stop bounded retention entirely.
+
+    The prune of the other generations' provenance waits - it would destroy
+    the last copy of an accepted receipt - but every other projection is
+    still cleaned.  Holding the whole prune is how the stand reached 44 GB.
+    """
+    from app.services.item_ledger import execution_projection_retention as retention
+
+    monkeypatch.setattr(
+        retention, "_assert_current_execution_coverage", lambda db, gid: None,
+    )
+    monkeypatch.setattr(
+        retention, "_provenance_prune_is_safe",
+        lambda db, gid: (False, "evidence is missing"),
+    )
+    executed = []
+
+    class _Result:
+        rowcount = 0
+
+    def _execute(statement, params=None):
+        executed.append(str(statement).split("DELETE FROM", 1)[1].split()[0])
+        return _Result()
+
+    monkeypatch.setattr(db_session, "execute", _execute)
+
+    removed = retention.prune_retired_execution_projections(db_session, 1)
+
+    assert "stock_ledger_supplier_receipt_provenance" not in executed
+    assert "replenishment_work_item" in executed
+    assert "assembly_readiness" in executed
+    assert removed["stock_ledger_supplier_receipt_provenance"] == 0
+    assert removed[
+        "stock_ledger_supplier_receipt_provenance_retained_reason"
+    ] == "evidence is missing"

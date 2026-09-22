@@ -733,8 +733,13 @@ def _replenishment_work_item_checkpoint(
 
     try:
         live_run_ids = tuple(live_plan_run_ids(db, generation))
-    except ValueError:
-        live_run_ids = ()
+    except ValueError as exc:
+        # An unreadable live scope is unavailable, never an empty one: a
+        # silent () here would have proved the journal complete by describing
+        # nothing.
+        raise GenerationValidationError(
+            f"live-plan scope is unreadable for generation {int(generation.id)}: {exc}"
+        ) from exc
     if live_run_ids:
         for entry in db.query(models.ReservationEntry).filter(
             models.ReservationEntry.run_id.in_(sorted(live_run_ids)),

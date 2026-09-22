@@ -622,10 +622,11 @@ def test_verified_empty_scope_clears_only_that_distribution_scope(db_session):
         operation="delete", source_revision=2
     ).all()
     assert cleared_audit
-    assert all(
-        row.reason
-        == "confirmed_empty:verified empty supplier stream for the scope"
-        for row in cleared_audit
+    # The canonical enum stays in ``reason``; the operator text is echoed to
+    # the caller instead of replacing it.
+    assert all(row.reason == "confirmed_empty_scope" for row in cleared_audit)
+    assert result.confirmed_empty_reason == (
+        "verified empty supplier stream for the scope"
     )
     assert db_session.get(models.ReservationConsumptionAllocation, foreign_row.id) is not None
     assert db_session.get(models.ReservationConsumptionAllocation, foreign_row.id).is_current is True

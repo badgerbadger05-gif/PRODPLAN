@@ -73,6 +73,7 @@ def lost_supplier_receipt_provenance_sle_ids(
     db: Session,
     *,
     ledger_generation_id: int,
+    planning_pool_by_warehouse: Mapping[str, str] | None = None,
     limit: int = 0,
 ) -> tuple[int, ...]:
     """Visible supplier facts this generation lost the typed evidence of.
@@ -92,6 +93,11 @@ def lost_supplier_receipt_provenance_sle_ids(
     A row in any status counts as owned, ``excluded_non_supplier`` included:
     the writer looked at the fact and typed it, which is what ownership means
     here.  ``limit`` bounds the diagnostic, never the verdict.
+
+    ``planning_pool_by_warehouse`` restricts the verdict to the live planning
+    contour.  A fact on a warehouse that has since left the contour is no
+    longer a planning receipt at all, so its missing evidence cannot make a
+    planning quantity uncountable and must not block publication for ever.
     """
     owned_here = exists().where(and_(
         models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
@@ -114,6 +120,17 @@ def lost_supplier_receipt_provenance_sle_ids(
         .with_entities(models.StockLedgerEntry.id)
         .order_by(models.StockLedgerEntry.id.asc())
     )
+    if planning_pool_by_warehouse is not None:
+        warehouses = [
+            str(key).strip()
+            for key, value in dict(planning_pool_by_warehouse).items()
+            if str(key or "").strip() and str(value or "").strip()
+        ]
+        if not warehouses:
+            return ()
+        query = query.filter(
+            models.StockLedgerEntry.warehouse_ref1c.in_(sorted(warehouses))
+        )
     if limit and int(limit) > 0:
         query = query.limit(int(limit))
     return tuple(int(value) for (value,) in query.all())
@@ -286,19 +303,20 @@ def _scope_for_row(
 ) -> DistributionScope:
     """Place one physical row in the BUY scope the publisher resolved for it.
 
-    Item and characteristic are the row's own; the organization is the
-    scope's.  The organization on a physical row is the 1C organization that
-    posted the document, not the planning organization of an obligation - the
-    publisher already refused to compare the two when it built these scopes
-    (``physical_refresh_current_publish._buy_scope_for_receipt``), and
-    comparing them again here would reject every row it just accepted.
+    The row is keyed through the canonical collapse
+    (``mrp_freeze.pool_key_for``), the same one the reservations behind those
+    scopes were frozen with.  Comparing raw columns here would reject every
+    row the publisher had just accepted.
     """
-    candidates = tuple(
-        scope
-        for scope in scopes
-        if int(row.item_id) == int(scope[0])
-        and _text(row.characteristic_ref) == scope[1]
+    from app.services.mrp_freeze import distribution_scope_for
+
+    key = distribution_scope_for(
+        int(row.item_id),
+        _text(row.characteristic_ref),
+        _text(row.organization_ref),
+        mode="buy",
     )
+    candidates = tuple(scope for scope in scopes if tuple(scope) == key)
     if len(candidates) != 1:
         raise BoundedSupplierEvidenceError(
             f"supplier SLE {int(row.id)} has ambiguous or foreign affected BUY scope"

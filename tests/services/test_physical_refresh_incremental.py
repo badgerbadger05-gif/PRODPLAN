@@ -1129,3 +1129,181 @@ def test_bounded_refresh_counts_one_document_output_once(db_session, monkeypatch
     db_session.refresh(line)
     assert line.accepted_output_qty == Decimal("2.000")
     db_session.rollback()
+
+
+def test_delta_output_reaches_a_rework_owner(db_session, monkeypatch):
+    """Canon §18: an accepted ``assembly_in`` closes a rework reserve too.
+
+    The bounded MAKE writer used to hard-code ``realization_mode='make'`` in
+    its owner query, so a rework obligation was resolved into a scope the
+    writer then found no owner for.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-REWORK")
+    owner, _requirement = _make_owner(db_session, parent, item, required="10")
+    owner.realization_mode = "rework"
+    owner.current_identity = (
+        f"reservation:req:{int(owner.requirement_id)}:mode:rework"
+    )
+    owner.organization_ref = ""
+    db_session.flush()
+    output = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов", ref="rework-out",
+    )
+    db_session.commit()
+
+    _patch_payloads(monkeypatch, evidence=())
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (output,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    # Rework is realized inside the MAKE scope, not a scope of its own.
+    assert result.affected_scopes == (f"{item.item_id}:::default:make",)
+    allocations = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, reservation_id=owner.id, sle_id=output.id,
+    ).all()
+    assert [row.allocated_qty for row in allocations] == [Decimal("4.000")]
+    db_session.rollback()
+
+
+def test_delta_output_with_a_real_characteristic_still_reaches_its_owner(
+    db_session, monkeypatch,
+):
+    """The canonical collapse keys both sides; raw columns never matched.
+
+    A frozen reservation is written through ``mrp_freeze.pool_key_for``,
+    which collapses characteristic and organization, so a fact that carries
+    either would never have matched an owner by column comparison.
+    """
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-CHARACTERISTIC")
+    owner, _requirement = _make_owner(db_session, parent, item, required="10")
+    owner.organization_ref = ""
+    owner.characteristic_ref = ""
+    db_session.flush()
+    output = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов", ref="char-out",
+    )
+    output.characteristic_ref = "a-real-characteristic"
+    output.organization_ref = "c78bcd0e-81f0-11ee-9ce5-9ee51454587f"
+    db_session.flush()
+    db_session.commit()
+
+    _patch_payloads(monkeypatch, evidence=())
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (output,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    assert result.affected_scopes == (f"{item.item_id}:::default:make",)
+    assert db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, reservation_id=owner.id, sle_id=output.id,
+    ).count() == 1
+    db_session.rollback()
+
+
+def test_two_distribution_pools_for_one_item_fail_closed_with_one_verdict(
+    db_session,
+):
+    """Ambiguity has one reaction and one message, on both sides."""
+    from app.services.item_ledger import physical_refresh_current_publish as pub
+
+    parent, _target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-AMBIGUOUS")
+    first, _req_a = _buy_owner(db_session, parent, item)
+    second, _req_b = _buy_owner(db_session, parent, item)
+    # Two live obligations of the same item in two realization modes: one
+    # physical fact cannot be attributed to both, and canon assigns a fact
+    # exactly once.
+    second.realization_mode = "rework"
+    second.current_identity = (
+        f"reservation:req:{int(second.requirement_id)}:mode:rework"
+    )
+    db_session.flush()
+    receipt = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="receipt",
+        warehouse="WH-BUY", recorder_type="Document_ПриходнаяНакладная",
+        ref="ambiguous",
+    )
+    db_session.flush()
+
+    owners = (first, second)
+    # Both owners realize inside one MAKE scope: one fact, one replay.
+    assembly = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
+        warehouse="WH-BUY", recorder_type="Document_СборкаЗапасов",
+        ref="ambiguous-make",
+    )
+    first.realization_mode = "make"
+    db_session.flush()
+    assert len(pub._make_scopes_for_assembly_row(assembly, owners)) == 1
+
+    # Two genuinely different distribution pools for one item is the one
+    # ambiguity this module refuses, with one message on both sides.
+    with pytest.raises(
+        pub.ForwardPhysicalRefreshUnavailable, match="ambiguous distribution pools"
+    ):
+        pub._single_scope_or_fail(
+            receipt,
+            (
+                (item.item_id, "", "", "default", "buy"),
+                (item.item_id, "", "", "other", "buy"),
+            ),
+        )
+    db_session.rollback()
+
+
+def test_historical_untyped_receipt_does_not_block_a_later_refresh(
+    db_session, monkeypatch,
+):
+    """The BUY gate judges this refresh's delta, not the whole prefix.
+
+    A receipt that predates its item's BUY owner was covered at freeze time,
+    not by replenishment.  Scanning the visible prefix made such history
+    block every future refresh for ever, against CANON "Объём вычислений
+    штатного физического refresh".
+    """
+    parent, target, parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "BOUNDED-HISTORICAL")
+    owner, _requirement = _buy_owner(db_session, parent, item)
+    owner.organization_ref = ""
+    db_session.flush()
+    # Untyped, visible, inside the contour - and none of this refresh's business.
+    _sle(
+        db_session, parent_batch, item, qty="7", at=PARENT_CUTOFF - timedelta(days=2),
+        kind="receipt", warehouse="WH-BUY",
+        recorder_type="Document_ПриходнаяНакладная", ref="historical-receipt",
+    )
+    unrelated = _sle(
+        db_session, target_batch, item, qty="1", at=FORWARD_AT, kind="transfer_in",
+        warehouse="WH-MOVE", recorder_type="Document_ПеремещениеЗапасов",
+        ref="unrelated-move",
+    )
+    db_session.commit()
+
+    _patch_payloads(monkeypatch, evidence=())
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (unrelated,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    assert result.target_generation_id == target.id
+    db_session.rollback()

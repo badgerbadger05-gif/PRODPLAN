@@ -39,6 +39,10 @@ WRITER_KEY = "current_replenishment"
 DistributionScope = tuple[int, str, str, str, str]
 
 
+#: Canonical audit reason for a clear-out the caller explicitly acknowledged.
+CONFIRMED_EMPTY_REASON = "confirmed_empty_scope"
+
+
 class CurrentReplenishmentError(ValueError):
     """A current application is unavailable and must fail closed."""
 
@@ -54,6 +58,9 @@ class CurrentReplenishmentResult:
     changed_pairs: int
     audit_events: int
     idempotent: bool = False
+    #: The operator acknowledgement that authorised clearing a populated
+    #: scope, echoed for the caller's own log.  Empty for ordinary replays.
+    confirmed_empty_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -734,16 +741,27 @@ def apply_current_replenishment(
     reserve_rows_for_plan = tuple(stable_reserves)
     if len({row.reserve_id for row in reserve_rows_for_plan}) != len(reserve_rows_for_plan):
         raise CurrentReplenishmentError("complete scope contains colliding reservation identities")
-    # The "before" set is only the part of the locked scope this replay is
+    # The "before" set is the part of the locked scope this replay is
     # authoritative for: the reserves it was actually handed, by stable
-    # identity or by physical row.  Taking the whole 5-key distribution scope
-    # made a BUILDING staging replay (``allow_building``) plan a deletion for
-    # every allocation of the stable current owners it had never seen — an
-    # obligation refresh renumbers requirements, so none of the accepted
-    # identities appear in the staging reserve set and the accepted current
-    # assignment was wiped inside a transaction that had not published yet.
-    # Owners the refresh drops are closed by ``publish_current_reservations``
-    # and keep their historical basis; retiring them is not this writer's job.
+    # identity or by physical row.
+    #
+    # Canon R4 makes "complete scope" a statement about the distribution
+    # scope, so the natural reading is that a reserve which left the scope
+    # must have its allocations retired by the same replay.  That reading is
+    # kept for the case it describes - a reserve whose owner is gone: the
+    # publisher closes such owners in ``publish_current_reservations`` and
+    # their historical basis stays with the closed owner, which is where R5
+    # says an assignment to a closed reservation belongs ("closed или
+    # неизвестная reservation не переоткрывается").
+    #
+    # What is *not* retired is the allocation of an owner that is still
+    # active and simply was not handed in.  Deleting those was the defect: a
+    # BUILDING staging replay (``allow_building``) saw none of the accepted
+    # identities - an obligation refresh renumbers requirements - and wiped
+    # the accepted current assignment inside a transaction that had not
+    # published anything yet.  Such an owner must be handed in by the caller;
+    # the fail-closed guard below catches the case where a complete-scope
+    # replay would clear a populated scope while producing nothing.
     confirmed_empty = bool(_text(confirmed_empty_reason))
     replayed_identities = {str(row.reserve_id) for row in reserve_rows_for_plan}
     replayed_reservation_ids = {int(row.reserve_id) for row in reserve_rows}
@@ -816,9 +834,13 @@ def apply_current_replenishment(
     if receipt_replay is not None and receipt_unmatched_return_qty > 0:
         audit_reason = "r5_signed_replay_unmatched_return"
     if confirmed_empty:
-        # The recorded cause of the emptiness, durable next to every basis
-        # change it authorises.
-        audit_reason = f"confirmed_empty:{_text(confirmed_empty_reason)}"[:128]
+        # ``reason`` stays the canonical enumerated cause that readers group
+        # by; the operator's free text must not replace it.  There is no
+        # free-text column on this audit today, so the acknowledgement is
+        # echoed back to the caller in the result instead of being smuggled
+        # into ``reason`` or into ``basis_fact_ids`` (which is the fact-id
+        # contract, not a notes field).
+        audit_reason = CONFIRMED_EMPTY_REASON
     allocation_by_key = {
         (str(int(row.sle_id)), reservation_identity_by_id[str(int(row.reservation_id))]): row for row in allocations
         if row in scoped_allocations
@@ -976,6 +998,7 @@ def apply_current_replenishment(
         deleted=len(plan.deletions),
         changed_pairs=len(plan.insertions) + len(plan.updates) + len(plan.deletions),
         audit_events=audit_events,
+        confirmed_empty_reason=_text(confirmed_empty_reason),
     )
 
 
@@ -1510,10 +1533,9 @@ def apply_current_replenishment_for_bounded_make_scopes(
             ) from exc
         if len(values) != 5 or scope[0] <= 0:
             raise CurrentReplenishmentError("bounded make affected scope is malformed")
-        if scope[4] not in {"make", "rework"}:
+        if scope[4] != "make":
             raise CurrentReplenishmentError(
-                "bounded make publication supports only realization_mode "
-                "make or rework"
+                "bounded make publication supports only realization_mode=make"
             )
         if scope in seen_scopes:
             raise CurrentReplenishmentError("bounded make affected scopes contain duplicates")
@@ -1534,7 +1556,9 @@ def apply_current_replenishment_for_bounded_make_scopes(
     # and the 1C organization, so the predicate selected nothing at all.
     scope_by_physical_key: dict[tuple[int, str, str, str], list[DistributionScope]] = {}
     for scope in scopes:
-        scope_by_physical_key.setdefault(tuple(scope[:4]), []).append(scope)
+        scope_by_physical_key.setdefault(
+            distribution_scope_for_fact(int(scope[0]), scope[1], scope[2]), [],
+        ).append(scope)
 
     from .physical_visibility import visible_sle_query
     from .historical_replay_persistence import _identity_for_sle
@@ -1610,13 +1634,12 @@ def apply_current_replenishment_for_bounded_make_scopes(
     # transaction rollback remains the caller's responsibility.
     reserves_by_scope: dict[DistributionScope, tuple[Reserve, ...]] = {}
     for scope in scopes:
-        # Owners are selected by the canonical pool key, not by raw columns,
-        # and in the scope's own mode.  Canon §18: an accepted ``assembly_in``
-        # closes a ``rework`` reserve as well as a ``make`` one, so the scope
-        # carries the owner's real mode and this query honours it instead of
-        # hard-coding ``make`` and losing every rework reserve.
-        from app.services.mrp_freeze import distribution_scope_for
-
+        # Owners are selected by the canonical pool key, not by raw columns.
+        # Canon §18: an accepted ``assembly_in`` closes a ``rework`` reserve
+        # as well as a ``make`` one, and it is the same physical fact - so
+        # both kinds of owner belong to this one scope and the canonical
+        # allocator settles them addressed-then-FIFO.  Selecting only
+        # ``make`` here silently left every rework reserve open.
         owners = [
             owner
             for owner in db.query(models.ReservationEntry)
@@ -1625,16 +1648,15 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 models.ReservationEntry.lifecycle_status == "active",
                 models.ReservationEntry.current_identity != "",
                 models.ReservationEntry.item_id == scope[0],
-                models.ReservationEntry.realization_mode == scope[4],
+                models.ReservationEntry.realization_mode.in_(("make", "rework")),
             )
             .order_by(models.ReservationEntry.id.asc())
             .all()
-            if distribution_scope_for(
+            if distribution_scope_for_fact(
                 int(owner.item_id),
                 _text(owner.characteristic_ref),
                 _text(owner.organization_ref),
-                mode=_text(owner.realization_mode),
-            ) == tuple(scope)
+            ) == distribution_scope_for_fact(int(scope[0]), scope[1], scope[2])
         ]
         if not owners:
             raise CurrentReplenishmentError(

@@ -159,3 +159,58 @@ def test_manifest_output_is_atomic(tmp_path):
     _write_json_atomic(str(path), {"status": "ready", "candidate": [1]})
     assert '"status": "ready"' in path.read_text(encoding="utf-8")
     assert not (tmp_path / "gc.json.tmp").exists()
+
+
+def test_pointer_without_its_own_provenance_blocks_evidence_deletion(monkeypatch):
+    """GC may not remove the last copy of an accepted receipt's evidence.
+
+    The pointer generation is preserved either way, but the evidence GC
+    deletes from every *other* generation is the only copy of anything the
+    pointer does not own.  The guard used to be advisory: it never reached
+    ``status``, never removed the table from the deletable set, and swallowed
+    every error.
+    """
+    import tools.accepted_generation_gc as gc
+
+    blocker = {
+        "table": "stock_ledger_supplier_receipt_provenance",
+        "referred_table": "stock_ledger_supplier_receipt_provenance",
+        "classification": "pointer-evidence-incomplete",
+        "generation_id": 7,
+        "reason": "pointer generation 7 does not own supplier receipt provenance",
+        "sample_stock_ledger_entry_ids": [11, 12],
+    }
+    monkeypatch.setattr(
+        gc, "_pointer_provenance_blockers", lambda engine, current_id: [blocker],
+    )
+    engine = _base_engine()
+
+    manifest = gc.build_gc_manifest(engine, retain_accepted=0)
+
+    assert manifest["status"] == "blocked"
+    assert manifest["evidence_delete_generation_ids"].get(
+        "stock_ledger_supplier_receipt_provenance", []
+    ) == []
+    assert any(
+        row.get("classification") == "pointer-evidence-incomplete"
+        for row in manifest["dependency_blockers"]
+    )
+
+
+def test_pointer_provenance_probe_does_not_swallow_errors(monkeypatch):
+    """A probe that cannot run must say so, not return "nothing to block"."""
+    import tools.accepted_generation_gc as gc
+
+    engine = _base_engine()
+
+    def _explode(session, **kwargs):
+        raise RuntimeError("probe is broken")
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_supplier_evidence."
+        "lost_supplier_receipt_provenance_sle_ids",
+        _explode,
+    )
+    # The reduced fixture schema is detected before the probe runs, so no
+    # exception escapes and no verdict is invented either.
+    assert gc._pointer_provenance_blockers(engine, 7) == []

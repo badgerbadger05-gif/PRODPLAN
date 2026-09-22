@@ -48,7 +48,6 @@ from app.services.item_ledger.physical_refresh_stock_bin import (
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
 from app.services.item_ledger.physical_refresh_supplier_evidence import (
     lost_supplier_receipt_provenance_sle_ids,
-    untyped_supplier_receipt_rows_in_contour,
     build_bounded_supplier_receipt_manifest,
     is_supplier_document_type,
 )
@@ -593,16 +592,20 @@ def _owner_scopes_for(
     row: Any,
     current_owners: Sequence[models.ReservationEntry],
     modes: set[str],
+    *,
+    scope_mode: str,
 ) -> tuple[tuple[int, str, str, str, str], ...]:
     """Scopes of the current owners of this row's item, in the given modes.
 
-    The owner's own realization mode is kept: canon §18 says an accepted
-    ``assembly_in`` closes a ``rework`` reserve as well as a ``make`` one, so
-    collapsing rework into make here would hand the writer a mode its own
-    reserve selection rejects.
+    ``modes`` selects which owners this kind of fact can realize; the scope
+    itself is emitted in ``scope_mode``.  Canon §18 says an accepted
+    ``assembly_in`` closes a ``rework`` reserve as well as a ``make`` one, and
+    it is the same physical fact either way - so rework owners join the MAKE
+    scope and the allocator settles them addressed-then-FIFO with the make
+    ones, instead of a second scope replaying the same fact a second time.
     """
     return tuple({
-        _canonical_scope(owner, _text(owner.realization_mode))
+        _canonical_scope(owner, scope_mode)
         for owner in current_owners
         if int(owner.item_id) == int(row.item_id)
         and _text(owner.realization_mode) in modes
@@ -635,15 +638,20 @@ def _make_scopes_for_assembly_row(
 
     Both sides are keyed through the canonical collapse, so a fact with a real
     characteristic and the 1C organization still reaches the owner that was
-    frozen with the collapsed key.  A ``rework`` owner keeps its own mode
-    (canon §18).
+    frozen with the collapsed key.  ``rework`` owners are realized in this
+    same MAKE scope (canon §18), so one physical output is replayed once and
+    settled across make and rework reserves by the canonical allocator.
+
+    At most one scope, and a second one is the single ambiguity verdict this
+    module gives.
     """
-    scopes = _owner_scopes_for(row, current_owners, {"make", "rework"})
-    if len({scope[:4] for scope in scopes}) > 1:
-        raise ForwardPhysicalRefreshUnavailable(
-            f"facts for item {int(row.item_id)} have ambiguous distribution pools"
-        )
-    return scopes
+    scope = _single_scope_or_fail(
+        row,
+        _owner_scopes_for(
+            row, current_owners, {"make", "rework"}, scope_mode="make",
+        ),
+    )
+    return () if scope is None else (scope,)
 
 
 def _buy_scope_for_receipt(
@@ -670,45 +678,59 @@ def _buy_scope_for_receipt(
     if not warehouse or not _text(planning_pool_by_warehouse.get(warehouse)):
         return None
     return _single_scope_or_fail(
-        row, _owner_scopes_for(row, current_owners, {"buy"})
+        row, _owner_scopes_for(row, current_owners, {"buy"}, scope_mode="buy"),
     )
 
 
-def _untyped_buy_owned_receipt_ids(
+def _typed_supplier_sle_ids(
     db: Session,
-    *,
     target_generation_id: int,
+    rows: Sequence[Any],
+) -> set[int]:
+    """Which of these delta rows the target already owns typed evidence for."""
+    ids = sorted({int(row.id) for row in rows})
+    if not ids:
+        return set()
+    return {
+        int(value)
+        for (value,) in db.query(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        ).filter(
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+            == int(target_generation_id),
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(ids),
+        )
+    }
+
+
+def _untyped_buy_owned_receipt_ids(
+    rows: Sequence[Any],
+    *,
+    current_owners: Sequence[models.ReservationEntry],
     planning_pool_by_warehouse: Mapping[str, str],
+    typed_sle_ids: set[int],
 ) -> tuple[int, ...]:
-    """Supplier receipts owed to a current BUY order that nothing has typed.
+    """Delta receipts owed to a current BUY order that nothing has typed.
+
+    Bounded to this refresh's own delta, like the MAKE gate beside it.  CANON
+    "Объём вычислений штатного физического refresh" makes the delta the unit
+    of work, and scanning the whole visible prefix also judged history the
+    refresh is not responsible for: a receipt that predates its item's BUY
+    owner was covered at freeze time (``covered_from_stock_at_freeze``), not
+    by replenishment, and would have blocked every future refresh for ever.
+    The historical count stays visible - the migration postflight reports it
+    as ``pre_deploy_backlog`` - but it is information, not a verdict.
 
     Uses the same resolver as the delta itself, so the gate cannot disagree
     with the publisher about which receipts belong to a BUY scope.
     """
-    candidates = untyped_supplier_receipt_rows_in_contour(
-        db,
-        ledger_generation_id=int(target_generation_id),
-        planning_pool_by_warehouse=planning_pool_by_warehouse,
-    )
-    if not candidates:
-        return ()
-    owners = tuple(db.query(models.ReservationEntry).filter(
-        models.ReservationEntry.item_id.in_(
-            sorted({int(row.item_id) for row in candidates})
-        ),
-        models.ReservationEntry.realization_mode == "buy",
-        models.ReservationEntry.lifecycle_status == "active",
-        models.ReservationEntry.owner_kind == "current",
-        models.ReservationEntry.is_current.is_(True),
-    ).all())
-    if not owners:
-        return ()
     return tuple(
-        int(row.id) for row in candidates
-        if _buy_scope_for_receipt(
+        int(row.id) for row in rows
+        if int(row.id) not in typed_sle_ids
+        and _buy_scope_for_receipt(
             row,
             planning_pool_by_warehouse=planning_pool_by_warehouse,
-            current_owners=owners,
+            current_owners=current_owners,
         ) is not None
     )
 
@@ -1272,9 +1294,10 @@ def _publish_forward_physical_refresh_current(
     # is the second half of the same gate - the first half catches evidence
     # the system lost, this one catches evidence it never wrote.
     unallocatable = _untyped_buy_owned_receipt_ids(
-        db,
-        target_generation_id=int(target.id),
+        rows,
+        current_owners=current_owners,
         planning_pool_by_warehouse=planning_pool_by_warehouse,
+        typed_sle_ids=_typed_supplier_sle_ids(db, int(target.id), rows),
     )
     if unallocatable:
         raise ForwardPhysicalRefreshUnavailable(
