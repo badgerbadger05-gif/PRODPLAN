@@ -42,6 +42,29 @@ DistributionScope = tuple[int, str, str, str, str]
 #: Canonical audit reason for a clear-out the caller explicitly acknowledged.
 CONFIRMED_EMPTY_REASON = "confirmed_empty_scope"
 
+#: The source stream of a distribution scope is a property of the scope, not
+#: of whoever is writing it (canon R4/R5: one canonical writer per scope).
+#: Every entry path - the full accept, the one-off bootstrap and both bounded
+#: replays - names the same stream, so entering a scope through a different
+#: door is not a stream change.
+SUPPLIER_RECEIPT_SOURCE_KEY = "supplier-receipts"
+ASSEMBLY_OUTPUT_SOURCE_KEY = "assembly-outputs"
+
+#: Keys earlier entry paths wrote for these same two streams.  They are
+#: accepted once and rewritten in place on the next write, which is why no
+#: data migration is needed; they are not a fallback for a foreign stream.
+SOURCE_KEY_ALIASES = {
+    "accepted-physical-receipts": SUPPLIER_RECEIPT_SOURCE_KEY,
+    "physical-refresh:buy": SUPPLIER_RECEIPT_SOURCE_KEY,
+    "physical-refresh:make": ASSEMBLY_OUTPUT_SOURCE_KEY,
+}
+
+
+def canonical_source_key(value: object) -> str:
+    """Resolve a source key to the stream it names."""
+    text = str(value or "").strip()
+    return SOURCE_KEY_ALIASES.get(text, text)
+
 
 class CurrentReplenishmentError(ValueError):
     """A current application is unavailable and must fail closed."""
@@ -565,6 +588,7 @@ def apply_current_replenishment(
         )
     if not _text(source_key):
         raise CurrentReplenishmentError("source_key is required")
+    canonical_key = canonical_source_key(source_key)
     try:
         revision = int(source_revision)
     except (TypeError, ValueError) as exc:
@@ -594,10 +618,15 @@ def apply_current_replenishment(
     if state is not None:
         if _text(state.writer_key) != WRITER_KEY:
             raise CurrentReplenishmentError("single current writer is current_replenishment")
-        if _text(state.source_key) != _text(source_key):
+        if canonical_source_key(state.source_key) != canonical_key:
             raise CurrentReplenishmentError(
                 "source stream changed for canonical distribution scope"
             )
+        # A row written under a documented legacy spelling is the same stream;
+        # rewrite it in place so the alias disappears on first write instead
+        # of needing a data migration.  Idempotent.
+        if _text(state.source_key) != canonical_key:
+            state.source_key = canonical_key
         previous_revision = int(state.source_revision)
         if revision < previous_revision:
             raise CurrentReplenishmentError(
@@ -615,7 +644,7 @@ def apply_current_replenishment(
                 db.flush()
             return CurrentReplenishmentResult(
                 generation_id=int(generation.id),
-                source_key=_text(source_key),
+                source_key=canonical_key,
                 source_revision=revision,
                 inserted=0,
                 updated=0,
@@ -627,7 +656,7 @@ def apply_current_replenishment(
     else:
         state = models.CurrentReplenishmentState(
             scope_key=canonical_scope_key,
-            source_key=_text(source_key),
+            source_key=canonical_key,
             ledger_generation_id=int(generation.id),
             source_revision=revision,
             scope_checksum=input_checksum,
@@ -955,7 +984,7 @@ def apply_current_replenishment(
                 organization_ref=_text(entry.organization_ref),
                 planning_stock_pool=_text(reserve.planning_stock_pool) or "default",
                 idempotency_key=(
-                    f"r4:{source_key}:{revision}:{insertion.fact_id}:{insertion.reserve_id}"
+                    f"r4:{canonical_key}:{revision}:{insertion.fact_id}:{insertion.reserve_id}"
                 ),
                 allocation_role="replenishment_receipt",
                 is_current=True,
@@ -1022,7 +1051,7 @@ def apply_current_replenishment(
 
     return CurrentReplenishmentResult(
         generation_id=int(generation.id),
-        source_key=_text(source_key),
+        source_key=canonical_key,
         source_revision=revision,
         inserted=len(plan.insertions),
         updated=len(plan.updates),
@@ -1475,7 +1504,7 @@ def apply_current_replenishment_for_accepted_generation(
             apply_current_receipt_replay(
                 db,
                 generation_id=int(generation_id),
-                source_key="accepted-physical-receipts",
+                source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
                 source_revision=revision,
                 receipt_facts=facts,
                 reserves=reserve_rows,
@@ -1765,7 +1794,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
             apply_current_replenishment(
                 db,
                 generation_id=int(target.id),
-                source_key="physical-refresh:make",
+                source_key=ASSEMBLY_OUTPUT_SOURCE_KEY,
                 source_revision=revision,
                 facts=tuple(facts_by_scope[scope]),
                 reserves=reserves_by_scope[scope],
@@ -2504,7 +2533,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
             apply_current_receipt_replay(
                 db,
                 generation_id=int(target.id),
-                source_key="physical-refresh:buy",
+                source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
                 source_revision=revision,
                 receipt_facts=full_facts,
                 reserves=reserves_by_scope[scope],

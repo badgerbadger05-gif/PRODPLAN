@@ -1073,3 +1073,234 @@ def test_a_generation_that_carried_its_typed_evidence_is_accepted(db_session):
     assert read_current_replenishment(
         db_session, generation_id=int(successor.id), item_id=item_id
     )
+
+
+def _state_rows(db):
+    return db.query(models.CurrentReplenishmentState).all()
+
+
+def _key(row):
+    return str(row.source_key or "").strip()
+
+
+def test_bootstrapped_buy_scope_accepts_the_next_bounded_replay(db_session):
+    """Entering a scope through another door is not a stream change.
+
+    The one-off bootstrap and the full accept wrote
+    ``accepted-physical-receipts`` while the bounded BUY replay wrote
+    ``physical-refresh:buy``, so the first bounded refresh after the
+    migration was rejected for all 547 scopes with "source stream changed for
+    canonical distribution scope".  Canon R4/R5: the stream belongs to the
+    distribution scope, not to the caller.
+    """
+    from app.services.item_ledger.current_replenishment import (
+        SUPPLIER_RECEIPT_SOURCE_KEY,
+    )
+
+    generation_id, item_id, reservations, facts = _world(db_session, prefix="stream")
+    reserves = _reserves(reservations)
+    # What the bootstrap writes.
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="accepted-physical-receipts",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    # A database migrated before this fix carries the old spelling on the row.
+    for row in _state_rows(db_session):
+        row.source_key = "accepted-physical-receipts"
+    db_session.commit()
+    assert {_key(row) for row in _state_rows(db_session)} == {
+        "accepted-physical-receipts"
+    }
+
+    # What the next bounded BUY refresh writes for the same scope.
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+        source_revision=2,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+
+    assert result.source_key == SUPPLIER_RECEIPT_SOURCE_KEY
+    states = _state_rows(db_session)
+    assert len(states) == 1
+    # The legacy spelling is rewritten in place; no data migration needed.
+    assert _key(states[0]) == SUPPLIER_RECEIPT_SOURCE_KEY
+
+
+def test_bootstrapped_make_scope_accepts_the_next_bounded_replay(db_session):
+    """Same for the assembly-output stream."""
+    from app.services.item_ledger.current_replenishment import (
+        ASSEMBLY_OUTPUT_SOURCE_KEY,
+    )
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="make")
+    for row in reservations:
+        row.realization_mode = "make"
+        row.current_identity = (
+            f"reservation:req:{int(row.requirement_id)}:mode:make"
+        )
+    db_session.flush()
+    make_facts = tuple(
+        Fact(**{**fact.__dict__, "mode": "make"}) for fact in facts
+    )
+    make_reserves = tuple(
+        Reserve(**{**reserve.__dict__, "mode": "make"})
+        for reserve in _reserves(reservations)
+    )
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical-refresh:make",
+        source_revision=1,
+        facts=make_facts,
+        reserves=make_reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    for row in _state_rows(db_session):
+        row.source_key = "physical-refresh:make"
+    db_session.commit()
+
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key=ASSEMBLY_OUTPUT_SOURCE_KEY,
+        source_revision=2,
+        facts=make_facts,
+        reserves=make_reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+
+    assert result.source_key == ASSEMBLY_OUTPUT_SOURCE_KEY
+    states = _state_rows(db_session)
+    assert len(states) == 1
+    assert _key(states[0]) == ASSEMBLY_OUTPUT_SOURCE_KEY
+
+
+def test_a_genuinely_foreign_source_stream_still_fails_closed(db_session):
+    """The guard still does its job for a stream nobody documented."""
+    from app.services.item_ledger.current_replenishment import (
+        SUPPLIER_RECEIPT_SOURCE_KEY,
+    )
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="foreign")
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+
+    with pytest.raises(CurrentReplenishmentError, match="source stream changed"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=generation_id,
+            source_key="some-other-importer",
+            source_revision=2,
+            facts=facts,
+            reserves=reserves,
+            complete_scope=True,
+        )
+
+
+def test_bootstrap_revision_cannot_collide_with_the_next_bounded_refresh(db_session):
+    """The drift guard must not fire on the first bounded refresh.
+
+    The bootstrap stamps the pointer's ``physical_import_batch_id``; a
+    bounded refresh stamps its own target's, and a fork always allocates a
+    new batch, so the bounded revision is strictly greater and the
+    equal-revision drift check is never reached.
+    """
+    from app.services.item_ledger.current_replenishment import (
+        SUPPLIER_RECEIPT_SOURCE_KEY,
+    )
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="revision")
+    reserves = _reserves(reservations)
+    pointer_batch = int(
+        db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id
+    )
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="accepted-physical-receipts",
+        source_revision=pointer_batch,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+    for row in _state_rows(db_session):
+        row.source_key = "accepted-physical-receipts"
+    db_session.commit()
+
+    # A later batch id, with a different payload: accepted as a new revision,
+    # never judged as drift.
+    changed = list(facts)
+    changed[0] = Fact(**{**facts[0].__dict__, "qty": Decimal("5")})
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+        source_revision=pointer_batch + 1,
+        facts=tuple(changed),
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+
+    assert result.source_revision == pointer_batch + 1
+    assert result.idempotent is False
+
+
+def test_the_two_entry_paths_are_one_stream_for_the_same_scope(db_session):
+    """The exact production failure, written with the literal keys.
+
+    This is what the stand hit on its first bounded refresh after the
+    bootstrap: 547 scopes rejected with "source stream changed for canonical
+    distribution scope" because the bootstrap had written
+    ``accepted-physical-receipts`` and the bounded BUY replay announced
+    ``physical-refresh:buy`` for the very same distribution scope.
+    """
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="literal")
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="accepted-physical-receipts",
+        source_revision=1,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+
+    result = apply_current_replenishment(
+        db_session,
+        generation_id=generation_id,
+        source_key="physical-refresh:buy",
+        source_revision=2,
+        facts=facts,
+        reserves=reserves,
+        complete_scope=True,
+    )
+    db_session.commit()
+
+    assert result.source_key == "supplier-receipts"
+    assert len(_state_rows(db_session)) == 1
