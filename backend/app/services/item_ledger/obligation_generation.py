@@ -20,6 +20,10 @@ from sqlalchemy.orm import Session
 from app import models
 
 from .generation_lifecycle import materialize_generation_stock_bins
+from .reservation import (
+    reservation_event_identity,
+    reservation_event_origin_kind,
+)
 
 
 ALGORITHM_VERSION = "ledger-obligation-generation/1"
@@ -566,6 +570,25 @@ def carry_forward_retained_reservations(
                 idempotency_key=(
                     f"carry-open:g{int(target_generation_id)}:source-r{int(source.id)}"
                 ),
+                # A carried-forward obligation is staging like any other, and
+                # the current-owner publisher refuses an event without a stable
+                # identity.  Use the one canonical builder - requirement and
+                # mode are identical on source and target - so a retained run
+                # can be promoted instead of blocking the whole refresh.
+                event_identity=reservation_event_identity(
+                    source,
+                    event_kind="open",
+                    reserved_delta=source.reserved_qty,
+                    realized_delta=Decimal("0"),
+                    sle_id=None,
+                    fact_ref="",
+                    fact_line_ref="",
+                    match_rule="",
+                ),
+                origin_kind=reservation_event_origin_kind(
+                    event_kind="open", realized_delta=Decimal("0"), sle_id=None,
+                ),
+                is_current=False,
                 event_at=source.opened_at or datetime.now(timezone.utc),
             ))
     db.flush()

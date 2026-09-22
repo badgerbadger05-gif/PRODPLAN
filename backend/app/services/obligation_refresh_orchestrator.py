@@ -67,6 +67,9 @@ from app.services.item_ledger.drum_schedule_persistence import (
 from app.services.item_ledger.replenishment_work_item_builder import (
     materialize_replenishment_work_items,
 )
+from app.services.item_ledger.reservation_current import (
+    publish_current_reservations,
+)
 from app.services.item_ledger.reservation_consumption_persistence import (
     ALGORITHM_VERSION as RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
     materialize_reservation_consumption_allocations,
@@ -646,6 +649,28 @@ def run_obligation_refresh(
     )
     drum_schedule = materialize_drum_schedule(db, target_id)
     shelf_projection = materialize_shelf_projections(db, target_id)
+    # Promote the stable current reservation owners here, in the same place the
+    # accept path puts it (``generation_lifecycle.accept_generation_build``):
+    # after the work items, before every compact payload.
+    #
+    # Until now no obligation refresh promoted at all.  The refresh published
+    # its journals from BUILDING staging and left the previous generation's
+    # rows as the ``is_current`` owners, so after an MRP recalculation or a
+    # specification rebase every consumer that reads ``owner_kind='current'``
+    # - bounded physical publish, compact purchase/production payloads, shelf
+    # scope, current replenishment - was looking at owners the refresh had
+    # already superseded.
+    #
+    # The publisher rebinds ``replenishment_work_item``,
+    # ``reservation_consumption_allocation``, ``current_replenishment_audit``
+    # and ``purchase_export_obligation_allocation`` from the staging ids onto
+    # the promoted owners, and retires the owners whose identity this refresh
+    # dropped (canon R11).  Doing it before the payload builders is what makes
+    # the journals below reference owners that still exist after acceptance;
+    # the caller-owned transaction keeps it atomic with the pointer switch.
+    reservation_current_publish = publish_current_reservations(
+        db, generation_id=target_id
+    )
     mrp_payloads = {
         str(run_id): build_mrp_result_current_payload(db, int(run_id))
         for run_id in sorted({int(value) for value in (*candidate_ids, *retained_run_ids)})
@@ -702,6 +727,7 @@ def run_obligation_refresh(
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
         "reservation_consumption_summary": _json_value(reservation_consumption),
+        "reservation_current_publish": _json_value(reservation_current_publish),
         "assembly_output_summary": _json_value(assembly_outputs),
         "drum_schedule_summary": _json_value(drum_schedule),
         "shelf_projection_summary": _json_value(shelf_projection),

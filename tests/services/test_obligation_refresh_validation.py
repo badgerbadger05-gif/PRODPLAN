@@ -82,6 +82,10 @@ def _retained_reservation(db, generation, run, requirement, item, *, cycle_id: s
         replenishment_required_qty=Decimal("7"),
         replenishment_received_qty=Decimal("0"),
         lifecycle_status="active",
+        # A candidate only reaches validation after its owners were published.
+        owner_kind="current",
+        is_current=True,
+        current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
     )
     db.add(entry)
     db.flush()

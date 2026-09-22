@@ -994,3 +994,203 @@ def test_stale_parent_is_rejected_before_published_retry(db_session):
     db_session.flush()
     with pytest.raises(workflow.ObligationRefreshOrchestratorError, match="published retry requires target"):
         _run(db_session, accepted, "orch-stale", add=[plan.id])
+
+
+def _current_owner_for_parent_run(db, accepted, plan, item, parent):
+    """The stable current owner a refresh of this plan has to supersede."""
+    requirement = models.MrpRequirement(
+        run_id=int(parent.run_id),
+        item_id=int(item.item_id),
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+        planning_stock_pool="selected",
+        characteristic_ref="",
+        organization_ref="",
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    owner = models.ReservationEntry(
+        ledger_generation_id=int(accepted.id),
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="selected",
+        run_id=int(parent.run_id),
+        freeze_version=1,
+        requirement_id=int(requirement.id),
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("5"),
+        replenishment_required_qty=Decimal("5"),
+        lifecycle_status="active",
+        owner_kind="current",
+        is_current=True,
+        current_identity=f"reservation:req:{int(requirement.id)}:mode:make",
+    )
+    db.add(owner)
+    db.flush()
+    return requirement, owner
+
+
+def test_refresh_promotes_current_reservation_owners_and_retires_the_replaced_ones(
+    db_session,
+):
+    """An obligation refresh must hand over the stable current owners.
+
+    Until this landed no refresh promoted at all: the candidate stayed
+    ``owner_kind='building'`` and the *previous* generation's rows remained
+    ``is_current``, so every consumer that reads the current owner served an
+    obligation the refresh had already superseded.
+    """
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    _old_requirement, old_owner = _current_owner_for_parent_run(
+        db_session, accepted, plan, item, parent
+    )
+    # An existing assignment basis on the owner being superseded: the refresh
+    # may hand it over or leave it as history, but it may not destroy it.
+    basis_fact = models.StockLedgerEntry(
+        ingest_batch_id=int(accepted.physical_import_batch_id),
+        source_content_hash="item10-basis".ljust(64, "0"),
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-OUT",
+        qty=Decimal("1"),
+        posting_at=cutoff - timedelta(hours=1),
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Doc",
+        recorder_ref="item10-basis",
+        line_no="1",
+        ingest_source="seed",
+    )
+    db_session.add(basis_fact)
+    db_session.flush()
+    # The compact current fold has to agree with the prefix this fact joins.
+    db_session.add(models.StockBin(
+        ledger_generation_id=int(accepted.id),
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-OUT",
+        on_hand=Decimal("1"),
+        last_entry_id=int(basis_fact.id),
+        is_current=True,
+    ))
+    db_session.flush()
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=int(accepted.id),
+        reservation_id=int(old_owner.id),
+        sle_id=int(basis_fact.id),
+        requirement_id=int(old_owner.requirement_id),
+        allocated_qty=Decimal("1"),
+        match_rule="fifo",
+        fact_ref="seed",
+        fact_line_ref="1",
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="selected",
+        idempotency_key="item10-seed-allocation",
+        allocation_role="material_consumption",
+        is_current=True,
+        event_at=cutoff,
+    ))
+    db_session.commit()
+    allocations_before = db_session.query(
+        models.ReservationConsumptionAllocation.id
+    ).filter_by(is_current=True).count()
+
+    result = _run(db_session, accepted, "orch-promote-owners", replace=[plan.id])
+    assert result.published is True
+
+    candidate = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=parent.run_id,
+    ).one()
+    promoted = db_session.query(models.ReservationEntry).filter_by(
+        run_id=int(candidate.run_id),
+    ).all()
+    assert promoted, "the refreshed run published no reservations at all"
+    assert all(str(row.owner_kind) == "current" for row in promoted)
+    assert all(bool(row.is_current) for row in promoted)
+    assert all(
+        str(row.current_identity)
+        == f"reservation:req:{int(row.requirement_id)}:mode:{row.realization_mode}"
+        for row in promoted
+    )
+    # No staging owner survives acceptance.
+    assert db_session.query(models.ReservationEntry).filter_by(
+        owner_kind="building",
+    ).count() == 0
+
+    # The owner this refresh superseded is retired, not left current beside it.
+    db_session.refresh(old_owner)
+    assert bool(old_owner.is_current) is False
+    assert str(old_owner.lifecycle_status) == "closed"
+
+    # Work items point at the promoted owners, not at staging ids.
+    work_items = db_session.query(models.ReplenishmentWorkItem).filter_by(
+        ledger_generation_id=int(result.target_generation_id),
+    ).all()
+    assert work_items
+    current_owner_ids = {
+        int(row.id)
+        for row in db_session.query(models.ReservationEntry).filter_by(is_current=True)
+    }
+    assert {int(row.reservation_id) for row in work_items} <= current_owner_ids
+
+    # Every published BUY row resolves to a current owner.
+    purchase_rows = db_session.query(models.CurrentExecutionRow).filter_by(
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    ).all()
+    buy_requirement_ids = {
+        int(value)
+        for row in purchase_rows
+        for value in (dict(row.payload or {}).get("requirement_ids") or [])
+        if value not in (None, "")
+    }
+    if buy_requirement_ids:
+        owned = {
+            int(row.requirement_id)
+            for row in db_session.query(models.ReservationEntry).filter(
+                models.ReservationEntry.requirement_id.in_(sorted(buy_requirement_ids)),
+                models.ReservationEntry.is_current.is_(True),
+                models.ReservationEntry.owner_kind == "current",
+            )
+        }
+        assert buy_requirement_ids <= owned
+
+    # R4: the refresh hands the assignment basis over or keeps it as history;
+    # it never reduces the set of current allocations.
+    allocations_after = db_session.query(
+        models.ReservationConsumptionAllocation.id
+    ).filter_by(is_current=True).count()
+    assert allocations_after >= allocations_before
+
+
+def test_refresh_that_skips_the_promotion_is_rejected_before_acceptance(
+    db_session, monkeypatch
+):
+    """The gate: a candidate with unpublished staging owners cannot become truth."""
+    accepted, plan, _line, _item, _parent, _cutoff = _world(db_session, qty=5)
+
+    # ``raising=False`` on purpose: the point of the gate is that a build which
+    # never promoted cannot be accepted, however it came to skip it.
+    monkeypatch.setattr(
+        workflow,
+        "publish_current_reservations",
+        lambda db, *, generation_id: {},
+        raising=False,
+    )
+
+    with pytest.raises(
+        workflow.ObligationRefreshOrchestratorError,
+        match="publish_current_reservations must run",
+    ):
+        _run(db_session, accepted, "orch-skip-promotion", replace=[plan.id])

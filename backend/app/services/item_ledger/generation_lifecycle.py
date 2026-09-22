@@ -933,6 +933,36 @@ def _supplier_provenance_checkpoint(
     return provenance, supplier_candidate_by_id, excluded_ids, supplier_status_counts
 
 
+def _reservation_owner_promotion_checkpoint(
+    db: Session,
+    generation: models.LedgerGeneration,
+) -> int:
+    """Prove the refresh published its stable current reservation owners.
+
+    An obligation refresh that skipped ``publish_current_reservations`` still
+    produced a complete, self-consistent candidate - and was therefore
+    accepted - while leaving the *previous* generation's rows as the
+    ``is_current`` owners.  Every consumer that reads ``owner_kind='current'``
+    then served obligations the refresh had already superseded.  Nothing in
+    the build proved the promotion had happened, so this is that proof: no
+    staging owner may survive into acceptance.
+    """
+    staged = db.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.ledger_generation_id == int(generation.id),
+        models.ReservationEntry.owner_kind == "building",
+    ).count()
+    if staged:
+        raise GenerationValidationError(
+            f"{staged} BUILDING reservation owners were never published; "
+            "publish_current_reservations must run before acceptance"
+        )
+    return int(db.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.ledger_generation_id == int(generation.id),
+        models.ReservationEntry.is_current.is_(True),
+        models.ReservationEntry.owner_kind == "current",
+    ).count())
+
+
 def validate_obligation_refresh_build(
     db: Session,
     generation_id: int,
@@ -989,6 +1019,10 @@ def validate_obligation_refresh_build(
     provenance, _candidates, excluded_ids, status_counts = (
         _supplier_provenance_checkpoint(db, generation, require_full_coverage=False)
     )
+    # Last: everything above proves the candidate itself, and a candidate that
+    # is structurally broken should say so rather than blame the publication
+    # step.  This one proves the publication actually happened.
+    promoted_owner_count = _reservation_owner_promotion_checkpoint(db, generation)
     return {
         "ledger_generation_id": int(generation.id),
         "physical_facts": len(visible),
@@ -996,6 +1030,7 @@ def validate_obligation_refresh_build(
         "mrp_requirements": requirement_count,
         "reservation_entries": len(entries),
         "reservation_events": len(events),
+        "promoted_current_reservation_owners": promoted_owner_count,
         "replenishment_work_items": work_item_count,
         "realized_physical_facts": realized_fact_count,
         "carried_forward_generations": sorted(
