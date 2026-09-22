@@ -185,6 +185,19 @@ def _normalise_bounded_buy_manifest(
     return result
 
 
+def distribution_scope_for_fact(
+    item_id: int,
+    characteristic_ref: str,
+    organization_ref: str,
+) -> tuple[int, str, str, str]:
+    """The pool part of a fact's distribution scope, canonically collapsed."""
+    from app.services.mrp_freeze import distribution_scope_for
+
+    return distribution_scope_for(
+        int(item_id), characteristic_ref, organization_ref, mode="",
+    )[:4]
+
+
 def _distribution_scope(value: Fact | Reserve) -> tuple[int, str, str, str, str]:
     return (
         int(value.item_id),
@@ -1497,9 +1510,10 @@ def apply_current_replenishment_for_bounded_make_scopes(
             ) from exc
         if len(values) != 5 or scope[0] <= 0:
             raise CurrentReplenishmentError("bounded make affected scope is malformed")
-        if scope[4] != "make":
+        if scope[4] not in {"make", "rework"}:
             raise CurrentReplenishmentError(
-                "bounded make publication supports only realization_mode=make"
+                "bounded make publication supports only realization_mode "
+                "make or rework"
             )
         if scope in seen_scopes:
             raise CurrentReplenishmentError("bounded make affected scopes contain duplicates")
@@ -1513,27 +1527,21 @@ def apply_current_replenishment_for_bounded_make_scopes(
     # therefore resolve to exactly one current pool; multiple pools would make
     # attribution ambiguous and must fail closed rather than inventing one.
     #
-    # The key is item + characteristic only.  A scope's organization is the
-    # planning organization of its MAKE owner, while the physical row carries
-    # the 1C organization that posted the document; the publisher that built
-    # these scopes already refused to equate the two
-    # (``physical_refresh_current_publish._make_scopes_for_assembly_row``), so
-    # matching on it here would select no rows at all and silently realize
-    # nothing.
-    scope_by_physical_key: dict[tuple[int, str], list[DistributionScope]] = {}
+    # Facts are keyed through the canonical collapse, the same one the
+    # reservations were frozen with (``mrp_freeze.pool_key_for``).  Matching
+    # raw columns was a second rule: the owner carries the collapsed
+    # ``('', '', 'default')`` while the row carries its real characteristic
+    # and the 1C organization, so the predicate selected nothing at all.
+    scope_by_physical_key: dict[tuple[int, str, str, str], list[DistributionScope]] = {}
     for scope in scopes:
-        scope_by_physical_key.setdefault(scope[:2], []).append(scope)
+        scope_by_physical_key.setdefault(tuple(scope[:4]), []).append(scope)
 
     from .physical_visibility import visible_sle_query
     from .historical_replay_persistence import _identity_for_sle
 
-    physical_scope_predicate = or_(*(
-        and_(
-            models.StockLedgerEntry.item_id == scope[0],
-            models.StockLedgerEntry.characteristic_ref == scope[1],
-        )
-        for scope in scopes
-    ))
+    physical_scope_predicate = models.StockLedgerEntry.item_id.in_(
+        sorted({int(scope[0]) for scope in scopes})
+    )
     rows = (
         visible_sle_query(
             db,
@@ -1558,9 +1566,10 @@ def apply_current_replenishment_for_bounded_make_scopes(
             raise CurrentReplenishmentError(
                 f"assembly_in fact {int(row.id)} has non-positive quantity"
             )
-        physical_key = (
+        physical_key = distribution_scope_for_fact(
             int(row.item_id),
             _text(row.characteristic_ref),
+            _text(row.organization_ref),
         )
         candidates = scope_by_physical_key.get(physical_key, [])
         if not candidates:
@@ -1601,21 +1610,32 @@ def apply_current_replenishment_for_bounded_make_scopes(
     # transaction rollback remains the caller's responsibility.
     reserves_by_scope: dict[DistributionScope, tuple[Reserve, ...]] = {}
     for scope in scopes:
-        owners = (
-            db.query(models.ReservationEntry)
+        # Owners are selected by the canonical pool key, not by raw columns,
+        # and in the scope's own mode.  Canon §18: an accepted ``assembly_in``
+        # closes a ``rework`` reserve as well as a ``make`` one, so the scope
+        # carries the owner's real mode and this query honours it instead of
+        # hard-coding ``make`` and losing every rework reserve.
+        from app.services.mrp_freeze import distribution_scope_for
+
+        owners = [
+            owner
+            for owner in db.query(models.ReservationEntry)
             .filter(
                 models.ReservationEntry.is_current.is_(True),
                 models.ReservationEntry.lifecycle_status == "active",
                 models.ReservationEntry.current_identity != "",
                 models.ReservationEntry.item_id == scope[0],
-                models.ReservationEntry.characteristic_ref == scope[1],
-                models.ReservationEntry.organization_ref == scope[2],
-                models.ReservationEntry.planning_stock_pool == scope[3],
-                models.ReservationEntry.realization_mode == "make",
+                models.ReservationEntry.realization_mode == scope[4],
             )
             .order_by(models.ReservationEntry.id.asc())
             .all()
-        )
+            if distribution_scope_for(
+                int(owner.item_id),
+                _text(owner.characteristic_ref),
+                _text(owner.organization_ref),
+                mode=_text(owner.realization_mode),
+            ) == tuple(scope)
+        ]
         if not owners:
             raise CurrentReplenishmentError(
                 f"bounded make scope has no stable current reservation owners: {_scope_key(scope)}"
@@ -1663,9 +1683,13 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 requirement_id=int(row.requirement_id),
                 bucket_date=None,
                 bucket_id=None,
-                characteristic_ref=_text(row.characteristic_ref),
-                organization_ref=_text(row.organization_ref),
-                planning_stock_pool=_text(row.planning_stock_pool),
+                # Attribution keys come from the scope, the canonical pool key
+                # both sides were resolved through; taking them from the raw
+                # owner columns would put the reserve and the fact in two
+                # different pools for the same obligation.
+                characteristic_ref=scope[1],
+                organization_ref=scope[2],
+                planning_stock_pool=scope[3],
                 order_refs=order_refs.get(int(row.requirement_id), ()),
             )
             for row in owners

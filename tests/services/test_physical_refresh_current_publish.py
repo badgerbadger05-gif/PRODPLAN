@@ -302,7 +302,16 @@ def test_unmatched_r4_fact_uses_explicit_pool_mapping(db_session, monkeypatch):
     assert result.affected_scopes == ()
 
 
-def test_unmatched_supplier_receipt_uses_explicit_pool_mapping(db_session, monkeypatch):
+def test_supplier_receipt_scope_comes_from_the_canonical_pool_key(db_session, monkeypatch):
+    """The owner's stored pool column does not decide the scope.
+
+    Every frozen reservation is written through ``mrp_freeze.pool_key_for``,
+    which collapses characteristic/organization/pool to one canonical key, so
+    a receipt resolves to that key no matter what an individual owner row
+    happens to carry.  The warehouse contour still decides whether the
+    receipt is planning-relevant at all - that is
+    ``test_unmapped_supplier_receipt_is_stock_only``.
+    """
     parent, target = _generations(db_session)
     item = models.Item(item_code="CP-10", item_name="Current publish item")
     db_session.add(item)
@@ -339,16 +348,32 @@ def test_unmatched_supplier_receipt_uses_explicit_pool_mapping(db_session, monke
     supplier_calls = []
     monkeypatch.setattr(
         publisher, "build_bounded_supplier_receipt_manifest",
-        lambda *a, **k: supplier_calls.append("manifest"),
+        lambda *a, **kw: supplier_calls.append(tuple(kw["affected_scopes"]))
+        or publisher.BoundedBuyReceiptDeltaManifest(new_sle_ids=(row.id,)),
     )
+    monkeypatch.setattr(
+        publisher, "apply_current_replenishment_for_bounded_buy_scopes",
+        lambda *a, **kw: SimpleNamespace(replayed_rows=1),
+    )
+    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=target.id, stock_ledger_entry_id=row.id,
+        receipt_doc_type="Document_ПриходнаяНакладная", receipt_doc_ref="cp10",
+        receipt_doc_line_no="1", supplier_order_ref=None,
+        supplier_order_line_no=None, operation_kind="supplier_receipt",
+        operation_key="test", operation_name="bounded typed supplier evidence",
+        evidence_hash="cp10".ljust(64, "0"),
+        evidence_payload={"signed_qty": "1", "item_id": int(item.item_id)},
+        match_rule="bounded-typed", match_status="unmatched", ambiguity_count=0,
+        reason="typed evidence has no supplier order line",
+    ))
+    db_session.flush()
     result = publisher.publish_forward_physical_refresh_current(
         db_session, target_generation_id=target.id, parent_generation_id=parent.id,
         delta_manifest={"rows": (row,), "supersessions": ()}, odata_client=None,
         source_revision=1, planning_pool_by_warehouse={"wh": "pool"},
     )
-    assert result.affected_scopes == ()
-    assert supplier_calls == []
-    assert "supplier_manifest" not in phases
+    assert result.affected_scopes == (f"{item.item_id}:::default:buy",)
+    assert supplier_calls == [((item.item_id, "", "", "default", "buy"),)]
 
 
 def test_mapped_supplier_receipt_uses_exact_current_buy_owner(db_session, monkeypatch):
@@ -418,9 +443,9 @@ def test_mapped_supplier_receipt_uses_exact_current_buy_owner(db_session, monkey
         delta_manifest={"rows": (row,), "supersessions": ()}, odata_client=None,
         source_revision=1, planning_pool_by_warehouse={"wh": "pool"},
     )
-    expected_scope = (item.item_id, "", "org", "pool", "buy")
+    expected_scope = (item.item_id, "", "", "default", "buy")
     assert buy_scope_calls == [("manifest", (expected_scope,)), ("apply", (expected_scope,))]
-    assert result.affected_scopes == (f"{item.item_id}::org:pool:buy",)
+    assert result.affected_scopes == (f"{item.item_id}:::default:buy",)
 
 
 def test_assembly_without_owner_or_pool_is_stock_output_only(db_session, monkeypatch):
@@ -494,8 +519,8 @@ def test_assembly_uses_current_owner_pool_when_warehouse_is_unmapped(db_session,
         delta_manifest={"rows": (row,), "supersessions": ()}, odata_client=None,
         source_revision=1, planning_pool_by_warehouse={},
     )
-    assert make_scopes == [((item.item_id, "", "org", "owner-pool", "make"),)]
-    assert result.affected_scopes == (f"{item.item_id}::org:owner-pool:make",)
+    assert make_scopes == [((item.item_id, "", "", "default", "make"),)]
+    assert result.affected_scopes == (f"{item.item_id}:::default:make",)
 
 
 def test_unmapped_supplier_receipt_is_stock_only(db_session, monkeypatch):

@@ -157,6 +157,36 @@ def pool_key_for(
     return PoolKey(int(item_id), EMPTY_REF, EMPTY_REF, DEFAULT_STOCK_POOL)
 
 
+def distribution_scope_for(
+    item_id: int,
+    characteristic_ref: Optional[str] = None,
+    organization_ref: Optional[str] = None,
+    *,
+    mode: str,
+) -> tuple[int, str, str, str, str]:
+    """The 5-key distribution scope of anything, through the one pool key.
+
+    Reservations write their pool columns through :func:`pool_key_for`, so a
+    physical fact has to be keyed the same way before it can be matched to an
+    owner.  Doing it anywhere else produced a second rule and the two
+    disagreed on live data: every frozen owner carries the collapsed
+    ``('', '', 'default')`` while a physical row carries the 1C organization
+    and the real characteristic, so an exact column comparison never held and
+    the bounded refresh silently resolved no scope at all.
+
+    Widening to real multi-pool support stays confined to ``pool_key_for``;
+    this function adds only the realization mode.
+    """
+    key = pool_key_for(item_id, characteristic_ref, organization_ref)
+    return (
+        int(key.item_id),
+        key.characteristic_ref,
+        key.organization_ref,
+        key.planning_stock_pool,
+        str(mode or "").strip(),
+    )
+
+
 # ---------------------------------------------------------------------------
 #  — shared structures
 # ---------------------------------------------------------------------------

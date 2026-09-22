@@ -963,10 +963,7 @@ def test_assembly_output_outside_every_make_scope_is_refused(db_session, monkeyp
     parent, target, _parent_batch, target_batch = _generations(db_session)
     item = _item(db_session, "BOUNDED-MAKE-UNSCOPED")
     owner, _requirement = _make_owner(db_session, parent, item, required="10")
-    # An owner with no planning pool cannot form a scope, so the fact would be
-    # published without ever being offered to the writer.
     owner.organization_ref = ""
-    owner.planning_stock_pool = ""
     db_session.flush()
     output = _sle(
         db_session, target_batch, item, qty="4", at=FORWARD_AT, kind="assembly_in",
@@ -976,6 +973,10 @@ def test_assembly_output_outside_every_make_scope_is_refused(db_session, monkeyp
     db_session.commit()
 
     _patch_payloads(monkeypatch, evidence=())
+    # The fact resolves to its owner's scope, but the scope plumbing drops it
+    # before the writer is called.  That is the regression the gate exists for:
+    # an output owed to a live MAKE owner must never be published unrealized.
+    monkeypatch.setattr(publisher, "_current_scopes", lambda *a, **kw: ())
     with pytest.raises(
         publisher.ForwardPhysicalRefreshUnavailable,
         match="outside every MAKE scope",

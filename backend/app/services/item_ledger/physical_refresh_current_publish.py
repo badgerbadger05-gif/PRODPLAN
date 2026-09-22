@@ -571,39 +571,79 @@ def _current_scopes(
     return tuple(sorted(scopes))
 
 
+def _canonical_scope(value: Any, mode: str) -> tuple[int, str, str, str, str]:
+    """The distribution scope of a fact or an owner, through the one pool key.
+
+    ``mrp_freeze.distribution_scope_for`` is that key; every frozen
+    reservation column was written through it, so a physical row has to be
+    keyed the same way before the two can be compared.  Comparing raw columns
+    was a second rule and it never matched live data.
+    """
+    from app.services.mrp_freeze import distribution_scope_for
+
+    return distribution_scope_for(
+        int(value.item_id),
+        _text(getattr(value, "characteristic_ref", "")),
+        _text(getattr(value, "organization_ref", "")),
+        mode=mode,
+    )
+
+
+def _owner_scopes_for(
+    row: Any,
+    current_owners: Sequence[models.ReservationEntry],
+    modes: set[str],
+) -> tuple[tuple[int, str, str, str, str], ...]:
+    """Scopes of the current owners of this row's item, in the given modes.
+
+    The owner's own realization mode is kept: canon §18 says an accepted
+    ``assembly_in`` closes a ``rework`` reserve as well as a ``make`` one, so
+    collapsing rework into make here would hand the writer a mode its own
+    reserve selection rejects.
+    """
+    return tuple({
+        _canonical_scope(owner, _text(owner.realization_mode))
+        for owner in current_owners
+        if int(owner.item_id) == int(row.item_id)
+        and _text(owner.realization_mode) in modes
+    })
+
+
+def _single_scope_or_fail(
+    row: Any,
+    scopes: tuple[tuple[int, str, str, str, str], ...],
+) -> tuple[int, str, str, str, str] | None:
+    """One scope, or fail closed with the one ambiguity verdict."""
+    if not scopes:
+        return None
+    if len(scopes) > 1:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"facts for item {int(row.item_id)} have ambiguous distribution pools"
+        )
+    return scopes[0]
+
+
 def _make_scopes_for_assembly_row(
     row: Any,
     current_owners: Sequence[models.ReservationEntry],
 ) -> tuple[tuple[int, str, str, str, str], ...]:
-    """The MAKE scopes one ``assembly_in`` fact realizes, if any.
+    """The MAKE/rework scopes one ``assembly_in`` fact realizes, if any.
 
-    An assembly fact without a current MAKE owner is a valid stock/output-only
-    fact: no pool is invented from the physical warehouse and the R4 writer is
-    not invoked for it.
+    An assembly fact without a current owner in those modes is a valid
+    stock/output-only fact: no pool is invented from the physical warehouse
+    and the R4 writer is not invoked for it.
 
-    Item and characteristic are the row's own; the organization comes from the
-    owner.  This used to compare the two, and on real data they never agree -
-    every frozen reservation owner carries an empty organization while every
-    physical fact carries the 1C GUID that posted the document.  The bounded
-    refresh therefore produced no MAKE scope at all and
-    ``apply_current_replenishment_for_bounded_make_scopes`` never ran: on the
-    stand, 492 visible ``assembly_in`` facts for items with a live MAKE owner
-    went unrealized since the migration, leaving their demand open.  It is the
-    same defect, and the same correction, as the BUY side in
-    :func:`_buy_scope_for_receipt`.
+    Both sides are keyed through the canonical collapse, so a fact with a real
+    characteristic and the 1C organization still reaches the owner that was
+    frozen with the collapsed key.  A ``rework`` owner keeps its own mode
+    (canon §18).
     """
-    return tuple(
-        (
-            int(row.item_id), _text(row.characteristic_ref),
-            _text(owner.organization_ref), _text(owner.planning_stock_pool),
-            "make",
+    scopes = _owner_scopes_for(row, current_owners, {"make", "rework"})
+    if len({scope[:4] for scope in scopes}) > 1:
+        raise ForwardPhysicalRefreshUnavailable(
+            f"facts for item {int(row.item_id)} have ambiguous distribution pools"
         )
-        for owner in current_owners
-        if int(owner.item_id) == int(row.item_id)
-        and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
-        and _text(owner.realization_mode) in {"make", "rework"}
-        and _text(owner.planning_stock_pool)
-    )
+    return scopes
 
 
 def _buy_scope_for_receipt(
@@ -617,51 +657,21 @@ def _buy_scope_for_receipt(
     Two rules, and only one of them looks at the physical row.  The warehouse
     decides *whether* the receipt is planning-relevant at all: outside the
     configured contour it is a legitimate stock-only receipt.  The scope
-    itself comes from the current BUY owner of the item, exactly as the
-    canonical generation-wide writer resolves it
+    itself is the canonical pool key of the item's current BUY owner - the
+    same key the reservation was frozen with, and the same one the
+    generation-wide writer resolves
     (``current_replenishment.apply_current_replenishment_for_accepted_generation``,
     which attaches receipts to reservations by item and states the reason: a
     physical receipt carries no pool identity).
-
-    Item, characteristic and pool are still matched against the owner; only
-    ``organization_ref`` is taken from the owner instead of being compared.
-    The organization on a physical row is the 1C organization that posted the
-    document, not the planning organization of an obligation, and on real
-    data the two never agree: every frozen reservation owner carries an empty
-    organization while every physical fact carries the 1C GUID.  Comparing
-    them meant the bounded refresh produced no BUY scope at all - it typed no
-    supplier receipt and allocated nothing for five consecutive accepted
-    refreshes.
-
-    Ambiguity fails closed with the same verdict the canonical writer gives:
-    one item cannot be fanned out to several distribution pools.
     """
     if not _is_supplier_receipt(row):
         return None
     warehouse = _text(row.warehouse_ref1c)
     if not warehouse or not _text(planning_pool_by_warehouse.get(warehouse)):
         return None
-    pool = _text(planning_pool_by_warehouse.get(warehouse))
-    owner_scopes = {
-        (
-            int(owner.item_id), _text(owner.characteristic_ref),
-            _text(owner.organization_ref), _text(owner.planning_stock_pool),
-            "buy",
-        )
-        for owner in current_owners
-        if int(owner.item_id) == int(row.item_id)
-        and _text(owner.realization_mode) == "buy"
-        and _text(owner.characteristic_ref) == _text(row.characteristic_ref)
-        and _text(owner.planning_stock_pool) == pool
-    }
-    if not owner_scopes:
-        return None
-    if len(owner_scopes) > 1:
-        raise ForwardPhysicalRefreshUnavailable(
-            f"receipt facts for item {int(row.item_id)} have ambiguous "
-            "distribution pools"
-        )
-    return next(iter(owner_scopes))
+    return _single_scope_or_fail(
+        row, _owner_scopes_for(row, current_owners, {"buy"})
+    )
 
 
 def _untyped_buy_owned_receipt_ids(
@@ -1279,17 +1289,17 @@ def _publish_forward_physical_refresh_current(
     # delta because that is what this refresh is responsible for, and because
     # "produced no allocation" is not by itself a defect - a surplus output
     # beyond the open requirement legitimately allocates nothing.
+    published_make_scopes = set(make_scopes)
     unscoped = tuple(
         int(row.id) for row in rows
         if _text(row.movement_kind) == "assembly_in"
         and _text(row.warehouse_ref1c)
         and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
-        and any(
-            int(owner.item_id) == int(row.item_id)
-            and _text(owner.realization_mode) in {"make", "rework"}
-            for owner in current_owners
+        and _make_scopes_for_assembly_row(row, current_owners)
+        and not (
+            set(_make_scopes_for_assembly_row(row, current_owners))
+            & published_make_scopes
         )
-        and not _make_scopes_for_assembly_row(row, current_owners)
     )
     if unscoped:
         raise ForwardPhysicalRefreshUnavailable(
