@@ -1354,3 +1354,161 @@ def test_obligation_refresh_on_a_pointer_older_than_the_limit_is_refused(
         generation_key="orch-stale"
     ).count() == 0
     assert "freshness threshold" in str(excinfo.value)
+
+
+# --- Item 25: one current custody owner per publication -----------------------
+
+
+def _current_custody_at(db, generation, item, *, qty="2"):
+    """A compact current custody owner as the last physical publication left it."""
+    db.add(models.ProductionMaterialCustodyProjection(
+        ledger_generation_id=int(generation.id),
+        product_id=int(item.item_id),
+        component_item_id=int(item.item_id),
+        location_kind="workshop",
+        warehouse_ref1c="WH-OUT",
+        reserved_qty=Decimal(qty),
+        source_event_high_watermark_id=0,
+        is_current=True,
+    ))
+    db.commit()
+
+
+def _current_custody(db):
+    return db.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True)
+    ).all()
+
+
+def test_obligation_refresh_makes_its_custody_projection_the_current_owner(db_session):
+    """The stand: 385 current rows stayed at 1446 through seven refreshes.
+
+    Each refresh built its own custody rows and a complete manifest, but only
+    the accept path promoted them; the obligation publication moved the
+    pointer and left the compact owner behind.
+    """
+    from app.services.production_material_custody_projection import (
+        load_compact_current_material_custody,
+    )
+
+    accepted, plan, _line, item, _old, _cutoff = _world(db_session, with_parent=False)
+    _current_custody_at(db_session, accepted, item)
+
+    result = _run(db_session, accepted, "orch-custody", add=[plan.id])
+    db_session.commit()
+
+    target_id = int(result.target_generation_id)
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target_id
+    current = _current_custody(db_session)
+    assert current and {int(row.ledger_generation_id) for row in current} == {target_id}
+    generation_id, _state = load_compact_current_material_custody(
+        db_session, consumer="test.after-obligation-refresh"
+    )
+    assert generation_id == target_id
+
+
+def test_two_obligation_refreshes_in_a_row_keep_one_current_custody_owner(db_session):
+    accepted, plan, _line, item, _old, _cutoff = _world(db_session, with_parent=False)
+    _current_custody_at(db_session, accepted, item)
+    first = _run(db_session, accepted, "orch-custody-1", add=[plan.id])
+    db_session.commit()
+    first_target = db_session.get(models.LedgerGeneration, first.target_generation_id)
+    second = _run(db_session, first_target, "orch-custody-2", retire=[plan.id])
+    db_session.commit()
+
+    assert {int(row.ledger_generation_id) for row in _current_custody(db_session)} <= {
+        int(second.target_generation_id)
+    }
+    from app.services.production_material_custody_projection import (
+        load_compact_current_material_custody,
+    )
+    generation_id, _state = load_compact_current_material_custody(
+        db_session, consumer="test.after-two-refreshes"
+    )
+    assert generation_id == int(second.target_generation_id)
+
+
+def test_a_bounded_physical_refresh_after_an_obligation_refresh_is_accepted(
+    db_session, monkeypatch,
+):
+    """End to end with the real assembly/readiness/custody/drum/shelf builders.
+
+    The stand's 1458 was refused in ``assembly_payload`` by the readiness
+    custody read: "compact current custody provenance is stale or ambiguous".
+    """
+    from app.services.item_ledger import physical_refresh_current_publish as publisher
+
+    accepted, plan, _line, item, _old, _cutoff = _world(db_session, with_parent=False)
+    _current_custody_at(db_session, accepted, item)
+    result = _run(db_session, accepted, "orch-then-physical", add=[plan.id])
+    db_session.commit()
+    parent = db_session.get(models.LedgerGeneration, int(result.target_generation_id))
+
+    target_cutoff = parent.cutoff + timedelta(hours=6)
+    batch = models.PhysicalImportBatch(
+        batch_key="orch-then-physical-batch", status="completed",
+        source_complete=True, cutoff=target_cutoff,
+        source_watermarks={}, completed_at=target_cutoff,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    target = models.LedgerGeneration(
+        generation_key="orch-then-physical-target", status="building",
+        cutoff=target_cutoff, source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities={}, physical_import_batch_id=int(batch.id), algorithm_version="test",
+    )
+    db_session.add(target)
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id),
+        source_content_hash="orch-then-physical-sle",
+        business_identity="orch-then-physical-sle",
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="WH-OUT", qty=Decimal("2"),
+        posting_at=target_cutoff - timedelta(hours=1), record_type="Receipt",
+        movement_kind="transfer_out", recorder_type="Document_Transfer",
+        recorder_ref="orch-then-physical", line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.commit()
+
+    # The same seams the item-20 end-to-end test stubs; everything on the
+    # path to the custody read - assembly, readiness, custody, drum, shelf -
+    # is the real builder.
+    monkeypatch.setattr(
+        publisher, "_build_obligation_view_payloads", lambda *a, **kw: ({}, {}),
+    )
+    monkeypatch.setattr(
+        publisher, "publish_current_obligation_views_from_generation",
+        lambda *a, **kw: {
+            "production_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "purchase_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "mrp_result": SimpleNamespace(changed_rows=0, idempotent=True),
+            "period_plan_execution": SimpleNamespace(changed_rows=0, idempotent=True),
+        },
+    )
+    monkeypatch.setattr(
+        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_production_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {}},
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_purchase_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {}},
+    )
+
+    published = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        delta_manifest={"rows": (sle,), "supersessions": ()},
+        odata_client=None,
+        source_revision=int(batch.id),
+        planning_pool_by_warehouse={"WH-OUT": "default"},
+    )
+
+    assert published.target_generation_id == int(target.id)
+    assert str(db_session.get(models.LedgerGeneration, target.id).status) == "accepted"
+    db_session.rollback()

@@ -25,6 +25,9 @@ from app.services.production_control_journal_projection import (
     validate_candidate_payload as validate_production_journal_payload,
 )
 from app.services.production_material_custody_projection import (
+    MaterialCustodySnapshotUnavailable,
+    publish_current_material_custody,
+    require_published_current_material_custody,
     validate_material_custody_projection,
 )
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
@@ -1039,6 +1042,24 @@ def publish_obligation_refresh_batch(
     publish_current_execution_from_generation(
         db, generation_id=int(target.id)
     )
+    # One current custody owner, promoted by every publication that moves the
+    # pointer - the same function and the same place relative to the current
+    # execution scopes as ``accept_generation_build``.  Without it the target
+    # built its custody rows and left them non-current, so the compact owner
+    # stayed at the physical generation that last promoted it and the next
+    # bounded physical refresh was refused ("compact current custody
+    # provenance is stale or ambiguous").
+    try:
+        publish_current_material_custody(
+            db, ledger_generation_id=int(target.id)
+        )
+        require_published_current_material_custody(
+            db, ledger_generation_id=int(target.id)
+        )
+    except MaterialCustodySnapshotUnavailable as exc:
+        raise ObligationRefreshPublishError(
+            f"custody current publication failed: {exc}"
+        ) from exc
     # Future supply is captured as immutable generation evidence but exposed
     # through one compact current projection, alongside the truth-pointer
     # switch.  No reader should select a historical generation copy.

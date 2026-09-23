@@ -1692,6 +1692,23 @@ def load_compact_current_material_custody(
             stored_generation_id=generation_id,
             reason="compact current custody has an unpublished event tail",
         )
+    rows = _compact_current_custody_rows(
+        db, generation_id=generation_id, watermark=watermark
+    )
+    if not rows:
+        return generation_id, MaterialCustodyState()
+    return generation_id, _state_from_projection_rows(rows)
+
+
+def _compact_current_custody_rows(
+    db: Session, *, generation_id: int, watermark: int
+) -> list[models.ProductionMaterialCustodyProjection]:
+    """The compact current owner, which must be exactly this generation's.
+
+    One predicate for the reader and for every publication that moves the
+    pointer: what a publication certifies here is what the next reader
+    accepts.
+    """
     rows = (
         db.query(models.ProductionMaterialCustodyProjection)
         .filter(models.ProductionMaterialCustodyProjection.is_current.is_(True))
@@ -1700,24 +1717,51 @@ def load_compact_current_material_custody(
     if not rows:
         generation_rows = (
             db.query(models.ProductionMaterialCustodyProjection)
-            .filter_by(ledger_generation_id=generation_id)
+            .filter_by(ledger_generation_id=int(generation_id))
             .count()
         )
         if generation_rows:
             raise MaterialCustodySnapshotUnavailable(
-                expected_generation_id=generation_id,
-                stored_generation_id=generation_id,
+                expected_generation_id=int(generation_id),
+                stored_generation_id=int(generation_id),
                 reason="accepted custody projection has no compact current marker",
             )
-        return generation_id, MaterialCustodyState()
+        return []
     if any(
-        int(row.ledger_generation_id) != generation_id
-        or int(row.source_event_high_watermark_id or 0) != watermark
+        int(row.ledger_generation_id) != int(generation_id)
+        or int(row.source_event_high_watermark_id or 0) != int(watermark)
         for row in rows
     ):
         raise MaterialCustodySnapshotUnavailable(
-            expected_generation_id=generation_id,
-            stored_generation_id=generation_id,
+            expected_generation_id=int(generation_id),
+            stored_generation_id=int(generation_id),
             reason="compact current custody provenance is stale or ambiguous",
         )
-    return generation_id, _state_from_projection_rows(rows)
+    return rows
+
+
+def require_published_current_material_custody(
+    db: Session, *, ledger_generation_id: int
+) -> int:
+    """Refuse a publication whose custody did not become the current owner.
+
+    Called after :func:`publish_current_material_custody` by every
+    publication that moves the accepted pointer.  It applies the reader's own
+    provenance predicate, so a publication cannot certify a pointer that the
+    next compact reader - readiness, the bounded physical refresh - would
+    reject as "stale or ambiguous".  An unpublished event tail is not judged
+    here: that is the physical refresh's input, not a publication defect.
+    """
+    generation_id = int(ledger_generation_id)
+    manifest = _read_manifest(db, generation_id=generation_id)
+    if manifest is None or str(manifest.status) != "complete":
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=None if manifest is None else int(manifest.ledger_generation_id),
+            reason="published custody manifest is missing or incomplete",
+        )
+    return len(_compact_current_custody_rows(
+        db,
+        generation_id=generation_id,
+        watermark=int(manifest.source_event_high_watermark_id),
+    ))

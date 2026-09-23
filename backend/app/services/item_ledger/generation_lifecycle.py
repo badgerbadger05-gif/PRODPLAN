@@ -1761,8 +1761,14 @@ def accept_generation_build(
         current_execution = publish_current_execution_from_generation(
             db, generation_id=int(generation.id)
         )
-        from ..production_material_custody_projection import publish_current_material_custody
+        from ..production_material_custody_projection import (
+            publish_current_material_custody,
+            require_published_current_material_custody,
+        )
         publish_current_material_custody(
+            db, ledger_generation_id=int(generation.id)
+        )
+        require_published_current_material_custody(
             db, ledger_generation_id=int(generation.id)
         )
         _publish_accepted_generation_current_state(
