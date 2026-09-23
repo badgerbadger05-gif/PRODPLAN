@@ -1531,16 +1531,31 @@ def apply_supplier_provenance_repair(
             return _supplier_provenance_repair_on_session(session, int(generation_id))
 
 
-def _closed_owner_current_allocations(session: Session) -> tuple[int, int]:
-    row = session.execute(text(
-        "SELECT count(*), coalesce(sum(allocation.allocated_qty), 0) "
-        "FROM reservation_consumption_allocation AS allocation "
-        "JOIN reservation_entry AS owner ON owner.id = allocation.reservation_id "
-        "WHERE allocation.is_current = true "
-        "AND allocation.allocation_role = 'replenishment_receipt' "
-        "AND owner.lifecycle_status = 'closed'"
-    )).one()
-    return int(row[0] or 0), int(row[1] or 0)
+def _closed_owner_current_allocations(session: Session) -> tuple[int, str]:
+    from app import models
+    from sqlalchemy import func
+    from app.services.item_ledger.current_replenishment import (
+        canonical_decimal_text,
+        closed_owner_predicate,
+    )
+
+    count, total = (
+        session.query(
+            func.count(models.ReservationConsumptionAllocation.id),
+            func.coalesce(func.sum(models.ReservationConsumptionAllocation.allocated_qty), 0),
+        )
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReservationConsumptionAllocation.reservation_id,
+        )
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            closed_owner_predicate(),
+        )
+        .one()
+    )
+    return int(count or 0), canonical_decimal_text(total or 0)
 
 
 def _retire_closed_owner_allocations_on_session(
@@ -1561,6 +1576,17 @@ def _retire_closed_owner_allocations_on_session(
         retire_current_allocations_of_closed_owners,
     )
 
+    # Serialize with every publication that moves the pointer: the pointer
+    # row is the publication lock, and this phase stamps its generation.
+    locked = session.execute(text(
+        "SELECT current_generation_id FROM planning_truth_state WHERE id = 1 FOR UPDATE"
+        if session.get_bind().dialect.name == "postgresql"
+        else "SELECT current_generation_id FROM planning_truth_state WHERE id = 1"
+    )).scalar_one_or_none()
+    if locked is None or int(locked) != int(generation_id):
+        raise PreflightBlocked(
+            f"truth pointer moved to {locked} while retiring for {int(generation_id)}"
+        )
     rows_before, units_before = _closed_owner_current_allocations(session)
     over_before = over_allocated_facts(session, limit=0)
     retired = retire_current_allocations_of_closed_owners(
@@ -1577,8 +1603,10 @@ def _retire_closed_owner_allocations_on_session(
         "status": "ready",
         "generation_id": int(generation_id),
         "closed_owner_allocations_before": rows_before,
-        "closed_owner_allocation_units_before": units_before,
+        "closed_owner_allocation_qty_before": units_before,
         "retired_allocations": int(retired["retired_allocations"]),
+        "retired_consumption_allocations": int(retired["retired_consumption_allocations"]),
+        "retired_qty": retired["retired_qty"],
         "retired_without_audit": int(retired["unaudited"]),
         "closed_owner_allocations_after": rows_after,
         "over_allocated_facts_before": len(over_before),

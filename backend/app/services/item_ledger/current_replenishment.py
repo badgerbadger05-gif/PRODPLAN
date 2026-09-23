@@ -500,7 +500,7 @@ def retire_current_allocations_of_closed_owners(
     generation_id: int,
     reservation_ids: Iterable[int] | None = None,
 ) -> dict[str, int]:
-    """Retire the current R4 allocations of owners that are closed.
+    """Retire every current allocation of owners that are closed (§42).
 
     Canon: "рабочая строка резерва после закрытия больше не существует", a
     fact on a closed reserve goes FIFO (CANON "Судьба резерва при
@@ -514,9 +514,18 @@ def retire_current_allocations_of_closed_owners(
     second count - on the stand 7287 rows / 324 975 units, 477 facts over
     their own quantity after 14 obligation refreshes.
 
-    The single current writer owns this change: one ``retire`` audit row per
-    pair with reason ``owner_retired`` in the scope's own marker, stamped
-    with the publishing generation (``GENERATION_REVISION``).  Idempotent: a
+    Both roles (§42: all allocations of the closed owner).  A closed owner
+    holds no S0, so its ``material_consumption`` claims go too; left current,
+    a replace or rebase after period start made the same ``assembly_out``
+    current for the closed and for the new owner.  "Closed" is
+    ``lifecycle_status='closed'`` or an owner that is neither current nor
+    BUILDING staging (a legacy copy); such an owner is no longer live either.
+
+    The single current writer owns this change.  A ``replenishment_receipt``
+    pair gets one ``retire`` audit row with reason ``owner_retired`` in its
+    scope's own marker, stamped with the publishing generation
+    (``GENERATION_REVISION``); ``material_consumption`` is not an R4 basis
+    and has no marker, so it is counted, not audited there.  Idempotent: a
     retired allocation is no longer current.  ``reservation_ids`` bounds the
     owners considered; ``None`` means every closed owner, which is what heals
     a database already in the double-counted state.
@@ -533,15 +542,16 @@ def retire_current_allocations_of_closed_owners(
         )
         .filter(
             models.ReservationConsumptionAllocation.is_current.is_(True),
-            models.ReservationConsumptionAllocation.allocation_role
-            == "replenishment_receipt",
-            models.ReservationEntry.lifecycle_status == "closed",
+            models.ReservationConsumptionAllocation.allocation_role.in_(
+                ("replenishment_receipt", "material_consumption")
+            ),
+            closed_owner_predicate(),
         )
     )
     if reservation_ids is not None:
         ids = sorted({int(value) for value in reservation_ids})
         if not ids:
-            return {"retired_allocations": 0, "retired_qty_units": 0, "unaudited": 0}
+            return _retire_result(0, 0, Decimal("0"), 0)
         query = query.filter(models.ReservationEntry.id.in_(ids))
     pairs = (
         query.with_for_update(of=models.ReservationConsumptionAllocation)
@@ -550,9 +560,16 @@ def retire_current_allocations_of_closed_owners(
     )
     states: dict[str, models.CurrentReplenishmentState | None] = {}
     retired = 0
+    consumption = 0
     unaudited = 0
     total = Decimal("0")
     for row, entry in pairs:
+        if _text(row.allocation_role) == "material_consumption":
+            row.is_current = False
+            retired += 1
+            consumption += 1
+            total += _decimal(row.allocated_qty)
+            continue
         scope_key = _scope_key(_allocation_scope(row, entry))
         if scope_key not in states:
             states[scope_key] = (
@@ -589,24 +606,50 @@ def retire_current_allocations_of_closed_owners(
             reason=OWNER_RETIRED_REASON,
         )
     db.flush()
+    return _retire_result(retired, consumption, total, unaudited)
+
+
+def closed_owner_predicate():
+    """An owner that is no longer live: closed, or a non-current legacy copy."""
+    return or_(
+        models.ReservationEntry.lifecycle_status == "closed",
+        and_(
+            models.ReservationEntry.is_current.is_(False),
+            models.ReservationEntry.owner_kind != "building",
+        ),
+    )
+
+
+def _retire_result(
+    retired: int, consumption: int, total: Decimal, unaudited: int
+) -> dict[str, object]:
     return {
-        "retired_allocations": retired,
-        "retired_qty_units": int(total),
-        "unaudited": unaudited,
+        "retired_allocations": int(retired),
+        "retired_receipt_allocations": int(retired) - int(consumption),
+        "retired_consumption_allocations": int(consumption),
+        # Exact Decimal(15,3) as text: never truncated to whole units.
+        "retired_qty": canonical_decimal_text(total),
+        "unaudited": int(unaudited),
     }
+
+
+def canonical_decimal_text(value: Decimal) -> str:
+    return format(_decimal(value).quantize(Decimal("0.001")), "f")
 
 
 def over_allocated_facts(
     db: Session,
     *,
     item_ids: Iterable[int] | None = None,
+    sle_ids: Iterable[int] | None = None,
     limit: int = 8,
 ) -> list[tuple[int, str, Decimal, Decimal]]:
     """Facts whose current allocations exceed the fact (invariants 2-3).
 
     Returns ``(sle_id, role, allocated, |qty|)`` for the first ``limit``
-    offenders; empty means the invariant holds.  ``item_ids`` bounds the
-    check to the scopes a bounded publication touched (decision §41).
+    offenders; empty means the invariant holds.  Compared per ``(sle,
+    role)``.  ``sle_ids`` bounds the check to the facts a bounded publication
+    brought in (decision §41); ``item_ids`` bounds it by item.
     """
     from sqlalchemy import func
 
@@ -636,6 +679,13 @@ def over_allocated_facts(
         if not ids:
             return []
         query = query.filter(models.ReservationConsumptionAllocation.item_id.in_(ids))
+    if sle_ids is not None:
+        sle_filter = sorted({int(value) for value in sle_ids})
+        if not sle_filter:
+            return []
+        query = query.filter(
+            models.ReservationConsumptionAllocation.sle_id.in_(sle_filter)
+        )
     if limit and int(limit) > 0:
         query = query.limit(int(limit))
     return [
@@ -645,10 +695,13 @@ def over_allocated_facts(
 
 
 def require_facts_not_over_allocated(
-    db: Session, *, item_ids: Iterable[int] | None = None
+    db: Session,
+    *,
+    item_ids: Iterable[int] | None = None,
+    sle_ids: Iterable[int] | None = None,
 ) -> None:
     """Fail closed when any fact carries more current allocation than itself."""
-    offenders = over_allocated_facts(db, item_ids=item_ids, limit=8)
+    offenders = over_allocated_facts(db, item_ids=item_ids, sle_ids=sle_ids, limit=8)
     if offenders:
         listed = ", ".join(
             f"SLE {sle_id} {role} {total}>{qty}"
@@ -1699,6 +1752,21 @@ def apply_current_replenishment_for_accepted_generation(
         db,
         ledger_generation_id=int(generation_id),
     )
+    # A retained owner is anchored to the generation that froze it, so the
+    # generation-scoped lookup cannot see its exact supplier-order link and it
+    # replayed as FIFO - flip-flopping with the bounded path, which finds it
+    # by stable owner id.  Look the retained owners up the same way.
+    retained_owner_ids = sorted(
+        int(row.id) for row in reservations if bool(row.is_current)
+    )
+    if _text(generation.status) == "building" and retained_owner_ids:
+        owner_caps = _exact_allocation_caps_by_order_line(
+            db,
+            ledger_generation_id=int(generation_id),
+            current_owner_ids=retained_owner_ids,
+        )
+        for key, by_owner in owner_caps.items():
+            exact_caps.setdefault(key, {}).update(by_owner)
     exact_keys = {
         (
             int(row.evidence_payload.get("item_id") or visible[int(row.stock_ledger_entry_id)].item_id),

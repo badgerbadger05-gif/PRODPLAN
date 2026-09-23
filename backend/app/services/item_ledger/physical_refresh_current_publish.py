@@ -1107,12 +1107,11 @@ def _publish_forward_physical_refresh_current(
         start_phase("buy")
     phase("buy")
     # Invariants 2-3 (planning-truth-contract): a fact is counted once and its
-    # current allocations never exceed it.  Bounded to the scopes this refresh
-    # replayed (decision §41), so history it did not touch is not its verdict.
-    if scopes:
-        require_facts_not_over_allocated(
-            db, item_ids={int(scope[0]) for scope in scopes}
-        )
+    # current allocations never exceed it.  Bounded to the facts this refresh
+    # brought in (decision §41): history it did not touch is not its verdict.
+    delta_sle_ids = {int(row.id) for row in rows}
+    if delta_sle_ids:
+        require_facts_not_over_allocated(db, sle_ids=delta_sle_ids)
 
     start_phase("assembly_output")
     output = apply_bounded_assembly_output_plan_execution(

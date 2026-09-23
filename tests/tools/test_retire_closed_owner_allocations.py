@@ -126,7 +126,8 @@ def test_retirement_heals_the_double_count_and_is_idempotent():
     assert first["status"] == "ready"
     assert first["generation_id"] == generation_id
     assert first["closed_owner_allocations_before"] == 1
-    assert first["closed_owner_allocation_units_before"] == 2
+    assert first["closed_owner_allocation_qty_before"] == "2.000"
+    assert first["retired_qty"] == "2.000"
     assert first["retired_allocations"] == 1
     assert first["closed_owner_allocations_after"] == 0
     assert first["over_allocated_facts_before"] == 1

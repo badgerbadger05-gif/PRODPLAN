@@ -51,6 +51,10 @@ def publish_current_reservations(
         db, generation_id=int(generation_id)
     )
     result["retired_allocations"] = int(retired["retired_allocations"])
+    result["retired_consumption_allocations"] = int(
+        retired["retired_consumption_allocations"]
+    )
+    result["retired_unaudited"] = int(retired["unaudited"])
     return result
 
 

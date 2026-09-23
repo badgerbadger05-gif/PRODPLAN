@@ -103,3 +103,23 @@ def test_export_rejects_null_or_foreign_issue_lineage_even_dry_run(db_session, l
     db_session.add(issue); db_session.flush()
     with pytest.raises(ValueError, match="not current accepted truth"):
         export_material_issues_to_1c(db_session, [issue.issue_id], dry_run=True)
+
+
+def test_a_building_reader_must_descend_from_the_truth_pointer(db_session):
+    """A candidate forked from anything but the pointer cannot read current bins."""
+    pointer = _accepted(db_session, "pointer")
+    stray_parent = _accepted(db_session, "stray")  # publish_generation moved the pointer
+    planning_truth.publish_generation(db_session, pointer)
+    cutoff = datetime(2026, 7, 24, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(batch_key="mi-building", status="completed", cutoff=cutoff, source_watermarks={})
+    building = models.LedgerGeneration(
+        generation_key="mi-building", status="building", cutoff=cutoff,
+        physical_import_batch=batch, capabilities={}, algorithm_version="test",
+        source_watermarks={"parent_generation_id": int(stray_parent.id)},
+    )
+    db_session.add_all((batch, building)); db_session.flush()
+    with pytest.raises(ValueError, match="not a child of the truth pointer"):
+        issues._source_warehouse_options(db_session, [1], ledger_generation_id=building.id)
+    building.source_watermarks = {"parent_generation_id": int(pointer.id)}
+    db_session.flush()
+    assert issues._source_warehouse_options(db_session, [1], ledger_generation_id=building.id) == {}

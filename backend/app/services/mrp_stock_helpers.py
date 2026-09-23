@@ -175,10 +175,36 @@ def current_stock_bin_query(db: Session, ledger_generation_id: int, *entities: A
     reads the same current set, bounded by its own lineage.
     """
     generation = db.get(LedgerGeneration, int(ledger_generation_id))
+    building = generation is not None and str(generation.status or "") == "building"
+    if building:
+        # A BUILDING reader is a publication descending from the pointer; a
+        # candidate forked from anything else must not read the current set.
+        # A genesis build has no parent and no pointer yet; a build already
+        # named by the pointer is its own lineage.
+        pointer = db.get(PlanningTruthState, 1)
+        raw_parent = (generation.source_watermarks or {}).get("parent_generation_id")
+        try:
+            parent_id = int(raw_parent) if raw_parent not in (None, "") else None
+        except (TypeError, ValueError):
+            parent_id = None
+        pointer_id = (
+            int(pointer.current_generation_id)
+            if pointer is not None and pointer.current_generation_id is not None
+            else None
+        )
+        descends = (
+            pointer_id == int(ledger_generation_id)
+            or (parent_id is not None and parent_id == pointer_id)
+            or (parent_id is None and pointer_id is None)
+        )
+        if not descends:
+            raise ValueError(
+                "BUILDING StockBin reader is not a child of the truth pointer "
+                f"(generation={int(ledger_generation_id)}, parent={parent_id}, "
+                f"pointer={pointer_id})"
+            )
     _require_current_stock_bin_provenance(
-        db,
-        int(ledger_generation_id),
-        require_pointer=generation is None or str(generation.status or "") != "building",
+        db, int(ledger_generation_id), require_pointer=not building,
     )
     return db.query(*entities).filter(StockBin.is_current.is_(True))
 

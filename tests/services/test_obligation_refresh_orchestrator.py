@@ -1167,12 +1167,15 @@ def test_refresh_promotes_current_reservation_owners_and_retires_the_replaced_on
         }
         assert buy_requirement_ids <= owned
 
-    # R4: the refresh hands the assignment basis over or keeps it as history;
-    # it never reduces the set of current allocations.
-    allocations_after = db_session.query(
+    # §42: the superseded owner's allocations are retired - every role - and
+    # kept as history, never deleted.  The owner holds no S0 once closed.
+    old_rows = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        reservation_id=int(old_owner.id),
+    ).all()
+    assert old_rows and all(row.is_current is False for row in old_rows)
+    assert db_session.query(
         models.ReservationConsumptionAllocation.id
-    ).filter_by(is_current=True).count()
-    assert allocations_after >= allocations_before
+    ).count() >= allocations_before
 
 
 def test_refresh_that_skips_the_promotion_is_rejected_before_acceptance(
@@ -1682,7 +1685,13 @@ def test_closed_owner_allocations_are_retired_idempotently(db_session):
     )
     db_session.commit()
 
-    assert first == {"retired_allocations": 1, "retired_qty_units": 2, "unaudited": 0}
+    assert first == {
+        "retired_allocations": 1,
+        "retired_receipt_allocations": 1,
+        "retired_consumption_allocations": 0,
+        "retired_qty": "2.000",
+        "unaudited": 0,
+    }
     assert second["retired_allocations"] == 0
     assert _current_receipt_allocations(db_session, receipt.id) == []
 
@@ -1832,3 +1841,207 @@ def test_source_warehouse_options_survive_an_obligation_refresh(db_session):
     )
     assert selected == "WH-OUT"
     assert [row["ref1c"] for row in candidates] == ["WH-OUT"]
+
+
+# --- Item 27 ---------------------------------------------------------------------
+
+
+def _consumption_claim(db, owner, sle, *, key, qty="1"):
+    db.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=int(owner.ledger_generation_id),
+        reservation_id=int(owner.id), sle_id=int(sle.id),
+        requirement_id=int(owner.requirement_id), allocated_qty=Decimal(qty),
+        match_rule="fifo", fact_ref="item27", fact_line_ref="1",
+        item_id=int(owner.item_id), characteristic_ref="", organization_ref="",
+        planning_stock_pool="default", idempotency_key=key,
+        allocation_role="material_consumption", is_current=True,
+        event_at=sle.posting_at,
+    ))
+
+
+def _second_owner(db, accepted, plan, item, cutoff, *, lifecycle="active",
+                  owner_kind="current", is_current=True):
+    run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
+        config_snapshot={}, active_freeze_version=1, ledger_cutoff=cutoff,
+    )
+    db.add(run)
+    db.flush()
+    requirement = models.MrpRequirement(
+        run_id=int(run.run_id), item_id=int(item.item_id),
+        total_required_qty=Decimal("5"), net_required_qty=Decimal("5"),
+        period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+        planning_stock_pool="default", characteristic_ref="", organization_ref="",
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    owner = models.ReservationEntry(
+        ledger_generation_id=int(accepted.id), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        run_id=int(run.run_id), freeze_version=1, requirement_id=int(requirement.id),
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        realization_mode="make", reserved_qty=Decimal("5"),
+        replenishment_required_qty=Decimal("5"), lifecycle_status=lifecycle,
+        owner_kind=owner_kind, is_current=is_current,
+        current_identity=(
+            f"reservation:req:{int(requirement.id)}:mode:make" if is_current else ""
+        ),
+    )
+    db.add(owner)
+    db.flush()
+    return owner
+
+
+def _assembly_out(db, accepted, item, cutoff, ref):
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(accepted.physical_import_batch_id),
+        source_content_hash=ref.ljust(64, "0"), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-OUT", qty=Decimal("-1"),
+        posting_at=cutoff - timedelta(hours=1), record_type="Expense",
+        movement_kind="assembly_out", recorder_type="Doc", recorder_ref=ref,
+        line_no="1", ingest_source="seed",
+    )
+    db.add(sle)
+    db.flush()
+    return sle
+
+
+@pytest.mark.parametrize("closed_kind", ["closed", "legacy-copy"])
+def test_a_closed_owners_material_consumption_is_retired_and_the_gate_holds(
+    db_session, closed_kind,
+):
+    """§42: all allocations of the closed owner, both roles.
+
+    A replace after period start made the same ``assembly_out`` current for
+    the closed and the new owner, and the gate fired on legitimate data.
+    """
+    from app.services.item_ledger.current_replenishment import (
+        over_allocated_facts,
+        require_facts_not_over_allocated,
+        retire_current_allocations_of_closed_owners,
+    )
+
+    accepted, plan, _line, item, _parent, cutoff = _world(db_session, with_parent=False)
+    sle = _assembly_out(db_session, accepted, item, cutoff, f"item27-{closed_kind}")
+    closed = (
+        _second_owner(db_session, accepted, plan, item, cutoff, lifecycle="closed")
+        if closed_kind == "closed"
+        else _second_owner(
+            db_session, accepted, plan, item, cutoff,
+            owner_kind="legacy", is_current=False,
+        )
+    )
+    live = _second_owner(db_session, accepted, plan, item, cutoff)
+    _consumption_claim(db_session, closed, sle, key=f"closed-{closed_kind}")
+    _consumption_claim(db_session, live, sle, key=f"live-{closed_kind}")
+    db_session.commit()
+    assert over_allocated_facts(db_session)  # 2 > 1: the state the stand reached
+
+    result = retire_current_allocations_of_closed_owners(
+        db_session, generation_id=int(accepted.id)
+    )
+    db_session.commit()
+
+    assert result["retired_consumption_allocations"] == 1
+    require_facts_not_over_allocated(db_session)
+    current = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        sle_id=int(sle.id), is_current=True,
+    ).all()
+    assert [int(row.reservation_id) for row in current] == [int(live.id)]
+
+
+def test_the_bounded_gate_judges_only_the_facts_of_its_delta(db_session):
+    """Decision §41: history the refresh did not bring in is not its verdict."""
+    from app.services.item_ledger.current_replenishment import (
+        CurrentReplenishmentError,
+        require_facts_not_over_allocated,
+    )
+
+    accepted, plan, _line, item, _parent, cutoff = _world(db_session, with_parent=False)
+    historical = _assembly_out(db_session, accepted, item, cutoff, "item27-history")
+    delta = _assembly_out(db_session, accepted, item, cutoff, "item27-delta")
+    first = _second_owner(db_session, accepted, plan, item, cutoff)
+    second = _second_owner(db_session, accepted, plan, item, cutoff)
+    _consumption_claim(db_session, first, historical, key="history-1")
+    _consumption_claim(db_session, second, historical, key="history-2")
+    db_session.commit()
+
+    require_facts_not_over_allocated(db_session, sle_ids=[int(delta.id)])
+    with pytest.raises(CurrentReplenishmentError, match=f"SLE {int(historical.id)}"):
+        require_facts_not_over_allocated(db_session, sle_ids=[int(historical.id)])
+
+
+def test_a_retained_owner_keeps_its_pegged_allocation_through_a_refresh(db_session):
+    """Exact caps were looked up by target generation; a retained owner is not
+    there, so it replayed as FIFO and flip-flopped with the bounded path.
+    """
+    from app.services.item_ledger.supplier_receipt_allocation import SUPPLIER_ORDER_TYPE
+
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    _old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
+        db_session, accepted, plan, item, parent, cutoff,
+    )
+    kept = _extra_fixed_plan(db_session, accepted, cutoff, name="kept", code="KEPT-27")
+    requirement = db_session.get(models.MrpRequirement, kept.owner.requirement_id)
+    requirement.item_id = item.item_id
+    requirement.planning_stock_pool = "default"
+    kept.owner.item_id = item.item_id
+    kept.owner.planning_stock_pool = "default"
+    allocation = db_session.query(models.ReservationConsumptionAllocation).one()
+    allocation.reservation_id = kept.owner.id
+    allocation.requirement_id = requirement.id
+    allocation.match_rule = "pegged"
+    # The receipt is an exact line of a supplier order exported for ``kept``.
+    order = models.SupplierOrder(
+        order_number="27", order_date=datetime(2026, 7, 1), order_ref1c="order-27",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(models.SupplierOrderItem(
+        order_id=order.order_id, item_id_ref=item.item_id, line_number=1,
+        quantity=Decimal("5"), received_qty=Decimal("0"), remaining_qty=Decimal("5"),
+    ))
+    provenance = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    provenance.supplier_order_ref = "order-27"
+    provenance.supplier_order_line_no = "1"
+    provenance.match_status = "exact"
+    provenance.reason = None
+    provenance.evidence_payload = {
+        **dict(provenance.evidence_payload),
+        "supplier_order_type": SUPPLIER_ORDER_TYPE,
+        "supplier_order_ref": "order-27",
+        "supplier_order_line_no": "1",
+    }
+    scope = models.CurrentExecutionScope(
+        entity_kind="purchase_control_journal", scope_key="item27-export",
+        source_generation_id=accepted.id, source_revision="item27",
+        result_ready=True, content_hash="c" * 64, summary={},
+    )
+    db_session.add(scope)
+    db_session.flush()
+    batch = models.PurchaseExportBatch(
+        ledger_generation_id=accepted.id, current_execution_scope_id=scope.id,
+        current_execution_source_revision="item27", idempotency_key="item27-export",
+        status="completed", payload_hash="d" * 64, request_payload={}, result_payload={},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    db_session.add(models.PurchaseExportObligationAllocation(
+        batch_id=batch.id, reservation_id=kept.owner.id,
+        supplier_order_ref="order-27", supplier_order_line_no="1",
+        allocated_qty=Decimal("2"), ledger_generation_id=accepted.id,
+        item_id=item.item_id, planning_stock_pool="default",
+    ))
+    db_session.commit()
+
+    result = _run(db_session, accepted, "orch-retained-pegged", replace=[plan.id])
+    db_session.commit()
+
+    assert result.published is True
+    current = _current_receipt_allocations(db_session, receipt.id)
+    assert [
+        (int(row.reservation_id), str(row.match_rule), Decimal(str(row.allocated_qty)))
+        for row in current
+    ] == [(int(kept.owner.id), "pegged", Decimal("2"))]
