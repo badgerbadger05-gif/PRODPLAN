@@ -9,7 +9,10 @@ from app.services.item_ledger.current_replenishment import (
     CurrentReplenishmentError,
     apply_current_replenishment_for_bounded_buy_scopes,
 )
-from app.services.item_ledger.supplier_receipt_allocation import ReceiptFact
+from app.services.item_ledger.supplier_receipt_allocation import (
+    SUPPLIER_ORDER_TYPE,
+    ReceiptFact,
+)
 
 
 def _scope(item_id: int):
@@ -158,6 +161,8 @@ def _receipt(
         receipt_ref=ref,
         receipt_line_no="1",
         planning_stock_pool="default",
+        # What the normalizer records for an exact line: the order document.
+        supplier_order_type=SUPPLIER_ORDER_TYPE if order_ref and order_line else "",
     )
 
 
@@ -221,6 +226,33 @@ def test_bounded_buy_empty_manifest_is_true_noop(db_session):
     assert result.results == ()
     assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
     assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 0
+
+
+def test_bounded_buy_writes_the_matched_order_type_on_an_exact_row(db_session):
+    """The obligation-refresh rebuild re-derives ``exact`` from this type.
+
+    Without it the row replays as ``unmatched`` and the receipt stops
+    allocating to its BUY owner, so the writer takes the type the manifest
+    matched, and refuses an exact fact that does not carry one.
+    """
+    parent, target, batch, items, _owners = _world(db_session)
+    row, fact = _receipt(db_session, batch, items[0])
+    _call(db_session, parent, target, fact)
+    db_session.commit()
+
+    provenance = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    assert provenance.match_status == "exact"
+    assert provenance.evidence_payload["supplier_order_type"] == SUPPLIER_ORDER_TYPE
+    assert provenance.receipt_doc_type == row.recorder_type
+
+
+def test_bounded_buy_refuses_an_exact_fact_without_the_order_type(db_session):
+    from dataclasses import replace
+
+    parent, target, batch, items, _owners = _world(db_session)
+    _row, fact = _receipt(db_session, batch, items[0])
+    with pytest.raises(CurrentReplenishmentError, match="requires supplier order type"):
+        _call(db_session, parent, target, replace(fact, supplier_order_type=""))
 
 
 def test_bounded_buy_exact_retry_has_no_new_audit_or_provenance(db_session):

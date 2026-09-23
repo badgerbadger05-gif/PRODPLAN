@@ -1301,6 +1301,77 @@ def _provenance_source_generations(
     return [int(value) for value in rows]
 
 
+def _pre_contract_provenance_rows(session: Session, generation_id: int) -> list[Any]:
+    from app import models
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        provenance_is_pre_contract,
+    )
+
+    return [
+        row
+        for row in session.query(models.StockLedgerSupplierReceiptProvenance)
+        .filter(
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+            == int(generation_id)
+        )
+        .order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id)
+        .all()
+        if provenance_is_pre_contract(row)
+    ]
+
+
+def _normalise_pre_contract_provenance(session: Session, generation_id: int) -> int:
+    """Bring rows written before the one-row contract up to it, in place.
+
+    The row keeps its fact, typing, status and rule; only its evidence is
+    re-derived - by ``resolve_persisted_supplier_evidence``, the same formula
+    the rebuild reads it with - and written through the one row builder.  A
+    normalised row is no longer pre-contract, so a second run changes nothing.
+    """
+
+    from app import models
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        build_supplier_receipt_provenance,
+        resolve_persisted_supplier_evidence,
+    )
+
+    normalised = 0
+    for row in _pre_contract_provenance_rows(session, int(generation_id)):
+        sle = session.get(models.StockLedgerEntry, int(row.stock_ledger_entry_id))
+        evidence, _from_sle = resolve_persisted_supplier_evidence(row, sle)
+        built = build_supplier_receipt_provenance(
+            ledger_generation_id=int(row.ledger_generation_id),
+            stock_ledger_entry_id=int(row.stock_ledger_entry_id),
+            receipt_doc_type=evidence.receipt_doc_type,
+            receipt_doc_ref=evidence.receipt_doc_ref,
+            receipt_doc_line_no=evidence.receipt_doc_line_no,
+            operation_kind=str(row.operation_kind),
+            operation_key=evidence.operation_key,
+            operation_name=evidence.operation_name,
+            item_id=int(evidence.item_id),
+            signed_qty=evidence.signed_qty,
+            match_rule=str(row.match_rule),
+            match_status=str(row.match_status),
+            supplier_order_type=evidence.supplier_order_type,
+            supplier_order_ref=evidence.supplier_order_ref,
+            supplier_order_line_no=evidence.supplier_order_line_no,
+            characteristic_ref=evidence.characteristic_ref,
+            warehouse_ref1c=evidence.warehouse_ref1c,
+            correction_receipt_ref=evidence.correction_receipt_ref,
+            ambiguity_count=int(row.ambiguity_count or 0),
+            reason=row.reason,
+        )
+        for field in (
+            "receipt_doc_type", "receipt_doc_ref", "receipt_doc_line_no",
+            "operation_key", "operation_name", "correction_receipt_ref",
+            "evidence_hash", "evidence_payload",
+        ):
+            setattr(row, field, getattr(built, field))
+        normalised += 1
+    session.flush()
+    return normalised
+
+
 def _supplier_provenance_repair_on_session(
     session: Session, generation_id: int
 ) -> dict[str, Any]:
@@ -1311,6 +1382,11 @@ def _supplier_provenance_repair_on_session(
     next publication.  The facts stayed accepted and visible; only the typing
     that says which supplier order they belong to was left behind at an older
     generation.  This phase re-owns what still exists, newest source first.
+
+    It then normalises, in place, the pointer's rows written before the
+    one-row contract (writer markers instead of the 1C document identity, no
+    order type on an exact line), so a stand does not wait for a physical
+    delta to touch them before an obligation refresh can rebuild from them.
 
     It does not invent typing.  A visible supplier fact that no generation
     ever typed is reported and left alone - that is the ordinary "outside the
@@ -1347,6 +1423,7 @@ def _supplier_provenance_repair_on_session(
         ), {"generation_id": int(generation_id)}).scalar_one() or 0)
 
     owned_before = _owned_here()
+    pre_contract_before = len(_pre_contract_provenance_rows(session, int(generation_id)))
     lost_before = lost_supplier_receipt_provenance_sle_ids(
         session, ledger_generation_id=int(generation_id)
     )
@@ -1383,6 +1460,19 @@ def _supplier_provenance_repair_on_session(
                 reowned += 1
         session.flush()
 
+    try:
+        normalised = _normalise_pre_contract_provenance(session, int(generation_id))
+    except ValueError as exc:
+        raise PostflightBlocked(
+            f"supplier provenance repair cannot normalise pre-contract rows: {exc}"
+        ) from exc
+    pre_contract_after = len(_pre_contract_provenance_rows(session, int(generation_id)))
+    if pre_contract_after:
+        raise PostflightBlocked(
+            f"supplier provenance repair left {pre_contract_after} pre-contract "
+            f"rows at generation {int(generation_id)}"
+        )
+
     lost_after = lost_supplier_receipt_provenance_sle_ids(
         session, ledger_generation_id=int(generation_id)
     )
@@ -1405,7 +1495,10 @@ def _supplier_provenance_repair_on_session(
         "lost_after": 0,
         # Reported, never repaired: a supplier document nobody ever typed.
         "untyped_anywhere": len(untyped_anywhere),
-        "idempotent": reowned == 0,
+        "pre_contract_rows_before": int(pre_contract_before),
+        "pre_contract_rows_normalised": int(normalised),
+        "pre_contract_rows_after": int(pre_contract_after),
+        "idempotent": reowned == 0 and normalised == 0,
     }
 
 

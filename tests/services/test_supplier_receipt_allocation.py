@@ -8,6 +8,7 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
     CORRECTION_OPERATION,
     RECEIPT_OPERATION,
+    SUPPLIER_ORDER_TYPE,
     SUPPLIER_RETURN_OPERATION,
     TRANSFER_OPERATION,
     ReceiptFact,
@@ -1076,6 +1077,7 @@ def _bounded_typed_row(db, generation, sle, *, order_ref="order-1", line_no="1")
         signed_qty=sle.qty,
         match_rule="bounded-typed",
         match_status="exact",
+        supplier_order_type=SUPPLIER_ORDER_TYPE,
         supplier_order_ref=order_ref,
         supplier_order_line_no=line_no,
         characteristic_ref=sle.characteristic_ref,
@@ -1189,32 +1191,17 @@ def test_both_writers_produce_the_same_payload_key_set(db_session):
     assert set(excluded.evidence_payload) == set(SUPPLIER_PROVENANCE_PAYLOAD_KEYS)
 
 
-def test_a_row_written_before_the_contract_is_readable_without_migration(db_session):
-    """The 26 rows already on the clone, written by hand exactly as they are.
+def _pre_contract_row(db, generation, sle, *, receipt_doc_ref="doc", payload=None):
+    """A row exactly as the bounded writer stored it before the contract.
 
-    They carry the writer's own marker in ``operation_key``/``operation_name``
-    and lack three payload keys, so the rebuild first called them incomplete
-    and then called their operation unsupported.  Their ``operation_kind``
-    column is the typed classification their writer already made; the next
-    bounded typing pass brings the row up to the contract from it, and the
-    rebuild then reads the typed fields from the columns.
+    Writer markers in the identity and operation columns; the payload is
+    whatever that writer happened to put there (``{}`` = none of the keys).
     """
-    generation, _req = _persistence_fixture(db_session, legacy_received=0)
-    sle = db_session.query(models.StockLedgerEntry).one()
-    payload = {
-        "receipt_doc_ref": "doc",
-        "receipt_doc_line_no": "1",
-        "item_id": int(sle.item_id),
-        "signed_qty": "3.000",
-        "supplier_order_ref": "order-1",
-        "supplier_order_line_no": "1",
-        "correction_receipt_ref": None,
-    }
-    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+    row = models.StockLedgerSupplierReceiptProvenance(
         ledger_generation_id=int(generation.id),
         stock_ledger_entry_id=int(sle.id),
         receipt_doc_type="bounded_physical_refresh",
-        receipt_doc_ref="doc",
+        receipt_doc_ref=receipt_doc_ref,
         receipt_doc_line_no="1",
         supplier_order_ref="order-1",
         supplier_order_line_no="1",
@@ -1223,30 +1210,60 @@ def test_a_row_written_before_the_contract_is_readable_without_migration(db_sess
         operation_name="bounded typed supplier evidence",
         correction_receipt_ref=None,
         evidence_hash="legacy".ljust(64, "0"),
-        evidence_payload=payload,
+        evidence_payload={} if payload is None else payload,
         match_rule="bounded-typed",
         match_status="exact",
         ambiguity_count=0,
-    ))
-    db_session.commit()
-    legacy = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    )
+    db.add(row)
+    db.flush()
+    return row
 
+
+@pytest.mark.parametrize(
+    ("receipt_doc_ref", "historic_payload"),
+    [
+        # No payload keys at all.
+        ("doc", False),
+        ("sle:{sle_id}", False),
+        # The payload the pre-contract writer really stored: this is the
+        # shape that failed with "has no explicit physical Ledger row".
+        ("doc", True),
+    ],
+)
+def test_a_pre_contract_row_rebuilds_from_its_own_sle(
+    db_session, receipt_doc_ref, historic_payload
+):
+    """The 26 rows on the clone, as they are, without waiting for a delta.
+
+    ``receipt_doc_type='bounded_physical_refresh'`` never equals the SLE's
+    ``recorder_type``, so the normalizer found "no explicit physical Ledger
+    row" and the obligation refresh (run 506) failed.  The row references its
+    SLE, which is the deterministic source of the document identity and of
+    whatever the payload lacks; ``exact`` names the supplier order document.
+    """
     from app.services.item_ledger.supplier_receipt_allocation import (
-        canonical_operation_for_kind,
-        resolves_to_documented_operation,
+        SUPPLIER_ORDER_TYPE,
+        provenance_is_pre_contract,
     )
 
-    # Recognised as pre-contract, which is what makes the next bounded typing
-    # pass upgrade it in place instead of skipping it.
-    assert resolves_to_documented_operation(
-        legacy.operation_key, legacy.operation_name
-    ) is False
-
-    # Apply exactly what that upgrade writes...
-    key, name = canonical_operation_for_kind(str(legacy.operation_kind))
-    legacy.operation_key = key
-    legacy.operation_name = name
-    legacy.receipt_doc_type = "Document_Receipt"
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    ref = receipt_doc_ref.format(sle_id=int(sle.id))
+    payload = {
+        "receipt_doc_ref": ref,
+        "receipt_doc_line_no": "1",
+        "item_id": int(sle.item_id),
+        "signed_qty": str(sle.qty),
+        "supplier_order_ref": "order-1",
+        "supplier_order_line_no": "1",
+        "correction_receipt_ref": None,
+    } if historic_payload else None
+    legacy = _pre_contract_row(
+        db_session, generation, sle, receipt_doc_ref=ref, payload=payload,
+    )
+    db_session.commit()
+    assert provenance_is_pre_contract(legacy)
 
     result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
         db_session,
@@ -1257,3 +1274,74 @@ def test_a_row_written_before_the_contract_is_readable_without_migration(db_sess
     db_session.commit()
 
     assert result.provenance_count == 1
+    assert result.exact_fact_count == 1
+    rebuilt = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    assert str(rebuilt.match_status) == "exact"
+    assert str(rebuilt.receipt_doc_type) == str(sle.recorder_type)
+    assert str(rebuilt.receipt_doc_ref) == str(sle.recorder_ref)
+    assert rebuilt.evidence_payload["supplier_order_type"] == SUPPLIER_ORDER_TYPE
+    assert not provenance_is_pre_contract(rebuilt)
+
+
+def test_a_pre_contract_row_whose_sle_is_gone_fails_closed(db_session):
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        resolve_persisted_supplier_evidence,
+    )
+
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    legacy = _pre_contract_row(db_session, generation, sle)
+
+    with pytest.raises(SupplierReceiptEvidenceError, match="physical Ledger row is missing"):
+        resolve_persisted_supplier_evidence(legacy, None)
+
+
+def test_a_bounded_typed_exact_row_stays_exact_after_the_rebuild(db_session):
+    """With the order type present, replay re-derives ``exact``.
+
+    Without it ``_candidate_order_lines`` sees type '' and the row replays as
+    ``unmatched``: the receipt stops allocating to its BUY owner.
+    """
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    _bounded_typed_row(db_session, generation, sle)
+    db_session.commit()
+
+    result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db_session,
+        ledger_generation_id=generation.id,
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    assert result.exact_fact_count == 1
+    assert result.allocation_count >= 1
+    rebuilt = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    assert str(rebuilt.match_status) == "exact"
+
+
+def test_the_builder_refuses_an_exact_row_without_the_order_type(db_session):
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        build_supplier_receipt_provenance,
+    )
+
+    generation, _req = _persistence_fixture(db_session, legacy_received=0)
+    sle = db_session.query(models.StockLedgerEntry).one()
+    with pytest.raises(SupplierReceiptEvidenceError, match="requires supplier order type"):
+        build_supplier_receipt_provenance(
+            ledger_generation_id=int(generation.id),
+            stock_ledger_entry_id=int(sle.id),
+            receipt_doc_type=sle.recorder_type,
+            receipt_doc_ref=sle.recorder_ref,
+            receipt_doc_line_no=sle.line_no,
+            operation_kind="supplier_receipt",
+            operation_key=RECEIPT_OPERATION,
+            operation_name="приобретение у поставщика",
+            item_id=int(sle.item_id),
+            signed_qty=sle.qty,
+            match_rule="bounded-typed",
+            match_status="exact",
+            supplier_order_ref="order-1",
+            supplier_order_line_no="1",
+        )

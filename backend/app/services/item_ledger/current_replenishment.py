@@ -2320,57 +2320,65 @@ def _ensure_bounded_supplier_evidence(
                 raise CurrentReplenishmentError(
                     f"typed supplier evidence conflicts for SLE {fact_id}"
                 )
-            from .supplier_receipt_allocation import (
-                resolves_to_documented_operation,
-            )
+            from .supplier_receipt_allocation import provenance_is_pre_contract
 
-            if resolves_to_documented_operation(
-                _text(existing.operation_key), _text(existing.operation_name)
-            ):
+            if not provenance_is_pre_contract(existing):
                 continue
             # A row written before the one-row contract names its writer
-            # instead of a 1C operation, so nothing can rebuild from it.  The
-            # fact and its typing are unchanged - only the row's own evidence
-            # is brought up to the contract - so this is a repair on write,
-            # idempotent, and it is why no data migration is needed.
+            # instead of a 1C document/operation, or lacks the order type of
+            # an exact line.  The fact and its typing are unchanged - only the
+            # row's own evidence is brought up to the contract - so this is a
+            # repair on write, idempotent.  Rows no later delta touches are
+            # resolved by the reader and normalised by the repair phase.
         from .supplier_receipt_allocation import (
+            SupplierReceiptEvidenceError,
             build_supplier_receipt_provenance,
             canonical_operation_for_kind,
         )
 
         exact = bool(_text(raw.supplier_order_ref) and _text(raw.supplier_order_line_no))
         sle = db.get(models.StockLedgerEntry, int(fact_id))
+        if sle is None:
+            raise CurrentReplenishmentError(
+                f"typed supplier evidence references missing SLE {fact_id}"
+            )
         operation_key, operation_name = canonical_operation_for_kind(kind)
-        upgraded = build_supplier_receipt_provenance(
-            ledger_generation_id=int(target.id),
-            stock_ledger_entry_id=int(fact_id),
-            # One row contract: the same builder the canonical writer uses, so
-            # both stores are filled the same way and an obligation refresh can
-            # rebuild from a row the bounded path wrote.
-            receipt_doc_type=(
-                getattr(sle, "recorder_type", "") if sle is not None
-                else "bounded_physical_refresh"
-            ),
-            receipt_doc_ref=_text(raw.receipt_ref) or f"sle:{fact_id}",
-            receipt_doc_line_no=_text(raw.receipt_line_no) or "1",
-            # The operation is the documented one for this kind, not a marker
-            # naming the writer: the rebuild resolves a row back to its
-            # operation from these two fields.
-            operation_kind=kind,
-            operation_key=operation_key,
-            operation_name=operation_name,
-            item_id=int(raw.item_id),
-            signed_qty=raw.signed_qty,
-            match_rule="bounded-typed",
-            match_status="exact" if exact else "unmatched",
-            supplier_order_ref=raw.supplier_order_ref,
-            supplier_order_line_no=raw.supplier_order_line_no,
-            characteristic_ref=getattr(sle, "characteristic_ref", "") if sle else "",
-            warehouse_ref1c=getattr(sle, "warehouse_ref1c", "") if sle else "",
-            correction_receipt_ref=raw.correction_receipt_ref,
-            ambiguity_count=0,
-            reason=None if exact else "typed evidence has no supplier order line",
-        )
+        try:
+            upgraded = build_supplier_receipt_provenance(
+                ledger_generation_id=int(target.id),
+                stock_ledger_entry_id=int(fact_id),
+                # One row contract: the same builder the canonical writer uses, so
+                # both stores are filled the same way and an obligation refresh can
+                # rebuild from a row the bounded path wrote.
+                # The document identity is the SLE's own: the rebuild matches
+                # evidence to its physical row by exactly this triple.
+                receipt_doc_type=sle.recorder_type,
+                receipt_doc_ref=_text(raw.receipt_ref) or sle.recorder_ref,
+                receipt_doc_line_no=_text(raw.receipt_line_no) or sle.line_no,
+                # The operation is the documented one for this kind, not a marker
+                # naming the writer: the rebuild resolves a row back to its
+                # operation from these two fields.
+                operation_kind=kind,
+                operation_key=operation_key,
+                operation_name=operation_name,
+                item_id=int(raw.item_id),
+                signed_qty=raw.signed_qty,
+                match_rule="bounded-typed",
+                match_status="exact" if exact else "unmatched",
+                # The order document the manifest matched; the builder refuses an
+                # exact row without it, because the rebuild would replay it as
+                # ``unmatched`` and the receipt would stop allocating.
+                supplier_order_type=_text(getattr(raw, "supplier_order_type", "")),
+                supplier_order_ref=raw.supplier_order_ref,
+                supplier_order_line_no=raw.supplier_order_line_no,
+                characteristic_ref=sle.characteristic_ref,
+                warehouse_ref1c=sle.warehouse_ref1c,
+                correction_receipt_ref=raw.correction_receipt_ref,
+                ambiguity_count=0,
+                reason=None if exact else "typed evidence has no supplier order line",
+            )
+        except SupplierReceiptEvidenceError as exc:
+            raise CurrentReplenishmentError(str(exc)) from exc
         if existing is not None:
             for field in (
                 "receipt_doc_type", "receipt_doc_ref", "receipt_doc_line_no",

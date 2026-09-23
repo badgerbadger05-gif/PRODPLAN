@@ -6,7 +6,8 @@ does not read OData or legacy ``received_qty`` projections.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Iterable, Literal
@@ -25,12 +26,18 @@ from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
 from .current_replenishment import reject_legacy_supplier_receipt_writer
 
+logger = logging.getLogger(__name__)
 
 RECEIPT_OPERATION = "8d97069c"
 CORRECTION_OPERATION = "8d96f940"
 SUPPLIER_RETURN_OPERATION = "8d96f436"
 TRANSFER_OPERATION = "8d970232"
 SUPPLIER_ORDER_TYPE = "Document_ЗаказПоставщику"
+#: ``receipt_doc_type`` values that name the writer instead of the 1C
+#: document the fact was recorded by.  The bounded physical refresh stored
+#: this marker before the one-row contract; such a row cannot be matched to
+#: its SLE as stored and is resolved from the SLE it already references.
+WRITER_MARKER_DOCUMENT_TYPES = frozenset({"bounded_physical_refresh"})
 
 _OPERATION_NAMES = {
     RECEIPT_OPERATION: frozenset({
@@ -137,6 +144,12 @@ class ReceiptFact:
     # when PRODPLAN accepted the evidence; reports choose the axis explicitly.
     known_at: datetime | None = None
     planning_stock_pool: str = "default"
+    # The 1C document type of ``supplier_order_ref``.  Set by the normalizer
+    # for an exact line only - the only type that can be exact - so a writer
+    # that persists the fact records which order document it matched.  It is
+    # evidence metadata, not allocation input: two facts that allocate the
+    # same way are equal whether or not one was re-read from persisted rows.
+    supplier_order_type: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -949,6 +962,10 @@ def normalize_supplier_receipt_evidence(
                     receipt_ref=_text(row.receipt_doc_ref),
                     receipt_line_no=_text(row.receipt_doc_line_no),
                     correction_receipt_ref=_text(row.correction_receipt_ref) or None,
+                    supplier_order_type=(
+                        _normalized_type(row.supplier_order_type)
+                        if status == "exact" else ""
+                    ),
                 ),
                 evidence=row,
                 operation=operation,
@@ -1206,7 +1223,20 @@ def build_supplier_receipt_provenance(
     supplier order type) so a rebuild can reconstruct the evidence without
     re-reading 1C.  Both stores are filled here, once, so a row cannot be
     half-written by whichever writer happened to create it.
+
+    An ``exact`` row must name the supplier order document it matched: the
+    rebuild re-derives exactness from that type, and a row without it would
+    silently replay as ``unmatched`` and stop allocating to its BUY owner.
     """
+    if (
+        str(match_status) == "exact"
+        and _normalized_type(supplier_order_type) != SUPPLIER_ORDER_TYPE
+    ):
+        raise SupplierReceiptEvidenceError(
+            f"exact supplier receipt provenance for SLE {int(stock_ledger_entry_id)} "
+            f"requires supplier order type {SUPPLIER_ORDER_TYPE}, got "
+            f"{_text(supplier_order_type)!r}"
+        )
     payload = {
         "receipt_doc_type": _text(receipt_doc_type)[:64],
         "receipt_doc_ref": _text(receipt_doc_ref)[:64],
@@ -1268,6 +1298,189 @@ def rebuild_supplier_receipt_coverage(
         )
 
 
+#: Generations whose pre-contract rows were already reported, so a stand
+#: that has not been repaired yet logs once per generation, not per refresh.
+_PRE_CONTRACT_LOGGED: set[int] = set()
+
+
+def _payload_of(row: models.StockLedgerSupplierReceiptProvenance) -> dict:
+    return dict(row.evidence_payload or {})
+
+
+def _has_documented_identity(
+    row: models.StockLedgerSupplierReceiptProvenance,
+) -> bool:
+    doc_type = _text(row.receipt_doc_type)
+    ref = _text(row.receipt_doc_ref)
+    return (
+        bool(doc_type)
+        and doc_type not in WRITER_MARKER_DOCUMENT_TYPES
+        and bool(ref)
+        and not ref.startswith("sle:")
+        and bool(_text(row.receipt_doc_line_no))
+    )
+
+
+_PHYSICAL_PAYLOAD_KEYS = ("item_id", "signed_qty", "characteristic_ref", "warehouse_ref1c")
+
+
+def _needs_physical_row(row: models.StockLedgerSupplierReceiptProvenance) -> bool:
+    payload = _payload_of(row)
+    return not _has_documented_identity(row) or any(
+        payload.get(key) is None for key in _PHYSICAL_PAYLOAD_KEYS
+    )
+
+
+def _sles_by_id(
+    db: Session, sle_ids: Iterable[int]
+) -> dict[int, models.StockLedgerEntry]:
+    ids = sorted({int(value) for value in sle_ids})
+    result: dict[int, models.StockLedgerEntry] = {}
+    for offset in range(0, len(ids), 1000):
+        chunk = ids[offset:offset + 1000]
+        for sle in db.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.id.in_(chunk)
+        ):
+            result[int(sle.id)] = sle
+    return result
+
+
+def provenance_is_pre_contract(
+    row: models.StockLedgerSupplierReceiptProvenance,
+) -> bool:
+    """Whether a row predates the one-row contract and needs normalising.
+
+    Such a row names its writer instead of the 1C document or operation, lacks
+    payload keys the contract declares, or is ``exact`` without the supplier
+    order type that makes it exact on replay.  ``excluded_non_supplier`` rows
+    are never replayed and are not judged here.
+    """
+    if _text(row.match_status) == "excluded_non_supplier":
+        return False
+    payload = _payload_of(row)
+    return (
+        not _has_documented_identity(row)
+        or not resolves_to_documented_operation(
+            _text(row.operation_key), _text(row.operation_name)
+        )
+        or any(key not in payload for key in SUPPLIER_PROVENANCE_PAYLOAD_KEYS)
+        or any(payload.get(key) is None for key in _PHYSICAL_PAYLOAD_KEYS)
+        or (
+            _text(row.match_status) == "exact"
+            and _normalized_type(payload.get("supplier_order_type"))
+            != SUPPLIER_ORDER_TYPE
+        )
+    )
+
+
+def resolve_persisted_supplier_evidence(
+    row: models.StockLedgerSupplierReceiptProvenance,
+    sle: models.StockLedgerEntry | None,
+) -> tuple[SupplierDocumentEvidence, bool]:
+    """Reconstruct one row's document evidence; the one formula for it.
+
+    Used by the rebuild an obligation refresh runs and by the repair phase
+    that normalises rows in place, so both read a pre-contract row the same
+    way.  Returns the evidence and whether the row's own SLE had to supply
+    part of it.
+
+    Typed fields come from the columns - the relational store every writer
+    fills - and the payload supplies what has no column.  A row written before
+    the one-row contract is resolved deterministically from the physical fact
+    it already references (``stock_ledger_entry_id``): the document identity
+    (``recorder_type``/``recorder_ref``/``line_no``) and, where the payload
+    lacks them, item, quantity, characteristic and warehouse.  The supplier
+    order type of an ``exact`` row is the supplier order document: the
+    normalizer only ever produced ``exact`` by matching one of its lines.
+    Nothing is invented - a row whose SLE is gone fails closed.
+    """
+    payload = _payload_of(row)
+    sle_id = int(row.stock_ledger_entry_id)
+    from_sle = False
+
+    def _physical() -> models.StockLedgerEntry:
+        nonlocal from_sle
+        if sle is None:
+            raise SupplierReceiptEvidenceError(
+                "persisted supplier receipt provenance is incomplete for "
+                f"SLE {sle_id}: its physical Ledger row is missing"
+            )
+        from_sle = True
+        return sle
+
+    if _has_documented_identity(row):
+        receipt_doc_type = _text(row.receipt_doc_type)
+        receipt_doc_ref = _text(row.receipt_doc_ref)
+        receipt_doc_line_no = _text(row.receipt_doc_line_no)
+    else:
+        physical = _physical()
+        receipt_doc_type = _text(physical.recorder_type)
+        stored_ref = _text(row.receipt_doc_ref)
+        synthetic = not stored_ref or stored_ref.startswith("sle:")
+        receipt_doc_ref = _text(physical.recorder_ref) if synthetic else stored_ref
+        receipt_doc_line_no = (
+            _text(physical.line_no)
+            if synthetic or not _text(row.receipt_doc_line_no)
+            else _text(row.receipt_doc_line_no)
+        )
+
+    # ``operation_kind`` is a column and is the typed classification the
+    # writer already made, so it - not a marker string - decides which
+    # documented operation a row replays as when the stored pair names a
+    # writer ("26 rows with 'bounded_physical_refresh'").
+    stored_key = _text(row.operation_key)
+    stored_name = _text(row.operation_name)
+    if resolves_to_documented_operation(stored_key, stored_name):
+        operation_key, operation_name = stored_key, stored_name
+    else:
+        operation_key, operation_name = canonical_operation_for_kind(
+            _text(row.operation_kind)
+        )
+
+    def _field(key: str, physical_attr: str) -> object:
+        if payload.get(key) is not None:
+            return payload[key]
+        return getattr(_physical(), physical_attr)
+
+    supplier_order_ref = (
+        _text(row.supplier_order_ref) or _text(payload.get("supplier_order_ref"))
+    )
+    supplier_order_type = _normalized_type(payload.get("supplier_order_type"))
+    if (
+        not supplier_order_type
+        and _text(row.match_status) == "exact"
+        and supplier_order_ref
+    ):
+        supplier_order_type = SUPPLIER_ORDER_TYPE
+    try:
+        evidence = SupplierDocumentEvidence(
+            receipt_doc_type=receipt_doc_type,
+            receipt_doc_ref=receipt_doc_ref,
+            receipt_doc_line_no=receipt_doc_line_no,
+            operation_key=operation_key,
+            operation_name=operation_name,
+            supplier_order_type=supplier_order_type,
+            supplier_order_ref=supplier_order_ref,
+            supplier_order_line_no=_text(row.supplier_order_line_no)
+            or _text(payload.get("supplier_order_line_no")),
+            item_id=int(_field("item_id", "item_id")),
+            characteristic_ref=_text(_field("characteristic_ref", "characteristic_ref")),
+            warehouse_ref1c=_text(_field("warehouse_ref1c", "warehouse_ref1c")),
+            signed_qty=_decimal(_field("signed_qty", "qty")),
+            correction_receipt_ref=(
+                _text(row.correction_receipt_ref)
+                or _text(payload.get("correction_receipt_ref"))
+                or None
+            ),
+        )
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise SupplierReceiptEvidenceError(
+            "persisted supplier receipt provenance is incomplete for "
+            f"SLE {sle_id}"
+        ) from exc
+    return evidence, from_sle
+
+
 def rebuild_supplier_receipt_coverage_from_persisted_provenance(
     db: Session,
     *,
@@ -1297,58 +1510,28 @@ def rebuild_supplier_receipt_coverage_from_persisted_provenance(
         )
         .all()
     )
+    needs_sle = [
+        int(row.stock_ledger_entry_id) for row in rows if _needs_physical_row(row)
+    ]
+    sles = _sles_by_id(db, needs_sle)
     evidence: list[SupplierDocumentEvidence] = []
+    resolved_from_sle = 0
     for row in rows:
-        payload = dict(row.evidence_payload or {})
-        # ``operation_kind`` is a column and is the typed classification the
-        # writer already made, so it - not a marker string - decides which
-        # documented operation this row replays as.  Rows written before the
-        # one-row contract carry a writer-name in ``operation_key`` ("26 rows
-        # with 'bounded_physical_refresh'"); they are readable from their own
-        # kind without a data migration.
-        stored_key = _text(row.operation_key)
-        stored_name = _text(row.operation_name)
-        if resolves_to_documented_operation(stored_key, stored_name):
-            operation_key, operation_name = stored_key, stored_name
-        else:
-            operation_key, operation_name = canonical_operation_for_kind(
-                _text(row.operation_kind)
-            )
-        try:
-            # Typed fields come from the columns, which are the relational
-            # store every writer fills; the payload supplies only what has no
-            # column.  Reading them from the payload made the rebuild depend
-            # on one writer's payload shape, and rows written by the bounded
-            # typing - which fills the columns - were rejected as incomplete.
-            evidence.append(SupplierDocumentEvidence(
-                receipt_doc_type=_text(row.receipt_doc_type)
-                or str(payload.get("receipt_doc_type") or ""),
-                receipt_doc_ref=_text(row.receipt_doc_ref)
-                or str(payload.get("receipt_doc_ref") or ""),
-                receipt_doc_line_no=_text(row.receipt_doc_line_no)
-                or str(payload.get("receipt_doc_line_no") or ""),
-                operation_key=operation_key,
-                operation_name=operation_name,
-                supplier_order_type=str(payload.get("supplier_order_type") or ""),
-                supplier_order_ref=_text(row.supplier_order_ref)
-                or str(payload.get("supplier_order_ref") or ""),
-                supplier_order_line_no=_text(row.supplier_order_line_no)
-                or str(payload.get("supplier_order_line_no") or ""),
-                item_id=int(payload["item_id"]),
-                characteristic_ref=str(payload.get("characteristic_ref") or ""),
-                warehouse_ref1c=str(payload.get("warehouse_ref1c") or ""),
-                signed_qty=_decimal(payload["signed_qty"]),
-                correction_receipt_ref=(
-                    _text(row.correction_receipt_ref)
-                    or str(payload.get("correction_receipt_ref") or "")
-                    or None
-                ),
-            ))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise SupplierReceiptEvidenceError(
-                "persisted supplier receipt provenance is incomplete for "
-                f"SLE {int(row.stock_ledger_entry_id)}"
-            ) from exc
+        resolved, from_sle = resolve_persisted_supplier_evidence(
+            row, sles.get(int(row.stock_ledger_entry_id))
+        )
+        evidence.append(resolved)
+        resolved_from_sle += int(from_sle)
+    if resolved_from_sle and int(ledger_generation_id) not in _PRE_CONTRACT_LOGGED:
+        _PRE_CONTRACT_LOGGED.add(int(ledger_generation_id))
+        logger.warning(
+            "supplier receipt rebuild of generation %s resolved %s pre-contract "
+            "provenance rows from their own SLE; run "
+            "`current_execution_migration --phase supplier-provenance-repair` "
+            "to normalise them in place",
+            int(ledger_generation_id),
+            resolved_from_sle,
+        )
     return rebuild_supplier_receipt_coverage(
         db,
         ledger_generation_id=int(ledger_generation_id),

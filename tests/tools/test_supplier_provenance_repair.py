@@ -233,3 +233,72 @@ def test_pre_deploy_backlog_is_its_own_read_only_phase():
         assert report["ambiguous_distribution_pool_count"] == 0
     else:
         assert report["reason"]
+
+
+def test_repair_normalises_pre_contract_rows_in_place():
+    """A stand is repaired without waiting for a delta to touch the rows.
+
+    The pointer owns rows exactly as the bounded writer stored them before
+    the one-row contract: writer markers in the identity and operation
+    columns, no payload keys.  The phase re-derives their evidence from the
+    SLE each already references and writes it through the one row builder;
+    a second run finds nothing to do.
+    """
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        SUPPLIER_ORDER_TYPE,
+        SUPPLIER_PROVENANCE_PAYLOAD_KEYS,
+        provenance_is_pre_contract,
+    )
+
+    engine = _engine()
+    _old_id, pointer_id = _world(engine, type_at_old=False, receipts=2)
+    with Session(engine) as session:
+        for sle in session.query(models.StockLedgerEntry).all():
+            session.add(models.StockLedgerSupplierReceiptProvenance(
+                ledger_generation_id=int(pointer_id),
+                stock_ledger_entry_id=int(sle.id),
+                receipt_doc_type="bounded_physical_refresh",
+                receipt_doc_ref=f"sle:{int(sle.id)}",
+                receipt_doc_line_no="1",
+                supplier_order_ref="ORDER-1",
+                supplier_order_line_no="1",
+                operation_kind="supplier_receipt",
+                operation_key="bounded_physical_refresh",
+                operation_name="bounded typed supplier evidence",
+                evidence_hash="legacy".ljust(64, "0"),
+                evidence_payload={},
+                match_rule="bounded-typed",
+                match_status="exact",
+                ambiguity_count=0,
+            ))
+        session.commit()
+
+    first = apply_supplier_provenance_repair(engine, writers_stopped=True)
+    second = apply_supplier_provenance_repair(engine, writers_stopped=True)
+
+    assert first["status"] == "ready"
+    assert first["pre_contract_rows_before"] == 2
+    assert first["pre_contract_rows_normalised"] == 2
+    assert first["pre_contract_rows_after"] == 0
+    assert first["idempotent"] is False
+    assert second["pre_contract_rows_before"] == 0
+    assert second["pre_contract_rows_normalised"] == 0
+    assert second["idempotent"] is True
+    with Session(engine) as session:
+        rows = session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+            ledger_generation_id=pointer_id
+        ).all()
+        assert len(rows) == 2
+        for row in rows:
+            sle = session.get(models.StockLedgerEntry, int(row.stock_ledger_entry_id))
+            assert not provenance_is_pre_contract(row)
+            assert row.receipt_doc_type == sle.recorder_type
+            assert row.receipt_doc_ref == sle.recorder_ref
+            assert row.receipt_doc_line_no == sle.line_no
+            assert set(row.evidence_payload) == set(SUPPLIER_PROVENANCE_PAYLOAD_KEYS)
+            assert row.evidence_payload["supplier_order_type"] == SUPPLIER_ORDER_TYPE
+            assert Decimal(row.evidence_payload["signed_qty"]) == Decimal("5")
+            # Typing is untouched: same order line, status and rule.
+            assert (row.supplier_order_ref, row.match_status, row.match_rule) == (
+                "ORDER-1", "exact", "bounded-typed",
+            )
