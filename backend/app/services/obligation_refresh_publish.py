@@ -955,6 +955,19 @@ def publish_obligation_refresh_batch(
         validate_production_journal_payload(direct_production_payload, target)
     except RuntimeError as exc:
         raise ObligationRefreshPublishError(str(exc)) from exc
+    # Invariants 2-3 (planning-truth-contract): one physical fact is counted
+    # once and its current allocations never exceed it.  The owners this
+    # refresh closed have had their claims retired by now, so an offender
+    # here is a real double count and the refresh must not become visible.
+    from .item_ledger.current_replenishment import (
+        CurrentReplenishmentError,
+        require_facts_not_over_allocated,
+    )
+
+    try:
+        require_facts_not_over_allocated(db)
+    except CurrentReplenishmentError as exc:
+        raise ObligationRefreshPublishError(str(exc)) from exc
     if _source_export_links_exist(db, candidate_ids):
         raise ObligationRefreshPublishError("candidate has external export links")
 

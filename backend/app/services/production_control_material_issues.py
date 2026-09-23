@@ -122,13 +122,16 @@ def _auto_select_source_warehouse(
 
     if ledger_generation_id is None:
         raise ValueError("accepted Ledger generation is required for source stock selection")
+    from .mrp_stock_helpers import current_stock_bin_query
+
+    # Canon R6: the current bin set is ``is_current``; its generation column
+    # is provenance.  Filtering it by the pointer emptied this list after
+    # every obligation refresh and kept only touched keys after a bounded one.
     rows = (
-        db.query(StockBin.warehouse_ref1c, StockBin.item_id)
-        .filter(
-            StockBin.is_current.is_(True),
-            StockBin.ledger_generation_id == int(ledger_generation_id),
-            StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
+        current_stock_bin_query(
+            db, int(ledger_generation_id), StockBin.warehouse_ref1c, StockBin.item_id,
         )
+        .filter(StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0)
         .all()
     )
 
@@ -197,15 +200,14 @@ def _source_warehouse_options(
 
     if ledger_generation_id is None:
         raise ValueError("accepted Ledger generation is required for source stock selection")
+    from .mrp_stock_helpers import current_stock_bin_query
+
     rows = (
-        db.query(
+        current_stock_bin_query(
+            db, int(ledger_generation_id),
             StockBin.item_id, StockBin.warehouse_ref1c, func.sum(StockBin.on_hand),
         )
-        .filter(
-            StockBin.is_current.is_(True),
-            StockBin.ledger_generation_id == int(ledger_generation_id),
-            StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
-        )
+        .filter(StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0)
         .group_by(StockBin.item_id, StockBin.warehouse_ref1c)
         .all()
     )

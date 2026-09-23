@@ -22,7 +22,7 @@ def _accepted(db, key="one"):
     return generation
 
 
-def test_source_selection_uses_current_accepted_stockbin_generation_only(db_session):
+def _two_generation_bins(db_session, *, foreign_is_current):
     generation = _accepted(db_session)
     item = models.Item(item_code="MI-LEDGER", item_name="Ledger item")
     db_session.add_all((item, models.StockWarehouse(warehouse_ref1c="BIN", warehouse_name="BIN", is_selected=True),
@@ -62,11 +62,30 @@ def test_source_selection_uses_current_accepted_stockbin_generation_only(db_sess
             organization_ref="",
             warehouse_ref1c="LEGACY",
             on_hand=99,
+            is_current=foreign_is_current,
         ),
     ])
     db_session.flush()
+    return generation, item
+
+
+def test_source_selection_uses_the_current_stockbin_set_only(db_session):
+    """Canon R6: membership is ``is_current``; the generation is provenance."""
+    generation, item = _two_generation_bins(db_session, foreign_is_current=False)
     options = issues._source_warehouse_options(db_session, [item.item_id], ledger_generation_id=generation.id)
     assert options[item.item_id] == [{"ref1c": "BIN", "name": "BIN", "qty": 4.0}]
+
+
+def test_source_selection_fails_closed_on_a_current_bin_of_an_unrelated_generation(db_session):
+    """A current bin outside the pointer's lineage is an ambiguous projection.
+
+    It used to be silently filtered out by ``ledger_generation_id ==
+    pointer``, the same filter that dropped every valid bin after an
+    obligation refresh.  The canonical current read refuses it instead.
+    """
+    generation, item = _two_generation_bins(db_session, foreign_is_current=True)
+    with pytest.raises(ValueError, match="stale or ambiguous"):
+        issues._source_warehouse_options(db_session, [item.item_id], ledger_generation_id=generation.id)
 
 
 def test_create_fails_closed_without_accepted_truth(db_session):

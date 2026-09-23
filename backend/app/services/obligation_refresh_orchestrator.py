@@ -635,8 +635,12 @@ def run_obligation_refresh(
         cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
         writer_mode="current",
     )
+    # The scope's live owners after this publication are the staged ones and
+    # the retained runs' current owners; both are handed in, so a fact held by
+    # a retained owner is not handed to a successor a second time.
     current_replenishment = apply_current_replenishment_for_accepted_generation(
-        db, generation_id=target_id, allow_building=True
+        db, generation_id=target_id, allow_building=True,
+        retained_run_ids=retained_run_ids,
     )
     supplier_summary = {
         "provenance_count": supplier.provenance_count,

@@ -33,6 +33,33 @@ def publish_current_reservations(
     generation_id: int,
     retire_run_ids: Iterable[int] | None = None,
 ) -> dict[str, int]:
+    """Publish the owners, then retire every closed owner's current claims.
+
+    An owner this publication closes (the R11 retire branch) - or one closed
+    earlier and still holding a current allocation - no longer counts a
+    physical fact: its current R4 allocations are retired in the same
+    transaction by the single current writer, and the fact returns to FIFO
+    for the live owners.  See :func:`_publish_current_reservation_owners` for
+    the owner publication itself.
+    """
+    from .current_replenishment import retire_current_allocations_of_closed_owners
+
+    result = dict(_publish_current_reservation_owners(
+        db, generation_id=generation_id, retire_run_ids=retire_run_ids,
+    ))
+    retired = retire_current_allocations_of_closed_owners(
+        db, generation_id=int(generation_id)
+    )
+    result["retired_allocations"] = int(retired["retired_allocations"])
+    return result
+
+
+def _publish_current_reservation_owners(
+    db: Session,
+    *,
+    generation_id: int,
+    retire_run_ids: Iterable[int] | None = None,
+) -> dict[str, int]:
     """Atomically publish target BUILDING reservations into stable owners.
 
     PostgreSQL uses set-based temporary mapping and updates.  SQLite keeps a

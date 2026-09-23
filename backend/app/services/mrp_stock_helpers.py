@@ -161,16 +161,31 @@ def apply_planning_warehouse_scope(
     return query
 
 
-def planning_stock_by_item(
-    db: Session,
-    ledger_generation_id: int,
-    *,
-    item_ids: Optional[Set[int]] = None,
-    organization_ref: Optional[str] = DEFAULT_ORGANIZATION_REF1C,
-) -> Dict[int, float]:
-    if item_ids is not None and not item_ids:
-        return {}
-    scope = planning_warehouse_scope(db)
+def current_stock_bin_query(db: Session, ledger_generation_id: int, *entities: Any):
+    """The one accepted current ``StockBin`` read, for the exact truth pointer.
+
+    Canon R6: ``StockBin.ledger_generation_id`` is provenance, not
+    membership.  An obligation refresh never restamps bins and a bounded
+    refresh restamps only the keys it touched, so a filter on
+    ``ledger_generation_id == pointer`` silently drops every other key.  The
+    current set is ``is_current``; the provenance of those rows is validated
+    against the requested generation's lineage instead (stale or ambiguous
+    fails closed).  An accepted caller must name the exact truth pointer; a
+    BUILDING generation - a publication building its candidate payloads -
+    reads the same current set, bounded by its own lineage.
+    """
+    generation = db.get(LedgerGeneration, int(ledger_generation_id))
+    _require_current_stock_bin_provenance(
+        db,
+        int(ledger_generation_id),
+        require_pointer=generation is None or str(generation.status or "") != "building",
+    )
+    return db.query(*entities).filter(StockBin.is_current.is_(True))
+
+
+def _require_current_stock_bin_provenance(
+    db: Session, ledger_generation_id: int, *, require_pointer: bool = True,
+) -> None:
     # Current StockBin is compact, but the requested provenance must still be
     # the live truth pointer.  Never silently return a newer compact row to a
     # stale generation-bound caller.
@@ -180,26 +195,10 @@ def planning_stock_by_item(
         if pointer is not None and pointer.current_generation_id is not None
         else None
     )
-    if current_generation_id != int(ledger_generation_id):
+    if require_pointer and current_generation_id != int(ledger_generation_id):
         raise ValueError(
             "current StockBin provenance does not match requested Ledger generation"
         )
-    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
-        StockBin.is_current.is_(True)
-    )
-    if item_ids is not None:
-        query = query.filter(StockBin.item_id.in_(sorted(item_ids)))
-    query = apply_planning_warehouse_scope(
-        query,
-        scope,
-        warehouse_column=StockBin.warehouse_ref1c,
-        organization_column=StockBin.organization_ref,
-        organization_ref=organization_ref,
-    )
-    result = {
-        int(item_id): float(quantity or 0)
-        for item_id, quantity in query.group_by(StockBin.item_id).all()
-    }
     # A malformed compact projection must fail closed even if its rows happen
     # to satisfy the requested query filters.
     provenance_revision = int(db.info.get("_stock_bin_provenance_revision", 0))
@@ -229,7 +228,34 @@ def planning_stock_by_item(
             f"(requested={int(ledger_generation_id)}, pointer={current_generation_id}, "
             f"stored={sorted(provenance_ids)})"
         )
-    return result
+
+
+def planning_stock_by_item(
+    db: Session,
+    ledger_generation_id: int,
+    *,
+    item_ids: Optional[Set[int]] = None,
+    organization_ref: Optional[str] = DEFAULT_ORGANIZATION_REF1C,
+) -> Dict[int, float]:
+    if item_ids is not None and not item_ids:
+        return {}
+    scope = planning_warehouse_scope(db)
+    query = current_stock_bin_query(
+        db, int(ledger_generation_id), StockBin.item_id, func.sum(StockBin.on_hand),
+    )
+    if item_ids is not None:
+        query = query.filter(StockBin.item_id.in_(sorted(item_ids)))
+    query = apply_planning_warehouse_scope(
+        query,
+        scope,
+        warehouse_column=StockBin.warehouse_ref1c,
+        organization_column=StockBin.organization_ref,
+        organization_ref=organization_ref,
+    )
+    return {
+        int(item_id): float(quantity or 0)
+        for item_id, quantity in query.group_by(StockBin.item_id).all()
+    }
 
 
 def historical_stock_by_item(

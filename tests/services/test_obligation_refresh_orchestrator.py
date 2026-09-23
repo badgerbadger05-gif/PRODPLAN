@@ -1512,3 +1512,323 @@ def test_a_bounded_physical_refresh_after_an_obligation_refresh_is_accepted(
     assert published.target_generation_id == int(target.id)
     assert str(db_session.get(models.LedgerGeneration, target.id).status) == "accepted"
     db_session.rollback()
+
+
+# --- Item 26a: a closed owner does not keep counting a fact -------------------
+
+_SUPPLIER_RECEIPT_DOC = "Document_ПриходнаяНакладная"
+
+
+def _buy_owner_with_a_current_receipt_allocation(db, accepted, plan, item, parent, cutoff, *, qty="2"):
+    """The stand's shape: a current BUY owner holding a typed receipt."""
+    from app.services.item_ledger.current_replenishment import (
+        SUPPLIER_RECEIPT_SOURCE_KEY,
+        _scope_key,
+    )
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        RECEIPT_OPERATION,
+        build_supplier_receipt_provenance,
+    )
+
+    requirement = models.MrpRequirement(
+        run_id=int(parent.run_id), item_id=int(item.item_id),
+        total_required_qty=Decimal("5"), net_required_qty=Decimal("5"),
+        period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+        planning_stock_pool="default", characteristic_ref="", organization_ref="",
+        freeze_version=1,
+    )
+    db.add(requirement)
+    db.flush()
+    owner = models.ReservationEntry(
+        ledger_generation_id=int(accepted.id), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        run_id=int(parent.run_id), freeze_version=1, requirement_id=int(requirement.id),
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        realization_mode="buy", reserved_qty=Decimal("5"),
+        replenishment_required_qty=Decimal("5"), lifecycle_status="active",
+        owner_kind="current", is_current=True,
+        current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
+    )
+    db.add(owner)
+    receipt = models.StockLedgerEntry(
+        ingest_batch_id=int(accepted.physical_import_batch_id),
+        source_content_hash="item26-receipt".ljust(64, "0"),
+        item_id=int(item.item_id), characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-OUT", qty=Decimal(qty),
+        posting_at=cutoff - timedelta(hours=1), record_type="Receipt",
+        movement_kind="receipt", recorder_type=_SUPPLIER_RECEIPT_DOC,
+        recorder_ref="item26-receipt", line_no="1", ingest_source="seed", active=True,
+    )
+    db.add(receipt)
+    db.flush()
+    # The compact current fold has to agree with the prefix this fact joins.
+    db.add(models.StockBin(
+        ledger_generation_id=int(accepted.id), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-OUT",
+        on_hand=Decimal(qty), last_entry_id=int(receipt.id), is_current=True,
+    ))
+    db.add(build_supplier_receipt_provenance(
+        ledger_generation_id=int(accepted.id), stock_ledger_entry_id=int(receipt.id),
+        receipt_doc_type=receipt.recorder_type, receipt_doc_ref=receipt.recorder_ref,
+        receipt_doc_line_no=receipt.line_no, operation_kind="supplier_receipt",
+        operation_key=RECEIPT_OPERATION, operation_name="приобретение у поставщика",
+        item_id=int(item.item_id), signed_qty=receipt.qty,
+        match_rule="supplier-receipt-exact-line", match_status="unmatched",
+        warehouse_ref1c="WH-OUT", reason="no exact typed supplier order line",
+    ))
+    scope = (int(item.item_id), "", "", "default", "buy")
+    state = models.CurrentReplenishmentState(
+        scope_key=_scope_key(scope), source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+        ledger_generation_id=int(accepted.id), source_revision=int(accepted.id),
+        scope_checksum="seed".ljust(64, "0"), writer_key="current_replenishment",
+        status="completed",
+    )
+    db.add(state)
+    db.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=int(accepted.id), reservation_id=int(owner.id),
+        sle_id=int(receipt.id), requirement_id=int(requirement.id),
+        allocated_qty=Decimal(qty), match_rule="fifo", fact_ref="item26-receipt",
+        fact_line_ref="1", item_id=int(item.item_id), characteristic_ref="",
+        organization_ref="", planning_stock_pool="default",
+        idempotency_key="item26-seed", allocation_role="replenishment_receipt",
+        is_current=True, event_at=receipt.posting_at,
+    ))
+    db.commit()
+    return owner, receipt
+
+
+def _current_receipt_allocations(db, sle_id):
+    return db.query(models.ReservationConsumptionAllocation).filter_by(
+        sle_id=int(sle_id), is_current=True, allocation_role="replenishment_receipt",
+    ).all()
+
+
+def test_a_replacement_retires_the_old_owners_allocations_and_counts_the_fact_once(
+    db_session,
+):
+    """The stand: 7287 current rows on closed owners, 477 facts over quantity."""
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
+        db_session, accepted, plan, item, parent, cutoff,
+    )
+
+    result = _run(db_session, accepted, "orch-retire-allocations", replace=[plan.id])
+    db_session.commit()
+    assert result.published is True
+
+    db_session.refresh(old_owner)
+    assert str(old_owner.lifecycle_status) == "closed"
+    current = _current_receipt_allocations(db_session, receipt.id)
+    # The closed owner no longer holds the fact...
+    assert all(int(row.reservation_id) != int(old_owner.id) for row in current)
+    retired = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        reservation_id=int(old_owner.id), sle_id=int(receipt.id),
+    ).one()
+    assert retired.is_current is False
+    audit = db_session.query(models.CurrentReplenishmentAudit).filter_by(
+        reservation_id=int(old_owner.id), sle_id=int(receipt.id),
+        reason="owner_retired",
+    ).one()
+    assert audit.operation == "retire"
+    assert int(audit.source_revision) == int(result.target_generation_id)
+    # ...and the fact is counted once, by the live owners only.
+    assert sum((Decimal(str(row.allocated_qty)) for row in current), Decimal("0")) <= abs(
+        Decimal(str(receipt.qty))
+    )
+    from app.services.item_ledger.current_replenishment import over_allocated_facts
+
+    assert over_allocated_facts(db_session) == []
+    live = {
+        int(row.id) for row in db_session.query(models.ReservationEntry).filter_by(
+            lifecycle_status="active", is_current=True,
+        )
+    }
+    assert {int(row.reservation_id) for row in current} <= live
+    # The successor's replay re-allocated the same fact, once.
+    candidate = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=parent.run_id,
+    ).one()
+    successor_ids = {
+        int(row.id) for row in db_session.query(models.ReservationEntry).filter_by(
+            run_id=int(candidate.run_id), realization_mode="buy",
+        )
+    }
+    assert [
+        (int(row.reservation_id) in successor_ids, Decimal(str(row.allocated_qty)))
+        for row in current
+    ] == [(True, Decimal("2"))]
+
+
+def test_closed_owner_allocations_are_retired_idempotently(db_session):
+    """A database already double counting is healed by the same writer."""
+    from app.services.item_ledger.current_replenishment import (
+        retire_current_allocations_of_closed_owners,
+    )
+
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
+        db_session, accepted, plan, item, parent, cutoff,
+    )
+    old_owner.lifecycle_status = "closed"
+    db_session.commit()
+
+    first = retire_current_allocations_of_closed_owners(
+        db_session, generation_id=int(accepted.id)
+    )
+    second = retire_current_allocations_of_closed_owners(
+        db_session, generation_id=int(accepted.id)
+    )
+    db_session.commit()
+
+    assert first == {"retired_allocations": 1, "retired_qty_units": 2, "unaudited": 0}
+    assert second["retired_allocations"] == 0
+    assert _current_receipt_allocations(db_session, receipt.id) == []
+
+
+def test_a_fact_over_allocated_across_owners_is_refused(db_session):
+    """Invariants 2-3: the sum of current allocations never exceeds the fact."""
+    from app.services.item_ledger.current_replenishment import (
+        CurrentReplenishmentError,
+        require_facts_not_over_allocated,
+    )
+
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
+        db_session, accepted, plan, item, parent, cutoff,
+    )
+    # A second owner claiming the same 2 units: 4 > 2.
+    other_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
+        config_snapshot={}, active_freeze_version=1, ledger_cutoff=cutoff,
+    )
+    db_session.add(other_run)
+    db_session.flush()
+    other_requirement = models.MrpRequirement(
+        run_id=int(other_run.run_id), item_id=int(item.item_id),
+        total_required_qty=Decimal("5"), net_required_qty=Decimal("5"),
+        period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+        planning_stock_pool="default", characteristic_ref="", organization_ref="",
+        freeze_version=1,
+    )
+    db_session.add(other_requirement)
+    db_session.flush()
+    second = models.ReservationEntry(
+        ledger_generation_id=int(accepted.id), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        run_id=int(other_run.run_id), freeze_version=1,
+        requirement_id=int(other_requirement.id),
+        priority_period_from=plan.period_from, priority_period_to=plan.period_to,
+        realization_mode="buy", reserved_qty=Decimal("5"),
+        replenishment_required_qty=Decimal("5"), lifecycle_status="active",
+        owner_kind="current", is_current=True,
+        current_identity=f"reservation:req:{int(other_requirement.id)}:mode:buy",
+    )
+    db_session.add(second)
+    db_session.flush()
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=int(accepted.id), reservation_id=int(second.id),
+        sle_id=int(receipt.id), requirement_id=int(other_requirement.id),
+        allocated_qty=Decimal("2"), match_rule="fifo", fact_ref="item26-receipt",
+        fact_line_ref="1", item_id=int(item.item_id), characteristic_ref="",
+        organization_ref="", planning_stock_pool="default",
+        idempotency_key="item26-double", allocation_role="replenishment_receipt",
+        is_current=True, event_at=receipt.posting_at,
+    ))
+    db_session.commit()
+
+    with pytest.raises(CurrentReplenishmentError, match="exceed their physical fact") as excinfo:
+        require_facts_not_over_allocated(db_session)
+    assert f"SLE {int(receipt.id)}" in str(excinfo.value)
+    # Bounded to other items, the check has nothing to say.
+    require_facts_not_over_allocated(db_session, item_ids=[int(item.item_id) + 999])
+
+
+def test_a_retained_owner_and_a_successor_do_not_both_count_one_fact(db_session):
+    """A retained run is not staged but stays live: it is part of the scope.
+
+    Without it the successor's replay was handed a fact the retained owner
+    already held - two active owners counting one receipt - which the
+    over-allocation gate now refuses.
+    """
+    from app.services.item_ledger.current_replenishment import over_allocated_facts
+
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    _old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
+        db_session, accepted, plan, item, parent, cutoff,
+    )
+    kept = _extra_fixed_plan(db_session, accepted, cutoff, name="kept", code="KEPT-26")
+    requirement = db_session.get(models.MrpRequirement, kept.owner.requirement_id)
+    requirement.item_id = item.item_id
+    requirement.planning_stock_pool = "default"
+    kept.owner.item_id = item.item_id
+    kept.owner.planning_stock_pool = "default"
+    allocation = db_session.query(models.ReservationConsumptionAllocation).one()
+    allocation.reservation_id = kept.owner.id
+    allocation.requirement_id = requirement.id
+    db_session.commit()
+
+    result = _run(db_session, accepted, "orch-retained-scope", replace=[plan.id])
+    db_session.commit()
+
+    assert result.published is True
+    assert over_allocated_facts(db_session) == []
+    current = _current_receipt_allocations(db_session, receipt.id)
+    assert sum((Decimal(str(row.allocated_qty)) for row in current), Decimal("0")) == Decimal("2")
+
+
+# --- Item 26b: StockBin generation is provenance, not membership ---------------
+
+
+def test_source_warehouse_options_survive_an_obligation_refresh(db_session):
+    """After any MRP recalculation the options list was empty.
+
+    The obligation path never restamps ``StockBin`` (canon R6: its generation
+    is provenance), and the options filtered ``ledger_generation_id ==
+    pointer``.
+    """
+    from app.services.production_control_material_issues import (
+        _auto_select_source_warehouse,
+        _source_warehouse_options,
+    )
+
+    accepted, plan, _line, item, _old, cutoff = _world(db_session, with_parent=False)
+    receipt = models.StockLedgerEntry(
+        ingest_batch_id=int(accepted.physical_import_batch_id),
+        source_content_hash="item26b-bin".ljust(64, "0"),
+        item_id=int(item.item_id), characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="WH-OUT",
+        qty=Decimal("4"), posting_at=cutoff - timedelta(hours=1),
+        record_type="Receipt", movement_kind="transfer_in", recorder_type="Doc",
+        recorder_ref="item26b-bin", line_no="1", ingest_source="seed",
+    )
+    db_session.add(receipt)
+    db_session.flush()
+    db_session.add(models.StockBin(
+        ledger_generation_id=int(accepted.id), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-OUT", on_hand=Decimal("4"),
+        last_entry_id=int(receipt.id), is_current=True,
+    ))
+    db_session.commit()
+
+    result = _run(db_session, accepted, "orch-bins", add=[plan.id])
+    db_session.commit()
+    pointer = int(result.target_generation_id)
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == pointer
+    # The bin keeps the physical generation it was folded at.
+    assert {
+        int(row.ledger_generation_id)
+        for row in db_session.query(models.StockBin).filter_by(is_current=True)
+    } == {int(accepted.id)}
+
+    options = _source_warehouse_options(
+        db_session, [int(item.item_id)], ledger_generation_id=pointer,
+    )
+    assert [row["ref1c"] for row in options[int(item.item_id)]] == ["WH-OUT"]
+    selected, candidates = _auto_select_source_warehouse(
+        db_session, [int(item.item_id)], ledger_generation_id=pointer,
+    )
+    assert selected == "WH-OUT"
+    assert [row["ref1c"] for row in candidates] == ["WH-OUT"]

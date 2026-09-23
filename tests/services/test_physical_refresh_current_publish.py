@@ -1055,3 +1055,85 @@ def test_the_publication_context_does_not_revive_an_invalidated_generation(
                 db_session, "publication", required_capabilities=("not_a_capability",),
             )
     db_session.rollback()
+
+
+def test_bounded_acceptance_refuses_a_fact_counted_twice_in_its_scopes(
+    db_session, monkeypatch,
+):
+    """Invariants 2-3 at the bounded acceptance: one fact, counted once.
+
+    Bounded to the scopes the refresh replayed (decision §41).
+    """
+    from datetime import date
+
+    from app.services.item_ledger.current_replenishment import CurrentReplenishmentError
+
+    parent, target = _generations(db_session)
+    item = models.Item(item_code="CP-OVER", item_name="Over-allocated item")
+    db_session.add(item)
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="cp-over-sle", business_identity="cp-over-sle",
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="wh", qty=Decimal("2"),
+        posting_at=target.cutoff - timedelta(hours=1), record_type="Receipt",
+        movement_kind="transfer_out", recorder_type="Document_Transfer",
+        recorder_ref="cp-over", line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.flush()
+    for index in (1, 2):
+        run = models.PlanningRun(
+            status="FIXED_SNAPSHOT", ledger_generation_id=parent.id,
+            config_snapshot={}, active_freeze_version=1, ledger_cutoff=parent.cutoff,
+        )
+        db_session.add(run)
+        db_session.flush()
+        requirement = models.MrpRequirement(
+            run_id=run.run_id, item_id=item.item_id, total_required_qty=Decimal("5"),
+            net_required_qty=Decimal("5"), period_from=date(2026, 9, 1),
+            period_to=date(2026, 9, 30), bom_level=0, planning_stock_pool="default",
+            characteristic_ref="", organization_ref="", freeze_version=1,
+        )
+        db_session.add(requirement)
+        db_session.flush()
+        owner = models.ReservationEntry(
+            ledger_generation_id=parent.id, item_id=item.item_id, run_id=run.run_id,
+            freeze_version=1, requirement_id=requirement.id,
+            priority_period_from=date(2026, 9, 1), priority_period_to=date(2026, 9, 30),
+            realization_mode="make", reserved_qty=Decimal("5"),
+            replenishment_required_qty=Decimal("5"), lifecycle_status="active",
+            owner_kind="current", is_current=True,
+            current_identity=f"reservation:req:{int(requirement.id)}:mode:make",
+        )
+        db_session.add(owner)
+        db_session.flush()
+        db_session.add(models.ReservationConsumptionAllocation(
+            ledger_generation_id=parent.id, reservation_id=owner.id, sle_id=sle.id,
+            requirement_id=requirement.id, allocated_qty=Decimal("2"), match_rule="fifo",
+            fact_ref="cp-over", fact_line_ref="1", item_id=item.item_id,
+            characteristic_ref="", organization_ref="", planning_stock_pool="default",
+            idempotency_key=f"cp-over-{index}", allocation_role="replenishment_receipt",
+            is_current=True, event_at=sle.posting_at,
+        ))
+    db_session.commit()
+
+    phases = []
+    _patch_safe_pipeline(monkeypatch, phases)
+    monkeypatch.setattr(
+        publisher, "_current_scopes",
+        lambda *a, **kw: ((int(item.item_id), "", "", "default", "make"),),
+    )
+    with pytest.raises(CurrentReplenishmentError, match="exceed their physical fact"):
+        publisher.publish_forward_physical_refresh_current(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            delta_manifest={"rows": (sle,), "supersessions": ()},
+            odata_client=None,
+            source_revision=target.physical_import_batch_id,
+            planning_pool_by_warehouse={"wh": "default"},
+        )
+    assert "pointer" not in phases
+    db_session.rollback()

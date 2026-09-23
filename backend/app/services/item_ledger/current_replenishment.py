@@ -491,6 +491,175 @@ def _require_complete_scope(
     return derived
 
 
+OWNER_RETIRED_REASON = "owner_retired"
+
+
+def retire_current_allocations_of_closed_owners(
+    db: Session,
+    *,
+    generation_id: int,
+    reservation_ids: Iterable[int] | None = None,
+) -> dict[str, int]:
+    """Retire the current R4 allocations of owners that are closed.
+
+    Canon: "рабочая строка резерва после закрытия больше не существует", a
+    fact on a closed reserve goes FIFO (CANON "Судьба резерва при
+    поступлении"), and one physical fact is counted once with assignments
+    never exceeding it (planning-truth-contract, Инварианты 2-3).  A closed
+    owner therefore cannot keep a *current* claim on a fact: its allocation
+    becomes history (``is_current=false``) and the fact's quantity returns to
+    FIFO for the live owners.  Every R4 replay already excludes a closed
+    owner from its before-set, so the replay that runs for the successor
+    allocates the same fact to it; keeping the closed claim current was a
+    second count - on the stand 7287 rows / 324 975 units, 477 facts over
+    their own quantity after 14 obligation refreshes.
+
+    The single current writer owns this change: one ``retire`` audit row per
+    pair with reason ``owner_retired`` in the scope's own marker, stamped
+    with the publishing generation (``GENERATION_REVISION``).  Idempotent: a
+    retired allocation is no longer current.  ``reservation_ids`` bounds the
+    owners considered; ``None`` means every closed owner, which is what heals
+    a database already in the double-counted state.
+    """
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise CurrentReplenishmentError(f"generation {generation_id} does not exist")
+    query = (
+        db.query(models.ReservationConsumptionAllocation, models.ReservationEntry)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReservationConsumptionAllocation.reservation_id,
+        )
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.ReservationConsumptionAllocation.allocation_role
+            == "replenishment_receipt",
+            models.ReservationEntry.lifecycle_status == "closed",
+        )
+    )
+    if reservation_ids is not None:
+        ids = sorted({int(value) for value in reservation_ids})
+        if not ids:
+            return {"retired_allocations": 0, "retired_qty_units": 0, "unaudited": 0}
+        query = query.filter(models.ReservationEntry.id.in_(ids))
+    pairs = (
+        query.with_for_update(of=models.ReservationConsumptionAllocation)
+        .order_by(models.ReservationConsumptionAllocation.id.asc())
+        .all()
+    )
+    states: dict[str, models.CurrentReplenishmentState | None] = {}
+    retired = 0
+    unaudited = 0
+    total = Decimal("0")
+    for row, entry in pairs:
+        scope_key = _scope_key(_allocation_scope(row, entry))
+        if scope_key not in states:
+            states[scope_key] = (
+                db.query(models.CurrentReplenishmentState)
+                .filter(models.CurrentReplenishmentState.scope_key == scope_key)
+                .one_or_none()
+            )
+        row.is_current = False
+        retired += 1
+        total += _decimal(row.allocated_qty)
+        state = states[scope_key]
+        if state is None:
+            # Retiring a claim is the safe direction; a pair written before
+            # the scope had a marker is retired without an audit row rather
+            # than left double-counted.
+            unaudited += 1
+            continue
+        _audit_change(
+            db,
+            state=state,
+            generation=generation,
+            entry=entry,
+            fact_id=str(int(row.sle_id)),
+            scope_key=scope_key,
+            source_revision=int(generation.id),
+            operation="retire",
+            before=Allocation(
+                fact_id=str(int(row.sle_id)),
+                reserve_id=str(int(entry.id)),
+                qty=_decimal(row.allocated_qty),
+                match_rule=_text(row.match_rule) or "fifo",
+            ),
+            after=None,
+            reason=OWNER_RETIRED_REASON,
+        )
+    db.flush()
+    return {
+        "retired_allocations": retired,
+        "retired_qty_units": int(total),
+        "unaudited": unaudited,
+    }
+
+
+def over_allocated_facts(
+    db: Session,
+    *,
+    item_ids: Iterable[int] | None = None,
+    limit: int = 8,
+) -> list[tuple[int, str, Decimal, Decimal]]:
+    """Facts whose current allocations exceed the fact (invariants 2-3).
+
+    Returns ``(sle_id, role, allocated, |qty|)`` for the first ``limit``
+    offenders; empty means the invariant holds.  ``item_ids`` bounds the
+    check to the scopes a bounded publication touched (decision §41).
+    """
+    from sqlalchemy import func
+
+    allocated = func.sum(models.ReservationConsumptionAllocation.allocated_qty)
+    query = (
+        db.query(
+            models.ReservationConsumptionAllocation.sle_id,
+            models.ReservationConsumptionAllocation.allocation_role,
+            allocated,
+            func.abs(models.StockLedgerEntry.qty),
+        )
+        .join(
+            models.StockLedgerEntry,
+            models.StockLedgerEntry.id == models.ReservationConsumptionAllocation.sle_id,
+        )
+        .filter(models.ReservationConsumptionAllocation.is_current.is_(True))
+        .group_by(
+            models.ReservationConsumptionAllocation.sle_id,
+            models.ReservationConsumptionAllocation.allocation_role,
+            models.StockLedgerEntry.qty,
+        )
+        .having(allocated > func.abs(models.StockLedgerEntry.qty))
+        .order_by(models.ReservationConsumptionAllocation.sle_id.asc())
+    )
+    if item_ids is not None:
+        ids = sorted({int(value) for value in item_ids})
+        if not ids:
+            return []
+        query = query.filter(models.ReservationConsumptionAllocation.item_id.in_(ids))
+    if limit and int(limit) > 0:
+        query = query.limit(int(limit))
+    return [
+        (int(sle_id), str(role), _decimal(total), _decimal(qty))
+        for sle_id, role, total, qty in query.all()
+    ]
+
+
+def require_facts_not_over_allocated(
+    db: Session, *, item_ids: Iterable[int] | None = None
+) -> None:
+    """Fail closed when any fact carries more current allocation than itself."""
+    offenders = over_allocated_facts(db, item_ids=item_ids, limit=8)
+    if offenders:
+        listed = ", ".join(
+            f"SLE {sle_id} {role} {total}>{qty}"
+            for sle_id, role, total, qty in offenders
+        )
+        raise CurrentReplenishmentError(
+            "current allocations exceed their physical fact "
+            f"(one fact is counted once); first offenders: {listed}"
+        )
+
+
 def _audit_change(
     db: Session,
     *,
@@ -864,9 +1033,11 @@ def apply_current_replenishment(
     # must have its allocations retired by the same replay.  That reading is
     # kept for the case it describes - a reserve whose owner is gone: the
     # publisher closes such owners in ``publish_current_reservations`` and
-    # their historical basis stays with the closed owner, which is where R5
-    # says an assignment to a closed reservation belongs ("closed или
-    # неизвестная reservation не переоткрывается").
+    # retires their current allocations in the same transaction
+    # (``retire_current_allocations_of_closed_owners``), so the fact returns
+    # to FIFO and this replay allocates it to the live owners once.  The
+    # closed owner is not reopened (R5: "closed или неизвестная reservation
+    # не переоткрывается"); its allocation stays only as non-current history.
     #
     # What is *not* retired is the allocation of an owner that is still
     # active and simply was not handed in.  Deleting those was the defect: a
@@ -1357,6 +1528,7 @@ def apply_current_replenishment_for_accepted_generation(
     generation_id: int,
     source_revision: int | None = None,
     allow_building: bool = False,
+    retained_run_ids: Iterable[int] = (),
 ) -> tuple[CurrentReplenishmentResult, ...]:
     """Publish current supplier-receipt replenishment at physical acceptance.
 
@@ -1366,6 +1538,14 @@ def apply_current_replenishment_for_accepted_generation(
     caller's transaction.  A single item cannot be silently fanned out to
     multiple pools because the physical receipt has no pool identity; such an
     ambiguous input fails closed.
+
+    ``retained_run_ids`` completes a BUILDING scope for an obligation
+    refresh.  A retained run is never staged - its obligations stay anchored
+    to the generation that froze them - yet its current owners stay live
+    after the publication, so they belong to the scope's live owners.  Left
+    out, their allocations were neither in the replay's before-set nor
+    subtracted from the fact, and the staging owners were handed the same
+    fact again: one fact counted by a retained owner and by a successor.
     """
 
     generation = db.get(models.LedgerGeneration, int(generation_id))
@@ -1382,9 +1562,21 @@ def apply_current_replenishment_for_accepted_generation(
         models.ReservationEntry.replenishment_required_qty > 0,
     )
     if _text(generation.status) == "building":
-        reservation_query = reservation_query.filter(
+        retained = sorted({int(value) for value in retained_run_ids})
+        staged = and_(
             models.ReservationEntry.ledger_generation_id == int(generation_id),
             models.ReservationEntry.owner_kind == "building",
+        )
+        reservation_query = reservation_query.filter(
+            or_(
+                staged,
+                and_(
+                    models.ReservationEntry.is_current.is_(True),
+                    models.ReservationEntry.owner_kind == "current",
+                    models.ReservationEntry.run_id.in_(retained),
+                ),
+            )
+            if retained else staged
         )
     else:
         pointer = db.get(models.PlanningTruthState, 1)

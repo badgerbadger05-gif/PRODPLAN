@@ -1531,6 +1531,84 @@ def apply_supplier_provenance_repair(
             return _supplier_provenance_repair_on_session(session, int(generation_id))
 
 
+def _closed_owner_current_allocations(session: Session) -> tuple[int, int]:
+    row = session.execute(text(
+        "SELECT count(*), coalesce(sum(allocation.allocated_qty), 0) "
+        "FROM reservation_consumption_allocation AS allocation "
+        "JOIN reservation_entry AS owner ON owner.id = allocation.reservation_id "
+        "WHERE allocation.is_current = true "
+        "AND allocation.allocation_role = 'replenishment_receipt' "
+        "AND owner.lifecycle_status = 'closed'"
+    )).one()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def _retire_closed_owner_allocations_on_session(
+    session: Session, generation_id: int
+) -> dict[str, Any]:
+    """Retire current R4 claims still held by closed owners (one-off repair).
+
+    The runtime does the same at every obligation-refresh publication
+    (``publish_current_reservations`` -> the single current writer), so the
+    next accepted obligation refresh heals such a database by itself.  This
+    phase exists for a stand that must accept a bounded physical refresh
+    first: that acceptance refuses a fact whose current allocations exceed
+    it.  Idempotent; the audit rows are stamped with the pointer generation.
+    """
+
+    from app.services.item_ledger.current_replenishment import (
+        over_allocated_facts,
+        retire_current_allocations_of_closed_owners,
+    )
+
+    rows_before, units_before = _closed_owner_current_allocations(session)
+    over_before = over_allocated_facts(session, limit=0)
+    retired = retire_current_allocations_of_closed_owners(
+        session, generation_id=int(generation_id)
+    )
+    rows_after, _units_after = _closed_owner_current_allocations(session)
+    if rows_after:
+        raise PostflightBlocked(
+            f"{rows_after} current allocations still held by closed owners"
+        )
+    over_after = over_allocated_facts(session, limit=0)
+    return {
+        "phase": "retire-closed-owner-allocations",
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "closed_owner_allocations_before": rows_before,
+        "closed_owner_allocation_units_before": units_before,
+        "retired_allocations": int(retired["retired_allocations"]),
+        "retired_without_audit": int(retired["unaudited"]),
+        "closed_owner_allocations_after": rows_after,
+        "over_allocated_facts_before": len(over_before),
+        # Reported, not repaired here: a fact two *live* owners hold is
+        # re-derived by the next replay of its scope (the obligation refresh
+        # replays every BUY scope with its retained owners handed in).
+        "over_allocated_facts_after": len(over_after),
+        "over_allocated_sample_after": [
+            {"sle_id": sle_id, "role": role, "allocated": str(total), "qty": str(qty)}
+            for sle_id, role, total, qty in over_after[:8]
+        ],
+        "idempotent": int(retired["retired_allocations"]) == 0,
+    }
+
+
+def apply_retire_closed_owner_allocations(
+    engine: Engine, *, writers_stopped: bool
+) -> dict[str, Any]:
+    """Run the closed-owner allocation retirement in one transaction."""
+
+    if not writers_stopped:
+        raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+    generation_id = _accepted_truth_generation(engine)
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        with session.begin():
+            return _retire_closed_owner_allocations_on_session(
+                session, int(generation_id)
+            )
+
+
 def apply_current_replenishment_bootstrap(
     engine: Engine, *, writers_stopped: bool
 ) -> dict[str, Any]:
@@ -1569,6 +1647,7 @@ def main(argv: list[str] | None = None) -> int:
             "postflight",
             "replenishment-bootstrap",
             "supplier-provenance-repair",
+            "retire-closed-owner-allocations",
             "pre-deploy-backlog",
         ),
         default="preflight",
@@ -1582,7 +1661,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "explicit acknowledgement required by --phase apply/"
-            "replenishment-bootstrap/supplier-provenance-repair"
+            "replenishment-bootstrap/supplier-provenance-repair/"
+            "retire-closed-owner-allocations"
         ),
     )
     parser.add_argument("--generation-id", type=int)
@@ -1608,6 +1688,10 @@ def main(argv: list[str] | None = None) -> int:
             report = pre_deploy_backlog(engine)
         elif args.phase == "supplier-provenance-repair":
             report = apply_supplier_provenance_repair(
+                engine, writers_stopped=bool(args.writers_stopped)
+            )
+        elif args.phase == "retire-closed-owner-allocations":
+            report = apply_retire_closed_owner_allocations(
                 engine, writers_stopped=bool(args.writers_stopped)
             )
         elif args.phase == "replenishment-bootstrap":
