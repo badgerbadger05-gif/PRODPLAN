@@ -2119,3 +2119,112 @@ def test_a_bounded_refresh_after_an_obligation_refresh_rewrites_no_unchanged_row
     ).all()
     assert [(row.entity_kind, row.operation, row.business_identity) for row in changes] == []
     db_session.rollback()
+
+
+# --- Item 29a: §49 on the generation-building replay as well ------------------
+
+
+def test_a_make_owner_folds_the_same_receipt_on_both_paths(db_session, monkeypatch):
+    """An output before the freeze cutoff is stock, on the obligation path too.
+
+    The generation replay built reserves without the freeze baseline and
+    folded the pre-cutoff output as received (2); the bounded MAKE replay then
+    recomputed with the boundary and received *fell* to 1 after a +1 output.
+    """
+    from app.services.item_ledger import physical_refresh_current_publish as publisher
+
+    accepted, plan, _line, item, _old, cutoff = _world(
+        db_session, with_parent=False, replenishment_method="Производство",
+    )
+    output = models.StockLedgerEntry(
+        ingest_batch_id=int(accepted.physical_import_batch_id),
+        source_content_hash="item29a-out".ljust(64, "0"), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-OUT", qty=Decimal("2"), posting_at=cutoff - timedelta(hours=1),
+        record_type="Receipt", movement_kind="assembly_in",
+        recorder_type="Document_СборкаЗапасов", recorder_ref="item29a-out",
+        line_no="1", ingest_source="seed", active=True,
+    )
+    db_session.add(output)
+    db_session.flush()
+    db_session.add(models.StockBin(
+        ledger_generation_id=int(accepted.id), item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-OUT", on_hand=Decimal("2"),
+        last_entry_id=int(output.id), is_current=True,
+    ))
+    db_session.commit()
+    _current_custody_at(db_session, accepted, item)
+    result = _run(db_session, accepted, "orch-29a", add=[plan.id])
+    db_session.commit()
+    owner = db_session.query(models.ReservationEntry).filter_by(
+        is_current=True, realization_mode="make",
+    ).one()
+    received_after_obligation = Decimal(str(owner.replenishment_received_qty))
+
+    parent = db_session.get(models.LedgerGeneration, int(result.target_generation_id))
+    target_cutoff = parent.cutoff + timedelta(hours=6)
+    batch = models.PhysicalImportBatch(
+        batch_key="orch-29a-batch", status="completed", source_complete=True,
+        cutoff=target_cutoff, source_watermarks={}, completed_at=target_cutoff,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    target = models.LedgerGeneration(
+        generation_key="orch-29a-target", status="building", cutoff=target_cutoff,
+        source_watermarks={"parent_generation_id": int(parent.id)}, capabilities={},
+        physical_import_batch_id=int(batch.id), algorithm_version="test",
+    )
+    db_session.add(target)
+    db_session.flush()
+    delta = models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id), source_content_hash="item29a-delta",
+        business_identity="item29a-delta", item_id=item.item_id, characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="WH-OUT",
+        qty=Decimal("1"), posting_at=target_cutoff - timedelta(hours=1),
+        record_type="Receipt", movement_kind="assembly_in",
+        recorder_type="Document_СборкаЗапасов", recorder_ref="item29a-delta",
+        line_no="1", ingest_source="test", active=True,
+    )
+    db_session.add(delta)
+    db_session.commit()
+    monkeypatch.setattr(
+        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+    )
+    publisher.publish_forward_physical_refresh_current(
+        db_session, target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        delta_manifest={"rows": (delta,), "supersessions": ()}, odata_client=None,
+        source_revision=int(batch.id), planning_pool_by_warehouse={"WH-OUT": "default"},
+    )
+    db_session.refresh(owner)
+
+    assert received_after_obligation == Decimal("0")
+    assert Decimal(str(owner.replenishment_received_qty)) == received_after_obligation + 1
+    db_session.rollback()
+
+
+def test_a_frozen_owner_without_its_own_baseline_is_refused(db_session):
+    """The receipt side fails closed exactly like the consumption side."""
+    from app.services.item_ledger.current_replenishment import (
+        CurrentReplenishmentError,
+        freeze_baselines_by_reservation,
+    )
+
+    accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    _requirement, owner = _current_owner_for_parent_run(
+        db_session, accepted, plan, item, parent,
+    )
+    # Pre-baseline data: no row for this freeze at all -> explicit no-boundary.
+    assert freeze_baselines_by_reservation(db_session, [owner]) == {}
+    other = models.Item(item_code="ORCH-29A-OTHER", item_name="another frozen item")
+    db_session.add(other)
+    db_session.flush()
+    db_session.add(models.MrpFreezeBaseline(
+        run_id=int(parent.run_id), freeze_version=1, item_id=int(other.item_id),
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        baseline_at=cutoff.replace(tzinfo=None),
+    ))
+    db_session.flush()
+    with pytest.raises(CurrentReplenishmentError, match="lacks exact frozen pool baseline"):
+        freeze_baselines_by_reservation(db_session, [owner])

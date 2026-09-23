@@ -422,20 +422,26 @@ def test_worker_stands_aside_while_a_physical_refresh_builds(
 # --- Decision §50: rebase only what the remaining roots need ------------------
 
 
-def _rebase_scope_world(db_session, *, changed_spec_used_by):
+def _rebase_scope_world(db_session, *, changed_spec_used_by, suffix=""):
     """Two roots on one fixed plan: ``done`` fully accepted, ``open`` not.
 
     ``changed`` is the specification whose frozen revision is outdated; the
     current BOM gives it to the root named by ``changed_spec_used_by``.
     """
     changed = models.Specification(
-        spec_code="CH", spec_name="Changed", spec_ref1c="spec-changed", content_hash="new-hash",
+        spec_code=f"CH{suffix}", spec_name="Changed", spec_ref1c=f"spec-changed{suffix}", content_hash="new-hash",
     )
     other = models.Specification(
-        spec_code="OT", spec_name="Other", spec_ref1c="spec-other", content_hash="other-hash",
+        spec_code=f"OT{suffix}", spec_name="Other", spec_ref1c=f"spec-other{suffix}", content_hash="other-hash",
     )
-    done = models.Item(item_code="ROOT-DONE", item_name="Accepted root", status="active")
-    open_root = models.Item(item_code="ROOT-OPEN", item_name="Remaining root", status="active")
+    done = models.Item(
+        item_code=f"ROOT-DONE{suffix}", item_name="Accepted root", status="active",
+        replenishment_method="Производство",
+    )
+    open_root = models.Item(
+        item_code=f"ROOT-OPEN{suffix}", item_name="Remaining root", status="active",
+        replenishment_method="Производство",
+    )
     db_session.add_all([changed, other, done, open_root])
     db_session.flush()
     uses_changed = done if changed_spec_used_by == "done" else open_root
@@ -445,7 +451,7 @@ def _rebase_scope_world(db_session, *, changed_spec_used_by):
         models.DefaultSpecification(item_id=int(uses_other.item_id), spec_id=int(other.spec_id)),
     ])
     plan = models.ProductionPlanHeader(
-        name="Scope", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        name=f"Scope{suffix}", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
         status="fixed", fixed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
     )
     db_session.add(plan)
@@ -467,6 +473,16 @@ def _rebase_scope_world(db_session, *, changed_spec_used_by):
     )
     db_session.add(run)
     db_session.flush()
+    # The other root's frozen node is current.
+    db_session.add(models.MrpFreezeComponent(
+        run_id=int(run.run_id), freeze_version=1, root_item_id=int(uses_other.item_id),
+        parent_item_id=int(uses_other.item_id), parent_characteristic_ref="",
+        parent_organization_ref="", parent_planning_stock_pool="default",
+        component_item_id=int(uses_other.item_id), component_characteristic_ref="",
+        component_organization_ref="", component_planning_stock_pool="default",
+        spec_ref=f"spec-other{suffix}", spec_version="other-hash",
+        norm_qty_per_unit=Decimal("1"), unit_coef=Decimal("1"),
+    ))
     # The frozen matrix still carries the old revision of ``changed``.
     db_session.add(models.MrpFreezeComponent(
         run_id=int(run.run_id), freeze_version=1, root_item_id=int(uses_changed.item_id),
@@ -474,7 +490,7 @@ def _rebase_scope_world(db_session, *, changed_spec_used_by):
         parent_organization_ref="", parent_planning_stock_pool="default",
         component_item_id=int(uses_changed.item_id), component_characteristic_ref="",
         component_organization_ref="", component_planning_stock_pool="default",
-        spec_ref="spec-changed", spec_version="old-hash",
+        spec_ref=f"spec-changed{suffix}", spec_version="old-hash",
         norm_qty_per_unit=Decimal("1"), unit_coef=Decimal("1"),
     ))
     revision = models.SpecificationRevision(
@@ -527,3 +543,68 @@ def test_a_change_a_remaining_root_uses_rebases_the_run(db_session, monkeypatch)
         run_one_pending_specification_rebase(db_session)
 
     assert calls == [(int(run.run_id), ("spec-changed",))]
+
+
+def test_a_main_specification_switched_to_another_document_rebases_the_run(
+    db_session, monkeypatch,
+):
+    """§50: needed-now differs from needed-frozen although nothing drifted."""
+    from app.services import specification_rebase_worker as worker
+
+    run, _request = _rebase_scope_world(db_session, changed_spec_used_by="done")
+    open_root = db_session.query(models.Item).filter_by(item_code="ROOT-OPEN").one()
+    switched = models.Specification(
+        spec_code="NEW", spec_name="New main", spec_ref1c="spec-new", content_hash="new-main",
+    )
+    db_session.add(switched)
+    db_session.flush()
+    default = db_session.query(models.DefaultSpecification).filter_by(
+        item_id=int(open_root.item_id)
+    ).one()
+    default.spec_id = int(switched.spec_id)
+    db_session.commit()
+    calls = []
+
+    def fake_rebase(db, run_id, **kwargs):
+        calls.append((int(run_id), tuple(kwargs.get("changed_spec_refs") or ())))
+        raise RuntimeError("stop after selection")
+
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", fake_rebase)
+    with pytest.raises(RuntimeError, match="stop after selection"):
+        run_one_pending_specification_rebase(db_session)
+
+    assert calls == [(int(run.run_id), ("spec-new", "spec-other"))]
+
+
+def test_a_run_that_keeps_failing_does_not_starve_the_others(db_session, monkeypatch):
+    from app.services import specification_rebase_worker as worker
+
+    first, first_request = _rebase_scope_world(
+        db_session, changed_spec_used_by="open", suffix="-a",
+    )
+    second, _second_request = _rebase_scope_world(
+        db_session, changed_spec_used_by="open", suffix="-b",
+    )
+    assert int(first.run_id) < int(second.run_id)
+    attempts = []
+
+    def fake_rebase(db, run_id, **kwargs):
+        attempts.append(int(run_id))
+        if int(run_id) == int(first.run_id):
+            raise RuntimeError("broken specification")
+        raise LookupError("second run selected")
+
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", fake_rebase)
+    for _ in range(worker.MAX_REBASE_ATTEMPTS):
+        with pytest.raises(RuntimeError, match="broken specification"):
+            run_one_pending_specification_rebase(db_session)
+    with pytest.raises(LookupError, match="second run selected"):
+        run_one_pending_specification_rebase(db_session)
+
+    assert attempts == [int(first.run_id)] * worker.MAX_REBASE_ATTEMPTS + [int(second.run_id)]
+    db_session.expire_all()
+    failed = db_session.get(models.SpecificationRebaseQueue, int(first_request.id))
+    assert failed.status == "failed"
+    assert failed.result["status"] == "failed_max_attempts"
+    assert failed.result["run_id"] == int(first.run_id)
+    assert "broken specification" in failed.result["reason"]

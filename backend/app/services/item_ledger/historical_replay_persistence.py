@@ -267,6 +267,13 @@ def run_historical_replay(
     # One document is netted before anything becomes a fact: its internal
     # transport legs are physical truth, but not production output.
     realizable_qty_by_sle = net_document_output_qty(candidate_rows)
+    # Decision §49 on the generation-building replay as well: each owner's
+    # freeze cutoff bounds what can realize it, exactly as in the bounded
+    # R4 replay - otherwise the two paths fold different received quantities
+    # for the same owner and the coverage flips on every alternation.
+    from .current_replenishment import freeze_baselines_by_reservation
+
+    baselines = freeze_baselines_by_reservation(db, entries)
     for row in entries:
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")
@@ -294,6 +301,7 @@ def run_historical_replay(
             organization_ref="",
             planning_stock_pool=str(row.planning_stock_pool or ""),
             order_refs=order_refs_by_requirement.get(int(row.requirement_id), ()),
+            baseline_at=baselines.get(int(row.id)),
         )
         reserves.append(reserve)
         entry_by_core_id[core_id] = row

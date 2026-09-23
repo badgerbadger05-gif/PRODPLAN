@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Mapping
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -528,8 +528,13 @@ def allocate_supplier_receipts(
     *,
     exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
     history_mode: HistoryMode = "as_occurred",
+    baseline_by_reservation: Mapping[int, datetime] | None = None,
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
+
+    ``baseline_by_reservation`` is each owner's §49 freeze cutoff; without it
+    a reservation's own ``baseline_at`` attribute is used (the R4 replay
+    passes pure owners that carry it).
 
     Positive supplier receipts fill exact supplier-order-line matches first inside
     their export allocation cap, then FIFO by item. Returns unwind the same
@@ -584,7 +589,10 @@ def allocate_supplier_receipts(
                 # Decision §49: a receipt not later than the owner's freeze
                 # cutoff is its frozen stock, never its replenishment.
                 and replenishes_after_baseline(
-                    fact.posting_at, getattr(entry, "baseline_at", None)
+                    fact.posting_at,
+                    baseline_by_reservation.get(int(_entry_key(entry)))
+                    if baseline_by_reservation is not None
+                    else getattr(entry, "baseline_at", None),
                 )
             )
 
@@ -1132,10 +1140,18 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         )
         for item_id in {int(fact.item_id) for fact in facts}
     }
+    # §49 holds on this path too: the same per-owner freeze cutoff the R4
+    # replay and the consumption allocator read.
+    from .current_replenishment import freeze_baselines_by_reservation
+
     allocations, surplus = allocate_supplier_receipts(
         facts,
         reservations_by_item,
         exact_allocation_caps=exact_caps,
+        baseline_by_reservation=freeze_baselines_by_reservation(
+            db,
+            [entry for entries in reservations_by_item.values() for entry in entries],
+        ),
     )
     realized_keys: set[tuple[int, int]] = set()
     folded_reservations: set[int] = set()

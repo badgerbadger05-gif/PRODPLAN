@@ -51,6 +51,7 @@ from ..services.production_control_material_availability import (
     MaterialCoverageSnapshotUnavailable,
     get_materials_snapshot,
     preview_make_work_item_materials,
+    public_materials_payload,
 )
 from ..services.production_control_live_launch import overlay_execution_state, overlay_launch_facts
 from ..services.item_ledger.current_execution import (
@@ -1953,8 +1954,15 @@ def get_work_item_materials(
                 },
             )
         current_generation_id = int(current_manifest.source_generation_id or 0)
+        # The current row is the owner, found by its stable identity under the
+        # revision checked above.  The work item is a locator that must exist
+        # and name the same requirement and item - but not the current
+        # generation: a bounded refresh republishes proposals without new
+        # work items, so the locator belongs to the generation that froze the
+        # obligation and the endpoint used to answer 503 after every bounded
+        # refresh.
         work = db.get(models.ReplenishmentWorkItem, int(work_item_id))
-        if work is None or int(work.ledger_generation_id) != current_generation_id:
+        if work is None:
             raise CurrentExecutionUnavailable("current work-item provenance is missing or stale")
         current_rows = [
             row for row in load_current_execution_rows(
@@ -1976,13 +1984,19 @@ def get_work_item_materials(
         persisted_material = current_payload.get("material_coverage_snapshot")
         if not isinstance(persisted_material, dict):
             raise CurrentExecutionUnavailable("current work-item material coverage is missing")
+        # The quantity the snapshot was previewed for.  Snapshots stored while
+        # the preview stripped ``line_quantity`` carry it only on the row, as
+        # the launchable quantity they were previewed for.
         stored_qty = persisted_material.get("line_quantity")
+        if stored_qty is None:
+            stored_qty = current_payload.get("launchable_qty")
         requested_qty = float(qty if qty is not None else stored_qty or 0)
         if requested_qty <= 0:
             raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
         if stored_qty is None or abs(float(stored_qty) - requested_qty) > 1e-6:
             raise CurrentExecutionUnavailable("current work-item material coverage is not persisted for requested quantity")
-        persisted = dict(persisted_material)
+        persisted = public_materials_payload(dict(persisted_material))
+        persisted["work_item_id"] = int(work_item_id)
         # The API keeps the accepted-generation provenance field, but it is
         # reconstructed from the current manifest at this read boundary.  It
         # is intentionally absent from the nested persisted current payload

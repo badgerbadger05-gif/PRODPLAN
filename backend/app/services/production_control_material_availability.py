@@ -776,7 +776,11 @@ def preview_make_work_item_materials(
     )
     payload["work_item_id"] = int(work_item_id)
     payload["product_id"] = None
-    return public_materials_payload(payload)
+    # Persisted as the stored snapshot, like a production line's: it keeps
+    # ``line_quantity`` - the quantity it was previewed for - which the
+    # work-item reader checks.  ``public_materials_payload`` shapes the HTTP
+    # response, not the stored row.
+    return payload
 
 
 def preview_make_work_items_coverage(

@@ -346,21 +346,27 @@ def freeze_baselines_by_reservation(
 ) -> dict[int, datetime]:
     """Each owner's freeze cutoff: its run's ``MrpFreezeBaseline.baseline_at``.
 
-    The one source of the §49 boundary, keyed exactly as the consumption
-    allocator keys it (run, freeze version, item, characteristic,
-    organization, pool).  An owner without a recorded baseline is absent
-    from the result and replays without a boundary.
+    The one source of the §49 boundary for every replenishment path (the
+    generation replay, the supplier rebuild and the R4 adapters), keyed
+    exactly as the consumption allocator keys it (run, freeze version, item,
+    characteristic, organization, pool).
+
+    It fails closed like the consumption side: an owner whose run was frozen
+    (the run has baseline rows for the owner's freeze version) but that has no
+    baseline of its own, or a null one, is refused.  The one explicit
+    compatibility branch is a run with no freeze baseline at all - data from
+    before freeze baselines existed - which replays without a boundary.
     """
     rows = list(entries)
     run_ids = sorted({int(row.run_id) for row in rows if row.run_id is not None})
     if not run_ids:
         return {}
-    by_key: dict[tuple[int, int, int, str, str, str], datetime] = {}
+    by_key: dict[tuple[int, int, int, str, str, str], datetime | None] = {}
+    frozen_versions: set[tuple[int, int]] = set()
     for baseline in db.query(models.MrpFreezeBaseline).filter(
         models.MrpFreezeBaseline.run_id.in_(run_ids)
     ):
-        if baseline.baseline_at is None:
-            continue
+        frozen_versions.add((int(baseline.run_id), int(baseline.freeze_version)))
         by_key[(
             int(baseline.run_id), int(baseline.freeze_version), int(baseline.item_id),
             _text(baseline.characteristic_ref), _text(baseline.organization_ref),
@@ -370,13 +376,20 @@ def freeze_baselines_by_reservation(
     for row in rows:
         if row.run_id is None:
             continue
+        version = (int(row.run_id), int(row.freeze_version or 0))
+        if version not in frozen_versions:
+            # Pre-baseline compatibility: nothing recorded for this freeze.
+            continue
         found = by_key.get((
-            int(row.run_id), int(row.freeze_version or 0), int(row.item_id),
+            *version, int(row.item_id),
             _text(row.characteristic_ref), _text(row.organization_ref),
             _text(row.planning_stock_pool),
         ))
-        if found is not None:
-            result[int(row.id)] = found
+        if found is None:
+            raise CurrentReplenishmentError(
+                f"reservation {int(row.id)} lacks exact frozen pool baseline"
+            )
+        result[int(row.id)] = found
     return result
 
 

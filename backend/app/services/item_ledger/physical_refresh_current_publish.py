@@ -823,6 +823,45 @@ def _member(value: Any, name: str, default: Any = ()) -> Any:
     return getattr(value, name, default)
 
 
+def production_affected_item_ids(
+    db: Session,
+    *,
+    rows: Sequence[Any],
+    stock_result: Any,
+    custody_source_sle_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Every item whose material basis this bounded refresh may have changed.
+
+    A persisted material snapshot (production order or MAKE proposal) is
+    reused only when none of these names its item or one of its components:
+
+    * the items of the physical delta (supplier receipts among them - a
+      receipt is how a supplier line's open future supply moves in this path);
+    * the items whose compact ``StockBin`` this refresh restamped;
+    * the components of the custody events this refresh folded.
+
+    Future supply rows themselves (``LedgerFutureSupplyCurrent``) and
+    competing demand change only in an obligation refresh or a full accept,
+    which rebuild every snapshot; the bounded path only hands their
+    provenance over, so they need no signal here.
+    """
+    items = {int(row.item_id) for row in rows}
+    changed_keys = getattr(stock_result, "changed_keys", ())
+    if isinstance(changed_keys, (list, tuple)):
+        items.update(int(key.item_id) for key in changed_keys)
+    source_ids = sorted({int(value) for value in custody_source_sle_ids})
+    if source_ids:
+        items.update(
+            int(item_id)
+            for (item_id,) in db.query(
+                models.ProductionMaterialCustodyEvent.component_item_id
+            ).filter(
+                models.ProductionMaterialCustodyEvent.source_sle_id.in_(source_ids)
+            ).distinct()
+        )
+    return tuple(sorted(items))
+
+
 def _publish_assembly_current(
     db: Session,
     *,
@@ -1034,7 +1073,7 @@ def _publish_forward_physical_refresh_current(
         _phase_tracker.complete("scope")
 
     start_phase("stock")
-    apply_bounded_current_stock_bins(
+    stock_result = apply_bounded_current_stock_bins(
         db,
         target_generation_id=int(target.id),
         parent_generation_id=int(parent.id),
@@ -1168,7 +1207,14 @@ def _publish_forward_physical_refresh_current(
         drum_payload=drum_payload,
         shelf_payload=shelf_payload,
         accepted_run_ids=run_ids,
-        affected_item_ids=tuple(sorted({int(row.item_id) for row in scoped_rows})),
+        affected_item_ids=production_affected_item_ids(
+            db,
+            rows=scoped_rows,
+            stock_result=stock_result,
+            custody_source_sle_ids=tuple(dict.fromkeys(
+                tuple(int(row.id) for row in rows) + custody_source_ids
+            )),
+        ),
     )
     if _phase_tracker is not None:
         _phase_tracker.complete("production_payload")

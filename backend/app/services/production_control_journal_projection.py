@@ -650,12 +650,15 @@ def _parent_current_proposal_snapshots(
     *,
     parent_generation_id: int,
     affected_item_ids: Sequence[int] | None,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, tuple[dict[str, Any], Any]]:
     """Reusable parent-boundary material snapshots of MAKE proposals.
 
-    Keyed by the proposal's stable current identity.  Only a snapshot the
-    bounded delta does not touch is returned; without an explicit delta
-    nothing is reused.
+    Keyed by the proposal's stable current identity, each with the launchable
+    quantity it was computed for - the row's own ``launchable_qty``, which
+    also covers snapshots stored while the preview stripped ``line_quantity``.  Only a snapshot the
+    bounded delta does not touch is returned - see
+    ``physical_refresh_current_publish.production_affected_item_ids`` for
+    what the delta names; without an explicit delta nothing is reused.
     """
     if affected_item_ids is None:
         return {}
@@ -695,7 +698,7 @@ def _parent_current_proposal_snapshots(
             continue
         if _snapshot_is_touched(payload, snapshot, touched, label=identity):
             continue
-        result[identity] = deepcopy(dict(snapshot))
+        result[identity] = (deepcopy(dict(snapshot)), payload.get("launchable_qty"))
     return result
 
 
@@ -1401,13 +1404,21 @@ def build_compact_current_production_control_payload(
         # bounded path must too.  An untouched proposal of the same quantity
         # reuses its parent-boundary snapshot; any other one is previewed with
         # the same canonical preview the staged path uses.
+        #
+        # Boundary: like the scalar coverage above (and every compact builder)
+        # the preview reads the accepted parent's compact current owners -
+        # StockBin, custody, future supply - which this transaction has
+        # already advanced by the delta; the BUILDING target has no staged
+        # copy of them.  The content therefore equals a target-boundary
+        # preview, and the generation locators that would differ are dropped
+        # at publication (``_drop_production_generation_references``).
         if proposal.get("spec_id") is not None and proposal.get("launchable_qty") not in (None, 0):
             launchable = float(proposal["launchable_qty"])
             reused = reusable_proposal_snapshots.get(proposal["current_identity"])
-            if reused is not None and reused.get("line_quantity") is not None and abs(
-                float(reused["line_quantity"]) - launchable
+            if reused is not None and reused[1] is not None and abs(
+                float(reused[1]) - launchable
             ) <= 1e-9:
-                snapshot = reused
+                snapshot = reused[0]
             else:
                 snapshot = preview_make_work_item_materials(
                     db,

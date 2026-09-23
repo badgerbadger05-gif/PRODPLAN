@@ -816,10 +816,14 @@ def test_compact_make_proposal_carries_and_reuses_its_material_snapshot(
 
     def preview(db, *, work_item_id, item_id, quantity, spec_id, **kwargs):
         previews.append(int(item_id))
+        # The real preview goes through ``public_materials_payload``, which
+        # drops ``line_quantity``: reuse must not depend on it.
         return {
-            "work_item_id": int(work_item_id), "line_quantity": float(quantity),
+            "work_item_id": int(work_item_id),
             "coverage_status": "shortage",
-            "components": [{"component_item_id": 555001, "required_qty": "1.000"}],
+            "components": [{
+                "component_item_id": 555001, "required_qty": str(quantity),
+            }],
         }
 
     monkeypatch.setattr(
@@ -849,7 +853,7 @@ def test_compact_make_proposal_carries_and_reuses_its_material_snapshot(
     row = next(row for row in first["rows"] if row.get("product_id") is None)
     assert row["coverage_status"] == "shortage"
     snapshot = row["material_coverage_snapshot"]
-    assert isinstance(snapshot, dict) and snapshot["line_quantity"] == float(row["launchable_qty"])
+    assert isinstance(snapshot, dict) and snapshot["components"]
     assert "work_item_id" not in snapshot  # no synthetic locator leaks
     assert previews == [int(reservation.item_id)]
 
@@ -1924,8 +1928,13 @@ def test_materials_endpoint_answers_through_its_strict_response_model(db_session
     assert "line_quantity" not in payload
 
 
-def test_work_item_materials_fail_closed_without_persisted_coverage(db_session):
-    """A current proposal without saved coverage cannot trigger a replay."""
+def test_work_item_materials_read_the_persisted_proposal_coverage(db_session):
+    """Item 29d, obligation path: the stored snapshot carries the quantity it
+    was previewed for, so the reader answers 200 without replaying anything.
+
+    It used to answer 400: the preview stripped ``line_quantity`` from the
+    stored snapshot, and the reader had no quantity basis.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -1976,10 +1985,13 @@ def test_work_item_materials_fail_closed_without_persisted_coverage(db_session):
         )
     app.dependency_overrides.clear()
 
-    # The accepted current row exists, but its persisted coverage has no
-    # quantity basis for this request; the endpoint fails closed instead of
-    # replaying the historical snapshot.
-    assert response.status_code == 400, response.text
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["components"]
+    assert body["work_item_id"] == work.id
+    assert "line_quantity" not in body  # response shaping, not storage
+    stored = current_row.payload["material_coverage_snapshot"]
+    assert stored["line_quantity"] == float(current_row.payload["launchable_qty"])
 
 
 def test_work_item_materials_remain_readable_from_the_published_row_generation(db_session):
@@ -2133,3 +2145,139 @@ def test_order_deleted_in_1c_does_not_resurrect_journal_row(db_session):
     row = rows[0]
     assert row["status"] == "not_created"
     assert row["product_id"] is None
+
+
+def test_a_custody_event_on_a_component_names_it_as_touched(db_session):
+    """Item 29c: custody folded by this refresh invalidates snapshot reuse.
+
+    The delta item, the items whose StockBin was restamped and the components
+    of the custody events linked to the delta are all "touched"; a snapshot
+    naming any of them is previewed again (see the proposal reuse test).
+    """
+    from app.services.item_ledger.physical_refresh_current_publish import (
+        production_affected_item_ids,
+    )
+
+    _item, _order, product = _journal_line(db_session)
+    delta_item = models.Item(item_code="CUSTODY-DELTA", item_name="delta")
+    component = models.Item(item_code="CUSTODY-COMPONENT", item_name="component")
+    restamped = models.Item(item_code="CUSTODY-RESTAMPED", item_name="restamped")
+    db_session.add_all([delta_item, component, restamped])
+    db_session.flush()
+    generation = _building_generation(db_session, "custody-touched")
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(generation.physical_import_batch_id),
+        source_content_hash="custody-touched-sle", business_identity="custody-touched-sle",
+        item_id=int(delta_item.item_id), characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="WH", qty=1, posting_at=datetime(2026, 7, 23),
+        record_type="Receipt", movement_kind="transfer_in", recorder_type="Doc",
+        recorder_ref="custody-touched", line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.flush()
+    db_session.add(models.ProductionMaterialCustodyEvent(
+        product_id=int(product.product_id), component_item_id=int(component.item_id),
+        source_kind="transfer_posted", source_sle_id=int(sle.id),
+        effective_at=datetime(2026, 7, 23), location_kind="workshop",
+        warehouse_ref1c="WH", delta_qty=1, idempotency_key="custody-touched",
+    ))
+    db_session.flush()
+
+    touched = production_affected_item_ids(
+        db_session,
+        rows=[sle],
+        stock_result=SimpleNamespace(
+            changed_keys=(SimpleNamespace(item_id=int(restamped.item_id)),)
+        ),
+        custody_source_sle_ids=[int(sle.id)],
+    )
+
+    assert set(touched) == {
+        int(delta_item.item_id), int(component.item_id), int(restamped.item_id),
+    }
+
+
+def test_work_item_materials_read_a_proposal_published_by_the_bounded_path(db_session):
+    """Item 29d, bounded path: same stored contract, same 200.
+
+    A bounded refresh republishes the proposal without a new work item; the
+    obligation-generation work item remains the locator.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.database import get_db
+    from app.routers.production_control import router as production_router
+    from app.services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+        publish_current_production_control_from_payload,
+    )
+
+    # The work item belongs to the generation that froze the obligation; the
+    # current rows are published by a later one.
+    frozen = _building_generation(db_session, "production-journal-wi-bounded-frozen")
+    run, work = _make_proposal(db_session, frozen)
+    parent = _building_generation(db_session, "production-journal-wi-bounded-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = f"reservation:req:{reservation.requirement_id}:mode:make"
+    target = _building_generation(db_session, "production-journal-wi-bounded-target")
+    db_session.flush()
+
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        assembly_payload={
+            "queue_rows": [{
+                "entity_kind": "assembly_queue",
+                "business_identity": "plan-line:bounded-reader",
+                "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
+            }],
+        },
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[run.run_id],
+    )
+    publish_current_production_control_from_payload(db_session, int(parent.id), payload)
+    db_session.flush()
+    manifest = get_current_execution_scope(
+        db_session, entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
+    current_row = next(
+        row for row in load_current_execution_rows(
+            db_session, entity_kind="production_control_journal",
+            scope_key="production:all-live-orders",
+        )
+        if row.payload.get("product_id") is None
+    )
+    assert current_row.business_identity.startswith("mrp-reservation:")
+
+    app = FastAPI()
+    app.include_router(production_router, prefix="/api")
+
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/production-control/work-items/{work.id}/materials",
+            params={
+                "current_identity": current_row.business_identity,
+                "expected_source_revision": manifest.source_revision,
+            },
+        )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["components"]
+    assert "line_quantity" not in body
