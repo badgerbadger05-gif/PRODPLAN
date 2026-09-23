@@ -7,7 +7,6 @@ an accepted generation identity or stop their calculation with
 
 import contextvars
 from contextlib import contextmanager
-from functools import wraps
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from collections.abc import Iterable, Iterator
@@ -131,11 +130,15 @@ _PUBLICATION_CONTEXT: contextvars.ContextVar[bool] = contextvars.ContextVar(
 def publication_context() -> Iterator[None]:
     """Mark the calling stack as the publication that restores freshness.
 
-    Decision §40.  A physical or obligation publication is the only thing
-    that makes the accepted pointer young again, so gating any part of it on
-    that pointer's age is a deadlock: once a stand has been quiet longer than
-    the threshold, every publication fails on staleness and nothing can
-    clear it.
+    Decision §40 names exactly two entry points: the physical refresh
+    publication (``publish_forward_physical_refresh_current``) and the no-op
+    scope repair (``repair_current_execution_scopes_from_pointer``).  They are
+    what makes the accepted pointer young again, so gating them on that
+    pointer's age is a deadlock: once a stand has been quiet longer than the
+    threshold, every tick fails on staleness and nothing can clear it.  An
+    obligation refresh or a build acceptance is not such an entry point - an
+    obligation refresh inherits its parent's cutoff and freezes MRP, which
+    the contract forbids on stale truth - so neither may enter this context.
 
     The exemption is a property of the operation, not of one call, which is
     why it lives here and not in a keyword threaded through the builders.
@@ -155,17 +158,6 @@ def publication_context() -> Iterator[None]:
 def inside_publication() -> bool:
     """Whether the caller runs inside a publication (see §40)."""
     return bool(_PUBLICATION_CONTEXT.get())
-
-
-def as_publication(func):
-    """Declare a whole publication entry point, so its callees inherit §40."""
-
-    @wraps(func)
-    def _wrapped(*args, **kwargs):
-        with publication_context():
-            return func(*args, **kwargs)
-
-    return _wrapped
 
 
 def _configured_max_age() -> timedelta | None:

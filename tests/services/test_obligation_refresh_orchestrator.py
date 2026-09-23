@@ -1327,3 +1327,30 @@ def test_closing_a_plan_retires_only_that_plans_owners(db_session):
     assert bool(closing.owner.is_current) is False
     assert str(kept.owner.lifecycle_status) == "active"
     assert bool(kept.owner.is_current) is True
+
+
+def test_obligation_refresh_on_a_pointer_older_than_the_limit_is_refused(
+    db_session, monkeypatch,
+):
+    """§40 exempts only the physical publication and the no-op repair.
+
+    An obligation refresh inherits its parent's cutoff, so it cannot restore
+    freshness; it freezes MRP, and MRP on stale truth is forbidden.  Inside
+    the publication context it froze anyway (item 24, P1-1).
+    """
+    from app.services import planning_truth
+    from app.services.mrp_freeze import LedgerPoolUnavailable
+
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    accepted, plan, _line, _item, _old, _cutoff = _world(db_session, with_parent=False)
+
+    with pytest.raises(LedgerPoolUnavailable, match="freshness threshold") as excinfo:
+        _run(db_session, accepted, "orch-stale", add=[plan.id])
+    db_session.rollback()
+
+    assert planning_truth.inside_publication() is False
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
+    assert db_session.query(models.LedgerGeneration).filter_by(
+        generation_key="orch-stale"
+    ).count() == 0
+    assert "freshness threshold" in str(excinfo.value)

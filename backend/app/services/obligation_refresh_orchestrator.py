@@ -70,7 +70,6 @@ from app.services.item_ledger.replenishment_work_item_builder import (
 from app.services.item_ledger.reservation_current import (
     publish_current_reservations,
 )
-from app.services.planning_truth import as_publication
 from app.services.item_ledger.reservation_consumption_persistence import (
     ALGORITHM_VERSION as RESERVATION_CONSUMPTION_ALGORITHM_VERSION,
     materialize_reservation_consumption_allocations,
@@ -419,10 +418,11 @@ def _retry_published(
     )
 
 
-# §40: an obligation refresh is a publication.  It republishes the current
-# scopes of the pointer it descends from, so nothing inside it may be gated
-# on that pointer's age - the same deadlock the physical refresh had.
-@as_publication
+# Not a §40 publication.  An obligation refresh inherits its parent's cutoff,
+# so it cannot make the pointer fresh again, and it freezes MRP: on a pointer
+# older than the freshness threshold it must be refused like any other MRP
+# freeze (the contract forbids MRP on stale truth).  Only the physical refresh
+# publication and the no-op scope repair restore freshness.
 def run_obligation_refresh(
     db: Session,
     *,

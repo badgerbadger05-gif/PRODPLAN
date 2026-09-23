@@ -445,6 +445,8 @@ def _pointer_provenance_blockers(engine: Engine, current_id: int | None) -> list
         if not {"physical_import_batch_id", "cutoff"}.issubset(generation_columns):
             return []
     with _Session(engine) as session:
+        # Prefix-wide and contour-less by design: this probe guards evidence
+        # removal, and a fact outside today's contour may rejoin it.
         lost = lost_supplier_receipt_provenance_sle_ids(
             session, ledger_generation_id=int(current_id), limit=9
         )

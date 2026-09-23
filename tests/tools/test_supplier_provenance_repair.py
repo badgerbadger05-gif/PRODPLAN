@@ -83,6 +83,13 @@ def _world(engine, *, type_at_old=True, receipts=2):
             completed_at=CUTOFF,
         )
         session.add(batch)
+        # The live planning contour the repair judges loss against.
+        session.add(models.StockWarehouse(
+            warehouse_ref1c="WH",
+            warehouse_name="Planning contour",
+            is_selected=True,
+            is_finished_goods=False,
+        ))
         session.flush()
         old = _generation(session, "repair-old", batch_id=batch.id)
         pointer = _generation(session, "repair-pointer", batch_id=batch.id)
@@ -302,3 +309,37 @@ def test_repair_normalises_pre_contract_rows_in_place():
             assert (row.supplier_order_ref, row.match_status, row.match_rule) == (
                 "ORDER-1", "exact", "bounded-typed",
             )
+
+
+def test_repair_judges_loss_against_the_live_planning_contour():
+    """The repair's verdict is the publication gate's verdict (§41).
+
+    A fact on a warehouse outside the live contour is not a planning receipt;
+    its missing evidence is neither repaired nor reported as lost.
+    """
+    engine = _engine()
+    _old_id, _pointer_id = _world(engine, receipts=2)
+    with Session(engine) as session:
+        outside = session.query(models.StockLedgerEntry).order_by(
+            models.StockLedgerEntry.id.desc()
+        ).first()
+        outside.warehouse_ref1c = "WH-OUTSIDE"
+        session.commit()
+
+    report = apply_supplier_provenance_repair(engine, writers_stopped=True)
+
+    assert report["status"] == "ready"
+    assert report["lost_before"] == 1
+    assert report["reowned_rows"] == 1
+    assert report["contour_warehouses"] == 1
+
+
+def test_repair_without_a_planning_contour_is_blocked():
+    engine = _engine()
+    _world(engine, receipts=1)
+    with Session(engine) as session:
+        session.query(models.StockWarehouse).delete()
+        session.commit()
+
+    with pytest.raises(PreflightBlocked, match="planning contour"):
+        apply_supplier_provenance_repair(engine, writers_stopped=True)

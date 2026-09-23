@@ -1416,6 +1416,21 @@ def _supplier_provenance_repair_on_session(
                 f"supplier provenance repair requires table {required}"
             )
 
+    # The loss verdict is the publication gate's verdict (decision §41): a
+    # fact on a warehouse outside the live planning contour is not a planning
+    # receipt, so its missing evidence is not what this phase repairs.
+    from app.services.planning_pool_resolver import (
+        PlanningPoolConfigurationError,
+        resolve_planning_pool_by_warehouse,
+    )
+
+    try:
+        contour = resolve_planning_pool_by_warehouse(session)
+    except PlanningPoolConfigurationError as exc:
+        raise PreflightBlocked(
+            f"supplier provenance repair needs the live planning contour: {exc}"
+        ) from exc
+
     def _owned_here() -> int:
         return int(session.execute(text(
             "SELECT count(*) FROM stock_ledger_supplier_receipt_provenance "
@@ -1425,7 +1440,7 @@ def _supplier_provenance_repair_on_session(
     owned_before = _owned_here()
     pre_contract_before = len(_pre_contract_provenance_rows(session, int(generation_id)))
     lost_before = lost_supplier_receipt_provenance_sle_ids(
-        session, ledger_generation_id=int(generation_id)
+        session, ledger_generation_id=int(generation_id), contour=contour
     )
     untyped_anywhere = untyped_supplier_receipt_sle_ids(
         session, ledger_generation_id=int(generation_id)
@@ -1474,7 +1489,7 @@ def _supplier_provenance_repair_on_session(
         )
 
     lost_after = lost_supplier_receipt_provenance_sle_ids(
-        session, ledger_generation_id=int(generation_id)
+        session, ledger_generation_id=int(generation_id), contour=contour
     )
     if lost_after:
         raise PostflightBlocked(
@@ -1488,6 +1503,7 @@ def _supplier_provenance_repair_on_session(
         "status": "ready",
         "generation_id": int(generation_id),
         "source_generation_ids": [int(value) for value in sources],
+        "contour_warehouses": len(contour),
         "provenance_rows_before": owned_before,
         "provenance_rows_after": _owned_here(),
         "reowned_rows": int(reowned),

@@ -527,6 +527,43 @@ def _audit_change(
     )
 
 
+#: R4 revision rule: a current replenishment marker is stamped with the id of
+#: the ledger generation whose publication wrote it.  Generation ids are
+#: unique and monotonic across every kind that publishes (historical accept,
+#: bootstrap on the pointer, bounded physical refresh, obligation refresh),
+#: and a candidate can only publish while its parent is still the pointer, so
+#: the published sequence is strictly increasing.  The import batch id is not
+#: a publication identity: an obligation refresh inherits its parent's batch,
+#: so two consecutive obligation refreshes stamped the same revision with
+#: different reserve ids and the second failed "same source revision has
+#: payload drift".
+GENERATION_REVISION = "generation"
+RevisionBasis = Literal["explicit", "generation"]
+
+
+def _previous_revision(
+    state: models.CurrentReplenishmentState, revision_basis: str
+) -> tuple[int, bool]:
+    """The stored revision on the caller's axis, and whether it is legacy.
+
+    Under the generation rule a marker always satisfies
+    ``source_revision == ledger_generation_id``.  A marker that does not was
+    stamped with an import batch id before the rule (``14440`` against
+    generation ids near ``1450``): numerically it looks newer than every
+    generation, so comparing it as stored would refuse every write forever.
+    Its generation column is the publication that wrote it, so that is its
+    revision on the generation axis - deterministic, no migration, and the
+    marker is rewritten to the rule by the first write that passes.
+    """
+    stored = int(state.source_revision)
+    if revision_basis != GENERATION_REVISION:
+        return stored, False
+    publishing_generation = int(state.ledger_generation_id)
+    if stored == publishing_generation:
+        return stored, False
+    return publishing_generation, True
+
+
 def apply_current_replenishment(
     db: Session,
     *,
@@ -545,6 +582,7 @@ def apply_current_replenishment(
     history_mode: str = "as_occurred",
     receipt_unmatched_return_qty: Decimal = Decimal("0"),
     confirmed_empty_reason: str = "",
+    revision_basis: RevisionBasis = "explicit",
 ) -> CurrentReplenishmentResult:
     """Apply one complete accepted-fact scope atomically.
 
@@ -560,6 +598,11 @@ def apply_current_replenishment(
     is only authoritative for the reserves it was handed.  The reason is
     stamped on every basis-change audit row the clear-out produces, so the
     emptiness always has a recorded cause in the database.
+
+    ``revision_basis="generation"`` is the production rule (see
+    :data:`GENERATION_REVISION`): the revision is the id of the generation
+    this write publishes.  ``"explicit"`` keeps a caller-chosen monotonic
+    integer and is a test/maintenance seam only.
     """
 
     fact_rows = tuple(facts)
@@ -595,6 +638,13 @@ def apply_current_replenishment(
         raise CurrentReplenishmentError("source_revision must be an integer") from exc
     if revision < 0:
         raise CurrentReplenishmentError("source_revision must be non-negative")
+    if revision_basis not in ("explicit", GENERATION_REVISION):
+        raise CurrentReplenishmentError(f"unknown revision basis {revision_basis!r}")
+    if revision_basis == GENERATION_REVISION and revision != int(generation_id):
+        raise CurrentReplenishmentError(
+            f"generation revision {revision} does not identify the publishing "
+            f"generation {int(generation_id)}"
+        )
 
     generation = (
         db.query(models.LedgerGeneration)
@@ -627,7 +677,7 @@ def apply_current_replenishment(
         # of needing a data migration.  Idempotent.
         if _text(state.source_key) != canonical_key:
             state.source_key = canonical_key
-        previous_revision = int(state.source_revision)
+        previous_revision, legacy_marker = _previous_revision(state, revision_basis)
         if revision < previous_revision:
             raise CurrentReplenishmentError(
                 f"stale source revision {revision}; current is {previous_revision}"
@@ -638,8 +688,12 @@ def apply_current_replenishment(
             if _text(state.status) != "completed":
                 raise CurrentReplenishmentError("current source marker is still applying")
             generation_changed = int(state.ledger_generation_id) != int(generation.id)
-            if generation_changed:
+            if generation_changed or legacy_marker:
+                # A legacy marker re-published by its own generation is the
+                # same publication: only its revision spelling is brought to
+                # the generation rule, so the alias disappears on first write.
                 state.ledger_generation_id = int(generation.id)
+                state.source_revision = revision
                 state.updated_at = datetime.now(timezone.utc)
                 db.flush()
             return CurrentReplenishmentResult(
@@ -651,7 +705,7 @@ def apply_current_replenishment(
                 deleted=0,
                 changed_pairs=0,
                 audit_events=0,
-                idempotent=not generation_changed,
+                idempotent=not (generation_changed or legacy_marker),
             )
     else:
         state = models.CurrentReplenishmentState(
@@ -1078,6 +1132,7 @@ def apply_current_receipt_replay(
     allow_building: bool = False,
     validated_visible_ids: Iterable[int] | None = None,
     confirmed_empty_reason: str = "",
+    revision_basis: RevisionBasis = "explicit",
 ) -> CurrentReplenishmentResult:
     """Publish signed correction/return replay through the R4 current writer."""
 
@@ -1205,6 +1260,7 @@ def apply_current_receipt_replay(
         history_mode=history_mode,
         receipt_unmatched_return_qty=replay.unmatched_return_qty,
         confirmed_empty_reason=confirmed_empty_reason,
+        revision_basis=revision_basis,
     )
 
 
@@ -1274,6 +1330,25 @@ def reject_legacy_supplier_receipt_writer(
         raise CurrentReplenishmentError(
             "supplier receipt ReservationEvent writer is retired for an R4 current scope"
         )
+
+
+def _adapter_revision(
+    source_revision: int | None, generation_id: int
+) -> tuple[int, RevisionBasis]:
+    """Production adapters stamp the publishing generation (the R4 rule).
+
+    An explicit integer is kept only as a test/maintenance seam and is
+    compared as given, exactly as before the rule.
+    """
+    if source_revision is None:
+        return int(generation_id), GENERATION_REVISION
+    try:
+        revision = int(source_revision)
+    except (TypeError, ValueError) as exc:
+        raise CurrentReplenishmentError("source_revision must be an integer") from exc
+    if revision < 0:
+        raise CurrentReplenishmentError("source_revision must be non-negative")
+    return revision, "explicit"
 
 
 def apply_current_replenishment_for_accepted_generation(
@@ -1464,11 +1539,7 @@ def apply_current_replenishment_for_accepted_generation(
                 correction_receipt_ref=_text(row.correction_receipt_ref) or None,
             )
         )
-    revision = int(
-        source_revision
-        if source_revision is not None
-        else generation.physical_import_batch_id
-    )
+    revision, basis = _adapter_revision(source_revision, int(generation.id))
     result: list[CurrentReplenishmentResult] = []
     for item_id, scope_set in sorted(item_scopes.items()):
         scope = next(iter(scope_set))
@@ -1513,6 +1584,7 @@ def apply_current_replenishment_for_accepted_generation(
                 exact_allocation_caps=exact_caps,
                 history_mode="as_occurred",
                 allow_building=allow_building,
+                revision_basis=basis,
             )
         )
     return tuple(result)
@@ -1525,7 +1597,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
     parent_generation_id: int,
     target_cutoff: datetime,
     affected_scopes: Iterable[DistributionScope],
-    source_revision: int,
+    source_revision: int | None = None,
 ) -> BoundedMakeReplenishmentResult:
     """Apply bounded ``assembly_in`` facts to stable current MAKE owners.
 
@@ -1545,12 +1617,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
     leave a partial bounded publication.
     """
 
-    try:
-        revision = int(source_revision)
-    except (TypeError, ValueError) as exc:
-        raise CurrentReplenishmentError("source_revision must be an integer") from exc
-    if revision < 0:
-        raise CurrentReplenishmentError("source_revision must be non-negative")
+    revision, basis = _adapter_revision(source_revision, int(target_generation_id))
 
     target = db.get(models.LedgerGeneration, int(target_generation_id))
     parent = db.get(models.LedgerGeneration, int(parent_generation_id))
@@ -1801,6 +1868,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 complete_scope=True,
                 distribution_scope=scope,
                 allow_building=True,
+                revision_basis=basis,
             )
         )
     return BoundedMakeReplenishmentResult(
@@ -2398,8 +2466,8 @@ def apply_current_replenishment_for_bounded_buy_scopes(
     parent_generation_id: int,
     target_cutoff: datetime,
     affected_scopes: Iterable[DistributionScope],
-    source_revision: int,
     delta_manifest: BoundedBuyReceiptDeltaManifest | Mapping[str, object],
+    source_revision: int | None = None,
 ) -> BoundedBuyReplenishmentResult:
     """Apply typed supplier receipts to stable current BUY owners only.
 
@@ -2409,12 +2477,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
     visibility query or generation-scoped provenance copy is performed.
     """
 
-    try:
-        revision = int(source_revision)
-    except (TypeError, ValueError) as exc:
-        raise CurrentReplenishmentError("source_revision must be an integer") from exc
-    if revision < 0:
-        raise CurrentReplenishmentError("source_revision must be non-negative")
+    revision, basis = _adapter_revision(source_revision, int(target_generation_id))
     scopes = _normalise_bounded_buy_scopes(affected_scopes)
     manifest = _normalise_bounded_buy_manifest(delta_manifest)
     target = db.get(models.LedgerGeneration, int(target_generation_id))
@@ -2579,6 +2642,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
                 history_mode="as_occurred",
                 allow_building=True,
                 validated_visible_ids=visible_ids,
+                revision_basis=basis,
             )
         )
     return BoundedBuyReplenishmentResult(

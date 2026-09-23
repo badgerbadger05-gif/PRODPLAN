@@ -103,10 +103,14 @@ def lost_supplier_receipt_provenance_sle_ids(
     ``rows`` restricts it to an explicit fact set.  A publication passes its
     own delta - CANON "Объём вычислений штатного физического refresh" makes
     that the unit of work, and history the refresh did not touch is not its
-    verdict to give.  Maintenance (the repair phase, the GC probe) passes
-    ``None`` and stays prefix-wide on purpose, because repairing history is
-    exactly its job; both still pass the contour.  One function, two explicit
-    arguments, so the two cannot drift apart.
+    verdict to give.  Maintenance passes ``rows=None`` and stays prefix-wide
+    on purpose, because repairing history is exactly its job.  The repair
+    phase passes the resolved live contour, so it repairs what the
+    publication gate would refuse and nothing else.  The GC probe passes no
+    contour, by design: it guards the *removal* of evidence, a warehouse
+    outside today's contour may rejoin it, and deleting the only typed copy
+    of such a fact is irreversible - so it is prefix-wide and contour-less.
+    One function, two explicit arguments, so the callers cannot drift apart.
     """
     owned_here = exists().where(and_(
         models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id

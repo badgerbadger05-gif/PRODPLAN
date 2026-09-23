@@ -642,3 +642,17 @@ def test_bounded_buy_stale_parent_is_rejected(db_session):
     pointer.current_generation_id = target.id
     with pytest.raises(CurrentReplenishmentError, match="not current truth"):
         _call(db_session, parent, target, fact)
+
+
+def test_bounded_buy_stamps_the_publishing_generation_by_default(db_session):
+    """R4 revision rule: the marker names the generation, not the batch."""
+    parent, target, batch, items, _owners = _world(db_session)
+    _row, fact = _receipt(db_session, batch, items[0])
+    result = _call(db_session, parent, target, fact, source_revision=None)
+    db_session.commit()
+
+    assert result.source_revision == int(target.id)
+    assert {
+        (int(row.source_revision), int(row.ledger_generation_id))
+        for row in db_session.query(models.CurrentReplenishmentState).all()
+    } == {(int(target.id), int(target.id))}

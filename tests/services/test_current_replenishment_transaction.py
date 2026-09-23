@@ -1222,10 +1222,11 @@ def test_a_genuinely_foreign_source_stream_still_fails_closed(db_session):
 def test_bootstrap_revision_cannot_collide_with_the_next_bounded_refresh(db_session):
     """The drift guard must not fire on the first bounded refresh.
 
-    The bootstrap stamps the pointer's ``physical_import_batch_id``; a
-    bounded refresh stamps its own target's, and a fork always allocates a
-    new batch, so the bounded revision is strictly greater and the
-    equal-revision drift check is never reached.
+    Exercised through the explicit-revision seam: a strictly greater revision
+    with a different payload is a new revision, never drift.  Production
+    writers stamp the publishing generation instead (``GENERATION_REVISION``;
+    see the item-23 tests below), because an obligation refresh inherits its
+    parent's batch and the batch id cannot tell two publications apart.
     """
     from app.services.item_ledger.current_replenishment import (
         SUPPLIER_RECEIPT_SOURCE_KEY,
@@ -1304,3 +1305,244 @@ def test_the_two_entry_paths_are_one_stream_for_the_same_scope(db_session):
 
     assert result.source_key == "supplier-receipts"
     assert len(_state_rows(db_session)) == 1
+
+
+# --- R4 revision identifies the publishing generation (item 23) -------------
+
+
+def _obligation_refresh_over(db, parent, *, key):
+    """An obligation-refresh generation: new id, the parent's own batch."""
+    from app.services.item_ledger.physical_refresh_generation import (
+        _clone_supplier_receipt_provenance,
+    )
+
+    successor = _successor_over_the_same_prefix(db, parent, key=key)
+    _clone_supplier_receipt_provenance(
+        db,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(successor.id),
+    )
+    return successor
+
+
+def _point_at(db, generation):
+    pointer = db.get(models.PlanningTruthState, 1)
+    if pointer is None:
+        db.add(models.PlanningTruthState(id=1, current_generation_id=int(generation.id)))
+    else:
+        pointer.current_generation_id = int(generation.id)
+    db.flush()
+
+
+def _replace_run(reservations, quantity):
+    """What a run replacement does to the scope input: new reserve quantities."""
+    for row in reservations:
+        row.reserved_qty = Decimal(quantity)
+        row.replenishment_required_qty = Decimal(quantity)
+
+
+def test_two_consecutive_obligation_refreshes_over_one_batch_are_both_accepted(
+    db_session,
+):
+    """The stand's run 507: the second refresh failed "payload drift".
+
+    Both refreshes inherit the parent's import batch, so the batch id could
+    not tell their publications apart; their reserve sets differ, which is
+    exactly a different checksum under "the same revision".
+    """
+    generation_id, _item_id, reservations, _facts = _supplier_typed_world(
+        db_session, prefix="two-refreshes"
+    )
+    parent = db_session.get(models.LedgerGeneration, int(generation_id))
+    first = _obligation_refresh_over(db_session, parent, key="refresh-1")
+    _replace_run(reservations, "6")
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(first.id)
+    )
+    db_session.commit()
+
+    second = _obligation_refresh_over(db_session, first, key="refresh-2")
+    assert second.physical_import_batch_id == first.physical_import_batch_id
+    _replace_run(reservations, "5")
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(second.id)
+    )
+    db_session.commit()
+
+    assert results and all(int(r.source_revision) == int(second.id) for r in results)
+    assert {
+        (int(row.source_revision), int(row.ledger_generation_id))
+        for row in _state_rows(db_session)
+    } == {(int(second.id), int(second.id))}
+
+
+def test_obligation_and_bounded_writes_interleave_on_one_axis(db_session):
+    """Bootstrap -> bounded -> obligation -> bounded: strictly increasing.
+
+    Every production writer stamps the generation it publishes, whatever its
+    kind, so the order of publication is the order of revisions.
+    """
+    from app.services.item_ledger.current_replenishment import (
+        GENERATION_REVISION,
+        SUPPLIER_RECEIPT_SOURCE_KEY,
+    )
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="axis")
+    reserves = _reserves(reservations)
+    pointer = db_session.get(models.LedgerGeneration, int(generation_id))
+
+    def bounded(generation, qty):
+        changed = (Fact(**{**facts[0].__dict__, "qty": Decimal(qty)}),) + tuple(facts[1:])
+        return apply_current_replenishment(
+            db_session,
+            generation_id=int(generation.id),
+            source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+            source_revision=int(generation.id),
+            facts=changed,
+            reserves=reserves,
+            complete_scope=True,
+            revision_basis=GENERATION_REVISION,
+        )
+
+    bootstrap = bounded(pointer, "8")
+    physical = _successor_over_the_same_prefix(db_session, pointer, key="axis-bounded")
+    after_bounded = bounded(physical, "5")
+    obligation = _successor_over_the_same_prefix(db_session, physical, key="axis-obl")
+    after_obligation = bounded(obligation, "4")
+    physical_again = _successor_over_the_same_prefix(
+        db_session, obligation, key="axis-bounded-2"
+    )
+    after_again = bounded(physical_again, "3")
+    db_session.commit()
+
+    revisions = [
+        int(r.source_revision)
+        for r in (bootstrap, after_bounded, after_obligation, after_again)
+    ]
+    assert revisions == sorted(set(revisions))
+    assert revisions == [
+        int(pointer.id), int(physical.id), int(obligation.id), int(physical_again.id)
+    ]
+
+
+def test_a_marker_stamped_with_a_batch_id_is_accepted_by_the_first_generation_write(
+    db_session,
+):
+    """Existing databases: ``14440`` against generation ids near ``1450``.
+
+    As stored the batch revision looks newer than every generation and would
+    refuse every write; its own generation column is its revision on the
+    generation axis, and the first write that passes rewrites it.
+    """
+    generation_id, _item_id, reservations, _facts = _supplier_typed_world(
+        db_session, prefix="legacy-batch"
+    )
+    parent = db_session.get(models.LedgerGeneration, int(generation_id))
+    _point_at(db_session, parent)
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(parent.id)
+    )
+    db_session.commit()
+    for row in _state_rows(db_session):
+        row.source_revision = 14440
+    db_session.commit()
+
+    successor = _obligation_refresh_over(db_session, parent, key="legacy-next")
+    _replace_run(reservations, "6")
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(successor.id)
+    )
+    db_session.commit()
+
+    assert results
+    assert {int(row.source_revision) for row in _state_rows(db_session)} == {
+        int(successor.id)
+    }
+
+
+def test_a_batch_id_marker_republished_by_its_own_generation_is_rewritten(db_session):
+    generation_id, _item_id, _reservations, _facts = _supplier_typed_world(
+        db_session, prefix="legacy-same"
+    )
+    _point_at(db_session, db_session.get(models.LedgerGeneration, int(generation_id)))
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(generation_id)
+    )
+    db_session.commit()
+    for row in _state_rows(db_session):
+        row.source_revision = 14440
+    db_session.commit()
+
+    results = apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(generation_id)
+    )
+    db_session.commit()
+
+    assert all(int(r.changed_pairs) == 0 for r in results)
+    assert {int(row.source_revision) for row in _state_rows(db_session)} == {
+        int(generation_id)
+    }
+
+
+def test_genuine_drift_under_one_generation_still_fails_closed(db_session):
+    """Same publication, different input: that is drift, not a new revision."""
+    generation_id, _item_id, reservations, _facts = _supplier_typed_world(
+        db_session, prefix="drift"
+    )
+    _point_at(db_session, db_session.get(models.LedgerGeneration, int(generation_id)))
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(generation_id)
+    )
+    db_session.commit()
+    _replace_run(reservations, "6")
+
+    with pytest.raises(CurrentReplenishmentError, match="payload drift"):
+        apply_current_replenishment_for_accepted_generation(
+            db_session, generation_id=int(generation_id)
+        )
+
+
+def test_an_older_generation_cannot_overwrite_a_newer_publication(db_session):
+    from app.services.item_ledger.current_replenishment import (
+        GENERATION_REVISION,
+        SUPPLIER_RECEIPT_SOURCE_KEY,
+    )
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="stale")
+    parent = db_session.get(models.LedgerGeneration, int(generation_id))
+    successor = _successor_over_the_same_prefix(db_session, parent, key="stale-next")
+
+    def write(generation):
+        return apply_current_replenishment(
+            db_session,
+            generation_id=int(generation.id),
+            source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+            source_revision=int(generation.id),
+            facts=facts,
+            reserves=_reserves(reservations),
+            complete_scope=True,
+            revision_basis=GENERATION_REVISION,
+        )
+
+    write(successor)
+    db_session.commit()
+    _replace_run(reservations, "6")
+    with pytest.raises(CurrentReplenishmentError, match="stale source revision"):
+        write(parent)
+
+
+def test_a_generation_revision_must_name_the_publishing_generation(db_session):
+    from app.services.item_ledger.current_replenishment import GENERATION_REVISION
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix="name")
+    with pytest.raises(CurrentReplenishmentError, match="does not identify"):
+        apply_current_replenishment(
+            db_session,
+            generation_id=int(generation_id),
+            source_key="supplier-receipts",
+            source_revision=int(generation_id) + 1,
+            facts=facts,
+            reserves=_reserves(reservations),
+            complete_scope=True,
+            revision_basis=GENERATION_REVISION,
+        )

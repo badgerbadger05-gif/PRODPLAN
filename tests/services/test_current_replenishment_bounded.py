@@ -335,3 +335,22 @@ def test_bounded_make_failure_after_one_scope_is_rollbackable_by_caller(
     assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
     assert db_session.query(models.CurrentReplenishmentState).count() == 0
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
+
+
+def test_bounded_make_stamps_the_publishing_generation_by_default(db_session):
+    """R4 revision rule: the marker names the generation, not the batch."""
+    parent, target, items, _owners, _facts = _world(db_session)
+    result = apply_current_replenishment_for_bounded_make_scopes(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        target_cutoff=target.cutoff,
+        affected_scopes=(_scope(items[0].item_id),),
+    )
+    db_session.commit()
+
+    assert result.source_revision == int(target.id)
+    assert {
+        (int(row.source_revision), int(row.ledger_generation_id))
+        for row in db_session.query(models.CurrentReplenishmentState).all()
+    } == {(int(target.id), int(target.id))}

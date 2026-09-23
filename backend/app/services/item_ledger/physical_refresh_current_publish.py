@@ -562,7 +562,7 @@ def _current_scopes(
     for row in rows:
         scope = _buy_scope_for_receipt(
             row,
-                planning_pool_by_warehouse=planning_pool_by_warehouse,
+            planning_pool_by_warehouse=planning_pool_by_warehouse,
             current_owners=current_owners,
         )
         if scope is not None:
@@ -1057,7 +1057,8 @@ def _publish_forward_physical_refresh_current(
             parent_generation_id=int(parent.id),
             target_cutoff=target.cutoff,
             affected_scopes=make_scopes,
-            source_revision=revision,
+            # R4 markers carry the publishing generation, not the import
+            # batch (``current_replenishment.GENERATION_REVISION``).
         )
         phase("make")
     elif _phase_tracker is not None:
@@ -1099,7 +1100,6 @@ def _publish_forward_physical_refresh_current(
             parent_generation_id=int(parent.id),
             target_cutoff=target.cutoff,
             affected_scopes=buy_scopes,
-            source_revision=revision,
             delta_manifest=buy_manifest,
         )
     else:
