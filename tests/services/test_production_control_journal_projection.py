@@ -620,7 +620,9 @@ def test_compact_current_production_control_payload_uses_current_sources_and_pub
     assert payload["meta"]["ledger_generation_id"] == target.id
     row = next(row for row in payload["rows"] if row["product_id"] == product.product_id)
     assert row["current_identity"] == f"production-order-line:{order.order_id}:1"
-    assert "material_coverage_snapshot" not in row
+    # Item 28a: the order row keeps the coverage snapshot the current material
+    # readers serve, exactly as the staged path publishes it.
+    assert isinstance(row.get("material_coverage_snapshot"), dict)
     assert not any(
         key in {"generation_id", "ledger_generation_id", "source_generation_id", "snapshot_id"}
         for key in row
@@ -782,9 +784,20 @@ def test_compact_make_proposal_keeps_only_its_row_root_membership(db_session):
     assert row["root_item_ids"] == [reservation.item_id]
 
 
-def test_compact_make_coverage_uses_one_bulk_fold_not_per_row_preview(
+def test_compact_make_proposal_carries_and_reuses_its_material_snapshot(
     db_session, monkeypatch
 ):
+    """Item 28d: the bounded path publishes the proposal snapshot the
+    work-item materials reader serves, previewing only what it cannot reuse.
+
+    Coverage scalars still come from one bulk fold; the per-proposal preview
+    runs for a proposal without a reusable parent snapshot, and an untouched
+    proposal of the same quantity reuses its parent row with zero change rows.
+    """
+    from app.services.item_ledger.current_execution import (
+        publish_current_production_control_from_payload,
+    )
+
     parent = _building_generation(db_session, "production-journal-compact-bulk-coverage-parent")
     parent.status = "accepted"
     parent.accepted_at = parent.cutoff
@@ -799,31 +812,63 @@ def test_compact_make_coverage_uses_one_bulk_fold_not_per_row_preview(
     target = _building_generation(db_session, "production-journal-compact-bulk-coverage-target")
     db_session.flush()
 
-    def fail_per_row_preview(*args, **kwargs):
-        raise AssertionError("compact refresh must not preview each MAKE row")
+    previews = []
+
+    def preview(db, *, work_item_id, item_id, quantity, spec_id, **kwargs):
+        previews.append(int(item_id))
+        return {
+            "work_item_id": int(work_item_id), "line_quantity": float(quantity),
+            "coverage_status": "shortage",
+            "components": [{"component_item_id": 555001, "required_qty": "1.000"}],
+        }
 
     monkeypatch.setattr(
         "app.services.production_control_material_availability.preview_make_work_item_materials",
-        fail_per_row_preview,
+        preview,
     )
-    payload = build_compact_current_production_control_payload(
-        db_session,
-        target_generation_id=target.id,
-        parent_generation_id=parent.id,
-        assembly_payload={
-            "queue_rows": [{
-                "entity_kind": "assembly_queue",
-                "business_identity": "plan-line:bulk-coverage",
-                "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
-            }],
-        },
-        drum_payload={"rows": []},
-        shelf_payload={"rows": []},
-        accepted_run_ids=[run.run_id],
-    )
-    row = next(row for row in payload["rows"] if row.get("product_id") is None)
+
+    def build(affected_item_ids=None):
+        return build_compact_current_production_control_payload(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            assembly_payload={
+                "queue_rows": [{
+                    "entity_kind": "assembly_queue",
+                    "business_identity": "plan-line:bulk-coverage",
+                    "payload": {"run_id": run.run_id, "item_id": reservation.item_id},
+                }],
+            },
+            drum_payload={"rows": []},
+            shelf_payload={"rows": []},
+            accepted_run_ids=[run.run_id],
+            affected_item_ids=affected_item_ids,
+        )
+
+    first = build()
+    row = next(row for row in first["rows"] if row.get("product_id") is None)
     assert row["coverage_status"] == "shortage"
-    assert "material_coverage_snapshot" not in row
+    snapshot = row["material_coverage_snapshot"]
+    assert isinstance(snapshot, dict) and snapshot["line_quantity"] == float(row["launchable_qty"])
+    assert "work_item_id" not in snapshot  # no synthetic locator leaks
+    assert previews == [int(reservation.item_id)]
+
+    publish_current_production_control_from_payload(db_session, int(parent.id), first)
+    changes = db_session.query(models.CurrentExecutionChange).count()
+    previews.clear()
+
+    # A delta that touches neither the proposal item nor its components.
+    second = build(affected_item_ids=[999999])
+    reused = next(row for row in second["rows"] if row.get("product_id") is None)
+    assert previews == []
+    assert reused["material_coverage_snapshot"] == snapshot
+    result = publish_current_production_control_from_payload(db_session, int(parent.id), second)
+    assert result.idempotent is True
+    assert db_session.query(models.CurrentExecutionChange).count() == changes
+
+    # A delta naming one of its components previews it again.
+    build(affected_item_ids=[555001])
+    assert previews == [int(reservation.item_id)]
 
 
 def test_compact_production_reuses_unchanged_parent_material_snapshot(

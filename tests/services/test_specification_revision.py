@@ -417,3 +417,113 @@ def test_worker_stands_aside_while_a_physical_refresh_builds(
         db_session.get(models.SpecificationRebaseQueue, int(request.id)).status
         == "pending"
     )
+
+
+# --- Decision §50: rebase only what the remaining roots need ------------------
+
+
+def _rebase_scope_world(db_session, *, changed_spec_used_by):
+    """Two roots on one fixed plan: ``done`` fully accepted, ``open`` not.
+
+    ``changed`` is the specification whose frozen revision is outdated; the
+    current BOM gives it to the root named by ``changed_spec_used_by``.
+    """
+    changed = models.Specification(
+        spec_code="CH", spec_name="Changed", spec_ref1c="spec-changed", content_hash="new-hash",
+    )
+    other = models.Specification(
+        spec_code="OT", spec_name="Other", spec_ref1c="spec-other", content_hash="other-hash",
+    )
+    done = models.Item(item_code="ROOT-DONE", item_name="Accepted root", status="active")
+    open_root = models.Item(item_code="ROOT-OPEN", item_name="Remaining root", status="active")
+    db_session.add_all([changed, other, done, open_root])
+    db_session.flush()
+    uses_changed = done if changed_spec_used_by == "done" else open_root
+    uses_other = open_root if changed_spec_used_by == "done" else done
+    db_session.add_all([
+        models.DefaultSpecification(item_id=int(uses_changed.item_id), spec_id=int(changed.spec_id)),
+        models.DefaultSpecification(item_id=int(uses_other.item_id), spec_id=int(other.spec_id)),
+    ])
+    plan = models.ProductionPlanHeader(
+        name="Scope", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        status="fixed", fixed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add_all([
+        models.ProductionPlanLine(
+            plan_id=int(plan.id), item_id=int(done.item_id), bucket_date=date(2026, 8, 1),
+            qty=Decimal("3"), accepted_output_qty=Decimal("3"), remaining_output_qty=Decimal("0"),
+        ),
+        models.ProductionPlanLine(
+            plan_id=int(plan.id), item_id=int(open_root.item_id), bucket_date=date(2026, 8, 1),
+            qty=Decimal("3"), accepted_output_qty=Decimal("1"), remaining_output_qty=Decimal("2"),
+        ),
+    ])
+    run = models.PlanningRun(
+        source_plan_id=int(plan.id), status="FIXED_SNAPSHOT",
+        period_from=plan.period_from, period_to=plan.period_to, fixed_at=plan.fixed_at,
+        active_freeze_version=1, pinned=True, config_snapshot={},
+    )
+    db_session.add(run)
+    db_session.flush()
+    # The frozen matrix still carries the old revision of ``changed``.
+    db_session.add(models.MrpFreezeComponent(
+        run_id=int(run.run_id), freeze_version=1, root_item_id=int(uses_changed.item_id),
+        parent_item_id=int(uses_changed.item_id), parent_characteristic_ref="",
+        parent_organization_ref="", parent_planning_stock_pool="default",
+        component_item_id=int(uses_changed.item_id), component_characteristic_ref="",
+        component_organization_ref="", component_planning_stock_pool="default",
+        spec_ref="spec-changed", spec_version="old-hash",
+        norm_qty_per_unit=Decimal("1"), unit_coef=Decimal("1"),
+    ))
+    revision = models.SpecificationRevision(
+        spec_id=int(changed.spec_id), content_hash="new-hash", payload={"version": 2}, source="test",
+    )
+    db_session.add(revision)
+    db_session.flush()
+    request = models.SpecificationRebaseQueue(
+        spec_id=int(changed.spec_id), revision_id=int(revision.id),
+        old_content_hash="old-hash", new_content_hash="new-hash", status="pending",
+    )
+    db_session.add(request)
+    db_session.commit()
+    return run, request
+
+
+def test_a_change_only_an_accepted_root_uses_does_not_rebase_the_run(db_session, monkeypatch):
+    from app.services import specification_rebase_worker as worker
+
+    _run, request = _rebase_scope_world(db_session, changed_spec_used_by="done")
+    calls = []
+    monkeypatch.setattr(
+        worker, "rebase_fixed_plan_remaining_roots",
+        lambda *a, **kw: calls.append(a) or {"status": "rebased"},
+    )
+
+    result = run_one_pending_specification_rebase(db_session)
+
+    assert result["status"] == "idle"
+    assert calls == []
+    db_session.expire_all()
+    queued = db_session.get(models.SpecificationRebaseQueue, int(request.id))
+    assert queued.status == "completed"
+    assert queued.result == {"status": worker.DRIFT_OUTSIDE_REMAINING_ROOTS}
+
+
+def test_a_change_a_remaining_root_uses_rebases_the_run(db_session, monkeypatch):
+    from app.services import specification_rebase_worker as worker
+
+    run, _request = _rebase_scope_world(db_session, changed_spec_used_by="open")
+    calls = []
+
+    def fake_rebase(db, run_id, **kwargs):
+        calls.append((int(run_id), tuple(kwargs.get("changed_spec_refs") or ())))
+        raise RuntimeError("stop after selection")
+
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", fake_rebase)
+
+    with pytest.raises(RuntimeError, match="stop after selection"):
+        run_one_pending_specification_rebase(db_session)
+
+    assert calls == [(int(run.run_id), ("spec-changed",))]

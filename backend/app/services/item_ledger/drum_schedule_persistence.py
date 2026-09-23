@@ -694,6 +694,10 @@ def build_compact_current_drum_payload(
             "readiness_ref": readiness_ref_for_plan_line(line),
             "plan_id": int(slot.plan_id), "plan_line_id": line,
             "run_id": int(queue_by_line[line]["run_id"]),
+            # Same field set as the staged publisher
+            # (``current_execution.publish_current_execution_from_generation``).
+            "period_from": str(queue_by_line[line]["period_from"]),
+            "period_to": str(queue_by_line[line]["period_to"]),
             "item_id": int(slot.item_id), "resource_id": int(slot.resource_id),
             "slot_date": slot.slot_date.isoformat(), "auto_slot_date": slot.slot_date.isoformat(),
             "slot_qty": str(slot.slot_qty), "capacity_load": str(slot.capacity_load),

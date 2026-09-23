@@ -1279,13 +1279,17 @@ def freeze_candidate_snapshots(
         raise LedgerPoolUnavailable("candidate freeze source plan is missing")
 
     relevant_item_ids = _relevant_item_ids_for_plans(db, set(plans))
-    # Frozen obligation stock is the signed physical Ledger balance immediately
-    # before the earliest plan business period starts.  Receipts on/after that
-    # boundary are execution facts, never retroactive netting.
-    baseline_day = min(plan.period_from for plan in plans.values())
-    stock_baseline_at = (
-        datetime.combine(baseline_day, time.min) - timedelta(microseconds=1)
-    )
+    # Decision §49: frozen obligation stock is the signed physical Ledger
+    # balance at the moment of fixation - the freeze cutoff of the generation
+    # this candidate is frozen against.  Every fact not later than it is in
+    # ``covered_from_stock_at_freeze`` and can never replenish this owner;
+    # only facts after it do.  The former "period_from - 1us" boundary left
+    # receipts between period start and a later fixation (a rebase successor)
+    # outside the stock basis and counted them as replenishment as well.
+    # The same instant is stored as the owner's ``MrpFreezeBaseline`` and is
+    # the one boundary both the consumption and the replenishment allocators
+    # read.
+    stock_baseline_at = target.cutoff
     pools = build_shared_pools(
         db, requested_ids, ledger_generation_id=target_id,
         relevant_item_ids=relevant_item_ids,

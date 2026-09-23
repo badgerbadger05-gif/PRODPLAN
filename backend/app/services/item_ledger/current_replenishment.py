@@ -326,12 +326,58 @@ def _input_checksum(
                 "characteristic": _text(row.characteristic_ref),
                 "organization": _text(row.organization_ref),
                 "pool": _text(row.planning_stock_pool),
+                **_baseline_part(row),
             }
             for row in sorted(reserves, key=lambda item: str(item.reserve_id))
         ],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _baseline_part(row: Reserve) -> dict[str, str]:
+    """The owner's freeze cutoff is allocation input (§49); absent = legacy."""
+    baseline = getattr(row, "baseline_at", None)
+    return {"baseline": baseline.isoformat()} if baseline is not None else {}
+
+
+def freeze_baselines_by_reservation(
+    db: Session, entries: Iterable[models.ReservationEntry]
+) -> dict[int, datetime]:
+    """Each owner's freeze cutoff: its run's ``MrpFreezeBaseline.baseline_at``.
+
+    The one source of the §49 boundary, keyed exactly as the consumption
+    allocator keys it (run, freeze version, item, characteristic,
+    organization, pool).  An owner without a recorded baseline is absent
+    from the result and replays without a boundary.
+    """
+    rows = list(entries)
+    run_ids = sorted({int(row.run_id) for row in rows if row.run_id is not None})
+    if not run_ids:
+        return {}
+    by_key: dict[tuple[int, int, int, str, str, str], datetime] = {}
+    for baseline in db.query(models.MrpFreezeBaseline).filter(
+        models.MrpFreezeBaseline.run_id.in_(run_ids)
+    ):
+        if baseline.baseline_at is None:
+            continue
+        by_key[(
+            int(baseline.run_id), int(baseline.freeze_version), int(baseline.item_id),
+            _text(baseline.characteristic_ref), _text(baseline.organization_ref),
+            _text(baseline.planning_stock_pool),
+        )] = baseline.baseline_at
+    result: dict[int, datetime] = {}
+    for row in rows:
+        if row.run_id is None:
+            continue
+        found = by_key.get((
+            int(row.run_id), int(row.freeze_version or 0), int(row.item_id),
+            _text(row.characteristic_ref), _text(row.organization_ref),
+            _text(row.planning_stock_pool),
+        ))
+        if found is not None:
+            result[int(row.id)] = found
+    return result
 
 
 def _receipt_input_checksum(
@@ -366,6 +412,7 @@ def _receipt_input_checksum(
                 "qty": str(row.reserved_qty),
                 "due": row.due_date.isoformat(),
                 "requirement": int(row.requirement_id),
+                **_baseline_part(row),
             }
             for row in sorted(reserves, key=lambda item: str(item.reserve_id))
         ],
@@ -1072,6 +1119,7 @@ def apply_current_replenishment(
                 organization_ref=reserve.organization_ref,
                 planning_stock_pool=reserve.planning_stock_pool,
                 order_refs=reserve.order_refs,
+                baseline_at=reserve.baseline_at,
             )
         )
     reserve_rows_for_plan = tuple(stable_reserves)
@@ -1424,6 +1472,7 @@ def apply_current_receipt_replay(
             lifecycle_status="active",
             replenishment_required_qty=pure.reserved_qty,
             replenishment_received_qty=Decimal("0"),
+            baseline_at=getattr(pure, "baseline_at", None),
         )
     reservations_by_item: dict[int, tuple[object, ...]] = {}
     for row in replay_reservations.values():
@@ -1800,6 +1849,7 @@ def apply_current_replenishment_for_accepted_generation(
             )
         )
     revision, basis = _adapter_revision(source_revision, int(generation.id))
+    baselines = freeze_baselines_by_reservation(db, reservations)
     result: list[CurrentReplenishmentResult] = []
     for item_id, scope_set in sorted(item_scopes.items()):
         scope = next(iter(scope_set))
@@ -1817,6 +1867,7 @@ def apply_current_replenishment_for_accepted_generation(
                 characteristic_ref=scope[1],
                 organization_ref=scope[2],
                 planning_stock_pool=scope[3],
+                baseline_at=baselines.get(int(row.id)),
             )
             for row in reservations
             if int(row.item_id) == item_id
@@ -2090,6 +2141,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 int(requirement_id): tuple(sorted(values))
                 for requirement_id, values in refs.items()
             }
+        owner_baselines = freeze_baselines_by_reservation(db, owners)
         reserves_by_scope[scope] = tuple(
             Reserve(
                 reserve_id=str(int(row.id)),
@@ -2111,6 +2163,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 organization_ref=scope[2],
                 planning_stock_pool=scope[3],
                 order_refs=order_refs.get(int(row.requirement_id), ()),
+                baseline_at=owner_baselines.get(int(row.id)),
             )
             for row in owners
         )
@@ -2533,6 +2586,7 @@ def _bounded_current_buy_reserves(
     )
     result: dict[DistributionScope, list[Reserve]] = {scope: [] for scope in scopes}
     identities: dict[DistributionScope, set[str]] = {scope: set() for scope in scopes}
+    baselines = freeze_baselines_by_reservation(db, owners)
     for row in owners:
         scope = (
             int(row.item_id),
@@ -2563,6 +2617,7 @@ def _bounded_current_buy_reserves(
                 characteristic_ref=_text(row.characteristic_ref),
                 organization_ref=_text(row.organization_ref),
                 planning_stock_pool=_text(row.planning_stock_pool),
+                baseline_at=baselines.get(int(row.id)),
             )
         )
     missing = [scope for scope in scopes if not result[scope]]

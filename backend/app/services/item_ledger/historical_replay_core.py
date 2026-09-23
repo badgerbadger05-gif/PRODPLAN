@@ -8,7 +8,7 @@ result in a separate orchestration layer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Iterable, Literal, Optional, Tuple
 
@@ -49,6 +49,28 @@ class Reserve:
     organization_ref: str = ""
     planning_stock_pool: str = "selected"
     order_refs: Tuple[str, ...] = ()
+    # Decision §49: the owner's freeze cutoff (``MrpFreezeBaseline``).  A fact
+    # not later than it is already in ``covered_from_stock_at_freeze`` and can
+    # never replenish this owner.  ``None`` = no recorded freeze boundary.
+    baseline_at: Optional[datetime] = None
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def replenishes_after_baseline(posting_at: datetime, baseline_at: Optional[datetime]) -> bool:
+    """Whether a fact posted at ``posting_at`` may replenish an owner (§49).
+
+    The one boundary rule for every replenishment allocator: only a fact
+    strictly after the owner's freeze cutoff counts; anything at or before it
+    is part of the stock the owner was frozen against.
+    """
+    if baseline_at is None:
+        return True
+    return _utc(posting_at) > _utc(baseline_at)
 
 
 @dataclass(frozen=True)
@@ -217,6 +239,7 @@ def allocate_historical_facts(
             reserve
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
+            and replenishes_after_baseline(fact.posting_at, reserve.baseline_at)
         ]
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
         # One requirement may legitimately have several dated reserve slices.

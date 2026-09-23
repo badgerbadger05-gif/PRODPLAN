@@ -232,7 +232,13 @@ def test_candidate_freeze_supports_sealed_add_only(db_session):
     assert db_session.query(models.MrpRequirement).filter_by(run_id=candidate.run_id).count() == 1
 
 
-def test_candidate_freeze_rejects_baseline_before_physical_opening(db_session):
+def test_candidate_freeze_baseline_is_the_freeze_cutoff_even_for_an_early_period(db_session):
+    """Decision §49: the stock basis is the moment of fixation.
+
+    The former boundary ("period_from - 1us") put a plan whose period started
+    before the physical opening in front of the known history and refused it;
+    the freeze cutoff is always inside that history.
+    """
     accepted, target, item, _parents, _candidates, _lines = _candidate_world(
         db_session, ()
     )
@@ -255,17 +261,19 @@ def test_candidate_freeze_rejects_baseline_before_physical_opening(db_session):
         horizon_days=30,
     )
 
-    with pytest.raises(LedgerPoolUnavailable, match="precedes physical opening"):
-        freeze_candidate_snapshots(
-            db_session,
-            parent_generation_id=accepted.id,
-            target_generation_id=target.id,
-            candidate_run_ids=[candidate.run_id],
-        )
+    freeze_candidate_snapshots(
+        db_session,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[candidate.run_id],
+    )
 
-    assert db_session.query(models.MrpRequirement).filter_by(
+    baselines = db_session.query(models.MrpFreezeBaseline).filter_by(
         run_id=candidate.run_id
-    ).count() == 0
+    ).all()
+    assert baselines
+    cutoff = target.cutoff.replace(tzinfo=None)
+    assert {row.baseline_at.replace(tzinfo=None) for row in baselines} == {cutoff}
 
 
 def test_first_candidate_freeze_clamps_negative_physical_pool_without_inflating_demand(

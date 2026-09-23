@@ -1067,6 +1067,7 @@ def build_candidate_payload(db: Session, generation_id: int) -> dict[str, Any]:
         )
         if float(row.get("remaining_qty") or 0) >= 0
     ]
+    buyer_rows = _with_stable_reservation_lineage(db, buyer_rows)
     merged_rows = [*supplier_rows, *buyer_rows]
 
     by_bucket: dict[str, dict[str, Any]] = {}
@@ -1234,6 +1235,56 @@ def _compact_purchase_row_without_work_item(
         ]
         compact["materialization_input"] = materialization
     return compact
+
+
+def _with_stable_reservation_lineage(
+    db: Session, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Give staged BUY rows the same stable lineage the compact path emits.
+
+    The bounded path names each BUY row's owners by their stable current
+    identity and drops generation-local work-item ids
+    (``_compact_purchase_row_without_work_item``).  The obligation/accept path
+    built the same row without that lineage, so every alternation between the
+    two paths rewrote every BUY row (271 updates per refresh on the stand).
+    One compaction for both paths.  A row whose owners carry no stable
+    identity yet (pre-owner data) is left as built.
+    """
+    reservation_ids = {
+        int(value)
+        for row in rows
+        for value in (row.get("reservation_ids") or [])
+    } | {
+        int(value["reservation_id"])
+        for row in rows
+        for field_name in ("slices", "horizon_buckets")
+        for value in (row.get(field_name) or [])
+        if isinstance(value, Mapping) and value.get("reservation_id") is not None
+    }
+    if not reservation_ids:
+        return rows
+    identity_by_reservation = {
+        int(reservation_id): _clean_ref(identity)
+        for reservation_id, identity in db.query(
+            models.ReservationEntry.id, models.ReservationEntry.current_identity
+        ).filter(models.ReservationEntry.id.in_(sorted(reservation_ids))).all()
+        if _clean_ref(identity)
+    }
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        needed = {int(value) for value in (row.get("reservation_ids") or [])} | {
+            int(value["reservation_id"])
+            for field_name in ("slices", "horizon_buckets")
+            for value in (row.get(field_name) or [])
+            if isinstance(value, Mapping) and value.get("reservation_id") is not None
+        }
+        if needed and needed <= set(identity_by_reservation):
+            result.append(_compact_purchase_row_without_work_item(
+                row, identity_by_reservation=identity_by_reservation
+            ))
+        else:
+            result.append(row)
+    return result
 
 
 def _normalise_legacy_parent_buy_row(

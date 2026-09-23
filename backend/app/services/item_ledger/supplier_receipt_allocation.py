@@ -22,6 +22,7 @@ from .reservation import (
     replenishment_remaining,
 )
 
+from .historical_replay_core import replenishes_after_baseline
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
 from .current_replenishment import reject_legacy_supplier_receipt_writer
@@ -580,6 +581,11 @@ def allocate_supplier_receipts(
                 for entry in reservations.get(item_id, ())
                 if _text(getattr(entry, "planning_stock_pool", "default"))
                 == _text(fact.planning_stock_pool)
+                # Decision §49: a receipt not later than the owner's freeze
+                # cutoff is its frozen stock, never its replenishment.
+                and replenishes_after_baseline(
+                    fact.posting_at, getattr(entry, "baseline_at", None)
+                )
             )
 
             for reservation in item_reservations:

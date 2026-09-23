@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import or_
@@ -12,9 +12,16 @@ from app import models
 from app.services.item_ledger.physical_refresh_candidacy import (
     has_live_physical_refresh_candidate,
 )
+from app.services.bom_specification_resolver import (
+    BomSpecificationResolutionError,
+    BomSpecificationResolver,
+)
 from app.services.specification_mrp_rebase import (
+    _remaining_root_rows,
     rebase_fixed_plan_remaining_roots,
 )
+
+DRIFT_OUTSIDE_REMAINING_ROOTS = "drift_outside_remaining_roots"
 
 
 def _current_requests(db: Session) -> list[models.SpecificationRebaseQueue]:
@@ -112,15 +119,80 @@ def _affected_runs(
     return rows
 
 
-def _all_affected_runs(db: Session) -> list[models.PlanningRun]:
-    """Find live runs whose frozen BOM differs from current specifications.
+def _remaining_root_item_ids(db: Session, run: models.PlanningRun) -> set[int]:
+    """Roots with an unaccepted remainder - the canonical remaining source."""
+    if run.source_plan_id is None:
+        return set()
+    rows, _audit = _remaining_root_rows(
+        db, plan_id=int(run.source_plan_id), successor_period_from=date.min,
+    )
+    return {int(row["item_id"]) for row in rows}
+
+
+def _refs_needed_by_remaining_roots(
+    db: Session,
+    run: models.PlanningRun,
+    resolver: BomSpecificationResolver,
+) -> set[str] | None:
+    """Specification refs the current expansion of the remaining roots uses.
+
+    ``None`` when the expansion cannot be resolved: the run then stays in
+    scope, and the rebase fails visibly instead of the drift being skipped.
+    """
+    try:
+        roots = _remaining_root_item_ids(db, run)
+        if not roots:
+            return set()
+        spec_ids = {
+            spec_id
+            for values in resolver.spec_ids_by_root(roots).values()
+            for spec_id in values
+        }
+    except (BomSpecificationResolutionError, ValueError):
+        return None
+    return {ref for ref in (resolver.spec_ref(spec_id) for spec_id in spec_ids) if ref}
+
+
+def _live_drift_refs(
+    db: Session,
+    run: models.PlanningRun,
+    drifted_refs: tuple[str, ...],
+    resolver: BomSpecificationResolver,
+) -> tuple[str, ...]:
+    """Decision §50: the drifted refs the run's remainder really needs."""
+    if not drifted_refs:
+        return ()
+    needed = _refs_needed_by_remaining_roots(db, run, resolver)
+    if needed is None:
+        return drifted_refs
+    return tuple(ref for ref in drifted_refs if ref in needed)
+
+
+def _all_affected_runs(
+    db: Session, *, resolver: BomSpecificationResolver | None = None
+) -> list[models.PlanningRun]:
+    """Find live runs whose remainder needs a changed specification (§50).
 
     The durable queue is an event log and a scheduling hint, not the source of
     truth for specification drift.  A specification may return to an existing
     historical revision, whose revision id already has a completed queue row.
     Comparing the live freeze directly with the current specification keeps
     that transition observable and recoverable.
+
+    A frozen matrix that differs from the current specification only in the
+    part already produced, or in nodes the remaining roots no longer use, is
+    not a reason to rebase: the successor would be equivalent.
     """
+    resolver = resolver or BomSpecificationResolver(db)
+    return [
+        run
+        for run in _drifted_runs(db)
+        if _live_drift_refs(db, run, _all_refs_for_run(db, run), resolver)
+    ]
+
+
+def _drifted_runs(db: Session) -> list[models.PlanningRun]:
+    """Live runs with any frozen component on a non-current revision."""
     return (
         db.query(models.PlanningRun)
         .join(
@@ -242,13 +314,19 @@ def run_one_pending_specification_rebase(
             "dry_run": False,
         }
     requests = _current_requests(db)
-    affected = _all_affected_runs(db)
+    resolver = BomSpecificationResolver(db)
+    affected = _all_affected_runs(db, resolver=resolver)
     if not affected:
         now = datetime.now(timezone.utc)
+        # Drift that no remaining root needs (§50) closes with its own reason,
+        # so "nothing to rebase" is distinguishable from "nothing drifted".
+        outside = bool(_drifted_runs(db))
         for request in requests:
             request.status = "completed"
             request.completed_at = now
-            request.result = {"status": "no_live_outdated_mrp"}
+            request.result = {
+                "status": DRIFT_OUTSIDE_REMAINING_ROOTS if outside else "no_live_outdated_mrp"
+            }
         if dry_run:
             db.rollback()
         else:
@@ -261,7 +339,7 @@ def run_one_pending_specification_rebase(
         }
 
     run = affected[0]
-    refs = _all_refs_for_run(db, run)
+    refs = _live_drift_refs(db, run, _all_refs_for_run(db, run), resolver)
     selected_requests = []
     for request in requests:
         spec = db.get(models.Specification, int(request.spec_id))
@@ -314,8 +392,13 @@ def run_one_pending_specification_rebase(
         for row in selected_requests
     ]
     selected_current = [row for row in selected_current if row is not None]
-    remaining_for_selected = _affected_runs(db, selected_current)
-    remaining = _all_affected_runs(db)
+    resolver = BomSpecificationResolver(db)
+    remaining = _all_affected_runs(db, resolver=resolver)
+    remaining_live_ids = {int(row.run_id) for row in remaining}
+    remaining_for_selected = [
+        row for row in _affected_runs(db, selected_current)
+        if int(row.run_id) in remaining_live_ids
+    ]
     remaining_ids = {int(row.run_id) for row in remaining}
     now = datetime.now(timezone.utc)
     for request_id in [int(row.id) for row in selected_requests]:
@@ -325,7 +408,9 @@ def run_one_pending_specification_rebase(
         spec = db.get(models.Specification, int(request.spec_id))
         ref = str(spec.spec_ref1c or "").strip() if spec is not None else ""
         still_used = any(
-            ref in _refs_for_run(db, remaining_run, [request])
+            ref in _live_drift_refs(
+                db, remaining_run, _refs_for_run(db, remaining_run, [request]), resolver
+            )
             for remaining_run in remaining_for_selected
         )
         request.status = "pending" if still_used else "completed"

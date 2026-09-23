@@ -1649,19 +1649,18 @@ def test_a_replacement_retires_the_old_owners_allocations_and_counts_the_fact_on
         )
     }
     assert {int(row.reservation_id) for row in current} <= live
-    # The successor's replay re-allocated the same fact, once.
+    # Decision §49: the receipt was posted before the successor's freeze
+    # cutoff, so it is in the successor's ``covered_from_stock_at_freeze`` and
+    # is not its replenishment - it is counted once, as stock.
     candidate = db_session.query(models.PlanningRun).filter_by(
         prior_run_id=parent.run_id,
     ).one()
-    successor_ids = {
-        int(row.id) for row in db_session.query(models.ReservationEntry).filter_by(
-            run_id=int(candidate.run_id), realization_mode="buy",
-        )
-    }
-    assert [
-        (int(row.reservation_id) in successor_ids, Decimal(str(row.allocated_qty)))
-        for row in current
-    ] == [(True, Decimal("2"))]
+    successor = db_session.query(models.ReservationEntry).filter_by(
+        run_id=int(candidate.run_id), realization_mode="buy",
+    ).one()
+    assert current == []
+    assert Decimal(str(successor.covered_from_stock_at_freeze_qty)) == Decimal("2")
+    assert Decimal(str(successor.replenishment_received_qty or 0)) == Decimal("0")
 
 
 def test_closed_owner_allocations_are_retired_idempotently(db_session):
@@ -2045,3 +2044,78 @@ def test_a_retained_owner_keeps_its_pegged_allocation_through_a_refresh(db_sessi
         (int(row.reservation_id), str(row.match_rule), Decimal(str(row.allocated_qty)))
         for row in current
     ] == [(int(kept.owner.id), "pegged", Decimal("2"))]
+
+
+# --- Item 28a: the two publication paths agree -----------------------------------
+
+
+@pytest.mark.parametrize("method", ["Производство", "Покупка"])
+def test_a_bounded_refresh_after_an_obligation_refresh_rewrites_no_unchanged_row(
+    db_session, monkeypatch, method,
+):
+    """Alternating paths wrote 2426 change rows for one touched scope.
+
+    The obligation path (staged rows) and the bounded path (compact builders)
+    must describe an unchanged row identically: same identity, same field
+    set, same quantity text.
+    """
+    from app.services.item_ledger import physical_refresh_current_publish as publisher
+
+    accepted, plan, _line, item, _old, cutoff = _world(
+        db_session, with_parent=False, replenishment_method=method,
+    )
+    _current_custody_at(db_session, accepted, item)
+    result = _run(db_session, accepted, "orch-28a", add=[plan.id])
+    db_session.commit()
+    parent = db_session.get(models.LedgerGeneration, int(result.target_generation_id))
+    last_change = db_session.query(models.CurrentExecutionChange.id).order_by(
+        models.CurrentExecutionChange.id.desc()
+    ).limit(1).scalar() or 0
+
+    target_cutoff = parent.cutoff + timedelta(hours=6)
+    batch = models.PhysicalImportBatch(
+        batch_key="orch-28a-batch", status="completed", source_complete=True,
+        cutoff=target_cutoff, source_watermarks={}, completed_at=target_cutoff,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    target = models.LedgerGeneration(
+        generation_key="orch-28a-target", status="building", cutoff=target_cutoff,
+        source_watermarks={"parent_generation_id": int(parent.id)}, capabilities={},
+        physical_import_batch_id=int(batch.id), algorithm_version="test",
+    )
+    other = models.Item(item_code="ORCH-28A-OTHER", item_name="untouched by the plan")
+    db_session.add_all([target, other])
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id), source_content_hash="orch-28a-sle",
+        business_identity="orch-28a-sle", item_id=other.item_id,
+        characteristic_ref="", organization_ref="org", warehouse_ref1c="WH-OUT",
+        qty=Decimal("2"), posting_at=target_cutoff - timedelta(hours=1),
+        record_type="Receipt", movement_kind="transfer_out",
+        recorder_type="Document_Transfer", recorder_ref="orch-28a",
+        line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.commit()
+    monkeypatch.setattr(
+        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+    )
+
+    publisher.publish_forward_physical_refresh_current(
+        db_session, target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        delta_manifest={"rows": (sle,), "supersessions": ()}, odata_client=None,
+        source_revision=int(batch.id), planning_pool_by_warehouse={"WH-OUT": "default"},
+    )
+
+    changes = db_session.query(models.CurrentExecutionChange).filter(
+        models.CurrentExecutionChange.id > last_change,
+        models.CurrentExecutionChange.entity_kind.in_((
+            "assembly_queue", "assembly_readiness", "drum_schedule", "drum_slot",
+            "drum_gap", "drum_excluded", "production_control_journal",
+            "purchase_control_journal",
+        )),
+    ).all()
+    assert [(row.entity_kind, row.operation, row.business_identity) for row in changes] == []
+    db_session.rollback()

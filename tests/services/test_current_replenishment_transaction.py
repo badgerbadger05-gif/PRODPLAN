@@ -1546,3 +1546,73 @@ def test_a_generation_revision_must_name_the_publishing_generation(db_session):
             complete_scope=True,
             revision_basis=GENERATION_REVISION,
         )
+
+
+# --- Decision §49: the owner's freeze cutoff bounds its replenishment ----------
+
+
+def test_a_fact_not_later_than_the_owners_freeze_cutoff_is_its_stock():
+    from datetime import timedelta
+
+    from app.services.item_ledger.historical_replay_core import (
+        allocate_historical_facts,
+    )
+
+    cutoff = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
+    reserve = Reserve(
+        reserve_id="owner", item_id=1, mode="buy", reserved_qty=Decimal("10"),
+        due_date=date(2026, 9, 30), plan_period_from=date(2026, 9, 1),
+        plan_period_to=date(2026, 9, 30), run_id=1, requirement_id=1,
+        baseline_at=cutoff,
+    )
+
+    def fact(fact_id, at):
+        return Fact(fact_id=fact_id, item_id=1, mode="buy", qty=Decimal("2"), posting_at=at)
+
+    result = allocate_historical_facts(
+        [
+            fact("before", cutoff - timedelta(hours=1)),
+            fact("at", cutoff),
+            fact("after", cutoff + timedelta(hours=1)),
+        ],
+        [reserve],
+    )
+
+    assert [(row.fact_id, row.qty) for row in result.allocations] == [("after", Decimal("2"))]
+    assert {row.fact_id for row in result.surplus} == {"before", "at"}
+
+
+@pytest.mark.parametrize(("baseline_shift_days", "allocated"), [(0, False), (-1, True)])
+def test_the_accepted_adapter_reads_each_owners_freeze_baseline(
+    db_session, baseline_shift_days, allocated,
+):
+    """The boundary is the owner's own ``MrpFreezeBaseline``, not a guess."""
+    from datetime import timedelta
+
+    generation_id, _item_id, reservations, facts = _supplier_typed_world(
+        db_session, prefix=f"baseline-{baseline_shift_days}"
+    )
+    generation = db_session.get(models.LedgerGeneration, int(generation_id))
+    _point_at(db_session, generation)
+    for row in reservations:
+        db_session.add(models.MrpFreezeBaseline(
+            run_id=int(row.run_id), freeze_version=1, item_id=int(row.item_id),
+            characteristic_ref="", organization_ref="",
+            planning_stock_pool=str(row.planning_stock_pool),
+            baseline_at=(
+                generation.cutoff + timedelta(days=baseline_shift_days)
+            ).replace(tzinfo=None),
+        ))
+    db_session.commit()
+
+    apply_current_replenishment_for_accepted_generation(
+        db_session, generation_id=int(generation_id)
+    )
+    db_session.commit()
+
+    current = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, allocation_role="replenishment_receipt",
+    ).count()
+    # Every receipt is posted at the cutoff: the owner frozen at the cutoff
+    # already holds it as stock; an owner frozen a day earlier is replenished.
+    assert (current > 0) is allocated

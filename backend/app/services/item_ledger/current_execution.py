@@ -9,7 +9,7 @@ business change when the saved result is unchanged.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 import hashlib
 import json
@@ -687,6 +687,57 @@ def _canonical_scalar(value: Any) -> Any:
     return value
 
 
+# A value under one of these names is a quantity whatever its spelling: the
+# staged path prints ``Decimal(15,3)`` ("0.000"), a compact builder may print
+# the integer ("0") or a float ("10.0").  Integer text elsewhere (codes, sort
+# keys, refs) keeps its exact text, so the rule is by name, not by shape.
+_QUANTITY_NAMES = frozenset({"capacity_load", "available_capacity"})
+_NUMBER_TEXT = re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def _is_quantity_name(name: str) -> bool:
+    return name.endswith("_qty") or name in _QUANTITY_NAMES
+
+
+def _canonical_quantity_value(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (Decimal, int, float)):
+        return canonical_quantity_text(Decimal(str(value)))
+    if isinstance(value, str) and _NUMBER_TEXT.match(value.strip()):
+        return canonical_quantity_text(value.strip())
+    return value
+
+
+# Instants copied from a naive source column (``ProductionPlanHeader.fixed_at``
+# is ``TIMESTAMP`` without zone).  The staged copy lives in a ``timestamptz``
+# column and reads back in the session zone with an offset ("+03:00"); the
+# compact path prints the naive source.  Both carry the same wall-clock time,
+# which is what the source column holds, so that is what is compared.
+_WALL_CLOCK_INSTANT_NAMES = frozenset({"eligible_from"})
+
+
+def _wall_clock_instant(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None).isoformat()
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value).replace(tzinfo=None).isoformat()
+        except ValueError:
+            return value
+    return value
+
+
+# The computed-at stamp of the coverage moves with every publication; the
+# coverage itself (scalars and the persisted snapshot the material readers
+# serve) stays compared.
+_PRODUCTION_CALCULATION_ARTIFACTS = frozenset({"material_coverage_calculated_at"})
+
+# Derived digests of rows that are published themselves; the staged schedule
+# row has no column for them, so they are technical and never a change.
+_DRUM_SCHEDULE_TECHNICAL = frozenset({"queue_signature", "slot_signature", "gap_signature"})
+
+
 def _drop_semantic_neutral_fields(value: Any, *, entity_kind: str, path: tuple[str, ...] = ()) -> Any:
     """Return the business comparison view of a current execution payload.
 
@@ -703,8 +754,20 @@ def _drop_semantic_neutral_fields(value: Any, *, entity_kind: str, path: tuple[s
             if (
                 entity_kind == "production_control_journal"
                 and not path
-                and name == "material_coverage_calculated_at"
+                and name in _PRODUCTION_CALCULATION_ARTIFACTS
             ):
+                continue
+            if (
+                entity_kind == "drum_schedule"
+                and not path
+                and name in _DRUM_SCHEDULE_TECHNICAL
+            ):
+                continue
+            if _is_quantity_name(name) and not isinstance(child, (dict, list, tuple)):
+                result[name] = _canonical_quantity_value(child)
+                continue
+            if name in _WALL_CLOCK_INSTANT_NAMES:
+                result[name] = _wall_clock_instant(child)
                 continue
             if (
                 entity_kind == "production_control_journal"
@@ -1517,7 +1580,12 @@ def publish_current_execution_from_generation(
                     f"drum slot has no current queue owner for plan line {int(slot.plan_line_id)}"
                 )
             manual = prior_manual.get(identity)
+            # Same field set as the compact builder
+            # (``drum_schedule_persistence.build_compact_current_drum_payload``):
+            # a missing ``queue_owner_identity`` rewrote every drum row on each
+            # alternation between the two publication paths.
             payload = {
+                "queue_owner_identity": f"plan-line:{int(slot.plan_line_id)}",
                 "queue_line_id": stable_queue_id,
                 "plan_id": int(slot.plan_id),
                 "plan_line_id": int(slot.plan_line_id),
@@ -1566,6 +1634,9 @@ def publish_current_execution_from_generation(
                 "payload": payload,
                 **({"manual_input": legacy_manual} if legacy_manual else {}),
             })
+        run_by_plan_line = {
+            int(row.plan_line_id): int(row.planning_run_id) for row in queue_rows
+        }
         for gap in db.query(models.DrumCapacityGap).filter(
             models.DrumCapacityGap.drum_schedule_id == int(schedule.id),
         ).order_by(
@@ -1584,9 +1655,11 @@ def publish_current_execution_from_generation(
                 "business_identity": identity,
                 "scope_key": "drum:all-live-plans",
                 "payload": {
+                    "queue_owner_identity": f"plan-line:{int(gap.plan_line_id)}",
                     "queue_line_id": stable_queue_id,
                     "plan_id": int(gap.plan_id),
                     "plan_line_id": int(gap.plan_line_id),
+                    "run_id": run_by_plan_line.get(int(gap.plan_line_id)),
                     "item_id": int(gap.item_id),
                     "resource_id": int(gap.resource_id),
                     "gap_date": gap.gap_date.isoformat(),
@@ -1625,6 +1698,7 @@ def publish_current_execution_from_generation(
                 "business_identity": f"excluded:plan-line:{int(queue.plan_line_id)}",
                 "scope_key": "drum:all-live-plans",
                 "payload": {
+                    "queue_owner_identity": f"plan-line:{int(queue.plan_line_id)}",
                     "queue_line_id": stable_queue_id,
                     "plan_id": int(queue.plan_id),
                     "plan_line_id": int(queue.plan_line_id),

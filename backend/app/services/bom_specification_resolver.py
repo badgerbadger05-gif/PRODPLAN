@@ -140,8 +140,37 @@ class BomSpecificationResolver:
         root_item_ids: Iterable[int],
     ) -> dict[int, set[int]]:
         """Walk descendants using the selected specification on every edge."""
+        items, _specs = self._walk(root_item_ids)
+        return items
+
+    def spec_ids_by_root(
+        self,
+        root_item_ids: Iterable[int],
+    ) -> dict[int, set[int]]:
+        """The specifications the current expansion of each root selects.
+
+        The same walk as :meth:`descendant_ids_by_root`: one expansion, so the
+        set of specification nodes a root needs cannot drift from the set of
+        items it needs.
+        """
+        _items, specs = self._walk(root_item_ids)
+        return specs
+
+    def spec_ref(self, spec_id: int) -> str:
+        self._load_specs()
+        for specs in self._specs_by_ref.values():
+            for spec in specs:
+                if int(spec.spec_id) == int(spec_id):
+                    return _norm_ref(spec.spec_ref1c)
+        return ""
+
+    def _walk(
+        self,
+        root_item_ids: Iterable[int],
+    ) -> tuple[dict[int, set[int]], dict[int, set[int]]]:
         roots = sorted({int(item_id) for item_id in root_item_ids})
-        result = {root: {root} for root in roots}
+        items = {root: {root} for root in roots}
+        specs: dict[int, set[int]] = {root: set() for root in roots}
 
         def visit(
             root_id: int,
@@ -154,10 +183,11 @@ class BomSpecificationResolver:
             scope = (int(item_id), int(spec_id))
             if scope in seen:
                 return
+            specs[root_id].add(int(spec_id))
             next_seen = seen | {scope}
             for component in self.components_for_spec(spec_id):
                 child_id = int(component.item_id)
-                result[root_id].add(child_id)
+                items[root_id].add(child_id)
                 visit(
                     root_id,
                     child_id,
@@ -167,4 +197,4 @@ class BomSpecificationResolver:
 
         for root in roots:
             visit(root, root, self.default_spec_id(root), frozenset())
-        return result
+        return items, specs

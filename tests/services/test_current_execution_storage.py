@@ -150,3 +150,77 @@ def test_migration_still_declares_historical_storage_contract():
     source = path.read_text()
     assert "ledger_generation_id" in source
     assert "ledger_cutoff" in source
+
+
+@pytest.mark.parametrize(
+    ("kind", "scope", "first", "second"),
+    [
+        # Integer text vs Decimal(15,3) text of the same quantities.
+        ("assembly_readiness", "assembly:all-live-plans",
+         {"open_qty": "5.000", "ready_qty": "0.000", "status": "blocked"},
+         {"open_qty": "5", "ready_qty": 0, "status": "blocked"}),
+        # Float text of a quantity and the session offset of a naive instant.
+        ("assembly_queue", "assembly:all-live-plans",
+         {"assembly_remaining_qty": "10.000", "eligible_from": "2026-09-01T10:00:00+03:00"},
+         {"assembly_remaining_qty": "10.0", "eligible_from": "2026-09-01T10:00:00"}),
+        # Derived digests of rows that are published themselves.
+        ("drum_schedule", "drum:all-live-plans",
+         {"schedule_from": "2026-09-01", "metrics": {"excluded_open_qty": "5.000"}},
+         {"schedule_from": "2026-09-01", "metrics": {"excluded_open_qty": "5.0"},
+          "queue_signature": "", "slot_signature": "", "gap_signature": ""}),
+        # The computed-at stamp of an unchanged coverage.
+        ("production_control_journal", "production:all-live-orders",
+         {"coverage_status": "full", "material_coverage_calculated_at": "2026-09-01T00:00:00+00:00",
+          "material_coverage_snapshot": {"line_quantity": 1, "required_qty": "2.000"}},
+         {"coverage_status": "full", "material_coverage_calculated_at": "2026-09-02T00:00:00+00:00",
+          "material_coverage_snapshot": {"line_quantity": 1, "required_qty": "2"}}),
+    ],
+)
+def test_representation_differences_between_publication_paths_are_a_no_op(
+    db_session, kind, scope, first, second,
+):
+    """Item 28a: the staged and the compact path print the same business value
+    differently; alternating between them must not write a change row."""
+    generation = _generation(db_session, f"repr-{kind}")
+
+    def publish(payload):
+        return publish_current_execution_scope(
+            db_session,
+            source_revision=f"accepted:g{generation.id}:{kind}",
+            source_generation_id=generation.id,
+            scope_key=scope,
+            entity_kinds=(kind,),
+            rows=[{
+                "entity_kind": kind, "business_identity": "row-1",
+                "scope_key": scope, "payload": payload,
+            }],
+        )
+
+    publish(first)
+    changes_before = db_session.query(models.CurrentExecutionChange).count()
+    result = publish(second)
+    again = publish(first)
+
+    assert result.idempotent is True
+    assert again.idempotent is True
+    assert db_session.query(models.CurrentExecutionChange).count() == changes_before
+
+
+def test_a_real_quantity_change_is_still_a_change(db_session):
+    generation = _generation(db_session, "repr-real")
+
+    def publish(payload):
+        return publish_current_execution_scope(
+            db_session,
+            source_revision=f"accepted:g{generation.id}:assembly_readiness",
+            source_generation_id=generation.id,
+            scope_key="assembly:all-live-plans",
+            entity_kinds=("assembly_readiness",),
+            rows=[{
+                "entity_kind": "assembly_readiness", "business_identity": "row-1",
+                "scope_key": "assembly:all-live-plans", "payload": payload,
+            }],
+        )
+
+    publish({"open_qty": "5.000"})
+    assert publish({"open_qty": "4"}).idempotent is False

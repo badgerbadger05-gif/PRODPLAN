@@ -552,18 +552,7 @@ def _parent_current_material_coverage(
     ):
         return {}, set()
     reusable: dict[int, dict[str, Any]] = {}
-    touched: set[int] = set()
-    for value in affected_item_ids or ():
-        if value in (None, ""):
-            continue
-        try:
-            item_id = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ProductionControlJournalPromotionError(
-                f"compact production affected item id is malformed: {value!r}"
-            ) from exc
-        if item_id > 0:
-            touched.add(item_id)
+    touched = _touched_item_ids(affected_item_ids)
     invalidated: set[int] = set()
     for row in load_current_execution_rows(
         db,
@@ -597,30 +586,117 @@ def _parent_current_material_coverage(
                 "coverage_label": str(label or status),
             }
         reusable[product_id] = snapshot_copy
-        if touched:
-            if int(payload.get("item_id") or 0) in touched:
-                invalidated.add(product_id)
-                continue
-            components = snapshot_copy.get("components")
-            if isinstance(components, list):
-                for component in components:
-                    if not isinstance(component, Mapping):
-                        continue
-                    raw_component_id = component.get("component_item_id")
-                    if raw_component_id in (None, ""):
-                        continue
-                    try:
-                        component_id = int(raw_component_id)
-                    except (TypeError, ValueError) as exc:
-                        raise ProductionControlJournalPromotionError(
-                            "compact production material snapshot has malformed "
-                            f"component item id for product {product_id}: "
-                            f"{raw_component_id!r}"
-                        ) from exc
-                    if component_id in touched:
-                        invalidated.add(product_id)
-                        break
+        if _snapshot_is_touched(
+            payload, snapshot_copy, touched, label=f"product {product_id}"
+        ):
+            invalidated.add(product_id)
     return reusable, invalidated
+
+
+def _touched_item_ids(affected_item_ids: Sequence[int] | None) -> set[int]:
+    touched: set[int] = set()
+    for value in affected_item_ids or ():
+        if value in (None, ""):
+            continue
+        try:
+            item_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ProductionControlJournalPromotionError(
+                f"compact production affected item id is malformed: {value!r}"
+            ) from exc
+        if item_id > 0:
+            touched.add(item_id)
+    return touched
+
+
+def _snapshot_is_touched(
+    payload: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    touched: set[int],
+    *,
+    label: str,
+) -> bool:
+    """Whether the bounded delta names the row's item or one of its components.
+
+    The one reuse rule for every persisted material snapshot: an untouched
+    row's parent-boundary snapshot is still exact; a touched one is rebuilt.
+    """
+    if not touched:
+        return False
+    if int(payload.get("item_id") or 0) in touched:
+        return True
+    components = snapshot.get("components")
+    if isinstance(components, list):
+        for component in components:
+            if not isinstance(component, Mapping):
+                continue
+            raw_component_id = component.get("component_item_id")
+            if raw_component_id in (None, ""):
+                continue
+            try:
+                component_id = int(raw_component_id)
+            except (TypeError, ValueError) as exc:
+                raise ProductionControlJournalPromotionError(
+                    "compact production material snapshot has malformed "
+                    f"component item id for {label}: {raw_component_id!r}"
+                ) from exc
+            if component_id in touched:
+                return True
+    return False
+
+
+def _parent_current_proposal_snapshots(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    affected_item_ids: Sequence[int] | None,
+) -> dict[str, dict[str, Any]]:
+    """Reusable parent-boundary material snapshots of MAKE proposals.
+
+    Keyed by the proposal's stable current identity.  Only a snapshot the
+    bounded delta does not touch is returned; without an explicit delta
+    nothing is reused.
+    """
+    if affected_item_ids is None:
+        return {}
+    from app.services.item_ledger.current_execution import (
+        get_current_execution_scope,
+        load_current_execution_rows,
+    )
+
+    scope = get_current_execution_scope(
+        db,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    )
+    if (
+        scope is None
+        or not bool(scope.result_ready)
+        or int(scope.source_generation_id or 0) != int(parent_generation_id)
+    ):
+        return {}
+    touched = _touched_item_ids(affected_item_ids)
+    result: dict[str, dict[str, Any]] = {}
+    for row in load_current_execution_rows(
+        db,
+        entity_kind="production_control_journal",
+        scope_key="production:all-live-orders",
+    ):
+        identity = str(row.business_identity or "")
+        payload = row.payload if isinstance(row.payload, Mapping) else None
+        if (
+            not identity.startswith("mrp-reservation:")
+            or not isinstance(payload, Mapping)
+            or payload.get("product_id") is not None
+        ):
+            continue
+        snapshot = payload.get("material_coverage_snapshot")
+        if not isinstance(snapshot, Mapping):
+            continue
+        if _snapshot_is_touched(payload, snapshot, touched, label=identity):
+            continue
+        result[identity] = deepcopy(dict(snapshot))
+    return result
 
 
 def _affected_production_product_ids(
@@ -830,6 +906,46 @@ def _build_candidate_components(
     return generation, payload, rows, roots_by_row
 
 
+def _proposal_owner_identities(
+    db: Session, rows: Sequence[Mapping[str, Any]]
+) -> dict[str, str]:
+    """Stable reservation identity of every MAKE proposal row, by row key.
+
+    The identity is the canonical ``reservation_business_identity`` of the
+    work item's reservation - the same one the stable current owner carries -
+    so it does not depend on whether the reservation is still BUILDING staging.
+    """
+    work_item_ids = {
+        int(row["work_item_id"])
+        for row in rows
+        if row.get("product_id") in (None, "") and row.get("work_item_id") not in (None, "")
+    }
+    if not work_item_ids:
+        return {}
+    pairs = (
+        db.query(models.ReplenishmentWorkItem.id, models.ReservationEntry)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id == models.ReplenishmentWorkItem.reservation_id,
+        )
+        .filter(models.ReplenishmentWorkItem.id.in_(sorted(work_item_ids)))
+        .all()
+    )
+    by_work_item = {
+        int(work_item_id): reservation_business_identity(
+            int(reservation.requirement_id), str(reservation.realization_mode or "")
+        )
+        for work_item_id, reservation in pairs
+    }
+    return {
+        str(row["journal_row_key"]): by_work_item[int(row["work_item_id"])]
+        for row in rows
+        if row.get("product_id") in (None, "")
+        and row.get("work_item_id") not in (None, "")
+        and int(row["work_item_id"]) in by_work_item
+    }
+
+
 def build_candidate_payload(
     db: Session,
     generation_id: int,
@@ -848,10 +964,20 @@ def build_candidate_payload(
         generation_id,
         accepted_run_ids=accepted_run_ids,
     )
+    proposal_owner_identity = _proposal_owner_identities(db, rows)
     direct_rows: list[dict[str, Any]] = []
     for row in rows:
         direct = dict(row)
-        direct["current_identity"] = _candidate_business_identity(direct)
+        owner_identity = proposal_owner_identity.get(str(row["journal_row_key"]))
+        # A MAKE proposal is the stable current reservation owner's row; the
+        # bounded path names it by that owner (``mrp-reservation:<identity>``)
+        # and so must this one, or every alternation between the two paths
+        # closes one row and inserts its twin.
+        direct["current_identity"] = (
+            f"mrp-reservation:{owner_identity}"
+            if owner_identity
+            else _candidate_business_identity(direct)
+        )
         direct["root_item_ids"] = sorted(
             int(value) for value in roots_by_row.get(str(row["journal_row_key"]), set())
         )
@@ -994,10 +1120,11 @@ def build_compact_current_production_control_payload(
     direct_rows: list[dict[str, Any]] = []
     for row in rows:
         direct = dict(row)
-        # Coverage is already represented by the scalar status/label fields.
-        # The nested preview is a generation-scoped calculation artifact and
-        # must not leak into the compact current owner.
-        direct.pop("material_coverage_snapshot", None)
+        # The persisted coverage snapshot stays: the current material readers
+        # serve it (``production_control`` work-item/product materials) and the
+        # staged path publishes it.  Stripping it here made every alternation
+        # between the two paths rewrite each production row, and left the
+        # readers without coverage after any bounded refresh.
         key = str(row.get("journal_row_key") or row.get("current_identity") or "")
         direct["current_identity"] = _candidate_business_identity(direct)
         direct["root_item_ids"] = sorted(
@@ -1255,11 +1382,49 @@ def build_compact_current_production_control_payload(
         rows=proposal_root_rows,
         accepted_run_ids=run_ids,
     )
+    from app.services.production_control_material_availability import (
+        preview_make_work_item_materials,
+    )
+
+    reusable_proposal_snapshots = _parent_current_proposal_snapshots(
+        db,
+        parent_generation_id=int(parent.id),
+        affected_item_ids=affected_item_ids,
+    )
     for proposal in canonical_proposals:
         synthetic_id = int(proposal["work_item_id"])
         reservation = reservation_by_work_id[synthetic_id]
         source_identity = str(reservation.current_identity or "").strip()
         proposal["current_identity"] = f"mrp-reservation:{source_identity}"
+        # The work-item materials reader serves this persisted snapshot, and
+        # the staged path publishes it for every launchable proposal - so the
+        # bounded path must too.  An untouched proposal of the same quantity
+        # reuses its parent-boundary snapshot; any other one is previewed with
+        # the same canonical preview the staged path uses.
+        if proposal.get("spec_id") is not None and proposal.get("launchable_qty") not in (None, 0):
+            launchable = float(proposal["launchable_qty"])
+            reused = reusable_proposal_snapshots.get(proposal["current_identity"])
+            if reused is not None and reused.get("line_quantity") is not None and abs(
+                float(reused["line_quantity"]) - launchable
+            ) <= 1e-9:
+                snapshot = reused
+            else:
+                snapshot = preview_make_work_item_materials(
+                    db,
+                    work_item_id=synthetic_id,
+                    item_id=int(proposal["item_id"]),
+                    quantity=launchable,
+                    spec_id=int(proposal["spec_id"]),
+                    ledger_generation_id=int(parent.id),
+                    order_number=f"MRP-R-{int(proposal['source_mrp_requirement_id'])}",
+                    run_id=(
+                        int(proposal["source_run_id"])
+                        if proposal.get("source_run_id") is not None else None
+                    ),
+                )
+                # A synthetic locator (``-reservation_id``) is not a work item.
+                snapshot.pop("work_item_id", None)
+            proposal["material_coverage_snapshot"] = snapshot
         proposal["reservation_id"] = int(reservation.id)
         proposal["root_item_ids"] = sorted(
             roots_by_proposal.get(proposal_root_keys[synthetic_id], set())
