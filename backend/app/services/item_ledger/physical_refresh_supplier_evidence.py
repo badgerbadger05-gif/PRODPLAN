@@ -596,6 +596,7 @@ def _bounded_scope_receipt_facts(
             sle_id=int(row.id),
             posting_at=row.posting_at,
             known_at=getattr(row, "known_at", None),
+            ingest_batch_id=getattr(row, "ingest_batch_id", None),
             signed_qty=Decimal(str(row.qty)),
             item_id=int(row.item_id),
             supplier_order_ref=_text(evidence.supplier_order_ref),

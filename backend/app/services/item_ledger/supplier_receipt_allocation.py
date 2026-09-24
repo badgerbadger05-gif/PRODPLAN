@@ -22,7 +22,7 @@ from .reservation import (
     replenishment_remaining,
 )
 
-from .historical_replay_core import replenishes_after_baseline
+from .historical_replay_core import known_at_freeze
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
 from .current_replenishment import reject_legacy_supplier_receipt_writer
@@ -151,6 +151,10 @@ class ReceiptFact:
     # evidence metadata, not allocation input: two facts that allocate the
     # same way are equal whether or not one was re-read from persisted rows.
     supplier_order_type: str = field(default="", compare=False)
+    # Decision §51: the physical import batch that made the fact known - the
+    # as-known axis of the freeze boundary.  Provenance, not allocation
+    # identity, so it does not take part in equality.
+    ingest_batch_id: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -528,13 +532,14 @@ def allocate_supplier_receipts(
     *,
     exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
     history_mode: HistoryMode = "as_occurred",
-    baseline_by_reservation: Mapping[int, datetime] | None = None,
+    freeze_batch_by_reservation: Mapping[int, int] | None = None,
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
 
-    ``baseline_by_reservation`` is each owner's §49 freeze cutoff; without it
-    a reservation's own ``baseline_at`` attribute is used (the R4 replay
-    passes pure owners that carry it).
+    ``freeze_batch_by_reservation`` is each owner's freeze boundary on the
+    as-known axis (§49/§51); without it a reservation's own
+    ``known_batch_id`` attribute is used (the R4 replay passes pure owners
+    that carry it).
 
     Positive supplier receipts fill exact supplier-order-line matches first inside
     their export allocation cap, then FIFO by item. Returns unwind the same
@@ -586,13 +591,13 @@ def allocate_supplier_receipts(
                 for entry in reservations.get(item_id, ())
                 if _text(getattr(entry, "planning_stock_pool", "default"))
                 == _text(fact.planning_stock_pool)
-                # Decision §49: a receipt not later than the owner's freeze
-                # cutoff is its frozen stock, never its replenishment.
-                and replenishes_after_baseline(
-                    fact.posting_at,
-                    baseline_by_reservation.get(int(_entry_key(entry)))
-                    if baseline_by_reservation is not None
-                    else getattr(entry, "baseline_at", None),
+                # Decisions §49/§51: a receipt known when the owner was frozen
+                # is its frozen stock, never its replenishment.
+                and not known_at_freeze(
+                    fact.ingest_batch_id,
+                    freeze_batch_by_reservation.get(int(_entry_key(entry)))
+                    if freeze_batch_by_reservation is not None
+                    else getattr(entry, "known_batch_id", None),
                 )
             )
 
@@ -969,6 +974,7 @@ def normalize_supplier_receipt_evidence(
                 fact=ReceiptFact(
                     sle_id=int(sle.id),
                     posting_at=sle.posting_at,
+                    ingest_batch_id=getattr(sle, "ingest_batch_id", None),
                     signed_qty=_decimal(sle.qty),
                     item_id=int(row.item_id),
                     supplier_order_ref=supplier_order_ref,
@@ -1148,10 +1154,13 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         facts,
         reservations_by_item,
         exact_allocation_caps=exact_caps,
-        baseline_by_reservation=freeze_baselines_by_reservation(
-            db,
-            [entry for entries in reservations_by_item.values() for entry in entries],
-        ),
+        freeze_batch_by_reservation={
+            reservation_id: boundary.batch_id
+            for reservation_id, boundary in freeze_baselines_by_reservation(
+                db,
+                [entry for entries in reservations_by_item.values() for entry in entries],
+            ).items()
+        },
     )
     realized_keys: set[tuple[int, int]] = set()
     folded_reservations: set[int] = set()

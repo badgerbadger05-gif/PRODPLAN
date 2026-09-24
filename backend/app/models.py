@@ -668,6 +668,25 @@ class SpecificationRebaseQueue(Base):
     result = Column(CrossPlatformJSON, nullable=True)
 
 
+class SpecificationRebaseRunState(Base):
+    """Consecutive rebase failures of one live run (the worker's skip rule).
+
+    Per run, not per queue request: a request can be shared by several runs,
+    and a run can be in rebase scope without any request.
+    """
+
+    __tablename__ = "specification_rebase_run_state"
+
+    run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    consecutive_failures = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(TEXT, nullable=True)
+    last_failed_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class SpecComponent(Base):
     __tablename__ = "spec_components"
 

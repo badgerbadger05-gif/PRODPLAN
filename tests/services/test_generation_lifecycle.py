@@ -160,7 +160,15 @@ def _add_execution_allocation_batch(
                 organization_ref=str(reservation.organization_ref or ""),
                 planning_stock_pool=str(reservation.planning_stock_pool or ""),
                 baseline_at=generation.cutoff,
-                physical_import_batch_id=int(generation.physical_import_batch_id),
+                # §51: the frozen stock was read at the batch of the
+                # generation the run was frozen against (the accepted anchor
+                # when there is one), not at the batch being built now.
+                physical_import_batch_id=int(
+                    db_session.get(
+                        models.LedgerGeneration,
+                        int(db_session.get(models.PlanningRun, int(reservation.run_id)).ledger_generation_id),
+                    ).physical_import_batch_id
+                ),
                 stock_qty=Decimal("0"),
                 produced_total=Decimal("0"),
                 received_total=Decimal("0"),
@@ -385,7 +393,12 @@ def _synthetic(
         organization_ref="",
         planning_stock_pool="default",
         baseline_at=plan.period_from,
-        physical_import_batch_id=generation.physical_import_batch_id,
+        # §51: frozen against the accepted anchor's batch; the fact below is
+        # imported later, in the generation being built.
+        physical_import_batch_id=(
+            anchor.physical_import_batch_id if anchor is not None
+            else generation.physical_import_batch_id
+        ),
         stock_qty=Decimal("0"),
         produced_total=Decimal("0"),
         received_total=Decimal("0"),

@@ -1551,7 +1551,13 @@ def test_a_generation_revision_must_name_the_publishing_generation(db_session):
 # --- Decision §49: the owner's freeze cutoff bounds its replenishment ----------
 
 
-def test_a_fact_not_later_than_the_owners_freeze_cutoff_is_its_stock():
+def test_the_freeze_boundary_is_the_batch_that_made_the_fact_known():
+    """Decision §51: as-known, not by document date.
+
+    A receipt posted long before the freeze but imported after the freeze
+    batch replenishes the owner (a backdated document); one imported by the
+    freeze batch is the owner's frozen stock, whatever its date.
+    """
     from datetime import timedelta
 
     from app.services.item_ledger.historical_replay_core import (
@@ -1563,34 +1569,50 @@ def test_a_fact_not_later_than_the_owners_freeze_cutoff_is_its_stock():
         reserve_id="owner", item_id=1, mode="buy", reserved_qty=Decimal("10"),
         due_date=date(2026, 9, 30), plan_period_from=date(2026, 9, 1),
         plan_period_to=date(2026, 9, 30), run_id=1, requirement_id=1,
-        baseline_at=cutoff,
+        known_batch_id=10, baseline_at=cutoff,
     )
 
-    def fact(fact_id, at):
-        return Fact(fact_id=fact_id, item_id=1, mode="buy", qty=Decimal("2"), posting_at=at)
+    def fact(fact_id, at, batch):
+        return Fact(
+            fact_id=fact_id, item_id=1, mode="buy", qty=Decimal("2"),
+            posting_at=at, known_batch_id=batch,
+        )
 
     result = allocate_historical_facts(
         [
-            fact("before", cutoff - timedelta(hours=1)),
-            fact("at", cutoff),
-            fact("after", cutoff + timedelta(hours=1)),
+            fact("backdated-late-import", cutoff - timedelta(days=100), 11),
+            fact("known-at-freeze", cutoff - timedelta(hours=1), 10),
+            fact("known-earlier", cutoff - timedelta(days=1), 9),
+            fact("post-cutoff-but-known", cutoff + timedelta(hours=1), 10),
         ],
         [reserve],
     )
 
-    assert [(row.fact_id, row.qty) for row in result.allocations] == [("after", Decimal("2"))]
-    assert {row.fact_id for row in result.surplus} == {"before", "at"}
+    assert [(row.fact_id, row.qty) for row in result.allocations] == [
+        ("backdated-late-import", Decimal("2")),
+    ]
+    assert {row.fact_id for row in result.surplus} == {
+        "known-at-freeze", "known-earlier", "post-cutoff-but-known",
+    }
 
 
-@pytest.mark.parametrize(("baseline_shift_days", "allocated"), [(0, False), (-1, True)])
+def test_a_fact_without_an_import_batch_cannot_be_judged_against_a_boundary():
+    from app.services.item_ledger.historical_replay_core import known_at_freeze
+
+    assert known_at_freeze(5, None) is False
+    with pytest.raises(ValueError, match="no physical import batch"):
+        known_at_freeze(None, 5)
+
+
+@pytest.mark.parametrize(("freeze_batch_offset", "allocated"), [(0, False), (-1, True)])
 def test_the_accepted_adapter_reads_each_owners_freeze_baseline(
-    db_session, baseline_shift_days, allocated,
+    db_session, freeze_batch_offset, allocated,
 ):
-    """The boundary is the owner's own ``MrpFreezeBaseline``, not a guess."""
+    """The boundary is the owner's own ``MrpFreezeBaseline`` batch (§51)."""
     from datetime import timedelta
 
     generation_id, _item_id, reservations, facts = _supplier_typed_world(
-        db_session, prefix=f"baseline-{baseline_shift_days}"
+        db_session, prefix=f"baseline-{freeze_batch_offset}"
     )
     generation = db_session.get(models.LedgerGeneration, int(generation_id))
     _point_at(db_session, generation)
@@ -1599,9 +1621,10 @@ def test_the_accepted_adapter_reads_each_owners_freeze_baseline(
             run_id=int(row.run_id), freeze_version=1, item_id=int(row.item_id),
             characteristic_ref="", organization_ref="",
             planning_stock_pool=str(row.planning_stock_pool),
-            baseline_at=(
-                generation.cutoff + timedelta(days=baseline_shift_days)
-            ).replace(tzinfo=None),
+            baseline_at=generation.cutoff.replace(tzinfo=None),
+            physical_import_batch_id=(
+                int(generation.physical_import_batch_id) + freeze_batch_offset
+            ),
         ))
     db_session.commit()
 
@@ -1613,6 +1636,101 @@ def test_the_accepted_adapter_reads_each_owners_freeze_baseline(
     current = db_session.query(models.ReservationConsumptionAllocation).filter_by(
         is_current=True, allocation_role="replenishment_receipt",
     ).count()
-    # Every receipt is posted at the cutoff: the owner frozen at the cutoff
-    # already holds it as stock; an owner frozen a day earlier is replenished.
+    # Every receipt is imported in the generation's batch: an owner frozen at
+    # that batch already holds it as stock; one frozen at the batch before is
+    # replenished by it.
     assert (current > 0) is allocated
+
+
+# --- Item 30a: a freeze-baseline exclusion is a recorded reason -------------------
+
+
+def _scope_with_baseline(db_session, prefix, *, baseline_at, facts_override=None):
+    from app.services.item_ledger.current_replenishment import SUPPLIER_RECEIPT_SOURCE_KEY
+
+    generation_id, _item_id, reservations, facts = _world(db_session, prefix=prefix)
+    reserves = _reserves(reservations)
+    apply_current_replenishment(
+        db_session, generation_id=generation_id, source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+        source_revision=1, facts=facts, reserves=reserves, complete_scope=True,
+    )
+    db_session.commit()
+    assert db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, allocation_role="replenishment_receipt",
+    ).count() > 0
+    batch = int(db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id)
+    known_facts = tuple(Fact(**{**row.__dict__, "known_batch_id": batch}) for row in facts)
+    bounded = tuple(
+        Reserve(**{**row.__dict__, "known_batch_id": batch, "baseline_at": baseline_at})
+        for row in reserves
+    )
+    return apply_current_replenishment(
+        db_session, generation_id=generation_id, source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
+        source_revision=2,
+        facts=known_facts if facts_override is None else facts_override,
+        reserves=bounded if baseline_at is not None else reserves,
+        complete_scope=True,
+    )
+
+
+def test_a_scope_emptied_by_the_freeze_baseline_is_accepted_and_recorded(db_session):
+    """The stand's run 561: the only fact predates the owner's freeze cutoff."""
+    from app.services.item_ledger.current_replenishment import FREEZE_BASELINE_REASON
+
+    result = _scope_with_baseline(
+        db_session, "baseline-empty",
+        baseline_at=datetime(2026, 9, 10, tzinfo=timezone.utc),  # facts post at the cutoff
+    )
+    db_session.commit()
+
+    assert result.confirmed_empty_reason.startswith(FREEZE_BASELINE_REASON)
+    assert db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=True, allocation_role="replenishment_receipt",
+    ).count() == 0
+    retired = db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        is_current=False, allocation_role="replenishment_receipt",
+    ).all()
+    assert retired
+    audits = db_session.query(models.CurrentReplenishmentAudit).filter_by(
+        reason=FREEZE_BASELINE_REASON,
+    ).all()
+    assert audits and all(row.operation == "retire" for row in audits)
+    assert {int(row.sle_id) for row in retired} <= {
+        int(value) for row in audits for value in row.basis_fact_ids
+    }
+
+
+def test_a_scope_whose_facts_vanished_without_a_reason_is_still_refused(db_session):
+    with pytest.raises(CurrentReplenishmentError, match="would delete all"):
+        _scope_with_baseline(
+            db_session, "baseline-vanished", baseline_at=None, facts_override=(),
+        )
+
+
+def test_a_baseline_without_a_batch_falls_back_to_the_freeze_generation(db_session):
+    """§51: a baseline row without ``physical_import_batch_id`` takes the batch
+    of the generation the run was frozen against; with neither it fails closed."""
+    from app.services.item_ledger.current_replenishment import (
+        freeze_baselines_by_reservation,
+    )
+
+    generation_id, _item_id, reservations, _facts = _world(db_session, prefix="batch-fallback")
+    generation = db_session.get(models.LedgerGeneration, int(generation_id))
+    owner = reservations[0]
+    db_session.add(models.MrpFreezeBaseline(
+        run_id=int(owner.run_id), freeze_version=1, item_id=int(owner.item_id),
+        characteristic_ref=owner.characteristic_ref or "",
+        organization_ref=owner.organization_ref or "",
+        planning_stock_pool=owner.planning_stock_pool or "",
+        baseline_at=generation.cutoff.replace(tzinfo=None),
+    ))
+    db_session.flush()
+
+    boundary = freeze_baselines_by_reservation(db_session, [owner])[int(owner.id)]
+    assert boundary.batch_id == int(generation.physical_import_batch_id)
+
+    run = db_session.get(models.PlanningRun, int(owner.run_id))
+    run.ledger_generation_id = None
+    db_session.flush()
+    with pytest.raises(CurrentReplenishmentError, match="no as-known freeze boundary"):
+        freeze_baselines_by_reservation(db_session, [owner])

@@ -301,7 +301,12 @@ def run_historical_replay(
             organization_ref="",
             planning_stock_pool=str(row.planning_stock_pool or ""),
             order_refs=order_refs_by_requirement.get(int(row.requirement_id), ()),
-            baseline_at=baselines.get(int(row.id)),
+            known_batch_id=(
+                baselines[int(row.id)].batch_id if int(row.id) in baselines else None
+            ),
+            baseline_at=(
+                baselines[int(row.id)].baseline_at if int(row.id) in baselines else None
+            ),
         )
         reserves.append(reserve)
         entry_by_core_id[core_id] = row
@@ -381,6 +386,7 @@ def run_historical_replay(
             planning_stock_pool=pool,
             requirement_id=requirement_id,
             order_ref=order_ref,
+            known_batch_id=getattr(row, "ingest_batch_id", None),
         ))
         sle_by_core_id[core_id] = row
 

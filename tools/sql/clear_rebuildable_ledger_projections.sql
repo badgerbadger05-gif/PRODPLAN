@@ -230,6 +230,7 @@ TRUNCATE
     planning_run_bucket_modes,
     mrp_bucket_type_legacy,
     mrp_run_root,
+    specification_rebase_run_state,
     planning_run,
     assembly_output_allocation,
     assembly_output_fact_decision,

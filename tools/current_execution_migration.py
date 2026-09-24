@@ -774,6 +774,161 @@ def _backlog_rows(
     return owed, ambiguous
 
 
+FREEZE_BASIS_IMPACT_COLUMNS = (
+    "run_id", "item_id", "reservation_id", "baseline_at", "freeze_batch_id",
+    "allocations_to_retire", "qty_to_retire",
+    "replenishment_required_qty", "received_before", "received_after",
+    "outstanding_before", "outstanding_after", "outstanding_delta",
+    "frozen_stock_qty", "frozen_received_total", "status",
+)
+
+
+def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[str, Any]:
+    """Read-only: what decision §49 will retire, per live run and item.
+
+    For every active current owner of a live run, the current replenishment
+    allocations on facts not later than the owner's freeze baseline are what
+    the next replay retires (reason ``facts_at_or_before_freeze_baseline``).
+    The report shows the owner's received quantity before and after, its
+    required quantity and the resulting change of the outstanding quantity -
+    what the purchase journal will show - next to the frozen stock basis the
+    fact already sits in (``mrp_freeze_baseline.stock_qty``/``received_total``).
+    Nothing is written; the session is rolled back.
+    """
+    from decimal import Decimal as _Decimal
+
+    from app import models
+    from app.services.item_ledger.current_replenishment import (
+        CurrentReplenishmentError,
+        canonical_decimal_text,
+        freeze_baselines_by_reservation,
+    )
+    from app.services.item_ledger.historical_replay_core import known_at_freeze
+
+    def _dec(value: Any) -> _Decimal:
+        return _Decimal(str(value or 0))
+
+    rows: list[dict[str, Any]] = []
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        try:
+            owners = (
+                session.query(models.ReservationEntry)
+                .join(models.PlanningRun, models.PlanningRun.run_id == models.ReservationEntry.run_id)
+                .filter(
+                    models.PlanningRun.status == "FIXED_SNAPSHOT",
+                    models.ReservationEntry.is_current.is_(True),
+                    models.ReservationEntry.lifecycle_status == "active",
+                )
+                .order_by(models.ReservationEntry.run_id, models.ReservationEntry.item_id,
+                          models.ReservationEntry.id)
+                .all()
+            )
+            frozen = {
+                (int(row.run_id), int(row.freeze_version), int(row.item_id),
+                 str(row.planning_stock_pool or "")): row
+                for row in session.query(models.MrpFreezeBaseline).filter(
+                    models.MrpFreezeBaseline.run_id.in_(
+                        sorted({int(owner.run_id) for owner in owners}) or [-1]
+                    )
+                )
+            }
+            for owner in owners:
+                try:
+                    boundary = freeze_baselines_by_reservation(session, [owner]).get(int(owner.id))
+                    status = "ok" if boundary is not None else "no_freeze_baseline"
+                except CurrentReplenishmentError:
+                    boundary, status = None, "baseline_missing"
+                allocations = (
+                    session.query(
+                        models.ReservationConsumptionAllocation,
+                        models.StockLedgerEntry.ingest_batch_id,
+                    )
+                    .join(models.StockLedgerEntry,
+                          models.StockLedgerEntry.id == models.ReservationConsumptionAllocation.sle_id)
+                    .filter(
+                        models.ReservationConsumptionAllocation.reservation_id == int(owner.id),
+                        models.ReservationConsumptionAllocation.is_current.is_(True),
+                        models.ReservationConsumptionAllocation.allocation_role == "replenishment_receipt",
+                    )
+                    .all()
+                )
+                # The same as-known predicate the replay applies (§51).
+                retire = [
+                    allocation for allocation, batch_id in allocations
+                    if boundary is not None
+                    and known_at_freeze(batch_id, boundary.batch_id)
+                ]
+                if not retire:
+                    continue
+                qty = sum((_dec(row.allocated_qty) for row in retire), _Decimal("0"))
+                required = _dec(owner.replenishment_required_qty)
+                before = _dec(owner.replenishment_received_qty)
+                after = max(before - qty, _Decimal("0"))
+                outstanding_before = max(required - before, _Decimal("0"))
+                outstanding_after = max(required - after, _Decimal("0"))
+                basis = frozen.get((int(owner.run_id), int(owner.freeze_version or 0),
+                                    int(owner.item_id), str(owner.planning_stock_pool or "")))
+                rows.append({
+                    "run_id": int(owner.run_id),
+                    "item_id": int(owner.item_id),
+                    "reservation_id": int(owner.id),
+                    "baseline_at": (
+                        boundary.baseline_at.isoformat()
+                        if boundary is not None and boundary.baseline_at is not None else None
+                    ),
+                    "freeze_batch_id": boundary.batch_id if boundary is not None else None,
+                    "allocations_to_retire": len(retire),
+                    "qty_to_retire": canonical_decimal_text(qty),
+                    "replenishment_required_qty": canonical_decimal_text(required),
+                    "received_before": canonical_decimal_text(before),
+                    "received_after": canonical_decimal_text(after),
+                    "outstanding_before": canonical_decimal_text(outstanding_before),
+                    "outstanding_after": canonical_decimal_text(outstanding_after),
+                    "outstanding_delta": canonical_decimal_text(outstanding_after - outstanding_before),
+                    "frozen_stock_qty": (
+                        canonical_decimal_text(basis.stock_qty) if basis is not None else None
+                    ),
+                    "frozen_received_total": (
+                        canonical_decimal_text(basis.received_total) if basis is not None else None
+                    ),
+                    "status": status,
+                })
+        finally:
+            session.rollback()
+    if csv_path:
+        import csv
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(FREEZE_BASIS_IMPACT_COLUMNS))
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+    by_run: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        summary = by_run.setdefault(row["run_id"], {
+            "run_id": row["run_id"], "owners": 0, "allocations_to_retire": 0,
+            "qty_to_retire": _Decimal("0"), "outstanding_delta": _Decimal("0"),
+        })
+        summary["owners"] += 1
+        summary["allocations_to_retire"] += row["allocations_to_retire"]
+        summary["qty_to_retire"] += _Decimal(row["qty_to_retire"])
+        summary["outstanding_delta"] += _Decimal(row["outstanding_delta"])
+    return {
+        "phase": "freeze-basis-impact",
+        "status": "ready",
+        "read_only": True,
+        "owners": len(rows),
+        "allocations_to_retire": sum(row["allocations_to_retire"] for row in rows),
+        "runs": [
+            {**value, "qty_to_retire": canonical_decimal_text(value["qty_to_retire"]),
+             "outstanding_delta": canonical_decimal_text(value["outstanding_delta"])}
+            for _run, value in sorted(by_run.items())
+        ],
+        "rows": rows,
+        "csv_path": csv_path,
+    }
+
+
 def pre_deploy_backlog(engine: Engine) -> dict[str, Any]:
     """Read-only report of what the bounded refresh gates would see.
 
@@ -1677,6 +1832,7 @@ def main(argv: list[str] | None = None) -> int:
             "supplier-provenance-repair",
             "retire-closed-owner-allocations",
             "pre-deploy-backlog",
+            "freeze-basis-impact",
         ),
         default="preflight",
         help=(
@@ -1694,6 +1850,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--generation-id", type=int)
+    parser.add_argument(
+        "--csv", dest="csv_path",
+        help="write the --phase freeze-basis-impact rows to this CSV file",
+    )
     parser.add_argument("--fault-after-consumer")
     args = parser.parse_args(argv)
     if not args.database_url:
@@ -1714,6 +1874,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.phase == "pre-deploy-backlog":
             report = pre_deploy_backlog(engine)
+        elif args.phase == "freeze-basis-impact":
+            report = freeze_basis_impact(engine, csv_path=args.csv_path)
         elif args.phase == "supplier-provenance-repair":
             report = apply_supplier_provenance_repair(
                 engine, writers_stopped=bool(args.writers_stopped)

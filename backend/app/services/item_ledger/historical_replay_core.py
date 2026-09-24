@@ -30,6 +30,8 @@ class Fact:
     requirement_id: Optional[int] = None
     order_ref: Optional[str] = None
     is_reversal: bool = False
+    # Decision §51: the physical import batch that made the fact known.
+    known_batch_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -49,28 +51,33 @@ class Reserve:
     organization_ref: str = ""
     planning_stock_pool: str = "selected"
     order_refs: Tuple[str, ...] = ()
-    # Decision §49: the owner's freeze cutoff (``MrpFreezeBaseline``).  A fact
-    # not later than it is already in ``covered_from_stock_at_freeze`` and can
+    # Decisions §49/§51: the physical import batch the owner's frozen stock
+    # was read at (``MrpFreezeBaseline.physical_import_batch_id``).  A fact
+    # known by then is already in ``covered_from_stock_at_freeze`` and can
     # never replenish this owner.  ``None`` = no recorded freeze boundary.
+    known_batch_id: Optional[int] = None
+    # The freeze cutoff instant, for display only; the boundary is the batch.
     baseline_at: Optional[datetime] = None
 
 
-def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+def known_at_freeze(fact_batch_id: Optional[int], freeze_batch_id: Optional[int]) -> bool:
+    """Whether a fact was known to the Ledger when the owner was frozen (§51).
 
-
-def replenishes_after_baseline(posting_at: datetime, baseline_at: Optional[datetime]) -> bool:
-    """Whether a fact posted at ``posting_at`` may replenish an owner (§49).
-
-    The one boundary rule for every replenishment allocator: only a fact
-    strictly after the owner's freeze cutoff counts; anything at or before it
-    is part of the stock the owner was frozen against.
+    The one boundary rule for every replenishment allocator, on the as-known
+    axis: a fact imported by the batch the frozen stock was read at is that
+    stock; a fact imported later replenishes the owner whatever its document
+    date - a backdated document included.  Without a freeze boundary nothing
+    is stock.  A fact whose import batch is unknown cannot be judged against
+    a boundary and fails closed.
     """
-    if baseline_at is None:
-        return True
-    return _utc(posting_at) > _utc(baseline_at)
+    if freeze_batch_id is None:
+        return False
+    if fact_batch_id is None:
+        raise ValueError(
+            "fact has no physical import batch; it cannot be judged against a "
+            "freeze boundary"
+        )
+    return int(fact_batch_id) <= int(freeze_batch_id)
 
 
 @dataclass(frozen=True)
@@ -239,7 +246,7 @@ def allocate_historical_facts(
             reserve
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
-            and replenishes_after_baseline(fact.posting_at, reserve.baseline_at)
+            and not known_at_freeze(fact.known_batch_id, reserve.known_batch_id)
         ]
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
         # One requirement may legitimately have several dated reserve slices.

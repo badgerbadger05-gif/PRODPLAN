@@ -77,8 +77,9 @@ def _current_requests(db: Session) -> list[models.SpecificationRebaseQueue]:
 
 
 #: A run whose rebase fails this many times in a row stops blocking the queue:
-#: its requests stay ``failed`` with the reason and the worker moves on to the
-#: next affected run (``attempt_count`` of the selected requests).
+#: the worker moves on to the next affected run.  The counter is the run's own
+#: (``SpecificationRebaseRunState``), so a run without any request is covered
+#: and a request shared with another run does not skip that other run.
 MAX_REBASE_ATTEMPTS = 3
 
 
@@ -250,11 +251,20 @@ def _request_ref(db: Session, request: models.SpecificationRebaseQueue) -> str:
     return str(spec.spec_ref1c or "").strip() if spec is not None else ""
 
 
-def _exhausted(request: models.SpecificationRebaseQueue) -> bool:
-    return (
-        str(request.status) == "failed"
-        and int(request.attempt_count or 0) >= MAX_REBASE_ATTEMPTS
-    )
+def _run_failures(db: Session, run_id: int) -> int:
+    state = db.get(models.SpecificationRebaseRunState, int(run_id))
+    return int(state.consecutive_failures or 0) if state is not None else 0
+
+
+def _record_run_failure(db: Session, run_id: int, error: str) -> int:
+    state = db.get(models.SpecificationRebaseRunState, int(run_id))
+    if state is None:
+        state = models.SpecificationRebaseRunState(run_id=int(run_id), consecutive_failures=0)
+        db.add(state)
+    state.consecutive_failures = int(state.consecutive_failures or 0) + 1
+    state.last_error = str(error)[:4000]
+    state.last_failed_at = datetime.now(timezone.utc)
+    return int(state.consecutive_failures)
 
 
 def run_one_pending_specification_rebase(
@@ -285,15 +295,18 @@ def run_one_pending_specification_rebase(
     refs: tuple[str, ...] = ()
     selected_requests: list[models.SpecificationRebaseQueue] = []
     skipped_run_ids: list[int] = []
+    held_refs: set[str] = set()
     for candidate, candidate_refs in affected:
         candidate_requests = [
             request for request in requests if _request_ref(db, request) in candidate_refs
         ]
-        # A run whose every request already failed MAX_REBASE_ATTEMPTS times
-        # must not starve the rest of the queue; it stays failed, with its
-        # reason, until an operator or a new revision changes something.
-        if candidate_requests and all(_exhausted(row) for row in candidate_requests):
+        # A run that failed MAX_REBASE_ATTEMPTS times in a row must not starve
+        # the rest of the queue; its state keeps the reason until an operator
+        # or a new revision changes something.  Its requests are not judged
+        # by that: another run sharing them is still processed.
+        if _run_failures(db, int(candidate.run_id)) >= MAX_REBASE_ATTEMPTS:
             skipped_run_ids.append(int(candidate.run_id))
+            held_refs.update(candidate_refs)
             continue
         run, refs, selected_requests = candidate, candidate_refs, candidate_requests
         break
@@ -304,7 +317,13 @@ def run_one_pending_specification_rebase(
         # so "nothing to rebase" is distinguishable from "nothing drifted".
         outside = _any_frozen_drift(db)
         for request in requests:
-            if _exhausted(request):
+            if _request_ref(db, request) in held_refs:
+                # Still needed by a run that keeps failing: stays failed.
+                request.status = "failed"
+                request.result = {
+                    "status": "failed_max_attempts",
+                    "run_ids": skipped_run_ids,
+                }
                 continue
             request.status = "completed"
             request.completed_at = now
@@ -343,12 +362,13 @@ def run_one_pending_specification_rebase(
     except Exception as exc:
         db.rollback()
         if not dry_run:
+            failures = _record_run_failure(db, int(run.run_id), str(exc))
             for request_id in [int(row.id) for row in selected_requests]:
                 request = db.get(models.SpecificationRebaseQueue, request_id)
                 if request is not None:
                     request.status = "failed"
                     request.last_error = str(exc)[:4000]
-                    if int(request.attempt_count or 0) >= MAX_REBASE_ATTEMPTS:
+                    if failures >= MAX_REBASE_ATTEMPTS:
                         request.result = {
                             "status": "failed_max_attempts",
                             "run_id": int(run.run_id),
@@ -369,6 +389,9 @@ def run_one_pending_specification_rebase(
     # The rebase commits its generation atomically. Re-scan current truth:
     # requests remain pending while another live run still needs their spec.
     db.expire_all()
+    state = db.get(models.SpecificationRebaseRunState, int(run.run_id))
+    if state is not None:
+        db.delete(state)
     resolver = BomSpecificationResolver(db)
     remaining = _affected(db, resolver)
     remaining_ids = sorted(int(candidate.run_id) for candidate, _refs in remaining)

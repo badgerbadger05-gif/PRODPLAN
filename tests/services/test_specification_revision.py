@@ -608,3 +608,93 @@ def test_a_run_that_keeps_failing_does_not_starve_the_others(db_session, monkeyp
     assert failed.result["status"] == "failed_max_attempts"
     assert failed.result["run_id"] == int(first.run_id)
     assert "broken specification" in failed.result["reason"]
+
+
+def _second_run_on_the_same_spec(db_session, first_run):
+    """Another fixed plan whose remaining root needs the same changed spec."""
+    open_root = db_session.query(models.Item).filter_by(item_code="ROOT-OPEN").one()
+    plan = models.ProductionPlanHeader(
+        name="Scope-2", period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        status="fixed", fixed_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(models.ProductionPlanLine(
+        plan_id=int(plan.id), item_id=int(open_root.item_id), bucket_date=date(2026, 9, 1),
+        qty=Decimal("1"), accepted_output_qty=Decimal("0"), remaining_output_qty=Decimal("1"),
+    ))
+    run = models.PlanningRun(
+        source_plan_id=int(plan.id), status="FIXED_SNAPSHOT",
+        period_from=plan.period_from, period_to=plan.period_to, fixed_at=plan.fixed_at,
+        active_freeze_version=1, pinned=True, config_snapshot={},
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(models.MrpFreezeComponent(
+        run_id=int(run.run_id), freeze_version=1, root_item_id=int(open_root.item_id),
+        parent_item_id=int(open_root.item_id), parent_characteristic_ref="",
+        parent_organization_ref="", parent_planning_stock_pool="default",
+        component_item_id=int(open_root.item_id), component_characteristic_ref="",
+        component_organization_ref="", component_planning_stock_pool="default",
+        spec_ref="spec-changed", spec_version="old-hash",
+        norm_qty_per_unit=Decimal("1"), unit_coef=Decimal("1"),
+    ))
+    db_session.commit()
+    return run
+
+
+def _failing_first(worker, first_run_id):
+    attempts = []
+
+    def fake_rebase(db, run_id, **kwargs):
+        attempts.append(int(run_id))
+        if int(run_id) == int(first_run_id):
+            raise RuntimeError("broken specification")
+        raise LookupError("other run selected")
+
+    return attempts, fake_rebase
+
+
+def test_a_failing_run_without_any_request_is_skipped_after_three_failures(
+    db_session, monkeypatch,
+):
+    """30c: the counter is the run's own, so a run in scope with no queue
+    request cannot starve the queue either."""
+    from app.services import specification_rebase_worker as worker
+
+    first, request = _rebase_scope_world(db_session, changed_spec_used_by="open")
+    second = _second_run_on_the_same_spec(db_session, first)
+    db_session.delete(db_session.get(models.SpecificationRebaseQueue, int(request.id)))
+    db_session.commit()
+    attempts, fake_rebase = _failing_first(worker, first.run_id)
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", fake_rebase)
+
+    for _ in range(worker.MAX_REBASE_ATTEMPTS):
+        with pytest.raises(RuntimeError, match="broken specification"):
+            run_one_pending_specification_rebase(db_session)
+    with pytest.raises(LookupError, match="other run selected"):
+        run_one_pending_specification_rebase(db_session)
+
+    assert attempts == [int(first.run_id)] * worker.MAX_REBASE_ATTEMPTS + [int(second.run_id)]
+    state = db_session.get(models.SpecificationRebaseRunState, int(first.run_id))
+    assert state.consecutive_failures == worker.MAX_REBASE_ATTEMPTS
+    assert "broken specification" in state.last_error
+
+
+def test_a_run_sharing_a_failed_request_is_not_skipped(db_session, monkeypatch):
+    """30c: the other run needing the same failed request is still processed."""
+    from app.services import specification_rebase_worker as worker
+
+    first, request = _rebase_scope_world(db_session, changed_spec_used_by="open")
+    second = _second_run_on_the_same_spec(db_session, first)
+    attempts, fake_rebase = _failing_first(worker, first.run_id)
+    monkeypatch.setattr(worker, "rebase_fixed_plan_remaining_roots", fake_rebase)
+
+    for _ in range(worker.MAX_REBASE_ATTEMPTS):
+        with pytest.raises(RuntimeError, match="broken specification"):
+            run_one_pending_specification_rebase(db_session)
+    with pytest.raises(LookupError, match="other run selected"):
+        run_one_pending_specification_rebase(db_session)
+
+    assert attempts[-1] == int(second.run_id)
+    assert db_session.get(models.SpecificationRebaseRunState, int(second.run_id)) is not None
