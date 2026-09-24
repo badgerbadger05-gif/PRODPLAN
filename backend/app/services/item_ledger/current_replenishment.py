@@ -1293,13 +1293,13 @@ def apply_current_replenishment(
     # writer names the reason itself; an allocation whose fact vanished, or
     # whose owner has no boundary, is not explained and stays guarded.
     known_fact = {
-        str(int(row.sle_id)): (getattr(row, "first_known_batch_id", None), row.posting_at)
+        str(int(row.sle_id)): tuple(getattr(row, "known_revisions", ()) or ())
         for row in receipt_facts
     }
     known_fact.update({
-        str(row.fact_id): (row.known_batch_id, row.posting_at)
+        str(row.fact_id): tuple(row.known_revisions)
         for row in fact_rows
-        if row.known_batch_id is not None
+        if row.known_revisions
     })
 
     def _dropped_by_baseline(old: Allocation) -> bool:
@@ -1307,10 +1307,10 @@ def apply_current_replenishment(
             (row for row in reserve_rows_for_plan if str(row.reserve_id) == str(old.reserve_id)),
             None,
         )
-        batch, posting_at = known_fact.get(str(old.fact_id), (None, None))
-        if reserve is None or reserve.known_batch_id is None or batch is None:
+        revisions = known_fact.get(str(old.fact_id), ())
+        if reserve is None or reserve.known_batch_id is None or not revisions:
             return False
-        return known_at_freeze(batch, posting_at, reserve.known_batch_id, reserve.baseline_at)
+        return known_at_freeze(revisions, reserve.known_batch_id, reserve.baseline_at)
 
     baseline_dropped = {
         (str(old.fact_id), str(old.reserve_id))
@@ -1659,7 +1659,7 @@ def apply_current_receipt_replay(
             qty=_decimal(row.signed_qty),
             posting_at=row.posting_at,
             planning_stock_pool=_text(row.planning_stock_pool),
-            known_batch_id=getattr(row, "first_known_batch_id", None),
+            known_revisions=tuple(getattr(row, "known_revisions", ()) or ()),
         )
         for row in rows
         if _decimal(row.signed_qty) > 0
@@ -1987,9 +1987,9 @@ def apply_current_replenishment_for_accepted_generation(
     }
     exact_caps = {key: value for key, value in exact_caps.items() if key in exact_keys}
     typed_facts: list[ReceiptFact] = []
-    from .physical_visibility import first_known_batch_by_sle
+    from .physical_visibility import known_revisions_by_sle
 
-    first_known = first_known_batch_by_sle(
+    first_known = known_revisions_by_sle(
         db, [visible.get(int(row.stock_ledger_entry_id)) for row in provenance],
     )
     for row in provenance:
@@ -2003,7 +2003,7 @@ def apply_current_replenishment_for_accepted_generation(
                 signed_qty=_decimal(sle.qty),
                 posting_at=sle.posting_at,
                 known_at=getattr(sle, "known_at", None) or getattr(sle, "created_at", None),
-                first_known_batch_id=first_known.get(int(sle.id)),
+                known_revisions=first_known.get(int(sle.id), ()),
                 supplier_order_ref=_text(row.supplier_order_ref),
                 supplier_order_line_no=_text(row.supplier_order_line_no),
                 receipt_ref=_text(row.receipt_doc_ref),
@@ -2196,9 +2196,9 @@ def apply_current_replenishment_for_bounded_make_scopes(
     facts_by_scope: dict[DistributionScope, list[Fact]] = {
         scope: [] for scope in scopes
     }
-    from .physical_visibility import first_known_batch_by_sle
+    from .physical_visibility import known_revisions_by_sle
 
-    make_first_known = first_known_batch_by_sle(db, rows)
+    make_first_known = known_revisions_by_sle(db, rows)
     for row in rows:
         if _decimal(row.qty) <= 0:
             raise CurrentReplenishmentError(
@@ -2231,7 +2231,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 mode="make",
                 qty=_decimal(row.qty),
                 posting_at=row.posting_at,
-                known_batch_id=make_first_known.get(int(row.id)),
+                known_revisions=make_first_known.get(int(row.id), ()),
                 characteristic_ref=scope[1],
                 # Attribution keys come from the scope, exactly as the BUY
                 # path takes its pool from the scope: the distribution scope
@@ -2667,9 +2667,9 @@ def _bounded_current_buy_basis_facts(
         .filter(models.StockLedgerEntry.id.in_(sle_ids))
         .all()
     }
-    from .physical_visibility import first_known_batch_by_sle
+    from .physical_visibility import known_revisions_by_sle
 
-    basis_first_known = first_known_batch_by_sle(db, list(sles.values()))
+    basis_first_known = known_revisions_by_sle(db, list(sles.values()))
     provenance_rows = (
         db.query(models.StockLedgerSupplierReceiptProvenance)
         .filter(
@@ -2724,7 +2724,7 @@ def _bounded_current_buy_basis_facts(
                 sle_id=sle_id,
                 posting_at=sle.posting_at,
                 known_at=getattr(sle, "known_at", None),
-                first_known_batch_id=basis_first_known.get(int(sle_id)),
+                known_revisions=basis_first_known.get(int(sle_id), ()),
                 signed_qty=_decimal(sle.qty),
                 item_id=int(sle.item_id),
                 supplier_order_ref=_text(evidence.supplier_order_ref),

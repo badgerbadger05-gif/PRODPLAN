@@ -1584,7 +1584,7 @@ def test_the_freeze_boundary_mirrors_how_the_frozen_stock_was_read(baseline_at, 
     def fact(fact_id, at, batch):
         return Fact(
             fact_id=fact_id, item_id=1, mode="buy", qty=Decimal("1"),
-            posting_at=at, known_batch_id=batch,
+            posting_at=at, known_revisions=((batch, None, at),),
         )
 
     in_period = datetime(2026, 9, 5, tzinfo=timezone.utc)
@@ -1611,16 +1611,18 @@ def test_a_fact_without_an_import_batch_cannot_be_judged_against_a_boundary():
     from app.services.item_ledger.historical_replay_core import known_at_freeze
 
     at = datetime(2026, 9, 1, tzinfo=timezone.utc)
-    assert known_at_freeze(5, at, None, at) is False
+    assert known_at_freeze(((5, None, at),), None, at) is False
     with pytest.raises(ValueError, match="no physical import batch"):
-        known_at_freeze(None, at, 5, at)
+        known_at_freeze((), 5, at)
+    with pytest.raises(ValueError, match="no physical import batch"):
+        known_at_freeze(((None, None, at),), 5, at)
 
 
 def test_a_document_reposted_after_the_freeze_is_known_from_its_first_import(db_session):
     """§53: a new revision of a document line the freeze knew is stock; a
     genuinely new document imported after the freeze is not."""
     from app.services.item_ledger.historical_replay_core import known_at_freeze
-    from app.services.item_ledger.physical_visibility import first_known_batch_by_sle
+    from app.services.item_ledger.physical_visibility import known_revisions_by_sle
 
     generation_id, item_id, _reservations, _facts = _world(db_session, prefix="revision")
     freeze_batch = int(db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id)
@@ -1652,15 +1654,13 @@ def test_a_document_reposted_after_the_freeze_is_known_from_its_first_import(db_
     db_session.flush()
     reposted = revision(first.business_identity, "A-repost", "9")  # same identity
     new_document = revision(f"r4:new-document-{generation_id}", "NEW", "3")
-    known = first_known_batch_by_sle(db_session, [reposted, new_document])
+    known = known_revisions_by_sle(db_session, [reposted, new_document])
     cutoff = datetime(2026, 9, 10, tzinfo=timezone.utc)
 
-    assert known[int(reposted.id)] == freeze_batch
-    assert known_at_freeze(known[int(reposted.id)], reposted.posting_at, freeze_batch, cutoff)
-    assert known[int(new_document.id)] == int(later.id)
-    assert not known_at_freeze(
-        known[int(new_document.id)], new_document.posting_at, freeze_batch, cutoff,
-    )
+    assert min(batch for batch, _sup, _at in known[int(reposted.id)]) == freeze_batch
+    assert known_at_freeze(known[int(reposted.id)], freeze_batch, cutoff)
+    assert [batch for batch, _sup, _at in known[int(new_document.id)]] == [int(later.id)]
+    assert not known_at_freeze(known[int(new_document.id)], freeze_batch, cutoff)
 
 
 @pytest.mark.parametrize(("freeze_batch_offset", "allocated"), [(0, False), (-1, True)])
@@ -1718,7 +1718,10 @@ def _scope_with_baseline(db_session, prefix, *, baseline_at, facts_override=None
         is_current=True, allocation_role="replenishment_receipt",
     ).count() > 0
     batch = int(db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id)
-    known_facts = tuple(Fact(**{**row.__dict__, "known_batch_id": batch}) for row in facts)
+    known_facts = tuple(
+        Fact(**{**row.__dict__, "known_revisions": ((batch, None, row.posting_at),)})
+        for row in facts
+    )
     bounded = tuple(
         Reserve(**{**row.__dict__, "known_batch_id": batch, "baseline_at": baseline_at})
         for row in reserves
@@ -1804,3 +1807,114 @@ def test_a_baseline_without_a_batch_falls_back_to_the_freeze_generation(db_sessi
     db_session.flush()
     with pytest.raises(CurrentReplenishmentError, match=f"of run {int(run.run_id)} has no as-known"):
         freeze_baselines_by_reservation(db_session, [owner])
+
+
+
+def _revision_world(db_session, prefix):
+    """A freeze batch B, a later batch and one first-imported document line."""
+    generation_id, item_id, _reservations, _facts = _world(db_session, prefix=prefix)
+    freeze_batch = int(db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id)
+    later = models.PhysicalImportBatch(
+        batch_key=f"{prefix}-later", status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc), source_watermarks={},
+        completed_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    db_session.add(later)
+    db_session.flush()
+    first = db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="A", ingest_batch_id=freeze_batch,
+    ).one()
+    return freeze_batch, later, first, item_id
+
+
+def test_a_line_unposted_before_the_freeze_and_reposted_after_is_not_stock(db_session):
+    """32a: known at B means VISIBLE at B, not merely imported by B."""
+    from app.services.item_ledger.historical_replay_core import known_at_freeze
+    from app.services.item_ledger.physical_visibility import known_revisions_by_sle
+
+    freeze_batch, later, first, item_id = _revision_world(db_session, "unposted")
+    # Unposted (tombstoned) by the freeze batch itself.
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(first.id), new_sle_id=None, import_batch_id=freeze_batch,
+    ))
+    first.active = False
+    db_session.flush()
+    reposted = models.StockLedgerEntry(
+        ingest_batch_id=int(later.id), source_content_hash="unposted-repost".ljust(64, "0"),
+        business_identity=first.business_identity, item_id=item_id, qty=Decimal("8"),
+        qty_after=Decimal("8"), posting_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        record_type="Receipt", movement_kind="receipt", recorder_type="Doc",
+        recorder_ref="A-repost", line_no="1", ingest_source="seed",
+    )
+    db_session.add(reposted)
+    db_session.flush()
+
+    revisions = known_revisions_by_sle(db_session, [reposted])[int(reposted.id)]
+    cutoff = datetime(2026, 9, 10, tzinfo=timezone.utc)
+
+    assert not known_at_freeze(revisions, freeze_batch, cutoff)
+    # A later freeze sees the re-post and counts it as stock.
+    assert known_at_freeze(revisions, int(later.id), datetime(2026, 9, 11, tzinfo=timezone.utc))
+
+
+def test_a_renumbered_line_on_another_item_does_not_inherit_the_first_import(db_session):
+    """32b: continuity is the identity AND the physical key."""
+    from app.services.item_ledger.historical_replay_core import known_at_freeze
+    from app.services.item_ledger.physical_visibility import known_revisions_by_sle
+
+    freeze_batch, later, first, _item_id = _revision_world(db_session, "renumbered")
+    other_item = models.Item(item_code="RENUMBERED-OTHER", item_name="Another item")
+    db_session.add(other_item)
+    db_session.flush()
+    first.active = False
+    db_session.flush()
+    # After a line insert in 1C, line 1 of document A now carries another item.
+    renumbered = models.StockLedgerEntry(
+        ingest_batch_id=int(later.id), source_content_hash="renumbered".ljust(64, "0"),
+        business_identity=first.business_identity, item_id=int(other_item.item_id),
+        qty=Decimal("4"), qty_after=Decimal("4"),
+        posting_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+        record_type="Receipt", movement_kind="receipt", recorder_type="Doc",
+        recorder_ref="A-renumbered", line_no="1", ingest_source="seed",
+    )
+    db_session.add(renumbered)
+    db_session.flush()
+
+    revisions = known_revisions_by_sle(db_session, [renumbered])[int(renumbered.id)]
+
+    assert [batch for batch, _sup, _at in revisions] == [int(later.id)]
+    assert not known_at_freeze(revisions, freeze_batch, datetime(2026, 9, 10, tzinfo=timezone.utc))
+
+
+def test_the_revision_lookup_issues_one_grouped_query_per_thousand_identities(db_session):
+    """32c: bounded by the identities it is given, chunked by 1000."""
+    from types import SimpleNamespace
+
+    from sqlalchemy import event
+
+    from app.services.item_ledger.physical_visibility import known_revisions_by_sle
+
+    rows = [
+        SimpleNamespace(
+            id=-(index + 1), business_identity=f"probe:{index}", item_id=1,
+            characteristic_ref="", organization_ref="", warehouse_ref1c="WH",
+            ingest_batch_id=1, posting_at=datetime(2026, 9, 1),
+        )
+        for index in range(2500)
+    ]
+    statements = []
+
+    def count(conn, cursor, statement, parameters, context, executemany):
+        if "stock_ledger_entry" in statement.lower():
+            statements.append(statement)
+
+    bind = db_session.get_bind()
+    event.listen(bind, "before_cursor_execute", count)
+    try:
+        result = known_revisions_by_sle(db_session, rows)
+    finally:
+        event.remove(bind, "before_cursor_execute", count)
+
+    assert len(statements) == 3  # 1000 + 1000 + 500 identities
+    assert all("group by" in statement.lower() for statement in statements)
+    assert len(result) == 2500

@@ -274,9 +274,9 @@ def run_historical_replay(
     from .current_replenishment import freeze_baselines_by_reservation
 
     baselines = freeze_baselines_by_reservation(db, entries)
-    from .physical_visibility import first_known_batch_by_sle
+    from .physical_visibility import known_revisions_by_sle
 
-    first_known = first_known_batch_by_sle(db, physical_rows)
+    first_known = known_revisions_by_sle(db, physical_rows)
     for row in entries:
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")
@@ -389,7 +389,7 @@ def run_historical_replay(
             planning_stock_pool=pool,
             requirement_id=requirement_id,
             order_ref=order_ref,
-            known_batch_id=first_known.get(int(row.id)),
+            known_revisions=first_known.get(int(row.id), ()),
         ))
         sle_by_core_id[core_id] = row
 

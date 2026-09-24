@@ -87,42 +87,110 @@ def visible_sle_query(
     )
 
 
-def first_known_batch_by_sle(
-    db: Session, rows: Any
-) -> dict[int, int]:
-    """The batch in which each fact's document line first became known (§53).
+#: One revision of a document line as the freeze would have seen it:
+#: ``(ingest_batch_id, first superseding batch or None, posting_at)``.
+Revision = tuple
 
-    A document re-posted in 1C is imported again as new SLE revisions in a
-    new batch, but its stable ``business_identity`` is kept across
-    revisions.  The Ledger knew the fact from the first import of that
-    identity, so that is the batch the freeze boundary judges - a re-post
-    after the freeze does not turn frozen stock into replenishment.  One
-    grouped query per chunk of identities; a row without an identity is
-    known from its own batch.
+
+def known_revisions_by_sle(
+    db: Session, rows: Any
+) -> dict[int, tuple[Revision, ...]]:
+    """Every revision of each fact's document line, for the freeze test (§53).
+
+    A document re-posted in 1C is imported again as new SLE revisions, and
+    ``business_identity`` survives the re-post.  Whether the freeze knew the
+    line is therefore a question about *all* its revisions: was one of them
+    visible at the freeze batch - imported by it and not superseded or
+    tombstoned by a batch not later than it - exactly as
+    ``visible_sle_query`` builds the frozen stock.  The predicate
+    (``historical_replay_core.known_at_freeze``) evaluates these intervals
+    against each owner's own batch; a line unposted before the freeze and
+    re-posted after it is not stock.
+
+    Technical reading of §53 for line renumbering: ``business_identity`` is
+    ``movement:<type>:<ref>:<line_no>`` and does not name the item, so after
+    a line is inserted or deleted in 1C, line *k* may carry another item.
+    Continuity is judged by the identity AND the physical key (item,
+    characteristic, organization, warehouse): a revision of the same identity
+    on a different key is a different line and does not lend its first
+    import.  A row without an identity is its own only revision.
+
+    One grouped query per chunk of at most 1000 identities (plus one per
+    chunk of rows without an identity), restricted to the identities of the
+    rows passed in.
     """
     facts = [row for row in rows if row is not None]
+
+    def _key(identity, item_id, characteristic, organization, warehouse):
+        return (
+            str(identity), int(item_id), str(characteristic or ""),
+            str(organization or ""), str(warehouse or ""),
+        )
+
     identities = sorted({
         str(row.business_identity)
         for row in facts
         if str(getattr(row, "business_identity", "") or "").strip()
     })
-    first_by_identity: dict[str, int] = {}
+    by_key: dict[tuple, list[Revision]] = {}
+    by_id: dict[int, Revision] = {}
+    sle = models.StockLedgerEntry
+    supersession = models.StockLedgerFactSupersession
+
+    def _revision_query():
+        return (
+            db.query(
+                sle.id, sle.business_identity, sle.item_id, sle.characteristic_ref,
+                sle.organization_ref, sle.warehouse_ref1c, sle.ingest_batch_id,
+                sle.posting_at, func.min(supersession.import_batch_id),
+            )
+            .outerjoin(supersession, supersession.old_sle_id == sle.id)
+            .group_by(sle.id)
+        )
+
     for offset in range(0, len(identities), 1000):
         chunk = identities[offset:offset + 1000]
-        for identity, batch_id in (
-            db.query(
-                models.StockLedgerEntry.business_identity,
-                func.min(models.StockLedgerEntry.ingest_batch_id),
+        for (
+            sle_id, identity, item_id, characteristic, organization, warehouse,
+            batch_id, posting_at, superseded_batch,
+        ) in _revision_query().filter(sle.business_identity.in_(chunk)):
+            revision = (
+                int(batch_id),
+                int(superseded_batch) if superseded_batch is not None else None,
+                posting_at,
             )
-            .filter(models.StockLedgerEntry.business_identity.in_(chunk))
-            .group_by(models.StockLedgerEntry.business_identity)
-        ):
-            first_by_identity[str(identity)] = int(batch_id)
-    result: dict[int, int] = {}
+            by_id[int(sle_id)] = revision
+            by_key.setdefault(
+                _key(identity, item_id, characteristic, organization, warehouse), []
+            ).append(revision)
+    anonymous = sorted({
+        int(row.id) for row in facts
+        if not str(getattr(row, "business_identity", "") or "").strip()
+    })
+    for offset in range(0, len(anonymous), 1000):
+        for (
+            sle_id, _identity, _item, _char, _org, _wh, batch_id, posting_at, superseded_batch,
+        ) in _revision_query().filter(sle.id.in_(anonymous[offset:offset + 1000])):
+            by_id[int(sle_id)] = (
+                int(batch_id),
+                int(superseded_batch) if superseded_batch is not None else None,
+                posting_at,
+            )
+    result: dict[int, tuple[Revision, ...]] = {}
     for row in facts:
-        own = int(row.ingest_batch_id)
         identity = str(getattr(row, "business_identity", "") or "").strip()
-        result[int(row.id)] = min(own, first_by_identity.get(identity, own))
+        own = by_id.get(int(row.id), (int(row.ingest_batch_id), None, row.posting_at))
+        if identity:
+            revisions = by_key.get(
+                _key(identity, row.item_id, row.characteristic_ref,
+                     row.organization_ref, row.warehouse_ref1c),
+                [],
+            )
+            result[int(row.id)] = tuple(sorted(
+                set(revisions) | {own}, key=lambda value: (value[0], value[1] or 0),
+            ))
+        else:
+            result[int(row.id)] = (own,)
     return result
 
 

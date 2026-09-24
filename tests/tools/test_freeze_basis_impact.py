@@ -129,11 +129,14 @@ def test_the_impact_report_lists_what_the_freeze_baseline_will_retire(tmp_path):
         "status": "ok",
     }
     assert report["revised_after_freeze_identities"] == 0
-    # The retired 2 go back to FIFO; the other live owner of the item still
-    # needs 3 (required 5, received 2), so all 2 can land there.
+    # The retired 2 go back to FIFO.  The other live owner of the item still
+    # needs 3, but it was frozen at the same batch and instant, so the
+    # released receipt is its stock as well: nothing can land there (32d).
     assert report["increases"] == [{
         "item_id": row["item_id"], "released_qty": "2.000",
-        "other_owners_outstanding": "3.000", "estimated_reallocated_qty": "2.000",
+        "other_owners_outstanding": "3.000",
+        "owners_for_which_the_fact_is_stock": 1,
+        "estimated_reallocated_qty": "0.000", "estimate_kind": "upper_bound",
     }]
     assert report["runs"] == [{
         "run_id": run_id, "owners": 1, "allocations_to_retire": 1,

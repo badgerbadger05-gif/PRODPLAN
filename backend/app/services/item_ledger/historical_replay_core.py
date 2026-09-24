@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Iterable, Literal, Optional, Tuple
+from typing import Any, Iterable, Literal, Optional, Tuple
 
 
 Mode = Literal["make", "buy"]
@@ -30,9 +30,10 @@ class Fact:
     requirement_id: Optional[int] = None
     order_ref: Optional[str] = None
     is_reversal: bool = False
-    # Decisions §51/§53: the batch in which the fact's document line was
-    # first imported (earliest batch of its ``business_identity``).
-    known_batch_id: Optional[int] = None
+    # Decisions §51/§53: every revision of the fact's document line as
+    # ``(ingest_batch, superseding batch or None, posting_at)``
+    # (``physical_visibility.known_revisions_by_sle``).
+    known_revisions: Tuple[Tuple[Optional[int], Optional[int], Optional[datetime]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,34 +69,48 @@ def _utc(value: datetime) -> datetime:
 
 
 def known_at_freeze(
-    fact_batch_id: Optional[int],
-    fact_posting_at: Optional[datetime],
+    revisions: Any,
     freeze_batch_id: Optional[int],
     freeze_baseline_at: Optional[datetime],
 ) -> bool:
-    """Whether a fact is in the owner's frozen stock (§49, §51, §53).
+    """Whether a fact's document line is in the owner's frozen stock.
 
-    Exactly the visibility condition the frozen basis was read with
-    (``physical_visibility.visible_sle_query``): the fact's document line was
-    first imported no later than the freeze batch, AND its document date is
-    not later than the freeze instant.  Anything else replenishes the owner -
-    a backdated document imported after the freeze, or a receipt dated inside
-    the plan period that an owner frozen at the period start never counted as
-    stock.  Without a freeze boundary nothing is stock.  A fact whose import
-    batch is unknown cannot be judged and fails closed.
+    Decisions §49/§51/§53, exactly the visibility rule the frozen basis was
+    read with (``physical_visibility.visible_sle_query``) at the owner's
+    freeze batch B and instant: stock iff some revision of the line was
+    visible at B - imported by B, not superseded or tombstoned by a batch
+    not later than B - and dated no later than the freeze instant.  A line
+    unposted before the freeze and re-posted after it, a backdated document
+    imported later, or a receipt dated inside a period an old-rule owner was
+    frozen before, all replenish.  Without a freeze boundary nothing is
+    stock.  A fact without any known revision cannot be judged and fails
+    closed.
     """
     if freeze_batch_id is None:
         return False
-    if fact_batch_id is None:
+    if not revisions:
         raise ValueError(
             "fact has no physical import batch; it cannot be judged against a "
             "freeze boundary"
         )
-    if int(fact_batch_id) > int(freeze_batch_id):
-        return False
-    if freeze_baseline_at is None or fact_posting_at is None:
-        return True
-    return _utc(fact_posting_at) <= _utc(freeze_baseline_at)
+    boundary = int(freeze_batch_id)
+    for ingest_batch, superseded_batch, posting_at in revisions:
+        if ingest_batch is None:
+            raise ValueError(
+                "fact has no physical import batch; it cannot be judged against "
+                "a freeze boundary"
+            )
+        if int(ingest_batch) > boundary:
+            continue
+        if superseded_batch is not None and int(superseded_batch) <= boundary:
+            continue
+        if (
+            freeze_baseline_at is None
+            or posting_at is None
+            or _utc(posting_at) <= _utc(freeze_baseline_at)
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -265,8 +280,7 @@ def allocate_historical_facts(
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
             and not known_at_freeze(
-                fact.known_batch_id, fact.posting_at,
-                reserve.known_batch_id, reserve.baseline_at,
+                fact.known_revisions, reserve.known_batch_id, reserve.baseline_at,
             )
         ]
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]

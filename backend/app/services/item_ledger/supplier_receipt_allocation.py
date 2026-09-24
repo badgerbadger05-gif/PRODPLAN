@@ -155,7 +155,7 @@ class ReceiptFact:
     # imported (earliest batch of its ``business_identity``) - the as-known
     # axis of the freeze boundary.  Provenance, not allocation identity, so it
     # does not take part in equality.
-    first_known_batch_id: int | None = field(default=None, compare=False)
+    known_revisions: tuple = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -539,7 +539,7 @@ def _receipt_known_at_freeze(
     else:
         batch = getattr(entry, "known_batch_id", None)
         instant = getattr(entry, "baseline_at", None)
-    return known_at_freeze(fact.first_known_batch_id, fact.posting_at, batch, instant)
+    return known_at_freeze(fact.known_revisions, batch, instant)
 
 
 def allocate_supplier_receipts(
@@ -926,9 +926,9 @@ def normalize_supplier_receipt_evidence(
             )
         evidence_by_identity[identity] = row
 
-    from .physical_visibility import first_known_batch_by_sle
+    from .physical_visibility import known_revisions_by_sle
 
-    first_known = first_known_batch_by_sle(db, sle_rows)
+    first_known = known_revisions_by_sle(db, sle_rows)
     normalized: list[NormalizedSupplierReceiptFact] = []
     for identity, row in sorted(evidence_by_identity.items()):
         operation = _operation_prefix(row)
@@ -990,7 +990,7 @@ def normalize_supplier_receipt_evidence(
                 fact=ReceiptFact(
                     sle_id=int(sle.id),
                     posting_at=sle.posting_at,
-                    first_known_batch_id=first_known.get(int(sle.id)),
+                    known_revisions=first_known.get(int(sle.id), ()),
                     signed_qty=_decimal(sle.qty),
                     item_id=int(row.item_id),
                     supplier_order_ref=supplier_order_ref,

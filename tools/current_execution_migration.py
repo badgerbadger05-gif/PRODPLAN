@@ -805,13 +805,14 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
         freeze_baselines_by_reservation,
     )
     from app.services.item_ledger.historical_replay_core import known_at_freeze
-    from app.services.item_ledger.physical_visibility import first_known_batch_by_sle
+    from app.services.item_ledger.physical_visibility import known_revisions_by_sle
 
     def _dec(value: Any) -> _Decimal:
         return _Decimal(str(value or 0))
 
     rows: list[dict[str, Any]] = []
     released_by_item: dict[int, Any] = {}
+    released_facts_by_item: dict[int, list[tuple[Any, tuple]]] = {}
     revised_identities: set[str] = set()
     increases: list[dict[str, Any]] = []
     with Session(engine, autoflush=False, expire_on_commit=False) as session:
@@ -857,14 +858,14 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                     )
                     .all()
                 )
-                first_known = first_known_batch_by_sle(session, [sle for _row, sle in allocations])
+                first_known = known_revisions_by_sle(session, [sle for _row, sle in allocations])
                 # The same predicate the replay applies (§51/§53): first import
                 # of the document line and its date against the freeze.
                 retire = [
                     (allocation, sle) for allocation, sle in allocations
                     if boundary is not None
                     and known_at_freeze(
-                        first_known.get(int(sle.id)), sle.posting_at,
+                        first_known.get(int(sle.id), ()),
                         boundary.batch_id, boundary.baseline_at,
                     )
                 ]
@@ -880,6 +881,10 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                 released_by_item[int(owner.item_id)] = released_by_item.get(
                     int(owner.item_id), _Decimal("0")
                 ) + sum((_dec(row.allocated_qty) for row, _sle in retire), _Decimal("0"))
+                released_facts_by_item.setdefault(int(owner.item_id), []).extend(
+                    (_dec(row.allocated_qty), first_known.get(int(sle.id), ()))
+                    for row, sle in retire
+                )
                 revised_identities.update(revised_after_freeze)
                 retire = [allocation for allocation, _sle in retire]
                 qty = sum((_dec(row.allocated_qty) for row in retire), _Decimal("0"))
@@ -917,9 +922,12 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                     ),
                     "status": status,
                 })
-            # Increases (estimate): a retired fact returns to FIFO, where it
-            # can go to other live owners of the same item that still have an
-            # outstanding need after the retirements - bounded by that need.
+            # Increases, an UPPER BOUND: a retired fact returns to FIFO, where
+            # it can go to another live owner of the same item that still has
+            # an outstanding need - but only to an owner for which the fact is
+            # not itself stock at that owner's freeze (one frozen later than
+            # the fact).  Bounded per owner by its need and overall by the
+            # released quantity; FIFO order among owners is not simulated.
             retiring_owner_ids = {row["reservation_id"] for row in rows}
             after_by_owner = {
                 row["reservation_id"]: _Decimal(row["received_after"]) for row in rows
@@ -930,22 +938,44 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                     if int(owner.item_id) == item_id
                     and int(owner.id) not in retiring_owner_ids
                 ]
-                open_need = sum(
-                    (
-                        max(
-                            _dec(owner.replenishment_required_qty)
-                            - after_by_owner.get(int(owner.id), _dec(owner.replenishment_received_qty)),
-                            _Decimal("0"),
-                        )
-                        for owner in others
-                    ),
-                    _Decimal("0"),
-                )
+                open_need = _Decimal("0")
+                receivable = _Decimal("0")
+                excluded_owners = 0
+                for other in others:
+                    need = max(
+                        _dec(other.replenishment_required_qty)
+                        - after_by_owner.get(int(other.id), _dec(other.replenishment_received_qty)),
+                        _Decimal("0"),
+                    )
+                    if need <= 0:
+                        continue
+                    open_need += need
+                    try:
+                        other_boundary = freeze_baselines_by_reservation(
+                            session, [other]
+                        ).get(int(other.id))
+                    except CurrentReplenishmentError:
+                        other_boundary = None
+                    eligible = sum(
+                        (
+                            qty for qty, revisions in released_facts_by_item.get(item_id, [])
+                            if other_boundary is None
+                            or not known_at_freeze(
+                                revisions, other_boundary.batch_id, other_boundary.baseline_at,
+                            )
+                        ),
+                        _Decimal("0"),
+                    )
+                    if eligible <= 0:
+                        excluded_owners += 1
+                    receivable += min(need, eligible)
                 increases.append({
                     "item_id": item_id,
                     "released_qty": canonical_decimal_text(released),
                     "other_owners_outstanding": canonical_decimal_text(open_need),
-                    "estimated_reallocated_qty": canonical_decimal_text(min(released, open_need)),
+                    "owners_for_which_the_fact_is_stock": excluded_owners,
+                    "estimated_reallocated_qty": canonical_decimal_text(min(released, receivable)),
+                    "estimate_kind": "upper_bound",
                 })
         finally:
             session.rollback()
