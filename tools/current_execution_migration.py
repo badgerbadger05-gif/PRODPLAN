@@ -812,7 +812,7 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
 
     rows: list[dict[str, Any]] = []
     released_by_item: dict[int, Any] = {}
-    released_facts_by_item: dict[int, list[tuple[Any, tuple]]] = {}
+    released_facts_by_item: dict[int, list[tuple[Any, tuple, int]]] = {}
     revised_identities: set[str] = set()
     increases: list[dict[str, Any]] = []
     with Session(engine, autoflush=False, expire_on_commit=False) as session:
@@ -882,7 +882,7 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                     int(owner.item_id), _Decimal("0")
                 ) + sum((_dec(row.allocated_qty) for row, _sle in retire), _Decimal("0"))
                 released_facts_by_item.setdefault(int(owner.item_id), []).extend(
-                    (_dec(row.allocated_qty), first_known.get(int(sle.id), ()))
+                    (_dec(row.allocated_qty), first_known.get(int(sle.id), ()), int(owner.id))
                     for row, sle in retire
                 )
                 revised_identities.update(revised_after_freeze)
@@ -923,25 +923,29 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                     "status": status,
                 })
             # Increases, an UPPER BOUND: a retired fact returns to FIFO, where
-            # it can go to another live owner of the same item that still has
-            # an outstanding need - but only to an owner for which the fact is
-            # not itself stock at that owner's freeze (one frozen later than
-            # the fact).  Bounded per owner by its need and overall by the
-            # released quantity; FIFO order among owners is not simulated.
-            retiring_owner_ids = {row["reservation_id"] for row in rows}
+            # it can go to any other live owner of the same item that still
+            # has an outstanding need - an owner that is itself retiring other
+            # facts included - but only to one for which the fact is NOT stock
+            # at that owner's freeze, i.e. an owner frozen BEFORE the fact
+            # became known.  An owner frozen after it already holds it as
+            # stock.  Bounded per owner by its need and overall by the released
+            # quantity; FIFO order among owners is not simulated.
             after_by_owner = {
                 row["reservation_id"]: _Decimal(row["received_after"]) for row in rows
             }
             for item_id, released in sorted(released_by_item.items()):
-                others = [
-                    owner for owner in owners
-                    if int(owner.item_id) == item_id
-                    and int(owner.id) not in retiring_owner_ids
-                ]
+                others = [owner for owner in owners if int(owner.item_id) == item_id]
                 open_need = _Decimal("0")
                 receivable = _Decimal("0")
                 excluded_owners = 0
                 for other in others:
+                    candidates = [
+                        fact for fact in released_facts_by_item.get(item_id, [])
+                        # Never back to the owner that released it.
+                        if fact[2] != int(other.id)
+                    ]
+                    if not candidates:
+                        continue
                     need = max(
                         _dec(other.replenishment_required_qty)
                         - after_by_owner.get(int(other.id), _dec(other.replenishment_received_qty)),
@@ -958,7 +962,8 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                         other_boundary = None
                     eligible = sum(
                         (
-                            qty for qty, revisions in released_facts_by_item.get(item_id, [])
+                            qty
+                            for qty, revisions, _releasing_owner in candidates
                             if other_boundary is None
                             or not known_at_freeze(
                                 revisions, other_boundary.batch_id, other_boundary.baseline_at,

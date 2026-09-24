@@ -276,7 +276,14 @@ def run_historical_replay(
     baselines = freeze_baselines_by_reservation(db, entries)
     from .physical_visibility import known_revisions_by_sle
 
-    first_known = known_revisions_by_sle(db, physical_rows)
+    # Only facts an owner with a freeze boundary can be judged against need
+    # their revisions: the facts of items whose owners have one.
+    bounded_items = {
+        int(row.item_id) for row in entries if int(row.id) in baselines
+    }
+    first_known = known_revisions_by_sle(db, [
+        row for row in physical_rows if int(row.item_id) in bounded_items
+    ])
     for row in entries:
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")

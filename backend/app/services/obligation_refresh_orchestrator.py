@@ -539,6 +539,12 @@ def run_obligation_refresh(
 
     fork = fork_obligation_generation(db, int(parent_generation_id), key)
     target_id = int(fork.ledger_generation_id)
+    # Start this refresh's freeze-boundary lookup counters from zero.
+    from app.services.item_ledger.physical_visibility import (
+        take_known_revisions_metrics as _reset_known_revisions_metrics,
+    )
+
+    _reset_known_revisions_metrics(db)
     manifest = create_obligation_refresh_manifest(
         db, int(parent_generation_id), target_id, add_ids,
         retire_plan_ids=retire_ids, replace_plan_ids=replace_ids,
@@ -741,7 +747,14 @@ def run_obligation_refresh(
     db.flush()
 
     capabilities = dict(_CORE_CAPABILITIES)
+    from app.services.item_ledger.physical_visibility import (
+        take_known_revisions_metrics,
+    )
+
     snapshot_metrics = {
+        # Freeze-boundary revision lookups this refresh issued (§53): how many
+        # document identities, how many grouped queries.
+        "known_revisions_lookup": take_known_revisions_metrics(db),
         "candidate_run_ids": list(candidate_ids),
         "future_supply_captured": True,
         "future_supply_capture_batch_id": int(future_supply_capture_batch.id),

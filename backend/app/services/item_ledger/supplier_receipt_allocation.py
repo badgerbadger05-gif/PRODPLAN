@@ -928,7 +928,14 @@ def normalize_supplier_receipt_evidence(
 
     from .physical_visibility import known_revisions_by_sle
 
-    first_known = known_revisions_by_sle(db, sle_rows)
+    # Only the rows this normaliser types - the supplier-document lines the
+    # evidence names - are ever judged against a freeze boundary; looking up
+    # every visible SLE's revisions cost ~250 grouped queries per rebuild.
+    first_known = known_revisions_by_sle(db, [
+        sle
+        for identity in evidence_by_identity
+        for sle in by_identity.get(identity, ())
+    ])
     normalized: list[NormalizedSupplierReceiptFact] = []
     for identity, row in sorted(evidence_by_identity.items()):
         operation = _operation_prefix(row)

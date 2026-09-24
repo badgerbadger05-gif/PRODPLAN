@@ -1652,7 +1652,8 @@ def test_a_document_reposted_after_the_freeze_is_known_from_its_first_import(db_
     # Re-posting deactivates the old revision, as the ingest does.
     first.active = False
     db_session.flush()
-    reposted = revision(first.business_identity, "A-repost", "9")  # same identity
+    # The same document re-posted (same recorder, same line, same item).
+    reposted = revision(first.business_identity, "A", "9")
     new_document = revision(f"r4:new-document-{generation_id}", "NEW", "3")
     known = known_revisions_by_sle(db_session, [reposted, new_document])
     cutoff = datetime(2026, 9, 10, tzinfo=timezone.utc)
@@ -1844,7 +1845,7 @@ def test_a_line_unposted_before_the_freeze_and_reposted_after_is_not_stock(db_se
         business_identity=first.business_identity, item_id=item_id, qty=Decimal("8"),
         qty_after=Decimal("8"), posting_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
         record_type="Receipt", movement_kind="receipt", recorder_type="Doc",
-        recorder_ref="A-repost", line_no="1", ingest_source="seed",
+        recorder_ref="A", line_no="1", ingest_source="seed",
     )
     db_session.add(reposted)
     db_session.flush()
@@ -1899,6 +1900,7 @@ def test_the_revision_lookup_issues_one_grouped_query_per_thousand_identities(db
             id=-(index + 1), business_identity=f"probe:{index}", item_id=1,
             characteristic_ref="", organization_ref="", warehouse_ref1c="WH",
             ingest_batch_id=1, posting_at=datetime(2026, 9, 1),
+            recorder_type="Doc", recorder_ref=f"probe-doc-{index}", line_no="1",
         )
         for index in range(2500)
     ]
@@ -1915,6 +1917,111 @@ def test_the_revision_lookup_issues_one_grouped_query_per_thousand_identities(db
     finally:
         event.remove(bind, "before_cursor_execute", count)
 
-    assert len(statements) == 3  # 1000 + 1000 + 500 identities
+    assert len(statements) == 3  # 1000 + 1000 + 500 documents
     assert all("group by" in statement.lower() for statement in statements)
     assert len(result) == 2500
+
+
+
+def test_a_line_delete_after_the_freeze_does_not_make_the_shifted_lines_new(db_session):
+    """§55: continuity by document and physical key, not by line number.
+
+    Document D had lines 1:X, 2:Y, 3:Z at the freeze.  After the freeze line 1
+    is deleted and D is re-posted as 1:Y, 2:Z, plus a genuinely new 3:W.
+    Y and Z are still the lines the freeze knew (no double count); X has no
+    current line at all (nothing resurrected); W is replenishment.
+    """
+    from app.services.item_ledger.historical_replay_core import known_at_freeze
+    from app.services.item_ledger.physical_visibility import known_revisions_by_sle
+
+    generation_id, _item_id, _reservations, _facts = _world(db_session, prefix="shift")
+    freeze_batch = int(db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id)
+    later = models.PhysicalImportBatch(
+        batch_key="shift-later", status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc), source_watermarks={},
+        completed_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    items = {}
+    for code in ("X", "Y", "Z", "W"):
+        items[code] = models.Item(item_code=f"SHIFT-{code}", item_name=code)
+    db_session.add_all([later, *items.values()])
+    db_session.flush()
+    posted = datetime(2026, 9, 5, tzinfo=timezone.utc)
+
+    def line(batch, number, code, *, active=True):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=int(batch), source_content_hash=f"shift-{batch}-{number}".ljust(64, "0"),
+            business_identity=f"movement:Doc:D-shift:{number}:{batch}",
+            item_id=int(items[code].item_id), warehouse_ref1c="WH", qty=Decimal("2"),
+            qty_after=Decimal("2"), posting_at=posted, record_type="Receipt",
+            movement_kind="receipt", recorder_type="Doc", recorder_ref="D-shift",
+            line_no=str(number), ingest_source="seed", active=active,
+        )
+        db_session.add(row)
+        db_session.flush()
+        return row
+
+    old = [line(freeze_batch, 1, "X", active=False),
+           line(freeze_batch, 2, "Y", active=False),
+           line(freeze_batch, 3, "Z", active=False)]
+    for row in old:  # the re-post supersedes the old revisions
+        db_session.add(models.StockLedgerFactSupersession(
+            old_sle_id=int(row.id), new_sle_id=None, import_batch_id=int(later.id),
+        ))
+    shifted_y = line(later.id, 1, "Y")
+    shifted_z = line(later.id, 2, "Z")
+    new_w = line(later.id, 3, "W")
+    db_session.flush()
+
+    revisions = known_revisions_by_sle(db_session, [shifted_y, shifted_z, new_w])
+    cutoff = datetime(2026, 9, 10, tzinfo=timezone.utc)
+
+    assert known_at_freeze(revisions[int(shifted_y.id)], freeze_batch, cutoff)
+    assert known_at_freeze(revisions[int(shifted_z.id)], freeze_batch, cutoff)
+    assert not known_at_freeze(revisions[int(new_w.id)], freeze_batch, cutoff)
+    # X is not a current line: nothing of it is judged, nothing resurrected.
+    assert int(old[0].id) not in revisions
+
+
+def test_the_normaliser_looks_up_only_the_supplier_lines_it_types(db_session):
+    """33a: 5000 visible rows, 100 supplier receipts -> at most 100 documents."""
+    from app.services.item_ledger.physical_visibility import take_known_revisions_metrics
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        RECEIPT_OPERATION,
+        SupplierDocumentEvidence,
+        normalize_supplier_receipt_evidence,
+    )
+    from types import SimpleNamespace
+
+    posted = datetime(2026, 9, 1)
+    visible = []
+    evidence = []
+    for index in range(5000):
+        supplier = index < 100
+        row = SimpleNamespace(
+            id=index + 1, item_id=1, qty=Decimal("1"), posting_at=posted,
+            ingest_batch_id=1, business_identity=f"probe:{index}",
+            recorder_type="Document_ПриходнаяНакладная" if supplier else "Document_Other",
+            recorder_ref=f"doc-{index}", line_no="1",
+            characteristic_ref="", organization_ref="", warehouse_ref1c="WH",
+        )
+        visible.append(row)
+        if supplier:
+            evidence.append(SupplierDocumentEvidence(
+                receipt_doc_type=row.recorder_type, receipt_doc_ref=row.recorder_ref,
+                receipt_doc_line_no="1", operation_key=RECEIPT_OPERATION,
+                operation_name="приобретение у поставщика",
+                supplier_order_type="", supplier_order_ref="", supplier_order_line_no="",
+                item_id=1, characteristic_ref="", warehouse_ref1c="WH",
+                signed_qty=Decimal("1"),
+            ))
+    take_known_revisions_metrics(db_session)
+
+    normalized = normalize_supplier_receipt_evidence(
+        db_session, explicit_sles=visible, evidence=evidence,
+    )
+
+    metrics = take_known_revisions_metrics(db_session)
+    assert len(normalized) == 100
+    assert metrics["identities"] <= 100
+    assert metrics["queries"] == 1

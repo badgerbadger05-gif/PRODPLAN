@@ -3777,6 +3777,9 @@ class StockLedgerFactSupersession(Base):
             "import_batch_id", "old_sle_id",
             name="uq_stock_ledger_supersession_transition",
         ),
+        # The freeze-boundary revision lookup (§53) joins supersessions by
+        # the revision they supersede.
+        Index("ix_stock_ledger_supersession_old_sle", "old_sle_id"),
     )
 
     id = Column(BigIntPK, primary_key=True, autoincrement=True)

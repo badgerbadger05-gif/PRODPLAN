@@ -150,3 +150,97 @@ def test_the_impact_report_lists_what_the_freeze_baseline_will_retire(tmp_path):
         assert session.query(models.ReservationConsumptionAllocation).filter_by(
             is_current=True
         ).count() == 2
+
+
+def test_a_retiring_owner_frozen_before_a_released_fact_can_receive_it():
+    """33c: receivers include owners that are themselves retiring facts.
+
+    Owner X is frozen at batch 1 and retires the receipt that batch knew.
+    Owner Y is frozen at batch 2 and retires the receipt imported by batch 2.
+    X was frozen BEFORE Y's receipt became known, so that receipt is not
+    X's stock and can land on X; X's receipt is Y's stock (excluded).
+    """
+    engine = _engine()
+    with Session(engine) as session:
+        batches = []
+        for key in ("x", "y"):
+            batch = models.PhysicalImportBatch(
+                batch_key=f"retiring-{key}", status="completed", cutoff=CUTOFF,
+                source_watermarks={}, source_complete=True, completed_at=CUTOFF,
+            )
+            session.add(batch)
+            session.flush()
+            batches.append(batch)
+        generation = models.LedgerGeneration(
+            generation_key="retiring-pointer", status="accepted", cutoff=CUTOFF,
+            accepted_at=CUTOFF, source_watermarks={}, capabilities={},
+            physical_import_batch_id=int(batches[-1].id), algorithm_version="impact-tests",
+        )
+        item = models.Item(item_code="IMPACT-R", item_name="Retiring receivers")
+        session.add_all([generation, item])
+        session.flush()
+        session.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
+        owners = {}
+        for label, batch in (("x", batches[0]), ("y", batches[1])):
+            run = models.PlanningRun(
+                status="FIXED_SNAPSHOT", ledger_generation_id=generation.id,
+                config_snapshot={}, active_freeze_version=1, ledger_cutoff=CUTOFF,
+            )
+            session.add(run)
+            session.flush()
+            requirement = models.MrpRequirement(
+                run_id=run.run_id, item_id=item.item_id, total_required_qty=Decimal("5"),
+                net_required_qty=Decimal("5"), period_from=date(2026, 10, 1),
+                period_to=date(2026, 10, 31), bom_level=0, planning_stock_pool="default",
+                characteristic_ref="", organization_ref="", freeze_version=1,
+            )
+            session.add(requirement)
+            session.flush()
+            owner = models.ReservationEntry(
+                ledger_generation_id=generation.id, item_id=item.item_id, run_id=run.run_id,
+                freeze_version=1, requirement_id=requirement.id,
+                priority_period_from=date(2026, 10, 1), priority_period_to=date(2026, 10, 31),
+                realization_mode="buy", reserved_qty=Decimal("5"),
+                replenishment_required_qty=Decimal("5"), replenishment_received_qty=Decimal("2"),
+                lifecycle_status="active", owner_kind="current", is_current=True,
+                planning_stock_pool="default", characteristic_ref="", organization_ref="",
+                current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
+            )
+            receipt = models.StockLedgerEntry(
+                ingest_batch_id=int(batch.id), source_content_hash=f"retiring-{label}".ljust(64, "0"),
+                item_id=int(item.item_id), characteristic_ref="", organization_ref="",
+                warehouse_ref1c="WH", qty=Decimal("2"), posting_at=CUTOFF - timedelta(days=1),
+                record_type="Receipt", recorder_type="Doc", recorder_ref=f"retiring-{label}",
+                line_no="1", ingest_source="seed",
+            )
+            session.add_all([owner, receipt])
+            session.flush()
+            session.add(models.MrpFreezeBaseline(
+                run_id=int(run.run_id), freeze_version=1, item_id=int(item.item_id),
+                characteristic_ref="", organization_ref="", planning_stock_pool="default",
+                baseline_at=CUTOFF.replace(tzinfo=None), stock_qty=Decimal("7"),
+                physical_import_batch_id=int(batch.id),
+            ))
+            session.add(models.ReservationConsumptionAllocation(
+                ledger_generation_id=generation.id, reservation_id=owner.id,
+                sle_id=receipt.id, requirement_id=requirement.id,
+                allocated_qty=Decimal("2"), match_rule="fifo", fact_ref=f"retiring-{label}",
+                fact_line_ref="1", item_id=item.item_id, characteristic_ref="",
+                organization_ref="", planning_stock_pool="default",
+                idempotency_key=f"retiring-{label}", allocation_role="replenishment_receipt",
+                is_current=True, event_at=CUTOFF - timedelta(days=1),
+            ))
+            owners[label] = int(owner.id)
+        session.commit()
+
+    report = freeze_basis_impact(engine)
+
+    assert sorted(row["reservation_id"] for row in report["rows"]) == sorted(owners.values())
+    # Both owners retire 2 and then need 5.  Y's receipt can land on X (X was
+    # frozen before it was imported); X's receipt is stock at Y's freeze.
+    assert report["increases"] == [{
+        "item_id": report["rows"][0]["item_id"], "released_qty": "4.000",
+        "other_owners_outstanding": "10.000",
+        "owners_for_which_the_fact_is_stock": 1,
+        "estimated_reallocated_qty": "2.000", "estimate_kind": "upper_bound",
+    }]

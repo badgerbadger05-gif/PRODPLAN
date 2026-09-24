@@ -92,105 +92,153 @@ def visible_sle_query(
 Revision = tuple
 
 
+#: Session-scoped counters of the revision lookup (calls, identities looked
+#: up, queries issued), read and reset by a publication for its metrics.
+KNOWN_REVISIONS_METRICS_KEY = "known_revisions_lookup"
+
+
+def take_known_revisions_metrics(db: Session) -> dict[str, int]:
+    """Return and reset the revision-lookup counters of this session."""
+    return dict(
+        db.info.pop(KNOWN_REVISIONS_METRICS_KEY, None)
+        or {"calls": 0, "identities": 0, "queries": 0}
+    )
+
+
 def known_revisions_by_sle(
     db: Session, rows: Any
 ) -> dict[int, tuple[Revision, ...]]:
     """Every revision of each fact's document line, for the freeze test (§53).
 
-    A document re-posted in 1C is imported again as new SLE revisions, and
-    ``business_identity`` survives the re-post.  Whether the freeze knew the
-    line is therefore a question about *all* its revisions: was one of them
-    visible at the freeze batch - imported by it and not superseded or
-    tombstoned by a batch not later than it - exactly as
-    ``visible_sle_query`` builds the frozen stock.  The predicate
+    A document re-posted in 1C is imported again as new SLE revisions.
+    Whether the freeze knew a line is therefore a question about *all* its
+    revisions: was one of them visible at the freeze batch - imported by it
+    and not superseded or tombstoned by a batch not later than it - exactly
+    as ``visible_sle_query`` builds the frozen stock.  The predicate
     (``historical_replay_core.known_at_freeze``) evaluates these intervals
     against each owner's own batch; a line unposted before the freeze and
     re-posted after it is not stock.
 
-    Technical reading of §53 for line renumbering: ``business_identity`` is
-    ``movement:<type>:<ref>:<line_no>`` and does not name the item, so after
-    a line is inserted or deleted in 1C, line *k* may carry another item.
-    Continuity is judged by the identity AND the physical key (item,
-    characteristic, organization, warehouse): a revision of the same identity
-    on a different key is a different line and does not lend its first
-    import.  A row without an identity is its own only revision.
+    Line continuity (decision §55): a line is the same line when the
+    document (recorder) and the physical key (item, characteristic,
+    organization, warehouse) match; the 1C line number does not take part,
+    so a line inserted or deleted after the freeze does not turn the shifted
+    lines into new facts.  Repeats of one key inside one document are paired
+    by order: in every import batch of the document, the k-th line of that
+    key (by line number) is the same line as the judged row's k-th.  The
+    same line number on the same key is the fast path.  A row without a
+    recorder is its own only revision.
 
-    One grouped query per chunk of at most 1000 identities (plus one per
-    chunk of rows without an identity), restricted to the identities of the
-    rows passed in.
+    One grouped query per chunk of at most 1000 documents (plus one per chunk
+    of rows without a recorder), restricted to the documents of the rows
+    passed in.
     """
     facts = [row for row in rows if row is not None]
-
-    def _key(identity, item_id, characteristic, organization, warehouse):
-        return (
-            str(identity), int(item_id), str(characteristic or ""),
-            str(organization or ""), str(warehouse or ""),
-        )
-
-    identities = sorted({
-        str(row.business_identity)
-        for row in facts
-        if str(getattr(row, "business_identity", "") or "").strip()
-    })
-    by_key: dict[tuple, list[Revision]] = {}
-    by_id: dict[int, Revision] = {}
     sle = models.StockLedgerEntry
     supersession = models.StockLedgerFactSupersession
+
+    def _key(row_or_values) -> tuple:
+        item, characteristic, organization, warehouse = row_or_values
+        return (int(item), str(characteristic or ""), str(organization or ""), str(warehouse or ""))
+
+    def _line_order(line_no: Any, sle_id: int) -> tuple:
+        text = str(line_no or "").strip()
+        return (int(text) if text.isdigit() else 10 ** 12, text, int(sle_id))
 
     def _revision_query():
         return (
             db.query(
-                sle.id, sle.business_identity, sle.item_id, sle.characteristic_ref,
-                sle.organization_ref, sle.warehouse_ref1c, sle.ingest_batch_id,
-                sle.posting_at, func.min(supersession.import_batch_id),
+                sle.id, sle.recorder_type, sle.recorder_ref, sle.line_no,
+                sle.item_id, sle.characteristic_ref, sle.organization_ref,
+                sle.warehouse_ref1c, sle.ingest_batch_id, sle.posting_at,
+                func.min(supersession.import_batch_id),
             )
             .outerjoin(supersession, supersession.old_sle_id == sle.id)
             .group_by(sle.id)
         )
 
-    for offset in range(0, len(identities), 1000):
-        chunk = identities[offset:offset + 1000]
-        for (
-            sle_id, identity, item_id, characteristic, organization, warehouse,
-            batch_id, posting_at, superseded_batch,
-        ) in _revision_query().filter(sle.business_identity.in_(chunk)):
-            revision = (
-                int(batch_id),
-                int(superseded_batch) if superseded_batch is not None else None,
-                posting_at,
+    documents = sorted({
+        str(row.recorder_ref)
+        for row in facts
+        if str(getattr(row, "recorder_ref", "") or "").strip()
+    })
+    metrics = db.info.setdefault(
+        KNOWN_REVISIONS_METRICS_KEY, {"calls": 0, "identities": 0, "queries": 0},
+    )
+    metrics["calls"] += 1
+    metrics["identities"] += len(documents)
+    # (recorder_type, recorder_ref, key) -> batch -> [(order, revision, line_no)]
+    lines: dict[tuple, dict[int, list[tuple]]] = {}
+    by_id: dict[int, Revision] = {}
+
+    def _remember(values) -> None:
+        (
+            sle_id, recorder_type, recorder_ref, line_no, item_id, characteristic,
+            organization, warehouse, batch_id, posting_at, superseded_batch,
+        ) = values
+        revision = (
+            int(batch_id),
+            int(superseded_batch) if superseded_batch is not None else None,
+            posting_at,
+        )
+        by_id[int(sle_id)] = revision
+        if str(recorder_ref or "").strip():
+            document = (
+                str(recorder_type or ""), str(recorder_ref),
+                _key((item_id, characteristic, organization, warehouse)),
             )
-            by_id[int(sle_id)] = revision
-            by_key.setdefault(
-                _key(identity, item_id, characteristic, organization, warehouse), []
-            ).append(revision)
+            lines.setdefault(document, {}).setdefault(int(batch_id), []).append(
+                (_line_order(line_no, sle_id), revision, str(line_no or "").strip(), int(sle_id))
+            )
+
+    for offset in range(0, len(documents), 1000):
+        metrics["queries"] += 1
+        for values in _revision_query().filter(
+            sle.recorder_ref.in_(documents[offset:offset + 1000])
+        ):
+            _remember(values)
     anonymous = sorted({
         int(row.id) for row in facts
-        if not str(getattr(row, "business_identity", "") or "").strip()
+        if not str(getattr(row, "recorder_ref", "") or "").strip()
     })
     for offset in range(0, len(anonymous), 1000):
-        for (
-            sle_id, _identity, _item, _char, _org, _wh, batch_id, posting_at, superseded_batch,
-        ) in _revision_query().filter(sle.id.in_(anonymous[offset:offset + 1000])):
-            by_id[int(sle_id)] = (
-                int(batch_id),
-                int(superseded_batch) if superseded_batch is not None else None,
-                posting_at,
+        metrics["queries"] += 1
+        for values in _revision_query().filter(sle.id.in_(anonymous[offset:offset + 1000])):
+            by_id[int(values[0])] = (
+                int(values[8]),
+                int(values[10]) if values[10] is not None else None,
+                values[9],
             )
+
     result: dict[int, tuple[Revision, ...]] = {}
     for row in facts:
-        identity = str(getattr(row, "business_identity", "") or "").strip()
         own = by_id.get(int(row.id), (int(row.ingest_batch_id), None, row.posting_at))
-        if identity:
-            revisions = by_key.get(
-                _key(identity, row.item_id, row.characteristic_ref,
-                     row.organization_ref, row.warehouse_ref1c),
-                [],
-            )
-            result[int(row.id)] = tuple(sorted(
-                set(revisions) | {own}, key=lambda value: (value[0], value[1] or 0),
-            ))
-        else:
+        document = (
+            str(getattr(row, "recorder_type", "") or ""),
+            str(getattr(row, "recorder_ref", "") or ""),
+            _key((row.item_id, row.characteristic_ref, row.organization_ref, row.warehouse_ref1c)),
+        )
+        batches = lines.get(document) if document[1].strip() else None
+        if not batches:
             result[int(row.id)] = (own,)
+            continue
+        own_batch = sorted(batches.get(int(row.ingest_batch_id), []))
+        own_line = str(getattr(row, "line_no", "") or "").strip()
+        position = next(
+            (index for index, entry in enumerate(own_batch) if entry[3] == int(row.id)),
+            None,
+        )
+        revisions = {own}
+        for batch_lines in batches.values():
+            ordered = sorted(batch_lines)
+            same_number = [entry for entry in ordered if entry[2] == own_line]
+            if len(same_number) == 1:
+                revisions.add(same_number[0][1])
+            elif position is not None and position < len(ordered):
+                revisions.add(ordered[position][1])
+        result[int(row.id)] = tuple(sorted(
+            revisions, key=lambda value: (value[0], value[1] or 0),
+        ))
     return result
 
 
