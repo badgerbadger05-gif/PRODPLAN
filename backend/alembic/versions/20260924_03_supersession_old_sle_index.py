@@ -29,10 +29,9 @@ def upgrade() -> None:
         "stock_ledger_fact_supersession",
         ["old_sle_id"],
     )
-    op.drop_index(
-        "ix_stock_ledger_entry_business_identity_batch",
-        table_name="stock_ledger_entry",
-    )
+    # The identity index is unused since the revision lookup went by recorder;
+    # a database built from the models never had it, so the drop is idempotent.
+    op.execute("DROP INDEX IF EXISTS ix_stock_ledger_entry_business_identity_batch")
 
 
 def downgrade() -> None:
