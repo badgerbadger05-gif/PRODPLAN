@@ -3923,46 +3923,22 @@ def build_period_plan_execution_payload(
     for item_id in list(roots_by_item):
         roots_by_item[item_id] = sorted(set(roots_by_item[item_id]))
 
-    run_root_accepted = _to_float(
-        db.query(func.coalesce(func.sum(MrpRunRoot.accepted_qty), 0))
-        .filter(MrpRunRoot.run_id == int(run.run_id))
-        .scalar()
+    # A replacement MRP (specification rebase, §7) starts with zero execution
+    # of its own: its rows are its own requirements, read from its own owners
+    # and roots, so nothing of the old MRP's journal is carried over.  The
+    # rows themselves are never withheld.  A guard here used to return no
+    # rows at all until the successor's first own receipt or output; under
+    # the freeze baseline (§49) that is the normal state at birth, so every
+    # rebase published an empty journal and the rows appeared only with the
+    # next physical refresh (rehearsal4: run 514, 428 rows, ~21 min late).
+    rows, _meta = _build_execution_snapshot_rows(
+        db,
+        run,
+        requirement_ids=run_requirements,
+        items_by_requirement=items_by_req,
+        generation_id=generation_id,
+        root_item_ids_by_item=roots_by_item,
     )
-    # The run owns its persisted replenishment execution through the stable
-    # reservation owner.  The requirement identity already scopes the read to
-    # this run, so no generation anchor is involved: once per-generation copies
-    # were replaced by one compact owner, anchoring this probe to a generation
-    # answered "no execution" for every retained run and blanked its journal.
-    run_reservation_criterion, _ = _reservation_truth_criteria(db, int(generation_id))
-    has_replenishment_execution = (
-        db.query(ReservationEntry.id)
-        .filter(
-            run_reservation_criterion,
-            ReservationEntry.run_id == int(run.run_id),
-            ReservationEntry.replenishment_received_qty > 0,
-        )
-        .first()
-        is not None
-    )
-    if (
-        run.prior_run_id is not None
-        and run_root_accepted <= 1e-9
-        and not has_replenishment_execution
-    ):
-        # A replacement MRP has no execution history of its own at birth.  Its
-        # requirements remain visible in the MRP result, while this journal
-        # stays empty until its own accepted execution. Component receipts
-        # execute replenishment before a finished root can be assembled.
-        rows = []
-    else:
-        rows, _meta = _build_execution_snapshot_rows(
-            db,
-            run,
-            requirement_ids=run_requirements,
-            items_by_requirement=items_by_req,
-            generation_id=generation_id,
-            root_item_ids_by_item=roots_by_item,
-        )
     rows = _filter_execution_rows(
         db,
         rows,

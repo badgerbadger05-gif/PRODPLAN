@@ -2228,3 +2228,81 @@ def test_a_frozen_owner_without_its_own_baseline_is_refused(db_session):
     db_session.flush()
     with pytest.raises(CurrentReplenishmentError, match="lacks exact frozen pool baseline"):
         freeze_baselines_by_reservation(db_session, [owner])
+
+
+def _period_rows_by_run(db):
+    rows = {}
+    for row in db.query(models.CurrentExecutionRow).filter_by(
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
+    ):
+        run_id = int((row.payload or {})["run_id"])
+        rows[run_id] = rows.get(run_id, 0) + 1
+    return rows
+
+
+def test_a_rebase_publishes_the_successors_journal_rows_at_the_obligation_pointer(
+    db_session,
+):
+    """Item 35: the successor's journal is published by the rebase itself.
+
+    On rehearsal4 the refresh that replaced run 506 by 514 closed the 1133
+    period rows of 506 and inserted none for 514: a replacement MRP with no
+    execution of its own yet - under §49 the normal state at birth - was
+    given an empty journal, and its 428 rows appeared only with the next
+    physical refresh.  The rows are the successor's requirements with zero
+    own execution (§7: its own execution starts at 0), the same rows the next
+    tick produces.
+    """
+    accepted, plan, _line, _item, parent, cutoff = _world(db_session, qty=5)
+    kept = _extra_fixed_plan(
+        db_session, accepted, cutoff, name="retained", code="ORCH-RETAIN-J",
+    )
+    db_session.commit()
+
+    result = _run(db_session, accepted, "orch-rebase-journal", replace=[plan.id])
+
+    assert result.published is True
+    successor = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=parent.run_id,
+    ).one()
+    requirements = db_session.query(models.MrpRequirement).filter_by(
+        run_id=int(successor.run_id),
+    ).count()
+    assert requirements >= 1
+    by_run = _period_rows_by_run(db_session)
+    assert by_run.get(int(successor.run_id)) == requirements
+    assert by_run.get(int(kept.run.run_id)) == 1
+    assert int(parent.run_id) not in by_run
+    # Zero own execution, not an inherited one.
+    for row in db_session.query(models.CurrentExecutionRow).filter_by(
+        entity_kind="period_plan_execution",
+    ):
+        if int(row.payload["run_id"]) == int(successor.run_id):
+            assert float(row.payload["completed_qty"] or 0) == 0
+
+
+def test_a_candidate_with_remaining_roots_and_no_journal_rows_is_refused(
+    db_session, monkeypatch,
+):
+    """Item 35: fail closed instead of publishing an empty journal."""
+    from app.services import period_plan_service
+
+    accepted, plan, _line, _item, parent, _cutoff = _world(db_session, qty=5)
+    real = period_plan_service.build_period_plan_execution_current_payloads_for_generation
+
+    def without_rows(db, generation_id, *, run_ids=None):
+        payloads = real(db, generation_id, run_ids=run_ids)
+        for payload in payloads.values():
+            if int(payload["run_id"]) != int(parent.run_id):
+                payload["rows"] = []
+        return payloads
+
+    monkeypatch.setattr(
+        period_plan_service,
+        "build_period_plan_execution_current_payloads_for_generation",
+        without_rows,
+    )
+
+    with pytest.raises(ObligationRefreshPublishError, match="no journal rows"):
+        _run(db_session, accepted, "orch-rebase-empty-journal", replace=[plan.id])

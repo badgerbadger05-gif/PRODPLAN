@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import InvalidOperation
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 from typing import Any, Iterable, Mapping
 
-from sqlalchemy import or_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -528,6 +528,44 @@ def _require_sealed_build(
     )
 
 
+def _require_period_rows_for_remaining_basis(
+    db: Session, payloads: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Refuse a live run with a remaining basis but an empty journal.
+
+    A run whose roots still have a remaining quantity and which has
+    requirements owns execution rows; publishing it with none would show an
+    empty execution journal until some later refresh (item 35).  An
+    ``unavailable`` payload is no exception: fail closed.
+    """
+    run_ids = sorted({int(payload["run_id"]) for payload in payloads.values()})
+    if not run_ids:
+        return
+    remaining = {
+        int(run_id): Decimal(str(qty or 0))
+        for run_id, qty in db.query(
+            models.MrpRunRoot.run_id, func.sum(models.MrpRunRoot.remaining_qty),
+        ).filter(models.MrpRunRoot.run_id.in_(run_ids)).group_by(models.MrpRunRoot.run_id)
+    }
+    with_requirements = {
+        int(run_id)
+        for (run_id,) in db.query(models.MrpRequirement.run_id)
+        .filter(models.MrpRequirement.run_id.in_(run_ids))
+        .distinct()
+    }
+    for key, payload in sorted(payloads.items()):
+        run_id = int(payload["run_id"])
+        if (
+            remaining.get(run_id, Decimal("0")) > 0
+            and run_id in with_requirements
+            and not list(payload.get("rows") or [])
+        ):
+            raise ObligationRefreshPublishError(
+                f"period payload {key} has a remaining root basis but no journal rows "
+                f"(truth_status={payload.get('truth_status')!r})"
+            )
+
+
 def _require_mrp_current_payloads(
     raw_payloads: Any,
     *,
@@ -919,6 +957,7 @@ def publish_obligation_refresh_batch(
             *(int(row.run_id) for row in retained),
         ],
     )
+    _require_period_rows_for_remaining_basis(db, direct_period_payloads)
     snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
         models.LedgerBuildBatch.stage == "snapshot_build",

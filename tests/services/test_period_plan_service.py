@@ -734,12 +734,11 @@ def test_replacement_mrp_journal_exposes_own_receipts_before_root_output(
         generation_id=generation_id,
     )
 
-    if received_qty:
-        assert len(payload["rows"]) == 1
-        assert payload["rows"][0]["completed_qty"] == received_qty
-        assert payload["rows"][0]["remaining_qty"] == 1
-    else:
-        assert payload["rows"] == []
+    # The successor's rows are its own requirements from birth; with no own
+    # receipt yet they show zero execution instead of being withheld (item 35).
+    assert len(payload["rows"]) == 1
+    assert payload["rows"][0]["completed_qty"] == received_qty
+    assert payload["rows"][0]["remaining_qty"] == 2 - received_qty
     assert payload["summary"]["execution_completed_qty"] == 0
     assert payload["summary"]["execution_base_qty"] == 2
     assert payload["summary"]["execution_pct"] == 0
