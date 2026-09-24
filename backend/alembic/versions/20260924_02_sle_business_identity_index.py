@@ -6,6 +6,11 @@ partial (``WHERE active``) and cannot serve superseded revisions, so the
 lookup scanned the table.  A normal ``CREATE INDEX`` (alembic runs in a
 transaction, so ``CONCURRENTLY`` is not available); the table is ~250k rows,
 which builds in seconds under the writers-stopped deploy window.
+
+Superseded: decision §55 moved the lookup to the document axis
+(``recorder_type, recorder_ref``), and no code queries revisions by
+``business_identity`` any more.  This migration is retained because it is
+already applied on rehearsal copies; 20260924_03 drops the index again.
 """
 
 from alembic import op

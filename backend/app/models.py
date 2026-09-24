@@ -3178,14 +3178,8 @@ class StockLedgerEntry(Base):
             "posting_at",
         ),
         Index("ix_stock_ledger_entry_posting_at", "posting_at"),
+        # Also serves the freeze-boundary revision lookup by document (§55).
         Index("ix_stock_ledger_entry_recorder", "recorder_type", "recorder_ref"),
-        # Every revision of a document line (freeze-boundary test, §53); the
-        # identity index above is partial and misses superseded revisions.
-        Index(
-            "ix_stock_ledger_entry_business_identity_batch",
-            "business_identity",
-            "ingest_batch_id",
-        ),
     )
 
     id = Column(BigIntPK, primary_key=True, index=True)

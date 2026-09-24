@@ -1919,6 +1919,12 @@ def test_the_revision_lookup_issues_one_grouped_query_per_thousand_identities(db
 
     assert len(statements) == 3  # 1000 + 1000 + 500 documents
     assert all("group by" in statement.lower() for statement in statements)
+    # 34a: filtered by recorder type as well, so the (recorder_type,
+    # recorder_ref) index applies.
+    assert all(
+        "stock_ledger_entry.recorder_type =" in statement.lower().split("where", 1)[1]
+        for statement in statements
+    )
     assert len(result) == 2500
 
 

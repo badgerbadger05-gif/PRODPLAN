@@ -7,7 +7,7 @@ Visibility is defined by the import-batch boundary, never by the mutable
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import exists, func
+from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Query, Session
 
 from app import models
@@ -129,9 +129,17 @@ def known_revisions_by_sle(
     same line number on the same key is the fast path.  A row without a
     recorder is its own only revision.
 
-    One grouped query per chunk of at most 1000 documents (plus one per chunk
-    of rows without a recorder), restricted to the documents of the rows
-    passed in.
+    Known limitation of order matching (accepted, recorded for the owner):
+    a repeat of a key inserted after the freeze BEFORE an existing repeat of
+    the same key in the same document takes the old line's position - the
+    new line's quantity is treated as stock at the freeze, and the old line,
+    now in a later position, counts anew as replenishment.  Only repeats of
+    one physical key inside one document are affected.
+
+    One grouped query per recorder type and chunk of at most 1000 documents
+    of that type (``recorder_type = :type AND recorder_ref IN (...)``, served
+    by ``ix_stock_ledger_entry_recorder``), plus one per chunk of rows
+    without a recorder; restricted to the documents of the rows passed in.
     """
     facts = [row for row in rows if row is not None]
     sle = models.StockLedgerEntry
@@ -157,16 +165,17 @@ def known_revisions_by_sle(
             .group_by(sle.id)
         )
 
-    documents = sorted({
-        str(row.recorder_ref)
-        for row in facts
-        if str(getattr(row, "recorder_ref", "") or "").strip()
-    })
+    documents_by_type: dict[str, set[str]] = {}
+    for row in facts:
+        if str(getattr(row, "recorder_ref", "") or "").strip():
+            documents_by_type.setdefault(
+                str(getattr(row, "recorder_type", "") or ""), set()
+            ).add(str(row.recorder_ref))
     metrics = db.info.setdefault(
         KNOWN_REVISIONS_METRICS_KEY, {"calls": 0, "identities": 0, "queries": 0},
     )
     metrics["calls"] += 1
-    metrics["identities"] += len(documents)
+    metrics["identities"] += sum(len(refs) for refs in documents_by_type.values())
     # (recorder_type, recorder_ref, key) -> batch -> [(order, revision, line_no)]
     lines: dict[tuple, dict[int, list[tuple]]] = {}
     by_id: dict[int, Revision] = {}
@@ -191,12 +200,20 @@ def known_revisions_by_sle(
                 (_line_order(line_no, sle_id), revision, str(line_no or "").strip(), int(sle_id))
             )
 
-    for offset in range(0, len(documents), 1000):
-        metrics["queries"] += 1
-        for values in _revision_query().filter(
-            sle.recorder_ref.in_(documents[offset:offset + 1000])
-        ):
-            _remember(values)
+    for recorder_type, refs in sorted(documents_by_type.items()):
+        # NULL and '' are the same (empty) recorder type, as in ``_remember``.
+        type_filter = (
+            sle.recorder_type == recorder_type
+            if recorder_type
+            else or_(sle.recorder_type.is_(None), sle.recorder_type == "")
+        )
+        documents = sorted(refs)
+        for offset in range(0, len(documents), 1000):
+            metrics["queries"] += 1
+            for values in _revision_query().filter(
+                type_filter, sle.recorder_ref.in_(documents[offset:offset + 1000])
+            ):
+                _remember(values)
     anonymous = sorted({
         int(row.id) for row in facts
         if not str(getattr(row, "recorder_ref", "") or "").strip()
