@@ -568,6 +568,9 @@ def _bounded_scope_receipt_facts(
     evidence_by_id = _persisted_scope_evidence(
         db, [int(row.id) for row in rows if int(row.id) not in delta_facts_by_id]
     )
+    from .physical_visibility import first_known_batch_by_sle
+
+    first_known = first_known_batch_by_sle(db, rows)
     facts: list[ReceiptFact] = []
     for row in rows:
         scope = _scope_for_row(row, scopes)
@@ -596,7 +599,7 @@ def _bounded_scope_receipt_facts(
             sle_id=int(row.id),
             posting_at=row.posting_at,
             known_at=getattr(row, "known_at", None),
-            ingest_batch_id=getattr(row, "ingest_batch_id", None),
+            first_known_batch_id=first_known.get(int(row.id)),
             signed_qty=Decimal(str(row.qty)),
             item_id=int(row.item_id),
             supplier_order_ref=_text(evidence.supplier_order_ref),

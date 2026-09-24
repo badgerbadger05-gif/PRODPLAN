@@ -698,3 +698,72 @@ def test_a_run_sharing_a_failed_request_is_not_skipped(db_session, monkeypatch):
 
     assert attempts[-1] == int(second.run_id)
     assert db_session.get(models.SpecificationRebaseRunState, int(second.run_id)) is not None
+
+
+def _parked_run(db_session, worker, *, changed_spec_used_by="open"):
+    run, request = _rebase_scope_world(db_session, changed_spec_used_by=changed_spec_used_by)
+    db_session.add(models.SpecificationRebaseRunState(
+        run_id=int(run.run_id), consecutive_failures=worker.MAX_REBASE_ATTEMPTS,
+        last_error="broken specification",
+    ))
+    request.status = "failed"
+    request.result = {"status": "failed_max_attempts", "run_id": int(run.run_id)}
+    db_session.commit()
+    return run, request
+
+
+def test_a_new_revision_of_a_needed_spec_resets_a_parked_run(db_session):
+    """31e: the revision may be the fix; the run gets a fresh counter and its
+    parked request is back in line."""
+    from app.services import specification_rebase_worker as worker
+
+    run, request = _parked_run(db_session, worker)
+    changed = db_session.query(models.Specification).filter_by(spec_ref1c="spec-changed").one()
+
+    record_specification_revisions(
+        db_session, [int(changed.spec_id)],
+        previous_hash_by_id={int(changed.spec_id): "some-older-hash"},
+    )
+    db_session.commit()
+
+    assert db_session.get(models.SpecificationRebaseRunState, int(run.run_id)) is None
+    db_session.refresh(request)
+    assert request.status == "pending"
+    assert request.result["status"] == "reopened"
+
+
+def test_a_revision_of_a_spec_the_remainder_does_not_need_keeps_the_run_parked(db_session):
+    from app.services import specification_rebase_worker as worker
+
+    # ``spec-changed`` is used only by the fully accepted root here.
+    run, _request = _parked_run(db_session, worker, changed_spec_used_by="done")
+    changed = db_session.query(models.Specification).filter_by(spec_ref1c="spec-changed").one()
+
+    record_specification_revisions(
+        db_session, [int(changed.spec_id)],
+        previous_hash_by_id={int(changed.spec_id): "some-older-hash"},
+    )
+    db_session.commit()
+
+    state = db_session.get(models.SpecificationRebaseRunState, int(run.run_id))
+    assert state is not None and state.consecutive_failures == worker.MAX_REBASE_ATTEMPTS
+
+
+def test_the_admin_reset_puts_a_parked_run_back_in_line(db_session):
+    from fastapi import HTTPException
+
+    from app.routers.item_ledger_admin import reset_specification_rebase_run
+    from app.services import specification_rebase_worker as worker
+
+    run, request = _parked_run(db_session, worker)
+
+    result = reset_specification_rebase_run(int(run.run_id), db=db_session)
+
+    assert result["reset_run_ids"] == [int(run.run_id)]
+    assert result["reopened_requests"] == 1
+    assert db_session.get(models.SpecificationRebaseRunState, int(run.run_id)) is None
+    db_session.refresh(request)
+    assert request.status == "pending"
+    with pytest.raises(HTTPException) as missing:
+        reset_specification_rebase_run(int(run.run_id), db=db_session)
+    assert missing.value.status_code == 404

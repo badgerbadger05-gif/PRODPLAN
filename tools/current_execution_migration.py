@@ -776,6 +776,7 @@ def _backlog_rows(
 
 FREEZE_BASIS_IMPACT_COLUMNS = (
     "run_id", "item_id", "reservation_id", "baseline_at", "freeze_batch_id",
+    "boundary_source", "revised_after_freeze_identities",
     "allocations_to_retire", "qty_to_retire",
     "replenishment_required_qty", "received_before", "received_after",
     "outstanding_before", "outstanding_after", "outstanding_delta",
@@ -804,11 +805,15 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
         freeze_baselines_by_reservation,
     )
     from app.services.item_ledger.historical_replay_core import known_at_freeze
+    from app.services.item_ledger.physical_visibility import first_known_batch_by_sle
 
     def _dec(value: Any) -> _Decimal:
         return _Decimal(str(value or 0))
 
     rows: list[dict[str, Any]] = []
+    released_by_item: dict[int, Any] = {}
+    revised_identities: set[str] = set()
+    increases: list[dict[str, Any]] = []
     with Session(engine, autoflush=False, expire_on_commit=False) as session:
         try:
             owners = (
@@ -841,7 +846,7 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                 allocations = (
                     session.query(
                         models.ReservationConsumptionAllocation,
-                        models.StockLedgerEntry.ingest_batch_id,
+                        models.StockLedgerEntry,
                     )
                     .join(models.StockLedgerEntry,
                           models.StockLedgerEntry.id == models.ReservationConsumptionAllocation.sle_id)
@@ -852,14 +857,31 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                     )
                     .all()
                 )
-                # The same as-known predicate the replay applies (§51).
+                first_known = first_known_batch_by_sle(session, [sle for _row, sle in allocations])
+                # The same predicate the replay applies (§51/§53): first import
+                # of the document line and its date against the freeze.
                 retire = [
-                    allocation for allocation, batch_id in allocations
+                    (allocation, sle) for allocation, sle in allocations
                     if boundary is not None
-                    and known_at_freeze(batch_id, boundary.batch_id)
+                    and known_at_freeze(
+                        first_known.get(int(sle.id)), sle.posting_at,
+                        boundary.batch_id, boundary.baseline_at,
+                    )
                 ]
                 if not retire:
                     continue
+                # §53: facts whose current revision was imported after the
+                # freeze but whose document the freeze already knew.
+                revised_after_freeze = {
+                    str(sle.business_identity or sle.id)
+                    for _allocation, sle in retire
+                    if int(sle.ingest_batch_id) > int(boundary.batch_id)
+                }
+                released_by_item[int(owner.item_id)] = released_by_item.get(
+                    int(owner.item_id), _Decimal("0")
+                ) + sum((_dec(row.allocated_qty) for row, _sle in retire), _Decimal("0"))
+                revised_identities.update(revised_after_freeze)
+                retire = [allocation for allocation, _sle in retire]
                 qty = sum((_dec(row.allocated_qty) for row in retire), _Decimal("0"))
                 required = _dec(owner.replenishment_required_qty)
                 before = _dec(owner.replenishment_received_qty)
@@ -877,6 +899,8 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                         if boundary is not None and boundary.baseline_at is not None else None
                     ),
                     "freeze_batch_id": boundary.batch_id if boundary is not None else None,
+                    "boundary_source": boundary.source if boundary is not None else None,
+                    "revised_after_freeze_identities": len(revised_after_freeze),
                     "allocations_to_retire": len(retire),
                     "qty_to_retire": canonical_decimal_text(qty),
                     "replenishment_required_qty": canonical_decimal_text(required),
@@ -892,6 +916,36 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                         canonical_decimal_text(basis.received_total) if basis is not None else None
                     ),
                     "status": status,
+                })
+            # Increases (estimate): a retired fact returns to FIFO, where it
+            # can go to other live owners of the same item that still have an
+            # outstanding need after the retirements - bounded by that need.
+            retiring_owner_ids = {row["reservation_id"] for row in rows}
+            after_by_owner = {
+                row["reservation_id"]: _Decimal(row["received_after"]) for row in rows
+            }
+            for item_id, released in sorted(released_by_item.items()):
+                others = [
+                    owner for owner in owners
+                    if int(owner.item_id) == item_id
+                    and int(owner.id) not in retiring_owner_ids
+                ]
+                open_need = sum(
+                    (
+                        max(
+                            _dec(owner.replenishment_required_qty)
+                            - after_by_owner.get(int(owner.id), _dec(owner.replenishment_received_qty)),
+                            _Decimal("0"),
+                        )
+                        for owner in others
+                    ),
+                    _Decimal("0"),
+                )
+                increases.append({
+                    "item_id": item_id,
+                    "released_qty": canonical_decimal_text(released),
+                    "other_owners_outstanding": canonical_decimal_text(open_need),
+                    "estimated_reallocated_qty": canonical_decimal_text(min(released, open_need)),
                 })
         finally:
             session.rollback()
@@ -919,6 +973,10 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
         "read_only": True,
         "owners": len(rows),
         "allocations_to_retire": sum(row["allocations_to_retire"] for row in rows),
+        # §53: document lines re-posted after the freeze that the freeze
+        # already knew - their allocations retire although the revision is new.
+        "revised_after_freeze_identities": len(revised_identities),
+        "increases": increases,
         "runs": [
             {**value, "qty_to_retire": canonical_decimal_text(value["qty_to_retire"]),
              "outstanding_delta": canonical_decimal_text(value["outstanding_delta"])}

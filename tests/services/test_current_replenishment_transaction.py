@@ -1551,12 +1551,22 @@ def test_a_generation_revision_must_name_the_publishing_generation(db_session):
 # --- Decision §49: the owner's freeze cutoff bounds its replenishment ----------
 
 
-def test_the_freeze_boundary_is_the_batch_that_made_the_fact_known():
-    """Decision §51: as-known, not by document date.
+@pytest.mark.parametrize(
+    ("baseline_at", "label"),
+    [
+        (datetime(2026, 9, 10, 12, tzinfo=timezone.utc), "new-freeze-at-cutoff"),
+        # An owner frozen under the old rule: stock read up to period_from - 1us.
+        (datetime(2026, 8, 31, 23, 59, 59, 999999, tzinfo=timezone.utc), "old-freeze-at-period-start"),
+    ],
+)
+def test_the_freeze_boundary_mirrors_how_the_frozen_stock_was_read(baseline_at, label):
+    """Decisions §49/§51/§53: batch AND date, exactly the visibility filter.
 
-    A receipt posted long before the freeze but imported after the freeze
-    batch replenishes the owner (a backdated document); one imported by the
-    freeze batch is the owner's frozen stock, whatever its date.
+    A fact is stock iff its document line was first imported by the freeze
+    batch and it is dated no later than the freeze instant.  A backdated
+    document imported later replenishes; a receipt dated inside the plan
+    period but imported before an old-rule freeze replenishes too - it was
+    never in that owner's stock.
     """
     from datetime import timedelta
 
@@ -1564,44 +1574,93 @@ def test_the_freeze_boundary_is_the_batch_that_made_the_fact_known():
         allocate_historical_facts,
     )
 
-    cutoff = datetime(2026, 9, 10, 12, tzinfo=timezone.utc)
     reserve = Reserve(
         reserve_id="owner", item_id=1, mode="buy", reserved_qty=Decimal("10"),
         due_date=date(2026, 9, 30), plan_period_from=date(2026, 9, 1),
         plan_period_to=date(2026, 9, 30), run_id=1, requirement_id=1,
-        known_batch_id=10, baseline_at=cutoff,
+        known_batch_id=10, baseline_at=baseline_at,
     )
 
     def fact(fact_id, at, batch):
         return Fact(
-            fact_id=fact_id, item_id=1, mode="buy", qty=Decimal("2"),
+            fact_id=fact_id, item_id=1, mode="buy", qty=Decimal("1"),
             posting_at=at, known_batch_id=batch,
         )
 
+    in_period = datetime(2026, 9, 5, tzinfo=timezone.utc)
     result = allocate_historical_facts(
         [
-            fact("backdated-late-import", cutoff - timedelta(days=100), 11),
-            fact("known-at-freeze", cutoff - timedelta(hours=1), 10),
-            fact("known-earlier", cutoff - timedelta(days=1), 9),
-            fact("post-cutoff-but-known", cutoff + timedelta(hours=1), 10),
+            fact("backdated-late-import", datetime(2026, 6, 1, tzinfo=timezone.utc), 11),
+            fact("before-period-known", datetime(2026, 8, 20, tzinfo=timezone.utc), 9),
+            fact("in-period-known", in_period, 10),
+            fact("after-cutoff-known", baseline_at + timedelta(hours=1), 10),
         ],
         [reserve],
     )
 
-    assert [(row.fact_id, row.qty) for row in result.allocations] == [
-        ("backdated-late-import", Decimal("2")),
-    ]
-    assert {row.fact_id for row in result.surplus} == {
-        "known-at-freeze", "known-earlier", "post-cutoff-but-known",
-    }
+    allocated = {row.fact_id for row in result.allocations}
+    assert "backdated-late-import" in allocated
+    assert "after-cutoff-known" in allocated
+    assert "before-period-known" not in allocated
+    # Dated inside the period, imported before the freeze: stock for a freeze
+    # at the cutoff, replenishment for a freeze read at the period start.
+    assert ("in-period-known" in allocated) is (label == "old-freeze-at-period-start")
 
 
 def test_a_fact_without_an_import_batch_cannot_be_judged_against_a_boundary():
     from app.services.item_ledger.historical_replay_core import known_at_freeze
 
-    assert known_at_freeze(5, None) is False
+    at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    assert known_at_freeze(5, at, None, at) is False
     with pytest.raises(ValueError, match="no physical import batch"):
-        known_at_freeze(None, 5)
+        known_at_freeze(None, at, 5, at)
+
+
+def test_a_document_reposted_after_the_freeze_is_known_from_its_first_import(db_session):
+    """§53: a new revision of a document line the freeze knew is stock; a
+    genuinely new document imported after the freeze is not."""
+    from app.services.item_ledger.historical_replay_core import known_at_freeze
+    from app.services.item_ledger.physical_visibility import first_known_batch_by_sle
+
+    generation_id, item_id, _reservations, _facts = _world(db_session, prefix="revision")
+    freeze_batch = int(db_session.get(models.LedgerGeneration, generation_id).physical_import_batch_id)
+    later = models.PhysicalImportBatch(
+        batch_key="revision-later", status="completed",
+        cutoff=datetime(2026, 9, 11, tzinfo=timezone.utc), source_watermarks={},
+        completed_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+    )
+    db_session.add(later)
+    db_session.flush()
+    first = db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="A", ingest_batch_id=freeze_batch,
+    ).one()
+
+    def revision(identity, ref, qty):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=int(later.id), source_content_hash=f"rev-{ref}".ljust(64, "0"),
+            business_identity=identity, item_id=item_id, qty=Decimal(qty),
+            qty_after=Decimal(qty), posting_at=datetime(2026, 9, 9, tzinfo=timezone.utc),
+            record_type="Receipt", movement_kind="receipt", recorder_type="Doc",
+            recorder_ref=ref, line_no="1", ingest_source="seed",
+        )
+        db_session.add(row)
+        db_session.flush()
+        return row
+
+    # Re-posting deactivates the old revision, as the ingest does.
+    first.active = False
+    db_session.flush()
+    reposted = revision(first.business_identity, "A-repost", "9")  # same identity
+    new_document = revision(f"r4:new-document-{generation_id}", "NEW", "3")
+    known = first_known_batch_by_sle(db_session, [reposted, new_document])
+    cutoff = datetime(2026, 9, 10, tzinfo=timezone.utc)
+
+    assert known[int(reposted.id)] == freeze_batch
+    assert known_at_freeze(known[int(reposted.id)], reposted.posting_at, freeze_batch, cutoff)
+    assert known[int(new_document.id)] == int(later.id)
+    assert not known_at_freeze(
+        known[int(new_document.id)], new_document.posting_at, freeze_batch, cutoff,
+    )
 
 
 @pytest.mark.parametrize(("freeze_batch_offset", "allocated"), [(0, False), (-1, True)])
@@ -1728,9 +1787,20 @@ def test_a_baseline_without_a_batch_falls_back_to_the_freeze_generation(db_sessi
 
     boundary = freeze_baselines_by_reservation(db_session, [owner])[int(owner.id)]
     assert boundary.batch_id == int(generation.physical_import_batch_id)
+    assert boundary.source == "run_generation"
 
+    # 31c: a legacy run without its generation link resolves through its
+    # ledger cutoff to the generation accepted then.
     run = db_session.get(models.PlanningRun, int(owner.run_id))
     run.ledger_generation_id = None
+    run.ledger_cutoff = generation.cutoff
     db_session.flush()
-    with pytest.raises(CurrentReplenishmentError, match="no as-known freeze boundary"):
+    boundary = freeze_baselines_by_reservation(db_session, [owner])[int(owner.id)]
+    assert (boundary.batch_id, boundary.source) == (
+        int(generation.physical_import_batch_id), "run_cutoff",
+    )
+
+    run.ledger_cutoff = None
+    db_session.flush()
+    with pytest.raises(CurrentReplenishmentError, match=f"of run {int(run.run_id)} has no as-known"):
         freeze_baselines_by_reservation(db_session, [owner])

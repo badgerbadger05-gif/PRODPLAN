@@ -42,9 +42,11 @@ DistributionScope = tuple[int, str, str, str, str]
 
 #: Canonical audit reason for a clear-out the caller explicitly acknowledged.
 CONFIRMED_EMPTY_REASON = "confirmed_empty_scope"
-#: Decision §49: an allocation whose fact is not later than its owner's freeze
-#: cutoff is that owner's frozen stock, never its replenishment.  A replay that
-#: drops such an allocation has a provable reason, recorded by the writer.
+#: Decisions §49/§51/§53: an allocation whose fact is in its owner's frozen
+#: stock - first imported by the freeze batch and dated no later than the
+#: freeze instant (``known_at_freeze``) - is never that owner's replenishment.
+#: A replay that drops such an allocation has a provable reason, recorded by
+#: the writer.
 FREEZE_BASELINE_REASON = "facts_at_or_before_freeze_baseline"
 
 #: The source stream of a distribution scope is a property of the scope, not
@@ -348,10 +350,17 @@ def _baseline_part(row: Reserve) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class FreezeBoundary:
-    """An owner's freeze boundary: the as-known batch, and the instant."""
+    """An owner's freeze boundary: the batch and the instant its stock was read at.
+
+    ``source`` names where the batch came from: ``baseline`` (the baseline
+    row), ``run_generation`` (the run's freeze generation) or ``run_cutoff``
+    (the generation accepted at the run's ``ledger_cutoff``, for legacy runs
+    whose generation link is gone).
+    """
 
     batch_id: int
     baseline_at: datetime | None
+    source: str = "baseline"
 
 
 def freeze_baselines_by_reservation(
@@ -363,7 +372,8 @@ def freeze_baselines_by_reservation(
     read at - ``MrpFreezeBaseline.physical_import_batch_id``, or, for a
     baseline row without it, the freeze generation's batch
     (``planning_run.ledger_generation_id`` -> its ``physical_import_batch_id``).
-    ``baseline_at`` rides along for display only.  The one source of the
+    ``baseline_at`` is the instant the stock was read up to; both halves are
+    the boundary (``known_at_freeze``).  The one source of the
     boundary for every replenishment path (the generation replay, the
     supplier rebuild and the R4 adapters), keyed exactly as the consumption
     allocator keys it (run, freeze version, item, characteristic,
@@ -390,15 +400,35 @@ def freeze_baselines_by_reservation(
             _text(baseline.characteristic_ref), _text(baseline.organization_ref),
             _text(baseline.planning_stock_pool),
         )] = baseline
-    generation_batch_by_run = {
-        int(run_id): (int(batch_id) if batch_id is not None else None)
-        for run_id, batch_id in db.query(
-            models.PlanningRun.run_id, models.LedgerGeneration.physical_import_batch_id
-        ).outerjoin(
-            models.LedgerGeneration,
-            models.LedgerGeneration.id == models.PlanningRun.ledger_generation_id,
-        ).filter(models.PlanningRun.run_id.in_(run_ids))
-    }
+    generation_batch_by_run: dict[int, int | None] = {}
+    cutoff_by_run: dict[int, Any] = {}
+    for run_id, batch_id, ledger_cutoff in db.query(
+        models.PlanningRun.run_id,
+        models.LedgerGeneration.physical_import_batch_id,
+        models.PlanningRun.ledger_cutoff,
+    ).outerjoin(
+        models.LedgerGeneration,
+        models.LedgerGeneration.id == models.PlanningRun.ledger_generation_id,
+    ).filter(models.PlanningRun.run_id.in_(run_ids)):
+        generation_batch_by_run[int(run_id)] = int(batch_id) if batch_id is not None else None
+        cutoff_by_run[int(run_id)] = ledger_cutoff
+
+    def _batch_accepted_at(cutoff: Any) -> int | None:
+        """The batch of the generation accepted at a run's ledger cutoff."""
+        if cutoff is None:
+            return None
+        batches = {
+            int(batch)
+            for (batch,) in db.query(models.LedgerGeneration.physical_import_batch_id)
+            .filter(
+                models.LedgerGeneration.cutoff == cutoff,
+                models.LedgerGeneration.status.in_(("accepted", "stale")),
+                models.LedgerGeneration.physical_import_batch_id.isnot(None),
+            )
+        }
+        # Obligation refreshes at one cutoff share its batch; two different
+        # batches at the same cutoff cannot be told apart.
+        return next(iter(batches)) if len(batches) == 1 else None
     result: dict[int, FreezeBoundary] = {}
     for row in rows:
         if row.run_id is None:
@@ -416,18 +446,25 @@ def freeze_baselines_by_reservation(
             raise CurrentReplenishmentError(
                 f"reservation {int(row.id)} lacks exact frozen pool baseline"
             )
+        source = "baseline"
         batch_id = (
             int(found.physical_import_batch_id)
-            if found.physical_import_batch_id is not None
-            else generation_batch_by_run.get(int(row.run_id))
+            if found.physical_import_batch_id is not None else None
         )
         if batch_id is None:
+            source = "run_generation"
+            batch_id = generation_batch_by_run.get(int(row.run_id))
+        if batch_id is None:
+            source = "run_cutoff"
+            batch_id = _batch_accepted_at(cutoff_by_run.get(int(row.run_id)))
+        if batch_id is None:
             raise CurrentReplenishmentError(
-                f"reservation {int(row.id)} has no as-known freeze boundary: neither "
-                "its baseline nor its freeze generation names a physical batch"
+                f"reservation {int(row.id)} of run {int(row.run_id)} has no as-known "
+                "freeze boundary: neither its baseline, nor its freeze generation, "
+                "nor a generation accepted at its ledger cutoff names a physical batch"
             )
         result[int(row.id)] = FreezeBoundary(
-            batch_id=int(batch_id), baseline_at=found.baseline_at,
+            batch_id=int(batch_id), baseline_at=found.baseline_at, source=source,
         )
     return result
 
@@ -1255,11 +1292,12 @@ def apply_current_replenishment(
     # the fact is the owner's frozen stock.  That is not a silent wipe, so the
     # writer names the reason itself; an allocation whose fact vanished, or
     # whose owner has no boundary, is not explained and stays guarded.
-    known_batch = {
-        str(int(row.sle_id)): getattr(row, "ingest_batch_id", None) for row in receipt_facts
+    known_fact = {
+        str(int(row.sle_id)): (getattr(row, "first_known_batch_id", None), row.posting_at)
+        for row in receipt_facts
     }
-    known_batch.update({
-        str(row.fact_id): row.known_batch_id
+    known_fact.update({
+        str(row.fact_id): (row.known_batch_id, row.posting_at)
         for row in fact_rows
         if row.known_batch_id is not None
     })
@@ -1269,10 +1307,10 @@ def apply_current_replenishment(
             (row for row in reserve_rows_for_plan if str(row.reserve_id) == str(old.reserve_id)),
             None,
         )
-        batch = known_batch.get(str(old.fact_id))
+        batch, posting_at = known_fact.get(str(old.fact_id), (None, None))
         if reserve is None or reserve.known_batch_id is None or batch is None:
             return False
-        return known_at_freeze(batch, reserve.known_batch_id)
+        return known_at_freeze(batch, posting_at, reserve.known_batch_id, reserve.baseline_at)
 
     baseline_dropped = {
         (str(old.fact_id), str(old.reserve_id))
@@ -1580,6 +1618,7 @@ def apply_current_receipt_replay(
             replenishment_required_qty=pure.reserved_qty,
             replenishment_received_qty=Decimal("0"),
             known_batch_id=getattr(pure, "known_batch_id", None),
+            baseline_at=getattr(pure, "baseline_at", None),
         )
     reservations_by_item: dict[int, tuple[object, ...]] = {}
     for row in replay_reservations.values():
@@ -1620,7 +1659,7 @@ def apply_current_receipt_replay(
             qty=_decimal(row.signed_qty),
             posting_at=row.posting_at,
             planning_stock_pool=_text(row.planning_stock_pool),
-            known_batch_id=getattr(row, "ingest_batch_id", None),
+            known_batch_id=getattr(row, "first_known_batch_id", None),
         )
         for row in rows
         if _decimal(row.signed_qty) > 0
@@ -1948,6 +1987,11 @@ def apply_current_replenishment_for_accepted_generation(
     }
     exact_caps = {key: value for key, value in exact_caps.items() if key in exact_keys}
     typed_facts: list[ReceiptFact] = []
+    from .physical_visibility import first_known_batch_by_sle
+
+    first_known = first_known_batch_by_sle(
+        db, [visible.get(int(row.stock_ledger_entry_id)) for row in provenance],
+    )
     for row in provenance:
         sle = visible.get(int(row.stock_ledger_entry_id))
         if sle is None or _decimal(sle.qty) == 0:
@@ -1959,7 +2003,7 @@ def apply_current_replenishment_for_accepted_generation(
                 signed_qty=_decimal(sle.qty),
                 posting_at=sle.posting_at,
                 known_at=getattr(sle, "known_at", None) or getattr(sle, "created_at", None),
-                ingest_batch_id=getattr(sle, "ingest_batch_id", None),
+                first_known_batch_id=first_known.get(int(sle.id)),
                 supplier_order_ref=_text(row.supplier_order_ref),
                 supplier_order_line_no=_text(row.supplier_order_line_no),
                 receipt_ref=_text(row.receipt_doc_ref),
@@ -2152,6 +2196,9 @@ def apply_current_replenishment_for_bounded_make_scopes(
     facts_by_scope: dict[DistributionScope, list[Fact]] = {
         scope: [] for scope in scopes
     }
+    from .physical_visibility import first_known_batch_by_sle
+
+    make_first_known = first_known_batch_by_sle(db, rows)
     for row in rows:
         if _decimal(row.qty) <= 0:
             raise CurrentReplenishmentError(
@@ -2184,7 +2231,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 mode="make",
                 qty=_decimal(row.qty),
                 posting_at=row.posting_at,
-                known_batch_id=getattr(row, "ingest_batch_id", None),
+                known_batch_id=make_first_known.get(int(row.id)),
                 characteristic_ref=scope[1],
                 # Attribution keys come from the scope, exactly as the BUY
                 # path takes its pool from the scope: the distribution scope
@@ -2620,6 +2667,9 @@ def _bounded_current_buy_basis_facts(
         .filter(models.StockLedgerEntry.id.in_(sle_ids))
         .all()
     }
+    from .physical_visibility import first_known_batch_by_sle
+
+    basis_first_known = first_known_batch_by_sle(db, list(sles.values()))
     provenance_rows = (
         db.query(models.StockLedgerSupplierReceiptProvenance)
         .filter(
@@ -2674,7 +2724,7 @@ def _bounded_current_buy_basis_facts(
                 sle_id=sle_id,
                 posting_at=sle.posting_at,
                 known_at=getattr(sle, "known_at", None),
-                ingest_batch_id=getattr(sle, "ingest_batch_id", None),
+                first_known_batch_id=basis_first_known.get(int(sle_id)),
                 signed_qty=_decimal(sle.qty),
                 item_id=int(sle.item_id),
                 supplier_order_ref=_text(evidence.supplier_order_ref),

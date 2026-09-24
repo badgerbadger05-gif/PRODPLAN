@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -173,6 +173,82 @@ def _is_drift(version: str | None, ref: str, hash_by_ref: dict[str, str]) -> boo
     return current is not None and (version is None or str(version) != current)
 
 
+def _needed_now_refs(roots: set[int], resolver: BomSpecificationResolver) -> set[str]:
+    """Specs the current expansion of these remaining roots selects."""
+    if not roots:
+        return set()
+    return {
+        ref
+        for spec_ids in resolver.spec_ids_by_root(roots).values()
+        for ref in (resolver.spec_ref(spec_id) for spec_id in spec_ids)
+        if ref
+    }
+
+
+def reset_rebase_run_failures(
+    db: Session,
+    *,
+    run_ids: Iterable[int] | None = None,
+    spec_refs: Iterable[str] | None = None,
+    reason: str,
+) -> dict[str, Any]:
+    """Give failing runs a fresh start (the counter of ``MAX_REBASE_ATTEMPTS``).
+
+    Either named runs (the operator's reset) or every failing run whose
+    remaining roots need one of ``spec_refs`` under the current expansion (a
+    new specification revision may be exactly the fix).  The queue requests
+    parked as ``failed_max_attempts`` for a reset run become pending again.
+    The caller owns the transaction.
+    """
+    query = db.query(models.SpecificationRebaseRunState)
+    if run_ids is not None:
+        ids = sorted({int(value) for value in run_ids})
+        if not ids:
+            return {"reset_run_ids": [], "reopened_requests": 0, "reason": reason}
+        query = query.filter(models.SpecificationRebaseRunState.run_id.in_(ids))
+    states = query.all()
+    if spec_refs is not None:
+        refs = {str(value).strip() for value in spec_refs if str(value or "").strip()}
+        resolver = BomSpecificationResolver(db)
+        selected = []
+        for state in states:
+            run = db.get(models.PlanningRun, int(state.run_id))
+            if run is None:
+                continue
+            try:
+                needed = _needed_now_refs(_remaining_production_roots(db, run), resolver)
+            except (BomSpecificationResolutionError, ValueError):
+                # An unresolvable expansion is exactly what a new revision may
+                # fix; do not keep the run parked because of it.
+                needed = set(refs)
+            if needed & refs:
+                selected.append(state)
+        states = selected
+    reset_ids = sorted(int(state.run_id) for state in states)
+    for state in states:
+        db.delete(state)
+    reopened = 0
+    if reset_ids:
+        reset = set(reset_ids)
+        for request in db.query(models.SpecificationRebaseQueue).filter(
+            models.SpecificationRebaseQueue.status == "failed"
+        ):
+            result = dict(request.result or {})
+            if result.get("status") != "failed_max_attempts":
+                continue
+            named = {int(value) for value in (result.get("run_ids") or [])}
+            if result.get("run_id") is not None:
+                named.add(int(result["run_id"]))
+            if not named & reset:
+                continue
+            request.status = "pending"
+            request.last_error = None
+            request.result = {"status": "reopened", "reason": reason, "run_ids": sorted(named & reset)}
+            reopened += 1
+    db.flush()
+    return {"reset_run_ids": reset_ids, "reopened_requests": reopened, "reason": reason}
+
+
 def _rebase_refs(
     db: Session,
     run: models.PlanningRun,
@@ -196,12 +272,7 @@ def _rebase_refs(
     nodes = _frozen_nodes(db, run)
     try:
         roots = _remaining_production_roots(db, run)
-        needed_now = {
-            ref
-            for spec_ids in resolver.spec_ids_by_root(roots).values()
-            for ref in (resolver.spec_ref(spec_id) for spec_id in spec_ids)
-            if ref
-        } if roots else set()
+        needed_now = _needed_now_refs(roots, resolver)
     except (BomSpecificationResolutionError, ValueError):
         return tuple(sorted({
             ref for _root, ref, version in nodes if _is_drift(version, ref, hash_by_ref)

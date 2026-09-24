@@ -553,6 +553,34 @@ def discard_physical_refresh(
     }
 
 
+@router.post("/specification-rebase/runs/{run_id}/reset", response_model=dict)
+def reset_specification_rebase_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Reset one run's consecutive rebase failures so the worker retries it.
+
+    A run that failed ``MAX_REBASE_ATTEMPTS`` times in a row is skipped so it
+    cannot starve the queue; once the operator has fixed the cause, this puts
+    it back in line and reopens its parked queue requests.
+    """
+    from ..services.specification_rebase_worker import reset_rebase_run_failures
+
+    try:
+        result = reset_rebase_run_failures(
+            db, run_ids=[int(run_id)], reason="operator_reset",
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if not result["reset_run_ids"]:
+        raise HTTPException(
+            status_code=404, detail=f"run {int(run_id)} has no recorded rebase failures",
+        )
+    return result
+
+
 @router.post("/generations/invalidate", response_model=TruthLifecycleResponse)
 def invalidate_generation(
     payload: GenerationInvalidateRequest,

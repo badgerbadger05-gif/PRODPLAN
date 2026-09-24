@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -151,10 +151,11 @@ class ReceiptFact:
     # evidence metadata, not allocation input: two facts that allocate the
     # same way are equal whether or not one was re-read from persisted rows.
     supplier_order_type: str = field(default="", compare=False)
-    # Decision §51: the physical import batch that made the fact known - the
-    # as-known axis of the freeze boundary.  Provenance, not allocation
-    # identity, so it does not take part in equality.
-    ingest_batch_id: int | None = field(default=None, compare=False)
+    # Decisions §51/§53: the batch in which the fact's document line was first
+    # imported (earliest batch of its ``business_identity``) - the as-known
+    # axis of the freeze boundary.  Provenance, not allocation identity, so it
+    # does not take part in equality.
+    first_known_batch_id: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -526,20 +527,35 @@ def _validate_operations(rows: tuple[SupplierDocumentEvidence, ...]) -> None:
             )
 
 
+def _receipt_known_at_freeze(
+    fact: "ReceiptFact",
+    entry: Any,
+    boundaries: Mapping[int, Any] | None,
+) -> bool:
+    if boundaries is not None:
+        boundary = boundaries.get(int(_entry_key(entry)))
+        batch = getattr(boundary, "batch_id", None)
+        instant = getattr(boundary, "baseline_at", None)
+    else:
+        batch = getattr(entry, "known_batch_id", None)
+        instant = getattr(entry, "baseline_at", None)
+    return known_at_freeze(fact.first_known_batch_id, fact.posting_at, batch, instant)
+
+
 def allocate_supplier_receipts(
     facts: Iterable[ReceiptFact],
     reservations_by_item: dict[int, Iterable[models.ReservationEntry]],
     *,
     exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
     history_mode: HistoryMode = "as_occurred",
-    freeze_batch_by_reservation: Mapping[int, int] | None = None,
+    freeze_boundary_by_reservation: Mapping[int, Any] | None = None,
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
 
-    ``freeze_batch_by_reservation`` is each owner's freeze boundary on the
-    as-known axis (§49/§51); without it a reservation's own
-    ``known_batch_id`` attribute is used (the R4 replay passes pure owners
-    that carry it).
+    ``freeze_boundary_by_reservation`` maps each owner to its freeze boundary
+    (``batch_id``/``baseline_at``, §49/§51/§53); without it a reservation's
+    own ``known_batch_id``/``baseline_at`` attributes are used (the R4 replay
+    passes pure owners that carry them).
 
     Positive supplier receipts fill exact supplier-order-line matches first inside
     their export allocation cap, then FIFO by item. Returns unwind the same
@@ -593,11 +609,8 @@ def allocate_supplier_receipts(
                 == _text(fact.planning_stock_pool)
                 # Decisions §49/§51: a receipt known when the owner was frozen
                 # is its frozen stock, never its replenishment.
-                and not known_at_freeze(
-                    fact.ingest_batch_id,
-                    freeze_batch_by_reservation.get(int(_entry_key(entry)))
-                    if freeze_batch_by_reservation is not None
-                    else getattr(entry, "known_batch_id", None),
+                and not _receipt_known_at_freeze(
+                    fact, entry, freeze_boundary_by_reservation,
                 )
             )
 
@@ -913,6 +926,9 @@ def normalize_supplier_receipt_evidence(
             )
         evidence_by_identity[identity] = row
 
+    from .physical_visibility import first_known_batch_by_sle
+
+    first_known = first_known_batch_by_sle(db, sle_rows)
     normalized: list[NormalizedSupplierReceiptFact] = []
     for identity, row in sorted(evidence_by_identity.items()):
         operation = _operation_prefix(row)
@@ -974,7 +990,7 @@ def normalize_supplier_receipt_evidence(
                 fact=ReceiptFact(
                     sle_id=int(sle.id),
                     posting_at=sle.posting_at,
-                    ingest_batch_id=getattr(sle, "ingest_batch_id", None),
+                    first_known_batch_id=first_known.get(int(sle.id)),
                     signed_qty=_decimal(sle.qty),
                     item_id=int(row.item_id),
                     supplier_order_ref=supplier_order_ref,
@@ -1154,13 +1170,10 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         facts,
         reservations_by_item,
         exact_allocation_caps=exact_caps,
-        freeze_batch_by_reservation={
-            reservation_id: boundary.batch_id
-            for reservation_id, boundary in freeze_baselines_by_reservation(
-                db,
-                [entry for entries in reservations_by_item.values() for entry in entries],
-            ).items()
-        },
+        freeze_boundary_by_reservation=freeze_baselines_by_reservation(
+            db,
+            [entry for entries in reservations_by_item.values() for entry in entries],
+        ),
     )
     realized_keys: set[tuple[int, int]] = set()
     folded_reservations: set[int] = set()

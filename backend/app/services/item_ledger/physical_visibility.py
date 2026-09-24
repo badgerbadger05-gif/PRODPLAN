@@ -7,7 +7,7 @@ Visibility is defined by the import-batch boundary, never by the mutable
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import exists
+from sqlalchemy import exists, func
 from sqlalchemy.orm import Query, Session
 
 from app import models
@@ -85,6 +85,45 @@ def visible_sle_query(
         models.StockLedgerEntry.posting_at.asc(),
         models.StockLedgerEntry.id.asc(),
     )
+
+
+def first_known_batch_by_sle(
+    db: Session, rows: Any
+) -> dict[int, int]:
+    """The batch in which each fact's document line first became known (§53).
+
+    A document re-posted in 1C is imported again as new SLE revisions in a
+    new batch, but its stable ``business_identity`` is kept across
+    revisions.  The Ledger knew the fact from the first import of that
+    identity, so that is the batch the freeze boundary judges - a re-post
+    after the freeze does not turn frozen stock into replenishment.  One
+    grouped query per chunk of identities; a row without an identity is
+    known from its own batch.
+    """
+    facts = [row for row in rows if row is not None]
+    identities = sorted({
+        str(row.business_identity)
+        for row in facts
+        if str(getattr(row, "business_identity", "") or "").strip()
+    })
+    first_by_identity: dict[str, int] = {}
+    for offset in range(0, len(identities), 1000):
+        chunk = identities[offset:offset + 1000]
+        for identity, batch_id in (
+            db.query(
+                models.StockLedgerEntry.business_identity,
+                func.min(models.StockLedgerEntry.ingest_batch_id),
+            )
+            .filter(models.StockLedgerEntry.business_identity.in_(chunk))
+            .group_by(models.StockLedgerEntry.business_identity)
+        ):
+            first_by_identity[str(identity)] = int(batch_id)
+    result: dict[int, int] = {}
+    for row in facts:
+        own = int(row.ingest_batch_id)
+        identity = str(getattr(row, "business_identity", "") or "").strip()
+        result[int(row.id)] = min(own, first_by_identity.get(identity, own))
+    return result
 
 
 def visible_sles(

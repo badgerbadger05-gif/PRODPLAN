@@ -148,6 +148,13 @@ def record_specification_revisions(
             changed_refs.append(str(spec.spec_ref1c or ""))
     db.flush()
     if changed_refs:
+        # A new revision of a spec a parked run's remainder needs may be the
+        # fix for that run's failing rebase: give it a fresh counter.
+        from .specification_rebase_worker import reset_rebase_run_failures
+
+        reset_rebase_run_failures(
+            db, spec_refs=changed_refs, reason="specification_revision",
+        )
         import hashlib
 
         from .item_ledger.current_execution import invalidate_current_execution_scope

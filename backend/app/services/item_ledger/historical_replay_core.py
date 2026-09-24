@@ -30,7 +30,8 @@ class Fact:
     requirement_id: Optional[int] = None
     order_ref: Optional[str] = None
     is_reversal: bool = False
-    # Decision §51: the physical import batch that made the fact known.
+    # Decisions §51/§53: the batch in which the fact's document line was
+    # first imported (earliest batch of its ``business_identity``).
     known_batch_id: Optional[int] = None
 
 
@@ -51,24 +52,37 @@ class Reserve:
     organization_ref: str = ""
     planning_stock_pool: str = "selected"
     order_refs: Tuple[str, ...] = ()
-    # Decisions §49/§51: the physical import batch the owner's frozen stock
-    # was read at (``MrpFreezeBaseline.physical_import_batch_id``).  A fact
-    # known by then is already in ``covered_from_stock_at_freeze`` and can
-    # never replenish this owner.  ``None`` = no recorded freeze boundary.
+    # Decisions §49/§51/§53: the owner's freeze boundary - the physical
+    # import batch its frozen stock was read at and the instant it was read
+    # up to (``MrpFreezeBaseline``).  A fact visible at that boundary is in
+    # ``covered_from_stock_at_freeze`` and can never replenish this owner.
+    # ``None`` batch = no recorded freeze boundary.
     known_batch_id: Optional[int] = None
-    # The freeze cutoff instant, for display only; the boundary is the batch.
     baseline_at: Optional[datetime] = None
 
 
-def known_at_freeze(fact_batch_id: Optional[int], freeze_batch_id: Optional[int]) -> bool:
-    """Whether a fact was known to the Ledger when the owner was frozen (§51).
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
-    The one boundary rule for every replenishment allocator, on the as-known
-    axis: a fact imported by the batch the frozen stock was read at is that
-    stock; a fact imported later replenishes the owner whatever its document
-    date - a backdated document included.  Without a freeze boundary nothing
-    is stock.  A fact whose import batch is unknown cannot be judged against
-    a boundary and fails closed.
+
+def known_at_freeze(
+    fact_batch_id: Optional[int],
+    fact_posting_at: Optional[datetime],
+    freeze_batch_id: Optional[int],
+    freeze_baseline_at: Optional[datetime],
+) -> bool:
+    """Whether a fact is in the owner's frozen stock (§49, §51, §53).
+
+    Exactly the visibility condition the frozen basis was read with
+    (``physical_visibility.visible_sle_query``): the fact's document line was
+    first imported no later than the freeze batch, AND its document date is
+    not later than the freeze instant.  Anything else replenishes the owner -
+    a backdated document imported after the freeze, or a receipt dated inside
+    the plan period that an owner frozen at the period start never counted as
+    stock.  Without a freeze boundary nothing is stock.  A fact whose import
+    batch is unknown cannot be judged and fails closed.
     """
     if freeze_batch_id is None:
         return False
@@ -77,7 +91,11 @@ def known_at_freeze(fact_batch_id: Optional[int], freeze_batch_id: Optional[int]
             "fact has no physical import batch; it cannot be judged against a "
             "freeze boundary"
         )
-    return int(fact_batch_id) <= int(freeze_batch_id)
+    if int(fact_batch_id) > int(freeze_batch_id):
+        return False
+    if freeze_baseline_at is None or fact_posting_at is None:
+        return True
+    return _utc(fact_posting_at) <= _utc(freeze_baseline_at)
 
 
 @dataclass(frozen=True)
@@ -246,7 +264,10 @@ def allocate_historical_facts(
             reserve
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
-            and not known_at_freeze(fact.known_batch_id, reserve.known_batch_id)
+            and not known_at_freeze(
+                fact.known_batch_id, fact.posting_at,
+                reserve.known_batch_id, reserve.baseline_at,
+            )
         ]
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
         # One requirement may legitimately have several dated reserve slices.

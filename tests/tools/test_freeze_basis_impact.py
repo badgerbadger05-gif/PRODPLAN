@@ -119,6 +119,7 @@ def test_the_impact_report_lists_what_the_freeze_baseline_will_retire(tmp_path):
     assert row == {
         "run_id": run_id, "item_id": row["item_id"], "reservation_id": owner_id,
         "baseline_at": row["baseline_at"], "freeze_batch_id": row["freeze_batch_id"],
+        "boundary_source": "baseline", "revised_after_freeze_identities": 0,
         "allocations_to_retire": 1, "qty_to_retire": "2.000",
         "replenishment_required_qty": "5.000",
         "received_before": "2.000", "received_after": "0.000",
@@ -127,6 +128,13 @@ def test_the_impact_report_lists_what_the_freeze_baseline_will_retire(tmp_path):
         "frozen_stock_qty": "7.000", "frozen_received_total": "0.000",
         "status": "ok",
     }
+    assert report["revised_after_freeze_identities"] == 0
+    # The retired 2 go back to FIFO; the other live owner of the item still
+    # needs 3 (required 5, received 2), so all 2 can land there.
+    assert report["increases"] == [{
+        "item_id": row["item_id"], "released_qty": "2.000",
+        "other_owners_outstanding": "3.000", "estimated_reallocated_qty": "2.000",
+    }]
     assert report["runs"] == [{
         "run_id": run_id, "owners": 1, "allocations_to_retire": 1,
         "qty_to_retire": "2.000", "outstanding_delta": "2.000",
