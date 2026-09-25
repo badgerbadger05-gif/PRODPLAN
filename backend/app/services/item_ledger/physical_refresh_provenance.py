@@ -475,13 +475,32 @@ def handoff_current_physical_refresh_provenance(
     *,
     parent_generation_id: int,
     target_generation_id: int,
+    include_future_supply: bool = True,
 ) -> CompactProvenanceHandoffResult:
-    """Handoff both compact owners in one caller-owned transaction."""
+    """Handoff both compact owners in one caller-owned transaction.
 
-    future = handoff_current_future_supply_provenance(
-        db,
-        parent_generation_id=int(parent_generation_id),
-        target_generation_id=int(target_generation_id),
+    ``include_future_supply=False`` is for a publisher which captured its own
+    supplier contour for this target: that generation publishes the compact
+    future-supply owner from its own capture, so rebinding the parent's rows
+    as technical provenance would be a second writer of the same owner.
+    """
+
+    future = (
+        handoff_current_future_supply_provenance(
+            db,
+            parent_generation_id=int(parent_generation_id),
+            target_generation_id=int(target_generation_id),
+        )
+        if include_future_supply
+        else CompactProvenanceHandoffResult(
+            parent_generation_id=int(parent_generation_id),
+            target_generation_id=int(target_generation_id),
+            future_supply_rows=0,
+            custody_rows=0,
+            custody_event_watermark=0,
+            future_supply_idempotent=False,
+            custody_idempotent=False,
+        )
     )
     custody = handoff_current_material_custody_provenance(
         db,

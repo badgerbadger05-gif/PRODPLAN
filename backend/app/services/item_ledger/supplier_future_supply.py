@@ -14,9 +14,10 @@ or quantity evidence is retained as rejected evidence (open quantity zero).
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,8 +26,34 @@ from app import models
 from app.services.one_c_export_common import clean_ref1c
 from app.services.supplier_order_status import SupplyPhase, phase_for_state
 
-from .future_supply_capture import FutureSupplyEvidence, future_supply_evidence_hash
+from .future_supply_capture import (
+    FutureSupplyEvidence,
+    _future_supply_identity,
+    future_supply_evidence_hash,
+)
 from .physical_visibility import visible_sle_query
+
+_BUY_MODE = "buy"
+
+# Fields whose change makes a supplier line a different supply fact.  The
+# capture cutoff and the content hash are technical: they move on every tick
+# and must not make an unchanged mirror look like a new order (§25).
+_SUPPLY_BUSINESS_FIELDS = (
+    "item_id",
+    "characteristic_ref",
+    "organization_ref",
+    "planning_stock_pool",
+    "destination_warehouse_ref1c",
+    "source_ref",
+    "source_line_ref",
+    "source_local_id",
+    "ordered_qty_at_cutoff",
+    "realized_qty_at_cutoff",
+    "eta_date",
+    "source_state_key",
+    "evidence_status",
+    "reason",
+)
 
 
 def _text(value: object) -> str:
@@ -408,3 +435,121 @@ def supplier_future_supply_evidence(
         }
         result.append(_evidence(**values))
     return tuple(result)
+
+
+@dataclass(frozen=True)
+class SupplierFutureSupplyDelta:
+    """Fresh supplier evidence plus the BUY scopes its change touches.
+
+    ``evidence`` is the complete supplier contour at the target cutoff; the
+    caller persists it through the single canonical capture batch together
+    with the carried WIP evidence.  ``changed_scopes`` names only the item/pool
+    groups whose supplier facts actually differ from the accepted current
+    owner, so a tick that merely re-read an unchanged 1C mirror stays a no-op
+    (decision §25: a repeated synchronization without business-field changes
+    does not change evidence).
+    """
+
+    evidence: tuple[FutureSupplyEvidence, ...]
+    changed_scopes: tuple[tuple[int, str, str, str, str], ...]
+    changed_identities: tuple[str, ...]
+
+
+def _business_payload(row: Any) -> tuple[str, ...]:
+    """Canonical comparison payload shared by evidence and current rows."""
+    values: list[str] = []
+    for field in _SUPPLY_BUSINESS_FIELDS:
+        value = getattr(row, field, None)
+        if field.endswith("_qty_at_cutoff"):
+            values.append(str(_qty(value).normalize()))
+        elif field == "eta_date":
+            date_value = _date(value)
+            values.append(date_value.isoformat() if date_value else "")
+        elif field == "item_id":
+            values.append("" if value is None else str(int(value)))
+        else:
+            values.append(_text(value))
+    return tuple(values)
+
+
+def _scope(row: Any) -> tuple[int, str, str, str, str] | None:
+    item_id = getattr(row, "item_id", None)
+    pool = _text(getattr(row, "planning_stock_pool", ""))
+    if item_id is None or not pool:
+        return None
+    return (
+        int(item_id),
+        _text(getattr(row, "characteristic_ref", "")),
+        _text(getattr(row, "organization_ref", "")),
+        pool,
+        _BUY_MODE,
+    )
+
+
+def supplier_future_supply_delta(
+    db: Session,
+    target_generation_id: int,
+    *,
+    planning_pool_by_warehouse: Mapping[str, str] | None = None,
+) -> SupplierFutureSupplyDelta:
+    """Qualify the live supplier mirror against the accepted current owner.
+
+    ``supplier_future_supply_evidence`` stays the only qualification engine;
+    this boundary adds nothing to it but the comparison which tells the
+    physical refresh whether the supplier contour actually moved.  Supplier
+    orders are mutable source documents, so a bounded refresh which only
+    rebinds provenance keeps serving the qualification of an old cutoff:
+    newly ordered goods stay invisible and a completed order stays open.
+    """
+
+    evidence = supplier_future_supply_evidence(
+        db,
+        int(target_generation_id),
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    )
+    fresh: dict[str, FutureSupplyEvidence] = {}
+    for row in evidence:
+        if _text(row.evidence_status) != "exact":
+            continue
+        identity = _future_supply_identity(
+            supply_kind=_text(row.supply_kind),
+            source_ref=row.source_ref,
+            source_line_ref=row.source_line_ref,
+            source_local_id=row.source_local_id,
+            source_content_hash=_text(row.source_content_hash),
+            evidence_status=_text(row.evidence_status),
+        )
+        fresh[identity] = row
+    current = {
+        _text(row.current_identity): row
+        for row in db.query(models.LedgerFutureSupplyCurrent)
+        .filter(models.LedgerFutureSupplyCurrent.supply_kind == "supplier_order")
+        .all()
+    }
+
+    changed_identities: list[str] = []
+    scopes: set[tuple[int, str, str, str, str]] = set()
+    for identity, row in fresh.items():
+        previous = current.get(identity)
+        if previous is not None and _business_payload(previous) == _business_payload(row):
+            continue
+        changed_identities.append(identity)
+        scope = _scope(row)
+        if scope is not None:
+            scopes.add(scope)
+        if previous is not None:
+            previous_scope = _scope(previous)
+            if previous_scope is not None:
+                scopes.add(previous_scope)
+    for identity, row in current.items():
+        if identity in fresh:
+            continue
+        changed_identities.append(identity)
+        scope = _scope(row)
+        if scope is not None:
+            scopes.add(scope)
+    return SupplierFutureSupplyDelta(
+        evidence=tuple(evidence),
+        changed_scopes=tuple(sorted(scopes)),
+        changed_identities=tuple(sorted(changed_identities)),
+    )

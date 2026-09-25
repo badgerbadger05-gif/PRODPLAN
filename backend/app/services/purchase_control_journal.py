@@ -1,7 +1,7 @@
 """Read-only facade over the accepted current purchase-control projection."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -14,7 +14,14 @@ from .item_ledger.current_execution import (
     load_current_execution_rows,
     require_current_execution_scope,
 )
-from .purchase_control_projection import PurchaseJournalUnavailable, _unavailable
+from .purchase_control_projection import (
+    PurchaseJournalUnavailable,
+    _parse_date,
+    _period_label,
+    _unavailable,
+    apply_read_time_supply_status,
+    purchase_journal_today,
+)
 
 _EPS = 1e-9
 _BUY_ROW_GENERATOR = "mrp_reservation"
@@ -43,8 +50,14 @@ def purchase_journal_meta(scope: Any) -> Dict[str, Any]:
     return meta
 
 
-def _current_payload(db: Session) -> Dict[str, Any]:
-    """Read one coherent accepted current scope, including valid empty runs."""
+def _current_payload(db: Session, *, today: Optional[date] = None) -> Dict[str, Any]:
+    """Read one coherent accepted current scope, including valid empty runs.
+
+    Stored rows carry frozen facts; the two fields that are a comparison with
+    the calendar (``line_status`` overdue/expected and ``overdue_days``) are
+    evaluated for the serving day. A row reused unchanged by many bounded
+    refreshes would otherwise keep answering with the day it was built.
+    """
     try:
         scope = require_current_execution_scope(
             db,
@@ -61,7 +74,17 @@ def _current_payload(db: Session) -> Dict[str, Any]:
     summary = dict(scope.summary or {})
     meta = purchase_journal_meta(scope)
     public_rows = [dict(row.payload or {}) for row in rows]
+    apply_read_time_supply_status(public_rows, today=today)
     cards = summary.get("cards") if isinstance(summary.get("cards"), dict) else {}
+    cards = {
+        key: {
+            **dict(card),
+            "lines": [dict(line) for line in (card.get("lines") or [])],
+        }
+        for key, card in cards.items()
+    }
+    for card in cards.values():
+        apply_read_time_supply_status(card["lines"], today=today)
     return {"rows": public_rows, "cards": cards, "meta": meta}
 
 
@@ -104,22 +127,38 @@ def apply_materialization_action(rows: Sequence[Dict[str, Any]]) -> None:
         row["materialize_disabled_reason"] = disabled_reason
 
 
-def purchase_journal_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate the page totals from the rows the reader actually serves."""
+def purchase_journal_summary(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Aggregate the page totals from the rows the reader actually serves.
+
+    ``overdue`` and ``expected_7d`` are counted over the statuses this read
+    already evaluated for the serving day, so the two toolbar counters and the
+    rows under them can never disagree.
+    """
     by_status: Dict[str, int] = {}
     by_phase: Dict[str, int] = {}
+    evaluation_date = purchase_journal_today(today)
+    window_end = evaluation_date + timedelta(days=7)
+    expected_7d = 0
     for row in rows:
         status = str(row.get("line_status") or "unavailable")
         phase = str(row.get("supply_phase") or "unavailable")
         by_status[status] = by_status.get(status, 0) + 1
         by_phase[phase] = by_phase.get(phase, 0) + 1
+        if status in {"expected", "partial"}:
+            eta = _parse_date(row.get("delivery_date"))
+            if eta is not None and evaluation_date <= eta <= window_end:
+                expected_7d += 1
     return {
         "total_rows": len(rows),
         "by_status": by_status,
         "by_phase": by_phase,
         "to_order": by_status.get("to_order", 0),
         "overdue": by_status.get("overdue", 0),
-        "expected_7d": 0,
+        "expected_7d": expected_7d,
         "in_transit_amount": 0.0,
         "fact_status": "available",
     }
@@ -465,6 +504,6 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
 
 
 def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) -> Dict[str, Any]:
-    snapshot = _current_payload(db); card = (snapshot.get("cards") or {}).get(str(int(order_id)))
+    snapshot = _current_payload(db, today=today); card = (snapshot.get("cards") or {}).get(str(int(order_id)))
     if card is None: raise ValueError(f"Supplier order {order_id} not found in current purchase journal")
     return {**card, "meta": snapshot["meta"]}

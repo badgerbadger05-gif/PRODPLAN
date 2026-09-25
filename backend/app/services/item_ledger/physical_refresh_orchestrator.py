@@ -48,6 +48,7 @@ from .physical_refresh_import import (
     run_physical_recorder_audit,
 )
 from .r3_contract import business_identity_for_cutoff_balance_adjustment
+from .supplier_future_supply import supplier_future_supply_delta
 from .physical_refresh_generation import fork_physical_refresh_generation
 from .physical_refresh_discard import discard_physical_refresh_candidate
 from .output_repair_gate import assert_output_repair_allows
@@ -1124,7 +1125,20 @@ def run_physical_refresh(
                 target_cutoff=cutoff,
             )
         ))
-        if not input_delta_rows and not custody_source_sle_ids:
+        # Decision §25: a real change of the supply-relevant supplier-order
+        # fields is accepted only by a new physical generation.  A tick with no
+        # movement at all therefore still has to ask whether the 1C order
+        # contour moved before it discards its candidate; §57 extends freshness
+        # only when this refresh found no semantic delta of any kind.
+        movement_delta = bool(input_delta_rows) or bool(custody_source_sle_ids)
+        supplier_changed = movement_delta or bool(
+            supplier_future_supply_delta(
+                db,
+                int(physical_generation.id),
+                planning_pool_by_warehouse=pool_mapping,
+            ).changed_scopes
+        )
+        if not movement_delta and not supplier_changed:
             # Equivalent imports have no successor in R3.  Discard the
             # technical fork and keep the accepted pointer and every compact
             # current owner untouched; even a provenance-only UPDATE would
@@ -1278,6 +1292,7 @@ def run_physical_refresh(
                     "supersessions": tuple(delta["supersessions"]),
                     "backdate_from": backdate_from,
                     "custody_source_sle_ids": custody_source_sle_ids,
+                    "supplier_future_supply_changed": supplier_changed,
                 },
                 odata_client=client,
                 source_revision=int(physical_generation.physical_import_batch_id),

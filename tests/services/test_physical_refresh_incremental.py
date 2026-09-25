@@ -408,6 +408,9 @@ def _patch_payloads(monkeypatch, *, evidence=()):
         },
     )
     monkeypatch.setattr(publisher, "publish_generation", lambda db, target, **kw: None)
+    monkeypatch.setattr(
+        publisher, "publish_current_future_supply", lambda db, generation_id: {},
+    )
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: ())
     monkeypatch.setattr(
         evidence_adapter, "extract_supplier_document_evidence",

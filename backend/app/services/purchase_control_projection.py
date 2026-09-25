@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 import hashlib
 import math
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ REQUIRED = (
 _BUY_MODE = "buy"
 _BUY_ROW_PREFIX = "buy:"
 _BUY_ROW_GENERATOR = "mrp_reservation"
+_SUPPLIER_ROW_GENERATOR = "ledger_future_supply"
 _EPS_FLOAT = 1e-9
 
 _RU_MONTHS = {
@@ -199,6 +201,20 @@ def _period_label(period_to: Any) -> str | None:
     return f"{_RU_MONTHS[int(period_to.month)]} {int(period_to.year)}"
 
 
+def _parse_date(value: Any) -> date | None:
+    """Read one stored ISO business date back; an unusable value is no date."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
 def _clean_ref(value: Any) -> str:
     if value is None:
         return ""
@@ -278,6 +294,52 @@ def _supplier_line_status(
     if eta_date is None:
         return "no_date"
     return "expected"
+
+
+def purchase_journal_today(today: date | None = None) -> date:
+    """The business day a purchase-journal read is answered for.
+
+    Delivery dates are local business dates, so the wall clock is read in the
+    contour's own timezone; UTC turned the first three hours of a Moscow day
+    into the previous day and made a line look one day less overdue.
+    """
+    if today is not None:
+        return today
+    return datetime.now(ZoneInfo("Europe/Moscow")).date()
+
+
+def apply_read_time_supply_status(
+    rows: Iterable[dict[str, Any]],
+    *,
+    today: date | None = None,
+) -> None:
+    """Re-evaluate the time-dependent supplier fields for the serving day.
+
+    Quantities, ETA, state and phase are frozen facts of the accepted
+    generation and are never recomputed here.  ``line_status`` and
+    ``overdue_days`` are not facts: they are a comparison of the stored ETA
+    with the current day.  A current row survives many refreshes untouched
+    (bounded reuse), so evaluating them at build time froze "expected" on a
+    delivery date that has since passed and kept ``overdue_days`` at the value
+    of the generation which happened to last rebuild the row.  The formulas
+    stay the ones above - this is the same single owner, asked a different
+    date.
+    """
+    evaluation_date = purchase_journal_today(today)
+    for row in rows:
+        if row.get("row_generator") != _SUPPLIER_ROW_GENERATOR:
+            continue
+        eta_date = _parse_date(row.get("delivery_date"))
+        row["overdue_days"] = _overdue_days(
+            row.get("delivery_date"), evaluation_date
+        )
+        row["line_status"] = _supplier_line_status(
+            open_qty=_to_float(row.get("remaining_qty")),
+            realized_qty=_to_float(row.get("received_qty")),
+            eta_date=eta_date,
+            cutoff_date=evaluation_date,
+            supply_phase=str(row.get("supply_phase") or ""),
+        )
 
 
 def order_block_reason(
@@ -553,14 +615,19 @@ def _build_supplier_card_rows(
     *,
     affected_scopes: Sequence[tuple[int, str, str, str, str]] | None = None,
     cutoff_date: date | None = None,
+    future_supply_generation_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     effective_cutoff_date = cutoff_date or generation.cutoff.date()
-    future_supply = future_supply_model(db, int(generation.id))
+    supply_generation_id = int(
+        generation.id if future_supply_generation_id is None
+        else future_supply_generation_id
+    )
+    future_supply = future_supply_model(db, supply_generation_id)
     supply_query = (
         db.query(future_supply, models.Item)
         .join(models.Item, models.Item.item_id == future_supply.item_id)
         .filter(
-            future_supply.ledger_generation_id == generation.id,
+            future_supply.ledger_generation_id == supply_generation_id,
             future_supply.supply_kind == "supplier_order",
         )
     )
@@ -712,6 +779,7 @@ def _build_buyer_rows(
     *,
     entries_override: Sequence[tuple[Any, Any, Any]] | None = None,
     affected_scopes: Sequence[tuple[int, str, str, str, str]] | None = None,
+    future_supply_generation_id: int | None = None,
 ) -> list[dict[str, Any]]:
     configured_destination_warehouse_ref1c = _clean_ref(
         _load_odata_config().get("purchase_destination_warehouse_ref1c")
@@ -753,7 +821,13 @@ def _build_buyer_rows(
 
     open_covered_by_reservation, open_coverage_slices = (
         open_supplier_coverage_by_reservation(
-            db, int(generation_id), entries, affected_scopes=affected_scopes
+            db,
+            int(
+                generation_id if future_supply_generation_id is None
+                else future_supply_generation_id
+            ),
+            entries,
+            affected_scopes=affected_scopes,
         )
     )
 
@@ -1591,6 +1665,7 @@ def build_compact_current_purchase_control_payload(
     accepted_run_ids: Sequence[int],
     affected_scopes: Iterable[tuple[int, str, str, str, str]] | None = None,
     reuse_parent_current: bool = False,
+    future_supply_generation_id: int | None = None,
 ) -> dict[str, Any]:
     """Build purchase-control DTOs from current BUY owners and current supply.
 
@@ -1693,6 +1768,7 @@ def build_compact_current_purchase_control_payload(
             validate_compact_current_purchase_control_payload(payload, target)
             return payload
     scope_keys = set(scopes or ())
+    requested_scopes = tuple(scopes or ())
     requested_item_pools = {
         (int(scope[0]), _clean_ref(scope[3]))
         for scope in scopes or ()
@@ -1781,8 +1857,11 @@ def build_compact_current_purchase_control_payload(
                 else scope_keys
             )
         ]
-        if reuse_parent_current and recomputed_scope_set:
-            scopes = tuple(sorted(recomputed_scope_set))
+        if reuse_parent_current:
+            # Keep every requested scope, including one whose supplier line has
+            # no live BUY owner at all: its card row still has to be rebuilt,
+            # and dropping it here would leave the reused parent row in place.
+            scopes = tuple(sorted(recomputed_scope_set | set(requested_scopes)))
     items = {
         int(item.item_id): item
         for item in db.query(models.Item)
@@ -1827,6 +1906,10 @@ def build_compact_current_purchase_control_payload(
         )
         entries.append((synthetic_work, reservation, items[int(reservation.item_id)]))
 
+    supply_generation_id = int(
+        parent.id if future_supply_generation_id is None
+        else future_supply_generation_id
+    )
     to_order_by_period: list[dict[str, Any]] = []
     buyer_rows = _build_buyer_rows(
         db,
@@ -1835,6 +1918,7 @@ def build_compact_current_purchase_control_payload(
         cutoff_date=target.cutoff.date(),
         entries_override=entries,
         affected_scopes=scopes,
+        future_supply_generation_id=supply_generation_id,
     )
     buyer_rows = [
         _compact_purchase_row_without_work_item(
@@ -1847,6 +1931,7 @@ def build_compact_current_purchase_control_payload(
         parent,
         affected_scopes=scopes,
         cutoff_date=target.cutoff.date(),
+        future_supply_generation_id=supply_generation_id,
     )
     if reuse_parent_current:
         affected_item_pools = {

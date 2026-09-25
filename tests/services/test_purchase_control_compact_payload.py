@@ -271,7 +271,7 @@ def test_bounded_purchase_recomputes_only_affected_item_and_reuses_neighbor(
     original_cards = purchase_projection._build_supplier_card_rows
     seen: list[set[int]] = []
 
-    def bounded_only(db, generation_id, entries, *, affected_scopes=None):
+    def bounded_only(db, generation_id, entries, *, affected_scopes=None, **kwargs):
         seen.append({int(item.item_id) for _work, _reservation, item in entries})
         assert affected_scopes == (scope,)
         return original(
@@ -287,13 +287,14 @@ def test_bounded_purchase_recomputes_only_affected_item_and_reuses_neighbor(
         bounded_only,
     )
 
-    def bounded_cards(db, generation, *, affected_scopes=None, cutoff_date=None):
+    def bounded_cards(db, generation, *, affected_scopes=None, cutoff_date=None, **kwargs):
         assert affected_scopes == (scope,)
         return original_cards(
             db,
             generation,
             affected_scopes=affected_scopes,
             cutoff_date=cutoff_date,
+            **kwargs,
         )
 
     monkeypatch.setattr(

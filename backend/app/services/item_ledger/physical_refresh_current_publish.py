@@ -38,9 +38,19 @@ from app.services.item_ledger.current_replenishment import (
 from app.services.item_ledger.drum_schedule_persistence import (
     build_compact_current_drum_payload,
 )
+from app.services.item_ledger.future_supply_capture import (
+    FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+    FUTURE_SUPPLY_CAPTURE_STAGE,
+    carry_forward_future_supply_evidence,
+    publish_current_future_supply,
+    replace_future_supply_capture,
+)
 from app.services.item_ledger.physical_refresh_provenance import (
     apply_bounded_current_material_custody_events,
     handoff_current_physical_refresh_provenance,
+)
+from app.services.item_ledger.supplier_future_supply import (
+    supplier_future_supply_delta,
 )
 from app.services.item_ledger.physical_refresh_stock_bin import (
     BoundedPhysicalDeltaManifest,
@@ -757,6 +767,61 @@ def _mapped_supplier_rows(
     )
 
 
+def _capture_bounded_future_supply(
+    db: Session,
+    *,
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+    supplier_evidence: Sequence[Any],
+) -> int:
+    """Stage the complete future-supply contour of the publishing generation.
+
+    A physical generation is the canonical point at which mutable supplier
+    documents become immutable evidence (decision §25).  WIP is carried from
+    the accepted parent, supplier lines are the freshly qualified mirror, and
+    both kinds are replaced in the one mandatory capture batch - replacing per
+    kind would let the second call erase the first.
+    """
+
+    batch_key = f"future-supply-capture:g{int(target.id)}"
+    batch = db.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+        models.LedgerBuildBatch.stage == FUTURE_SUPPLY_CAPTURE_STAGE,
+        models.LedgerBuildBatch.batch_key == batch_key,
+    ).one_or_none()
+    if batch is None:
+        batch = models.LedgerBuildBatch(
+            ledger_generation_id=int(target.id),
+            stage=FUTURE_SUPPLY_CAPTURE_STAGE,
+            batch_key=batch_key,
+            status="building",
+            algorithm_version=FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION,
+            metrics={},
+        )
+        db.add(batch)
+        db.flush()
+    if str(batch.algorithm_version) != FUTURE_SUPPLY_CAPTURE_ALGORITHM_VERSION:
+        raise ForwardPhysicalRefreshUnavailable(
+            "physical future supply requires the canonical capture algorithm"
+        )
+    wip = carry_forward_future_supply_evidence(
+        db,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(target.id),
+        supply_kinds=("wip_order",),
+    )
+    metrics = replace_future_supply_capture(
+        db,
+        int(target.id),
+        int(batch.id),
+        (*wip, *tuple(supplier_evidence)),
+    )
+    batch.status = "completed"
+    batch.completed_at = datetime.now(timezone.utc)
+    db.flush()
+    return int(metrics.get("rows", 0) or 0)
+
+
 def _fixed_run_ids(db: Session) -> tuple[int, ...]:
     return tuple(int(value) for (value,) in db.query(models.PlanningRun.run_id).filter(
         models.PlanningRun.status == "FIXED_SNAPSHOT",
@@ -1001,7 +1066,14 @@ def _publish_forward_physical_refresh_current(
             + tuple(delta_manifest.get("custody_source_sle_ids") or ())
         )
     )
-    if not rows and not custody_source_ids:
+    # Supplier orders are mutable 1C documents whose supply-relevant fields are
+    # accepted only by a new physical generation (§25), so a tick which found
+    # no movement at all still has a reason to publish when the 1C order
+    # contour moved.  The orchestrator already answered that question to decide
+    # against discarding the candidate; the evidence itself is qualified below,
+    # after this refresh has written its own receipt provenance.
+    supplier_changed = bool(delta_manifest.get("supplier_future_supply_changed"))
+    if not rows and not custody_source_ids and not supplier_changed:
         raise ForwardPhysicalRefreshUnavailable(
             "empty physical delta is a no-op; discard the candidate without publication"
         )
@@ -1170,6 +1242,24 @@ def _publish_forward_physical_refresh_current(
     )
     phase("assembly_output")
 
+    # Qualify and seal the supplier contour after this refresh wrote its own
+    # receipt provenance: the realized quantity of an order line includes the
+    # receipts this very delta typed.
+    start_phase("future_supply")
+    supplier_delta = supplier_future_supply_delta(
+        db,
+        int(target.id),
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    )
+    supplier_scopes = tuple(supplier_delta.changed_scopes)
+    _capture_bounded_future_supply(
+        db,
+        parent=parent,
+        target=target,
+        supplier_evidence=supplier_delta.evidence,
+    )
+    phase("future_supply")
+
     start_phase("assembly_payload")
     assembly_payload = build_compact_current_assembly_payload(
         db,
@@ -1227,9 +1317,16 @@ def _publish_forward_physical_refresh_current(
         # The current writer requires a complete payload.  Reuse unchanged
         # parent rows/cards and recompute only the stable BUY scopes touched
         # by this physical delta; an empty set is a true current-manifest
-        # reuse and does not traverse purchase/custody history.
-        affected_scopes=buy_scopes,
+        # reuse and does not traverse purchase/custody history.  A supplier
+        # order changed in 1C moves no stock, so its scopes join the delta
+        # scopes - otherwise the reused row keeps hiding the new order and the
+        # demand is offered for purchase a second time.
+        affected_scopes=tuple(sorted(set(buy_scopes) | set(supplier_scopes))),
         reuse_parent_current=True,
+        # The supplier contour this generation just captured is its own
+        # BUILDING staging; the accepted current owner still describes the
+        # parent until the pointer moves at the end of this publication.
+        future_supply_generation_id=int(target.id),
     )
     if _phase_tracker is not None:
         _phase_tracker.complete("purchase_payload")
@@ -1253,10 +1350,15 @@ def _publish_forward_physical_refresh_current(
     )
 
     start_phase("provenance")
+    # Future supply is no longer rebound as technical provenance: this
+    # generation captured its own supplier contour above and publishes it as
+    # the current owner after the pointer switch.  Custody keeps the bounded
+    # provenance handoff.
     handoff_current_physical_refresh_provenance(
         db,
         parent_generation_id=int(parent.id),
         target_generation_id=int(target.id),
+        include_future_supply=False,
     )
     phase("provenance")
 
@@ -1399,6 +1501,11 @@ def _publish_forward_physical_refresh_current(
     # CAS pointer switch is deliberately the last business mutation.
     start_phase("pointer")
     publish_generation(db, target, expected_parent_id=int(parent.id))
+    # The compact current owner can only be promoted once the pointer names
+    # this generation.  It replaces the staging captured above in the same
+    # transaction, so a rollback restores both the previous current owner and
+    # the retryable staging.
+    publish_current_future_supply(db, int(target.id))
     phase("pointer")
     return PhysicalRefreshCurrentPublishResult(
         target_generation_id=int(target.id),

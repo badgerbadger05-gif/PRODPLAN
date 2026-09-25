@@ -122,6 +122,9 @@ def _patch_safe_pipeline(monkeypatch, phases):
         },
     )
     monkeypatch.setattr(publisher, "publish_generation", lambda db, target, **kw: phases.append("pointer"))
+    monkeypatch.setattr(
+        publisher, "publish_current_future_supply", lambda db, generation_id: {},
+    )
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: (1,))
 
 

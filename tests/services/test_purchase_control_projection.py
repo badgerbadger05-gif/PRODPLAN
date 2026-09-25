@@ -499,12 +499,15 @@ def test_filters_sort_pagination_and_summary_use_only_snapshot(db_session):
     )
 
     assert result["total"] == 2
+    # The fixture ETA is in the past, so the serving day answers ``overdue``:
+    # quantities and phase come from the stored row, the comparison with the
+    # calendar is made when the row is read.
     assert result["summary"] == {
         "total_rows": 2,
-        "by_status": {"partial": 2},
+        "by_status": {"overdue": 2},
         "by_phase": {"no_goods": 2},
         "to_order": 0,
-        "overdue": 0,
+        "overdue": 2,
         "expected_7d": 0,
         "in_transit_amount": 0.0,
         "fact_status": "available",
