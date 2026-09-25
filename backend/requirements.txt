@@ -1,7 +1,7 @@
 fastapi>=0.68.0
 # >=0.37: first release with --timeout-worker-healthcheck (backend/Dockerfile CMD).
 uvicorn[standard]>=0.37.0
-sqlalchemy>=1.4.0
+sqlalchemy>=2.0,<2.1
 psycopg2-binary>=2.9.0
 alembic>=1.7.0
 pydantic>=1.8.0
