@@ -1078,7 +1078,9 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(await screen.findByRole('checkbox', { name: /MRP-R-701/ }))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
 
-    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101], 'erp-shell', undefined))
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
+      [101], 'erp-shell', undefined, ['production:order:101'], 'rev-7',
+    ))
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
     expect(materializeMakeWorkItems).not.toHaveBeenCalled()
   })
