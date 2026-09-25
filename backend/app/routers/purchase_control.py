@@ -25,7 +25,10 @@ from ..services.purchase_control_journal import (
     purchase_journal_meta,
     purchase_journal_summary,
 )
-from ..services.purchase_control_projection import PurchaseJournalUnavailable
+from ..services.purchase_control_projection import (
+    PurchaseJournalUnavailable,
+    apply_read_time_supply_status,
+)
 from ..services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
     load_current_execution_rows,
@@ -225,6 +228,11 @@ def get_orders(
             # publication, so never expose it as the action revision.
             payload["source_revision"] = str(current_manifest.source_revision)
             rows.append(payload)
+        # The calendar-dependent supplier fields are a comparison with today,
+        # not a stored fact.  Evaluate them before anything filters, sorts or
+        # counts, so the ``line_status`` filter and the page summary answer for
+        # the day this page is served.
+        apply_read_time_supply_status(rows)
         if horizon_period_to is not None:
             from ..services.purchase_control_journal import _reconcile_buy_row_for_horizon
             rows = [
@@ -337,7 +345,10 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
             meta.pop("summary", None)
             meta.pop("cards", None)
             meta["current_execution_scope_id"] = int(manifest.id)
-            return {**dict(cards[str(int(order_id))]), "meta": meta}
+            card = dict(cards[str(int(order_id))])
+            card["lines"] = [dict(line) for line in (card.get("lines") or [])]
+            apply_read_time_supply_status(card["lines"])
+            return {**card, "meta": meta}
         raise ValueError(f"Supplier order {order_id} card is not published in current purchase journal")
     except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())

@@ -278,3 +278,74 @@ def test_current_path_is_a_superset_of_the_canonical_reader_contract(db_session)
         assert set(expected) <= set(row)
         assert row["can_materialize"] == expected["can_materialize"]
         assert row["materialize_disabled_reason"] == expected["materialize_disabled_reason"]
+
+
+def _ledger_supply_row(
+    key="ledger-supply:supplier_order:REF:1:supplier_order_item:9",
+    *,
+    delivery_date,
+    line_status="expected",
+    overdue_days=0,
+):
+    """A supplier row exactly as the current publisher persists it."""
+    return {
+        "row_generator": "ledger_future_supply",
+        "row_key": key,
+        "line_status": line_status,
+        "overdue_days": overdue_days,
+        "supply_phase": "in_transit",
+        "quantity": 5.0,
+        "received_qty": 0.0,
+        "remaining_qty": 5.0,
+        "delivery_date": delivery_date,
+        "order_id": 77,
+        "order_number": "ЗСНФ-001727",
+        "order_ref1c": "REF",
+        "order_state_name": "Заказан (товар в пути)",
+        "item_code": "ITEM-1",
+        "supplier_id": 3,
+        "supplier_name": "ООО Поставщик",
+        "fact_status": "available",
+        "fact_source": "ledger",
+    }
+
+
+def test_current_path_evaluates_the_calendar_status_for_the_serving_day(monkeypatch):
+    """The served endpoint, not only the reader facade, answers for today.
+
+    A current row survives many bounded refreshes untouched, so a stored
+    ``expected`` with a delivery date that has since passed would otherwise
+    keep the line out of the ``overdue`` filter and out of the page total.
+    """
+    from datetime import date, timedelta
+
+    passed = date.today() - timedelta(days=8)
+    manifest = _manifest(_build_time_envelope())
+    monkeypatch.setattr(
+        current_execution, "require_current_execution_scope", lambda *a, **k: manifest
+    )
+    monkeypatch.setattr(
+        current_execution,
+        "load_current_execution_rows",
+        lambda *a, **k: _current_rows(
+            _ledger_supply_row(delivery_date=passed.isoformat())
+        ),
+    )
+
+    result = get_orders(db=object(), horizon_period_to=None, limit=100, offset=0)
+
+    assert [row["line_status"] for row in result["rows"]] == ["overdue"]
+    assert [row["overdue_days"] for row in result["rows"]] == [8]
+    assert result["summary"]["by_status"] == {"overdue": 1}
+    assert result["summary"]["overdue"] == 1
+
+    filtered = get_orders(
+        db=object(), horizon_period_to=None, line_status="overdue",
+        limit=100, offset=0,
+    )
+    assert filtered["total"] == 1
+    stale_filter = get_orders(
+        db=object(), horizon_period_to=None, line_status="expected",
+        limit=100, offset=0,
+    )
+    assert stale_filter["total"] == 0

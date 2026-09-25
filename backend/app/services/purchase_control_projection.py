@@ -643,6 +643,31 @@ def _build_supplier_card_rows(
         ))) if affected_scopes else supply_query.filter(future_supply.id < 0)
     supplies = supply_query.all()
 
+    # The whole contour is rebuilt on every publishing tick, so resolve the 1C
+    # order headers once instead of per supply row.
+    source_refs = sorted({
+        ref for supply, _item in supplies
+        if (ref := _clean_ref(supply.source_ref))
+    })
+    orders_by_ref: dict[str, models.SupplierOrder] = {}
+    if source_refs:
+        for order in (
+            db.query(models.SupplierOrder)
+            .filter(models.SupplierOrder.order_ref1c.in_(source_refs))
+            .all()
+        ):
+            orders_by_ref[_clean_ref(order.order_ref1c)] = order
+    suppliers_by_id = {
+        int(supplier.supplier_id): supplier
+        for supplier in db.query(models.Supplier)
+        .filter(models.Supplier.supplier_id.in_(sorted({
+            int(order.supplier_id)
+            for order in orders_by_ref.values()
+            if order.supplier_id is not None
+        })))
+        .all()
+    } if orders_by_ref else {}
+
     cards: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     seen_source_lines: set[tuple[str, str]] = set()
@@ -673,9 +698,9 @@ def _build_supplier_card_rows(
         if not str(item.item_code or "").strip():
             raise ValueError("LedgerFutureSupply supplier-order item has no code")
 
-        order = db.query(models.SupplierOrder).filter(models.SupplierOrder.order_ref1c == source_ref).one_or_none()
+        order = orders_by_ref.get(source_ref)
         supplier = (
-            db.get(models.Supplier, order.supplier_id)
+            suppliers_by_id.get(int(order.supplier_id))
             if order is not None and order.supplier_id is not None
             else None
         )
@@ -1726,8 +1751,11 @@ def build_compact_current_purchase_control_payload(
             parent_cards = {}
         # A stock-only physical delta has no BUY scope.  Preserve the accepted
         # complete purchase payload without touching ReservationEvent,
-        # custody, or future-supply history.
-        elif not scopes:
+        # custody, or future-supply history.  A generation which recaptured the
+        # supplier contour is never a pure reuse: its supplier rows are rebuilt
+        # from that capture below, which is also what supersedes rows published
+        # under an older row identity.
+        elif not scopes and future_supply_generation_id is None:
             rows = list(parent_rows)
             rows.sort(
                 key=lambda row: (
@@ -1926,10 +1954,19 @@ def build_compact_current_purchase_control_payload(
         )
         for row in buyer_rows
     ]
+    # A generation which captured its own supplier contour owns the complete
+    # supplier side of the journal: every open 1C order line is in that
+    # capture and nothing else is.  Rebuilding it whole is the only way the
+    # closed order leaves the page and the only way a row published under an
+    # older identity is superseded rather than duplicated.  Reuse stays where
+    # it pays for itself - the BUY rows, whose coverage math runs per owner.
+    rebuild_supplier_contour = (
+        reuse_parent_current and future_supply_generation_id is not None
+    )
     supplier_rows, recomputed_cards = _build_supplier_card_rows(
         db,
         parent,
-        affected_scopes=scopes,
+        affected_scopes=None if rebuild_supplier_contour else scopes,
         cutoff_date=target.cutoff.date(),
         future_supply_generation_id=supply_generation_id,
     )
@@ -1945,37 +1982,44 @@ def build_compact_current_purchase_control_payload(
         }
         unchanged_rows = [
             row for row in parent_rows
-            if (
+            if not (
+                rebuild_supplier_contour
+                and row.get("row_generator") == _SUPPLIER_ROW_GENERATOR
+            )
+            and (
                 int(row.get("item_id") or 0),
                 _clean_ref(row.get("planning_stock_pool")),
             ) not in affected_item_pools
             and str(row.get("row_key") or "") not in recomputed_row_keys
         ]
         reused_row_count = len(unchanged_rows)
-        replaced_order_ids: set[str] = set()
-        for key, card in parent_cards.items():
-            lines = card.get("lines", []) if isinstance(card, Mapping) else []
-            if any(
-                (
-                    int(line.get("item_id") or 0),
-                    _clean_ref(line.get("planning_stock_pool")),
-                ) in affected_item_pools
-                for line in lines
-                if isinstance(line, Mapping)
-            ):
-                replaced_order_ids.add(str(key))
-        replaced_order_ids.update(
-            str(row.get("order_id"))
-            for row in supplier_rows
-            if row.get("order_id") not in (None, "")
-        )
-        preserved_cards = {
-            key: value
-            for key, value in parent_cards.items()
-            if str(key) not in replaced_order_ids
-        }
-        preserved_cards.update(recomputed_cards)
-        bounded_cards = preserved_cards
+        if rebuild_supplier_contour:
+            bounded_cards = recomputed_cards
+        else:
+            replaced_order_ids: set[str] = set()
+            for key, card in parent_cards.items():
+                lines = card.get("lines", []) if isinstance(card, Mapping) else []
+                if any(
+                    (
+                        int(line.get("item_id") or 0),
+                        _clean_ref(line.get("planning_stock_pool")),
+                    ) in affected_item_pools
+                    for line in lines
+                    if isinstance(line, Mapping)
+                ):
+                    replaced_order_ids.add(str(key))
+            replaced_order_ids.update(
+                str(row.get("order_id"))
+                for row in supplier_rows
+                if row.get("order_id") not in (None, "")
+            )
+            preserved_cards = {
+                key: value
+                for key, value in parent_cards.items()
+                if str(key) not in replaced_order_ids
+            }
+            preserved_cards.update(recomputed_cards)
+            bounded_cards = preserved_cards
         rows = [*unchanged_rows, *supplier_rows, *buyer_rows]
     else:
         bounded_cards = recomputed_cards

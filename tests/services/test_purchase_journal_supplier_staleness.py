@@ -142,12 +142,16 @@ def _world(db):
 
 
 def _order(db, item, *, number="ЗСНФ-001766", state="Заказан (товар в пути)", qty="6"):
-    supplier = models.Supplier(
-        supplier_name="Поставщик",
-        supplier_ref1c="SUP-REF",
-    )
-    db.add(supplier)
-    db.flush()
+    supplier = db.query(models.Supplier).filter(
+        models.Supplier.supplier_ref1c == "SUP-REF"
+    ).one_or_none()
+    if supplier is None:
+        supplier = models.Supplier(
+            supplier_name="Поставщик",
+            supplier_ref1c="SUP-REF",
+        )
+        db.add(supplier)
+        db.flush()
     order = models.SupplierOrder(
         order_number=number,
         order_date=datetime(2026, 9, 5),
@@ -558,3 +562,153 @@ def test_expected_within_seven_days_is_counted_for_the_serving_day(db_session):
 
     assert served["summary"]["expected_7d"] == 1
     assert served["summary"]["overdue"] == 0
+
+
+def _legacy_supplier_row(*, key, item, order_ref, qty="6"):
+    """A journal row as the pre-contract publisher wrote it.
+
+    Its identity is the technical id of a future-supply row and its payload
+    carries no planning pool, so neither the row key nor the item/pool scope of
+    a later bounded refresh can ever match it.
+    """
+    return {
+        "row_key": key,
+        "order_id": None,
+        "order_number": order_ref.replace("REF-", ""),
+        "order_ref1c": order_ref,
+        "order_state_name": "Заказан (товар в пути)",
+        "supply_phase": "in_transit",
+        "item_id": item.item_id,
+        "item_code": item.item_code,
+        "item_name": item.item_name,
+        "quantity": float(qty),
+        "received_qty": 0.0,
+        "remaining_qty": float(qty),
+        "delivery_date": "2026-09-22",
+        "overdue_days": 0,
+        "line_status": "expected",
+        "row_generator": "ledger_future_supply",
+        "fact_status": "available",
+        "fact_source": "ledger",
+        "run_ids": [],
+    }
+
+
+def _publish_parent_with_legacy_rows(db, parent, target, run, item, legacy_rows):
+    ordinary = build_compact_current_purchase_control_payload(
+        db,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[run.run_id],
+    )
+    payload = {
+        **ordinary,
+        "rows": [*ordinary["rows"], *legacy_rows],
+    }
+    publish_current_purchase_control_from_payload(db, parent.id, payload)
+    db.flush()
+    return payload
+
+
+def test_recapture_supersedes_rows_published_under_the_old_row_identity(db_session):
+    """One journal row per supplier order line, and none for a closed order."""
+    parent, target, item, run, _reservation = _world(db_session)
+    open_order, open_line = _order(db_session, item)
+    closed_order, _closed_line = _order(
+        db_session, item, number="ЗСНФ-001565", state="Завершен", qty="4",
+    )
+    _publish_parent_with_legacy_rows(
+        db_session, parent, target, run, item,
+        [
+            _legacy_supplier_row(
+                key="ledger-supply:34560614", item=item,
+                order_ref=open_order.order_ref1c,
+            ),
+            _legacy_supplier_row(
+                key="ledger-supply:34572633", item=item,
+                order_ref=closed_order.order_ref1c, qty="4",
+            ),
+        ],
+    )
+
+    delta = supplier_future_supply_delta(
+        db_session,
+        target.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+    _stage_supplier_capture(db_session, target, delta)
+    payload = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[run.run_id],
+        affected_scopes=delta.changed_scopes,
+        reuse_parent_current=True,
+        future_supply_generation_id=target.id,
+    )
+
+    supplier_rows = [
+        row for row in payload["rows"]
+        if row["row_generator"] == "ledger_future_supply"
+    ]
+    assert [row["row_key"] for row in supplier_rows] == [
+        "ledger-supply:supplier_order:"
+        f"{open_order.order_ref1c}:1:supplier_order_item:{open_line.item_id}"
+    ]
+    assert [row["order_number"] for row in supplier_rows] == ["ЗСНФ-001766"]
+    assert not [
+        row for row in payload["rows"]
+        if str(row.get("order_ref1c") or "") == closed_order.order_ref1c
+    ]
+
+
+def test_a_stock_only_tick_still_closes_legacy_supplier_rows(db_session):
+    """No BUY scope at all is not a reason to keep an unsupported identity."""
+    parent, target, item, run, _reservation = _world(db_session)
+    order, line = _order(db_session, item)
+    delta = supplier_future_supply_delta(
+        db_session,
+        target.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+    _stage_supplier_capture(db_session, target, delta)
+    # The parent already describes this very order, but under the old identity.
+    _publish_parent_with_legacy_rows(
+        db_session, parent, target, run, item,
+        [_legacy_supplier_row(
+            key="ledger-supply:34560614", item=item, order_ref=order.order_ref1c,
+        )],
+    )
+
+    payload = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[run.run_id],
+        affected_scopes=(),
+        reuse_parent_current=True,
+        future_supply_generation_id=target.id,
+    )
+
+    assert [
+        row["row_key"] for row in payload["rows"]
+        if row["row_generator"] == "ledger_future_supply"
+    ] == [
+        "ledger-supply:supplier_order:"
+        f"{order.order_ref1c}:1:supplier_order_item:{line.item_id}"
+    ]
+
+
+def _stage_supplier_capture(db, target, delta):
+    batch = models.LedgerBuildBatch(
+        ledger_generation_id=target.id,
+        stage="future_supply_capture",
+        batch_key=f"future-supply-capture:g{target.id}",
+        status="building",
+        algorithm_version="ledger-future-supply-capture/1",
+        metrics={},
+    )
+    db.add(batch)
+    db.flush()
+    replace_future_supply_capture(db, target.id, batch.id, delta.evidence)
+    return batch
