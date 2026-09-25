@@ -59,6 +59,20 @@ class ChainClosePayload(BaseModel):
     initiated_by: Optional[str] = None
 
 
+class PendingChainCommandResponse(BaseModel):
+    command: Optional[ChainClosePayload] = None
+    message: str
+
+
+@router.get("/chain/{product_id}/pending-command", response_model=PendingChainCommandResponse)
+async def pending_chain_command(product_id: int, db: Session = Depends(get_db)):
+    from ..services.paint_weld_chain import pending_chain_command as read_command
+    try:
+        return read_command(db, product_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @router.get("/pairs", response_model=dict)
 async def get_pairs(active_only: bool = True, db: Session = Depends(get_db)):
     return {"pairs": service.list_pairs(db, active_only=active_only)}

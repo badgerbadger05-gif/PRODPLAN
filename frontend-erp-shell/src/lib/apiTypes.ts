@@ -2709,6 +2709,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/paint-weld/chain/{product_id}/pending-command": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Pending Chain Command */
+        get: operations["pending_chain_command_api_v1_paint_weld_chain__product_id__pending_command_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/paint-weld/pairs": {
         parameters: {
             query?: never;
@@ -4895,6 +4912,23 @@ export interface components {
             /** Expected Source Revision */
             expected_source_revision?: string | null;
         };
+        /** MaterializedMakeProductResponse */
+        MaterializedMakeProductResponse: {
+            /** Work Item Id */
+            work_item_id: number;
+            /** Product Id */
+            product_id: number;
+            /** Order Id */
+            order_id: number;
+            /** Order Number */
+            order_number?: string | null;
+            /** Requirement Id */
+            requirement_id: number;
+            /** Qty */
+            qty: number;
+        } & {
+            [key: string]: unknown;
+        };
         /** MoveRequest */
         MoveRequest: {
             /** Component Id */
@@ -5049,6 +5083,23 @@ export interface components {
             /** Expected Source Revision */
             expected_source_revision?: string | null;
         };
+        /** OrdersFromWorkItemsResponse */
+        OrdersFromWorkItemsResponse: {
+            /** Status */
+            status: string;
+            /** Created */
+            created?: components["schemas"]["MaterializedMakeProductResponse"][];
+            /** Reused */
+            reused?: components["schemas"]["MaterializedMakeProductResponse"][];
+            /** Skipped */
+            skipped?: {
+                [key: string]: unknown;
+            }[];
+            /** Errors */
+            errors?: string[];
+            /** Initiated By */
+            initiated_by?: string | null;
+        };
         /** PaintWeldChainResponse */
         PaintWeldChainResponse: {
             /** Role */
@@ -5097,6 +5148,12 @@ export interface components {
             counterpart_item_article: string;
             /** Selection Disabled Reason */
             selection_disabled_reason?: string | null;
+        };
+        /** PendingChainCommandResponse */
+        PendingChainCommandResponse: {
+            command?: components["schemas"]["ChainClosePayload"] | null;
+            /** Message */
+            message: string;
         };
         /** PendingSpecificationRebaseRequest */
         PendingSpecificationRebaseRequest: {
@@ -11162,9 +11219,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["OrdersFromWorkItemsResponse"];
                 };
             };
             /** @description Validation Error */
@@ -12080,6 +12135,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BindingReviewLinesResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    pending_chain_command_api_v1_paint_weld_chain__product_id__pending_command_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingChainCommandResponse"];
                 };
             };
             /** @description Validation Error */

@@ -891,6 +891,8 @@ def _merge_chain_payloads(
     for idx, row in enumerate(rows, start=1):
         row["LineNumber"] = idx
     combined["Операции"] = rows
+    combined["ПоложениеЗаказаНаПроизводство"] = "ВТабличнойЧасти"
+    combined["ПоложениеСтруктурнойЕдиницы"] = "ВТабличнойЧасти"
 
     has_row_executor = any(_clean_ref1c(row.get("Исполнитель")) for row in rows)
     if has_row_executor:
@@ -954,6 +956,41 @@ def export_chain_piecework_to_1c(
 
 
 # Labor coverage is a document-write guard, never a source of production facts.
+def _header_scoped_chain_repair(doc, entries):
+    """Repair only the known header-normalization defect in our exact batch.
+
+    Keep prices, employees, quantities and row identities from 1C unchanged.
+    Ambiguous or otherwise changed documents are never rewritten.
+    """
+    if not any(doc.get(field) == "ВШапке" for field in (
+        "ПоложениеЗаказаНаПроизводство", "ПоложениеСтруктурнойЕдиницы"
+    )):
+        return None
+    expected = [row for entry in entries for row in _build_header_payload(entry, operation_ref="")["Операции"]]
+    actual = doc.get("Операции") or []
+    if len(actual) != len(expected):
+        return None
+    remaining = list(expected)
+    repaired = []
+    for row in actual:
+        matches = [want for want in remaining if _labor_key(want)[1:] == _labor_key(row)[1:]
+                   and abs(float(want["КоличествоФакт"]) - float(row.get("КоличествоФакт") or 0)) < 1e-6]
+        if len(matches) != 1:
+            return None
+        want = matches[0]
+        remaining.remove(want)
+        for field, header in (("ЗаказНаПроизводство_Key", "ЗаказНаПроизводство_Key"),
+                              ("СтруктурнаяЕдиница_Key", "СтруктурнаяЕдиница_Key")):
+            if _clean_ref1c(row.get(field)) not in {_clean_ref1c(want.get(field)), _clean_ref1c(doc.get(header))}:
+                return None
+        repaired.append({**{k: v for k, v in row.items() if k != "Ref_Key"},
+                         **{field: want[field] for field in (
+                             "ЗаказНаПроизводство_Key", "СтруктурнаяЕдиница_Key", "ПодразделениеЗавершающегоЭтапа_Key"
+                         ) if field in want}})
+    return {"ПоложениеЗаказаНаПроизводство": "ВТабличнойЧасти",
+            "ПоложениеСтруктурнойЕдиницы": "ВТабличнойЧасти", "Операции": repaired}
+
+
 def _labor_key(row):
     def key(name):
         value = _clean_ref1c(row.get(name)).lower()
@@ -1081,15 +1118,50 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
         # Recover POST-after-timeout by stable identity, including unposted headers.
         marker = f"PRODPLAN source={source_doctype}/{target.manufacture_id};"
         found = client._make_request(PIECEWORK_ENTITY, params={
-            "$filter": f"substringof('{marker}', Комментарий)", "$top": 2,
+            "$filter": f"substringof('{marker}', Комментарий)", "$top": 100,
         })
         if not isinstance(found, dict) or not isinstance(found.get("value"), list):
             raise ValueError("1С не подтвердила поиск ранее созданного сдельного наряда")
-        candidates = [doc for doc in found["value"] if doc.get("DeletionMark") is not True]
+        if len(found["value"]) >= 100:
+            raise ValueError("Поиск ранее созданного наряда усечён; оформление остановлено")
+
+        def belongs_to_command(doc):
+            # Local ids are reused across PRODPLAN databases. The 1C order
+            # and manufacture basis must also match before recovering a doc.
+            return (
+                _clean_ref1c(doc.get("ЗаказНаПроизводство_Key")) == _clean_ref1c(target.order_ref1c)
+                and _clean_ref1c(doc.get("ДокументОснование")) == _clean_ref1c(target.basis_ref1c)
+            )
+
+        if retry_ref:
+            linked_doc = client._make_request(f"{PIECEWORK_ENTITY}(guid'{retry_ref}')")
+            if not belongs_to_command(linked_doc):
+                if link.status == "success":
+                    # A successful coverage link may refer to a manual labor
+                    # document. Re-read its rows, but never recover/PATCH it.
+                    retry_ref = ""
+                else:
+                    raise ValueError("Связанный сдельный наряд относится к другому заказу или выпуску; требуется проверка связи")
+        candidates = [doc for doc in found["value"]
+                      if doc.get("DeletionMark") is not True and belongs_to_command(doc)]
         if len(candidates) > 1:
             raise ValueError("В 1С несколько нарядов одной команды; требуется проверка")
         if candidates:
+            if retry_ref and retry_ref != _clean_ref1c(candidates[0].get("Ref_Key")):
+                raise ValueError("Найдены разные ссылки на наряд одной команды; требуется проверка связи")
             retry_ref = _clean_ref1c(candidates[0].get("Ref_Key"))
+        if combined and retry_ref:
+            doc = client._make_request(f"{PIECEWORK_ENTITY}(guid'{retry_ref}')")
+            repair = _header_scoped_chain_repair(doc, entries) if belongs_to_command(doc) and not doc.get("DeletionMark") else None
+            if repair is not None:
+                if dry_run:
+                    return {"status": "repair_required", "dry_run": True, "target_ref_key": retry_ref,
+                            "message": "В существующем наряде требуется восстановить заказы и участки операций сварки и окраски.",
+                            "repair_payload": repair}
+                if doc.get("Posted"):
+                    client.post_operation(f"{PIECEWORK_ENTITY}(guid'{retry_ref}')/Unpost")
+                client.patch(f"{PIECEWORK_ENTITY}(guid'{retry_ref}')", repair)
+                _post_document_operational(client, entity=PIECEWORK_ENTITY, ref_key=retry_ref)
         live = _read_piecework_rows(client, [e.order_ref1c for e in entries], retry_ref=retry_ref)
         for entry in entries:
             payload = _build_header_payload(entry, operation_ref="", business_operation_ref=business_operation_ref, organization_ref=organization_ref or _config_ref1c(
@@ -1118,6 +1190,10 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
                     source_id=current.manufacture_id, target_entity=PIECEWORK_ENTITY,
                     target_number=target.number, payload_hash=payload_hash,
                     target_ref_key=ref, status=status, last_error=last_error)
+                if status == "success" and not standalone:
+                    manufacture = db.get(ProductionManufacture, current.manufacture_id)
+                    if manufacture is not None and str(manufacture.export_error or "").startswith("СдельныйНаряд:"):
+                        manufacture.export_error = None
 
         if not payload["Операции"]:
             save_links(entry=target, payload_hash="live-coverage", target_ref_key=retry_ref,
@@ -1163,6 +1239,9 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
         summary.update(status="ok" if not errors else "partial_error", created=created, errored=errors,
             manufactures_created=created, manufactures_error=errors, target_ref_key=target.target_ref_key,
             entries=[asdict(e) for e in entries], message="Сдельный наряд оформлен; уже оплаченные операции исключены")
+        if errors:
+            summary["error"] = "; ".join(str(entry.error) for entry in entries if entry.error)
+            summary["message"] = "Документ сдельного наряда создан, но проверка оформления не завершена. " + summary["error"]
         return summary
 
 

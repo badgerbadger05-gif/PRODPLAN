@@ -192,24 +192,29 @@ def _journal_coverage_status(
     return "unknown"
 
 
-def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
-    """Active local materializations for the exact frozen requirement.
-
-    Physical Ledger generations advance while the frozen MRP requirement stays
-    immutable. Matching the exact requirement prevents duplicate executors
-    without rewriting their creation-generation provenance.
-    """
-    return [
-        (product, order)
-        for product, order in (
-        db.query(ProductionProduct, ProductionOrder)
+def _active_mrp_product_scope(db: Session):
+    """Live executors with their stable plan/item scope, including older MRP runs."""
+    return (
+        db.query(ProductionProduct, ProductionOrder, MrpRequirement.item_id, PlanningRun.source_plan_id)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .filter(ProductionProduct.source_mrp_requirement_id == int(req.id))
-        .filter(ProductionOrder.source == "mrp")
-        .filter(ProductionOrder.deletion_mark.is_(False))
-        .all()
-        )
-    ]
+        .join(MrpRequirement, MrpRequirement.id == ProductionProduct.source_mrp_requirement_id)
+        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
+        .filter(ProductionOrder.source == "mrp", ProductionOrder.deletion_mark.is_(False))
+    )
+
+
+def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
+    """Use the same plan/item boundary as journal proposals after MRP rebase."""
+    run = db.get(PlanningRun, int(req.run_id))
+    if run is None:
+        return []
+    query = _active_mrp_product_scope(db).filter(MrpRequirement.item_id == int(req.item_id))
+    if run.source_plan_id is None:
+        # Unbound runs have no shared plan identity.
+        query = query.filter(MrpRequirement.id == int(req.id))
+    else:
+        query = query.filter(PlanningRun.source_plan_id == int(run.source_plan_id))
+    return [(product, order) for product, order, _item, _plan in query.all()]
 
 
 def _reused_product_payload(
@@ -599,7 +604,7 @@ def materialize_make_work_items(
                     reused.append(payload)
                 continue
             if abs(active_open_qty - expected_materialized_qty) > 1e-6:
-                errors.append(f"work_item_id={work_id}: состав живых заказов изменился; обновите журнал")
+                errors.append(f"MRP-R-{rid}: количество ранее созданных заказов изменилось. Обновите журнал и повторите запуск.")
                 continue
             if requested_qty - remaining > 1e-6:
                 errors.append(f"work_item_id={work_id}: доступно к запуску {remaining:g}, запрошено {requested_qty:g}")
@@ -1479,30 +1484,11 @@ def _active_open_qty_by_requirement(
     неё саму себя (``exclude_product_id``) — иначе строка вычла бы собственное
     количество и не дала бы себя увеличить.
     """
-    query = (
-        db.query(
-            ProductionProduct.quantity,
-            ProductionProduct.produced_qty,
-            MrpRequirement.item_id,
-            PlanningRun.source_plan_id,
-        )
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .join(
-            MrpRequirement,
-            MrpRequirement.id == ProductionProduct.source_mrp_requirement_id,
-        )
-        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
-        .filter(
-            ProductionOrder.source == "mrp",
-            ProductionOrder.deletion_mark.is_(False),
-            func.coalesce(ProductionProduct.quantity, 0)
-            > func.coalesce(ProductionProduct.produced_qty, 0),
-        )
-    )
+    query = _active_mrp_product_scope(db)
     if exclude_product_id is not None:
         query = query.filter(ProductionProduct.product_id != int(exclude_product_id))
     active_open: Dict[int, float] = {}
-    for quantity, produced_qty, requirement_item_id, requirement_plan_id in query.all():
+    for product, _order, requirement_item_id, requirement_plan_id in query.all():
         target = current_requirement_by_plan_item.get(
             (
                 int(requirement_plan_id) if requirement_plan_id is not None else None,
@@ -1511,8 +1497,8 @@ def _active_open_qty_by_requirement(
         )
         if target is None:
             continue
-        active_open[target] = active_open.get(target, 0.0) + max(
-            0.0, _to_float(quantity) - _to_float(produced_qty)
+        active_open[target] = active_open.get(target, 0.0) + _to_float(
+            accepted_product_output(product).remaining_qty
         )
     return active_open
 

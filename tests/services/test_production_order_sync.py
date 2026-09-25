@@ -657,6 +657,105 @@ def test_production_fact_cache_uses_exact_manufacture_link(db_session, monkeypat
     assert other_order.order_id != order.order_id
 
 
+@pytest.mark.parametrize("exact_link", [True, False])
+def test_partial_output_nets_internal_warehouse_transfer(db_session, monkeypatch, exact_link):
+    """Five produced units (+5 -5 +5) must leave four of nine to produce."""
+    db = db_session
+    _no_odata(monkeypatch)
+    _generation, batch = _accepted_generation(db)
+    item = _fact_item(db)
+    order, product = _order_with_line(db, item=item, order_ref1c="asm-order", qty=9)
+    product.produced_qty = 9
+    product.remaining_qty = 0
+    if exact_link:
+        db.add(models.ProductionManufacture(
+            product_id=product.product_id,
+            order_id=order.order_id,
+            qty=5,
+            complete_order=False,
+            status="exported",
+            exported_ref1c="asm-doc-1",
+        ))
+    else:
+        _recorder_pull(db, recorder_ref="asm-doc-1", order_ref="asm-order")
+    _assembly_fact(db, batch=batch, item=item, recorder_ref="asm-doc-1", qty=5)
+    outbound = _assembly_fact(
+        db, batch=batch, item=item, recorder_ref="asm-doc-1", qty=-5, line_no="2",
+    )
+    outbound.movement_kind = "assembly_out"
+    outbound.record_type = "Expense"
+    destination = _assembly_fact(
+        db, batch=batch, item=item, recorder_ref="asm-doc-1", qty=5, line_no="3",
+    )
+    destination.warehouse_ref1c = "finished-goods"
+    db.commit()
+
+    for expected_updates in (1, 0):
+        stats = sync_production_facts(db)
+        db.refresh(product)
+        assert stats["status"] == "ok"
+        assert stats["products_updated"] == expected_updates
+        assert stats["matched_qty"] == 5
+        assert stats["surplus_qty"] == 0
+        assert float(product.produced_qty) == 5
+        assert float(product.remaining_qty) == 4
+        assert float(product.quantity) == 9
+
+
+@pytest.mark.parametrize("outside_scope", ["import", "cutoff", "document"])
+def test_output_does_not_net_expense_outside_visible_document(db_session, monkeypatch, outside_scope):
+    db = db_session
+    _no_odata(monkeypatch)
+    _generation, batch = _accepted_generation(db)
+    item = _fact_item(db)
+    _order, product = _order_with_line(db, item=item, order_ref1c="asm-order")
+    _recorder_pull(db, recorder_ref="asm-doc-1", order_ref="asm-order")
+    _assembly_fact(db, batch=batch, item=item, recorder_ref="asm-doc-1", qty=5)
+    outbound = _assembly_fact(
+        db,
+        batch=_later_import_batch(db) if outside_scope == "import" else batch,
+        item=item,
+        recorder_ref="other-doc" if outside_scope == "document" else "asm-doc-1",
+        qty=-5,
+        line_no="2",
+    )
+    outbound.movement_kind = "assembly_out"
+    outbound.record_type = "Expense"
+    if outside_scope == "cutoff":
+        outbound.posting_at = CUTOFF + datetime.timedelta(seconds=1)
+    db.commit()
+
+    sync_production_facts(db)
+
+    db.refresh(product)
+    assert float(product.produced_qty) == 5
+    assert float(product.remaining_qty) == 5
+
+
+def test_consumed_component_is_not_production_output(db_session, monkeypatch):
+    db = db_session
+    _no_odata(monkeypatch)
+    _generation, batch = _accepted_generation(db)
+    item = _fact_item(db)
+    _order, product = _order_with_line(db, item=item, order_ref1c="asm-order")
+    _recorder_pull(db, recorder_ref="asm-doc-1", order_ref="asm-order")
+    _assembly_fact(db, batch=batch, item=item, recorder_ref="asm-doc-1", qty=5)
+    for line_no in ("2", "3"):
+        outbound = _assembly_fact(
+            db, batch=batch, item=item, recorder_ref="asm-doc-1", qty=-5, line_no=line_no,
+        )
+        outbound.movement_kind = "assembly_out"
+        outbound.record_type = "Expense"
+    db.commit()
+
+    stats = sync_production_facts(db)
+
+    db.refresh(product)
+    assert stats["matched_qty"] == 0
+    assert float(product.produced_qty) == 0
+    assert float(product.remaining_qty) == 10
+
+
 def test_exact_manufacture_output_overflow_stays_surplus(db_session, monkeypatch):
     db = db_session
     _no_odata(monkeypatch)

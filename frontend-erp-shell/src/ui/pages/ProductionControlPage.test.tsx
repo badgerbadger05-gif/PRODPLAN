@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { act, fireEvent, render, screen, within, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, useLocation } from 'react-router-dom'
@@ -7,6 +7,8 @@ import { ProductionControlPage } from './ProductionControlPage'
 import { ApiError } from '../../lib/api'
 import type { MaterialsResponse, OrderRow } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
+
+afterEach(() => vi.unstubAllGlobals())
 
 // --- Service layer mocks: no real network is allowed. Every named export the
 // page imports is replaced with a vi.fn() so we can both feed fake data and
@@ -24,6 +26,7 @@ vi.mock('../../services/productionControl', () => ({
   materializeMakeWorkItems: vi.fn(),
   openPaintWeldChains: vi.fn(),
   closePaintWeldChain: vi.fn(),
+  getPendingChainCommand: vi.fn().mockResolvedValue({ command: null, message: '' }),
   getStandalonePieceworkOptions: vi.fn(),
   createStandalonePiecework: vi.fn(),
   saveProductionControlSettings: vi.fn(),
@@ -75,6 +78,7 @@ import {
   materializeMakeWorkItems,
   openPaintWeldChains,
   closePaintWeldChain,
+  getPendingChainCommand,
   getStandalonePieceworkOptions,
   createStandalonePiecework,
   updateOrderQuantity,
@@ -384,6 +388,7 @@ beforeEach(() => {
     status: 'ok', product_ids: productIds, entries: [], errors: [],
   }))
   vi.mocked(closePaintWeldChain).mockResolvedValue({ status: 'ok' })
+  vi.mocked(getPendingChainCommand).mockReset().mockResolvedValue({ command: null, message: '' })
   vi.mocked(updateOrderStatus).mockResolvedValue({} as never)
   vi.mocked(deleteProductionOrder).mockResolvedValue({} as never)
   vi.mocked(produceOrderLine).mockResolvedValue({ qty: 10 } as never)
@@ -1111,6 +1116,33 @@ describe('ProductionControlPage — characterization', () => {
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })
 
+  it('shows materialization refusal and does not continue a partially created selection', async () => {
+    const proposal = {
+      ...fakeRows()[0], journal_row_key: 'work-item:701', work_item_id: 701,
+      product_id: null, order_id: null, order_number: 'MRP-R-701',
+      order_prodplan_number: 'MRP-R-701', status: 'not_created',
+      available_actions: ['materialize'], materialized_order_qty: 0, launchable_qty: 10,
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(materializeMakeWorkItems).mockResolvedValue({
+      status: 'ok', reused: [],
+      created: [{ work_item_id: 701, product_id: 901, order_id: 801,
+        order_number: 'MRP-R-701-1', requirement_id: 701, qty: 10 }],
+      errors: ['Количество ранее созданных заказов изменилось. Обновите журнал и повторите запуск.'],
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Расчёт MRP · заказ ещё не создан')
+    await user.click(screen.getByRole('checkbox', { name: /MRP-R-701/ }))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    expect(await screen.findByText('Количество ранее созданных заказов изменилось. Обновите журнал и повторите запуск.')).toBeInTheDocument()
+    expect(openPaintWeldChains).not.toHaveBeenCalled()
+    expect(postMaterialIssues).not.toHaveBeenCalled()
+  })
+
   it('retries proposal materials with the journal generation after refresh', async () => {
     const proposal = {
       ...fakeRows()[0],
@@ -1218,7 +1250,15 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.queryByRole('spinbutton', { name: 'Количество запуска' })).toBeNull()
   })
 
-  it.each([false, true])('asks for executors and sends explicit partial=%s', async (partial) => {
+  it.each([
+    { partial: false, http: false },
+    { partial: true, http: false },
+    { partial: false, http: true },
+    { partial: true, http: true },
+  ])('asks for executors and sends explicit partial=$partial over HTTP=$http', async ({ partial, http }) => {
+    if (http) {
+      vi.stubGlobal('crypto', { getRandomValues: globalThis.crypto.getRandomValues.bind(globalThis.crypto) })
+    }
     // 1С не проводит сдельный наряд с пустой строкой регистра «Сдельные наряды»,
     // поэтому исполнители выбираются до записи, а не подставляются заглушкой.
     vi.mocked(listProductionOperations).mockResolvedValue({
@@ -1269,7 +1309,7 @@ describe('ProductionControlPage — characterization', () => {
       partial,
       current_identity: 'production:order:101',
       expected_source_revision: 'rev-7',
-      request_key: expect.any(String),
+      request_key: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
       qty: partial ? 7 : 11,
       operation_executors: [
         { spec_operation_id: 51, operation_id: 61, line_number: 1, employee_ref1c: 'E1' },
@@ -1363,6 +1403,36 @@ describe('ProductionControlPage — characterization', () => {
     tableRow.focus()
     await user.keyboard(' ')
     expect(within(tableRow).getByRole('checkbox')).not.toBeChecked()
+  })
+
+  it('opens a saved unfinished batch instead of asking for quantities and employees again', async () => {
+    const paint = { ...fakeRows()[0], paint_weld_chain: {
+      role: 'painted', link_id: 72, counterpart_product_id: 102,
+    } } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({ rows: [paint], total: 1, limit: 100, offset: 0, truth_meta: fakeTruthMeta } as never)
+    vi.mocked(getPendingChainCommand).mockResolvedValueOnce({
+      command: { product_id: 101, request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40, dry_run: false, allow_production: false },
+      message: 'Сварка проведена. Окраска: конфликт блокировок. Исполнители сохранены.',
+    }).mockResolvedValueOnce({
+      command: { product_id: 101, request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40, dry_run: false, allow_production: false },
+      message: 'Сварка и окраска проведены. Исполнители сохранены.',
+    })
+    vi.mocked(closePaintWeldChain).mockResolvedValueOnce({ status: 'partial', resume_required: true, message: 'Не завершено оформление сдельного наряда.' })
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findAllByText('Кронштейн')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Произвести' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).queryByRole('spinbutton')).toBeNull()
+    expect(within(dialog).queryByRole('combobox')).toBeNull()
+    expect(closePaintWeldChain).not.toHaveBeenCalled()
+    await user.click(within(dialog).getByRole('button', { name: 'Продолжить оформление' }))
+    await waitFor(() => expect(closePaintWeldChain).toHaveBeenCalledWith(101, {
+      request_key: 'saved-batch', partial: false, weld_qty: 40, paint_qty: 40,
+    }))
+    await within(dialog).findByText('Сварка и окраска проведены. Исполнители сохранены.')
+    expect(within(dialog).queryByText(/конфликт блокировок/)).toBeNull()
   })
 
   it('asks for an executor on every operation of both chain sides before closing the chain', async () => {
