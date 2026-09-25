@@ -421,8 +421,12 @@ def _retry_published(
 # Not a §40 publication.  An obligation refresh inherits its parent's cutoff,
 # so it cannot make the pointer fresh again, and it freezes MRP: on a pointer
 # older than the freshness threshold it must be refused like any other MRP
-# freeze (the contract forbids MRP on stale truth).  Only the physical refresh
-# publication and the no-op scope repair restore freshness.
+# freeze (the contract forbids MRP on stale truth).  Only the physical contour
+# restores freshness: its publication, the no-op scope repair, and - since §57 -
+# a converged reconciliation that found no semantic delta and therefore extends
+# the current pointer's verified cutoff instead of publishing a successor.  The
+# gate here is unchanged: it reads the same readiness and simply sees a pointer
+# that a recent reconciliation proved still true.
 def run_obligation_refresh(
     db: Session,
     *,

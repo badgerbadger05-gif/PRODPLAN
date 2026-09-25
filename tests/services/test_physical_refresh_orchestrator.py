@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import event
 
 from app import models
+from app.services import planning_truth
 from app.services.item_ledger import historical_bootstrap_phase0 as bootstrap
 from app.services.item_ledger import historical_import_orchestration as importer
 from app.services.item_ledger import physical_refresh_generation
@@ -1140,6 +1141,25 @@ def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_sessio
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
     assert db_session.get(models.LedgerGeneration, physical.id).status == "rejected"
     assert db_session.query(models.StockBin).count() == before_bins
+    # Decision §57: the tick read 1C up to the new cutoff and converged, so the
+    # pointer it was computed from is verified that far even though nothing was
+    # published.  Without this a weekend without postings put every reader on
+    # 503 planning_truth_unavailable.
+    target_utc = planning_truth._as_utc(target_cutoff)
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    assert int(pointer.verified_generation_id) == int(parent.id)
+    assert planning_truth._as_utc(pointer.verified_cutoff) == target_utc
+    assert result.verified_cutoff == target_utc
+    monkeypatch.setenv(planning_truth.TRUTH_MAX_AGE_SECONDS_ENV, str(24 * 3600))
+    readiness = planning_truth.get_readiness(
+        db_session, now=target_utc + timedelta(hours=1)
+    )
+    assert readiness.ready is True
+    assert readiness.verified_cutoff == target_utc
+    # The extension is bounded: it ages from the check, not forever.
+    assert planning_truth.get_readiness(
+        db_session, now=target_utc + timedelta(hours=25),
+    ).truth_status == "stale"
 
 
 def test_balance_adjustment_row_is_not_classified_as_noop(db_session, monkeypatch):

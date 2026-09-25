@@ -386,6 +386,14 @@ class PlanningTruthState(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(),
         onupdate=func.now(),
     )
+    #: Decision §57: the last successful reconciliation with 1C that proved the
+    #: pointed-at generation still true up to a newer cutoff without producing a
+    #: successor.  Deliberately no FK - an equality witness, not a reference, so
+    #: it never holds a superseded generation against GC.  Read only while
+    #: ``verified_generation_id == current_generation_id``.
+    verified_generation_id = Column(BigInteger, nullable=True)
+    verified_cutoff = Column(DateTime(timezone=True), nullable=True)
+    verified_at = Column(DateTime(timezone=True), nullable=True)
 
     current_generation = relationship("LedgerGeneration")
 

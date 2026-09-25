@@ -50,6 +50,13 @@ class PlanningTruthReadiness:
     replay_version: str | None
     reason: str | None
     accepted_at: datetime | None
+    #: Decision §57: cutoff of the last successful reconciliation with 1C that
+    #: found no semantic delta for *this* pointer generation.  ``None`` when the
+    #: pointer has never been verified or moved since it was.  Operators read it
+    #: as "сверено до ...".
+    verified_cutoff: datetime | None = None
+    #: When that reconciliation was recorded.
+    verified_at: datetime | None = None
 
     @property
     def status(self) -> str:
@@ -183,6 +190,28 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _pointer_verification(
+    pointer: models.PlanningTruthState | None,
+    generation: models.LedgerGeneration | None,
+) -> tuple[datetime | None, datetime | None]:
+    """The §57 verification of *this* pointer generation, or ``(None, None)``.
+
+    A verification proves only the generation it was computed from.  Any
+    pointer move - a published physical successor, an obligation refresh -
+    leaves the stored triple describing a generation that is no longer
+    current, and it is simply not read; the next verification overwrites it.
+    That is why no pointer writer has to clear it.
+    """
+    if pointer is None or generation is None:
+        return None, None
+    verified_generation_id = pointer.verified_generation_id
+    if verified_generation_id is None or int(verified_generation_id) != int(generation.id):
+        return None, None
+    if pointer.verified_cutoff is None or pointer.verified_at is None:
+        return None, None
+    return _as_utc(pointer.verified_cutoff), _as_utc(pointer.verified_at)
+
+
 def get_readiness(
     db: Session,
     *,
@@ -195,6 +224,13 @@ def get_readiness(
     running inside :func:`publication_context` (§40).  Every structural rule
     and an explicit operator invalidation still decide the status, so a
     generation invalidated to ``stale``/``rejected`` stays unavailable.
+
+    Freshness is measured from the last successful reconciliation with 1C, not
+    from the last publication (§57): a refresh that read 1C up to a newer
+    cutoff, converged on balances and found no semantic delta proves the
+    accepted generation is still true up to that cutoff, and publishing a
+    successor for it would be pure churn.  Without that rule a quiet weekend
+    put every HTTP reader into ``stale`` until the first posting arrived.
     """
     pointer = db.get(models.PlanningTruthState, 1)
     generation = pointer.current_generation if pointer is not None else None
@@ -227,12 +263,20 @@ def get_readiness(
         if apply_freshness_limit and not inside_publication()
         else None
     )
+    verified_cutoff, verified_at = _pointer_verification(pointer, generation)
     if structurally_accepted and freshness_limit is not None:
         checked_at = _as_utc(now or datetime.now(timezone.utc))
         freshness_reference = min(
             _as_utc(generation.cutoff),
             _as_utc(generation.accepted_at),
         )
+        if verified_cutoff is not None and verified_at is not None:
+            # Same conservative pairing as the publication above: a cutoff can
+            # only vouch for the span actually read, so a cutoff dated past the
+            # moment the check was recorded cannot buy extra freshness.
+            freshness_reference = max(
+                freshness_reference, min(verified_cutoff, verified_at),
+            )
         age = checked_at - freshness_reference
         if age > freshness_limit:
             status = "stale"
@@ -258,6 +302,8 @@ def get_readiness(
         replay_version=generation.replay_version,
         reason=reason,
         accepted_at=generation.accepted_at,
+        verified_cutoff=verified_cutoff,
+        verified_at=verified_at,
     )
 
 
@@ -365,6 +411,84 @@ def publish_generation(
     # the previous generation. Force the readiness read to follow the new FK.
     db.expire(pointer, ["current_generation"])
     return get_readiness(db)
+
+
+def record_pointer_verification(
+    db: Session,
+    *,
+    verified_generation_id: int,
+    verified_cutoff: datetime,
+    balance_convergence_valid: bool,
+    verified_at: datetime | None = None,
+) -> datetime | None:
+    """Extend the current pointer's freshness by a proven 1C reconciliation (§57).
+
+    A physical refresh that read 1C up to ``verified_cutoff``, converged on
+    balances and found no semantic delta has proved the accepted generation
+    still true up to that cutoff.  It creates no successor - an equivalent
+    import has none - so the proof is recorded here, on the pointer, and never
+    by mutating the accepted generation row: generation lineage is immutable.
+
+    The rule is deliberately narrow and fail-closed in every direction:
+
+    * only forward - a later verification never lowers the reference;
+    * only for the pointer the check was computed from, re-read under the
+      pointer lock, because the pointer may have moved since;
+    * only with a valid balance convergence - a failed or non-converged check
+      proves nothing and extends nothing.
+
+    Returns the stored cutoff when the verification moved the reference, and
+    ``None`` when it changed nothing, so an unchanged pointer produces no
+    write and no WAL churn.  The caller owns the transaction.
+    """
+    if not balance_convergence_valid:
+        return None
+    if verified_cutoff is None:
+        raise ValueError("verified_cutoff is required")
+    try:
+        target_id = int(verified_generation_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("verified_generation_id must be a positive integer") from exc
+    if target_id <= 0:
+        raise ValueError("verified_generation_id must be a positive integer")
+
+    pointer = db.execute(
+        select(models.PlanningTruthState)
+        .where(models.PlanningTruthState.id == 1)
+        .with_for_update(),
+    ).scalar_one_or_none()
+    if pointer is None or pointer.current_generation_id is None:
+        return None
+    if int(pointer.current_generation_id) != target_id:
+        return None
+    generation = db.get(models.LedgerGeneration, target_id)
+    if (
+        generation is None
+        or str(generation.status) != "accepted"
+        or generation.cutoff is None
+        or generation.accepted_at is None
+    ):
+        return None
+
+    checked_at = _as_utc(verified_at or datetime.now(timezone.utc))
+    cutoff = _as_utc(verified_cutoff)
+    # Same conservative pairing the reader applies: a check vouches only for
+    # the span it actually read.
+    effective = min(cutoff, checked_at)
+    reference = min(_as_utc(generation.cutoff), _as_utc(generation.accepted_at))
+    stored_cutoff, stored_at = _pointer_verification(pointer, generation)
+    if stored_cutoff is not None and stored_at is not None:
+        reference = max(reference, min(stored_cutoff, stored_at))
+    if effective <= reference:
+        return None
+
+    pointer.verified_generation_id = target_id
+    pointer.verified_cutoff = cutoff
+    pointer.verified_at = checked_at
+    db.flush()
+    return cutoff
+
+
 def invalidate_current_generation(
     db: Session,
     *,

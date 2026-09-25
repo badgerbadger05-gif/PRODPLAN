@@ -65,7 +65,20 @@ def _install_sqlite_compat() -> None:
     ApplyBatchImpl.drop_constraint = _tolerant_drop
 
 
-def main(db_path: str, *, round_trip: bool = False) -> int:
+def _tables() -> dict[str, list[str]]:
+    from sqlalchemy import create_engine, inspect
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+    inspector = inspect(engine)
+    tables = {
+        name: sorted(col["name"] for col in inspector.get_columns(name))
+        for name in inspector.get_table_names()
+    }
+    engine.dispose()
+    return tables
+
+
+def main(db_path: str, *, round_trip: bool = False, step_down: bool = False) -> int:
     sys.path.insert(0, str(BACKEND))
     os.chdir(BACKEND)
     os.environ["DATABASE_URL"] = "sqlite:///" + db_path.replace("\\", "/")
@@ -81,18 +94,20 @@ def main(db_path: str, *, round_trip: bool = False) -> int:
         command.downgrade(config, "20260726_14")
         command.upgrade(config, "head")
 
-    from sqlalchemy import create_engine, inspect
+    # Полный round trip невозможен (есть необратимые cutover-ревизии), поэтому
+    # обратимость новой головы проверяется на один шаг: вниз и снова вверх.
+    stepped: dict[str, list[str]] | None = None
+    if step_down:
+        command.downgrade(config, "-1")
+        stepped = _tables()
+        command.upgrade(config, "head")
 
-    engine = create_engine(os.environ["DATABASE_URL"])
-    inspector = inspect(engine)
-    tables = {
-        name: sorted(col["name"] for col in inspector.get_columns(name))
-        for name in inspector.get_table_names()
-    }
-    engine.dispose()
+    payload: dict[str, object] = {"tables": _tables()}
+    if stepped is not None:
+        payload["tables_after_step_down"] = stepped
 
     print("---JSON---")
-    print(json.dumps({"tables": tables}))
+    print(json.dumps(payload))
     return 0
 
 
@@ -101,5 +116,6 @@ if __name__ == "__main__":
         main(
             sys.argv[1],
             round_trip="--round-trip" in sys.argv[2:],
+            step_down="--step-down" in sys.argv[2:],
         )
     )
