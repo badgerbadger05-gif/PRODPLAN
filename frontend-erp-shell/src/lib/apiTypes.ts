@@ -3116,6 +3116,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/item-ledger/admin/specification-rebase/runs/{run_id}/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reset Specification Rebase Run
+         * @description Reset one run's consecutive rebase failures so the worker retries it.
+         *
+         *     A run that failed ``MAX_REBASE_ATTEMPTS`` times in a row is skipped so it
+         *     cannot starve the queue; once the operator has fixed the cause, this puts
+         *     it back in line and reopens its parked queue requests.
+         */
+        post: operations["reset_specification_rebase_run_api_v1_item_ledger_admin_specification_rebase_runs__run_id__reset_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/item-ledger/admin/generations/invalidate": {
         parameters: {
             query?: never;
@@ -12826,6 +12850,41 @@ export interface operations {
                 "application/json": components["schemas"]["PhysicalRefreshDiscardRequest"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reset_specification_rebase_run_api_v1_item_ledger_admin_specification_rebase_runs__run_id__reset_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path: {
+                run_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
