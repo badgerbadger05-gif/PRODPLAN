@@ -914,6 +914,30 @@ async def period_plans_execution_journal(
             raise CurrentExecutionUnavailable("period-plan current metadata is missing")
         plan = _get_plan(db, int(plan_id))
         resolved_run = _resolve_execution_run(db, plan, run_id)
+        if str(resolved_run.status or "") == "CLOSED":
+            # A closed plan is never part of the live current scope
+            # (`period-plan:all-live-plans` is built only from live runs), so
+            # its journal is owned by the immutable `closed_plan_snapshot`
+            # history (`.docs/period_plan_target.md`, «Закрытие»).  Reading the
+            # live scope for it would fail closed forever instead of serving
+            # the saved history, and a missing snapshot stays `unavailable`
+            # inside that same envelope rather than becoming a zero fact.
+            return ExecutionJournalResponse.model_validate(
+                get_period_plan_execution_journal(
+                    db,
+                    int(plan_id),
+                    run_id=int(resolved_run.run_id),
+                    root_item_id=root_item_id,
+                    bom_level=bom_level,
+                    flow=flow,
+                    status=status,
+                    include_net_zero=include_net_zero,
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                    limit=limit,
+                    offset=offset,
+                )
+            )
         selected = None
         for metadata in snapshots.values():
             if not isinstance(metadata, dict):

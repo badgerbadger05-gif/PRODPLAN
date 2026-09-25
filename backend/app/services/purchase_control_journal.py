@@ -20,6 +20,29 @@ _EPS = 1e-9
 _BUY_ROW_GENERATOR = "mrp_reservation"
 
 
+def purchase_journal_meta(scope: Any) -> Dict[str, Any]:
+    """Read-time metadata of the served current purchase scope.
+
+    Truth is reported from pointer readiness at read time: a scope is only
+    handed out by ``require_current_execution_scope`` when it matches the
+    accepted semantic pointer, so the served answer is ``accepted``.  The
+    build-time status captured inside the publication envelope describes the
+    candidate while it was being built and must never be echoed as the truth
+    of an accepted read.
+    """
+    summary = dict(getattr(scope, "summary", None) or {})
+    meta = dict(summary.get("meta") or summary)
+    meta.update({
+        "current_scope_id": int(scope.id),
+        "ledger_generation": scope.source_generation_id,
+        "ledger_generation_id": scope.source_generation_id,
+        "source_revision": scope.source_revision,
+        "truth_status": "accepted",
+        "truth_reason": None,
+    })
+    return meta
+
+
 def _current_payload(db: Session) -> Dict[str, Any]:
     """Read one coherent accepted current scope, including valid empty runs."""
     try:
@@ -36,13 +59,7 @@ def _current_payload(db: Session) -> Dict[str, Any]:
         scope_key="purchase:all-live-plans",
     )
     summary = dict(scope.summary or {})
-    meta = dict(summary.get("meta") or summary)
-    meta.update({
-        "current_scope_id": int(scope.id),
-        "ledger_generation": scope.source_generation_id,
-        "source_revision": scope.source_revision,
-        "truth_status": "accepted",
-    })
+    meta = purchase_journal_meta(scope)
     public_rows = [dict(row.payload or {}) for row in rows]
     cards = summary.get("cards") if isinstance(summary.get("cards"), dict) else {}
     return {"rows": public_rows, "cards": cards, "meta": meta}
@@ -77,6 +94,35 @@ def _materialization_action(row: Dict[str, Any]) -> tuple[bool, Optional[str]]:
     if _to_float(row.get("to_order_qty")) <= _EPS:
         return False, "Количество к заказу отсутствует"
     return True, None
+
+
+def apply_materialization_action(rows: Sequence[Dict[str, Any]]) -> None:
+    """Stamp the single canonical materialization rule onto projected rows."""
+    for row in rows:
+        can_materialize, disabled_reason = _materialization_action(row)
+        row["can_materialize"] = can_materialize
+        row["materialize_disabled_reason"] = disabled_reason
+
+
+def purchase_journal_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate the page totals from the rows the reader actually serves."""
+    by_status: Dict[str, int] = {}
+    by_phase: Dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("line_status") or "unavailable")
+        phase = str(row.get("supply_phase") or "unavailable")
+        by_status[status] = by_status.get(status, 0) + 1
+        by_phase[phase] = by_phase.get(phase, 0) + 1
+    return {
+        "total_rows": len(rows),
+        "by_status": by_status,
+        "by_phase": by_phase,
+        "to_order": by_status.get("to_order", 0),
+        "overdue": by_status.get("overdue", 0),
+        "expected_7d": 0,
+        "in_transit_amount": 0.0,
+        "fact_status": "available",
+    }
 
 
 def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -359,10 +405,7 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
         )
         if projected is not None
     ]
-    for row in rows:
-        can_materialize, disabled_reason = _materialization_action(row)
-        row["can_materialize"] = can_materialize
-        row["materialize_disabled_reason"] = disabled_reason
+    apply_materialization_action(rows)
 
     if line_status:
         rows = [r for r in rows if r.get("line_status") == str(line_status)]
@@ -409,17 +452,7 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
         sort_by = "delivery_date"
     reverse = str(kwargs.get("sort_dir") or "asc").casefold() == "desc"
     rows.sort(key=lambda r: (r.get(sort_by) is None, r.get(sort_by) if r.get(sort_by) is not None else "", r.get("row_key")), reverse=reverse)
-    by_status: dict[str, int] = {}
-    by_phase: dict[str, int] = {}
-    for row in rows:
-        status = str(row.get("line_status") or "unavailable")
-        phase = str(row.get("supply_phase") or "unavailable")
-        by_status[status] = by_status.get(status, 0) + 1
-        by_phase[phase] = by_phase.get(phase, 0) + 1
-    summary = {"total_rows": len(rows), "by_status": by_status, "by_phase": by_phase,
-               "to_order": by_status.get("to_order", 0), "overdue": by_status.get("overdue", 0),
-               "expected_7d": 0, "in_transit_amount": 0.0,
-               "fact_status": "available"}
+    summary = purchase_journal_summary(rows)
     limit, offset = max(1, min(int(kwargs.get("limit") or 100), 500)), max(0, int(kwargs.get("offset") or 0))
     return {"rows": rows[offset:offset + limit], "total": len(rows), "limit": limit, "offset": offset,
             "run_id": run_ids[0] if len(run_ids) == 1 else None,

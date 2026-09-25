@@ -325,7 +325,11 @@ def test_period_current_get_returns_persisted_summary_without_business_recalcula
 
     import app.services.period_plan_service as service
     monkeypatch.setattr(service, "_get_plan", lambda db, plan_id: SimpleNamespace(id=plan_id))
-    monkeypatch.setattr(service, "_resolve_execution_run", lambda db, plan, run_id: SimpleNamespace(run_id=run_id or 41))
+    monkeypatch.setattr(
+        service,
+        "_resolve_execution_run",
+        lambda db, plan, run_id: SimpleNamespace(run_id=run_id or 41, status="FIXED_SNAPSHOT"),
+    )
     monkeypatch.setattr(
         service, "_finalize_execution_payload",
         lambda *args, **kwargs: (_ for _ in ()).throw(

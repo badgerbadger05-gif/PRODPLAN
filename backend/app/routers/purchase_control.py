@@ -19,8 +19,11 @@ from ..services.purchase_control_journal import (
     get_order_card,
     get_selection_summary,
     _selection_summary_from_rows,
+    apply_materialization_action,
     list_filters,
     list_journal,
+    purchase_journal_meta,
+    purchase_journal_summary,
 )
 from ..services.purchase_control_projection import PurchaseJournalUnavailable
 from ..services.item_ledger.current_execution import (
@@ -230,6 +233,10 @@ def get_orders(
                 for projected in [_reconcile_buy_row_for_horizon(row, horizon_period_to.isoformat())]
                 if projected is not None
             ]
+        # One canonical materialization rule, stamped on the projected row and
+        # before any row is filtered out: the export endpoint re-checks the very
+        # same rule, so the journal must not publish a second answer.
+        apply_materialization_action(rows)
         if order_id is not None:
             rows = [row for row in rows if row.get("order_id") == int(order_id)]
         if supplier_id is not None:
@@ -261,33 +268,17 @@ def get_orders(
         )
         effective_limit = max(1, min(int(limit or 100), 500))
         effective_offset = max(0, int(offset or 0))
-        saved = dict(current_manifest.summary or {})
+        # Read-time metadata of the served scope.  The stored envelope keeps the
+        # status captured while the candidate was still BUILDING; the reader
+        # reports the readiness of the accepted pointer it was served from.
+        saved = purchase_journal_meta(current_manifest)
         saved.pop("snapshot_id", None)
-        saved["current_scope_id"] = int(current_manifest.id)
-        saved["source_revision"] = str(current_manifest.source_revision)
+        saved.pop("summary", None)
+        saved.pop("cards", None)
         saved["current_execution_scope_id"] = int(current_manifest.id)
-        saved_summary = saved.get("summary")
-        if not isinstance(saved_summary, dict):
-            nested_meta = saved.get("meta")
-            if isinstance(nested_meta, dict) and isinstance(nested_meta.get("summary"), dict):
-                saved_summary = dict(nested_meta["summary"])
-        # A ready current scope with zero rows is a valid persisted empty
-        # result.  Older publishers did not always persist the summary
-        # envelope for that case; derive only the zero cardinality contract,
-        # never business rows or totals from legacy sources.
-        if not isinstance(saved_summary, dict) and not rows:
-            saved_summary = {
-                "total_rows": 0,
-                "by_status": {},
-                "by_phase": {},
-                "to_order": 0,
-                "overdue": 0,
-                "expected_7d": 0,
-                "in_transit_amount": 0.0,
-                "fact_status": "available",
-            }
-        if not isinstance(saved_summary, dict):
-            raise CurrentExecutionUnavailable("purchase current summary is missing")
+        # The page totals belong to the rows this answer serves, not to the
+        # unfiltered build-time cardinality of the publication envelope.
+        page_summary = purchase_journal_summary(rows)
         saved_buckets = [
             dict(bucket)
             for bucket in list(saved.get("to_order_by_period") or [])
@@ -308,12 +299,12 @@ def get_orders(
                 "offset": effective_offset,
                 "run_id": saved.get("run_id"),
                 "run_ids": list(saved.get("run_ids") or []),
-                "truth_status": saved.get("truth_status"),
+                "truth_status": saved["truth_status"],
                 "ledger_generation_id": current_manifest.source_generation_id,
                 "source_revision": str(current_manifest.source_revision),
                 "current_identity": None,
                 "to_order_by_period": saved_buckets,
-                "summary": saved_summary,
+                "summary": page_summary,
                 "meta": saved,
         }
     except PurchaseJournalUnavailable as e:
@@ -338,10 +329,15 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
             entity_kind="purchase_control_journal",
             scope_key="purchase:all-live-plans",
         )
-        saved = dict(manifest.summary or {})
-        cards = saved.get("cards")
+        cards = dict(manifest.summary or {}).get("cards")
         if isinstance(cards, dict) and str(int(order_id)) in cards:
-            return {**dict(cards[str(int(order_id))]), "meta": saved}
+            # Same read-time truth rule as the journal: a card served from the
+            # accepted pointer is accepted, never the stored build-time status.
+            meta = purchase_journal_meta(manifest)
+            meta.pop("summary", None)
+            meta.pop("cards", None)
+            meta["current_execution_scope_id"] = int(manifest.id)
+            return {**dict(cards[str(int(order_id))]), "meta": meta}
         raise ValueError(f"Supplier order {order_id} card is not published in current purchase journal")
     except PurchaseJournalUnavailable as e:
         raise HTTPException(status_code=503, detail=e.as_dict())
