@@ -484,7 +484,7 @@ export function ProductionControlPage() {
   async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
     let ids = productIds ?? selectedRows.flatMap(productionRowProductIds)
     const workItemIds = productIds == null
-      ? selectedRows.flatMap((row) => row.work_item_id == null ? [] : [row.work_item_id])
+      ? selectedRows.flatMap((row) => row.product_id != null || row.work_item_id == null ? [] : [row.work_item_id])
       : []
     if (!ids.length && !workItemIds.length) return
     if (!beginDangerousMutation()) return

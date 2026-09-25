@@ -1050,6 +1050,39 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
   })
 
+  it('launches an order created after cutoff without materializing its retained work item again', async () => {
+    const launched = {
+      ...fakeRows()[0],
+      journal_row_key: 'work-item:701',
+      work_item_id: 701,
+      order_number: 'MRP-R-701',
+      order_prodplan_number: 'MRP-R-701',
+      quantity: 20,
+      remaining_qty: 20,
+      materialized_order_qty: 20,
+      launchable_qty: 20,
+      status: 'created',
+      issue_status: 'not_requested',
+      available_actions: [],
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [launched], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    vi.mocked(materializeMakeWorkItems).mockResolvedValue({
+      status: 'ok', created: [], reused: [],
+      errors: ['work_item_id=701: доступно к запуску 0, запрошено 20'],
+    })
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('checkbox', { name: /MRP-R-701/ }))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith([101], 'erp-shell', undefined))
+    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
+    expect(materializeMakeWorkItems).not.toHaveBeenCalled()
+  })
+
   it('materializes a calculated MRP proposal before launching it in 1C', async () => {
     const proposal = {
       ...fakeRows()[0],
