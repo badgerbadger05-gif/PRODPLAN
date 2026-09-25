@@ -454,14 +454,27 @@ def _carry_forward_rows(
     db: Session,
     parent: models.LedgerGeneration,
     target: models.LedgerGeneration,
+    supply_kinds: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     parent_cutoff = _as_utc(parent.cutoff)
     target_cutoff = _as_utc(target.cutoff)
     if parent_cutoff is None or target_cutoff is None:
         raise FutureSupplyCaptureError("future supply carry-forward requires parent and target cutoffs")
+    requested = {
+        _norm(value)
+        for value in (supply_kinds if supply_kinds is not None else _KINDS)
+    }
+    if not requested or not requested.issubset(_KINDS):
+        raise FutureSupplyCaptureError("future supply evidence carry-forward has invalid kinds")
 
     carried: list[dict[str, Any]] = []
     for source in _read_generation_rows(db, int(parent.id)):
+        # Only the requested kinds are carried, so only they are recomputed and
+        # validated.  A kind this caller never carries (the bounded physical
+        # refresh recaptures supplier orders from 1C instead) must not be able
+        # to fail the carry-forward of another kind.
+        if _norm(getattr(source, "supply_kind", "")) not in requested:
+            continue
         row = {
             field: getattr(source, field)
             for field in _CARRY_FORWARD_FIELDS
@@ -487,7 +500,12 @@ def _carry_forward_rows(
                     source_ref=_norm(row["source_ref"] or ""),
                     source_line_ref=_norm(row["source_line_ref"] or ""),
                 )
-            if ordered <= 0:
+            # The qualification engines own evidence validity; this boundary
+            # only guards the storage contract (NOT NULL, CHECK >= 0).  A line
+            # ordered for zero is legal captured evidence with no open supply
+            # (§25 records the ordered quantity, it does not gate on it), so
+            # re-rejecting it here would make a published parent uncarryable.
+            if row["ordered_qty_at_cutoff"] is None or ordered < 0:
                 raise FutureSupplyCaptureError("parent future-supply capture has invalid ordered qty")
             row["realized_qty_at_cutoff"] = realized
             row["open_qty_at_cutoff"] = max(ordered - realized, Decimal("0"))
@@ -527,17 +545,10 @@ def carry_forward_future_supply_evidence(
         raise FutureSupplyCaptureError(
             "future supply evidence carry-forward requires a BUILDING target generation"
         )
-    requested = {
-        _norm(value)
-        for value in (supply_kinds if supply_kinds is not None else _KINDS)
-    }
-    if not requested or not requested.issubset(_KINDS):
-        raise FutureSupplyCaptureError("future supply evidence carry-forward has invalid kinds")
-
     evidence: list[FutureSupplyEvidence] = []
-    for row in _carry_forward_rows(db, parent=parent, target=target):
-        if str(row["supply_kind"]) not in requested:
-            continue
+    for row in _carry_forward_rows(
+        db, parent=parent, target=target, supply_kinds=supply_kinds
+    ):
         values = {
             field: row[field]
             for field in FutureSupplyEvidence.__dataclass_fields__

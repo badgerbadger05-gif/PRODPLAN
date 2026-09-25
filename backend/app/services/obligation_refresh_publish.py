@@ -42,6 +42,7 @@ from app.services.item_ledger.future_supply_capture import (
     publish_current_future_supply,
     verify_future_supply_capture,
 )
+from app.services.planning_truth import move_pointer_to_generation
 from app.services.item_ledger.r3_contract import (
     record_successor,
     retire_live_pointer,
@@ -1089,7 +1090,10 @@ def publish_obligation_refresh_batch(
     target.status = "accepted"
     target.accepted_at = accepted_at
     target.capabilities = capability_snapshot
-    pointer.current_generation_id = int(target.id)
+    # The obligation successor reuses the parent's physical batch and cutoff,
+    # so the §57 verification of the parent proves it too; the single pointer
+    # writer decides that, not this publisher.
+    move_pointer_to_generation(db, pointer, target)
     from .item_ledger.current_execution import publish_current_execution_from_generation
     publish_current_execution_from_generation(
         db, generation_id=int(target.id)

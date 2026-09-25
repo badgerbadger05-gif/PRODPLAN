@@ -40,6 +40,7 @@ from app.services.one_c_purchase_order_export import (
 from app.services.odata_client import OData1CClient
 from app.services.planning_truth import PlanningTruthUnavailable
 from .purchase_control_projection import validate_purchase_control_journal_buy_row
+from .purchase_control_journal import _materialization_action
 
 
 class PurchaseControlMaterializationError(ValueError):
@@ -635,9 +636,19 @@ def _validate_requested_rows(
             raise PurchaseControlMaterializationError(
                 f"row {_row_key(row)} has unsupported generator"
             )
-        to_order_qty = round(_to_float(row.get("to_order_qty"), field="to_order_qty"), 6)
-        if to_order_qty > 0:
-            valid_rows.append(row)
+        # The journal stamps one canonical materialization rule on every row it
+        # serves; the export answers with that same rule and never with a
+        # second, laxer one.  ``to_order_qty`` alone let a row the operator
+        # cannot press through as long as its quantity was positive.
+        # Keep the typed quantity check: the journal rule reads a malformed
+        # quantity as zero, which would hide a broken row behind the generic
+        # refusal below.
+        _to_float(row.get("to_order_qty"), field="to_order_qty")
+        if not _materialization_action(row)[0]:
+            raise PurchaseControlMaterializationError(
+                "Выбор содержит строку, недоступную для формирования заказа"
+            )
+        valid_rows.append(row)
 
     if not valid_rows:
         raise PurchaseControlMaterializationError("no rows with positive to_order_qty")

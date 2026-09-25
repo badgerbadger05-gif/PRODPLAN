@@ -530,6 +530,30 @@ def test_materialize_rows_rejects_stale_current_scope_id(db_session):
         )
 
 
+def test_materialize_rows_rejects_a_row_the_journal_disables(db_session):
+    """The export re-checks the journal's own materialization rule.
+
+    A positive ``to_order_qty`` alone used to be enough here, so a row the
+    operator cannot press in the journal could still be exported through the
+    API.
+    """
+    _generation, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    assert row["line_status"] == "to_order"
+    snapshot.payload["rows"][0]["line_status"] = "expected"
+
+    with pytest.raises(
+        PurchaseControlMaterializationError,
+        match="недоступную для формирования заказа",
+    ):
+        materialize_rows(
+            db_session,
+            snapshot_id=snapshot.id,
+            row_keys=[row["row_key"]],
+            dry_run=True,
+        )
+
+
 def test_materialize_rows_dry_run_writes_nothing(db_session):
     generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)

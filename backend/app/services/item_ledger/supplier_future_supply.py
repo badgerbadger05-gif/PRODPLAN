@@ -27,6 +27,7 @@ from app.services.one_c_export_common import clean_ref1c
 from app.services.supplier_order_status import SupplyPhase, phase_for_state
 
 from .future_supply_capture import (
+    _CURRENT_BUSINESS_FIELDS,
     FutureSupplyEvidence,
     _future_supply_identity,
     future_supply_evidence_hash,
@@ -35,24 +36,28 @@ from .physical_visibility import visible_sle_query
 
 _BUY_MODE = "buy"
 
-# Fields whose change makes a supplier line a different supply fact.  The
-# capture cutoff and the content hash are technical: they move on every tick
-# and must not make an unchanged mirror look like a new order (§25).
-_SUPPLY_BUSINESS_FIELDS = (
-    "item_id",
-    "characteristic_ref",
-    "organization_ref",
-    "planning_stock_pool",
-    "destination_warehouse_ref1c",
-    "source_ref",
-    "source_line_ref",
-    "source_local_id",
-    "ordered_qty_at_cutoff",
-    "realized_qty_at_cutoff",
-    "eta_date",
-    "source_state_key",
-    "evidence_status",
-    "reason",
+# Technical columns: identity, provenance, digests and synchronization times.
+# They move on every tick and must not make an unchanged mirror look like a
+# new order (§25).
+_TECHNICAL_FIELDS = frozenset({
+    "id",
+    "current_identity",
+    "is_current",
+    "ledger_generation_id",
+    "source_generation_id",
+    "capture_batch_id",
+    "source_capture_batch_id",
+    "capture_cutoff",
+    "source_content_hash",
+    "source_updated_at",
+    "created_at",
+    "updated_at",
+})
+# Fields whose change makes a supplier line a different supply fact.  The set
+# is the business payload of the current owner itself, so a field added to the
+# capture cannot silently drop out of this comparison.
+_SUPPLY_BUSINESS_FIELDS = tuple(
+    field for field in _CURRENT_BUSINESS_FIELDS if field not in _TECHNICAL_FIELDS
 )
 
 
@@ -455,12 +460,34 @@ class SupplierFutureSupplyDelta:
     changed_identities: tuple[str, ...]
 
 
+def _open_qty(row: Any) -> Decimal:
+    """Open quantity of either side, with the one canonical formula.
+
+    ``FutureSupplyEvidence`` deliberately has no ``open_qty_at_cutoff``: it is
+    a derived Ledger value which the capture computes.  Comparing a stored
+    current row against fresh evidence therefore has to derive it exactly as
+    the capture does, or every unchanged line would look changed on every tick.
+    """
+    stored = getattr(row, "open_qty_at_cutoff", None)
+    if stored is not None:
+        return _qty(stored)
+    if _text(getattr(row, "evidence_status", "")) != "exact":
+        return Decimal("0")
+    return max(
+        _qty(getattr(row, "ordered_qty_at_cutoff", None))
+        - _qty(getattr(row, "realized_qty_at_cutoff", None)),
+        Decimal("0"),
+    )
+
+
 def _business_payload(row: Any) -> tuple[str, ...]:
     """Canonical comparison payload shared by evidence and current rows."""
     values: list[str] = []
     for field in _SUPPLY_BUSINESS_FIELDS:
         value = getattr(row, field, None)
-        if field.endswith("_qty_at_cutoff"):
+        if field == "open_qty_at_cutoff":
+            values.append(str(_open_qty(row).normalize()))
+        elif field.endswith("_qty_at_cutoff"):
             values.append(str(_qty(value).normalize()))
         elif field == "eta_date":
             date_value = _date(value)

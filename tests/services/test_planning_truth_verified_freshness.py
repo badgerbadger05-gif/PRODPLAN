@@ -211,7 +211,7 @@ def test_check_dated_past_its_own_moment_buys_no_freshness(db_session, threshold
     ).truth_status == "stale"
 
 
-def test_new_accepted_generation_supersedes_the_verification(db_session, threshold):
+def test_physical_successor_supersedes_the_verification(db_session, threshold):
     generation = _accepted(db_session, "verified-before", accepted_at=ANCHOR)
     checked_at = ANCHOR + timedelta(hours=38)
     planning_truth.record_pointer_verification(
@@ -226,9 +226,11 @@ def test_new_accepted_generation_supersedes_the_verification(db_session, thresho
         db_session, now=ANCHOR + timedelta(hours=40)
     ).ready is True
 
-    # An obligation refresh inherits the parent cutoff: the successor carries
-    # no reconciliation of its own, so the old proof stops counting at once.
-    successor = _accepted(db_session, "obligation-successor", accepted_at=ANCHOR)
+    # A physical successor stands on facts read up to its own, newer cutoff.
+    # Nothing has reconciled those, so the old proof stops counting at once.
+    successor = _accepted(
+        db_session, "physical-successor", accepted_at=ANCHOR + timedelta(hours=1)
+    )
 
     state = planning_truth.get_readiness(
         db_session, now=ANCHOR + timedelta(hours=40)
@@ -238,6 +240,40 @@ def test_new_accepted_generation_supersedes_the_verification(db_session, thresho
     assert state.verified_cutoff is None
     pointer = db_session.get(models.PlanningTruthState, 1)
     assert int(pointer.verified_generation_id) == int(generation.id)
+
+
+def test_obligation_successor_keeps_the_verification_of_its_parent(
+    db_session, threshold
+):
+    """A quiet weekend must survive the first plan fixation (§57).
+
+    An obligation refresh reuses the parent's physical batch and cutoff, so the
+    reconciliation which proved the parent proves the successor too.  Dropping
+    it here sent every reader into ``stale``/503 until the next physical tick.
+    """
+    generation = _accepted(db_session, "weekend-parent", accepted_at=ANCHOR)
+    checked_at = ANCHOR + timedelta(hours=38)
+    planning_truth.record_pointer_verification(
+        db_session,
+        verified_generation_id=int(generation.id),
+        verified_cutoff=checked_at,
+        balance_convergence_valid=True,
+        verified_at=checked_at,
+    )
+    db_session.commit()
+
+    successor = _accepted(db_session, "obligation-successor", accepted_at=ANCHOR)
+
+    state = planning_truth.get_readiness(
+        db_session, now=ANCHOR + timedelta(hours=40)
+    )
+    assert state.ledger_generation == successor.id
+    assert state.truth_status == "accepted"
+    assert state.ready is True
+    assert state.verified_cutoff == checked_at
+    assert state.verified_at == checked_at
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    assert int(pointer.verified_generation_id) == int(successor.id)
 
 
 def test_verified_freshness_migration_is_linear_head_and_reversible(tmp_path):

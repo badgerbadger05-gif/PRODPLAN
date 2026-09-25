@@ -1131,12 +1131,21 @@ def run_physical_refresh(
         # contour moved before it discards its candidate; §57 extends freshness
         # only when this refresh found no semantic delta of any kind.
         movement_delta = bool(input_delta_rows) or bool(custody_source_sle_ids)
-        supplier_changed = movement_delta or bool(
-            supplier_future_supply_delta(
+        # Qualified here only when this tick moved no fact at all; with
+        # movements the publication qualifies the contour itself, after it has
+        # written its own receipt provenance.  The result is handed to the
+        # publisher so the movement-free tick qualifies the mirror once.
+        prepared_supplier_delta = (
+            None
+            if movement_delta
+            else supplier_future_supply_delta(
                 db,
                 int(physical_generation.id),
                 planning_pool_by_warehouse=pool_mapping,
-            ).changed_scopes
+            )
+        )
+        supplier_changed = movement_delta or bool(
+            prepared_supplier_delta.changed_scopes
         )
         if not movement_delta and not supplier_changed:
             # Equivalent imports have no successor in R3.  Discard the
@@ -1293,6 +1302,7 @@ def run_physical_refresh(
                     "backdate_from": backdate_from,
                     "custody_source_sle_ids": custody_source_sle_ids,
                     "supplier_future_supply_changed": supplier_changed,
+                    "supplier_future_supply_delta": prepared_supplier_delta,
                 },
                 odata_client=client,
                 source_revision=int(physical_generation.physical_import_batch_id),

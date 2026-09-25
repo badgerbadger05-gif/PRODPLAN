@@ -196,11 +196,12 @@ def _pointer_verification(
 ) -> tuple[datetime | None, datetime | None]:
     """The §57 verification of *this* pointer generation, or ``(None, None)``.
 
-    A verification proves only the generation it was computed from.  Any
-    pointer move - a published physical successor, an obligation refresh -
-    leaves the stored triple describing a generation that is no longer
-    current, and it is simply not read; the next verification overwrites it.
-    That is why no pointer writer has to clear it.
+    A verification proves only the generation it was computed from.  A pointer
+    move to a generation with *new* physical facts leaves the stored triple
+    describing a generation that is no longer current, and it is simply not
+    read; the next verification overwrites it.  That is why no pointer writer
+    has to clear it.  The one move that keeps it is handled by
+    :func:`move_pointer_to_generation`.
     """
     if pointer is None or generation is None:
         return None, None
@@ -359,6 +360,47 @@ def require_accepted_truth(
     return readiness
 
 
+def move_pointer_to_generation(
+    db: Session,
+    pointer: models.PlanningTruthState,
+    generation: models.LedgerGeneration,
+) -> None:
+    """Move the accepted pointer, keeping a §57 verification that still holds.
+
+    Every pointer writer goes through here, because the rule belongs to the
+    move and not to one publisher.  A successor which inherits its parent's
+    cutoff - an obligation refresh - stands on exactly the same physical facts
+    the reconciliation with 1C proved true, so the proof moves with the
+    pointer: otherwise the first plan fixation after a quiet weekend (when the
+    pointer is fresh only by §57) would drop the verification and put every
+    reader into ``stale`` until the next posting arrives.
+
+    A successor with a new cutoff carries new facts which nothing has verified
+    yet, so it never inherits the proof.  ``verified_cutoff``/``verified_at``
+    are never rewritten here: the check is not re-run by moving a pointer.
+    """
+    previous = (
+        db.get(models.LedgerGeneration, int(pointer.current_generation_id))
+        if pointer.current_generation_id is not None
+        else None
+    )
+    verified_cutoff, verified_at = _pointer_verification(pointer, previous)
+    same_physical_facts = (
+        previous is not None
+        and previous.cutoff is not None
+        and generation.cutoff is not None
+        and _as_utc(previous.cutoff) == _as_utc(generation.cutoff)
+    )
+    pointer.current_generation_id = int(generation.id)
+    if (
+        same_physical_facts
+        and verified_cutoff is not None
+        and verified_at is not None
+    ):
+        pointer.verified_generation_id = int(generation.id)
+    db.flush()
+
+
 def publish_generation(
     db: Session,
     generation: models.LedgerGeneration,
@@ -405,8 +447,7 @@ def publish_generation(
             raise PlanningTruthPublishConflict(
                 f"planning truth pointer is {current_id}, expected parent {expected}"
             )
-    pointer.current_generation_id = generation.id
-    db.flush()
+    move_pointer_to_generation(db, pointer, generation)
     # A long-lived worker session may already have resolved the relationship to
     # the previous generation. Force the readiness read to follow the new FK.
     db.expire(pointer, ["current_generation"])
@@ -452,6 +493,11 @@ def record_pointer_verification(
     if target_id <= 0:
         raise ValueError("verified_generation_id must be a positive integer")
 
+    # The pointer is reached through the same serialization as a publication:
+    # this call also runs after the no-op repair has locked current scopes and
+    # rows, so taking the pointer without the shared lock would be a second
+    # lock order against ``publish_generation``.
+    _serialize_publication(db)
     pointer = db.execute(
         select(models.PlanningTruthState)
         .where(models.PlanningTruthState.id == 1)

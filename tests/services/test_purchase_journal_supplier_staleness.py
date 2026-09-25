@@ -18,7 +18,13 @@ from app.services.item_ledger.current_execution import (
 from app.services.item_ledger.future_supply_capture import (
     replace_future_supply_capture,
 )
+from app.services.item_ledger.future_supply_capture import (
+    _CURRENT_BUSINESS_FIELDS,
+    FutureSupplyEvidence,
+)
 from app.services.item_ledger.supplier_future_supply import (
+    _SUPPLY_BUSINESS_FIELDS,
+    _business_payload,
     supplier_future_supply_delta,
 )
 from app.services.purchase_control_journal import list_journal
@@ -228,6 +234,49 @@ def test_repeated_sync_without_business_change_is_not_a_delta(db_session):
         target.id,
         planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
     ).changed_scopes == ()
+
+
+def test_supplier_comparison_covers_the_whole_current_business_payload():
+    """The delta compares every business field the current owner stores.
+
+    ``source_requirement_id`` and ``open_qty_at_cutoff`` used to be missing, so
+    a change of either was invisible to the tick that had to notice it.
+    """
+    assert set(_SUPPLY_BUSINESS_FIELDS) == set(_CURRENT_BUSINESS_FIELDS)
+
+
+def test_derived_open_qty_does_not_make_an_unchanged_line_look_changed(db_session):
+    """Evidence has no stored open quantity; comparing it must not flap."""
+    stored = models.LedgerFutureSupplyCurrent(
+        current_identity="supplier_order:REF-1:1:",
+        supply_kind="supplier_order",
+        item_id=1,
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="WH-1",
+        source_ref="REF-1",
+        source_line_ref="1",
+        ordered_qty_at_cutoff=Decimal("10.000"),
+        realized_qty_at_cutoff=Decimal("4.000"),
+        open_qty_at_cutoff=Decimal("6.000"),
+        eta_date=date(2026, 9, 22),
+        source_state_key="STATE",
+        evidence_status="exact",
+    )
+    fresh = FutureSupplyEvidence(
+        supply_kind="supplier_order",
+        item_id=1,
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="WH-1",
+        source_ref="REF-1",
+        source_line_ref="1",
+        ordered_qty_at_cutoff=Decimal("10"),
+        realized_qty_at_cutoff=Decimal("4"),
+        eta_date=date(2026, 9, 22),
+        source_state_key="STATE",
+        evidence_status="exact",
+    )
+
+    assert _business_payload(stored) == _business_payload(fresh)
 
 
 def test_completed_supplier_order_closes_its_supply_and_names_the_scope(db_session):

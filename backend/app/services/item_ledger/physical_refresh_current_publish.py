@@ -50,6 +50,7 @@ from app.services.item_ledger.physical_refresh_provenance import (
     handoff_current_physical_refresh_provenance,
 )
 from app.services.item_ledger.supplier_future_supply import (
+    SupplierFutureSupplyDelta,
     supplier_future_supply_delta,
 )
 from app.services.item_ledger.physical_refresh_stock_bin import (
@@ -1246,10 +1247,20 @@ def _publish_forward_physical_refresh_current(
     # receipt provenance: the realized quantity of an order line includes the
     # receipts this very delta typed.
     start_phase("future_supply")
-    supplier_delta = supplier_future_supply_delta(
-        db,
-        int(target.id),
-        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    prepared_supplier_delta = delta_manifest.get("supplier_future_supply_delta")
+    supplier_delta = (
+        # A tick which brought no fact at all wrote no receipt provenance, so
+        # the qualification the orchestrator already ran against this same
+        # target is still the current one: qualify the mirror once per tick.
+        prepared_supplier_delta
+        if isinstance(prepared_supplier_delta, SupplierFutureSupplyDelta)
+        and not rows
+        and not basis_rows
+        else supplier_future_supply_delta(
+            db,
+            int(target.id),
+            planning_pool_by_warehouse=planning_pool_by_warehouse,
+        )
     )
     supplier_scopes = tuple(supplier_delta.changed_scopes)
     _capture_bounded_future_supply(

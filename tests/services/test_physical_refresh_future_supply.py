@@ -19,6 +19,9 @@ from app.services.item_ledger.future_supply_capture import (
     carry_forward_future_supply,
 )
 from app.services.item_ledger.generation_lifecycle import accept_generation_build
+from app.services.item_ledger.physical_refresh_current_publish import (
+    _capture_bounded_future_supply,
+)
 
 from tests.services.test_generation_lifecycle import _synthetic
 
@@ -129,6 +132,47 @@ def _building_child(db, key: str, parent):
     db.add(child)
     db.flush()
     return child
+
+
+def _add_current_supply_row(
+    db,
+    parent,
+    item,
+    *,
+    key: str,
+    supply_kind: str,
+    qty: str,
+    realized_qty: str = "0",
+):
+    """Add one more accepted current-owner row to the parent contour."""
+    batch = db.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=int(parent.id),
+        stage="future_supply_capture",
+    ).one()
+    ordered = Decimal(qty)
+    realized = Decimal(realized_qty)
+    row = models.LedgerFutureSupplyCurrent(
+        current_identity=f"{supply_kind}:order-{key}:1:",
+        source_generation_id=int(parent.id),
+        source_capture_batch_id=int(batch.id),
+        supply_kind=supply_kind,
+        item_id=item.item_id,
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="WH",
+        source_ref=f"order-{key}",
+        source_line_ref="1",
+        ordered_qty_at_cutoff=ordered,
+        realized_qty_at_cutoff=realized,
+        open_qty_at_cutoff=max(ordered - realized, Decimal("0")),
+        eta_date=date(2026, 8, 1),
+        source_state_key="ready",
+        capture_cutoff=CUTOFF,
+        source_content_hash=f"hash-{key}",
+        evidence_status="exact",
+    )
+    db.add(row)
+    db.flush()
+    return row
 
 
 def _item(db, code: str):
@@ -266,6 +310,70 @@ def test_carry_forward_reduces_open_qty_when_realization_occurs_between_cutoffs(
     carried = rows[0]
     assert carried.source_ref == "order-carry-between"
     assert carried.open_qty_at_cutoff == Decimal("5")
+
+
+def test_bounded_recapture_carries_wip_past_a_zero_quantity_supplier_line(db_session):
+    """A 1C line ordered for zero must not freeze the truth after one tick.
+
+    The bounded refresh carries WIP only and recaptures supplier orders from
+    the mirror.  A supplier line the parent captured with ordered zero is not
+    carried at all, so it may neither be recomputed nor re-validated here.
+    """
+    item = _item(db_session, "FS-ZERO-SUPPLIER")
+    parent = _accepted_parent_with_future_supply(
+        db_session, "zero-supplier", item, qty="4"
+    )
+    _add_current_supply_row(
+        db_session,
+        parent,
+        item,
+        key="zero-supplier-buy",
+        supply_kind="supplier_order",
+        qty="0",
+    )
+
+    for tick in ("tick-1", "tick-2"):
+        target = _building_child(db_session, f"zero-supplier-{tick}", parent)
+        rows = _capture_bounded_future_supply(
+            db_session, parent=parent, target=target, supplier_evidence=()
+        )
+        staged = db_session.query(models.LedgerFutureSupply).filter_by(
+            ledger_generation_id=int(target.id)
+        ).all()
+        assert rows == 1
+        assert [row.supply_kind for row in staged] == ["wip_order"]
+        assert staged[0].open_qty_at_cutoff == Decimal("4")
+
+
+def test_full_carry_forward_keeps_a_zero_quantity_supplier_line(db_session):
+    """The rebuild path captures the same zero-ordered line with no open supply."""
+    item = _item(db_session, "FS-ZERO-FULL")
+    parent = _accepted_parent_with_future_supply(
+        db_session, "zero-full", item, qty="4"
+    )
+    _add_current_supply_row(
+        db_session,
+        parent,
+        item,
+        key="zero-full-buy",
+        supply_kind="supplier_order",
+        qty="0",
+    )
+    child = _building_child(db_session, "zero-full", parent)
+
+    summary = carry_forward_future_supply(
+        db_session,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(child.id),
+    )
+
+    carried = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=int(child.id),
+        supply_kind="supplier_order",
+    ).one()
+    assert summary["rows"] == 2
+    assert carried.ordered_qty_at_cutoff == Decimal("0")
+    assert carried.open_qty_at_cutoff == Decimal("0")
 
 
 def test_carry_forward_copies_source_requirement_id(db_session):

@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -24,6 +24,7 @@ from app.services.obligation_refresh_manifest import (
     MANIFEST_KEY,
     create_obligation_refresh_manifest,
 )
+from app.services import planning_truth
 
 
 def _generation(db, *, key, status, cutoff, watermarks=None):
@@ -396,6 +397,33 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert db_session.query(models.CurrentExecutionScope).filter_by(
         source_generation_id=target.id, entity_kind="mrp_result"
     ).count() == 0
+
+
+def test_publish_carries_the_parent_verification_to_the_successor(db_session):
+    """§57 survives the first plan fixation after a quiet weekend.
+
+    The successor reuses the parent's physical batch and cutoff, so the 1C
+    reconciliation that proved the parent proves it too.  Losing it here made
+    every reader answer 503 until the next physical tick.
+    """
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    checked_at = cutoff + timedelta(hours=20)
+    assert planning_truth.record_pointer_verification(
+        db_session,
+        verified_generation_id=int(parent.id),
+        verified_cutoff=checked_at,
+        balance_convergence_valid=True,
+        verified_at=checked_at,
+    ) is not None
+
+    _publish(db_session, parent, target, cutoff)
+
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    assert int(pointer.current_generation_id) == int(target.id)
+    assert int(pointer.verified_generation_id) == int(target.id)
+    assert planning_truth._as_utc(pointer.verified_cutoff) == checked_at
+    state = planning_truth.get_readiness(db_session)
+    assert state.verified_cutoff == checked_at
 
 
 def test_added_run_preserves_source_plan_historical_fixation_time(db_session):
