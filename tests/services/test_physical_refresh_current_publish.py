@@ -1140,3 +1140,59 @@ def test_bounded_acceptance_refuses_a_fact_counted_twice_in_its_scopes(
         )
     assert "pointer" not in phases
     db_session.rollback()
+
+
+def test_a_supplier_only_tick_publishes_with_the_real_builders(db_session, monkeypatch):
+    """No movement, a changed 1C order contour (§25): the tick still publishes.
+
+    A weekend tick found no fact at all while supplier orders moved in 1C.
+    With no physical key there is no assembly output to replay, so the output
+    phase must not refuse the whole publication for lack of scopes.  The
+    stand's first refresh after the 2026-09-25 copy failed exactly here.
+    """
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "86400")
+    parent, target = _stale_pointer_world(db_session, days=2)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        publisher, "_build_obligation_view_payloads", lambda *a, **kw: ({}, {}),
+    )
+    monkeypatch.setattr(
+        publisher, "publish_current_obligation_views_from_generation",
+        lambda *a, **kw: {
+            "production_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "purchase_control_journal": SimpleNamespace(changed_rows=0, idempotent=True),
+            "mrp_result": SimpleNamespace(changed_rows=0, idempotent=True),
+            "period_plan_execution": SimpleNamespace(changed_rows=0, idempotent=True),
+        },
+    )
+    monkeypatch.setattr(
+        publisher, "handoff_current_physical_refresh_provenance", lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_production_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {}},
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_purchase_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {}},
+    )
+
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={
+            "rows": (),
+            "supersessions": (),
+            "supplier_future_supply_changed": True,
+        },
+        odata_client=None,
+        source_revision=target.physical_import_batch_id,
+        planning_pool_by_warehouse={"wh": "default"},
+    )
+
+    assert result.target_generation_id == target.id
+    assert result.input_delta_rows == 0
+    assert str(db_session.get(models.LedgerGeneration, target.id).status) == "accepted"
+    db_session.rollback()

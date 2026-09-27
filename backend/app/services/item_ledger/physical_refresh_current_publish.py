@@ -1226,21 +1226,26 @@ def _publish_forward_physical_refresh_current(
         require_facts_not_over_allocated(db, sle_ids=delta_sle_ids)
 
     start_phase("assembly_output")
-    output = apply_bounded_assembly_output_plan_execution(
-        db,
-        target_generation_id=int(target.id),
-        parent_generation_id=int(parent.id),
-        affected_sle_ids=tuple(
-            int(row.id) for row in rows if _text(row.movement_kind) == "assembly_in"
-        ),
-        affected_physical_scopes=tuple((key[0], key[1], key[2]) for key in keys),
-        # A backdated or superseded output moves the earliest boundary back so
-        # the canonical document netting still sees the complete document.
-        earliest_posting_at=min(
-            (row.posting_at for row in scoped_rows), default=None,
-        ),
-        source_revision=str(revision),
+    assembly_in_ids = tuple(
+        int(row.id) for row in rows if _text(row.movement_kind) == "assembly_in"
     )
+    output = None
+    # A tick published only for a moved 1C order contour (§25) or a custody
+    # tail has no physical key: there is no output to replay.
+    if keys or assembly_in_ids:
+        output = apply_bounded_assembly_output_plan_execution(
+            db,
+            target_generation_id=int(target.id),
+            parent_generation_id=int(parent.id),
+            affected_sle_ids=assembly_in_ids,
+            affected_physical_scopes=tuple((key[0], key[1], key[2]) for key in keys),
+            # A backdated or superseded output moves the earliest boundary back so
+            # the canonical document netting still sees the complete document.
+            earliest_posting_at=min(
+                (row.posting_at for row in scoped_rows), default=None,
+            ),
+            source_revision=str(revision),
+        )
     phase("assembly_output")
 
     # Qualify and seal the supplier contour after this refresh wrote its own
