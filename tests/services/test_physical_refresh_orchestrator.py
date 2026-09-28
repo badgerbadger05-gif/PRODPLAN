@@ -1505,6 +1505,263 @@ def test_balance_snap_refuses_wholesale_divergence(db_session):
         )
 
 
+def _seed_cutoff_snap(db_session, batch, item, *, qty, posting_at):
+    """One synthetic cutoff adjustment cell, shaped like the snap writer's."""
+    row = models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id),
+        source_content_hash=f"snap-{item.item_id}-{qty}",
+        business_identity=business_identity_for_cutoff_balance_adjustment(
+            f"snap-{item.item_id}-{qty}", "0",
+            item_id=int(item.item_id), characteristic_ref="",
+            organization_ref="org-ref", warehouse_ref1c="WH-PHYSICAL-PLAN",
+            snap_content_hash=f"hash-{item.item_id}-{qty}",
+        ),
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="org-ref",
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        qty=Decimal(str(qty)),
+        posting_at=posting_at,
+        record_type="Receipt" if Decimal(str(qty)) > 0 else "Expense",
+        movement_kind="cutoff_balance_adjustment",
+        recorder_type="cutoff_balance_adjustment",
+        recorder_ref=f"snap-{item.item_id}-{qty}",
+        line_no="0",
+        ingest_source="cutoff_balance_adjustment",
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+def _seed_document_fact(db_session, batch, item, *, qty, posting_at, ref="doc-1"):
+    row = models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id),
+        source_content_hash=f"{ref}-{item.item_id}",
+        item_id=int(item.item_id),
+        characteristic_ref="",
+        organization_ref="org-ref",
+        warehouse_ref1c="WH-PHYSICAL-PLAN",
+        qty=Decimal(str(qty)),
+        posting_at=posting_at,
+        record_type="Receipt" if Decimal(str(qty)) > 0 else "Expense",
+        movement_kind="receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref=ref,
+        line_no="1",
+        ingest_source="document_pull",
+    )
+    db_session.add(row)
+    db_session.flush()
+    return row
+
+
+def _active_cell_total(db_session, item):
+    return sum(
+        (Decimal(row.qty) for row in db_session.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.item_id == int(item.item_id),
+            models.StockLedgerEntry.active.is_(True),
+        ).all()),
+        Decimal("0"),
+    )
+
+
+def test_cutoff_snap_is_retired_and_its_remainder_reissued(db_session):
+    """The document the snap stood in for replaces it without moving balance."""
+    parent, parent_batch = _accepted_parent(db_session, generation_key="snap-retire")
+    item = models.Item(item_code="RET-1", item_name="Ret", item_ref1c="ret-1")
+    db_session.add(item)
+    db_session.flush()
+    posted = _moscow_naive(parent.cutoff) - timedelta(days=8)
+    snap = _seed_cutoff_snap(
+        db_session, parent_batch, item, qty=10, posting_at=_moscow_naive(parent.cutoff),
+    )
+    db_session.flush()
+    # The truth before the document arrived: the snap alone stood for the cell.
+    before = _active_cell_total(db_session, item)
+    fact = _seed_document_fact(
+        db_session, parent_batch, item, qty=7, posting_at=posted,
+    )
+    db_session.commit()
+
+    retirement = workflow.retire_cutoff_snaps_absorbing_facts(
+        db_session,
+        fact_rows=[fact],
+        previous_import_batch_id=int(parent_batch.id),
+        reason="test",
+    )
+    db_session.flush()
+
+    assert retirement is not None
+    assert retirement.retired_rows == 1
+    assert retirement.reissued_rows == 1
+    assert Decimal(retirement.absorbed_qty) == Decimal("7")
+    assert retirement.unabsorbed == ()
+    assert db_session.get(models.StockLedgerEntry, int(snap.id)).active is False
+    edge = db_session.query(models.StockLedgerFactSupersession).filter_by(
+        old_sle_id=int(snap.id)
+    ).one()
+    assert edge.new_sle_id is not None
+    replacement = db_session.get(models.StockLedgerEntry, int(edge.new_sle_id))
+    assert Decimal(replacement.qty) == Decimal("3")
+    assert replacement.posting_at == snap.posting_at
+    assert replacement.movement_kind == "cutoff_balance_adjustment"
+    # The operation is balance-neutral: the snap it retired is exactly the
+    # imported quantity plus the remainder it re-issued.
+    assert _active_cell_total(db_session, item) == before
+
+
+def test_fully_explained_cutoff_snap_is_tombstoned(db_session):
+    parent, parent_batch = _accepted_parent(db_session, generation_key="snap-tombstone")
+    item = models.Item(item_code="RET-2", item_name="Ret2", item_ref1c="ret-2")
+    db_session.add(item)
+    db_session.flush()
+    snap = _seed_cutoff_snap(
+        db_session, parent_batch, item, qty=29600,
+        posting_at=_moscow_naive(parent.cutoff),
+    )
+    db_session.flush()
+    before = _active_cell_total(db_session, item)
+    fact = _seed_document_fact(
+        db_session, parent_batch, item, qty=29600,
+        posting_at=_moscow_naive(parent.cutoff) - timedelta(days=8),
+    )
+    db_session.commit()
+
+    retirement = workflow.retire_cutoff_snaps_absorbing_facts(
+        db_session, fact_rows=[fact],
+        previous_import_batch_id=int(parent_batch.id), reason="test",
+    )
+    db_session.flush()
+
+    assert retirement.retired_rows == 1
+    assert retirement.reissued_rows == 0
+    edge = db_session.query(models.StockLedgerFactSupersession).filter_by(
+        old_sle_id=int(snap.id)
+    ).one()
+    assert edge.new_sle_id is None
+    assert _active_cell_total(db_session, item) == before
+
+
+def test_cutoff_snap_older_than_the_fact_is_not_retired(db_session):
+    """A snap written before the document was posted absorbed something else."""
+    parent, parent_batch = _accepted_parent(db_session, generation_key="snap-older")
+    item = models.Item(item_code="RET-3", item_name="Ret3", item_ref1c="ret-3")
+    db_session.add(item)
+    db_session.flush()
+    snap = _seed_cutoff_snap(
+        db_session, parent_batch, item, qty=10,
+        posting_at=_moscow_naive(parent.cutoff) - timedelta(days=20),
+    )
+    fact = _seed_document_fact(
+        db_session, parent_batch, item, qty=7,
+        posting_at=_moscow_naive(parent.cutoff) - timedelta(days=8),
+    )
+    db_session.commit()
+
+    retirement = workflow.retire_cutoff_snaps_absorbing_facts(
+        db_session, fact_rows=[fact],
+        previous_import_batch_id=int(parent_batch.id), reason="test",
+    )
+
+    assert retirement.retired_rows == 0
+    assert len(retirement.unabsorbed) == 1
+    assert retirement.unabsorbed[0][:3] == (
+        int(item.item_id), "org-ref", "WH-PHYSICAL-PLAN",
+    )
+    assert Decimal(retirement.unabsorbed[0][3]) == Decimal("7")
+    assert db_session.get(models.StockLedgerEntry, int(snap.id)).active is True
+
+
+def test_opposite_signed_cutoff_snap_is_left_alone(db_session):
+    parent, parent_batch = _accepted_parent(db_session, generation_key="snap-sign")
+    item = models.Item(item_code="RET-4", item_name="Ret4", item_ref1c="ret-4")
+    db_session.add(item)
+    db_session.flush()
+    snap = _seed_cutoff_snap(
+        db_session, parent_batch, item, qty=-10,
+        posting_at=_moscow_naive(parent.cutoff),
+    )
+    fact = _seed_document_fact(
+        db_session, parent_batch, item, qty=7,
+        posting_at=_moscow_naive(parent.cutoff) - timedelta(days=1),
+    )
+    db_session.commit()
+
+    retirement = workflow.retire_cutoff_snaps_absorbing_facts(
+        db_session, fact_rows=[fact],
+        previous_import_batch_id=int(parent_batch.id), reason="test",
+    )
+
+    assert retirement.retired_rows == 0
+    assert db_session.get(models.StockLedgerEntry, int(snap.id)).active is True
+
+
+def test_snap_never_runs_before_the_targeted_recorder_repair(db_session, monkeypatch):
+    """A residual is a missing document until the register says otherwise."""
+    parent, _ = _accepted_parent(db_session, generation_key="repair-first")
+    target_cutoff = parent.cutoff + timedelta(days=1)
+    order = []
+
+    forked_batch = models.PhysicalImportBatch(
+        batch_key="repair-first-physical", status="completed", cutoff=target_cutoff,
+        source_watermarks={}, completed_at=target_cutoff,
+    )
+    physical = models.LedgerGeneration(
+        generation_key="repair-first-fork", status="building", cutoff=target_cutoff,
+        source_watermarks={
+            "replay_from": "2026-07-01T00:00:00+00:00",
+            "parent_generation_id": parent.id,
+        },
+        physical_import_batch=forked_batch,
+        algorithm_version="ledger-physical-refresh-generation/1",
+        replay_version="ledger-physical-refresh-replay/1",
+    )
+    db_session.add_all([forked_batch, physical])
+    db_session.flush()
+    fork_result = physical_refresh_generation.PhysicalRefreshGenerationResult(
+        ledger_generation_id=physical.id, generation_key="repair-first-fork",
+        physical_import_batch_id=forked_batch.id, cutoff=target_cutoff,
+        from_cutoff=parent.cutoff, created=True,
+    )
+    import_result = importer.HistoricalImportResult(
+        ledger_generation_id=physical.id, from_exclusive=parent.cutoff,
+        cutoff=target_cutoff, completed_through=target_cutoff, windows_completed=1,
+        windows_resumed=0, recorders_pulled=0, movements_inserted=0, complete=True,
+        physical_import_batch_id=forked_batch.id,
+    )
+    mismatch = bootstrap.BalanceConvergenceResult(
+        ledger_generation_id=physical.id, cutoff=target_cutoff.isoformat(),
+        checked_at=target_cutoff.isoformat(), valid=False, content_hash="mismatch",
+        compared=4, mismatched=1, matched=3, terminal_batch_id=forked_batch.id,
+        deltas=(),
+    )
+
+    monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
+    monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
+    monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
+    monkeypatch.setattr(
+        workflow, "evaluate_physical_refresh_balance_convergence",
+        lambda *a, **k: mismatch,
+    )
+    monkeypatch.setattr(
+        workflow, "_repair_mismatched_recorders",
+        lambda *a, **k: order.append("repair") or 0,
+    )
+    monkeypatch.setattr(
+        workflow, "_snap_balance_at_cutoff",
+        lambda *a, **k: order.append("snap") or 0,
+    )
+
+    with pytest.raises(workflow.PhysicalRefreshOrchestratorError):
+        workflow.run_physical_refresh(
+            db_session, generation_key="repair-first", target_cutoff=target_cutoff,
+            client=object(), balance_snapshot={},
+        )
+
+    assert order == ["repair", "snap"]
+
+
 def test_backdated_and_superseded_delta_is_replayed_not_rejected(db_session, monkeypatch):
     """A correction no longer stops the hourly refresh.
 

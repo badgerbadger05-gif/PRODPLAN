@@ -768,6 +768,11 @@ def _run_physical_refresh_job(
         # Routine sync has no retained-horizon discovery. Explicitly queued
         # recorder identities are still processed regardless of age; historical
         # discovery is an explicit maintenance operation.
+        #
+        # A document dated behind the parent cutoff but written after it is
+        # therefore invisible here — it is found instead by the targeted repair
+        # the refresh runs when the balance does not converge, which is bounded
+        # by the mismatched cells rather than by the history.
         discovery_lookback=_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK,
         audit_all_known_recorders=False,
         database_ledger_rows=database_ledger_rows,

@@ -431,6 +431,14 @@ def _snap_balance_at_cutoff(
     bounded by the number of mismatched cells, not by recorder fan-out, and
     converges even against 1C's own negative balances (they are mirrored).
 
+    This runs only after ``_repair_mismatched_recorders`` has already asked the
+    register which real recorders touch the mismatched cells and imported the
+    ones it found, so what reaches this function is the residual no 1C document
+    explains.  A snap must never stand in for a document: it carries the
+    synthetic ``cutoff_balance_adjustment`` kind, which no replenishment
+    attribution reads, so a receipt absorbed here would raise the balance while
+    leaving the plan uncredited and the purchase journal overstated.
+
     Planning-relevant flows (production output, supplier receipts, order-linked
     consumption) are still imported as real movements upstream; only the
     residual left by untracked or backdated adjustments is absorbed here. Each
@@ -530,6 +538,231 @@ def _snap_balance_at_cutoff(
     return len(bad)
 
 
+@dataclass(frozen=True)
+class CutoffSnapRetirement:
+    """What retiring the snaps a freshly imported document explains changed."""
+
+    import_batch_id: int
+    retired_rows: int
+    reissued_rows: int
+    retired_qty: str
+    absorbed_qty: str
+    unabsorbed: tuple[tuple[int, str, str, str], ...]
+
+
+def _global_import_terminal(db: Session) -> int:
+    return int(db.query(func.max(models.PhysicalImportBatch.id)).scalar() or 0)
+
+
+def replaced_revision_ids(
+    db: Session, *, lower_batch_id: int, upper_batch_id: int
+) -> set[int]:
+    """Ids of rows that merely replace an earlier revision in a batch range."""
+    return {
+        int(value)
+        for (value,) in db.query(models.StockLedgerFactSupersession.new_sle_id)
+        .filter(
+            models.StockLedgerFactSupersession.import_batch_id > int(lower_batch_id),
+            models.StockLedgerFactSupersession.import_batch_id <= int(upper_batch_id),
+            models.StockLedgerFactSupersession.new_sle_id.isnot(None),
+        )
+        .all()
+    }
+
+
+def _snap_key(row: Any) -> tuple[int, str, str]:
+    return (
+        int(row.item_id),
+        str(row.organization_ref or ""),
+        str(row.warehouse_ref1c or ""),
+    )
+
+
+def retire_cutoff_snaps_absorbing_facts(
+    db: Session,
+    *,
+    fact_rows: Any,
+    previous_import_batch_id: int,
+    reason: str,
+) -> CutoffSnapRetirement | None:
+    """Retire the cutoff snap that stood in for a now-imported document.
+
+    A ``cutoff_balance_adjustment`` is not a fact.  It is the residual 1C's
+    Balance still showed after the movement import, written at the cutoff of
+    the generation that could not close it.  The moment the real recorder that
+    residual stood for is ingested, the snap is no longer evidence of anything:
+    leaving it beside the document carries the same receipt twice, and the half
+    of it that is synthetic is invisible to replenishment attribution, so the
+    plan is never credited for a receipt the warehouse actually took.
+
+    Every active snap on the cell of a newly imported backdated fact, dated at
+    or after that fact and pointing the same way, is therefore consumed
+    oldest-first up to the imported quantity.  A snap the document explains in
+    full is superseded outright; a snap it explains in part is superseded and
+    re-issued for the remainder, because that remainder was — and still is — a
+    real residual of untracked movement.  Nothing is invented: the replacement
+    is exactly ``retired - absorbed`` per cell, so this operation never moves
+    the cell's balance, and ``unabsorbed`` names every cell where the import
+    exceeded the snaps, which the caller must resolve against 1C rather than
+    silently double.
+
+    Earlier generations are untouched.  The supersession edge carries this new
+    import batch and ``visible_sle_query`` resolves supersessions at the
+    boundary each generation was published with, so every accepted prefix keeps
+    exactly the rows it was accepted with.
+    """
+    rows = [
+        row for row in (fact_rows or ())
+        if str(row.movement_kind or "") != CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+        and str(row.recorder_type or "") != CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+    ]
+    if not rows:
+        return None
+
+    imported: dict[tuple[int, str, str], Decimal] = {}
+    earliest: dict[tuple[int, str, str], datetime] = {}
+    for row in rows:
+        key = _snap_key(row)
+        imported[key] = imported.get(key, Decimal("0")) + Decimal(row.qty or 0)
+        posting = row.posting_at
+        if key not in earliest or _naive(posting) < _naive(earliest[key]):
+            earliest[key] = posting
+    keys = [key for key, qty in imported.items() if qty != 0]
+    if not keys:
+        return None
+
+    snaps = db.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.movement_kind
+        == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+        models.StockLedgerEntry.active.is_(True),
+        models.StockLedgerEntry.item_id.in_(sorted({key[0] for key in keys})),
+    ).order_by(
+        models.StockLedgerEntry.posting_at.asc(),
+        models.StockLedgerEntry.id.asc(),
+    ).all()
+    by_key: dict[tuple[int, str, str], list[Any]] = {}
+    for snap in snaps:
+        key = _snap_key(snap)
+        if key not in imported:
+            continue
+        if _naive(snap.posting_at) < _naive(earliest[key]):
+            # A snap written before the document was posted cannot have
+            # absorbed it; it closed some other residual.
+            continue
+        by_key.setdefault(key, []).append(snap)
+
+    plan: list[tuple[Any, Decimal]] = []
+    unabsorbed: list[tuple[int, str, str, str]] = []
+    retired_qty = Decimal("0")
+    absorbed_qty = Decimal("0")
+    for key in sorted(keys):
+        remaining = imported[key]
+        for snap in by_key.get(key, ()):  # oldest snap first
+            if remaining == 0:
+                break
+            snap_qty = Decimal(snap.qty or 0)
+            if snap_qty == 0 or (snap_qty > 0) != (remaining > 0):
+                # An opposite-signed snap is a different residual; consuming it
+                # would move the balance instead of explaining the document.
+                continue
+            take = snap_qty if abs(snap_qty) <= abs(remaining) else remaining
+            plan.append((snap, snap_qty - take))
+            retired_qty += snap_qty
+            absorbed_qty += take
+            remaining -= take
+        if remaining != 0:
+            unabsorbed.append((key[0], key[1], key[2], str(remaining)))
+    if not plan:
+        return CutoffSnapRetirement(
+            import_batch_id=int(previous_import_batch_id),
+            retired_rows=0,
+            reissued_rows=0,
+            retired_qty="0",
+            absorbed_qty="0",
+            unabsorbed=tuple(unabsorbed),
+        )
+
+    content_hash = canonical_content_hash(
+        [[int(snap.id), str(remainder)] for snap, remainder in plan]
+    )
+    guard_physical_batch_writer(db)
+    batch = models.PhysicalImportBatch(
+        batch_key=f"cutoff-snap-retire:{content_hash[:40]}",
+        status="completed",
+        cutoff=max(snap.posting_at for snap, _ in plan),
+        completed_at=datetime.now(timezone.utc),
+        source_watermarks={
+            "source": CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+            "operation": "retire_cutoff_snaps_absorbing_facts",
+            "reason": str(reason),
+            "retired_rows": len(plan),
+            "content_hash": content_hash,
+            "previous_import_batch_id": int(previous_import_batch_id),
+        },
+    )
+    db.add(batch)
+    db.flush()
+
+    reissued = 0
+    for snap, remainder in plan:
+        replacement = None
+        if remainder != 0:
+            key = _snap_key(snap)
+            recorder_ref = canonical_content_hash(
+                {
+                    "retired_sle_id": int(snap.id),
+                    "item_id": key[0],
+                    "organization_ref": key[1],
+                    "warehouse_ref1c": key[2],
+                }
+            )[:40]
+            replacement = models.StockLedgerEntry(
+                ingest_batch_id=int(batch.id),
+                source_content_hash=recorder_ref,
+                business_identity=business_identity_for_cutoff_balance_adjustment(
+                    recorder_ref,
+                    "0",
+                    item_id=key[0],
+                    characteristic_ref="",
+                    organization_ref=key[1],
+                    warehouse_ref1c=key[2],
+                    snap_content_hash=content_hash,
+                ),
+                item_id=key[0],
+                characteristic_ref="",
+                organization_ref=key[1],
+                warehouse_ref1c=key[2],
+                qty=remainder,
+                posting_at=snap.posting_at,
+                record_type="Receipt" if remainder > 0 else "Expense",
+                movement_kind=CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+                recorder_type=CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+                recorder_ref=recorder_ref,
+                line_no="0",
+                ingest_source=CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+            )
+            db.add(replacement)
+            db.flush()
+            reissued += 1
+        snap.active = False
+        db.add(
+            models.StockLedgerFactSupersession(
+                old_sle_id=int(snap.id),
+                new_sle_id=int(replacement.id) if replacement is not None else None,
+                import_batch_id=int(batch.id),
+            )
+        )
+    db.flush()
+    return CutoffSnapRetirement(
+        import_batch_id=int(batch.id),
+        retired_rows=len(plan),
+        reissued_rows=reissued,
+        retired_qty=str(retired_qty),
+        absorbed_qty=str(absorbed_qty),
+        unabsorbed=tuple(unabsorbed),
+    )
+
+
 def _repair_mismatched_recorders(
     db: Session,
     *,
@@ -568,6 +801,8 @@ def _repair_mismatched_recorders(
     opening_at = _utc(opening[1], "opening boundary")
     cutoff = _utc(generation.cutoff, "generation cutoff")
     identities: set[tuple[str, str]] = set()
+    truncated = False
+    start_terminal = _global_import_terminal(db)
 
     # A cancelled/unposted recorder disappears from 1C's current register, so
     # the register-side lookup below cannot discover it.  Seed the repair set
@@ -581,7 +816,15 @@ def _repair_mismatched_recorders(
     ).filter(
         models.StockLedgerEntry.item_id.in_({key[0] for key in mismatch_keys}),
     ).all()
-    synthetic_types = {SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE}
+    # A cutoff snap is PRODPLAN's own synthetic row, not a 1C document.
+    # Filtering the register by its recorder type makes 1C reject the request,
+    # so it must never enter the repair set; the snap is retired by
+    # ``retire_cutoff_snaps_absorbing_facts`` once the real document lands.
+    synthetic_types = {
+        SEED_RECORDER_TYPE,
+        ADJUSTMENT_RECORDER_TYPE,
+        CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+    }
     for row in known_rows:
         key = (
             int(row.item_id),
@@ -642,16 +885,24 @@ def _repair_mismatched_recorders(
                 if identity[0] and identity[1]:
                     identities.add(identity)
             if len(identities) > _TARGETED_REPAIR_MAX_RECORDERS:
-                raise PhysicalRefreshOrchestratorError(
-                    "targeted convergence repair exceeded recorder limit"
-                )
+                # A backlog wider than the budget is still worth the part of
+                # itself that fits: repair what it can and let the snap absorb
+                # the rest, instead of failing the tick and freezing the
+                # Ledger the way the unbounded repair once did.
+                truncated = True
+                break
             if len(rows) < _TARGETED_REPAIR_PAGE_SIZE:
                 break
             offset += len(rows)
+        if truncated:
+            break
 
     deferred: list[tuple[str, str]] = []
     repaired = 0
-    for recorder_type, recorder_ref in sorted(identities):
+    failed: list[tuple[str, str]] = []
+    for recorder_type, recorder_ref in sorted(identities)[
+        :_TARGETED_REPAIR_MAX_RECORDERS
+    ]:
         try:
             result = pull_recorder_movements(
                 db,
@@ -677,9 +928,10 @@ def _repair_mismatched_recorders(
             or result.skipped_unknown_record_type
             or result.skipped_non_warehouse
         ):
-            raise PhysicalRefreshOrchestratorError(
-                f"targeted recorder repair failed: {recorder_type} {recorder_ref}"
-            )
+            # One unusable recorder is not a reason to leave every other
+            # mismatched cell unexplained; the snap still closes what stays.
+            failed.append((recorder_type, recorder_ref))
+            continue
         repaired += 1
 
     terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
@@ -687,17 +939,57 @@ def _repair_mismatched_recorders(
         raise PhysicalRefreshOrchestratorError(
             "targeted convergence repair lost physical terminal"
         )
+    # A revision of a recorder the Ledger already had is not new evidence: its
+    # quantity was already in the basis the snap was computed against, so
+    # retiring a snap by it would move the balance.  Only rows that replace
+    # nothing count as the document the snap stood in for.
+    replacements = replaced_revision_ids(
+        db, lower_batch_id=int(start_terminal), upper_batch_id=int(terminal),
+    )
+    imported_rows = tuple(
+        row for row in db.query(models.StockLedgerEntry)
+        .filter(
+            models.StockLedgerEntry.ingest_batch_id > int(start_terminal),
+            models.StockLedgerEntry.ingest_batch_id <= int(terminal),
+        )
+        .order_by(models.StockLedgerEntry.id.asc())
+        .all()
+        if int(row.id) not in replacements
+    )
+    retirement = retire_cutoff_snaps_absorbing_facts(
+        db,
+        fact_rows=imported_rows,
+        previous_import_batch_id=int(terminal),
+        reason="targeted convergence repair imported the real recorder",
+    )
+    if retirement is not None and retirement.retired_rows:
+        terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
     generation.physical_import_batch_id = int(terminal)
     generation.source_watermarks = {
         **dict(generation.source_watermarks or {}),
         "targeted_convergence_repair": {
-            "version": "1",
+            "version": "2",
             "mismatched_keys": len(mismatch_keys),
             "recorder_count": repaired,
+            "discovery_truncated": bool(truncated),
+            "failed_recorders": [
+                {"recorder_type": recorder_type, "recorder_ref": recorder_ref}
+                for recorder_type, recorder_ref in failed
+            ],
             "deferred_beyond_cutoff": [
                 {"recorder_type": recorder_type, "recorder_ref": recorder_ref}
                 for recorder_type, recorder_ref in deferred
             ],
+            "retired_cutoff_snaps": (
+                {
+                    "retired_rows": retirement.retired_rows,
+                    "reissued_rows": retirement.reissued_rows,
+                    "retired_qty": retirement.retired_qty,
+                    "absorbed_qty": retirement.absorbed_qty,
+                    "unabsorbed_cells": len(retirement.unabsorbed),
+                }
+                if retirement is not None else None
+            ),
             "physical_import_batch_id": int(terminal),
         },
     }
@@ -1021,6 +1313,7 @@ def run_physical_refresh(
             )
 
         convergence = _bounded_convergence()
+        targeted_repair: dict[str, Any] | None = None
         if not convergence.valid:
             physical_generation = db.get(
                 models.LedgerGeneration, int(fork.ledger_generation_id)
@@ -1028,6 +1321,49 @@ def run_physical_refresh(
             if physical_generation is None:
                 raise PhysicalRefreshOrchestratorError(
                     "physical refresh generation disappeared before targeted repair"
+                )
+            # A residual is first assumed to be a real 1C document this tick
+            # has not seen.  Routine sync does no retained-horizon discovery
+            # (that scan is O(history)), so a document dated behind the parent
+            # cutoff but written after it is invisible to both the forward
+            # window and the recorder audit.  This repair is driven by the
+            # mismatched cells themselves — it asks the register which
+            # recorders touch exactly those items — so it is bounded by the
+            # divergence, not by the history.  Only what it cannot explain is
+            # handed to the snap below: a snap must never stand in for a
+            # document, or replenishment is never credited for the receipt.
+            try:
+                repaired = _repair_mismatched_recorders(
+                    db,
+                    generation=physical_generation,
+                    client=client,
+                    convergence=convergence,
+                )
+            except Exception as exc:
+                # Never freeze the Ledger on a repair: the snap still converges.
+                db.rollback()
+                targeted_repair = {"repaired": 0, "error": str(exc)}
+            else:
+                targeted_repair = {"repaired": int(repaired)}
+                if repaired:
+                    physical_generation = db.get(
+                        models.LedgerGeneration, int(fork.ledger_generation_id)
+                    )
+                    delta = _physical_refresh_delta_rows(
+                        db,
+                        parent=parent,
+                        target=physical_generation,
+                        physical_import=physical_import,
+                        recorder_audit=recorder_audit,
+                    )
+                    convergence = _bounded_convergence()
+        if not convergence.valid:
+            physical_generation = db.get(
+                models.LedgerGeneration, int(fork.ledger_generation_id)
+            )
+            if physical_generation is None:
+                raise PhysicalRefreshOrchestratorError(
+                    "physical refresh generation disappeared before balance snap"
                 )
             snapped = _snap_balance_at_cutoff(
                 db,
@@ -1351,6 +1687,7 @@ def run_physical_refresh(
                 ),
                 "database_ledger_rows": database_ledger_rows,
                 "duration_ms": publish_duration_ms,
+                "targeted_repair": targeted_repair,
                 "phase_timings": dict(getattr(current_publish, "phase_timings", ()) or ()),
             },
         }
