@@ -116,11 +116,6 @@ def known_at_freeze(
     return False
 
 
-#: Named cause of the part of a fact an owner had already taken from stock at
-#: its freeze (decision §58).  It is neither an allocation nor free surplus.
-FROZEN_STOCK_REASON = "covered_from_stock_at_freeze"
-
-
 def replenishment_available_from_fact(
     fact_qty: Decimal,
     revisions: Any,

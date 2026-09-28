@@ -22,10 +22,7 @@ from .reservation import (
     replenishment_remaining,
 )
 
-from .historical_replay_core import (
-    known_at_freeze,
-    replenishment_available_from_fact,
-)
+from .historical_replay_core import replenishment_available_from_fact
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
 from .current_replenishment import reject_legacy_supplier_receipt_writer
@@ -540,15 +537,6 @@ def _freeze_boundary_of(
         getattr(entry, "known_batch_id", None),
         getattr(entry, "baseline_at", None),
     )
-
-
-def _receipt_known_at_freeze(
-    fact: "ReceiptFact",
-    entry: Any,
-    boundaries: Mapping[int, Any] | None,
-) -> bool:
-    batch, instant = _freeze_boundary_of(entry, boundaries)
-    return known_at_freeze(fact.known_revisions, batch, instant)
 
 
 def _freeze_caps_for_receipt(
