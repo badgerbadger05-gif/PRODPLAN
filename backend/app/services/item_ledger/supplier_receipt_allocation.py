@@ -1394,6 +1394,85 @@ def build_supplier_receipt_provenance(
     )
 
 
+def persist_supplier_receipt_provenance_for_sles(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    explicit_sles: Iterable[models.StockLedgerEntry],
+    evidence: Iterable[SupplierDocumentEvidence],
+) -> tuple[models.StockLedgerSupplierReceiptProvenance, ...]:
+    """Type an explicit set of receipt rows, without touching the rest.
+
+    A supplier receipt is invisible to BUY replenishment until this
+    generation owns typed provenance for it: the R4 writer deliberately reads
+    ``StockLedgerSupplierReceiptProvenance``, not raw ``receipt`` movements,
+    because internal transfers look the same in the register.
+
+    ``rebuild_supplier_receipt_coverage`` is the whole-generation writer: it
+    replaces the entire supplier read model and sweeps anything its evidence
+    no longer names, which is right for a rebuild and wrong for a repair that
+    adds a document nobody had typed.  This is the same seam narrowed to an
+    explicit SLE set — identical normaliser, identical row builder — and it
+    refuses to overwrite provenance that already exists, so it can only ever
+    add what was missing.
+    """
+    rows = tuple(evidence)
+    _validate_operations(rows)
+    sles = tuple(explicit_sles)
+    if not sles or not rows:
+        return ()
+    normalized_rows = normalize_supplier_receipt_evidence(
+        db, explicit_sles=sles, evidence=rows,
+    )
+    existing = {
+        int(row.stock_ledger_entry_id)
+        for row in db.query(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        ).filter(
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+            == int(ledger_generation_id),
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
+                sorted({int(sle.id) for sle in sles})
+            ),
+        ).all()
+    }
+    created: list[models.StockLedgerSupplierReceiptProvenance] = []
+    for normalized in normalized_rows:
+        matched_sle_id = int(normalized.fact.sle_id)
+        if matched_sle_id in existing:
+            continue
+        row = normalized.evidence
+        built = build_supplier_receipt_provenance(
+            ledger_generation_id=int(ledger_generation_id),
+            stock_ledger_entry_id=matched_sle_id,
+            receipt_doc_type=row.receipt_doc_type,
+            receipt_doc_ref=row.receipt_doc_ref,
+            receipt_doc_line_no=row.receipt_doc_line_no,
+            operation_kind=_OPERATION_KINDS[normalized.operation],
+            operation_key=row.operation_key,
+            operation_name=row.operation_name,
+            item_id=row.item_id,
+            signed_qty=row.signed_qty,
+            match_rule=normalized.match_rule,
+            match_status=normalized.match_status,
+            supplier_order_type=row.supplier_order_type,
+            supplier_order_ref=row.supplier_order_ref,
+            supplier_order_line_no=row.supplier_order_line_no,
+            characteristic_ref=row.characteristic_ref,
+            warehouse_ref1c=row.warehouse_ref1c,
+            correction_receipt_ref=row.correction_receipt_ref,
+            ambiguity_count=normalized.ambiguity_count,
+            reason=normalized.reason,
+        )
+        built.supplier_order_ref = normalized.fact.supplier_order_ref
+        built.supplier_order_line_no = normalized.fact.supplier_order_line_no
+        db.add(built)
+        created.append(built)
+        existing.add(matched_sle_id)
+    db.flush()
+    return tuple(created)
+
+
 def rebuild_supplier_receipt_coverage(
     db: Session,
     *,

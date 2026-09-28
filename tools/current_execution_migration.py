@@ -2039,6 +2039,278 @@ def apply_replenishment_rebase(
             )
 
 
+def _parse_recorder_identity(value: str) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    recorder_type, _, recorder_ref = raw.partition(":")
+    recorder_type = recorder_type.strip()
+    recorder_ref = recorder_ref.strip().strip("{}")
+    if not recorder_type or not recorder_ref:
+        raise PreflightBlocked(
+            f"--recorder expects '<Recorder_Type>:<Ref_Key>', got {value!r}"
+        )
+    return recorder_type, recorder_ref
+
+
+def _backdated_recorder_repair_on_session(
+    session: Session,
+    generation_id: int,
+    *,
+    recorders: tuple[tuple[str, str], ...],
+    client: Any,
+    republish: bool = True,
+) -> dict[str, Any]:
+    """Ingest a backdated 1C document a cutoff snap papered over, then rebase.
+
+    The bounded physical refresh discovers a recorder either inside its forward
+    window or through an explicitly queued pull.  A document *dated* behind the
+    accepted cutoff but *written* after it is in neither: 1C's register carries
+    the document date in ``Period``, so the closed forward window never
+    revisits it, and nothing queues a receipt a person typed in 1C.  The
+    balance then diverged, and the cutoff snap closed the divergence with a
+    synthetic ``cutoff_balance_adjustment`` — a row no replenishment
+    attribution reads.  The warehouse had the goods, the plan was never
+    credited, and the purchase journal kept asking for them.
+
+    The refresh now repairs that class by itself (targeted recorder repair
+    before the snap).  It cannot repair what is already absorbed: those cells
+    converge against 1C, so no residual points at them any more.  This one-off
+    is that pointer, given by hand.
+
+    It changes nothing about how any quantity is computed.  It pulls the named
+    recorders through the canonical ``pull_recorder_movements``, retires the
+    snaps they explain through the canonical
+    ``retire_cutoff_snaps_absorbing_facts`` (balance-neutral by construction:
+    the unexplained remainder of each snap is re-issued), advances the pointer
+    generation's physical boundary so the accepted prefix contains facts that
+    were already true at its own cutoff, and then hands the result to the
+    existing ``--phase replenishment-rebase`` writers.  No second engine, no
+    new cutoff, no 1C write, no pointer move.
+    """
+
+    from app import models
+    from app.services.item_ledger.ingest import pull_recorder_movements
+    from app.services.item_ledger.physical_refresh_orchestrator import (
+        replaced_revision_ids,
+        retire_cutoff_snaps_absorbing_facts,
+    )
+
+    if not recorders:
+        raise PreflightBlocked("--recorder is required at least once")
+    _lock_truth_pointer(session, int(generation_id))
+    generation = session.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise PreflightBlocked(
+            f"generation {int(generation_id)} is not an accepted pointer generation"
+        )
+    if generation.cutoff is None:
+        raise PreflightBlocked(
+            f"accepted generation {int(generation_id)} has no cutoff"
+        )
+    building = session.execute(text(
+        "SELECT count(*) FROM ledger_generation WHERE status = 'building'"
+    )).scalar_one()
+    if int(building or 0):
+        raise PreflightBlocked(
+            "a BUILDING physical candidate exists; finish or discard it first"
+        )
+
+    start_terminal = int(session.execute(text(
+        "SELECT coalesce(max(id), 0) FROM physical_import_batch"
+    )).scalar_one() or 0)
+    if start_terminal != int(generation.physical_import_batch_id or 0):
+        raise PreflightBlocked(
+            "the accepted pointer is not the physical terminal "
+            f"({generation.physical_import_batch_id} vs {start_terminal}); "
+            "an unaccepted import is in flight"
+        )
+
+    pulled: list[dict[str, Any]] = []
+    for recorder_type, recorder_ref in recorders:
+        result = pull_recorder_movements(
+            session,
+            recorder_type,
+            recorder_ref,
+            client=client,
+            source="backdated_recorder_repair",
+            ledger_generation_id=None,
+            max_posting_at=generation.cutoff,
+            strict_historical=True,
+        )
+        if result.status not in {"done", "empty"} or result.error or result.diagnostics:
+            raise PreflightBlocked(
+                f"recorder {recorder_type} {recorder_ref} failed: {result.status}"
+            )
+        if (
+            result.skipped_unknown_item
+            or result.skipped_unknown_record_type
+            or result.skipped_non_warehouse
+        ):
+            raise PreflightBlocked(
+                f"recorder {recorder_type} {recorder_ref} produced skipped movements"
+            )
+        pulled.append({
+            "recorder_type": recorder_type,
+            "recorder_ref": recorder_ref,
+            "status": result.status,
+            "inserted": int(result.inserted),
+            "deleted": int(result.deleted),
+        })
+    session.flush()
+
+    terminal = int(session.execute(text(
+        "SELECT coalesce(max(id), 0) FROM physical_import_batch"
+    )).scalar_one() or 0)
+    # A revision of a recorder the Ledger already had was already in the basis
+    # the snap was computed against; only rows that replace nothing are the
+    # document the snap stood in for.
+    replacements = replaced_revision_ids(
+        session, lower_batch_id=start_terminal, upper_batch_id=terminal,
+    )
+    imported_rows = [
+        row for row in session.query(models.StockLedgerEntry)
+        .filter(models.StockLedgerEntry.ingest_batch_id > start_terminal)
+        .order_by(models.StockLedgerEntry.id.asc())
+        .all()
+        if int(row.id) not in replacements
+    ]
+    retirement = retire_cutoff_snaps_absorbing_facts(
+        session,
+        fact_rows=imported_rows,
+        previous_import_batch_id=terminal,
+        reason=(
+            "one-off backdated recorder repair: the real 1C document replaces "
+            "the cutoff snap that absorbed it"
+        ),
+    )
+    if retirement is not None and retirement.unabsorbed:
+        # The import is not covered by a snap, so accepting it would raise the
+        # cell above 1C's own balance.  That is a different defect and must not
+        # be closed by this tool.
+        raise PostflightBlocked(
+            "imported facts exceed the cutoff snaps on "
+            f"{len(retirement.unabsorbed)} cells: {retirement.unabsorbed[:5]}"
+        )
+    terminal = int(session.execute(text(
+        "SELECT coalesce(max(id), 0) FROM physical_import_batch"
+    )).scalar_one() or 0)
+    generation.physical_import_batch_id = terminal
+    session.flush()
+
+    # A receipt stays invisible to BUY replenishment until this generation
+    # owns typed supplier provenance for it: the R4 writer reads the typed
+    # evidence, not raw ``receipt`` movements.  Typing uses the same canonical
+    # seam the bounded refresh uses (extract -> normalise -> build), narrowed
+    # to the rows this repair imported.
+    from app.services.item_ledger.supplier_receipt_odata import (
+        extract_supplier_document_evidence,
+    )
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        persist_supplier_receipt_provenance_for_sles,
+    )
+    from app.services.item_ledger.physical_refresh_supplier_evidence import (
+        is_supplier_document_type,
+    )
+
+    supplier_rows = [
+        row for row in imported_rows
+        if is_supplier_document_type(row.recorder_type)
+    ]
+    typed = ()
+    if supplier_rows:
+        extraction = extract_supplier_document_evidence(
+            session, client, supplier_rows
+        )
+        if extraction.diagnostics:
+            raise PostflightBlocked(
+                "supplier document evidence diagnostic "
+                f"{extraction.diagnostics[0].code}: {extraction.diagnostics[0].detail}"
+            )
+        typed = persist_supplier_receipt_provenance_for_sles(
+            session,
+            ledger_generation_id=int(generation_id),
+            explicit_sles=supplier_rows,
+            evidence=extraction.evidence,
+        )
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "backdated_recorder_repair": {
+            "version": "1",
+            "recorders": pulled,
+            "typed_supplier_provenance": len(typed),
+            "physical_import_batch_id": terminal,
+            "retired_cutoff_snaps": (
+                {
+                    "retired_rows": retirement.retired_rows,
+                    "reissued_rows": retirement.reissued_rows,
+                    "retired_qty": retirement.retired_qty,
+                    "absorbed_qty": retirement.absorbed_qty,
+                }
+                if retirement is not None else None
+            ),
+        },
+    }
+    session.flush()
+
+    rebase = _replenishment_rebase_on_session(
+        session, int(generation_id), republish=republish
+    )
+    return {
+        **rebase,
+        "phase": "backdated-recorder-repair",
+        "recorders": pulled,
+        "imported_rows": len(imported_rows),
+        "typed_supplier_provenance": len(typed),
+        "physical_import_batch_id": terminal,
+        "retired_cutoff_snaps": (
+            {
+                "retired_rows": retirement.retired_rows,
+                "reissued_rows": retirement.reissued_rows,
+                "retired_qty": retirement.retired_qty,
+                "absorbed_qty": retirement.absorbed_qty,
+            }
+            if retirement is not None else None
+        ),
+    }
+
+
+def apply_backdated_recorder_repair(
+    engine: Engine,
+    *,
+    writers_stopped: bool,
+    recorders: tuple[tuple[str, str], ...],
+    client: Any | None = None,
+    republish: bool = True,
+) -> dict[str, Any]:
+    """Ingest named backdated recorders and rebase R4, in one transaction."""
+
+    if not writers_stopped:
+        raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+    if client is None:
+        from app.services.odata_config import load_odata_config, sanitize_base_url
+        from app.services.odata_client import OData1CClient
+
+        config = load_odata_config()
+        base_url = sanitize_base_url(str(config.get("base_url") or ""))
+        if not base_url:
+            raise PreflightBlocked("OData connection is not configured (base_url)")
+        client = OData1CClient(
+            base_url=base_url,
+            username=config.get("username") or None,
+            password=config.get("password") or None,
+            token=config.get("token") or None,
+        )
+    generation_id = _accepted_truth_generation(engine)
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        with session.begin():
+            return _backdated_recorder_repair_on_session(
+                session,
+                int(generation_id),
+                recorders=recorders,
+                client=client,
+                republish=republish,
+            )
+
+
 def _provenance_source_generations(
     session: Session, pointer_generation_id: int
 ) -> list[int]:
@@ -2427,6 +2699,7 @@ def main(argv: list[str] | None = None) -> int:
             "postflight",
             "replenishment-bootstrap",
             "replenishment-rebase",
+            "backdated-recorder-repair",
             "supplier-provenance-repair",
             "retire-closed-owner-allocations",
             "pre-deploy-backlog",
@@ -2444,6 +2717,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "explicit acknowledgement required by --phase apply/"
             "replenishment-bootstrap/replenishment-rebase/"
+            "backdated-recorder-repair/"
             "supplier-provenance-repair/retire-closed-owner-allocations"
         ),
     )
@@ -2451,9 +2725,19 @@ def main(argv: list[str] | None = None) -> int:
         "--no-republish",
         action="store_true",
         help=(
-            "replenishment-rebase only: write the R4 state and leave the "
-            "dependent current execution scopes to the next physical refresh "
-            "tick instead of republishing them here"
+            "replenishment-rebase/backdated-recorder-repair only: write the "
+            "R4 state and leave the dependent current execution scopes to the "
+            "next physical refresh tick instead of republishing them here"
+        ),
+    )
+    parser.add_argument(
+        "--recorder",
+        action="append",
+        default=[],
+        metavar="TYPE:REF",
+        help=(
+            "backdated-recorder-repair only: a 1C recorder to ingest, e.g. "
+            "Document_ПриходнаяНакладная:<Ref_Key>; repeatable"
         ),
     )
     parser.add_argument("--generation-id", type=int)
@@ -2499,6 +2783,15 @@ def main(argv: list[str] | None = None) -> int:
             report = apply_replenishment_rebase(
                 engine,
                 writers_stopped=args.writers_stopped,
+                republish=not args.no_republish,
+            )
+        elif args.phase == "backdated-recorder-repair":
+            report = apply_backdated_recorder_repair(
+                engine,
+                writers_stopped=args.writers_stopped,
+                recorders=tuple(
+                    _parse_recorder_identity(value) for value in args.recorder
+                ),
                 republish=not args.no_republish,
             )
         else:
