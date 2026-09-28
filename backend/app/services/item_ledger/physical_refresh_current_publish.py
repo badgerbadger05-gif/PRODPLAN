@@ -36,6 +36,7 @@ from app.services.item_ledger.current_replenishment import (
     apply_current_replenishment_for_bounded_make_scopes,
     require_facts_not_over_allocated,
 )
+from app.services.item_ledger.document_net_output import NETTED_MOVEMENT_KINDS
 from app.services.item_ledger.drum_schedule_persistence import (
     build_compact_current_drum_payload,
 )
@@ -537,7 +538,7 @@ def _current_owner_rows(
     relevant_item_ids = {
         int(row.item_id)
         for row in rows
-        if _text(row.movement_kind) == "assembly_in"
+        if _text(row.movement_kind) in NETTED_MOVEMENT_KINDS
         or (
             _is_supplier_receipt(row)
             and _text(row.warehouse_ref1c)
@@ -562,8 +563,13 @@ def _current_scopes(
     current_owners: Sequence[models.ReservationEntry],
 ) -> tuple[tuple[int, str, str, str, str], ...]:
     scopes: set[tuple[int, str, str, str, str]] = set()
+    # Both netted kinds open a MAKE scope.  The creditable quantity of an
+    # ``assembly_in`` line is its document's net output, so an ``assembly_out``
+    # leg arriving on its own - a re-posted or backdated document line - changes
+    # how much of that document was produced and must replay the scope; scoping
+    # on receipts alone left the stale credit in place.
     assembly_rows = tuple(
-        row for row in rows if _text(row.movement_kind) == "assembly_in"
+        row for row in rows if _text(row.movement_kind) in NETTED_MOVEMENT_KINDS
     )
     if assembly_rows:
         for row in assembly_rows:

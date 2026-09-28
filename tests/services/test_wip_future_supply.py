@@ -260,3 +260,69 @@ def test_destination_outside_contour_is_rejected_without_failing_the_capture(db_
     assert by_ref["ORDER-OUT"].evidence_status == "rejected"
     assert by_ref["ORDER-OUT"].reason == "planning_pool_not_mapped"
     assert by_ref["ORDER-OUT"].ordered_qty_at_cutoff == Decimal("10")
+
+
+def test_wip_realized_is_the_canonical_document_net_output(db_session):
+    """An 8945-shaped document: the item passes through, it is not produced.
+
+    ``СборкаЗапасов`` writes a receipt on the production warehouse, an issue
+    from it and a receipt on the destination warehouse; only the net was
+    produced (CANON R7, ``document_net_output.py``).  Adding up the raw
+    ``assembly_in`` lines made this adapter report more realized than the line
+    had ordered, which closed its open WIP supply and offered the work for
+    ordering a second time.
+    """
+    generation, _physical, _build, item, warehouse = _scope(db_session, "net")
+    order, _product_row = _product(
+        db_session, item, warehouse, order_ref="ORDER-NET", qty="10",
+    )
+    # One document that really produced 3 units: +3 production warehouse,
+    # -3 leaving it, +3 arriving at the destination.
+    _sle(db_session, generation, item, recorder="ORDER-NET", qty="3", line="1")
+    _sle(
+        db_session, generation, item, recorder="ORDER-NET", qty="-3",
+        kind="assembly_out", line="2",
+    )
+    _sle(
+        db_session, generation, item, recorder="ORDER-NET", qty="3", line="3",
+        warehouse=warehouse.warehouse_ref1c,
+    )
+    # One document that only consumed the item: the raw receipt leg alone
+    # would count as production of 4.
+    _sle(db_session, generation, item, recorder="ORDER-NET", qty="4", line="4")
+    _sle(
+        db_session, generation, item, recorder="ORDER-NET", qty="-8",
+        kind="assembly_out", line="5",
+    )
+    db_session.flush()
+
+    # A second order whose own document really produced 2 units, so the test
+    # proves the linkage still works and only the quantity rule changed.
+    _order2, _product2 = _product(
+        db_session, item, warehouse, order_ref="ORDER-NET-2", line=2, qty="6",
+    )
+    _sle(db_session, generation, item, recorder="ORDER-NET-2", qty="2", line="1")
+    _sle(
+        db_session, generation, item, recorder="ORDER-NET-2", qty="-2",
+        kind="assembly_out", line="2",
+    )
+    _sle(
+        db_session, generation, item, recorder="ORDER-NET-2", qty="2", line="3",
+        warehouse=warehouse.warehouse_ref1c,
+    )
+    db_session.flush()
+
+    rows = {
+        str(row.source_ref): row
+        for row in collect_wip_future_supply_evidence(
+            db_session, generation.id,
+            planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
+        )
+    }
+
+    # Raw ``assembly_in`` would be 3 + 3 + 4 = 10; the document nets to
+    # max(10 - 11, 0) = 0.
+    assert rows["ORDER-NET"].realized_qty_at_cutoff == Decimal("0")
+    assert rows["ORDER-NET"].ordered_qty_at_cutoff == Decimal("10")
+    # Raw would be 4 here; the document produced 2.
+    assert rows["ORDER-NET-2"].realized_qty_at_cutoff == Decimal("2")

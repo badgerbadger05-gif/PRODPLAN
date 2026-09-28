@@ -411,3 +411,83 @@ def test_bounded_make_credits_document_net_output_not_raw_assembly_in(db_session
     }
     assert int(facts[item.item_id].id) not in allocated
     assert sum(allocated.values()) == Decimal("2")
+
+
+def test_the_over_allocation_guard_measures_an_output_against_its_net(db_session):
+    """Invariants 2-3: an ``assembly_in`` line exists only as its net output.
+
+    Measured against the raw line, an allocation of a pure transport leg
+    satisfied the invariant while counting a movement that produced nothing.
+    A supplier receipt and a material issue keep their own ``|qty|``.
+    """
+    from app.services.item_ledger.current_replenishment import over_allocated_facts
+
+    parent, _target, items, owners, _facts = _world(db_session)
+    item = items[0]
+    owner = owners[item.item_id]
+    posted = parent.cutoff
+
+    def leg(qty, kind, line_no, suffix):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=parent.physical_import_batch_id,
+            source_content_hash=f"guard-{suffix}".ljust(64, "0"),
+            business_identity=f"guard:{suffix}",
+            item_id=item.item_id, characteristic_ref="", organization_ref="",
+            warehouse_ref1c="WH-MAKE", qty=Decimal(qty), posting_at=posted,
+            record_type="Receipt" if Decimal(qty) > 0 else "Expense",
+            movement_kind=kind, recorder_type="Assembly", recorder_ref="G1",
+            line_no=line_no, ingest_source="pull",
+        )
+        db_session.add(row)
+        db_session.flush()
+        return row
+
+    # One document: a receipt on the production warehouse and the issue that
+    # takes it away again.  It produced nothing.
+    receipt = leg("3", "assembly_in", "1", "in")
+    leg("-3", "assembly_out", "2", "out")
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=parent.id, reservation_id=owner.id,
+        sle_id=receipt.id, requirement_id=owner.requirement_id,
+        allocated_qty=Decimal("3"), match_rule="fifo", fact_ref="G1",
+        fact_line_ref="1", item_id=item.item_id, characteristic_ref="",
+        organization_ref="", planning_stock_pool="selected",
+        idempotency_key="guard-1", allocation_role="replenishment_receipt",
+        is_current=True, event_at=posted,
+    ))
+    db_session.flush()
+
+    offenders = over_allocated_facts(db_session, limit=0)
+    assert [(row[0], row[2], row[3]) for row in offenders] == [
+        (int(receipt.id), Decimal("3"), Decimal("0"))
+    ]
+
+
+def test_an_assembly_out_leg_alone_opens_the_make_scope(db_session):
+    """The netted kinds both decide how much a document produced.
+
+    An ``assembly_out`` leg arriving on its own - a re-posted or backdated
+    document line - changes the net output of its document, so it has to
+    replay the MAKE scope; scoping on receipts alone left the stale credit in
+    place.
+    """
+    from types import SimpleNamespace
+
+    from app.services.item_ledger import physical_refresh_current_publish as publisher
+
+    parent, _target, items, owners, _facts = _world(db_session)
+    owner = owners[items[0].item_id]
+    row = SimpleNamespace(
+        id=1, item_id=int(items[0].item_id), characteristic_ref="",
+        organization_ref="", warehouse_ref1c="WH-MAKE",
+        movement_kind="assembly_out", recorder_type="Document_СборкаЗапасов",
+    )
+    current_owners = publisher._current_owner_rows(
+        db_session, (row,), planning_pool_by_warehouse={"WH-MAKE": "default"},
+    )
+    assert {int(entry.id) for entry in current_owners} == {int(owner.id)}
+    assert publisher._current_scopes(
+        (row,),
+        planning_pool_by_warehouse={"WH-MAKE": "default"},
+        current_owners=current_owners,
+    ) == ((int(items[0].item_id), "", "", "default", "make"),)

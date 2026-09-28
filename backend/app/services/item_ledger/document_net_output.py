@@ -117,3 +117,59 @@ def net_document_output_qty(rows: Iterable[Any]) -> dict[int, Decimal]:
             unmatched_offset -= take
 
     return net_by_sle
+
+
+def net_output_for_facts(
+    db: Any,
+    rows: Iterable[Any],
+    *,
+    physical_import_batch_id: int,
+    cutoff: Any = None,
+) -> dict[int, Decimal]:
+    """:func:`net_document_output_qty` for facts whose documents are not loaded.
+
+    The formula needs the *complete* document: a receipt line alone cannot say
+    how much of itself is internal transport.  A caller that holds only the
+    lines it cares about - an invariant check over existing allocations, a
+    backlog report, an evidence adapter - would otherwise each write its own
+    "now load the rest of the document" query, and the first one to get it
+    wrong would quietly net against an incomplete document.
+
+    So the lookup lives beside the formula it feeds.  It only reads, inside the
+    same visible prefix the caller names, and it still owns no allocation
+    policy: it answers how much of each given row exists, nothing else.
+    """
+    from app import models
+    from .physical_visibility import visible_sle_query
+
+    wanted = [row for row in rows if row is not None]
+    if not wanted:
+        return {}
+    recorders = sorted({
+        str(row.recorder_ref or "").strip()
+        for row in wanted
+        if str(row.recorder_ref or "").strip()
+    })
+    document_rows: list[Any] = []
+    for start in range(0, len(recorders), 500):
+        chunk = recorders[start:start + 500]
+        document_rows.extend(
+            visible_sle_query(
+                db,
+                physical_import_batch_id=int(physical_import_batch_id),
+                cutoff=cutoff,
+            )
+            .filter(
+                models.StockLedgerEntry.recorder_ref.in_(chunk),
+                models.StockLedgerEntry.movement_kind.in_(
+                    tuple(sorted(NETTED_MOVEMENT_KINDS))
+                ),
+            )
+            .all()
+        )
+    # A row without a recorder is its own only document (``_document_key``),
+    # so it is judged on its own even when the query above cannot find it.
+    by_id = {int(row.id): row for row in document_rows}
+    for row in wanted:
+        by_id.setdefault(int(row.id), row)
+    return net_document_output_qty(by_id.values())

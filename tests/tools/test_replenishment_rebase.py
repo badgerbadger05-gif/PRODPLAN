@@ -1,4 +1,4 @@
-"""Contract of ``--phase make-replenishment-bootstrap``.
+"""Contract of ``--phase replenishment-rebase``.
 
 The bounded physical refresh replays a MAKE distribution scope only when its
 delta carries an ``assembly_in`` of that item, so a stand migrated from a live
@@ -30,7 +30,7 @@ from app.services.item_ledger.physical_refresh_current_publish import (
 )
 from tools.current_execution_migration import (
     PreflightBlocked,
-    apply_make_replenishment_bootstrap,
+    apply_replenishment_rebase,
 )
 
 
@@ -88,6 +88,7 @@ def _owner(
     freeze_batch: models.PhysicalImportBatch,
     item: models.Item,
     required: Decimal,
+    covered: Decimal = Decimal("0"),
     mode: str = "make",
     lifecycle: str = "active",
     period_from: date = date(2026, 8, 1),
@@ -118,9 +119,9 @@ def _owner(
         ledger_generation_id=generation.id, item_id=item.item_id,
         run_id=run.run_id, freeze_version=1, requirement_id=requirement.id,
         priority_period_from=period_from, priority_period_to=period_to,
-        realization_mode=mode, reserved_qty=required,
+        realization_mode=mode, reserved_qty=required + covered,
         replenishment_required_qty=required,
-        covered_from_stock_at_freeze_qty=Decimal("0"),
+        covered_from_stock_at_freeze_qty=covered,
         lifecycle_status=lifecycle, owner_kind="current", is_current=True,
         current_identity=f"reservation:req:{int(requirement.id)}:mode:{mode}",
     )
@@ -151,9 +152,9 @@ def _world(engine):
         session.flush()
 
         # Known at freeze (§49/§51): imported by the freeze batch and dated
-        # before its instant - this is the owner's frozen stock, not its
-        # replenishment.
-        _sle(
+        # before its instant.  Decision §58: it is this owner's frozen stock
+        # only up to what the owner actually covered from stock.
+        pre_freeze = _sle(
             session, batch=freeze_batch, item_id=item.item_id, qty=Decimal("4"),
             posting_at=FREEZE_AT - timedelta(days=2), movement_kind="assembly_in",
             recorder="doc-before-freeze", line_no="1",
@@ -186,6 +187,7 @@ def _world(engine):
             "item_id": int(item.item_id),
             "owner_id": int(owner.id),
             "output_sle_id": int(output.id),
+            "pre_freeze_sle_id": int(pre_freeze.id),
         }
 
 
@@ -208,28 +210,33 @@ def test_phase_requires_writers_stopped():
     engine = _engine()
     _world(engine)
     with pytest.raises(PreflightBlocked, match="writers-stopped"):
-        apply_make_replenishment_bootstrap(engine, writers_stopped=False)
+        apply_replenishment_rebase(engine, writers_stopped=False)
 
 
 def test_bootstrap_credits_only_the_net_output_after_the_freeze_boundary():
     engine = _engine()
     world = _world(engine)
-    report = apply_make_replenishment_bootstrap(
+    report = apply_replenishment_rebase(
         engine, writers_stopped=True, republish=False
     )
     assert report["status"] == "ready"
     assert report["generation_id"] == world["generation_id"]
-    assert report["make_scopes"] == 1
-    # Three ``assembly_in`` rows are visible; one is pre-freeze, one is an
-    # internal transport leg, and only the third is a fact.
-    assert report["assembly_output_facts"] == 2
-    assert report["netted_internal_transfer_rows"] == 1
-    assert report["inserted"] == 1
+    assert report["make"]["make_scopes"] == 1
+    # Three ``assembly_in`` rows are visible; one is an internal transport leg
+    # of its own document and is not output at all.  The pre-freeze one is a
+    # fact: decision §58 excludes it only within what the owner covered from
+    # stock, and this owner covered nothing.
+    assert report["make"]["assembly_output_facts"] == 2
+    assert report["make"]["netted_internal_transfer_rows"] == 1
+    assert report["make"]["inserted"] == 2
     assert report["over_allocated_facts_after"] == 0
 
     received, allocations = _owner_state(engine, world["owner_id"])
-    assert received == Decimal("6")
-    assert allocations == [(world["output_sle_id"], Decimal("6"))]
+    assert received == Decimal("10")
+    assert dict(allocations) == {
+        world["pre_freeze_sle_id"]: Decimal("4"),
+        world["output_sle_id"]: Decimal("6"),
+    }
 
     with Session(engine) as session:
         scope = (world["item_id"], "", "", "default", "make")
@@ -245,21 +252,50 @@ def test_bootstrap_credits_only_the_net_output_after_the_freeze_boundary():
         assert marker.status == "completed"
 
 
+def test_pre_freeze_fact_is_excluded_only_within_what_the_owner_covered():
+    """Decision §58, both directions, on the same physical history."""
+    engine = _engine()
+    world = _world(engine)
+    with Session(engine) as session:
+        owner = session.get(models.ReservationEntry, world["owner_id"])
+        # The plan took 3 of the 4 pre-freeze units off the shelf at its
+        # freeze; only the remaining 1 may replenish it.
+        owner.covered_from_stock_at_freeze_qty = Decimal("3")
+        session.commit()
+    apply_replenishment_rebase(engine, writers_stopped=True, republish=False)
+    received, allocations = _owner_state(engine, world["owner_id"])
+    assert received == Decimal("7")
+    assert dict(allocations) == {
+        world["pre_freeze_sle_id"]: Decimal("1"),
+        world["output_sle_id"]: Decimal("6"),
+    }
+
+    with Session(engine) as session:
+        owner = session.get(models.ReservationEntry, world["owner_id"])
+        # Covering the whole pre-freeze fact from stock excludes all of it.
+        owner.covered_from_stock_at_freeze_qty = Decimal("4")
+        session.commit()
+    apply_replenishment_rebase(engine, writers_stopped=True, republish=False)
+    received, allocations = _owner_state(engine, world["owner_id"])
+    assert received == Decimal("6")
+    assert dict(allocations) == {world["output_sle_id"]: Decimal("6")}
+
+
 def test_bootstrap_is_idempotent():
     engine = _engine()
     world = _world(engine)
-    apply_make_replenishment_bootstrap(engine, writers_stopped=True, republish=False)
+    apply_replenishment_rebase(engine, writers_stopped=True, republish=False)
     with Session(engine) as session:
         marker_before = [
             (row.scope_key, row.scope_checksum, int(row.source_revision), row.updated_at)
             for row in session.query(models.CurrentReplenishmentState).all()
         ]
         audit_before = session.query(models.CurrentReplenishmentAudit).count()
-    second = apply_make_replenishment_bootstrap(
+    second = apply_replenishment_rebase(
         engine, writers_stopped=True, republish=False
     )
     assert second["changed_pairs"] == 0
-    assert second["inserted"] == second["updated"] == second["deleted"] == 0
+    assert second["make"]["inserted"] == second["make"]["updated"] == second["make"]["deleted"] == 0
     assert second["idempotent"] is True
     assert second["republished_current_execution"] is None
     with Session(engine) as session:
@@ -269,9 +305,12 @@ def test_bootstrap_is_idempotent():
         ]
         assert marker_after == marker_before
         assert session.query(models.CurrentReplenishmentAudit).count() == audit_before
-    assert _owner_state(engine, world["owner_id"]) == (
-        Decimal("6"), [(world["output_sle_id"], Decimal("6"))]
-    )
+    received, allocations = _owner_state(engine, world["owner_id"])
+    assert received == Decimal("10")
+    assert dict(allocations) == {
+        world["pre_freeze_sle_id"]: Decimal("4"),
+        world["output_sle_id"]: Decimal("6"),
+    }
 
 
 def test_bootstrap_settles_rework_inside_the_make_scope_and_skips_closed_owners():
@@ -303,9 +342,11 @@ def test_bootstrap_settles_rework_inside_the_make_scope_and_skips_closed_owners(
             (world["item_id"], "", "", "default", "make"),
         )
 
-    apply_make_replenishment_bootstrap(engine, writers_stopped=True, republish=False)
-    # The oldest live owner takes the 6 units FIFO; the closed one takes none.
-    assert _owner_state(engine, world["owner_id"])[0] == Decimal("6")
+    apply_replenishment_rebase(engine, writers_stopped=True, republish=False)
+    # The oldest live owner takes all 10 creditable units FIFO (§58 lets the
+    # pre-freeze fact in: it covered nothing from stock); the closed owner
+    # takes none, neither as coverage nor as replenishment (§42).
+    assert _owner_state(engine, world["owner_id"])[0] == Decimal("10")
     assert _owner_state(engine, rework_id) == (Decimal("0"), [])
     assert _owner_state(engine, closed_id) == (Decimal("0"), [])
 
@@ -321,7 +362,7 @@ def test_bootstrap_settles_rework_inside_the_make_scope_and_skips_closed_owners(
             recorder="doc-output-2", line_no="1",
         )
         session.commit()
-    apply_make_replenishment_bootstrap(engine, writers_stopped=True, republish=False)
+    apply_replenishment_rebase(engine, writers_stopped=True, republish=False)
     assert _owner_state(engine, world["owner_id"])[0] == Decimal("10")
     assert _owner_state(engine, rework_id)[0] == Decimal("4")
     assert _owner_state(engine, closed_id) == (Decimal("0"), [])
@@ -335,7 +376,7 @@ def test_bootstrap_refuses_a_pointer_that_is_not_the_accepted_generation():
         pointer.current_generation_id = None
         session.commit()
     with pytest.raises((PreflightBlocked, RuntimeError)):
-        apply_make_replenishment_bootstrap(
+        apply_replenishment_rebase(
             engine, writers_stopped=True, republish=False
         )
 
@@ -370,7 +411,7 @@ def test_same_revision_payload_drift_needs_an_explicit_basis_correction():
     """The runtime guard stays; only an acknowledged repair may rewrite a scope."""
     engine = _engine()
     world = _world(engine)
-    apply_make_replenishment_bootstrap(engine, writers_stopped=True, republish=False)
+    apply_replenishment_rebase(engine, writers_stopped=True, republish=False)
     with Session(engine) as session:
         batch = session.query(models.PhysicalImportBatch).filter(
             models.PhysicalImportBatch.batch_key == "make-bootstrap-current"
@@ -380,6 +421,8 @@ def test_same_revision_payload_drift_needs_an_explicit_basis_correction():
             posting_at=CUTOFF - timedelta(hours=2), movement_kind="assembly_in",
             recorder="doc-output-3", line_no="1",
         )
+        owner = session.get(models.ReservationEntry, world["owner_id"])
+        owner.replenishment_required_qty = Decimal("12")
         session.commit()
     scope = (world["item_id"], "", "", "default", "make")
     with Session(engine) as session:
@@ -407,4 +450,4 @@ def test_same_revision_payload_drift_needs_an_explicit_basis_correction():
             for row in session.query(models.CurrentReplenishmentAudit).all()
         }
         assert BASIS_CORRECTED_REASON in reasons
-    assert _owner_state(engine, world["owner_id"])[0] == Decimal("8")
+    assert _owner_state(engine, world["owner_id"])[0] == Decimal("12")

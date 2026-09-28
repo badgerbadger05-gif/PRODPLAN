@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.production_control_common import DONE_STATE_KEY, norm_guid
 
+from .document_net_output import NETTED_MOVEMENT_KINDS, net_document_output_qty
 from .future_supply_capture import (
     FutureSupplyEvidence,
     future_supply_evidence_hash,
@@ -143,14 +144,34 @@ def collect_wip_future_supply_evidence(
     invalid_reasons: dict[int, set[str]] = defaultdict(set)
     evidence_kinds_by_product: dict[int, set[str]] = defaultdict(set)
 
-    for sle in visible_sle_query(
+    visible = list(visible_sle_query(
         db,
         physical_import_batch_id=int(generation.physical_import_batch_id),
         cutoff=generation.cutoff,
-    ):
+    ))
+    # How much of an assembly receipt exists as production is owned by
+    # ``document_net_output.py`` and by nothing else (CANON R7: "Чистый выпуск
+    # документа берётся только из document_net_output.py").  This adapter used
+    # to add up the raw ``assembly_in`` lines, so the internal transport of one
+    # document counted as this order line's output: on the 28.09 stand copy
+    # item 8945 realized 3660 against 300 units of real net output, which drove
+    # its open WIP supply to zero and offered the work for ordering again.  A
+    # ``transfer_in`` is not part of an assembly document and the netting has no
+    # opinion on it: it is not a netted kind, so it keeps its own quantity - and
+    # only when the caller explicitly classified its recorder as make evidence,
+    # which is checked below.
+    net_output = net_document_output_qty(visible)
+
+    for sle in visible:
         kind = _text(sle.movement_kind)
-        qty = _decimal(sle.qty)
-        if kind not in _MAKE_KINDS or qty <= 0:
+        if kind not in _MAKE_KINDS:
+            continue
+        qty = (
+            net_output.get(int(sle.id), Decimal("0"))
+            if kind in NETTED_MOVEMENT_KINDS
+            else _decimal(sle.qty)
+        )
+        if qty <= 0:
             continue
         recorder = _text(sle.recorder_ref)
         candidates = set(direct_links.get(recorder, set()))

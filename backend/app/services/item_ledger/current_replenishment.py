@@ -32,6 +32,7 @@ from .historical_replay_core import (
     ReserveRealization,
     plan_allocation_changes,
     known_at_freeze,
+    replenishment_available_from_fact,
 )
 from .reservation import reservation_business_identity
 
@@ -47,6 +48,11 @@ CONFIRMED_EMPTY_REASON = "confirmed_empty_scope"
 #: itself was corrected.  Only a one-off repair with writers stopped may ask
 #: for it (see ``basis_correction_reason``); the ordinary runtime never can.
 BASIS_CORRECTED_REASON = "basis_corrected"
+#: Named cause of a scope that the document netting itself empties: every
+#: visible ``assembly_in`` line of the scope is internal transport of its own
+#: document, so there is no production output to credit.  A recorded cause, not
+#: a silent wipe - the fail-closed guard stays for the unexplained case.
+NETTED_OUTPUT_EMPTY_REASON = "all assembly output nets to zero"
 #: Decisions §49/§51/§53: an allocation whose fact is in its owner's frozen
 #: stock - first imported by the freeze batch and dated no later than the
 #: freeze instant (``known_at_freeze``) - is never that owner's replenishment.
@@ -96,6 +102,10 @@ class CurrentReplenishmentResult:
     #: The operator acknowledgement that authorised clearing a populated
     #: scope, echoed for the caller's own log.  Empty for ordinary replays.
     confirmed_empty_reason: str = ""
+    #: The one-off acknowledgement that authorised rewriting a scope its own
+    #: publishing generation had already written, echoed the same way (the
+    #: audit's ``reason`` column stays the enumerated cause).
+    basis_correction_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -119,6 +129,9 @@ class BoundedMakeReplenishmentResult:
     #: not production output (canon "Что является положительным фактом одного
     #: документа", invariant 15).
     netted_internal_transfer_rows: int = 0
+    #: Scopes the one-off cleared with a recorded cause because every visible
+    #: ``assembly_in`` line of the scope nets to zero.
+    scopes_confirmed_empty_by_netting: int = 0
 
     @property
     def fact_rows(self) -> int:
@@ -353,9 +366,17 @@ def _input_checksum(
 
 
 def _baseline_part(row: Reserve) -> dict[str, str]:
-    """The owner's freeze cutoff is allocation input (§49); absent = legacy."""
+    """The owner's freeze cutoff is allocation input (§49); absent = legacy.
+
+    Decision §58 makes the quantity it covered from stock allocation input as
+    well: it is the budget a pre-freeze fact is excluded within, so a scope
+    whose coverage changed is a different replay input.
+    """
     batch = getattr(row, "known_batch_id", None)
-    return {"freeze_batch": int(batch)} if batch is not None else {}
+    if batch is None:
+        return {}
+    covered = _decimal(getattr(row, "covered_from_stock_at_freeze_qty", 0))
+    return {"freeze_batch": int(batch), "freeze_covered": str(covered)}
 
 
 @dataclass(frozen=True)
@@ -792,15 +813,41 @@ def over_allocated_facts(
 ) -> list[tuple[int, str, Decimal, Decimal]]:
     """Facts whose current allocations exceed the fact (invariants 2-3).
 
-    Returns ``(sle_id, role, allocated, |qty|)`` for the first ``limit``
+    Returns ``(sle_id, role, allocated, ceiling)`` for the first ``limit``
     offenders; empty means the invariant holds.  Compared per ``(sle,
     role)``.  ``sle_ids`` bounds the check to the facts a bounded publication
     brought in (decision §41); ``item_ids`` bounds it by item.
+
+    The ceiling of a supplier receipt or a material issue is its own ``|qty|``.
+    The ceiling of an ``assembly_in`` line is the canonical net output of its
+    document (``document_net_output.py``), because that is how much of it
+    exists as production at all: measured against the raw line, an allocation
+    of a pure transport leg - a line whose net output is zero - satisfied the
+    invariant while counting a movement that produced nothing.
     """
     from sqlalchemy import func
+    from .document_net_output import OUTPUT_MOVEMENT_KIND
 
     allocated = func.sum(models.ReservationConsumptionAllocation.allocated_qty)
-    query = (
+
+    def _scoped(query):
+        if item_ids is not None:
+            ids = sorted({int(value) for value in item_ids})
+            if not ids:
+                return None
+            query = query.filter(
+                models.ReservationConsumptionAllocation.item_id.in_(ids)
+            )
+        if sle_ids is not None:
+            sle_filter = sorted({int(value) for value in sle_ids})
+            if not sle_filter:
+                return None
+            query = query.filter(
+                models.ReservationConsumptionAllocation.sle_id.in_(sle_filter)
+            )
+        return query
+
+    raw_query = _scoped(
         db.query(
             models.ReservationConsumptionAllocation.sle_id,
             models.ReservationConsumptionAllocation.allocation_role,
@@ -811,7 +858,10 @@ def over_allocated_facts(
             models.StockLedgerEntry,
             models.StockLedgerEntry.id == models.ReservationConsumptionAllocation.sle_id,
         )
-        .filter(models.ReservationConsumptionAllocation.is_current.is_(True))
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.StockLedgerEntry.movement_kind != OUTPUT_MOVEMENT_KIND,
+        )
         .group_by(
             models.ReservationConsumptionAllocation.sle_id,
             models.ReservationConsumptionAllocation.allocation_role,
@@ -820,23 +870,88 @@ def over_allocated_facts(
         .having(allocated > func.abs(models.StockLedgerEntry.qty))
         .order_by(models.ReservationConsumptionAllocation.sle_id.asc())
     )
-    if item_ids is not None:
-        ids = sorted({int(value) for value in item_ids})
-        if not ids:
-            return []
-        query = query.filter(models.ReservationConsumptionAllocation.item_id.in_(ids))
-    if sle_ids is not None:
-        sle_filter = sorted({int(value) for value in sle_ids})
-        if not sle_filter:
-            return []
-        query = query.filter(
-            models.ReservationConsumptionAllocation.sle_id.in_(sle_filter)
-        )
-    if limit and int(limit) > 0:
-        query = query.limit(int(limit))
-    return [
+    if raw_query is None:
+        return []
+    offenders = [
         (int(sle_id), str(role), _decimal(total), _decimal(qty))
-        for sle_id, role, total, qty in query.all()
+        for sle_id, role, total, qty in raw_query.all()
+    ]
+    offenders.extend(_over_allocated_assembly_output(db, _scoped))
+    offenders.sort(key=lambda row: (row[0], row[1]))
+    if limit and int(limit) > 0:
+        return offenders[:int(limit)]
+    return offenders
+
+
+def _over_allocated_assembly_output(db: Session, scoped) -> list[
+    tuple[int, str, Decimal, Decimal]
+]:
+    """The ``assembly_in`` half of :func:`over_allocated_facts`.
+
+    The ceiling is a property of the whole 1C document, so it cannot be a
+    ``HAVING`` clause: the allocated sums are read in SQL and measured against
+    the one canonical net output of the documents they name.
+    """
+    from sqlalchemy import func
+    from .document_net_output import OUTPUT_MOVEMENT_KIND, net_output_for_facts
+
+    query = scoped(
+        db.query(
+            models.ReservationConsumptionAllocation.sle_id,
+            models.ReservationConsumptionAllocation.allocation_role,
+            func.sum(models.ReservationConsumptionAllocation.allocated_qty),
+        )
+        .join(
+            models.StockLedgerEntry,
+            models.StockLedgerEntry.id == models.ReservationConsumptionAllocation.sle_id,
+        )
+        .filter(
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+            models.StockLedgerEntry.movement_kind == OUTPUT_MOVEMENT_KIND,
+        )
+        .group_by(
+            models.ReservationConsumptionAllocation.sle_id,
+            models.ReservationConsumptionAllocation.allocation_role,
+        )
+    )
+    if query is None:
+        return []
+    allocated_by_pair = [
+        (int(sle_id), str(role), _decimal(total))
+        for sle_id, role, total in query.all()
+    ]
+    if not allocated_by_pair:
+        return []
+    pointer = db.get(models.PlanningTruthState, 1)
+    generation = (
+        db.get(models.LedgerGeneration, int(pointer.current_generation_id))
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    if generation is None or generation.physical_import_batch_id is None:
+        # Without an accepted prefix there is no visible document to net
+        # against; fail closed rather than fall back to the raw line.
+        raise CurrentReplenishmentError(
+            "assembly output allocations cannot be measured without an accepted "
+            "physical prefix"
+        )
+    rows = (
+        db.query(models.StockLedgerEntry)
+        .filter(models.StockLedgerEntry.id.in_(
+            sorted({sle_id for sle_id, _role, _total in allocated_by_pair})
+        ))
+        .all()
+    )
+    net_by_sle = net_output_for_facts(
+        db,
+        rows,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        cutoff=generation.cutoff,
+    )
+    return [
+        (sle_id, role, total, net_by_sle.get(sle_id, Decimal("0")))
+        for sle_id, role, total in allocated_by_pair
+        if total > net_by_sle.get(sle_id, Decimal("0"))
     ]
 
 
@@ -1067,6 +1182,21 @@ def apply_current_replenishment(
             drifted = _text(state.scope_checksum) != input_checksum
             if drifted and not _text(basis_correction_reason):
                 raise CurrentReplenishmentError("same source revision has payload drift")
+            if drifted:
+                # Only a one-off repair publishing at the exact accepted
+                # pointer may rewrite its own generation's state.  A BUILDING
+                # candidate has a generation of its own and must simply stamp
+                # it, so the acknowledgement can never reach the runtime.
+                pointer = db.get(models.PlanningTruthState, 1)
+                if (
+                    allow_building
+                    or pointer is None
+                    or int(pointer.current_generation_id or -1) != int(generation.id)
+                ):
+                    raise CurrentReplenishmentError(
+                        "a basis correction is only allowed for a replay publishing "
+                        "at the exact accepted truth pointer"
+                    )
             if _text(state.status) != "completed":
                 raise CurrentReplenishmentError("current source marker is still applying")
             if drifted:
@@ -1244,6 +1374,9 @@ def apply_current_replenishment(
                 order_refs=reserve.order_refs,
                 known_batch_id=reserve.known_batch_id,
                 baseline_at=reserve.baseline_at,
+                covered_from_stock_at_freeze_qty=(
+                    reserve.covered_from_stock_at_freeze_qty
+                ),
             )
         )
     reserve_rows_for_plan = tuple(stable_reserves)
@@ -1337,14 +1470,23 @@ def apply_current_replenishment(
     })
 
     def _dropped_by_baseline(old: Allocation) -> bool:
-        reserve = next(
-            (row for row in reserve_rows_for_plan if str(row.reserve_id) == str(old.reserve_id)),
-            None,
-        )
         revisions = known_fact.get(str(old.fact_id), ())
-        if reserve is None or reserve.known_batch_id is None or not revisions:
+        if not revisions:
             return False
-        return known_at_freeze(revisions, reserve.known_batch_id, reserve.baseline_at)
+        # Decision §58: the fact is somebody's frozen stock in this scope -
+        # an owner whose freeze knew it and that did take stock off the shelf
+        # then.  The question is about the fact, not about the owner that used
+        # to hold the allocation: the absorbed quantity leaves the fact, so a
+        # neighbour's allocation disappears for the same recorded reason.  An
+        # owner that covered nothing absorbs nothing, so a scope of such owners
+        # keeps the fact as replenishment and the silent-wipe guard still
+        # applies.
+        return any(
+            row.known_batch_id is not None
+            and _decimal(row.covered_from_stock_at_freeze_qty) > 0
+            and known_at_freeze(revisions, row.known_batch_id, row.baseline_at)
+            for row in reserve_rows_for_plan
+        )
 
     baseline_dropped = {
         (str(old.fact_id), str(old.reserve_id))
@@ -1389,10 +1531,6 @@ def apply_current_replenishment(
     reserve_by_id = {str(row.reserve_id): row for row in reserve_rows_for_plan}
     basis_fact_ids = tuple(sorted({int(row.sle_id) for row in receipt_facts}))
     audit_reason = "r5_signed_replay" if receipt_replay is not None else "current_replay"
-    if basis_corrected:
-        # The rewrite of a scope its own publishing generation wrote under the
-        # superseded fact-selection rule; named so the change has a cause.
-        audit_reason = BASIS_CORRECTED_REASON
     if receipt_replay is not None and receipt_unmatched_return_qty > 0:
         audit_reason = "r5_signed_replay_unmatched_return"
     if confirmed_empty:
@@ -1403,6 +1541,13 @@ def apply_current_replenishment(
         # into ``reason`` or into ``basis_fact_ids`` (which is the fact-id
         # contract, not a notes field).
         audit_reason = CONFIRMED_EMPTY_REASON
+    if basis_corrected:
+        # Last word, and deliberately so: this replay exists *because* the rule
+        # that wrote the scope was superseded, which is the cause a reader has
+        # to see on every row it changed - including the rows a clear-out or an
+        # unmatched return would otherwise have named.  The free text stays in
+        # the result, like ``confirmed_empty_reason``.
+        audit_reason = BASIS_CORRECTED_REASON
     allocation_by_key = {
         (str(int(row.sle_id)), reservation_identity_by_id[str(int(row.reservation_id))]): row for row in allocations
         if row in scoped_allocations
@@ -1568,6 +1713,7 @@ def apply_current_replenishment(
         changed_pairs=len(plan.insertions) + len(plan.updates) + len(plan.deletions),
         audit_events=audit_events,
         confirmed_empty_reason=_text(confirmed_empty_reason),
+        basis_correction_reason=_text(basis_correction_reason) if basis_corrected else "",
     )
 
 
@@ -1588,6 +1734,7 @@ def apply_current_receipt_replay(
     validated_visible_ids: Iterable[int] | None = None,
     confirmed_empty_reason: str = "",
     revision_basis: RevisionBasis = "explicit",
+    basis_correction_reason: str = "",
 ) -> CurrentReplenishmentResult:
     """Publish signed correction/return replay through the R4 current writer."""
 
@@ -1657,6 +1804,9 @@ def apply_current_receipt_replay(
             replenishment_received_qty=Decimal("0"),
             known_batch_id=getattr(pure, "known_batch_id", None),
             baseline_at=getattr(pure, "baseline_at", None),
+            covered_from_stock_at_freeze_qty=_decimal(
+                getattr(pure, "covered_from_stock_at_freeze_qty", 0)
+            ),
         )
     reservations_by_item: dict[int, tuple[object, ...]] = {}
     for row in replay_reservations.values():
@@ -1719,6 +1869,7 @@ def apply_current_receipt_replay(
         receipt_unmatched_return_qty=replay.unmatched_return_qty,
         confirmed_empty_reason=confirmed_empty_reason,
         revision_basis=revision_basis,
+        basis_correction_reason=basis_correction_reason,
     )
 
 
@@ -1826,6 +1977,7 @@ def apply_current_replenishment_for_accepted_generation(
     source_revision: int | None = None,
     allow_building: bool = False,
     retained_run_ids: Iterable[int] = (),
+    basis_correction_reason: str = "",
 ) -> tuple[CurrentReplenishmentResult, ...]:
     """Publish current supplier-receipt replenishment at physical acceptance.
 
@@ -1856,7 +2008,14 @@ def apply_current_replenishment_for_accepted_generation(
     reservation_query = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.lifecycle_status == "active",
         models.ReservationEntry.realization_mode == "buy",
-        models.ReservationEntry.replenishment_required_qty > 0,
+        # Decision §58: an owner with nothing left to receive still belongs to
+        # the scope when it took stock at its freeze - that stock has to come
+        # out of the pre-freeze receipts before another owner is credited with
+        # them.  It can never take an allocation: its outstanding is zero.
+        or_(
+            models.ReservationEntry.replenishment_required_qty > 0,
+            models.ReservationEntry.covered_from_stock_at_freeze_qty > 0,
+        ),
     )
     if _text(generation.status) == "building":
         retained = sorted({int(value) for value in retained_run_ids})
@@ -2070,6 +2229,9 @@ def apply_current_replenishment_for_accepted_generation(
                 planning_stock_pool=scope[3],
                 known_batch_id=_boundary_batch(baselines, row),
                 baseline_at=_boundary_instant(baselines, row),
+                covered_from_stock_at_freeze_qty=_decimal(
+                    row.covered_from_stock_at_freeze_qty
+                ),
             )
             for row in reservations
             if int(row.item_id) == item_id
@@ -2098,6 +2260,7 @@ def apply_current_replenishment_for_accepted_generation(
                 history_mode="as_occurred",
                 allow_building=allow_building,
                 revision_basis=basis,
+                basis_correction_reason=basis_correction_reason,
             )
         )
     return tuple(result)
@@ -2140,6 +2303,11 @@ def apply_current_replenishment_for_bounded_make_scopes(
     pointer's own id, so the next bounded refresh publishes a higher one).
     """
 
+    if _text(basis_correction_reason) and not at_accepted_pointer:
+        raise CurrentReplenishmentError(
+            "a basis correction belongs to the one-off bootstrap at the accepted "
+            "pointer; a bounded refresh publishes its own generation"
+        )
     revision, basis = _adapter_revision(source_revision, int(target_generation_id))
 
     target = db.get(models.LedgerGeneration, int(target_generation_id))
@@ -2295,6 +2463,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
 
     make_first_known = known_revisions_by_sle(db, rows)
     netted_internal_transfer_rows = 0
+    netted_rows_by_scope: dict[DistributionScope, int] = {}
     for row in rows:
         if _decimal(row.qty) <= 0:
             raise CurrentReplenishmentError(
@@ -2320,6 +2489,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
             # An internal transport leg of its own document: physical truth,
             # no production output, therefore no replenishment.
             netted_internal_transfer_rows += 1
+            netted_rows_by_scope[scope] = netted_rows_by_scope.get(scope, 0) + 1
             continue
         requirement_id, order_ref, ambiguous = _identity_for_sle(db, row)
         if ambiguous:
@@ -2435,12 +2605,35 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 order_refs=order_refs.get(int(row.requirement_id), ()),
                 known_batch_id=_boundary_batch(owner_baselines, row),
                 baseline_at=_boundary_instant(owner_baselines, row),
+                covered_from_stock_at_freeze_qty=_decimal(
+                    row.covered_from_stock_at_freeze_qty
+                ),
             )
             for row in owners
         )
 
     results: list[CurrentReplenishmentResult] = []
+    scopes_confirmed_empty_by_netting = 0
     for scope in scopes:
+        # A scope whose every visible ``assembly_in`` line nets to zero is
+        # provably empty: the document netting, not a missing input, is why
+        # there is nothing to credit.  Naming it keeps the fail-closed guard
+        # for the unexplained case (previous allocations on facts that are no
+        # longer visible at all) while letting the one-off correct a scope the
+        # superseded raw-line rule had filled.  The runtime never reaches this:
+        # only the one-off passes a basis correction.
+        confirmed_empty_reason = ""
+        if (
+            _text(basis_correction_reason)
+            and not facts_by_scope[scope]
+            and netted_rows_by_scope.get(scope, 0)
+        ):
+            confirmed_empty_reason = (
+                f"{NETTED_OUTPUT_EMPTY_REASON}: all "
+                f"{int(netted_rows_by_scope[scope])} visible assembly_in lines of "
+                "this scope are internal transport of their own document"
+            )
+            scopes_confirmed_empty_by_netting += 1
         results.append(
             apply_current_replenishment(
                 db,
@@ -2454,6 +2647,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 allow_building=not at_accepted_pointer,
                 revision_basis=basis,
                 basis_correction_reason=basis_correction_reason,
+                confirmed_empty_reason=confirmed_empty_reason,
             )
         )
     return BoundedMakeReplenishmentResult(
@@ -2464,6 +2658,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
         scope_history_rows=sum(len(rows) for rows in facts_by_scope.values()),
         results=tuple(results),
         netted_internal_transfer_rows=int(netted_internal_transfer_rows),
+        scopes_confirmed_empty_by_netting=int(scopes_confirmed_empty_by_netting),
     )
 
 
@@ -2896,6 +3091,9 @@ def _bounded_current_buy_reserves(
                 planning_stock_pool=_text(row.planning_stock_pool),
                 known_batch_id=_boundary_batch(baselines, row),
                 baseline_at=_boundary_instant(baselines, row),
+                covered_from_stock_at_freeze_qty=_decimal(
+                    row.covered_from_stock_at_freeze_qty
+                ),
             )
         )
     missing = [scope for scope in scopes if not result[scope]]

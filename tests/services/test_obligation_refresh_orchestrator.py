@@ -2125,11 +2125,14 @@ def test_a_bounded_refresh_after_an_obligation_refresh_rewrites_no_unchanged_row
 
 
 def test_a_make_owner_folds_the_same_receipt_on_both_paths(db_session, monkeypatch):
-    """An output before the freeze cutoff is stock, on the obligation path too.
+    """Both paths fold the same pre-cutoff output the same way.
 
-    The generation replay built reserves without the freeze baseline and
-    folded the pre-cutoff output as received (2); the bounded MAKE replay then
-    recomputed with the boundary and received *fell* to 1 after a +1 output.
+    The generation replay built reserves without the freeze baseline, so the
+    bounded MAKE replay recomputed with the boundary and received *fell* to 1
+    after a +1 output.  Decision §58 fixes how much of such an output is the
+    owner's stock: only what the owner actually covered from stock at its
+    freeze, which is nothing here - so the output replenishes it and both
+    paths agree on the same number.
     """
     from app.services.item_ledger import physical_refresh_current_publish as publisher
 
@@ -2199,7 +2202,10 @@ def test_a_make_owner_folds_the_same_receipt_on_both_paths(db_session, monkeypat
     )
     db_session.refresh(owner)
 
-    assert received_after_obligation == Decimal("0")
+    # §58: this owner took nothing off the shelf at its freeze, so the
+    # pre-cutoff output is its replenishment, not its stock.
+    assert Decimal(str(owner.covered_from_stock_at_freeze_qty)) == Decimal("0")
+    assert received_after_obligation == Decimal("2")
     assert Decimal(str(owner.replenishment_received_qty)) == received_after_obligation + 1
     db_session.rollback()
 

@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import models
+from .document_net_output import NETTED_MOVEMENT_KINDS, net_document_output_qty
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sle_query
 from .future_supply_read import future_supply_model
@@ -431,23 +432,39 @@ def _wip_realized_delta(
 ) -> Decimal:
     if target_generation_cutoff <= parent_cutoff:
         return Decimal("0")
-    return sum(
-        (
-            Decimal(str(qty))
-            for (qty,) in visible_sle_query(
-                db,
-                physical_import_batch_id=int(target_physical_import_batch_id),
-                cutoff=target_generation_cutoff,
-            ).filter(
-                models.StockLedgerEntry.recorder_ref == source_ref,
-                models.StockLedgerEntry.line_no == source_line_ref,
-                models.StockLedgerEntry.movement_kind.in_(_WIP_REALIZATION_KINDS),
-                models.StockLedgerEntry.qty > Decimal("0"),
-                models.StockLedgerEntry.posting_at > parent_cutoff,
-            ).with_entities(models.StockLedgerEntry.qty)
+    # The whole document is read, not only the line this delta is about: the
+    # creditable quantity of an ``assembly_in`` line is its document's net
+    # output (``document_net_output.py``, CANON R7), and a single line cannot
+    # say how much of itself is internal transport.  The line filter is applied
+    # afterwards, to the netted result.  A ``transfer_in`` is not part of an
+    # assembly document and is not a netted kind, so it keeps its own quantity.
+    rows = visible_sle_query(
+        db,
+        physical_import_batch_id=int(target_physical_import_batch_id),
+        cutoff=target_generation_cutoff,
+    ).filter(
+        models.StockLedgerEntry.recorder_ref == source_ref,
+        models.StockLedgerEntry.movement_kind.in_(
+            tuple(sorted(set(_WIP_REALIZATION_KINDS) | set(NETTED_MOVEMENT_KINDS)))
         ),
-        Decimal("0"),
-    )
+    ).all()
+    net_output = net_document_output_qty(rows)
+    total = Decimal("0")
+    for row in rows:
+        if str(row.line_no or "") != str(source_line_ref or ""):
+            continue
+        if str(row.movement_kind or "") not in _WIP_REALIZATION_KINDS:
+            continue
+        if row.posting_at is None or _as_utc(row.posting_at) <= parent_cutoff:
+            continue
+        qty = (
+            net_output.get(int(row.id), Decimal("0"))
+            if str(row.movement_kind or "") in NETTED_MOVEMENT_KINDS
+            else Decimal(str(row.qty or 0))
+        )
+        if qty > 0:
+            total += qty
+    return total
 
 
 def _carry_forward_rows(

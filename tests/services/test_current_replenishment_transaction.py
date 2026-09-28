@@ -1579,6 +1579,11 @@ def test_the_freeze_boundary_mirrors_how_the_frozen_stock_was_read(baseline_at, 
         due_date=date(2026, 9, 30), plan_period_from=date(2026, 9, 1),
         plan_period_to=date(2026, 9, 30), run_id=1, requirement_id=1,
         known_batch_id=10, baseline_at=baseline_at,
+        # Decision §58: the owner took two units off the shelf at its freeze,
+        # which is what its pre-freeze facts here add up to.  This test is
+        # about *which* facts the freeze knew; how much of a known fact the
+        # coverage excludes is the subject of the §58 test below.
+        covered_from_stock_at_freeze_qty=Decimal("2"),
     )
 
     def fact(fact_id, at, batch):
@@ -1677,6 +1682,12 @@ def test_the_accepted_adapter_reads_each_owners_freeze_baseline(
     generation = db_session.get(models.LedgerGeneration, int(generation_id))
     _point_at(db_session, generation)
     for row in reservations:
+        # Decision §58: this owner took every unit the freeze knew off the
+        # shelf, so a receipt its freeze knew is that stock and cannot also
+        # replenish it.  The test asks *which batch* the boundary is read at.
+        row.covered_from_stock_at_freeze_qty = sum(
+            (Decimal(str(row.qty)) for row in facts), Decimal("0")
+        )
         db_session.add(models.MrpFreezeBaseline(
             run_id=int(row.run_id), freeze_version=1, item_id=int(row.item_id),
             characteristic_ref="", organization_ref="",
@@ -1724,7 +1735,17 @@ def _scope_with_baseline(db_session, prefix, *, baseline_at, facts_override=None
         for row in facts
     )
     bounded = tuple(
-        Reserve(**{**row.__dict__, "known_batch_id": batch, "baseline_at": baseline_at})
+        Reserve(**{
+            **row.__dict__,
+            "known_batch_id": batch,
+            "baseline_at": baseline_at,
+            # Decision §58: run 561 took every unit of the pre-freeze receipts
+            # off the shelf at its freeze, which is why they are its stock and
+            # not its replenishment.
+            "covered_from_stock_at_freeze_qty": sum(
+                (Decimal(str(fact.qty)) for fact in facts), Decimal("0")
+            ),
+        })
         for row in reserves
     )
     return apply_current_replenishment(
@@ -2031,3 +2052,52 @@ def test_the_normaliser_looks_up_only_the_supplier_lines_it_types(db_session):
     assert len(normalized) == 100
     assert metrics["identities"] <= 100
     assert metrics["queries"] == 1
+
+
+# --- Decision §58: a pre-freeze fact is excluded only within the coverage -------
+
+
+def test_a_pre_freeze_fact_replenishes_the_part_the_owner_did_not_take():
+    """CP-000077-R: 2688 produced on 21.07, plans frozen 31.07 covering nothing.
+
+    The old rule excluded such a fact wholesale, so the demand looked open
+    while the stock was already on the shelf and the plan was asked to produce
+    it again.  §58: the exclusion is bounded by ``covered_from_stock_at_freeze``
+    and each owner is judged on its own coverage.
+    """
+    from app.services.item_ledger.historical_replay_core import (
+        allocate_historical_facts,
+        replenishment_available_from_fact,
+    )
+
+    at = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    baseline_at = datetime(2026, 7, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    def owner(name, qty, covered):
+        return Reserve(
+            reserve_id=name, item_id=1, mode="make", reserved_qty=Decimal(qty),
+            due_date=date(2026, 8, 31), plan_period_from=date(2026, 8, 1),
+            plan_period_to=date(2026, 8, 31), run_id=1, requirement_id=1,
+            known_batch_id=14033, baseline_at=baseline_at,
+            covered_from_stock_at_freeze_qty=Decimal(covered),
+        )
+
+    fact = Fact(
+        fact_id="out", item_id=1, mode="make", qty=Decimal("2688"), posting_at=at,
+        known_revisions=((6177, None, at),),
+    )
+    result = allocate_historical_facts(
+        [fact], [owner("508", "400", "0"), owner("509", "1054", "0")],
+    )
+    assert {row.reserve_id: row.qty for row in result.allocations} == {
+        "508": Decimal("400"), "509": Decimal("1054"),
+    }
+
+    # The same fact, for an owner that did take 300 units off the shelf: only
+    # the rest of it may replenish that owner.
+    available, absorbed = replenishment_available_from_fact(
+        Decimal("2688"), fact.known_revisions, 14033, baseline_at, Decimal("300"),
+    )
+    assert (available, absorbed) == (Decimal("2388"), Decimal("300"))
+    result = allocate_historical_facts([fact], [owner("508", "400", "2688")])
+    assert result.allocations == ()

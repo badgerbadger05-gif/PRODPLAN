@@ -70,8 +70,12 @@ def _world(engine):
                 ledger_generation_id=generation.id, item_id=item.item_id, run_id=run.run_id,
                 freeze_version=1, requirement_id=requirement.id,
                 priority_period_from=date(2026, 10, 1), priority_period_to=date(2026, 10, 31),
-                realization_mode="buy", reserved_qty=Decimal("5"),
+                realization_mode="buy", reserved_qty=Decimal("7"),
                 replenishment_required_qty=Decimal("5"), replenishment_received_qty=Decimal("2"),
+                # Decision §58: the owner took 2 units off the shelf at its
+                # freeze, which is exactly the pre-freeze receipt below - so
+                # that receipt is its stock and its allocation is retired.
+                covered_from_stock_at_freeze_qty=Decimal("2"),
                 lifecycle_status="active", owner_kind="current", is_current=True,
                 planning_stock_pool="default", characteristic_ref="", organization_ref="",
                 current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
@@ -200,8 +204,12 @@ def test_a_retiring_owner_frozen_before_a_released_fact_can_receive_it():
                 ledger_generation_id=generation.id, item_id=item.item_id, run_id=run.run_id,
                 freeze_version=1, requirement_id=requirement.id,
                 priority_period_from=date(2026, 10, 1), priority_period_to=date(2026, 10, 31),
-                realization_mode="buy", reserved_qty=Decimal("5"),
+                realization_mode="buy", reserved_qty=Decimal("7"),
                 replenishment_required_qty=Decimal("5"), replenishment_received_qty=Decimal("2"),
+                # Decision §58: the owner took 2 units off the shelf at its
+                # freeze, which is exactly the pre-freeze receipt below - so
+                # that receipt is its stock and its allocation is retired.
+                covered_from_stock_at_freeze_qty=Decimal("2"),
                 lifecycle_status="active", owner_kind="current", is_current=True,
                 planning_stock_pool="default", characteristic_ref="", organization_ref="",
                 current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",

@@ -55,11 +55,14 @@ class Reserve:
     order_refs: Tuple[str, ...] = ()
     # Decisions §49/§51/§53: the owner's freeze boundary - the physical
     # import batch its frozen stock was read at and the instant it was read
-    # up to (``MrpFreezeBaseline``).  A fact visible at that boundary is in
-    # ``covered_from_stock_at_freeze`` and can never replenish this owner.
-    # ``None`` batch = no recorded freeze boundary.
+    # up to (``MrpFreezeBaseline``).  ``None`` batch = no recorded freeze
+    # boundary.
     known_batch_id: Optional[int] = None
     baseline_at: Optional[datetime] = None
+    # Decision §58: how much this owner actually took off the shelf when it
+    # was frozen.  A fact its freeze knew is excluded from its replenishment
+    # only up to this quantity; the rest of such a fact replenishes normally.
+    covered_from_stock_at_freeze_qty: Decimal = Decimal("0")
 
 
 def _utc(value: datetime) -> datetime:
@@ -111,6 +114,54 @@ def known_at_freeze(
         ):
             return True
     return False
+
+
+#: Named cause of the part of a fact an owner had already taken from stock at
+#: its freeze (decision §58).  It is neither an allocation nor free surplus.
+FROZEN_STOCK_REASON = "covered_from_stock_at_freeze"
+
+
+def replenishment_available_from_fact(
+    fact_qty: Decimal,
+    revisions: Any,
+    freeze_batch_id: Optional[int],
+    freeze_baseline_at: Optional[datetime],
+    freeze_coverage_left: Decimal,
+) -> Tuple[Decimal, Decimal]:
+    """Decision §58: how much of one fact may replenish one owner.
+
+    Returns ``(available, absorbed)``.  ``absorbed`` is the part of the fact
+    this owner had already taken off the shelf when it was frozen and which
+    therefore cannot also replenish it; ``available`` is the rest of the fact,
+    which reaches this owner through the ordinary addressed-then-FIFO
+    distribution like any other quantity.  The answer is about one owner: the
+    absorbed part is not removed from the fact for everybody, because another
+    owner's frozen coverage is that owner's own obligation and is not evidence
+    about this one.  A fact is still allocated at most once in total, which is
+    the allocator's half of the §58 invariant; the other half - that the freeze
+    did not hand the same stock to two plans - belongs to the freeze (§16).
+
+    A fact the freeze did not know is untouched: all of it replenishes.  A
+    fact the freeze did know is excluded **only up to the quantity this owner
+    actually covered from stock** (``covered_from_stock_at_freeze``), not
+    wholesale: a plan that took nothing off the shelf must take the free stock
+    rather than order or produce it again.  The owner's coverage is a single
+    budget spent by its pre-freeze facts oldest-first, so one fact is never
+    excluded twice for the same owner, and the caller consumes the absorbed
+    part from the fact so no other owner can be credited with it either -
+    which is the §58 invariant "covered at freeze + replenishment <= the fact".
+
+    This is the one place that answers the question.  Every allocator - the
+    generation replay, the current MAKE and BUY replays and the supplier
+    rebuild - calls it instead of re-deciding what a pre-freeze fact means.
+    """
+    if fact_qty <= 0:
+        return Decimal("0"), Decimal("0")
+    if not known_at_freeze(revisions, freeze_batch_id, freeze_baseline_at):
+        return fact_qty, Decimal("0")
+    budget = freeze_coverage_left if freeze_coverage_left > 0 else Decimal("0")
+    absorbed = min(fact_qty, budget)
+    return fact_qty - absorbed, absorbed
 
 
 @dataclass(frozen=True)
@@ -247,6 +298,7 @@ def allocate_historical_facts(
         rule: MatchRule,
         *,
         is_addressed: bool = False,
+        caps: dict[str, Decimal] | None = None,
     ) -> Decimal:
         left = qty
         for reserve in candidates:
@@ -255,7 +307,13 @@ def allocate_historical_facts(
             available = remaining[reserve.reserve_id]
             if available <= 0:
                 continue
+            if caps is not None:
+                available = min(available, caps.get(reserve.reserve_id, Decimal("0")))
+                if available <= 0:
+                    continue
             take = min(left, available)
+            if caps is not None:
+                caps[reserve.reserve_id] = caps[reserve.reserve_id] - take
             allocations.append(
                 Allocation(
                     fact.fact_id,
@@ -272,6 +330,14 @@ def allocate_historical_facts(
 
     sorted_facts = tuple(sorted(fact_rows, key=_fact_key))
     leftovers = {fact.fact_id: fact.qty for fact in sorted_facts}
+    # Decision §58: each owner's freeze coverage is one budget, spent by the
+    # pre-freeze facts it knew, oldest fact first.
+    coverage_left = {
+        reserve.reserve_id: max(
+            reserve.covered_from_stock_at_freeze_qty, Decimal("0")
+        )
+        for reserve in ordered_reserves
+    }
 
     for fact in sorted_facts:
         left = leftovers[fact.fact_id]
@@ -279,10 +345,23 @@ def allocate_historical_facts(
             reserve
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
-            and not known_at_freeze(
-                fact.known_revisions, reserve.known_batch_id, reserve.baseline_at,
-            )
         ]
+        # Decision §58: for each owner of this pool, how much of this fact may
+        # replenish it.  The owner's freeze coverage is a budget spent by the
+        # pre-freeze facts it knew, oldest fact first; what the budget does not
+        # cover reaches the owner through the ordinary distribution below.
+        caps: dict[str, Decimal] = {}
+        for reserve in compatible:
+            available, absorbed = replenishment_available_from_fact(
+                left,
+                fact.known_revisions,
+                reserve.known_batch_id,
+                reserve.baseline_at,
+                coverage_left[reserve.reserve_id],
+            )
+            caps[reserve.reserve_id] = available
+            if absorbed > 0:
+                coverage_left[reserve.reserve_id] -= absorbed
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
         # One requirement may legitimately have several dated reserve slices.
         # An order reference shared by different requirements is ambiguous and
@@ -292,10 +371,10 @@ def allocate_historical_facts(
             fact.requirement_id is not None or len(exact_requirement_ids) == 1
         )
         if address_is_unambiguous:
-            left = place(fact, left, exact, "pegged", is_addressed=True)
+            left = place(fact, left, exact, "pegged", is_addressed=True, caps=caps)
 
         if left > 0:
-            left = place(fact, left, compatible, "fifo")
+            left = place(fact, left, compatible, "fifo", caps=caps)
 
         if left > 0:
             surplus.append(

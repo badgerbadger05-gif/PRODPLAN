@@ -317,6 +317,10 @@ def run_historical_replay(
             baseline_at=(
                 baselines[int(row.id)].baseline_at if int(row.id) in baselines else None
             ),
+            # Decision §58: the budget a pre-freeze fact is excluded within.
+            covered_from_stock_at_freeze_qty=_decimal(
+                row.covered_from_stock_at_freeze_qty
+            ),
         )
         reserves.append(reserve)
         entry_by_core_id[core_id] = row
