@@ -2101,3 +2101,51 @@ def test_a_pre_freeze_fact_replenishes_the_part_the_owner_did_not_take():
     assert (available, absorbed) == (Decimal("2388"), Decimal("300"))
     result = allocate_historical_facts([fact], [owner("508", "400", "2688")])
     assert result.allocations == ()
+
+
+def test_a_neighbour_that_took_the_stock_leaves_nothing_of_the_fact():
+    """§58: the absorbed part leaves the fact for everybody.
+
+    A senior plan covered its need from the shelf at its freeze (§16 senior
+    holds are exactly why the junior plan's coverage is zero).  That stock is
+    not free, so the receipt it was made of cannot replenish the junior plan -
+    on the 28.09 copy that mistake handed out 35 988.626 units twice, 13.6% of
+    all BUY replenishment, on 133 items.
+    """
+    from app.services.item_ledger.historical_replay_core import (
+        allocate_historical_facts,
+    )
+
+    at = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    baseline_at = datetime(2026, 7, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    def owner(name, qty, covered):
+        return Reserve(
+            reserve_id=name, item_id=1, mode="buy", reserved_qty=Decimal(qty),
+            due_date=date(2026, 8, 31), plan_period_from=date(2026, 8, 1),
+            plan_period_to=date(2026, 8, 31), run_id=1, requirement_id=1,
+            known_batch_id=14033, baseline_at=baseline_at,
+            covered_from_stock_at_freeze_qty=Decimal(covered),
+        )
+
+    def fact(qty):
+        return Fact(
+            fact_id="receipt", item_id=1, mode="buy", qty=Decimal(qty),
+            posting_at=at, known_revisions=((6177, None, at),),
+        )
+
+    # The senior covered its whole need from the shelf, so its own
+    # replenishment need is zero: ``reserved_qty`` here is the frozen
+    # replenishment requirement, which is the reserve minus that coverage.
+    senior, junior = owner("A", "0", "100"), owner("B", "100", "0")
+    result = allocate_historical_facts([fact("100")], [senior, junior])
+    assert result.allocations == ()
+    assert [(row.qty, row.reason) for row in result.surplus] == [
+        (Decimal("100"), "covered_from_stock_at_freeze")
+    ]
+
+    # Only the part the senior did not take is free, and the junior gets it.
+    result = allocate_historical_facts([fact("150")], [senior, junior])
+    assert {row.reserve_id: row.qty for row in result.allocations} == {
+        "B": Decimal("50"),
+    }

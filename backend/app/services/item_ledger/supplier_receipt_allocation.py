@@ -199,6 +199,9 @@ class SupplierReceiptReplayResult:
     convergence_boundary: int
     processed_fact_ids: tuple[int, ...]
     unmatched_return_qty: Decimal = Decimal("0")
+    #: Decision §58, per fact id: how much of it was already its owners' frozen
+    #: stock and therefore never entered the distribution.
+    frozen_stock_by_fact: Mapping[int, Decimal] = field(default_factory=dict)
 
 
 HistoryMode = Literal["as_occurred", "as_known"]
@@ -539,36 +542,42 @@ def _freeze_boundary_of(
     )
 
 
-def _freeze_caps_for_receipt(
+def _absorb_frozen_stock(
     fact: "ReceiptFact",
-    qty: Decimal,
+    left: Decimal,
     entries: Iterable[Any],
     boundaries: Mapping[int, Any] | None,
     coverage_left: dict[int, Decimal],
-) -> dict[int, Decimal]:
+) -> tuple[Decimal, Decimal]:
     """Decision §58 for one positive receipt, through the one canonical rule.
 
-    How much of this receipt may replenish each owner: a receipt the owner's
-    freeze knew is that owner's frozen stock only up to what it actually
-    covered from stock, and the rest of it replenishes that owner like any
-    other quantity.  The owner's coverage is one budget, spent by the
-    pre-freeze receipts it knew, oldest receipt first.
+    What the owners of this item had already taken off the shelf at their
+    freeze comes out of the receipt first, oldest owner first, and it comes out
+    for everybody: stock a senior plan took at its freeze is not free stock for
+    a junior one, whose coverage is zero precisely because the senior held it
+    (§16).  Each owner's coverage is one budget, spent by the pre-freeze
+    receipts it knew, oldest receipt first, and beyond it the same receipt
+    replenishes that owner like any other quantity.
+
+    Returns ``(left, absorbed_total)``.
     """
-    caps: dict[int, Decimal] = {}
+    absorbed_total = Decimal("0")
     for entry in entries:
+        if left <= 0:
+            break
         key = int(_entry_key(entry))
         batch, instant = _freeze_boundary_of(entry, boundaries)
-        available, absorbed = replenishment_available_from_fact(
-            qty,
+        left, absorbed = replenishment_available_from_fact(
+            left,
             fact.known_revisions,
             batch,
             instant,
             coverage_left.get(key, Decimal("0")),
         )
-        caps[key] = available
         if absorbed > 0:
             coverage_left[key] = coverage_left.get(key, Decimal("0")) - absorbed
-    return caps
+            absorbed_total += absorbed
+    return left, absorbed_total
 
 
 def allocate_supplier_receipts(
@@ -578,6 +587,7 @@ def allocate_supplier_receipts(
     exact_allocation_caps: dict[tuple[int, str, str], dict[int, Decimal]] | None = None,
     history_mode: HistoryMode = "as_occurred",
     freeze_boundary_by_reservation: Mapping[int, Any] | None = None,
+    frozen_stock_out: dict[int, Decimal] | None = None,
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
 
@@ -628,6 +638,10 @@ def allocate_supplier_receipts(
     active_qty: dict[int, Decimal] = {}
     result: list[CoverageAllocation] = []
     surplus = Decimal("0")
+    # Decision §58: per fact, how much of it was already somebody's frozen
+    # stock.  Reported so the R4 writer can name the cause of an assignment it
+    # has to retire, instead of guessing from the owners' coverage.
+    frozen_stock_by_fact: dict[int, Decimal] = {}
     for fact in ordered:
         qty = _decimal(fact.signed_qty)
         if qty > 0:
@@ -647,17 +661,22 @@ def allocate_supplier_receipts(
                 if _text(getattr(entry, "planning_stock_pool", "default"))
                 == _text(fact.planning_stock_pool)
             )
-            # Decisions §49/§51/§53 as §58 bounds them: a receipt an owner's
-            # freeze knew is that owner's frozen stock only within what it
-            # actually covered from stock; the rest of the receipt replenishes
-            # it like any other quantity.
-            freeze_caps = _freeze_caps_for_receipt(
+            # Decisions §49/§51/§53 as §58 bounds them: the part of this
+            # receipt its owners had already taken off the shelf at their
+            # freeze leaves the receipt before anyone is credited; the rest of
+            # it replenishes normally, those same owners included.
+            left, absorbed = _absorb_frozen_stock(
                 fact,
-                qty,
+                left,
                 item_reservations,
                 freeze_boundary_by_reservation,
                 coverage_left,
             )
+            if absorbed > 0:
+                frozen_stock_by_fact[int(fact.sle_id)] = (
+                    frozen_stock_by_fact.get(int(fact.sle_id), Decimal("0"))
+                    + absorbed
+                )
 
             for reservation in item_reservations:
                 if left <= 0:
@@ -669,12 +688,10 @@ def allocate_supplier_receipts(
                 exact_key_value = exact_caps_for_key.get(int(key), Decimal("0"))
                 if exact_key_value <= 0:
                     continue
-                freeze_cap = freeze_caps.get(int(key), Decimal("0"))
-                exact_take = min(left, outstanding, exact_key_value, freeze_cap)
+                exact_take = min(left, outstanding, exact_key_value)
                 if exact_take <= 0:
                     continue
                 exact_caps_for_key[int(key)] = exact_key_value - exact_take
-                freeze_caps[int(key)] = freeze_cap - exact_take
                 remaining[key] = outstanding - exact_take
                 left -= exact_take
                 allocation = CoverageAllocation(
@@ -698,11 +715,9 @@ def allocate_supplier_receipts(
                 outstanding = remaining.get(key, Decimal("0"))
                 if outstanding <= 0:
                     continue
-                freeze_cap = freeze_caps.get(int(key), Decimal("0"))
-                take = min(left, outstanding, freeze_cap)
+                take = min(left, outstanding)
                 if take <= 0:
                     continue
-                freeze_caps[int(key)] = freeze_cap - take
                 allocation = CoverageAllocation(
                     fact=fact,
                     reservation=reservation,
@@ -794,6 +809,9 @@ def allocate_supplier_receipts(
                 basis_events=tuple(basis_events),
             ))
 
+    if frozen_stock_out is not None:
+        for key, value in frozen_stock_by_fact.items():
+            frozen_stock_out[key] = frozen_stock_out.get(key, Decimal("0")) + value
     return tuple(result), surplus
 
 
@@ -857,11 +875,13 @@ def replay_supplier_receipt_basis(
                     }
                 )
             )
+    frozen_stock_by_fact: dict[int, Decimal] = {}
     final_allocations, surplus_qty = allocate_supplier_receipts(
         effective_facts,
         active_reservations,
         exact_allocation_caps=exact_allocation_caps,
         history_mode=history_mode,
+        frozen_stock_out=frozen_stock_by_fact,
     )
     merged: dict[tuple[int, int], CoverageAllocation] = {}
     for row in final_allocations:
@@ -897,6 +917,7 @@ def replay_supplier_receipt_basis(
     return SupplierReceiptReplayResult(
         allocations=final,
         surplus_qty=_decimal(surplus_qty),
+        frozen_stock_by_fact=dict(frozen_stock_by_fact),
         convergence_boundary=len(rows),
         processed_fact_ids=tuple(
             int(row.sle_id)

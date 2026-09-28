@@ -1270,7 +1270,15 @@ def _publish_forward_physical_refresh_current(
     # brought in (decision §41): history it did not touch is not its verdict.
     delta_sle_ids = {int(row.id) for row in rows}
     if delta_sle_ids:
-        require_facts_not_over_allocated(db, sle_ids=delta_sle_ids)
+        require_facts_not_over_allocated(
+            db,
+            sle_ids=delta_sle_ids,
+            # This publication's own prefix: at the pointer the delta's own
+            # document legs are not visible yet, and the gate would net an
+            # incomplete document.
+            physical_import_batch_id=int(target.physical_import_batch_id),
+            cutoff=target.cutoff,
+        )
 
     start_phase("assembly_output")
     assembly_in_ids = tuple(

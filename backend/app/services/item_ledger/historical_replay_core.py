@@ -60,8 +60,9 @@ class Reserve:
     known_batch_id: Optional[int] = None
     baseline_at: Optional[datetime] = None
     # Decision §58: how much this owner actually took off the shelf when it
-    # was frozen.  A fact its freeze knew is excluded from its replenishment
-    # only up to this quantity; the rest of such a fact replenishes normally.
+    # was frozen.  A fact its freeze knew is taken out of the distribution up
+    # to this quantity - for every owner, not only for this one; the rest of
+    # such a fact replenishes normally, this owner included.
     covered_from_stock_at_freeze_qty: Decimal = Decimal("0")
 
 
@@ -116,6 +117,12 @@ def known_at_freeze(
     return False
 
 
+#: Named cause of the part of a fact its owners had already taken off the shelf
+#: at their freeze (decision §58).  It is neither an allocation nor free
+#: surplus: it is the fact's own quantity, already counted as somebody's stock.
+FROZEN_STOCK_REASON = "covered_from_stock_at_freeze"
+
+
 def replenishment_available_from_fact(
     fact_qty: Decimal,
     revisions: Any,
@@ -123,32 +130,35 @@ def replenishment_available_from_fact(
     freeze_baseline_at: Optional[datetime],
     freeze_coverage_left: Decimal,
 ) -> Tuple[Decimal, Decimal]:
-    """Decision §58: how much of one fact may replenish one owner.
+    """Decision §58: how much of one fact is still free to replenish anybody.
 
-    Returns ``(available, absorbed)``.  ``absorbed`` is the part of the fact
-    this owner had already taken off the shelf when it was frozen and which
-    therefore cannot also replenish it; ``available`` is the rest of the fact,
-    which reaches this owner through the ordinary addressed-then-FIFO
-    distribution like any other quantity.  The answer is about one owner: the
-    absorbed part is not removed from the fact for everybody, because another
-    owner's frozen coverage is that owner's own obligation and is not evidence
-    about this one.  A fact is still allocated at most once in total, which is
-    the allocator's half of the §58 invariant; the other half - that the freeze
-    did not hand the same stock to two plans - belongs to the freeze (§16).
+    Returns ``(left, absorbed)``.  ``absorbed`` is the part of the remaining
+    fact this owner had already taken off the shelf when it was frozen;
+    ``left`` is what remains of the fact after that part is taken out of it.
 
-    A fact the freeze did not know is untouched: all of it replenishes.  A
-    fact the freeze did know is excluded **only up to the quantity this owner
-    actually covered from stock** (``covered_from_stock_at_freeze``), not
-    wholesale: a plan that took nothing off the shelf must take the free stock
-    rather than order or produce it again.  The owner's coverage is a single
-    budget spent by its pre-freeze facts oldest-first, so one fact is never
-    excluded twice for the same owner, and the caller consumes the absorbed
-    part from the fact so no other owner can be credited with it either -
-    which is the §58 invariant "covered at freeze + replenishment <= the fact".
+    A fact the freeze did not know is untouched.  A fact the freeze did know is
+    excluded **only up to the quantity that owner actually covered from stock**
+    (``covered_from_stock_at_freeze``), not wholesale: a plan that took nothing
+    off the shelf must take the free stock rather than order or produce it
+    again.  Beyond that quantity the same fact replenishes that very owner like
+    any other.
+
+    The absorbed part leaves the fact for **everybody**, which is what the §58
+    invariant requires: "covered at freeze (by every plan whose freeze knew the
+    fact) + replenishment <= the fact".  Free stock is there to be taken, but
+    only the free part: stock a senior plan had already taken at its freeze
+    (§16 senior holds are exactly why a junior plan's coverage is zero) is not
+    free, and crediting it to the junior plan handed one quantity out twice.
+    So the caller folds this over the owners whose freeze knew the fact, oldest
+    owner first, threading ``left`` through, and distributes only what is left.
+
+    Each owner's coverage is one budget, spent by its pre-freeze facts oldest
+    fact first, so one fact is never excluded twice for the same owner.
 
     This is the one place that answers the question.  Every allocator - the
-    generation replay, the current MAKE and BUY replays and the supplier
-    rebuild - calls it instead of re-deciding what a pre-freeze fact means.
+    generation replay, the current MAKE replay and its one-off bootstrap, and
+    the supplier receipt allocator - calls it instead of re-deciding what a
+    pre-freeze fact means.
     """
     if fact_qty <= 0:
         return Decimal("0"), Decimal("0")
@@ -293,7 +303,6 @@ def allocate_historical_facts(
         rule: MatchRule,
         *,
         is_addressed: bool = False,
-        caps: dict[str, Decimal] | None = None,
     ) -> Decimal:
         left = qty
         for reserve in candidates:
@@ -302,13 +311,7 @@ def allocate_historical_facts(
             available = remaining[reserve.reserve_id]
             if available <= 0:
                 continue
-            if caps is not None:
-                available = min(available, caps.get(reserve.reserve_id, Decimal("0")))
-                if available <= 0:
-                    continue
             take = min(left, available)
-            if caps is not None:
-                caps[reserve.reserve_id] = caps[reserve.reserve_id] - take
             allocations.append(
                 Allocation(
                     fact.fact_id,
@@ -341,22 +344,26 @@ def allocate_historical_facts(
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
         ]
-        # Decision §58: for each owner of this pool, how much of this fact may
-        # replenish it.  The owner's freeze coverage is a budget spent by the
-        # pre-freeze facts it knew, oldest fact first; what the budget does not
-        # cover reaches the owner through the ordinary distribution below.
-        caps: dict[str, Decimal] = {}
+        # Decision §58: what the owners of this pool had already taken off the
+        # shelf at their freeze comes out of the fact first, oldest owner
+        # first, and it comes out for everybody - stock a senior plan took at
+        # its freeze is not free stock for a junior one.  Only what is left is
+        # distributed below, to these same owners included.
         for reserve in compatible:
-            available, absorbed = replenishment_available_from_fact(
+            if left <= 0:
+                break
+            left, absorbed = replenishment_available_from_fact(
                 left,
                 fact.known_revisions,
                 reserve.known_batch_id,
                 reserve.baseline_at,
                 coverage_left[reserve.reserve_id],
             )
-            caps[reserve.reserve_id] = available
             if absorbed > 0:
                 coverage_left[reserve.reserve_id] -= absorbed
+                surplus.append(
+                    SurplusFact(fact.fact_id, absorbed, FROZEN_STOCK_REASON)
+                )
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
         # One requirement may legitimately have several dated reserve slices.
         # An order reference shared by different requirements is ambiguous and
@@ -366,10 +373,10 @@ def allocate_historical_facts(
             fact.requirement_id is not None or len(exact_requirement_ids) == 1
         )
         if address_is_unambiguous:
-            left = place(fact, left, exact, "pegged", is_addressed=True, caps=caps)
+            left = place(fact, left, exact, "pegged", is_addressed=True)
 
         if left > 0:
-            left = place(fact, left, compatible, "fifo", caps=caps)
+            left = place(fact, left, compatible, "fifo")
 
         if left > 0:
             surplus.append(

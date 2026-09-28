@@ -974,8 +974,10 @@ def freeze_basis_impact(engine: Engine, *, csv_path: str | None = None) -> dict[
                         ).get(int(other.id))
                     except CurrentReplenishmentError:
                         other_boundary = None
-                    # §58: for this other owner the released fact is stock only
-                    # within what it covered from stock; the rest can reach it.
+                    # §58: the released fact is stock within what this other
+                    # owner covered from stock, and only the rest can reach it.
+                    # An upper bound: the estimate looks at one receiving owner
+                    # at a time and does not model what its neighbours took.
                     other_budget = _dec(other.covered_from_stock_at_freeze_qty)
                     eligible = _Decimal("0")
                     for qty, revisions, _releasing_owner in candidates:

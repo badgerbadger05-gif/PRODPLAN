@@ -31,8 +31,8 @@ from .historical_replay_core import (
     ReplayResult,
     ReserveRealization,
     plan_allocation_changes,
-    known_at_freeze,
-    replenishment_available_from_fact,
+    FROZEN_STOCK_REASON,
+    SurplusFact,
 )
 from .reservation import reservation_business_identity
 
@@ -53,11 +53,12 @@ BASIS_CORRECTED_REASON = "basis_corrected"
 #: document, so there is no production output to credit.  A recorded cause, not
 #: a silent wipe - the fail-closed guard stays for the unexplained case.
 NETTED_OUTPUT_EMPTY_REASON = "all assembly output nets to zero"
-#: Decisions §49/§51/§53: an allocation whose fact is in its owner's frozen
-#: stock - first imported by the freeze batch and dated no later than the
-#: freeze instant (``known_at_freeze``) - is never that owner's replenishment.
-#: A replay that drops such an allocation has a provable reason, recorded by
-#: the writer.
+#: Decisions §49/§51/§53 as §58 bounds them: an allocation whose fact lost that
+#: quantity to somebody's frozen stock - a fact first imported by the freeze
+#: batch and dated no later than the freeze instant (``known_at_freeze``),
+#: within what that owner covered from stock - is not replenishment at all.  A
+#: replay that drops such an allocation has a provable reason, recorded by the
+#: writer.
 FREEZE_BASELINE_REASON = "facts_at_or_before_freeze_baseline"
 
 #: The source stream of a distribution scope is a property of the scope, not
@@ -587,7 +588,15 @@ def _receipt_change_plan(
     )
     result = ReplayResult(
         allocations=after,
-        surplus=(),
+        # Decision §58: the part of each receipt that was already its owners'
+        # frozen stock, carried through so the writer can name the cause of an
+        # assignment it retires.
+        surplus=tuple(
+            SurplusFact(str(int(fact_id)), _decimal(qty), FROZEN_STOCK_REASON)
+            for fact_id, qty in sorted(
+                dict(getattr(replay, "frozen_stock_by_fact", {}) or {}).items()
+            )
+        ),
         realizations=realizations,
         fact_qty=sum((row.signed_qty for row in receipt_facts), Decimal("0")),
         allocated_qty=sum((row.qty for row in after), Decimal("0")),
@@ -810,6 +819,8 @@ def over_allocated_facts(
     item_ids: Iterable[int] | None = None,
     sle_ids: Iterable[int] | None = None,
     limit: int = 8,
+    physical_import_batch_id: int | None = None,
+    cutoff: datetime | None = None,
 ) -> list[tuple[int, str, Decimal, Decimal]]:
     """Facts whose current allocations exceed the fact (invariants 2-3).
 
@@ -824,6 +835,12 @@ def over_allocated_facts(
     exists as production at all: measured against the raw line, an allocation
     of a pure transport leg - a line whose net output is zero - satisfied the
     invariant while counting a movement that produced nothing.
+
+    A document is netted inside one visible prefix.  A publication in progress
+    must name its own target's prefix (``physical_import_batch_id``/``cutoff``):
+    judged at the pointer, the delta's own legs are not visible yet and the
+    gate would net an incomplete document.  Without them the accepted pointer
+    is used, which is the right prefix for a one-off or a report.
     """
     from sqlalchemy import func
     from .document_net_output import OUTPUT_MOVEMENT_KIND
@@ -876,16 +893,24 @@ def over_allocated_facts(
         (int(sle_id), str(role), _decimal(total), _decimal(qty))
         for sle_id, role, total, qty in raw_query.all()
     ]
-    offenders.extend(_over_allocated_assembly_output(db, _scoped))
+    offenders.extend(_over_allocated_assembly_output(
+        db, _scoped,
+        physical_import_batch_id=physical_import_batch_id,
+        cutoff=cutoff,
+    ))
     offenders.sort(key=lambda row: (row[0], row[1]))
     if limit and int(limit) > 0:
         return offenders[:int(limit)]
     return offenders
 
 
-def _over_allocated_assembly_output(db: Session, scoped) -> list[
-    tuple[int, str, Decimal, Decimal]
-]:
+def _over_allocated_assembly_output(
+    db: Session,
+    scoped,
+    *,
+    physical_import_batch_id: int | None = None,
+    cutoff: datetime | None = None,
+) -> list[tuple[int, str, Decimal, Decimal]]:
     """The ``assembly_in`` half of :func:`over_allocated_facts`.
 
     The ceiling is a property of the whole 1C document, so it cannot be a
@@ -922,19 +947,24 @@ def _over_allocated_assembly_output(db: Session, scoped) -> list[
     ]
     if not allocated_by_pair:
         return []
-    pointer = db.get(models.PlanningTruthState, 1)
-    generation = (
-        db.get(models.LedgerGeneration, int(pointer.current_generation_id))
-        if pointer is not None and pointer.current_generation_id is not None
-        else None
-    )
-    if generation is None or generation.physical_import_batch_id is None:
-        # Without an accepted prefix there is no visible document to net
-        # against; fail closed rather than fall back to the raw line.
-        raise CurrentReplenishmentError(
-            "assembly output allocations cannot be measured without an accepted "
-            "physical prefix"
+    prefix_batch_id = physical_import_batch_id
+    prefix_cutoff = cutoff
+    if prefix_batch_id is None:
+        pointer = db.get(models.PlanningTruthState, 1)
+        generation = (
+            db.get(models.LedgerGeneration, int(pointer.current_generation_id))
+            if pointer is not None and pointer.current_generation_id is not None
+            else None
         )
+        if generation is None or generation.physical_import_batch_id is None:
+            # Without a prefix there is no visible document to net against;
+            # fail closed rather than fall back to the raw line.
+            raise CurrentReplenishmentError(
+                "assembly output allocations cannot be measured without a "
+                "physical prefix"
+            )
+        prefix_batch_id = int(generation.physical_import_batch_id)
+        prefix_cutoff = generation.cutoff
     rows = (
         db.query(models.StockLedgerEntry)
         .filter(models.StockLedgerEntry.id.in_(
@@ -945,8 +975,8 @@ def _over_allocated_assembly_output(db: Session, scoped) -> list[
     net_by_sle = net_output_for_facts(
         db,
         rows,
-        physical_import_batch_id=int(generation.physical_import_batch_id),
-        cutoff=generation.cutoff,
+        physical_import_batch_id=int(prefix_batch_id),
+        cutoff=prefix_cutoff,
     )
     return [
         (sle_id, role, total, net_by_sle.get(sle_id, Decimal("0")))
@@ -960,9 +990,14 @@ def require_facts_not_over_allocated(
     *,
     item_ids: Iterable[int] | None = None,
     sle_ids: Iterable[int] | None = None,
+    physical_import_batch_id: int | None = None,
+    cutoff: datetime | None = None,
 ) -> None:
     """Fail closed when any fact carries more current allocation than itself."""
-    offenders = over_allocated_facts(db, item_ids=item_ids, sle_ids=sle_ids, limit=8)
+    offenders = over_allocated_facts(
+        db, item_ids=item_ids, sle_ids=sle_ids, limit=8,
+        physical_import_batch_id=physical_import_batch_id, cutoff=cutoff,
+    )
     if offenders:
         listed = ", ".join(
             f"SLE {sle_id} {role} {total}>{qty}"
@@ -1454,45 +1489,34 @@ def apply_current_replenishment(
     except (TypeError, ValueError) as exc:
         raise CurrentReplenishmentError(str(exc)) from exc
 
-    # Decision §49: a previous allocation whose fact is still here but is not
-    # later than its owner's freeze cutoff is dropped for a provable reason -
-    # the fact is the owner's frozen stock.  That is not a silent wipe, so the
+    # Decisions §49/§51/§53 as §58 bounds them: a previous allocation is
+    # dropped for a provable reason when the fact it stood on lost that
+    # quantity to somebody's frozen stock.  That is not a silent wipe, so the
     # writer names the reason itself; an allocation whose fact vanished, or
-    # whose owner has no boundary, is not explained and stays guarded.
-    known_fact = {
-        str(int(row.sle_id)): tuple(getattr(row, "known_revisions", ()) or ())
-        for row in receipt_facts
-    }
-    known_fact.update({
-        str(row.fact_id): tuple(row.known_revisions)
-        for row in fact_rows
-        if row.known_revisions
-    })
-
-    def _dropped_by_baseline(old: Allocation) -> bool:
-        revisions = known_fact.get(str(old.fact_id), ())
-        if not revisions:
-            return False
-        # Decision §58: the fact is somebody's frozen stock in this scope -
-        # an owner whose freeze knew it and that did take stock off the shelf
-        # then.  The question is about the fact, not about the owner that used
-        # to hold the allocation: the absorbed quantity leaves the fact, so a
-        # neighbour's allocation disappears for the same recorded reason.  An
-        # owner that covered nothing absorbs nothing, so a scope of such owners
-        # keeps the fact as replenishment and the silent-wipe guard still
-        # applies.
-        return any(
-            row.known_batch_id is not None
-            and _decimal(row.covered_from_stock_at_freeze_qty) > 0
-            and known_at_freeze(revisions, row.known_batch_id, row.baseline_at)
-            for row in reserve_rows_for_plan
+    # that goes beyond the absorbed quantity, is not explained and stays
+    # guarded.
+    # Decision §58: exactly how much of each fact the replay took out of it as
+    # its owners' frozen stock.  The allocators report it; this is not a second
+    # decision about what a pre-freeze fact means.
+    frozen_stock_budget: dict[str, Decimal] = {}
+    for row in plan.result.surplus:
+        if _text(row.reason) != FROZEN_STOCK_REASON:
+            continue
+        frozen_stock_budget[str(row.fact_id)] = (
+            frozen_stock_budget.get(str(row.fact_id), Decimal("0")) + _decimal(row.qty)
         )
 
-    baseline_dropped = {
-        (str(old.fact_id), str(old.reserve_id))
-        for old in plan.deletions
-        if _dropped_by_baseline(old)
-    }
+    # A deletion is explained only within that absorbed quantity: the fact lost
+    # exactly this much to somebody's frozen stock, so at most this much of its
+    # former assignment has a recorded cause.  Anything beyond it is the
+    # unexplained wipe the guard below still refuses.
+    baseline_dropped: set[tuple[str, str]] = set()
+    for old in sorted(plan.deletions, key=lambda row: (str(row.fact_id), str(row.reserve_id))):
+        budget = frozen_stock_budget.get(str(old.fact_id), Decimal("0"))
+        if budget <= 0:
+            continue
+        frozen_stock_budget[str(old.fact_id)] = budget - _decimal(old.qty)
+        baseline_dropped.add((str(old.fact_id), str(old.reserve_id)))
     if (
         complete_scope and previous and not plan.result.allocations
         and not confirmed_empty

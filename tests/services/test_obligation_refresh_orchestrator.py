@@ -1763,8 +1763,12 @@ def test_a_retained_owner_and_a_successor_do_not_both_count_one_fact(db_session)
     from app.services.item_ledger.current_replenishment import over_allocated_facts
 
     accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    # Decision §58: the successor's freeze covers its whole need (5) from this
+    # receipt, and that part is nobody's replenishment.  The receipt is larger
+    # than the coverage so the question this test asks - is what is left
+    # counted once, by the retained owner, or twice - is still the question.
     _old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
-        db_session, accepted, plan, item, parent, cutoff,
+        db_session, accepted, plan, item, parent, cutoff, qty="7",
     )
     kept = _extra_fixed_plan(db_session, accepted, cutoff, name="kept", code="KEPT-26")
     requirement = db_session.get(models.MrpRequirement, kept.owner.requirement_id)
@@ -1783,7 +1787,9 @@ def test_a_retained_owner_and_a_successor_do_not_both_count_one_fact(db_session)
     assert result.published is True
     assert over_allocated_facts(db_session) == []
     current = _current_receipt_allocations(db_session, receipt.id)
-    assert sum((Decimal(str(row.allocated_qty)) for row in current), Decimal("0")) == Decimal("2")
+    # 4 of the 7 are the successor's frozen stock (§58); the 3 that are left are
+    # counted once, by the retained owner - not twice, once by each.
+    assert sum((Decimal(str(row.allocated_qty)) for row in current), Decimal("0")) == Decimal("3")
 
 
 # --- Item 26b: StockBin generation is provenance, not membership ---------------
@@ -1979,8 +1985,10 @@ def test_a_retained_owner_keeps_its_pegged_allocation_through_a_refresh(db_sessi
     from app.services.item_ledger.supplier_receipt_allocation import SUPPLIER_ORDER_TYPE
 
     accepted, plan, _line, item, parent, cutoff = _world(db_session, qty=5)
+    # Decision §58: 5 of this receipt are the successor's frozen stock, so the
+    # peg this test is about is the 2 that are left.
     _old_owner, receipt = _buy_owner_with_a_current_receipt_allocation(
-        db_session, accepted, plan, item, parent, cutoff,
+        db_session, accepted, plan, item, parent, cutoff, qty="7",
     )
     kept = _extra_fixed_plan(db_session, accepted, cutoff, name="kept", code="KEPT-27")
     requirement = db_session.get(models.MrpRequirement, kept.owner.requirement_id)
@@ -2043,7 +2051,11 @@ def test_a_retained_owner_keeps_its_pegged_allocation_through_a_refresh(db_sessi
     assert [
         (int(row.reservation_id), str(row.match_rule), Decimal(str(row.allocated_qty)))
         for row in current
-    ] == [(int(kept.owner.id), "pegged", Decimal("2"))]
+    # The 3 units left after the successor's frozen coverage (§58) stay with the
+    # retained owner, and its exact supplier-order cap is found: 2 of them are
+    # inside the exported ``allocated_qty`` and 1 is FIFO, which is the
+    # ``mixed`` rule.  A lost cap lookup would have made it plain ``fifo``.
+    ] == [(int(kept.owner.id), "mixed", Decimal("3"))]
 
 
 # --- Item 28a: the two publication paths agree -----------------------------------
