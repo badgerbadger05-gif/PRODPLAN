@@ -1643,6 +1643,7 @@ def repair_current_execution_scopes_from_pointer(
     pointer_generation_id: int,
     payload_boundary_generation_id: int,
     source_revision: int | str,
+    rebuild_purchase: bool = False,
 ) -> CurrentExecutionScopeRepairResult | None:
     """Republish stale/not-ready current scopes from the accepted pointer.
 
@@ -1666,6 +1667,7 @@ def repair_current_execution_scopes_from_pointer(
             pointer_generation_id=int(pointer_generation_id),
             payload_boundary_generation_id=int(payload_boundary_generation_id),
             source_revision=source_revision,
+            rebuild_purchase=bool(rebuild_purchase),
         )
 
 
@@ -1675,6 +1677,7 @@ def _repair_current_execution_scopes_from_pointer(
     pointer_generation_id: int,
     payload_boundary_generation_id: int,
     source_revision: int | str,
+    rebuild_purchase: bool = False,
 ) -> CurrentExecutionScopeRepairResult | None:
     pointer = db.get(models.PlanningTruthState, 1)
     generation = db.get(models.LedgerGeneration, int(pointer_generation_id))
@@ -1739,13 +1742,17 @@ def _repair_current_execution_scopes_from_pointer(
         accepted_run_ids=run_ids,
         affected_item_ids=(),
     )
+    # An ordinary repair reuses the purchase rows: nothing it republishes can
+    # have changed them.  A caller that has just rewritten BUY replenishment
+    # has, so it asks for the complete rebuild instead of reusing rows computed
+    # from the coverage it replaced.
     purchase_payload = build_compact_current_purchase_control_payload(
         db,
         target_generation_id=int(boundary.id),
         parent_generation_id=int(generation.id),
         accepted_run_ids=run_ids,
-        affected_scopes=(),
-        reuse_parent_current=True,
+        affected_scopes=None if rebuild_purchase else (),
+        reuse_parent_current=not rebuild_purchase,
     )
     mrp_payloads, period_payloads = _build_obligation_view_payloads(
         db, generation_id=int(generation.id), run_ids=run_ids,

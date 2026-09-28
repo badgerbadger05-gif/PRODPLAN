@@ -598,17 +598,7 @@ def allocate_supplier_receipts(
     reservations = {
         item_id: tuple(
             sorted(
-                (
-                    entry for entry in values
-                    if _entry_outstanding(entry) > 0
-                    # Decision §58: an owner that is already fully covered has
-                    # nothing to receive, but the stock it took at its freeze
-                    # still has to come out of the pre-freeze receipts before
-                    # anyone else is credited with them.
-                    or _decimal(
-                        getattr(entry, "covered_from_stock_at_freeze_qty", 0)
-                    ) > 0
-                ),
+                (entry for entry in values if _entry_outstanding(entry) > 0),
                 key=_buy_reservation_order,
             )
         )

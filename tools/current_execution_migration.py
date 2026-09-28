@@ -1755,6 +1755,9 @@ def _republish_current_execution_after_rebase(
             pointer_generation_id=int(generation_id),
             payload_boundary_generation_id=int(boundary.id),
             source_revision=revision,
+            # This phase rewrote BUY replenishment, so the purchase rows must
+            # be rebuilt rather than reused from the coverage it replaced.
+            rebuild_purchase=True,
         )
     finally:
         boundary.status = "rejected"

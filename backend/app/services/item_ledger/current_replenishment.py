@@ -2008,14 +2008,7 @@ def apply_current_replenishment_for_accepted_generation(
     reservation_query = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.lifecycle_status == "active",
         models.ReservationEntry.realization_mode == "buy",
-        # Decision §58: an owner with nothing left to receive still belongs to
-        # the scope when it took stock at its freeze - that stock has to come
-        # out of the pre-freeze receipts before another owner is credited with
-        # them.  It can never take an allocation: its outstanding is zero.
-        or_(
-            models.ReservationEntry.replenishment_required_qty > 0,
-            models.ReservationEntry.covered_from_stock_at_freeze_qty > 0,
-        ),
+        models.ReservationEntry.replenishment_required_qty > 0,
     )
     if _text(generation.status) == "building":
         retained = sorted({int(value) for value in retained_run_ids})
@@ -2250,6 +2243,10 @@ def apply_current_replenishment_for_accepted_generation(
             apply_current_receipt_replay(
                 db,
                 generation_id=int(generation_id),
+                # The visible prefix is already in hand; without it every
+                # scope loaded the whole accepted prefix again, which is what
+                # made a full rebase of ~500 BUY scopes take hours.
+                validated_visible_ids=tuple(visible),
                 source_key=SUPPLIER_RECEIPT_SOURCE_KEY,
                 source_revision=revision,
                 receipt_facts=facts,
