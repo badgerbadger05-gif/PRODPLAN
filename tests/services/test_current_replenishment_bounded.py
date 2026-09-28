@@ -354,3 +354,60 @@ def test_bounded_make_stamps_the_publishing_generation_by_default(db_session):
         (int(row.source_revision), int(row.ledger_generation_id))
         for row in db_session.query(models.CurrentReplenishmentState).all()
     } == {(int(target.id), int(target.id))}
+
+
+def test_bounded_make_credits_document_net_output_not_raw_assembly_in(db_session):
+    """Canon: the internal transport of one document is not production output.
+
+    ``СборкаЗапасов`` writes a receipt on the production warehouse, an issue
+    from it and a receipt on the destination warehouse.  The canonical net
+    output of that document is owned by ``document_net_output.py`` and both the
+    replenishment replay and the plan-output allocation read it; crediting the
+    raw ``assembly_in`` lines counted a component's pass-through movement as
+    this item's production (item 8945 on the 28.09 stand copy: 3660 raw units
+    against 300 units of real net output).
+    """
+    parent, target, items, owners, facts = _world(db_session)
+    item = items[0]
+    # The item's own fact of the world is 3 units on document ``M1``; add the
+    # transport legs of that same document, which cancel it, plus a second
+    # document that really produced 2 units.
+    for quantity, kind, ref, line_no, warehouse in (
+        ("-3", "assembly_out", "M1", "2", "WH-MAKE"),
+        ("2", "assembly_in", "M3", "1", "WH-MAKE"),
+    ):
+        db_session.add(models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash=f"net-{ref}-{line_no}".ljust(64, "0"),
+            business_identity=f"net:{ref}:{line_no}",
+            item_id=item.item_id, characteristic_ref="", organization_ref="",
+            warehouse_ref1c=warehouse, qty=Decimal(quantity),
+            posting_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+            known_at=datetime(2026, 9, 11, tzinfo=timezone.utc),
+            record_type="Receipt" if Decimal(quantity) > 0 else "Expense",
+            movement_kind=kind, recorder_type="Assembly", recorder_ref=ref,
+            line_no=line_no, ingest_source="pull",
+        ))
+    db_session.flush()
+
+    result = apply_current_replenishment_for_bounded_make_scopes(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        target_cutoff=target.cutoff,
+        affected_scopes=(_scope(item.item_id),),
+    )
+    db_session.commit()
+
+    assert result.netted_internal_transfer_rows == 1
+    owner = db_session.get(models.ReservationEntry, owners[item.item_id].id)
+    assert Decimal(str(owner.replenishment_received_qty)) == Decimal("2")
+    allocated = {
+        int(row.sle_id): Decimal(str(row.allocated_qty))
+        for row in db_session.query(models.ReservationConsumptionAllocation).filter(
+            models.ReservationConsumptionAllocation.reservation_id == owner.id,
+            models.ReservationConsumptionAllocation.is_current.is_(True),
+        ).all()
+    }
+    assert int(facts[item.item_id].id) not in allocated
+    assert sum(allocated.values()) == Decimal("2")

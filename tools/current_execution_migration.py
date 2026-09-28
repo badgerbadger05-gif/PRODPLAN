@@ -7,6 +7,7 @@ rows.  A non-ready manifest is a hard stop for the eventual migration runner.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -1535,6 +1536,368 @@ def _replenishment_bootstrap_on_session(
     }
 
 
+#: Distribution scopes handed to the canonical MAKE writer per call.  One call
+#: reads the visible netted assembly history of its own items only, so the
+#: batch bounds peak memory without changing a single scope's input: every
+#: scope is still replayed complete, and the writer owns one scope at a time.
+MAKE_BOOTSTRAP_SCOPE_BATCH = 250
+
+#: Current execution scopes whose payload reads
+#: ``ReservationEntry.replenishment_received_qty`` and therefore changes when
+#: MAKE replenishment is credited: the production journal's MAKE proposals
+#: (``production_control_journal_projection``), the shelf pull
+#: (``shelf_projection_persistence``) and the period plan execution view
+#: (``period_plan_service``).  Invalidated by this writer in its own
+#: transaction, exactly as canon R8 requires of a mutation writer; the
+#: republish below (and, if it is skipped, the next refresh tick) clears them.
+MAKE_BOOTSTRAP_DEPENDENT_SCOPES = (
+    ("production_control_journal", "production:all-live-orders"),
+    ("shelf_projection", "shelf:all-live-mrps"),
+    ("period_plan_execution", "period-plan:all-live-plans"),
+)
+
+
+def _lock_truth_pointer(session: Session, generation_id: int) -> None:
+    """Serialize with every publication that moves the pointer."""
+
+    locked = session.execute(text(
+        "SELECT current_generation_id FROM planning_truth_state WHERE id = 1 FOR UPDATE"
+        if session.get_bind().dialect.name == "postgresql"
+        else "SELECT current_generation_id FROM planning_truth_state WHERE id = 1"
+    )).scalar_one_or_none()
+    if locked is None or int(locked) != int(generation_id):
+        raise PreflightBlocked(
+            f"truth pointer is {locked}, expected {int(generation_id)}"
+        )
+
+
+def _current_replenishment_allocations_by_recorder(
+    session: Session,
+) -> dict[str, int]:
+    rows = session.execute(text(
+        "SELECT e.recorder_type AS recorder_type, count(*) AS row_count "
+        "FROM reservation_consumption_allocation a "
+        "JOIN stock_ledger_entry e ON e.id = a.sle_id "
+        "WHERE a.is_current AND a.allocation_role = 'replenishment_receipt' "
+        "GROUP BY e.recorder_type ORDER BY e.recorder_type"
+    )).mappings().all()
+    return {str(row["recorder_type"]): int(row["row_count"]) for row in rows}
+
+
+def _make_owner_totals(session: Session) -> dict[str, Any]:
+    """Required/received/remaining of the live current MAKE and rework owners."""
+
+    from app.services.item_ledger.current_replenishment import canonical_decimal_text
+
+    row = session.execute(text(
+        "SELECT count(*) AS owners, "
+        "coalesce(sum(replenishment_required_qty), 0) AS required, "
+        "coalesce(sum(replenishment_received_qty), 0) AS received, "
+        "coalesce(sum(CASE WHEN replenishment_required_qty "
+        "> replenishment_received_qty THEN replenishment_required_qty "
+        "- replenishment_received_qty ELSE 0 END), 0) AS remaining "
+        "FROM reservation_entry "
+        "WHERE is_current AND owner_kind = 'current' "
+        "AND lifecycle_status = 'active' AND current_identity <> '' "
+        "AND realization_mode IN ('make', 'rework')"
+    )).mappings().one()
+    return {
+        "owners": int(row["owners"]),
+        "required_total": canonical_decimal_text(row["required"]),
+        "received_total": canonical_decimal_text(row["received"]),
+        "remaining_total": canonical_decimal_text(row["remaining"]),
+    }
+
+
+def _owners_above_required(session: Session) -> int:
+    return int(session.execute(text(
+        "SELECT count(*) FROM reservation_entry "
+        "WHERE is_current AND lifecycle_status = 'active' "
+        "AND replenishment_received_qty > replenishment_required_qty"
+    )).scalar_one() or 0)
+
+
+def _technical_payload_boundary(session: Session, pointer: Any) -> Any:
+    """A BUILDING generation that exists only as the payload ``as_of`` boundary.
+
+    ``repair_current_execution_scopes_from_pointer`` republishes from the
+    accepted pointer but evaluates readiness/drum/shelf against a BUILDING
+    boundary's cutoff, because in the runtime it is always called by a refresh
+    tick that already forked its candidate.  A one-off has no such candidate
+    and must not invent a *new* cutoff: ``fork_physical_refresh_generation``
+    requires a cutoff strictly after the parent's, which is a claim about a 1C
+    read this tool never made, and it also clones supplier provenance and a
+    physical boundary it would then have to delete again.
+
+    So the boundary carries exactly the pointer's own cutoff and physical
+    import batch: the same ``as_of`` date the pointer was published with, no
+    new physical truth, nothing above the accepted boundary.  It is retired to
+    ``rejected`` in this same transaction, and a rollback removes it entirely.
+    """
+
+    from app import models
+
+    boundary = models.LedgerGeneration(
+        generation_key=(
+            f"make-replenishment-bootstrap:g{int(pointer.id)}:"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+        ),
+        status="building",
+        cutoff=pointer.cutoff,
+        source_watermarks={
+            "parent_generation_id": int(pointer.id),
+            "payload_boundary_only": True,
+        },
+        capabilities=dict(pointer.capabilities or {}),
+        physical_import_batch_id=int(pointer.physical_import_batch_id),
+        algorithm_version=str(pointer.algorithm_version or "make-bootstrap"),
+        replay_version=pointer.replay_version,
+    )
+    session.add(boundary)
+    session.flush()
+    return boundary
+
+
+def _republish_current_execution_after_make(
+    session: Session, generation_id: int
+) -> dict[str, Any]:
+    """Republish the current execution scopes this bootstrap changed."""
+
+    from app import models
+    from app.services.item_ledger.current_execution import (
+        invalidate_current_execution_scope,
+    )
+    from app.services.item_ledger.physical_refresh_current_publish import (
+        repair_current_execution_scopes_from_pointer,
+    )
+
+    revision = f"make-replenishment-bootstrap:g{int(generation_id)}"
+    invalidated = [
+        f"{entity_kind}:{scope_key}"
+        for entity_kind, scope_key in MAKE_BOOTSTRAP_DEPENDENT_SCOPES
+        if invalidate_current_execution_scope(
+            session,
+            entity_kind=entity_kind,
+            scope_key=scope_key,
+            source_revision=revision,
+            reason="make_replenishment_bootstrap",
+        )
+    ]
+    pointer_generation = session.get(models.LedgerGeneration, int(generation_id))
+    boundary = _technical_payload_boundary(session, pointer_generation)
+    try:
+        repair = repair_current_execution_scopes_from_pointer(
+            session,
+            pointer_generation_id=int(generation_id),
+            payload_boundary_generation_id=int(boundary.id),
+            source_revision=revision,
+        )
+    finally:
+        boundary.status = "rejected"
+        boundary.reason = "payload boundary of the MAKE replenishment bootstrap"
+        session.flush()
+    still_stale = current_execution_scopes_needing_repair_names(
+        session, int(generation_id)
+    )
+    if still_stale:
+        raise PostflightBlocked(
+            "current execution scopes are still not ready after the republish: "
+            + ", ".join(still_stale)
+        )
+    return {
+        "invalidated_scopes": invalidated,
+        "repaired_scopes": list(repair.repaired_scopes) if repair is not None else [],
+        "changed_rows": int(repair.changed_rows) if repair is not None else 0,
+        "closed_rows": int(repair.closed_rows) if repair is not None else 0,
+    }
+
+
+def current_execution_scopes_needing_repair_names(
+    session: Session, generation_id: int
+) -> tuple[str, ...]:
+    from app.services.item_ledger.physical_refresh_current_publish import (
+        current_execution_scopes_needing_repair,
+    )
+
+    return current_execution_scopes_needing_repair(
+        session, pointer_generation_id=int(generation_id)
+    )
+
+
+def _make_replenishment_bootstrap_on_session(
+    session: Session,
+    generation_id: int,
+    *,
+    republish: bool = True,
+) -> dict[str, Any]:
+    """Credit every historical MAKE output the bounded refresh never touched.
+
+    The bounded physical refresh replays a MAKE distribution scope only when
+    its delta carries an ``assembly_in`` of that item.  A stand migrated from a
+    live copy therefore starts with the BUY half of the R4 current state built
+    by ``--phase replenishment-bootstrap`` and the MAKE half empty: on the
+    28.09 stand 1586 current allocations on ``ПриходнаяНакладная`` against 79
+    on ``СборкаЗапасов``, all 79 from that day's own delta.  Canon: "Факт
+    выпуска - это поступление на склад. Оно гасит потребность", so the
+    production journal offered work that had already been produced.
+
+    This phase asks the *owners* which MAKE scopes exist and hands all of them
+    to the one canonical MAKE writer
+    (``apply_current_replenishment_for_bounded_make_scopes``), exactly as the
+    bounded path would if every MAKE scope had been touched: same facts, same
+    document netting, same freeze basis (§49/§51/§53/§55), same §44 rework
+    settlement inside the MAKE scope, same §42 exclusion of closed owners, and
+    the same §46 marker rule - the revision is the publishing generation, which
+    for a one-off at the pointer is the pointer's own id, so the next bounded
+    refresh still publishes a strictly higher revision.
+    """
+
+    from app.services.item_ledger.current_replenishment import (
+        apply_current_replenishment_for_bounded_make_scopes,
+        over_allocated_facts,
+        require_facts_not_over_allocated,
+    )
+    from app.services.item_ledger.physical_refresh_current_publish import (
+        all_current_make_scopes,
+    )
+    from app import models
+
+    names = set(inspect(session.connection()).get_table_names())
+    for required in (
+        "current_replenishment_state",
+        "reservation_consumption_allocation",
+        "current_execution_scope",
+    ):
+        if required not in names:
+            raise PreflightBlocked(
+                f"make replenishment bootstrap requires table {required}"
+            )
+    _lock_truth_pointer(session, int(generation_id))
+    generation = session.get(models.LedgerGeneration, int(generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise PreflightBlocked(
+            f"generation {int(generation_id)} is not an accepted pointer generation"
+        )
+    if generation.cutoff is None:
+        raise PreflightBlocked(
+            f"accepted generation {int(generation_id)} has no cutoff"
+        )
+
+    scopes = all_current_make_scopes(session)
+    allocations_before = _current_replenishment_allocations_by_recorder(session)
+    roles_before = _current_allocations_by_role(session)
+    owners_before = _make_owner_totals(session)
+    over_before = over_allocated_facts(session, limit=0)
+    if _owners_above_required(session):
+        raise PreflightBlocked(
+            "current owners already carry more received than required; run "
+            "--phase retire-closed-owner-allocations first"
+        )
+
+    scope_count = 0
+    fact_rows = 0
+    netted_rows = 0
+    inserted = 0
+    updated = 0
+    deleted = 0
+    changed_pairs = 0
+    audit_events = 0
+    for start in range(0, len(scopes), MAKE_BOOTSTRAP_SCOPE_BATCH):
+        batch = scopes[start:start + MAKE_BOOTSTRAP_SCOPE_BATCH]
+        result = apply_current_replenishment_for_bounded_make_scopes(
+            session,
+            target_generation_id=int(generation_id),
+            target_cutoff=generation.cutoff,
+            affected_scopes=batch,
+            at_accepted_pointer=True,
+            # A MAKE scope the last bounded refresh touched already carries a
+            # marker at this very pointer generation, written while the writer
+            # still credited raw ``assembly_in`` lines.  This phase holds the
+            # pointer with writers stopped, so it may republish that scope
+            # under the corrected document-net-output basis; the rewrite is
+            # audited with its own reason.
+            basis_correction_reason=(
+                "make-replenishment-bootstrap: document net output fact selection"
+            ),
+        )
+        scope_count += len(result.affected_scopes)
+        fact_rows += int(result.scope_history_rows)
+        netted_rows += int(result.netted_internal_transfer_rows)
+        inserted += sum(int(row.inserted) for row in result.results)
+        updated += sum(int(row.updated) for row in result.results)
+        deleted += sum(int(row.deleted) for row in result.results)
+        changed_pairs += sum(int(row.changed_pairs) for row in result.results)
+        audit_events += int(result.audit_events)
+        session.flush()
+
+    # Invariants 2-3 of the truth contract, bounded to the facts this phase is
+    # responsible for (decision §41): every assembly fact of a replayed scope.
+    if scopes:
+        require_facts_not_over_allocated(
+            session, item_ids=sorted({int(scope[0]) for scope in scopes})
+        )
+    above_required = _owners_above_required(session)
+    if above_required:
+        raise PostflightBlocked(
+            f"{above_required} current owners received more than they required"
+        )
+    over_after = over_allocated_facts(session, limit=0)
+    if len(over_after) > len(over_before):
+        raise PostflightBlocked(
+            f"{len(over_after)} facts are allocated above their quantity, "
+            f"{len(over_before)} before this phase"
+        )
+
+    republished: dict[str, Any] | None = None
+    if republish and changed_pairs:
+        republished = _republish_current_execution_after_make(
+            session, int(generation_id)
+        )
+    return {
+        "phase": "make-replenishment-bootstrap",
+        "status": "ready",
+        "generation_id": int(generation_id),
+        "make_scopes": scope_count,
+        "assembly_output_facts": fact_rows,
+        "netted_internal_transfer_rows": netted_rows,
+        "inserted": inserted,
+        "updated": updated,
+        "deleted": deleted,
+        "changed_pairs": changed_pairs,
+        "audit_events": audit_events,
+        "current_replenishment_state": int(session.execute(text(
+            "SELECT count(*) FROM current_replenishment_state"
+        )).scalar_one() or 0),
+        "allocations_by_recorder_before": allocations_before,
+        "allocations_by_recorder_after": (
+            _current_replenishment_allocations_by_recorder(session)
+        ),
+        "allocations_by_role_before": roles_before,
+        "allocations_by_role_after": _current_allocations_by_role(session),
+        "make_owners_before": owners_before,
+        "make_owners_after": _make_owner_totals(session),
+        "over_allocated_facts_before": len(over_before),
+        "over_allocated_facts_after": len(over_after),
+        "republished_current_execution": republished,
+        "idempotent": changed_pairs == 0,
+    }
+
+
+def apply_make_replenishment_bootstrap(
+    engine: Engine, *, writers_stopped: bool, republish: bool = True
+) -> dict[str, Any]:
+    """Run the one-off MAKE current replenishment bootstrap in one transaction."""
+
+    if not writers_stopped:
+        raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+    generation_id = _accepted_truth_generation(engine)
+    with Session(engine, autoflush=False, expire_on_commit=False) as session:
+        with session.begin():
+            return _make_replenishment_bootstrap_on_session(
+                session, int(generation_id), republish=republish
+            )
+
+
 def _provenance_source_generations(
     session: Session, pointer_generation_id: int
 ) -> list[int]:
@@ -1922,6 +2285,7 @@ def main(argv: list[str] | None = None) -> int:
             "apply",
             "postflight",
             "replenishment-bootstrap",
+            "make-replenishment-bootstrap",
             "supplier-provenance-repair",
             "retire-closed-owner-allocations",
             "pre-deploy-backlog",
@@ -1938,8 +2302,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "explicit acknowledgement required by --phase apply/"
-            "replenishment-bootstrap/supplier-provenance-repair/"
-            "retire-closed-owner-allocations"
+            "replenishment-bootstrap/make-replenishment-bootstrap/"
+            "supplier-provenance-repair/retire-closed-owner-allocations"
+        ),
+    )
+    parser.add_argument(
+        "--no-republish",
+        action="store_true",
+        help=(
+            "make-replenishment-bootstrap only: write the R4 MAKE state and "
+            "leave the dependent current execution scopes to the next physical "
+            "refresh tick instead of republishing them here"
         ),
     )
     parser.add_argument("--generation-id", type=int)
@@ -1980,6 +2353,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.phase == "replenishment-bootstrap":
             report = apply_current_replenishment_bootstrap(
                 engine, writers_stopped=args.writers_stopped
+            )
+        elif args.phase == "make-replenishment-bootstrap":
+            report = apply_make_replenishment_bootstrap(
+                engine,
+                writers_stopped=args.writers_stopped,
+                republish=not args.no_republish,
             )
         else:
             generation_id = args.generation_id

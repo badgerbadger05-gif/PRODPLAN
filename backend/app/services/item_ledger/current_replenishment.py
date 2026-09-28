@@ -42,6 +42,11 @@ DistributionScope = tuple[int, str, str, str, str]
 
 #: Canonical audit reason for a clear-out the caller explicitly acknowledged.
 CONFIRMED_EMPTY_REASON = "confirmed_empty_scope"
+#: Canonical audit reason for a replay that rewrote the state its own
+#: publishing generation had already written, because the fact-selection rule
+#: itself was corrected.  Only a one-off repair with writers stopped may ask
+#: for it (see ``basis_correction_reason``); the ordinary runtime never can.
+BASIS_CORRECTED_REASON = "basis_corrected"
 #: Decisions §49/§51/§53: an allocation whose fact is in its owner's frozen
 #: stock - first imported by the freeze batch and dated no later than the
 #: freeze instant (``known_at_freeze``) - is never that owner's replenishment.
@@ -109,6 +114,11 @@ class BoundedMakeReplenishmentResult:
     affected_scopes: tuple[DistributionScope, ...]
     scope_history_rows: int
     results: tuple[CurrentReplenishmentResult, ...]
+    #: ``assembly_in`` rows whose canonical document net output is zero: the
+    #: internal transport legs of one 1C document, which are physical truth but
+    #: not production output (canon "Что является положительным фактом одного
+    #: документа", invariant 15).
+    netted_internal_transfer_rows: int = 0
 
     @property
     def fact_rows(self) -> int:
@@ -941,6 +951,7 @@ def apply_current_replenishment(
     receipt_unmatched_return_qty: Decimal = Decimal("0"),
     confirmed_empty_reason: str = "",
     revision_basis: RevisionBasis = "explicit",
+    basis_correction_reason: str = "",
 ) -> CurrentReplenishmentResult:
     """Apply one complete accepted-fact scope atomically.
 
@@ -961,6 +972,17 @@ def apply_current_replenishment(
     :data:`GENERATION_REVISION`): the revision is the id of the generation
     this write publishes.  ``"explicit"`` keeps a caller-chosen monotonic
     integer and is a test/maintenance seam only.
+
+    ``basis_correction_reason`` is the one-off acknowledgement that this replay
+    may rewrite what its own publishing generation already wrote.  "Same
+    revision, same payload" exists to catch a second concurrent writer, and
+    that guard is unchanged for the runtime; but when the fact-selection rule
+    itself is corrected - a superseded rule credited the raw ``assembly_in``
+    lines instead of the canonical document net output - the corrected replay
+    has to be able to publish under the same accepted pointer.  Only a repair
+    that holds the truth pointer with writers stopped may pass it; a stale
+    (lower) revision is still refused, and the audit rows of the rewrite carry
+    :data:`BASIS_CORRECTED_REASON`.
     """
 
     fact_rows = tuple(facts)
@@ -1017,6 +1039,7 @@ def apply_current_replenishment(
     ):
         raise CurrentReplenishmentError("current replenishment requires accepted generation")
 
+    basis_corrected = False
     state = (
         db.query(models.CurrentReplenishmentState)
         .filter(models.CurrentReplenishmentState.scope_key == canonical_scope_key)
@@ -1041,12 +1064,22 @@ def apply_current_replenishment(
                 f"stale source revision {revision}; current is {previous_revision}"
             )
         if revision == previous_revision:
-            if _text(state.scope_checksum) != input_checksum:
+            drifted = _text(state.scope_checksum) != input_checksum
+            if drifted and not _text(basis_correction_reason):
                 raise CurrentReplenishmentError("same source revision has payload drift")
             if _text(state.status) != "completed":
                 raise CurrentReplenishmentError("current source marker is still applying")
-            generation_changed = int(state.ledger_generation_id) != int(generation.id)
-            if generation_changed or legacy_marker:
+            if drifted:
+                # An acknowledged basis correction: reopen the marker and let
+                # the replay below rewrite this scope under the same pointer.
+                basis_corrected = True
+                state.status = "applying"
+                db.flush()
+            generation_changed = (
+                not drifted
+                and int(state.ledger_generation_id) != int(generation.id)
+            )
+            if not drifted and (generation_changed or legacy_marker):
                 # A legacy marker re-published by its own generation is the
                 # same publication: only its revision spelling is brought to
                 # the generation rule, so the alias disappears on first write.
@@ -1054,17 +1087,18 @@ def apply_current_replenishment(
                 state.source_revision = revision
                 state.updated_at = datetime.now(timezone.utc)
                 db.flush()
-            return CurrentReplenishmentResult(
-                generation_id=int(generation.id),
-                source_key=canonical_key,
-                source_revision=revision,
-                inserted=0,
-                updated=0,
-                deleted=0,
-                changed_pairs=0,
-                audit_events=0,
-                idempotent=not (generation_changed or legacy_marker),
-            )
+            if not drifted:
+                return CurrentReplenishmentResult(
+                    generation_id=int(generation.id),
+                    source_key=canonical_key,
+                    source_revision=revision,
+                    inserted=0,
+                    updated=0,
+                    deleted=0,
+                    changed_pairs=0,
+                    audit_events=0,
+                    idempotent=not (generation_changed or legacy_marker),
+                )
     else:
         state = models.CurrentReplenishmentState(
             scope_key=canonical_scope_key,
@@ -1355,6 +1389,10 @@ def apply_current_replenishment(
     reserve_by_id = {str(row.reserve_id): row for row in reserve_rows_for_plan}
     basis_fact_ids = tuple(sorted({int(row.sle_id) for row in receipt_facts}))
     audit_reason = "r5_signed_replay" if receipt_replay is not None else "current_replay"
+    if basis_corrected:
+        # The rewrite of a scope its own publishing generation wrote under the
+        # superseded fact-selection rule; named so the change has a cause.
+        audit_reason = BASIS_CORRECTED_REASON
     if receipt_replay is not None and receipt_unmatched_return_qty > 0:
         audit_reason = "r5_signed_replay_unmatched_return"
     if confirmed_empty:
@@ -2069,10 +2107,12 @@ def apply_current_replenishment_for_bounded_make_scopes(
     db: Session,
     *,
     target_generation_id: int,
-    parent_generation_id: int,
+    parent_generation_id: int | None = None,
     target_cutoff: datetime,
     affected_scopes: Iterable[DistributionScope],
     source_revision: int | None = None,
+    at_accepted_pointer: bool = False,
+    basis_correction_reason: str = "",
 ) -> BoundedMakeReplenishmentResult:
     """Apply bounded ``assembly_in`` facts to stable current MAKE owners.
 
@@ -2090,28 +2130,62 @@ def apply_current_replenishment_for_bounded_make_scopes(
     fails.  The preflight validates every visible ``assembly_in`` row before
     applying the first scope, so an out-of-scope or ambiguous fact cannot
     leave a partial bounded publication.
+
+    ``at_accepted_pointer`` is the one-off bootstrap door into this same
+    writer: the accepted pointer generation is both the target and the parent,
+    because there is no BUILDING candidate to fork from when a migrated stand
+    has to credit MAKE history the bounded path never touched.  Nothing else
+    changes - the same facts, the same owners, the same freeze basis and the
+    same marker rule (§46: the revision is the publishing generation, here the
+    pointer's own id, so the next bounded refresh publishes a higher one).
     """
 
     revision, basis = _adapter_revision(source_revision, int(target_generation_id))
 
     target = db.get(models.LedgerGeneration, int(target_generation_id))
-    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
-    if target is None or _text(target.status) != "building":
-        raise CurrentReplenishmentError(
-            "bounded make publication requires a BUILDING target generation"
-        )
-    if parent is None or _text(parent.status) != "accepted":
-        raise CurrentReplenishmentError(
-            "bounded make publication requires an accepted parent generation"
-        )
-    if int(target.id) == int(parent.id):
-        raise CurrentReplenishmentError("bounded make target must differ from parent")
-    if target.physical_import_batch_id is None or parent.physical_import_batch_id is None:
-        raise CurrentReplenishmentError("bounded make generations require import batches")
-    if int(target.physical_import_batch_id) < int(parent.physical_import_batch_id):
-        raise CurrentReplenishmentError(
-            "bounded make target import batch is older than its parent"
-        )
+    if at_accepted_pointer:
+        if parent_generation_id is not None and int(parent_generation_id) != int(
+            target_generation_id
+        ):
+            raise CurrentReplenishmentError(
+                "make publication at the accepted pointer has no separate parent"
+            )
+        if target is None or _text(target.status) != "accepted":
+            raise CurrentReplenishmentError(
+                "make publication at the accepted pointer requires an accepted generation"
+            )
+        pointer = db.get(models.PlanningTruthState, 1)
+        if pointer is None or int(pointer.current_generation_id or -1) != int(target.id):
+            raise CurrentReplenishmentError(
+                "make publication at the accepted pointer is not the exact planning truth pointer"
+            )
+        if target.physical_import_batch_id is None:
+            raise CurrentReplenishmentError(
+                "make publication at the accepted pointer requires an import batch"
+            )
+        parent = target
+    else:
+        if parent_generation_id is None:
+            raise CurrentReplenishmentError(
+                "bounded make publication requires an accepted parent generation"
+            )
+        parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+        if target is None or _text(target.status) != "building":
+            raise CurrentReplenishmentError(
+                "bounded make publication requires a BUILDING target generation"
+            )
+        if parent is None or _text(parent.status) != "accepted":
+            raise CurrentReplenishmentError(
+                "bounded make publication requires an accepted parent generation"
+            )
+        if int(target.id) == int(parent.id):
+            raise CurrentReplenishmentError("bounded make target must differ from parent")
+        if target.physical_import_batch_id is None or parent.physical_import_batch_id is None:
+            raise CurrentReplenishmentError("bounded make generations require import batches")
+        if int(target.physical_import_batch_id) < int(parent.physical_import_batch_id):
+            raise CurrentReplenishmentError(
+                "bounded make target import batch is older than its parent"
+            )
     if target_cutoff is None:
         raise CurrentReplenishmentError("bounded make target cutoff is required")
     if target.cutoff is not None:
@@ -2177,7 +2251,20 @@ def apply_current_replenishment_for_bounded_make_scopes(
     physical_scope_predicate = models.StockLedgerEntry.item_id.in_(
         sorted({int(scope[0]) for scope in scopes})
     )
-    rows = (
+    # Both netted movement kinds are read, because the creditable quantity of
+    # an ``assembly_in`` line is the canonical document net output, not its raw
+    # quantity: one ``СборкаЗапасов`` writes a receipt on the production
+    # warehouse, an issue from it and a receipt on the destination warehouse,
+    # and only the net was produced (CANON: owner
+    # ``document_net_output.py``, readers are the replenishment replay and the
+    # plan-output allocation, "собственного отбора фактов у них нет").
+    # Crediting the raw lines counted a component's pass-through movement as
+    # this item's production: on the 28.09 stand copy item 8945 had 3660 raw
+    # ``assembly_in`` units and 300 units of real net output.
+    from .document_net_output import NETTED_MOVEMENT_KINDS
+    from .document_net_output import net_document_output_qty
+
+    netted_rows = (
         visible_sle_query(
             db,
             physical_import_batch_id=int(target.physical_import_batch_id),
@@ -2185,7 +2272,10 @@ def apply_current_replenishment_for_bounded_make_scopes(
         )
         .filter(
             physical_scope_predicate,
-            models.StockLedgerEntry.movement_kind == "assembly_in",
+            models.StockLedgerEntry.movement_kind.in_(
+                tuple(sorted(NETTED_MOVEMENT_KINDS))
+            ),
+            models.StockLedgerEntry.qty != 0,
         )
         .order_by(
             models.StockLedgerEntry.posting_at.asc(),
@@ -2193,12 +2283,18 @@ def apply_current_replenishment_for_bounded_make_scopes(
         )
         .all()
     )
+    net_qty_by_sle = net_document_output_qty(netted_rows)
+    rows = [
+        row for row in netted_rows
+        if _text(row.movement_kind) == "assembly_in"
+    ]
     facts_by_scope: dict[DistributionScope, list[Fact]] = {
         scope: [] for scope in scopes
     }
     from .physical_visibility import known_revisions_by_sle
 
     make_first_known = known_revisions_by_sle(db, rows)
+    netted_internal_transfer_rows = 0
     for row in rows:
         if _decimal(row.qty) <= 0:
             raise CurrentReplenishmentError(
@@ -2219,6 +2315,12 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 f"assembly_in fact {int(row.id)} has ambiguous planning pool"
             )
         scope = candidates[0]
+        realizable_qty = net_qty_by_sle.get(int(row.id), Decimal("0"))
+        if realizable_qty <= 0:
+            # An internal transport leg of its own document: physical truth,
+            # no production output, therefore no replenishment.
+            netted_internal_transfer_rows += 1
+            continue
         requirement_id, order_ref, ambiguous = _identity_for_sle(db, row)
         if ambiguous:
             raise CurrentReplenishmentError(
@@ -2229,7 +2331,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 fact_id=str(int(row.id)),
                 item_id=int(row.item_id),
                 mode="make",
-                qty=_decimal(row.qty),
+                qty=realizable_qty,
                 posting_at=row.posting_at,
                 known_revisions=make_first_known.get(int(row.id), ()),
                 characteristic_ref=scope[1],
@@ -2349,8 +2451,9 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 reserves=reserves_by_scope[scope],
                 complete_scope=True,
                 distribution_scope=scope,
-                allow_building=True,
+                allow_building=not at_accepted_pointer,
                 revision_basis=basis,
+                basis_correction_reason=basis_correction_reason,
             )
         )
     return BoundedMakeReplenishmentResult(
@@ -2360,6 +2463,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
         affected_scopes=tuple(scopes),
         scope_history_rows=sum(len(rows) for rows in facts_by_scope.values()),
         results=tuple(results),
+        netted_internal_transfer_rows=int(netted_internal_transfer_rows),
     )
 
 

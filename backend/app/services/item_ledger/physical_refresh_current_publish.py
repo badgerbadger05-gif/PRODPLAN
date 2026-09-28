@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from threading import RLock
+from types import SimpleNamespace
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -664,6 +665,46 @@ def _make_scopes_for_assembly_row(
         ),
     )
     return () if scope is None else (scope,)
+
+
+def all_current_make_scopes(
+    db: Session,
+) -> tuple[tuple[int, str, str, str, str], ...]:
+    """Every MAKE distribution scope the live current owners span.
+
+    The bounded publisher derives its MAKE scopes from the delta's facts
+    (:func:`_make_scopes_for_assembly_row`); this is the same question asked of
+    the owners instead of the facts, for the one-off bootstrap of a stand whose
+    first bounded refresh never touched the historical assembly outputs.  Both
+    key the owner through the one canonical pool key, so the two agree by
+    construction; enumerating owners here is deliberately not a second scope
+    rule.
+
+    Canon §18/§44: a ``rework`` owner is realized inside the MAKE scope of its
+    item, so it contributes that same scope and never a second one.
+    """
+    owners = db.query(
+        models.ReservationEntry.item_id,
+        models.ReservationEntry.characteristic_ref,
+        models.ReservationEntry.organization_ref,
+    ).filter(
+        models.ReservationEntry.is_current.is_(True),
+        models.ReservationEntry.owner_kind == "current",
+        models.ReservationEntry.lifecycle_status == "active",
+        models.ReservationEntry.current_identity != "",
+        models.ReservationEntry.realization_mode.in_(("make", "rework")),
+    ).distinct().all()
+    return tuple(sorted({
+        _canonical_scope(
+            SimpleNamespace(
+                item_id=int(item_id),
+                characteristic_ref=characteristic_ref,
+                organization_ref=organization_ref,
+            ),
+            "make",
+        )
+        for item_id, characteristic_ref, organization_ref in owners
+    }))
 
 
 def _buy_scope_for_receipt(
@@ -1758,6 +1799,7 @@ def _repair_current_execution_scopes_from_pointer(
 __all__ = [
     "CURRENT_EXECUTION_SCOPE_KEYS",
     "CurrentExecutionScopeRepairResult",
+    "all_current_make_scopes",
     "ForwardPhysicalRefreshUnavailable",
     "PhysicalRefreshCurrentPublishResult",
     "current_execution_scopes_needing_repair",
