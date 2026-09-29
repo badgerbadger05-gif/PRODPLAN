@@ -198,7 +198,7 @@ def test_unknown_manifest_blocks_before_publisher(monkeypatch):
     _schema(engine)
     _seed_truth(engine)
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE r2_tx_probe (id INTEGER PRIMARY KEY)"))
+        connection.execute(text('CREATE TABLE "ops_backup_X" (id INTEGER PRIMARY KEY)'))
 
     called = []
     monkeypatch.setattr(
@@ -206,9 +206,10 @@ def test_unknown_manifest_blocks_before_publisher(monkeypatch):
         lambda session, generation_id: called.append(generation_id),
     )
 
-    with pytest.raises(PreflightBlocked, match="unknown"):
+    with pytest.raises(PreflightBlocked, match=r'unknown.*ops_backup_X') as blocked:
         apply_current_obligation_migration(engine, writers_stopped=True)
     assert called == []
+    assert blocked.value.manifest["categories"]["unknown"]["ops_backup_X"]["row_count"] == 0
 
 
 def test_missing_obligation_source_evidence_blocks_before_publisher_and_dml(monkeypatch):

@@ -52,6 +52,13 @@ EXPECTED_EXECUTION_SCOPES = (
 class PreflightBlocked(RuntimeError):
     """The migration may not start because its read-only preflight is unsafe."""
 
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        # A completed manifest is diagnostic evidence, never authorization to
+        # skip a future preflight.  Preserve this in-memory result so callers
+        # can write it without repeating the potentially expensive table reads.
+        self.manifest = manifest
+
 
 class PostflightBlocked(RuntimeError):
     """The canonical publication did not produce an unambiguous current view."""
@@ -125,6 +132,15 @@ _PRESERVE_REASONS = {
     "closed_plan_snapshot": "immutable business closure history",
     "alembic_version": "schema migration history",
     "planning_truth_state": "accepted-truth pointer",
+    "ops_backup_mrp13_coverage_before_fix_20260603": "historical maintenance backup from 2026-06-03",
+    "ops_backup_obsolete_mrp12_after_run13_20260603_orders": "historical maintenance backup from 2026-06-03",
+    "ops_backup_obsolete_mrp12_after_run13_20260603_products": "historical maintenance backup from 2026-06-03",
+    "ops_backup_obsolete_mrp12_after_run13_20260603_states": "historical maintenance backup from 2026-06-03",
+    "ops_backup_obsolete_mrp12_after_run13_20260603_summary": "historical maintenance backup from 2026-06-03",
+    "ops_backup_remove_g_articles_20260603_line_states": "historical maintenance backup from 2026-06-03",
+    "ops_backup_remove_g_articles_20260603_plan_line": "historical maintenance backup from 2026-06-03",
+    "ops_backup_remove_g_articles_20260603_production_orders": "historical maintenance backup from 2026-06-03",
+    "ops_backup_remove_g_articles_20260603_production_products": "historical maintenance backup from 2026-06-03",
 }
 
 _MIGRATE_REASONS = {
@@ -1360,9 +1376,17 @@ def apply_current_obligation_migration(
 
     manifest = build_manifest(engine)
     if manifest["status"] != "ready":
+        unknown_tables = sorted(manifest["categories"]["unknown"])
         raise PreflightBlocked(
-            "R10 preflight is blocked by unknown or ambiguous dependencies: "
-            + json.dumps(manifest["dependencies"], sort_keys=True)
+            "R10 preflight is blocked by unknown tables or ambiguous dependencies: "
+            + json.dumps(
+                {
+                    "unknown_tables": unknown_tables,
+                    "dependencies": manifest["dependencies"],
+                },
+                sort_keys=True,
+            ),
+            manifest=manifest,
         )
 
     generation_id = _accepted_truth_generation(engine)

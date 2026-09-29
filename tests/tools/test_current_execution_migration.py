@@ -82,6 +82,32 @@ def test_closed_plan_snapshot_is_preserved_business_closure_history():
     assert "closed_plan_snapshot" not in manifest["categories"]["delete"]
 
 
+def test_known_20260603_maintenance_backups_are_preserved_explicitly():
+    tables = (
+        "ops_backup_mrp13_coverage_before_fix_20260603",
+        "ops_backup_obsolete_mrp12_after_run13_20260603_orders",
+        "ops_backup_obsolete_mrp12_after_run13_20260603_products",
+        "ops_backup_obsolete_mrp12_after_run13_20260603_states",
+        "ops_backup_obsolete_mrp12_after_run13_20260603_summary",
+        "ops_backup_remove_g_articles_20260603_line_states",
+        "ops_backup_remove_g_articles_20260603_plan_line",
+        "ops_backup_remove_g_articles_20260603_production_orders",
+        "ops_backup_remove_g_articles_20260603_production_products",
+    )
+    engine = _engine()
+    with engine.begin() as connection:
+        for table in tables:
+            connection.execute(text(f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY)'))
+            connection.execute(text(f'INSERT INTO "{table}" (id) VALUES (1)'))
+
+    manifest = build_manifest(engine)
+
+    assert manifest["status"] == "ready"
+    assert set(manifest["categories"]["preserve"]) >= set(tables)
+    assert all(manifest["categories"]["preserve"][table]["row_count"] == 1 for table in tables)
+    assert not set(tables) & set(manifest["categories"]["unknown"])
+
+
 def test_historical_bucket_evidence_is_migrated_not_unknown():
     engine = _engine()
     with engine.begin() as connection:
@@ -199,13 +225,13 @@ def test_nested_legacy_references_are_fail_closed():
 def test_unknown_table_blocks_preflight_instead_of_being_deleted():
     engine = _engine()
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE mystery_dependency (id INTEGER PRIMARY KEY)"))
+        connection.execute(text('CREATE TABLE "ops_backup_X" (id INTEGER PRIMARY KEY)'))
 
     manifest = build_manifest(engine)
 
     assert manifest["status"] == "blocked"
-    assert manifest["categories"]["unknown"]["mystery_dependency"]["row_count"] == 0
-    assert "not classified" in manifest["categories"]["unknown"]["mystery_dependency"]["reason"]
+    assert manifest["categories"]["unknown"]["ops_backup_X"]["row_count"] == 0
+    assert "not classified" in manifest["categories"]["unknown"]["ops_backup_X"]["reason"]
 
 
 def test_ambiguous_legacy_row_to_current_identity_blocks_preflight():
