@@ -100,6 +100,280 @@ def _building_generation(db, *, key: str, cutoff: datetime) -> models.LedgerGene
     return generation
 
 
+def _custody_revision_world(
+    db, *, chain: bool = False, tombstone: bool = False, clipped: bool = False,
+):
+    """Accepted −64/+64 transfer, then a physical revision in one refresh."""
+    parent, target, _supply, workshop = _world(db)
+    earlier = parent.cutoff - timedelta(days=14)
+    before = parent.cutoff.replace(tzinfo=None) - timedelta(days=1)
+    baseline = _building_generation(db, key="custody-explicit-baseline", cutoff=earlier)
+    baseline.status = "accepted"
+    baseline.accepted_at = earlier
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=baseline.id, baseline_generation_id=baseline.id,
+        cutoff=earlier, status="complete", is_baseline=True,
+        source_event_high_watermark_id=0,
+    ))
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    workshop.reserved_qty = Decimal("64")
+    workshop.warehouse_ref1c = "WORKSHOP"
+    transit = models.ProductionMaterialCustodyProjection(
+        ledger_generation_id=parent.id, product_id=workshop.product_id,
+        component_item_id=workshop.component_item_id,
+        location_kind="transit", warehouse_ref1c="TRANSIT",
+        reserved_qty=Decimal("48"), source_event_high_watermark_id=0,
+        is_current=True,
+    )
+    db.add(transit)
+    db.flush()
+
+    def sle(batch, name, qty, warehouse):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=batch.id, source_content_hash=name,
+            business_identity=f"custody-{warehouse}",
+            item_id=int(workshop.component_item_id),
+            characteristic_ref="", organization_ref="org",
+            warehouse_ref1c=warehouse, qty=Decimal(str(qty)),
+            posting_at=before, record_type="Expense" if qty < 0 else "Receipt",
+            movement_kind="transfer_out" if qty < 0 else "transfer_in",
+            recorder_type="Document_Transfer",
+            recorder_ref="custody-transit-document" if warehouse == "TRANSIT"
+            else "custody-workshop-document",
+            line_no="1", ingest_source="test",
+        )
+        db.add(row)
+        db.flush()
+        return row
+
+    def event(kind, source, qty, warehouse, location, name):
+        row = models.ProductionMaterialCustodyEvent(
+            product_id=int(workshop.product_id),
+            component_item_id=int(workshop.component_item_id),
+            source_kind=kind, source_sle_id=None if source is None else source.id,
+            effective_at=before if source is not None else before - timedelta(days=1),
+            location_kind=location, warehouse_ref1c=warehouse,
+            delta_qty=Decimal(str(qty)), idempotency_key=name,
+        )
+        db.add(row)
+        db.flush()
+        return row
+
+    event("issue_created", None, 112, "TRANSIT", "transit", "custody-open-112")
+    old_t = sle(parent.physical_import_batch, "old-transit", -64, "TRANSIT")
+    old_w = sle(parent.physical_import_batch, "old-workshop", 64, "WORKSHOP")
+    old_events = [
+        event("transfer_posted", old_t, -64, "TRANSIT", "transit", "old-transit-event"),
+        event("transfer_posted", old_w, 64, "WORKSHOP", "workshop", "old-workshop-event"),
+    ]
+    last_parent_event = old_events[-1]
+    if clipped:
+        last_parent_event = models.ProductionMaterialCustodyEvent(
+            product_id=int(workshop.product_id),
+            component_item_id=int(workshop.component_item_id),
+            source_kind="terminal_release", source_sle_id=None,
+            source_ref2c="order-terminal-v1:revision-test",
+            effective_at=before + timedelta(hours=1),
+            location_kind="transit", warehouse_ref1c="TRANSIT",
+            delta_qty=Decimal("-100"), idempotency_key="terminal-clipping-test",
+        )
+        db.add(last_parent_event)
+        db.flush()
+        db.delete(transit)
+    parent_manifest = db.get(models.ProductionMaterialCustodyProjectionManifest, parent.id)
+    parent_manifest.source_event_high_watermark_id = last_parent_event.id
+    workshop.source_event_high_watermark_id = last_parent_event.id
+    if not clipped:
+        transit.source_event_high_watermark_id = last_parent_event.id
+    explicit = {old_t.id, old_w.id}
+    tail = []
+    for old, qty, warehouse, location in (
+        (old_t, -56, "TRANSIT", "transit"),
+        (old_w, 56, "WORKSHOP", "workshop"),
+    ):
+        predecessor = old
+        if chain:
+            intermediate = sle(target.physical_import_batch, f"middle-{location}",
+                               -60 if qty < 0 else 60, warehouse)
+            db.add(models.StockLedgerFactSupersession(
+                old_sle_id=old.id, new_sle_id=intermediate.id,
+                import_batch_id=target.physical_import_batch_id,
+            ))
+            tail.append(event("transfer_posted", intermediate,
+                              -60 if qty < 0 else 60, warehouse, location,
+                              f"middle-{location}-event"))
+            explicit.add(intermediate.id)
+            predecessor = intermediate
+        replacement = None if tombstone else sle(
+            target.physical_import_batch, f"new-{location}", qty, warehouse,
+        )
+        db.add(models.StockLedgerFactSupersession(
+            old_sle_id=predecessor.id,
+            new_sle_id=None if replacement is None else replacement.id,
+            import_batch_id=target.physical_import_batch_id,
+        ))
+        if replacement is not None:
+            tail.append(event("transfer_posted", replacement, qty, warehouse,
+                              location, f"new-{location}-event"))
+            explicit.add(replacement.id)
+    db.flush()
+    return parent, target, workshop, transit, explicit, tail
+
+
+@pytest.mark.parametrize("chain", [False, True], ids=["direct", "transient-chain"])
+def test_bounded_custody_revision_refolds_both_warehouse_legs(db_session, chain):
+    parent, target, workshop, transit, explicit, tail = _custody_revision_world(
+        db_session, chain=chain,
+    )
+    count = apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    )
+    assert count == len(tail)
+    assert Decimal(str(transit.reserved_qty)) == Decimal("56")
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("56")
+    handoff_current_material_custody_provenance(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+    )
+    _accept(db_session, target)
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    ) == 0
+
+
+def test_bounded_custody_revision_tombstone_refolds_without_event_tail(db_session):
+    parent, target, workshop, transit, explicit, tail = _custody_revision_world(
+        db_session, tombstone=True,
+    )
+    assert not tail
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    ) == 0
+    assert Decimal(str(transit.reserved_qty)) == Decimal("112")
+    assert db_session.get(models.ProductionMaterialCustodyProjection, workshop.id) is None
+
+
+def test_bounded_custody_revision_requires_complete_physical_basis(db_session):
+    parent, target, workshop, transit, explicit, _tail = _custody_revision_world(db_session)
+    old_source = db_session.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id
+        <= db_session.get(models.ProductionMaterialCustodyProjectionManifest, parent.id)
+        .source_event_high_watermark_id,
+        models.ProductionMaterialCustodyEvent.source_sle_id.isnot(None),
+    ).first().source_sle_id
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="correction chain is absent"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit - {int(old_source)}),
+        )
+    assert Decimal(str(transit.reserved_qty)) == Decimal("48")
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("64")
+
+
+def test_bounded_custody_revision_rejects_mismatched_compact_parent(db_session):
+    parent, target, workshop, transit, explicit, _tail = _custody_revision_world(db_session)
+    transit.reserved_qty = Decimal("47.999")
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable, match="parent basis differs"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+
+
+def test_bounded_custody_revision_requires_retained_early_baseline(db_session):
+    parent, target, _workshop, _transit, explicit, _tail = _custody_revision_world(db_session)
+    baseline = db_session.query(models.ProductionMaterialCustodyProjectionManifest).filter(
+        models.ProductionMaterialCustodyProjectionManifest.is_baseline.is_(True),
+    ).one()
+    baseline.status = "building"
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="no canonical bounded replay basis"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+
+
+def test_bounded_custody_revision_rejects_missing_lineage_edge(db_session):
+    parent, target, workshop, transit, explicit, _tail = _custody_revision_world(db_session)
+    old = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.source_content_hash == "old-transit",
+    ).one()
+    edge = db_session.query(models.StockLedgerFactSupersession).filter_by(
+        old_sle_id=old.id,
+    ).one()
+    db_session.delete(edge)
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="lacks a bounded supersession"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+    assert Decimal(str(transit.reserved_qty)) == Decimal("48")
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("64")
+
+
+def test_bounded_custody_revision_rejects_future_tail(db_session):
+    parent, target, _workshop, _transit, explicit, tail = _custody_revision_world(db_session)
+    tail[0].effective_at = target.cutoff.replace(tzinfo=None) + timedelta(seconds=1)
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="extends beyond the target cutoff"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+
+
+def test_bounded_custody_revision_rejects_missing_terminal_event(db_session):
+    parent, target, workshop, transit, explicit, tail = _custody_revision_world(db_session)
+    db_session.delete(tail[0])
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="no event for target-visible transfer"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+    assert Decimal(str(transit.reserved_qty)) == Decimal("48")
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("64")
+
+
+def test_bounded_custody_revision_uses_canonical_terminal_clipping(db_session):
+    parent, target, workshop, _transit, explicit, tail = _custody_revision_world(
+        db_session, clipped=True,
+    )
+    outside = models.ProductionMaterialCustodyProjection(
+        ledger_generation_id=parent.id, product_id=workshop.product_id,
+        component_item_id=workshop.component_item_id,
+        location_kind="workshop", warehouse_ref1c="OUTSIDE",
+        reserved_qty=Decimal("7"),
+        source_event_high_watermark_id=db_session.get(
+            models.ProductionMaterialCustodyProjectionManifest, parent.id,
+        ).source_event_high_watermark_id,
+        is_current=True,
+    )
+    db_session.add(outside)
+    db_session.flush()
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    ) == len(tail)
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("56")
+    assert Decimal(str(outside.reserved_qty)) == Decimal("7")
+    assert not db_session.query(models.ProductionMaterialCustodyProjection.id).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+        models.ProductionMaterialCustodyProjection.location_kind == "transit",
+        models.ProductionMaterialCustodyProjection.warehouse_ref1c == "TRANSIT",
+    ).first()
+
+
 def _accept(db, generation: models.LedgerGeneration) -> None:
     generation.status = "accepted"
     generation.accepted_at = generation.cutoff

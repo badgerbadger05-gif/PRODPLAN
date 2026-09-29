@@ -7,7 +7,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
-from sqlalchemy import func, or_
+from sqlalchemy import exists, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -59,6 +59,13 @@ class MaterialCustodySnapshotUnavailable(RuntimeError):
 _LOCATION_TRANSIT = "transit"
 _LOCATION_WORKSHOP = "workshop"
 ProjectionRowKey = Tuple[int, int, str, str]
+
+
+def _custody_cell_predicate(model: Any, keys: set[ProjectionRowKey]) -> Any:
+    return tuple_(
+        model.product_id, model.component_item_id,
+        model.location_kind, model.warehouse_ref1c,
+    ).in_(sorted(keys))
 
 
 def _ensure_material_custody_product_state(
@@ -369,6 +376,7 @@ def _late_events_behind_baseline(
     baseline_cutoff: datetime,
     baseline_high_watermark_id: int,
     target_high_watermark_id: int,
+    selected_keys: set[ProjectionRowKey] | None = None,
 ) -> list[int]:
     """Events appended after a baseline was built, yet dated inside its window.
 
@@ -381,21 +389,25 @@ def _late_events_behind_baseline(
     defect.  Only a re-import of a physical line an older event already carries
     is exempt: it changes nothing.
     """
+    query = (
+        db.query(models.ProductionMaterialCustodyEvent.id)
+        .filter(
+            models.ProductionMaterialCustodyEvent.id > int(baseline_high_watermark_id)
+        )
+        .filter(
+            models.ProductionMaterialCustodyEvent.id <= int(target_high_watermark_id)
+        )
+        .filter(
+            models.ProductionMaterialCustodyEvent.effective_at <= baseline_cutoff
+        )
+    )
+    if selected_keys is not None:
+        query = query.filter(_custody_cell_predicate(
+            models.ProductionMaterialCustodyEvent, selected_keys,
+        ))
     return [
         int(event_id)
-        for (event_id,) in (
-            db.query(models.ProductionMaterialCustodyEvent.id)
-            .filter(
-                models.ProductionMaterialCustodyEvent.id > int(baseline_high_watermark_id)
-            )
-            .filter(
-                models.ProductionMaterialCustodyEvent.id <= int(target_high_watermark_id)
-            )
-            .filter(
-                models.ProductionMaterialCustodyEvent.effective_at <= baseline_cutoff
-            )
-            .all()
-        )
+        for (event_id,) in query.all()
         if not _is_reimport_duplicate_physical_event(
             db,
             db.get(models.ProductionMaterialCustodyEvent, int(event_id)),
@@ -497,6 +509,7 @@ def _select_visible_custody_events(
     baseline_cutoff: datetime,
     baseline_high_watermark_id: int,
     target_high_watermark_id: int,
+    selected_keys: set[ProjectionRowKey] | None = None,
 ) -> Sequence[models.ProductionMaterialCustodyEvent]:
     if baseline_cutoff is None:
         raise MaterialCustodySnapshotUnavailable(
@@ -519,6 +532,7 @@ def _select_visible_custody_events(
         baseline_cutoff=baseline_cutoff,
         baseline_high_watermark_id=baseline_high_watermark_id,
         target_high_watermark_id=target_high_watermark_id,
+        selected_keys=selected_keys,
     ):
         raise MaterialCustodySnapshotUnavailable(
             manifest_generation_id=int(generation.id),
@@ -536,7 +550,7 @@ def _select_visible_custody_events(
         cutoff=generation.cutoff,
     ).with_entities(models.StockLedgerEntry.id)
 
-    events = (
+    query = (
         db.query(models.ProductionMaterialCustodyEvent)
         .filter(models.ProductionMaterialCustodyEvent.effective_at > baseline_cutoff)
         .filter(models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff)
@@ -547,11 +561,14 @@ def _select_visible_custody_events(
                 models.ProductionMaterialCustodyEvent.source_sle_id.in_(visible_sle_ids),
             )
         )
-        # Fold order is owned by ``_custody_fold_order_key`` alone; this is only
-        # a stable read order, never a second ordering rule.
-        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
-        .all()
     )
+    if selected_keys is not None:
+        query = query.filter(_custody_cell_predicate(
+            models.ProductionMaterialCustodyEvent, selected_keys,
+        ))
+    # Fold order is owned by ``_custody_fold_order_key`` alone; this is only a
+    # stable read order, never a second ordering rule.
+    events = query.order_by(models.ProductionMaterialCustodyEvent.id.asc()).all()
     visible = [
         event
         for event in events
@@ -561,7 +578,19 @@ def _select_visible_custody_events(
             original_high_watermark_id=baseline_high_watermark_id,
         )
     ]
-    anchors = _custody_fold_anchor(visible)
+    anchor_events = visible
+    if selected_keys is not None:
+        issue_ids = {int(event.issue_id) for event in visible if event.issue_id is not None}
+        if issue_ids:
+            openings = db.query(models.ProductionMaterialCustodyEvent).filter(
+                models.ProductionMaterialCustodyEvent.issue_id.in_(issue_ids),
+                models.ProductionMaterialCustodyEvent.source_kind == "issue_created",
+                models.ProductionMaterialCustodyEvent.effective_at > baseline_cutoff,
+                models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff,
+                models.ProductionMaterialCustodyEvent.id <= target_high_watermark_id,
+            ).all()
+            anchor_events = [*visible, *openings]
+    anchors = _custody_fold_anchor(anchor_events)
     return sorted(visible, key=lambda event: _custody_fold_order_key(event, anchors))
 
 
@@ -671,12 +700,17 @@ def _build_projection_from_seed_and_events(
     baseline_high_watermark_id: int,
     baseline_cutoff: datetime,
     target_high_watermark_id: int,
+    selected_keys: set[ProjectionRowKey] | None = None,
 ) -> tuple[MaterialCustodyState, dict[ProjectionRowKey, float]]:
-    baseline_rows = (
+    baseline_query = (
         db.query(models.ProductionMaterialCustodyProjection)
         .filter_by(ledger_generation_id=int(baseline_generation_id))
-        .all()
     )
+    if selected_keys is not None:
+        baseline_query = baseline_query.filter(_custody_cell_predicate(
+            models.ProductionMaterialCustodyProjection, selected_keys,
+        ))
+    baseline_rows = baseline_query.all()
     state = _state_from_projection_rows(baseline_rows)
     projection_rows = _projection_rows_by_key(baseline_rows)
 
@@ -686,16 +720,22 @@ def _build_projection_from_seed_and_events(
         baseline_cutoff=baseline_cutoff,
         baseline_high_watermark_id=baseline_high_watermark_id,
         target_high_watermark_id=target_high_watermark_id,
+        selected_keys=selected_keys,
     )
 
+    terminal_query = db.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.source_kind == "terminal_release",
+        models.ProductionMaterialCustodyEvent.source_ref2c.like("order-terminal-v1:%"),
+        models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff,
+        models.ProductionMaterialCustodyEvent.id <= target_high_watermark_id,
+    )
+    if selected_keys is not None:
+        terminal_query = terminal_query.filter(_custody_cell_predicate(
+            models.ProductionMaterialCustodyEvent, selected_keys,
+        ))
     terminal_cells = {
         (int(row.product_id), int(row.component_item_id), str(row.location_kind), str(row.warehouse_ref1c))
-        for row in db.query(models.ProductionMaterialCustodyEvent).filter(
-            models.ProductionMaterialCustodyEvent.source_kind == "terminal_release",
-            models.ProductionMaterialCustodyEvent.source_ref2c.like("order-terminal-v1:%"),
-            models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff,
-            models.ProductionMaterialCustodyEvent.id <= target_high_watermark_id,
-        ).all()
+        for row in terminal_query.all()
     }
 
     for event in events:
@@ -816,6 +856,98 @@ def _build_projection_from_seed_and_events(
             state.by_warehouse_item[(warehouse, comp_id)] = warehouse_qty
 
     return state, projection_rows
+
+
+def replay_bounded_material_custody_cells(
+    db: Session,
+    *,
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+    keys: set[ProjectionRowKey],
+    earliest_changed_at: datetime,
+) -> tuple[int, dict[ProjectionRowKey, float], dict[ProjectionRowKey, float], int]:
+    """Refold only changed cells from a retained pre-correction baseline.
+
+    A physical revision can replace an accepted transfer. The compact parent
+    quantity contains the old event's *folded* contribution, which need not
+    equal its raw delta after canonical terminal clipping. Both versions are
+    therefore folded by the same kernel and visibility/order rules above.
+    """
+    if not keys or earliest_changed_at is None:
+        raise ValueError("bounded custody replay requires cells and a changed date")
+    retained_cells = exists().where(
+        models.ProductionMaterialCustodyProjection.ledger_generation_id
+        == models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id
+    )
+    pointer = db.get(models.PlanningTruthState, 1)
+    live_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None else -1
+    )
+    candidates = db.query(
+        models.ProductionMaterialCustodyProjectionManifest,
+        models.LedgerGeneration,
+    ).join(
+        models.LedgerGeneration,
+        models.LedgerGeneration.id
+        == models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id,
+    ).filter(
+        models.ProductionMaterialCustodyProjectionManifest.status == "complete",
+        models.LedgerGeneration.status == "accepted",
+        models.ProductionMaterialCustodyProjectionManifest.cutoff < earliest_changed_at,
+        or_(
+            models.ProductionMaterialCustodyProjectionManifest.is_baseline.is_(True),
+            models.ProductionMaterialCustodyProjectionManifest.baseline_generation_id.is_(None),
+            retained_cells,
+            models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id
+            == live_generation_id,
+        ),
+    ).order_by(
+        models.ProductionMaterialCustodyProjectionManifest.cutoff.desc(),
+        models.ProductionMaterialCustodyProjectionManifest.ledger_generation_id.desc(),
+    ).all()
+    parent_manifest = _read_manifest(db, generation_id=int(parent.id))
+    if parent_manifest is None or parent_manifest.status != "complete":
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=int(parent.id), stored_generation_id=None,
+            reason="bounded custody parent manifest is missing",
+        )
+    _require_manifest_cutoff(parent_manifest, parent)
+    parent_hwm = int(parent_manifest.source_event_high_watermark_id)
+    target_hwm = _event_high_watermark_id_at_cutoff(db, cutoff=target.cutoff)
+    for baseline_manifest, baseline_generation in candidates:
+        _require_manifest_cutoff(baseline_manifest, baseline_generation)
+        baseline_hwm = int(baseline_manifest.source_event_high_watermark_id)
+        if baseline_hwm > parent_hwm or baseline_hwm > target_hwm:
+            continue
+        if _late_events_behind_baseline(
+            db, baseline_cutoff=baseline_generation.cutoff,
+            baseline_high_watermark_id=baseline_hwm,
+            target_high_watermark_id=target_hwm,
+            selected_keys=keys,
+        ):
+            continue
+        _, parent_rows = _build_projection_from_seed_and_events(
+            db, generation=parent,
+            baseline_generation_id=int(baseline_generation.id),
+            baseline_high_watermark_id=baseline_hwm,
+            baseline_cutoff=baseline_generation.cutoff,
+            target_high_watermark_id=parent_hwm,
+            selected_keys=keys,
+        )
+        _, target_rows = _build_projection_from_seed_and_events(
+            db, generation=target,
+            baseline_generation_id=int(baseline_generation.id),
+            baseline_high_watermark_id=baseline_hwm,
+            baseline_cutoff=baseline_generation.cutoff,
+            target_high_watermark_id=target_hwm,
+            selected_keys=keys,
+        )
+        return int(baseline_generation.id), parent_rows, target_rows, target_hwm
+    raise MaterialCustodySnapshotUnavailable(
+        expected_generation_id=int(target.id), stored_generation_id=None,
+        reason="no retained custody baseline predates the bounded correction",
+    )
 
 
 def build_material_custody_projection(

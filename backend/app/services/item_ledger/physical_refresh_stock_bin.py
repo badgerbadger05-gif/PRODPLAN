@@ -12,12 +12,12 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from sqlalchemy import tuple_
-from sqlalchemy.orm import Session
+from sqlalchemy import or_, tuple_
+from sqlalchemy.orm import Session, aliased
 
 from app import models
 from .physical import LedgerKey, fold_running_balance
-from .physical_visibility import PhysicalVisibilityError, require_import_batch
+from .physical_visibility import PhysicalVisibilityError, require_import_batch, visible_sle_query
 
 
 class BoundedStockBinRefreshError(ValueError):
@@ -217,23 +217,31 @@ def _validate_manifest(
     if set(edges) != declared_edge_ids:
         raise BoundedStockBinRefreshError("delta manifest references missing supersession edge")
 
+    old_entry = aliased(models.StockLedgerEntry)
+    new_entry = aliased(models.StockLedgerEntry)
     persisted_edge_rows = (
-        db.query(models.StockLedgerFactSupersession, models.StockLedgerEntry)
+        db.query(models.StockLedgerFactSupersession, old_entry, new_entry)
         .join(
-            models.StockLedgerEntry,
-            models.StockLedgerEntry.id == models.StockLedgerFactSupersession.old_sle_id,
+            old_entry,
+            old_entry.id == models.StockLedgerFactSupersession.old_sle_id,
+        )
+        .outerjoin(
+            new_entry,
+            new_entry.id == models.StockLedgerFactSupersession.new_sle_id,
         )
         .filter(
             models.StockLedgerFactSupersession.import_batch_id > lower,
             models.StockLedgerFactSupersession.import_batch_id <= upper,
-            models.StockLedgerEntry.item_id.in_(item_ids) if item_ids else models.StockLedgerEntry.id < 0,
+            or_(old_entry.item_id.in_(item_ids), new_entry.item_id.in_(item_ids))
+            if item_ids else old_entry.id < 0,
         )
         .all()
     )
     persisted_edge_ids: set[int] = set()
-    for edge, old in persisted_edge_rows:
-        key = _entry_key(old)
-        if key not in key_set:
+    for edge, old, new in persisted_edge_rows:
+        if _entry_key(old) not in key_set or (
+            new is not None and _entry_key(new) not in key_set
+        ):
             raise BoundedStockBinRefreshError(
                 "persisted supersession belongs to undeclared affected key"
             )
@@ -282,8 +290,8 @@ def _validate_manifest(
             raise BoundedStockBinRefreshError("supersession old SLE was not visible in parent basis")
         if edge.new_sle_id is not None:
             new = db.get(models.StockLedgerEntry, int(edge.new_sle_id))
-            if new is None or _entry_key(new) != key:
-                raise BoundedStockBinRefreshError("supersession new SLE is outside affected key")
+            if new is None or _entry_key(new) not in key_set:
+                raise BoundedStockBinRefreshError("supersession new SLE is outside affected keys")
             if int(new.id) not in declared_ids:
                 raise BoundedStockBinRefreshError("supersession new SLE is missing from manifest")
     if set().union(*(set(group) for group in entries_by_key.values())) != declared_ids:
@@ -459,6 +467,27 @@ def apply_bounded_current_stock_bins(
         )
     }
 
+    def target_visible_last(key: LedgerKey) -> models.StockLedgerEntry | None:
+        """Resolve only this full key's final visible fact at the target boundary."""
+        return (
+            visible_sle_query(
+                db, physical_import_batch_id=int(target.physical_import_batch_id),
+                cutoff=target.cutoff,
+            )
+            .filter(
+                models.StockLedgerEntry.item_id == key.item_id,
+                models.StockLedgerEntry.characteristic_ref == key.characteristic_ref,
+                models.StockLedgerEntry.organization_ref == key.organization_ref,
+                models.StockLedgerEntry.warehouse_ref1c == key.warehouse_ref1c,
+            )
+            .order_by(None)
+            .order_by(
+                models.StockLedgerEntry.posting_at.desc(),
+                models.StockLedgerEntry.id.desc(),
+            )
+            .first()
+        )
+
     for key in keys:
         current = current_by_key[key]
         if (
@@ -511,27 +540,11 @@ def apply_bounded_current_stock_bins(
             and int(current.last_entry_id) in old_ids
         )
         if current_last_was_superseded:
-            # The compact owner stores only the last visible ID.  If a
-            # correction removes it, a replacement earlier than that ID would
-            # require discovering an unaffected predecessor from history.  Do
-            # not silently publish an invalid last_entry_id; the caller must
-            # provide a wider bounded scope or use maintenance recovery.
-            if latest is None:
-                raise BoundedStockBinRefreshError(
-                    "superseded current last entry lacks bounded replacement"
-                )
-            previous = last_entries.get(int(current.last_entry_id))
-            if previous is None:
-                raise BoundedStockBinRefreshError("current last entry is missing")
-            if (
-                _comparable_datetime(latest.posting_at), int(latest.id)
-            ) < (
-                _comparable_datetime(previous.posting_at), int(previous.id)
-            ):
-                raise BoundedStockBinRefreshError(
-                    "bounded correction cannot prove replacement last entry"
-                )
-            last_id = int(latest.id)
+            # The replacement can move to another physical key or be older
+            # than an unaffected predecessor. The compact pointer must name
+            # the final target-visible fact of this exact full key.
+            visible_last = target_visible_last(key)
+            last_id = int(visible_last.id) if visible_last is not None else None
         elif latest is not None:
             if last_id is None:
                 last_id = int(latest.id)
@@ -545,6 +558,21 @@ def apply_bounded_current_stock_bins(
                     _comparable_datetime(previous.posting_at), int(previous.id)
                 ):
                     last_id = int(latest.id)
+
+        if last_id is None:
+            visible_last = target_visible_last(key)
+            last_id = int(visible_last.id) if visible_last is not None else None
+        if last_id is None:
+            if next_qty != 0:
+                raise BoundedStockBinRefreshError(
+                    "nonzero current StockBin has no target-visible physical history"
+                )
+            # A full accepted-prefix fold has no group for an empty key.
+            # Do not retain a current zero row after its last fact vanishes.
+            if current is not None:
+                db.delete(current)
+            changed.append(key)
+            continue
 
         if current is None:
             current = models.StockBin(

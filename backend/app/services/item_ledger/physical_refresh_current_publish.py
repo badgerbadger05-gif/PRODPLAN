@@ -1653,7 +1653,9 @@ def _publish_forward_physical_refresh_current(
         parent_generation_id=int(parent.id),
         target_generation_id=int(target.id),
         source_sle_ids=tuple(dict.fromkeys(
-            tuple(int(row.id) for row in rows) + custody_source_ids
+            tuple(int(row.id) for row in rows)
+            + tuple(int(row.id) for row in basis_rows)
+            + custody_source_ids
         )),
     )
     if _phase_tracker is not None:

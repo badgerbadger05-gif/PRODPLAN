@@ -11,6 +11,8 @@ from app.services.item_ledger.physical_refresh_stock_bin import (
     BoundedStockBinRefreshError,
     apply_bounded_current_stock_bins,
 )
+from app.services.item_ledger.physical_visibility import visible_sle_query
+from app.services.item_ledger.generation_lifecycle import _stock_bin_fold_checkpoint
 
 
 def _setup_refresh(db, *, key="stock-bin-refresh"):
@@ -74,6 +76,14 @@ def _current_bin(db, generation, item, *, warehouse="WH-A", quantity=0):
     db.add(row)
     db.flush()
     return row
+
+
+def _assert_exact_target_stock_fold(db, target):
+    visible = visible_sle_query(
+        db, physical_import_batch_id=target.physical_import_batch_id,
+        cutoff=target.cutoff,
+    ).all()
+    _stock_bin_fold_checkpoint(db, target, visible)
 
 
 def test_empty_affected_scope_is_true_noop(db_session):
@@ -305,6 +315,176 @@ def test_supersession_uses_target_visible_replacement_once(db_session):
     assert result.visible_fact_rows == 1
     assert row.on_hand == Decimal("8")
     assert row.last_entry_id == replacement.id
+
+
+def test_cross_warehouse_supersession_moves_signed_quantity_and_keeps_predecessor(db_session):
+    parent, target, item = _setup_refresh(db_session, key="stock-bin-cross-warehouse")
+    earlier = _entry(db_session, parent.physical_import_batch, item, 3, ref="earlier")
+    old = _entry(db_session, parent.physical_import_batch, item, 5, ref="old")
+    destination_open = _entry(
+        db_session, parent.physical_import_batch, item, 2,
+        warehouse="WH-B", ref="destination-opening",
+    )
+    source = _current_bin(db_session, parent, item, quantity=8)
+    destination = _current_bin(db_session, parent, item, warehouse="WH-B", quantity=2)
+    source.last_entry_id = old.id
+    destination.last_entry_id = destination_open.id
+    replacement = _entry(
+        db_session, target.physical_import_batch, item, 7,
+        warehouse="WH-B", ref="replacement",
+    )
+    edge = models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=replacement.id,
+        import_batch_id=target.physical_import_batch.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+
+    result = apply_bounded_current_stock_bins(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        affected_physical_keys=[
+            (item.item_id, "", "ORG-A", "WH-A"),
+            (item.item_id, "", "ORG-A", "WH-B"),
+        ],
+        delta_manifest={"new_sle_ids": [replacement.id], "supersession_edge_ids": [edge.id]},
+    )
+    assert set(result.changed_keys) == {
+        LedgerKey(item.item_id, "", "ORG-A", "WH-A"),
+        LedgerKey(item.item_id, "", "ORG-A", "WH-B"),
+    }
+    assert (source.on_hand, source.last_entry_id) == (Decimal("3"), earlier.id)
+    assert (destination.on_hand, destination.last_entry_id) == (Decimal("9"), replacement.id)
+    assert source.on_hand + destination.on_hand == Decimal("12")
+    _assert_exact_target_stock_fold(db_session, target)
+
+
+def test_cross_item_supersession_requires_both_keys_and_edge(db_session):
+    parent, target, old_item = _setup_refresh(db_session, key="stock-bin-cross-item")
+    new_item = models.Item(item_code="stock-bin-cross-item:new", item_name="New", unit="шт")
+    db_session.add(new_item)
+    db_session.flush()
+    old = _entry(db_session, parent.physical_import_batch, old_item, 4, ref="old")
+    source = _current_bin(db_session, parent, old_item, quantity=4)
+    source.last_entry_id = old.id
+    replacement = _entry(db_session, target.physical_import_batch, new_item, 6, ref="new")
+    edge = models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=replacement.id,
+        import_batch_id=target.physical_import_batch.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    new_key = (new_item.item_id, "", "ORG-A", "WH-A")
+    old_key = (old_item.item_id, "", "ORG-A", "WH-A")
+
+    for keys, manifest in (
+        ([new_key], {"new_sle_ids": [replacement.id]}),
+        ([old_key, new_key], {"new_sle_ids": [replacement.id]}),
+        ([old_key, new_key], {"supersession_edge_ids": [edge.id]}),
+    ):
+        with pytest.raises(BoundedStockBinRefreshError):
+            apply_bounded_current_stock_bins(
+                db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+                affected_physical_keys=keys, delta_manifest=manifest,
+            )
+    assert (source.ledger_generation_id, source.on_hand) == (parent.id, Decimal("4"))
+
+    result = apply_bounded_current_stock_bins(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        affected_physical_keys=[old_key, new_key],
+        delta_manifest={"new_sle_ids": [replacement.id], "supersession_edge_ids": [edge.id]},
+    )
+    destination = db_session.query(models.StockBin).filter_by(
+        item_id=new_item.item_id, is_current=True,
+    ).one()
+    assert result.changed_rows == 2
+    assert db_session.query(models.StockBin).filter_by(
+        item_id=old_item.item_id, is_current=True,
+    ).one_or_none() is None
+    assert (destination.on_hand, destination.last_entry_id) == (Decimal("6"), replacement.id)
+    _assert_exact_target_stock_fold(db_session, target)
+
+
+def test_cross_key_transient_chain(db_session):
+    parent, target, item = _setup_refresh(db_session, key="stock-bin-cross-chain")
+    old = _entry(db_session, parent.physical_import_batch, item, 8, ref="old")
+    source = _current_bin(db_session, parent, item, quantity=8)
+    source.last_entry_id = old.id
+    middle = _entry(db_session, target.physical_import_batch, item, 9,
+                    warehouse="WH-B", ref="middle")
+    terminal = _entry(db_session, target.physical_import_batch, item, 10,
+                      warehouse="WH-C", ref="terminal")
+    first = models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=middle.id,
+        import_batch_id=target.physical_import_batch.id,
+    )
+    second = models.StockLedgerFactSupersession(
+        old_sle_id=middle.id, new_sle_id=terminal.id,
+        import_batch_id=target.physical_import_batch.id,
+    )
+    db_session.add_all([first, second])
+    db_session.flush()
+    keys = [(item.item_id, "", "ORG-A", warehouse) for warehouse in ("WH-A", "WH-B", "WH-C")]
+    result = apply_bounded_current_stock_bins(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        affected_physical_keys=keys,
+        delta_manifest={"new_sle_ids": [middle.id, terminal.id],
+                        "supersession_edge_ids": [first.id, second.id]},
+    )
+    bins = {row.warehouse_ref1c: row for row in db_session.query(models.StockBin).filter_by(
+        item_id=item.item_id, is_current=True,
+    )}
+    assert result.changed_rows == 3
+    assert {warehouse: row.on_hand for warehouse, row in bins.items()} == {
+        "WH-C": Decimal("10"),
+    }
+    assert bins["WH-C"].last_entry_id == terminal.id
+    _assert_exact_target_stock_fold(db_session, target)
+
+
+def test_tombstone_restores_target_visible_last_predecessor(db_session):
+    # A separate tombstone has no target-visible successor. The current last
+    # fact is removed, while an earlier same-key fact remains the exact last.
+    parent2, target2, item2 = _setup_refresh(db_session, key="stock-bin-tombstone-last")
+    predecessor = _entry(db_session, parent2.physical_import_batch, item2, 2, ref="predecessor")
+    obsolete = _entry(db_session, parent2.physical_import_batch, item2, 5, ref="obsolete")
+    owner = _current_bin(db_session, parent2, item2, quantity=7)
+    owner.last_entry_id = obsolete.id
+    tombstone = models.StockLedgerFactSupersession(
+        old_sle_id=obsolete.id, new_sle_id=None,
+        import_batch_id=target2.physical_import_batch.id,
+    )
+    db_session.add(tombstone)
+    db_session.flush()
+    apply_bounded_current_stock_bins(
+        db_session, target_generation_id=target2.id, parent_generation_id=parent2.id,
+        affected_physical_keys=[(item2.item_id, "", "ORG-A", "WH-A")],
+        delta_manifest={"supersession_edge_ids": [tombstone.id]},
+    )
+    assert (owner.on_hand, owner.last_entry_id) == (Decimal("2"), predecessor.id)
+    _assert_exact_target_stock_fold(db_session, target2)
+
+
+def test_zero_balance_retains_last_when_visible_history_remains(db_session):
+    parent, target, item = _setup_refresh(db_session, key="stock-bin-zero-visible")
+    old = _entry(db_session, parent.physical_import_batch, item, 5, ref="obsolete")
+    owner = _current_bin(db_session, parent, item, quantity=5)
+    owner.last_entry_id = old.id
+    receipt = _entry(db_session, target.physical_import_batch, item, 2, ref="receipt")
+    expense = _entry(db_session, target.physical_import_batch, item, -2, ref="expense")
+    tombstone = models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=None,
+        import_batch_id=target.physical_import_batch.id,
+    )
+    db_session.add(tombstone)
+    db_session.flush()
+    apply_bounded_current_stock_bins(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        affected_physical_keys=[(item.item_id, "", "ORG-A", "WH-A")],
+        delta_manifest={"new_sle_ids": [receipt.id, expense.id],
+                        "supersession_edge_ids": [tombstone.id]},
+    )
+    assert (owner.on_hand, owner.last_entry_id) == (Decimal("0"), expense.id)
+    _assert_exact_target_stock_fold(db_session, target)
 
 
 def test_retry_same_target_is_idempotent_without_second_row_change(db_session):

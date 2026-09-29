@@ -17,7 +17,11 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.services.production_material_custody_events import _custody_event_idempotency_key
-from app.services.production_material_custody_projection import _same_1c_timestamp
+from app.services.production_material_custody_projection import (
+    MaterialCustodySnapshotUnavailable,
+    _same_1c_timestamp,
+    replay_bounded_material_custody_cells,
+)
 from .physical_visibility import PhysicalVisibilityError, visible_sle_query
 
 
@@ -368,8 +372,6 @@ def apply_bounded_current_material_custody_events(
         .order_by(models.ProductionMaterialCustodyEvent.id.asc())
         .all()
     )
-    if not tail:
-        return 0
     if any(
         event.source_sle_id is not None and int(event.source_sle_id) not in explicit
         for event in tail
@@ -383,6 +385,146 @@ def apply_bounded_current_material_custody_events(
         target_cutoff=target.cutoff,
         allowed_sle_ids=explicit,
     )
+
+    parent_batch = int(parent.physical_import_batch_id)
+    target_batch = int(target.physical_import_batch_id)
+    edges = db.query(models.StockLedgerFactSupersession).filter(
+        models.StockLedgerFactSupersession.import_batch_id > parent_batch,
+        models.StockLedgerFactSupersession.import_batch_id <= target_batch,
+    ).order_by(models.StockLedgerFactSupersession.id).all()
+    edge_by_old: dict[int, models.StockLedgerFactSupersession] = {}
+    for edge in edges:
+        old_id = int(edge.old_sle_id)
+        if old_id in edge_by_old:
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody physical revision has two successors (old_sle_id={old_id})"
+            )
+        edge_by_old[old_id] = edge
+    parent_event_rows = db.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id <= previous_watermark,
+        models.ProductionMaterialCustodyEvent.source_sle_id.in_(list(edge_by_old)),
+    ).all() if edge_by_old else []
+    parent_visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=parent_batch, cutoff=parent.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(
+            [int(event.source_sle_id) for event in parent_event_rows]
+        )).all()
+    } if parent_event_rows else set()
+    corrected_events = [
+        event for event in parent_event_rows
+        if int(event.source_sle_id) in parent_visible_ids
+        and _ordered_1c_timestamps(event.effective_at, parent.cutoff)[0]
+        <= _ordered_1c_timestamps(event.effective_at, parent.cutoff)[1]
+    ]
+    correction_keys = {
+        (int(event.product_id), int(event.component_item_id),
+         str(event.location_kind or ""), str(event.warehouse_ref1c or ""))
+        for event in corrected_events
+    }
+    connected_ids = {int(event.source_sle_id) for event in corrected_events}
+    while True:
+        successors = {
+            int(edge_by_old[old_id].new_sle_id)
+            for old_id in connected_ids if old_id in edge_by_old
+            and edge_by_old[old_id].new_sle_id is not None
+        }
+        if successors <= connected_ids:
+            break
+        connected_ids.update(successors)
+    if corrected_events and not connected_ids <= explicit:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody correction chain is absent from the bounded SLE manifest"
+        )
+    # A replacement transfer must have a persisted edge from the accepted
+    # recorder line. Without it, the new event could be appended to the old
+    # compact quantity and remain nonnegative while silently counting both.
+    tail_source_ids = {
+        int(event.source_sle_id) for event in tail if event.source_sle_id is not None
+    }
+    tail_sources = db.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.id.in_(tail_source_ids)
+    ).all() if tail_source_ids else []
+    new_identities = {
+        str(row.business_identity)
+        for row in tail_sources
+        if int(row.ingest_batch_id) > parent_batch and row.business_identity
+    }
+    if new_identities:
+        candidates = db.query(
+            models.ProductionMaterialCustodyEvent,
+            models.StockLedgerEntry,
+        ).join(
+            models.StockLedgerEntry,
+            models.StockLedgerEntry.id
+            == models.ProductionMaterialCustodyEvent.source_sle_id,
+        ).filter(
+            models.ProductionMaterialCustodyEvent.id <= previous_watermark,
+            models.StockLedgerEntry.ingest_batch_id <= parent_batch,
+            models.StockLedgerEntry.business_identity.in_(new_identities),
+        ).all()
+        candidate_ids = {int(old.id) for _, old in candidates}
+        accepted_ids = {
+            int(row.id) for row in visible_sle_query(
+                db, physical_import_batch_id=parent_batch, cutoff=parent.cutoff,
+            ).filter(models.StockLedgerEntry.id.in_(candidate_ids)).all()
+        } if candidate_ids else set()
+        for event, old in candidates:
+            if int(old.id) in accepted_ids and int(old.id) not in connected_ids:
+                raise PhysicalRefreshProvenanceUnavailable(
+                    f"custody recorder correction lacks a bounded supersession "
+                    f"(old_sle_id={int(old.id)}, event_id={int(event.id)})"
+                )
+    for event in tail:
+        if event.source_sle_id is None:
+            continue
+        source_id = int(event.source_sle_id)
+        if source_id in connected_ids:
+            correction_keys.add((
+                int(event.product_id), int(event.component_item_id),
+                str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
+            ))
+        elif source_id in edge_by_old:
+            # A newly imported A may already have been replaced by B or NULL
+            # inside the same physical import interval.
+            continue
+    if any(
+        _ordered_1c_timestamps(event.effective_at, target.cutoff)[0]
+        > _ordered_1c_timestamps(event.effective_at, target.cutoff)[1]
+        for event in tail
+    ):
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody event tail extends beyond the target cutoff"
+        )
+    visible_tail_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=target_batch, cutoff=target.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(
+            [int(event.source_sle_id) for event in tail if event.source_sle_id is not None]
+        )).all()
+    } if tail else set()
+    terminal_correction_ids = connected_ids - set(edge_by_old)
+    terminal_visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=target_batch, cutoff=target.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(terminal_correction_ids)).all()
+    } if terminal_correction_ids else set()
+    tail_event_source_ids = {
+        int(event.source_sle_id) for event in tail if event.source_sle_id is not None
+    }
+    missing_terminal_events = terminal_visible_ids - tail_event_source_ids
+    if missing_terminal_events:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody correction has no event for target-visible transfer "
+            f"(sle_ids={sorted(missing_terminal_events)[:8]})"
+        )
+    for event in tail:
+        if event.source_sle_id is not None and int(event.source_sle_id) not in visible_tail_ids:
+            if int(event.source_sle_id) not in edge_by_old:
+                raise PhysicalRefreshProvenanceUnavailable(
+                    f"custody event has invisible source without a bounded supersession "
+                    f"(event_id={int(event.id)}, sle_id={int(event.source_sle_id)})"
+                )
 
     current_rows = (
         db.query(models.ProductionMaterialCustodyProjection)
@@ -411,6 +553,54 @@ def apply_bounded_current_material_custody_events(
         ): row
         for row in current_rows
     }
+    if correction_keys:
+        earliest = min(
+            event.effective_at.replace(tzinfo=None)
+            for event in (*corrected_events, *(
+                event for event in tail
+                if event.source_sle_id is not None
+                and int(event.source_sle_id) in connected_ids
+            ))
+        )
+        try:
+            baseline_id, parent_cells, target_cells, target_watermark = (
+                replay_bounded_material_custody_cells(
+                    db, parent=parent, target=target, keys=correction_keys,
+                    earliest_changed_at=earliest,
+                )
+            )
+        except MaterialCustodySnapshotUnavailable as exc:
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody correction has no canonical bounded replay basis "
+                f"(old_sle_ids={sorted(int(event.source_sle_id) for event in corrected_events)})"
+            ) from exc
+        for key in correction_keys:
+            stored = Decimal(str(rows_by_key[key].reserved_qty)) if key in rows_by_key else Decimal(0)
+            expected = Decimal(str(parent_cells.get(key, 0)))
+            if stored.quantize(Decimal("0.001")) != expected.quantize(Decimal("0.001")):
+                raise PhysicalRefreshProvenanceUnavailable(
+                    f"custody correction parent basis differs from compact owner "
+                    f"(key={key}, baseline_generation_id={baseline_id}, "
+                    f"stored={stored}, replayed={expected})"
+                )
+            result = Decimal(str(target_cells.get(key, 0)))
+            row = rows_by_key.get(key)
+            if result <= 0:
+                if row is not None:
+                    db.delete(row)
+                    rows_by_key.pop(key, None)
+            elif row is not None:
+                row.reserved_qty = result
+            else:
+                row = models.ProductionMaterialCustodyProjection(
+                    ledger_generation_id=int(parent.id), product_id=key[0],
+                    component_item_id=key[1], location_kind=key[2],
+                    warehouse_ref1c=key[3], reserved_qty=result,
+                    source_event_high_watermark_id=target_watermark,
+                    is_current=True,
+                )
+                db.add(row)
+                rows_by_key[key] = row
     for event in tail:
         key = (
             int(event.product_id),
@@ -418,6 +608,11 @@ def apply_bounded_current_material_custody_events(
             str(event.location_kind or ""),
             str(event.warehouse_ref1c or ""),
         )
+        if key in correction_keys or (
+            event.source_sle_id is not None
+            and int(event.source_sle_id) not in visible_tail_ids
+        ):
+            continue
         row = rows_by_key.get(key)
         current_qty = Decimal(str(row.reserved_qty or 0)) if row is not None else Decimal("0")
         next_qty = current_qty + Decimal(str(event.delta_qty or 0))
@@ -453,7 +648,7 @@ def apply_bounded_current_material_custody_events(
                 "bounded custody event has no current basis"
             )
 
-    watermark = int(tail[-1].id)
+    watermark = int(tail[-1].id) if tail else previous_watermark
     for row in rows_by_key.values():
         row.source_event_high_watermark_id = watermark
     # The manifest is the compact owner's provenance.  The handoff below
