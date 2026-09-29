@@ -1702,6 +1702,12 @@ def _repair_current_execution_scopes_from_pointer(
     )
     if not stale:
         return None
+    # R4 invalidates the purchase scope when an accepted-pointer correction
+    # changes BUY fulfillment.  Its rows can no longer be copied from the
+    # parent; the no-op repair must rebuild them from current reservations.
+    rebuild_purchase = bool(rebuild_purchase) or (
+        "purchase_control_journal:purchase:all-live-plans" in stale
+    )
     boundary = db.get(models.LedgerGeneration, int(payload_boundary_generation_id))
     if boundary is None or _text(boundary.status) != "building":
         raise ForwardPhysicalRefreshUnavailable(
@@ -1750,10 +1756,8 @@ def _repair_current_execution_scopes_from_pointer(
         accepted_run_ids=run_ids,
         affected_item_ids=(),
     )
-    # An ordinary repair reuses the purchase rows: nothing it republishes can
-    # have changed them.  A caller that has just rewritten BUY replenishment
-    # has, so it asks for the complete rebuild instead of reusing rows computed
-    # from the coverage it replaced.
+    # Unrelated repairs reuse purchase rows.  A stale purchase scope, or a
+    # caller that just rewrote BUY replenishment, needs a complete rebuild.
     purchase_payload = build_compact_current_purchase_control_payload(
         db,
         target_generation_id=int(boundary.id),

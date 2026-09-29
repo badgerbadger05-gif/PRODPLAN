@@ -1704,6 +1704,7 @@ def apply_current_replenishment(
         str(row.reserve_id): _decimal(row.realized_qty)
         for row in plan.result.realizations
     }
+    received_changed = False
     for reserve_id, realized in realization_by_reserve.items():
         entry = entry_by_identity.get(reserve_id)
         reserve = reserve_by_id.get(reserve_id)
@@ -1713,6 +1714,7 @@ def apply_current_replenishment(
         if _decimal(entry.replenishment_received_qty) != received:
             entry.replenishment_received_qty = received
             entry.realized_qty = received
+            received_changed = True
     db.flush()
     if fail_after == "execution":
         raise CurrentReplenishmentError("injected failure after execution")
@@ -1726,6 +1728,32 @@ def apply_current_replenishment(
     db.flush()
     if fail_after == "marker":
         raise CurrentReplenishmentError("injected failure after marker")
+
+    # An accepted-pointer correction can change BUY fulfillment without a new
+    # physical delta (and even without changing any allocation pair).  The
+    # purchase journal reuses untouched parent rows during bounded refresh;
+    # mark that persisted result unavailable in this same transaction so the
+    # next no-op tick rebuilds it from this canonical current owner.  BUILDING
+    # publication constructs its purchase payload later in the same pipeline.
+    if distribution_scope[4] == "buy" and (audit_events or received_changed):
+        pointer = db.get(models.PlanningTruthState, 1)
+        if (
+            _text(generation.status) == "accepted"
+            and pointer is not None
+            and int(pointer.current_generation_id or -1) == int(generation.id)
+        ):
+            from .current_execution import invalidate_current_execution_scope
+
+            invalidate_current_execution_scope(
+                db,
+                entity_kind="purchase_control_journal",
+                scope_key="purchase:all-live-plans",
+                source_revision=(
+                    f"replenishment:{canonical_scope_key}:{revision}:"
+                    f"{input_checksum[:12]}"
+                ),
+                reason="buy_replenishment_changed",
+            )
 
     return CurrentReplenishmentResult(
         generation_id=int(generation.id),

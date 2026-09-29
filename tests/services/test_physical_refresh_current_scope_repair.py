@@ -27,6 +27,7 @@ from app.services.item_ledger import physical_refresh_generation
 from app.services.item_ledger import physical_refresh_orchestrator as workflow
 from app.services.item_ledger.current_execution import (
     CurrentExecutionUnavailable,
+    invalidate_current_execution_scope,
     publish_current_execution_from_generation,
     publish_current_execution_scope,
     publish_current_obligation_views_from_generation,
@@ -447,3 +448,48 @@ def test_noop_refresh_leaves_ready_scopes_completely_untouched(db_session, monke
     assert _row_state(db_session) == rows_before
     assert db_session.query(models.CurrentExecutionChange).count() == audit_before
     assert set(_manifests(db_session).values()) == {(parent.id, True)}
+
+
+def test_noop_repair_rebuilds_invalidated_purchase_from_current_owners(
+    db_session, monkeypatch,
+):
+    parent, boundary = _generations(db_session, key="buy-scope-repair")
+    _publish_all_current_scopes(db_session, parent.id)
+    assert invalidate_current_execution_scope(
+        db_session,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+        source_revision="replenishment-correction",
+        reason="buy_replenishment_changed",
+    )
+    _patch_compute_only(monkeypatch)
+    purchase_calls = []
+
+    def purchase_builder(*args, **kwargs):
+        purchase_calls.append(kwargs)
+        return dict(_EMPTY_JOURNAL_PAYLOAD)
+
+    monkeypatch.setattr(
+        publisher, "build_compact_current_purchase_control_payload", purchase_builder,
+    )
+    first = publisher.repair_current_execution_scopes_from_pointer(
+        db_session,
+        pointer_generation_id=parent.id,
+        payload_boundary_generation_id=boundary.id,
+        source_revision="no-op-tick",
+    )
+    assert first is not None
+    assert purchase_calls[0]["reuse_parent_current"] is False
+    assert purchase_calls[0]["affected_scopes"] is None
+    assert _manifests(db_session)[
+        ("purchase_control_journal", "purchase:all-live-plans")
+    ] == (parent.id, True)
+
+    second = publisher.repair_current_execution_scopes_from_pointer(
+        db_session,
+        pointer_generation_id=parent.id,
+        payload_boundary_generation_id=boundary.id,
+        source_revision="no-op-tick",
+    )
+    assert second is None
+    assert len(purchase_calls) == 1

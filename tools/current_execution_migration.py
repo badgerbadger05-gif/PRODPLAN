@@ -2051,6 +2051,29 @@ def _parse_recorder_identity(value: str) -> tuple[str, str]:
     return recorder_type, recorder_ref
 
 
+def _validate_backdated_supplier_recorders(
+    recorders: tuple[tuple[str, str], ...],
+) -> None:
+    """The one-off rebase has no production-output or custody publisher."""
+    from app.services.item_ledger.physical_refresh_supplier_evidence import (
+        is_supplier_document_type,
+    )
+
+    if not recorders:
+        raise PreflightBlocked("--recorder is required at least once")
+    unsupported = sorted({
+        str(recorder_type)
+        for recorder_type, _ in recorders
+        if not is_supplier_document_type(recorder_type)
+    })
+    if unsupported:
+        raise PreflightBlocked(
+            "backdated-recorder-repair supports supplier documents only; "
+            "use the canonical physical refresh for other recorder types "
+            f"({', '.join(unsupported)})"
+        )
+
+
 def _backdated_recorder_repair_on_session(
     session: Session,
     generation_id: int,
@@ -2094,8 +2117,7 @@ def _backdated_recorder_repair_on_session(
         retire_cutoff_snaps_absorbing_facts,
     )
 
-    if not recorders:
-        raise PreflightBlocked("--recorder is required at least once")
+    _validate_backdated_supplier_recorders(recorders)
     _lock_truth_pointer(session, int(generation_id))
     generation = session.get(models.LedgerGeneration, int(generation_id))
     if generation is None or str(generation.status or "") != "accepted":
@@ -2285,6 +2307,7 @@ def apply_backdated_recorder_repair(
 
     if not writers_stopped:
         raise PreflightBlocked("explicit writers-stopped acknowledgement is required")
+    _validate_backdated_supplier_recorders(recorders)
     if client is None:
         from app.services.odata_config import load_odata_config, sanitize_base_url
         from app.services.odata_client import OData1CClient

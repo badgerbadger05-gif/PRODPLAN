@@ -1735,10 +1735,26 @@ def build_compact_current_purchase_control_payload(
             raise PurchaseControlCompactPayloadError(
                 "bounded compact purchase refresh requires explicit affected scopes"
             )
-        parent_rows, parent_cards = _load_parent_compact_purchase_rows(
-            db, parent_generation_id=int(parent.id)
+        from app.services.item_ledger.current_execution import get_current_execution_scope
+
+        parent_scope = get_current_execution_scope(
+            db,
+            entity_kind="purchase_control_journal",
+            scope_key="purchase:all-live-plans",
         )
-        if not parent_rows and _has_active_current_buy_owners(db, run_ids=run_ids):
+        if parent_scope is not None and not bool(parent_scope.result_ready):
+            # An accepted-pointer R4 correction invalidated the purchase
+            # result in the same transaction.  A semantic no-op tick may leave
+            # its source generation older than the accepted pointer.  A
+            # forward refresh must rebuild from current BUY owners regardless
+            # of that provenance rather than copy retired rows.
+            reuse_parent_current = False
+            scopes = None
+        else:
+            parent_rows, parent_cards = _load_parent_compact_purchase_rows(
+                db, parent_generation_id=int(parent.id)
+            )
+        if reuse_parent_current and not parent_rows and _has_active_current_buy_owners(db, run_ids=run_ids):
             # The parent manifest is empty while live BUY owners exist: reusing
             # it would republish that emptiness for every later refresh.  A
             # migrated/repaired stand starts exactly here, so recompute the
@@ -1755,7 +1771,7 @@ def build_compact_current_purchase_control_payload(
         # supplier contour is never a pure reuse: its supplier rows are rebuilt
         # from that capture below, which is also what supersedes rows published
         # under an older row identity.
-        elif not scopes and future_supply_generation_id is None:
+        elif reuse_parent_current and not scopes and future_supply_generation_id is None:
             rows = list(parent_rows)
             rows.sort(
                 key=lambda row: (

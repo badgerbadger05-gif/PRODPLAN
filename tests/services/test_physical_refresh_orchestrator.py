@@ -1418,6 +1418,7 @@ def test_cutoff_snap_then_bounded_stock_publish_has_one_target_owner(
     monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
     monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
+    monkeypatch.setattr(workflow, "_repair_mismatched_recorders", lambda *a, **k: 0)
     monkeypatch.setattr(
         workflow, "evaluate_physical_refresh_balance_convergence",
         lambda *a, **k: next(convergence_results),
@@ -1643,6 +1644,90 @@ def test_fully_explained_cutoff_snap_is_tombstoned(db_session):
     assert _active_cell_total(db_session, item) == before
 
 
+def test_historical_audit_retires_only_new_absorbed_facts_once(db_session):
+    parent, parent_batch = _accepted_parent(
+        db_session, generation_key="audit-snap-retire"
+    )
+    fresh = models.Item(item_code="AUDIT-NEW", item_name="Audit new")
+    revised = models.Item(item_code="AUDIT-REV", item_name="Audit revision")
+    db_session.add_all([fresh, revised])
+    db_session.flush()
+    parent_posting = _moscow_naive(parent.cutoff)
+    fresh_snap = _seed_cutoff_snap(
+        db_session, parent_batch, fresh, qty=10, posting_at=parent_posting,
+    )
+    revised_snap = _seed_cutoff_snap(
+        db_session, parent_batch, revised, qty=5, posting_at=parent_posting,
+    )
+    old_revision = _seed_document_fact(
+        db_session, parent_batch, revised, qty=2,
+        posting_at=parent_posting - timedelta(days=1), ref="known-revision",
+    )
+    generation = _building_physical_generation(db_session, parent, parent_batch)
+    audit_batch = models.PhysicalImportBatch(
+        batch_key="audit-snap-retire-import", status="completed",
+        cutoff=generation.cutoff, source_watermarks={},
+        completed_at=generation.cutoff,
+    )
+    db_session.add(audit_batch)
+    db_session.flush()
+    fresh_fact = _seed_document_fact(
+        db_session, audit_batch, fresh, qty=7,
+        posting_at=parent_posting - timedelta(days=2), ref="new-backdate",
+    )
+    vanished_fact = _seed_document_fact(
+        db_session, audit_batch, fresh, qty=2,
+        posting_at=parent_posting - timedelta(days=2), ref="vanished-in-audit",
+    )
+    vanished_fact.active = False
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(vanished_fact.id), new_sle_id=None,
+        import_batch_id=int(audit_batch.id),
+    ))
+    old_revision.active = False
+    db_session.flush()
+    new_revision = _seed_document_fact(
+        db_session, audit_batch, revised, qty=2,
+        posting_at=parent_posting - timedelta(days=1), ref="known-revision",
+    )
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(old_revision.id), new_sle_id=int(new_revision.id),
+        import_batch_id=int(audit_batch.id),
+    ))
+    generation.physical_import_batch_id = int(audit_batch.id)
+    db_session.commit()
+
+    parent_cell_balance = Decimal("10")
+    audit = SimpleNamespace(terminal_physical_import_batch_id=audit_batch.id)
+    result = workflow._retire_audit_absorbed_cutoff_snaps(
+        db_session, parent=parent, generation=generation, recorder_audit=audit,
+    )
+    db_session.commit()
+
+    assert result is not None
+    assert result.retired_rows == 1
+    assert result.reissued_rows == 1
+    assert Decimal(result.absorbed_qty) == Decimal("7")
+    assert result.unabsorbed == ()
+    assert _active_cell_total(db_session, fresh) == parent_cell_balance
+    assert db_session.get(models.StockLedgerEntry, fresh_snap.id).active is False
+    assert db_session.get(models.StockLedgerEntry, revised_snap.id).active is True
+    assert generation.physical_import_batch_id > audit_batch.id
+    assert db_session.get(models.StockLedgerEntry, fresh_fact.id).active is True
+    # The earlier accepted prefix still sees its original synthetic row.
+    assert fresh_snap.id in {
+        row.id for row in workflow.visible_sle_query(
+            db_session, physical_import_batch_id=parent_batch.id,
+            cutoff=parent_posting,
+        ).all()
+    }
+    supersessions = db_session.query(models.StockLedgerFactSupersession).count()
+    assert workflow._retire_audit_absorbed_cutoff_snaps(
+        db_session, parent=parent, generation=generation, recorder_audit=audit,
+    ) is None
+    assert db_session.query(models.StockLedgerFactSupersession).count() == supersessions
+
+
 def test_cutoff_snap_older_than_the_fact_is_not_retired(db_session):
     """A snap written before the document was posted absorbed something else."""
     parent, parent_batch = _accepted_parent(db_session, generation_key="snap-older")
@@ -1697,7 +1782,10 @@ def test_opposite_signed_cutoff_snap_is_left_alone(db_session):
     assert db_session.get(models.StockLedgerEntry, int(snap.id)).active is True
 
 
-def test_snap_never_runs_before_the_targeted_recorder_repair(db_session, monkeypatch):
+@pytest.mark.parametrize("repair_fails", [False, True])
+def test_snap_never_runs_before_the_targeted_recorder_repair(
+    db_session, monkeypatch, repair_fails,
+):
     """A residual is a missing document until the register says otherwise."""
     parent, _ = _accepted_parent(db_session, generation_key="repair-first")
     target_cutoff = parent.cutoff + timedelta(days=1)
@@ -1719,6 +1807,7 @@ def test_snap_never_runs_before_the_targeted_recorder_repair(db_session, monkeyp
     )
     db_session.add_all([forked_batch, physical])
     db_session.flush()
+    db_session.commit()
     fork_result = physical_refresh_generation.PhysicalRefreshGenerationResult(
         ledger_generation_id=physical.id, generation_key="repair-first-fork",
         physical_import_batch_id=forked_batch.id, cutoff=target_cutoff,
@@ -1741,13 +1830,20 @@ def test_snap_never_runs_before_the_targeted_recorder_repair(db_session, monkeyp
     monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
     monkeypatch.setattr(
+        workflow, "_retire_audit_absorbed_cutoff_snaps",
+        lambda *a, **k: order.append("retire"),
+    )
+    monkeypatch.setattr(
         workflow, "evaluate_physical_refresh_balance_convergence",
         lambda *a, **k: mismatch,
     )
-    monkeypatch.setattr(
-        workflow, "_repair_mismatched_recorders",
-        lambda *a, **k: order.append("repair") or 0,
-    )
+    def _repair(*_args, **_kwargs):
+        order.append("repair")
+        if repair_fails:
+            raise RuntimeError("simulated targeted-pull failure")
+        return 0
+
+    monkeypatch.setattr(workflow, "_repair_mismatched_recorders", _repair)
     monkeypatch.setattr(
         workflow, "_snap_balance_at_cutoff",
         lambda *a, **k: order.append("snap") or 0,
@@ -1759,7 +1855,10 @@ def test_snap_never_runs_before_the_targeted_recorder_repair(db_session, monkeyp
             client=object(), balance_snapshot={},
         )
 
-    assert order == ["repair", "snap"]
+    assert order == (
+        ["retire", "repair", "retire", "snap"]
+        if repair_fails else ["retire", "repair", "snap"]
+    )
 
 
 def test_backdated_and_superseded_delta_is_replayed_not_rejected(db_session, monkeypatch):

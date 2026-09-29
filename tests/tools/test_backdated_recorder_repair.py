@@ -221,6 +221,26 @@ def test_phase_requires_at_least_one_recorder():
         )
 
 
+@pytest.mark.parametrize("recorder_type", [
+    "Document_СборкаЗапасов",
+    "Document_ПеремещениеЗапасов",
+])
+def test_phase_rejects_non_supplier_documents_before_import(recorder_type):
+    engine = _engine()
+    world = _world(engine)
+    before = _active_total(engine, world["item_id"])
+    with pytest.raises(PreflightBlocked, match="canonical physical refresh"):
+        apply_backdated_recorder_repair(
+            engine,
+            writers_stopped=True,
+            recorders=((recorder_type, DOC_REF),),
+            client=StubClient(),
+        )
+    assert _active_total(engine, world["item_id"]) == before
+    with Session(engine) as session:
+        assert session.query(models.StockRecorderPull).count() == 0
+
+
 def test_receipt_replaces_its_snap_and_credits_the_owner():
     engine = _engine()
     world = _world(engine)

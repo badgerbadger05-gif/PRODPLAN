@@ -570,6 +570,76 @@ def replaced_revision_ids(
     }
 
 
+def _retire_audit_absorbed_cutoff_snaps(
+    db: Session,
+    *,
+    parent: models.LedgerGeneration,
+    generation: models.LedgerGeneration,
+    recorder_audit: Any,
+) -> CutoffSnapRetirement | None:
+    """Replace old synthetic balance with newly discovered backdated facts.
+
+    The audit import precedes convergence.  Without this step convergence
+    sees both the real document and the cutoff snap that stood in for it, then
+    writes a compensating snap.  Only genuinely new document rows qualify:
+    replacement revisions were already represented in the parent's balance.
+    The persisted watermark makes checkpoint recovery safe to repeat.
+    """
+    parent_batch = int(parent.physical_import_batch_id or 0)
+    audit_terminal = int(
+        getattr(recorder_audit, "terminal_physical_import_batch_id", 0) or 0
+    )
+    if audit_terminal <= parent_batch:
+        return None
+    source = dict(generation.source_watermarks or {})
+    prior = source.get("historical_audit_snap_retirement")
+    if prior is not None:
+        if (
+            int(prior.get("parent_batch_id") or 0) != parent_batch
+            or int(prior.get("audit_terminal_batch_id") or 0) != audit_terminal
+        ):
+            raise PhysicalRefreshOrchestratorError(
+                "historical audit snap retirement checkpoint changed"
+            )
+        return None
+    replacements = replaced_revision_ids(
+        db, lower_batch_id=parent_batch, upper_batch_id=audit_terminal,
+    )
+    parent_cutoff = _utc(parent.cutoff, "parent cutoff")
+    facts = tuple(
+        row for row in visible_sle_query(
+            db, physical_import_batch_id=audit_terminal,
+        ).filter(
+            models.StockLedgerEntry.ingest_batch_id > parent_batch,
+            models.StockLedgerEntry.ingest_batch_id <= audit_terminal,
+            models.StockLedgerEntry.recorder_type.like("Document_%"),
+        ).all()
+        if int(row.id) not in replacements
+        and _posting_at_utc(row.posting_at, "audit posting_at") <= parent_cutoff
+    )
+    retirement = retire_cutoff_snaps_absorbing_facts(
+        db,
+        fact_rows=facts,
+        previous_import_batch_id=int(generation.physical_import_batch_id),
+        reason="historical recorder audit imported the real 1C document",
+    )
+    if retirement is not None and retirement.retired_rows:
+        generation.physical_import_batch_id = _global_import_terminal(db)
+    generation.source_watermarks = {
+        **source,
+        "historical_audit_snap_retirement": {
+            "parent_batch_id": parent_batch,
+            "audit_terminal_batch_id": audit_terminal,
+            "new_backdated_rows": len(facts),
+            "retired_rows": retirement.retired_rows if retirement else 0,
+            "reissued_rows": retirement.reissued_rows if retirement else 0,
+            "unabsorbed_cells": len(retirement.unabsorbed) if retirement else 0,
+        },
+    }
+    db.flush()
+    return retirement
+
+
 def _snap_key(row: Any) -> tuple[int, str, str]:
     return (
         int(row.item_id),
@@ -1290,6 +1360,13 @@ def run_physical_refresh(
                 "physical refresh generation disappeared before convergence"
             )
 
+        _retire_audit_absorbed_cutoff_snaps(
+            db,
+            parent=parent,
+            generation=physical_generation,
+            recorder_audit=recorder_audit,
+        )
+
         # Resolve the bounded import manifest before convergence.  The
         # convergence gate folds the parent's compact current StockBin plus
         # these rows; it must not scan the accepted historical SLE prefix.
@@ -1340,9 +1417,32 @@ def run_physical_refresh(
                     convergence=convergence,
                 )
             except Exception as exc:
-                # Never freeze the Ledger on a repair: the snap still converges.
+                # The targeted pull may fail after the audit's snap retirement
+                # was flushed but before it was committed.  Rollback removes
+                # that retirement too; never snap against its stale delta.
                 db.rollback()
                 targeted_repair = {"repaired": 0, "error": str(exc)}
+                physical_generation = db.get(
+                    models.LedgerGeneration, int(fork.ledger_generation_id)
+                )
+                if physical_generation is None:
+                    raise PhysicalRefreshOrchestratorError(
+                        "physical refresh generation disappeared after targeted repair rollback"
+                    ) from exc
+                _retire_audit_absorbed_cutoff_snaps(
+                    db,
+                    parent=parent,
+                    generation=physical_generation,
+                    recorder_audit=recorder_audit,
+                )
+                delta = _physical_refresh_delta_rows(
+                    db,
+                    parent=parent,
+                    target=physical_generation,
+                    physical_import=physical_import,
+                    recorder_audit=recorder_audit,
+                )
+                convergence = _bounded_convergence()
             else:
                 targeted_repair = {"repaired": int(repaired)}
                 if repaired:

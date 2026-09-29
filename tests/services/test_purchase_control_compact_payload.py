@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,9 @@ from app.services.item_ledger.current_execution import (
     load_current_execution_rows,
     publish_current_purchase_control_from_payload,
 )
+from app.services.item_ledger.current_replenishment import apply_current_replenishment
+from app.services.item_ledger.historical_replay_core import Reserve
+from app.services.item_ledger import physical_refresh_current_publish as publisher
 from app.services import purchase_control_projection as purchase_projection
 
 
@@ -257,6 +261,143 @@ def test_bounded_purchase_reuses_complete_parent_for_stock_only_tick_without_cov
     assert payload["rows"] == [dict(row.payload) for row in current_rows]
     assert payload["cards"] == {}
     validate_compact_current_purchase_control_payload(payload, target2)
+
+
+def test_accepted_buy_correction_invalidates_purchase_scope_only_on_change(
+    db_session, monkeypatch,
+):
+    prior_cutoff = datetime(2026, 9, 9, tzinfo=timezone.utc)
+    prior_batch = _batch("compact-purchase-prior-batch", prior_cutoff)
+    db_session.add(prior_batch)
+    db_session.flush()
+    prior = models.LedgerGeneration(
+        generation_key="compact-purchase-prior",
+        status="accepted",
+        cutoff=prior_cutoff,
+        accepted_at=prior_cutoff,
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch=prior_batch,
+        algorithm_version="compact-purchase-tests",
+    )
+    db_session.add(prior)
+    db_session.flush()
+    parent, target, next_target, rows = _world(db_session, item_count=2)
+    initial = _build(db_session, parent, target, rows)
+    publish_current_purchase_control_from_payload(db_session, parent.id, initial)
+    db_session.flush()
+    item, run, reservation, _capture = rows[0]
+    scope = (item.item_id, "", "", "default", "buy")
+    reserve = Reserve(
+        reserve_id=str(reservation.id), item_id=item.item_id, mode="buy",
+        reserved_qty=Decimal("10"), due_date=reservation.priority_period_to,
+        plan_period_from=reservation.priority_period_from,
+        plan_period_to=reservation.priority_period_to,
+        run_id=run.run_id, requirement_id=reservation.requirement_id,
+        planning_stock_pool="default",
+    )
+    purchase_scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="purchase_control_journal", scope_key="purchase:all-live-plans"
+    ).one()
+    # A semantic no-op physical tick can leave a ready read model from an
+    # earlier generation.  Invalidation does not rewrite its source id.
+    purchase_scope.source_generation_id = prior.id
+    db_session.flush()
+    assert purchase_scope.result_ready is True
+
+    first = apply_current_replenishment(
+        db_session, generation_id=parent.id, source_key="supplier-receipts",
+        source_revision=parent.id, facts=(), reserves=(reserve,),
+        complete_scope=True, distribution_scope=scope,
+    )
+    db_session.flush()
+    assert reservation.replenishment_received_qty == Decimal("0")
+    assert first.changed_pairs == 0  # Quantity changed without an allocation diff.
+    assert purchase_scope.result_ready is False
+
+    second = apply_current_replenishment(
+        db_session, generation_id=parent.id, source_key="supplier-receipts",
+        source_revision=parent.id, facts=(), reserves=(reserve,),
+        complete_scope=True, distribution_scope=scope,
+    )
+    assert second.idempotent is True
+    assert second.changed_pairs == 0
+    assert purchase_scope.result_ready is False
+
+    # A real physical delta may arrive before the no-op repair.  Its bounded
+    # purchase builder must consume the invalidation and use current owners.
+    refreshed = build_compact_current_purchase_control_payload(
+        db_session,
+        target_generation_id=next_target.id,
+        parent_generation_id=parent.id,
+        accepted_run_ids=[run.run_id for _item, run, _res, _capture in rows],
+        affected_scopes=(),
+        reuse_parent_current=True,
+    )
+    by_item = {row["item_id"]: row for row in refreshed["rows"]}
+    assert refreshed["meta"]["bounded_reuse"] is False
+    assert by_item[item.item_id]["received_qty"] == 0
+    assert by_item[rows[1][0].item_id]["received_qty"] == 2
+
+    # The worker's no-op tick repairs the same invalidated manifest, using
+    # the real purchase builder.  Other heavy scope builders are unrelated.
+    monkeypatch.setattr(
+        publisher, "build_compact_current_assembly_payload",
+        lambda *a, **kw: SimpleNamespace(
+            queue_rows=(), readiness_rows=(), readiness_metrics={},
+        ),
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_drum_payload",
+        lambda *a, **kw: SimpleNamespace(rows=(), metrics={}),
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_shelf_payload",
+        lambda *a, **kw: SimpleNamespace(rows=(), metrics={}),
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_production_control_payload",
+        lambda *a, **kw: {"rows": [], "meta": {"read_only": True, "fact_source": "current"}},
+    )
+    monkeypatch.setattr(publisher, "_build_obligation_view_payloads", lambda *a, **kw: ({}, {}))
+    monkeypatch.setattr(
+        publisher, "publish_current_obligation_views_from_generation",
+        lambda db, generation_id, *, purchase_payload, **kw: {
+            "purchase_control_journal": publish_current_purchase_control_from_payload(
+                db, generation_id, purchase_payload
+            ),
+        },
+    )
+    repair = publisher.repair_current_execution_scopes_from_pointer(
+        db_session,
+        pointer_generation_id=parent.id,
+        payload_boundary_generation_id=next_target.id,
+        source_revision="no-op-tick",
+    )
+    assert repair is not None
+    published = load_current_execution_rows(
+        db_session,
+        entity_kind="purchase_control_journal",
+        scope_key="purchase:all-live-plans",
+    )
+    published_by_item = {row.payload["item_id"]: row.payload for row in published}
+    assert published_by_item[item.item_id]["received_qty"] == 0
+    assert published_by_item[rows[1][0].item_id]["received_qty"] == 2
+    changes = db_session.query(models.CurrentExecutionChange).count()
+    repeated = apply_current_replenishment(
+        db_session, generation_id=parent.id, source_key="supplier-receipts",
+        source_revision=parent.id, facts=(), reserves=(reserve,),
+        complete_scope=True, distribution_scope=scope,
+    )
+    assert repeated.idempotent is True
+    assert purchase_scope.result_ready is True
+    assert publisher.repair_current_execution_scopes_from_pointer(
+        db_session,
+        pointer_generation_id=parent.id,
+        payload_boundary_generation_id=next_target.id,
+        source_revision="no-op-tick",
+    ) is None
+    assert db_session.query(models.CurrentExecutionChange).count() == changes
 
 
 def test_bounded_purchase_recomputes_only_affected_item_and_reuses_neighbor(
