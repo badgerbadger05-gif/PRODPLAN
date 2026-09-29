@@ -262,6 +262,8 @@ def test_bounded_buy_chain_rejects_missing_and_foreign_edges(db_session):
         check(first.id)
     with pytest.raises(CurrentReplenishmentError, match="omits.*edge"):
         check(second.id)
+    with pytest.raises(CurrentReplenishmentError, match="omits.*edge"):
+        check()
     with pytest.raises(CurrentReplenishmentError, match="outside or ambiguous"):
         check(first.id, second.id, foreign_edge.id)
 

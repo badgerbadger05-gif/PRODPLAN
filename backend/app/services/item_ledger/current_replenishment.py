@@ -2937,15 +2937,16 @@ def _bounded_buy_manifest_facts(
     # Exact incident-edge closure catches a missing P -> A or A -> B edge
     # without inventing a synthetic P -> B transition.  It is bounded to the
     # explicitly supplied endpoints, not a scan of the generation.
+    incident_ids = endpoint_ids | declared_ids
     incident_edges = {
         int(row.id)
         for row in db.query(models.StockLedgerFactSupersession).filter(
             models.StockLedgerFactSupersession.import_batch_id > lower,
             models.StockLedgerFactSupersession.import_batch_id <= upper,
             (
-                models.StockLedgerFactSupersession.old_sle_id.in_(sorted(endpoint_ids))
-                | models.StockLedgerFactSupersession.new_sle_id.in_(sorted(endpoint_ids))
-            ) if endpoint_ids else models.StockLedgerFactSupersession.id < 0,
+                models.StockLedgerFactSupersession.old_sle_id.in_(sorted(incident_ids))
+                | models.StockLedgerFactSupersession.new_sle_id.in_(sorted(incident_ids))
+            ) if incident_ids else models.StockLedgerFactSupersession.id < 0,
         ).all()
     }
     if incident_edges != set(edges):
