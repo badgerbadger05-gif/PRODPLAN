@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -6,7 +7,7 @@ import sys
 
 from sqlalchemy import create_engine, text
 
-from tools.current_execution_migration import build_manifest
+from tools.current_execution_migration import _table_digest, build_manifest
 
 
 def _engine():
@@ -110,6 +111,69 @@ def test_table_checksum_is_stable_and_changes_with_subject_values():
         connection.execute(text("UPDATE items SET item_name = 'B' WHERE item_id = 1"))
     changed = build_manifest(engine)
     assert changed["categories"]["preserve"]["items"]["checksum"] != first["categories"]["preserve"]["items"]["checksum"]
+
+
+def test_table_digest_streams_one_row_at_a_time_without_changing_checksum():
+    class Row:
+        def __init__(self, mapping):
+            self._mapping = mapping
+
+    class Result:
+        def __init__(self, rows):
+            self.rows = iter(rows)
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.rows)
+
+        def close(self):
+            self.closed = True
+
+    class Connection:
+        def __init__(self, result):
+            self.result = result
+            self.options = None
+
+        def execution_options(self, **options):
+            self.options = options
+            return self
+
+        def execute(self, _statement):
+            return self.result
+
+    class Inspector:
+        def get_columns(self, _table_name):
+            return [{"name": "id"}, {"name": "payload"}]
+
+        def get_pk_constraint(self, _table_name):
+            return {"constrained_columns": ["id"]}
+
+    payloads = ["x" * 250_000, {"nested": ["y" * 100_000, 7]}]
+    rows = [Row({"id": index, "payload": payload}) for index, payload in enumerate(payloads)]
+    result = Result(rows)
+    connection = Connection(result)
+
+    row_count, actual = _table_digest(connection, Inspector(), "large_rows")
+
+    expected = hashlib.sha256()
+    for index, payload in enumerate(payloads):
+        encoded = json.dumps(
+            [index, payload],
+            ensure_ascii=False,
+            sort_keys=False,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        expected.update(len(encoded).to_bytes(8, "big"))
+        expected.update(encoded)
+
+    assert row_count == 2
+    assert actual == expected.hexdigest()
+    assert connection.options == {"stream_results": True, "yield_per": 1}
+    assert result.closed
 
 
 def test_nested_legacy_references_are_fail_closed():

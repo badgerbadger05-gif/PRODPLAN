@@ -200,18 +200,19 @@ def _table_digest(connection, inspector, table_name: str) -> tuple[int, str]:
     )
     digest = hashlib.sha256()
     count = 0
-    result = connection.execution_options(stream_results=True).execute(statement)
+    # Some restored production tables contain large JSON/TOAST values.  A
+    # fixed-size fetchmany batch retains every decoded value in that batch
+    # while each row is also serialized for hashing.  Keep both the DB cursor
+    # and Python-side row buffer to one row so manifest memory is independent
+    # of table row count (apart from the largest individual row).
+    result = connection.execution_options(stream_results=True, yield_per=1).execute(statement)
     try:
-        while True:
-            batch = result.fetchmany(512)
-            if not batch:
-                break
-            for row in batch:
-                values = [row._mapping[column] for column in columns]
-                encoded = json.dumps(values, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":")).encode("utf-8")
-                digest.update(len(encoded).to_bytes(8, "big"))
-                digest.update(encoded)
-                count += 1
+        for row in result:
+            values = [row._mapping[column] for column in columns]
+            encoded = json.dumps(values, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":")).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            count += 1
     finally:
         # PostgreSQL stream_results uses a server-side cursor.  Explicitly
         # close it so a read-only manifest cannot leave an idle transaction or
