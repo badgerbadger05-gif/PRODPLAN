@@ -628,7 +628,9 @@ def _validate_manifest_shape(
         raise BoundedSupplierEvidenceError(
             "bounded supplier replay requires an explicit backdate boundary"
         )
-    if bounded_replay and not normalized.scope_receipt_facts:
+    if bounded_replay and not normalized.scope_receipt_facts and not (
+        normalized.supersession_edge_ids and not normalized.new_sle_ids
+    ):
         raise BoundedSupplierEvidenceError(
             f"{_REJECTED_DELTA_MESSAGE}: complete scope evidence is required"
         )

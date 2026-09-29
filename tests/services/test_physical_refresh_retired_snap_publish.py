@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -227,12 +228,40 @@ def test_second_canonical_retirement_can_consume_first_remainder(db_session):
     second = db_session.get(models.StockLedgerEntry, edge.new_sle_id)
     assert edge.old_sle_id == first.id and Decimal(second.qty) == Decimal("1")
     assert first.active is False
+    physical, visible = publish._partition_persisted_rows(
+        db_session, (first, second),
+        parent=SimpleNamespace(
+            physical_import_batch_id=parent_batch.id, cutoff=cutoff,
+        ),
+        target=SimpleNamespace(
+            physical_import_batch_id=second.ingest_batch_id,
+            cutoff=cutoff + timedelta(days=1),
+        ),
+        supersessions=(edge,), backdate_from=first.posting_at,
+    )
+    assert {row.id for row in physical} == {first.id, second.id}
+    assert [row.id for row in visible] == [second.id]
+    publish._assert_retired_cutoff_snap_remainder(
+        db_session, first,
+        parent_batch_id=parent_batch.id,
+        target_batch_id=second.ingest_batch_id,
+        parent_cutoff=cutoff, validated_batches={}, require_active=False,
+    )
     publish._assert_supported_delta(
         (second,), db=db_session,
         parent_batch_id=parent_batch.id, target_batch_id=second.ingest_batch_id,
         parent_cutoff=cutoff, target_cutoff=cutoff + timedelta(days=1),
         backdate_from=cutoff - timedelta(days=8),
     )
+    first.business_identity = "forged-transient-remainder"
+    db_session.flush()
+    with pytest.raises(publish.ForwardPhysicalRefreshUnavailable, match="canonical retirement proof"):
+        publish._assert_retired_cutoff_snap_remainder(
+            db_session, first,
+            parent_batch_id=parent_batch.id,
+            target_batch_id=second.ingest_batch_id,
+            parent_cutoff=cutoff, validated_batches={}, require_active=False,
+        )
 
 
 @pytest.mark.parametrize("forgery", [

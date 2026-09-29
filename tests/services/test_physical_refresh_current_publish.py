@@ -12,6 +12,7 @@ from app.services.item_ledger import assembly_output_persistence as output_persi
 from app.services import planning_truth
 from app.services.item_ledger import current_execution
 from app.services.item_ledger import physical_refresh_current_publish as publisher
+from app.services.item_ledger import physical_refresh_stock_bin as stock_bin
 from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
 
 
@@ -163,6 +164,219 @@ def test_forward_publish_is_atomic_and_pointer_is_last(db_session, monkeypatch):
     assert "supplier_manifest" not in phases
     assert db_session.get(models.LedgerGeneration, target.id).status == "accepted"
     # The service owns no transaction boundary: caller can still roll back.
+    db_session.rollback()
+
+
+def test_in_window_supersession_keeps_full_stock_manifest_but_one_business_fact(
+    db_session, monkeypatch,
+):
+    parent, target = _generations(db_session)
+    intermediate_batch = db_session.get(
+        models.PhysicalImportBatch, target.physical_import_batch_id,
+    )
+    final_batch = models.PhysicalImportBatch(
+        batch_key="current-publish-chain-terminal", status="completed",
+        source_complete=True, cutoff=target.cutoff, source_watermarks={},
+        completed_at=target.cutoff,
+    )
+    db_session.add(final_batch)
+    db_session.flush()
+    target.physical_import_batch_id = final_batch.id
+    item = models.Item(item_code="CP-CHAIN", item_name="In-window revision")
+    db_session.add(item)
+    db_session.flush()
+    posting = parent.cutoff + timedelta(hours=1)
+    a = models.StockLedgerEntry(
+        ingest_batch_id=intermediate_batch.id, source_content_hash="chain-a",
+        business_identity="chain-a", item_id=item.item_id,
+        characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+        qty=Decimal("5"), posting_at=posting, record_type="Receipt",
+        movement_kind="receipt", recorder_type="Document_Transfer",
+        recorder_ref="chain", line_no="1", ingest_source="test", active=False,
+    )
+    b = models.StockLedgerEntry(
+        ingest_batch_id=final_batch.id, source_content_hash="chain-b",
+        business_identity="chain-b", item_id=item.item_id,
+        characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+        qty=Decimal("7"), posting_at=posting, record_type="Receipt",
+        movement_kind="receipt", recorder_type="Document_Transfer",
+        recorder_ref="chain", line_no="1", ingest_source="test", active=True,
+    )
+    db_session.add_all((a, b))
+    db_session.flush()
+    edge = models.StockLedgerFactSupersession(
+        import_batch_id=final_batch.id, old_sle_id=a.id, new_sle_id=b.id,
+    )
+    db_session.add(edge)
+    db_session.commit()
+
+    stock_bin.apply_bounded_current_stock_bins(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        affected_physical_keys=((item.item_id, "", "org", "wh"),),
+        delta_manifest=stock_bin.BoundedPhysicalDeltaManifest(
+            new_sle_ids=(a.id, b.id), supersession_edge_ids=(edge.id,),
+            backdate_from=posting,
+        ),
+    )
+    folded = db_session.query(models.StockBin).filter_by(
+        item_id=item.item_id, warehouse_ref1c="wh", is_current=True,
+    ).one()
+    assert Decimal(folded.on_hand) == Decimal("7")  # +A +B -A = B
+    db_session.rollback()
+
+    phases = []
+    _patch_safe_pipeline(monkeypatch, phases)
+    observed = {}
+    def stock(*args, **kwargs):
+        observed["stock"] = kwargs["delta_manifest"]
+        return SimpleNamespace(changed_keys=1)
+    def custody(*args, **kwargs):
+        observed["custody"] = kwargs["source_sle_ids"]
+        return 0
+    monkeypatch.setattr(
+        publisher, "apply_bounded_current_stock_bins",
+        stock,
+    )
+    monkeypatch.setattr(
+        publisher, "apply_bounded_current_material_custody_events",
+        custody,
+    )
+    monkeypatch.setattr(
+        publisher, "require_facts_not_over_allocated",
+        lambda *args, **kwargs: observed.setdefault("allocation", kwargs["sle_ids"]),
+    )
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        delta_manifest={"rows": (a, b), "supersessions": (edge,), "backdate_from": posting},
+        odata_client=None, source_revision=final_batch.id,
+        planning_pool_by_warehouse={"wh": "pool"},
+    )
+    assert result.input_delta_rows == 2
+    assert set(observed["stock"].new_sle_ids) == {a.id, b.id}
+    assert observed["stock"].supersession_edge_ids == (edge.id,)
+    assert observed["custody"] == (b.id,)
+    assert observed["allocation"] == {b.id}
+    db_session.rollback()
+    with pytest.raises(
+        publisher.ForwardPhysicalRefreshUnavailable,
+        match=f"custody source lost target physical visibility.*{a.id}",
+    ):
+        publisher.publish_forward_physical_refresh_current(
+            db_session,
+            target_generation_id=target.id, parent_generation_id=parent.id,
+            delta_manifest={"rows": (a, b), "supersessions": (edge,),
+                            "backdate_from": posting},
+            odata_client=None, source_revision=final_batch.id,
+            planning_pool_by_warehouse={"wh": "pool"},
+            custody_source_sle_ids=(a.id,),
+        )
+    db_session.rollback()
+
+
+def test_in_window_tombstone_is_physical_delta_with_no_visible_fact(db_session):
+    parent, target = _generations(db_session)
+    item = models.Item(item_code="CP-TOMBSTONE", item_name="In-window tombstone")
+    db_session.add(item)
+    db_session.flush()
+    a = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="tombstone-a", business_identity="tombstone-a",
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="wh", qty=Decimal("5"),
+        posting_at=parent.cutoff + timedelta(hours=1), record_type="Receipt",
+        movement_kind="receipt", recorder_type="Document_Transfer",
+        recorder_ref="tombstone", line_no="1", ingest_source="test", active=False,
+    )
+    db_session.add(a)
+    db_session.flush()
+    edge = models.StockLedgerFactSupersession(
+        import_batch_id=target.physical_import_batch_id,
+        old_sle_id=a.id, new_sle_id=None,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    physical, visible = publisher._partition_persisted_rows(
+        db_session, (a,), parent=parent, target=target,
+        supersessions=(edge,), backdate_from=a.posting_at,
+    )
+    assert [row.id for row in physical] == [a.id]
+    assert visible == ()
+    with pytest.raises(
+        publisher.ForwardPhysicalRefreshUnavailable,
+        match=f"sle_id={a.id}",
+    ):
+        publisher._partition_persisted_rows(
+            db_session, (a,), parent=parent, target=target,
+            supersessions=(), backdate_from=a.posting_at,
+        )
+
+
+def test_buy_edges_keep_connected_transient_chain_only():
+    owner = SimpleNamespace(
+        item_id=17, characteristic_ref="", organization_ref="org",
+        realization_mode="buy", planning_stock_pool="default",
+    )
+    scope = publisher._canonical_scope(owner, "buy")
+    def receipt(sle_id, item_id):
+        return SimpleNamespace(
+            id=sle_id, item_id=item_id, characteristic_ref="",
+            organization_ref="org", warehouse_ref1c="wh",
+            recorder_type="Document_ПриходнаяНакладная", movement_kind="receipt",
+        )
+    parent, transient, foreign = receipt(1, 17), receipt(2, 17), receipt(3, 18)
+    first = SimpleNamespace(id=11, old_sle_id=1, new_sle_id=2)
+    terminal = SimpleNamespace(id=12, old_sle_id=2, new_sle_id=None)
+    unrelated = SimpleNamespace(id=13, old_sle_id=3, new_sle_id=None)
+    assert publisher._buy_connected_supersession_edge_ids(
+        rows=(parent, transient, foreign),
+        supersessions=(first, terminal, unrelated), buy_scopes=(scope,),
+        planning_pool_by_warehouse={"wh": "default"}, current_owners=(owner,),
+    ) == (11, 12)
+
+
+def test_parent_tombstone_edge_only_is_not_a_noop(db_session, monkeypatch):
+    parent, target = _generations(db_session)
+    item = models.Item(item_code="CP-PARENT-TOMB", item_name="Parent tombstone")
+    db_session.add(item)
+    db_session.flush()
+    old = models.StockLedgerEntry(
+        ingest_batch_id=parent.physical_import_batch_id,
+        source_content_hash="parent-tombstone", business_identity="parent-tombstone",
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="wh", qty=Decimal("5"),
+        posting_at=parent.cutoff - timedelta(hours=1), record_type="Receipt",
+        movement_kind="receipt", recorder_type="Document_Transfer",
+        recorder_ref="parent-tombstone", line_no="1", ingest_source="test",
+        active=False,
+    )
+    db_session.add(old)
+    db_session.flush()
+    edge = models.StockLedgerFactSupersession(
+        import_batch_id=target.physical_import_batch_id,
+        old_sle_id=old.id, new_sle_id=None,
+    )
+    db_session.add(edge)
+    db_session.commit()
+    _patch_safe_pipeline(monkeypatch, [])
+    observed = {}
+    def stock(*args, **kwargs):
+        observed["manifest"] = kwargs["delta_manifest"]
+        return SimpleNamespace(changed_keys=1)
+    monkeypatch.setattr(publisher, "apply_bounded_current_stock_bins", stock)
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        delta_manifest={
+            "rows": (), "basis_rows": (old,), "supersessions": (edge,),
+            "backdate_from": old.posting_at,
+        },
+        odata_client=None, source_revision=target.physical_import_batch_id,
+        planning_pool_by_warehouse={"wh": "pool"},
+    )
+    assert result.input_delta_rows == 0
+    assert observed["manifest"].new_sle_ids == ()
+    assert observed["manifest"].supersession_edge_ids == (edge.id,)
     db_session.rollback()
 
 

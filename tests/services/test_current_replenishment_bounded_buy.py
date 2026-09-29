@@ -7,6 +7,7 @@ from app import models
 from app.services.item_ledger.current_replenishment import (
     BoundedBuyReceiptDeltaManifest,
     CurrentReplenishmentError,
+    _bounded_buy_manifest_facts,
     apply_current_replenishment_for_bounded_buy_scopes,
 )
 from app.services.item_ledger.supplier_receipt_allocation import (
@@ -181,6 +182,165 @@ def _call(db_session, parent, target, fact, *, scopes=None, source_revision=1, f
         affected_scopes=scopes,
         source_revision=source_revision,
         delta_manifest=manifest,
+    )
+
+
+def _edge(db_session, batch, old, new=None):
+    edge = models.StockLedgerFactSupersession(
+        import_batch_id=batch.id,
+        old_sle_id=old.id,
+        new_sle_id=None if new is None else new.id,
+    )
+    db_session.add(edge)
+    db_session.flush()
+    return edge
+
+
+@pytest.mark.parametrize("parent_basis,tombstone", [
+    (False, False), (True, False), (False, True), (True, True),
+])
+def test_bounded_buy_chain_uses_only_visible_typed_terminal(
+    db_session, parent_basis, tombstone,
+):
+    parent, target, batch, items, _owners = _world(db_session)
+    old_batch = db_session.get(models.PhysicalImportBatch, parent.physical_import_batch_id)
+    old = None
+    if parent_basis:
+        old, _ = _receipt(db_session, old_batch, items[0], ref="parent-receipt")
+    transient, _ = _receipt(db_session, batch, items[0], ref="transient-receipt")
+    terminal = None
+    terminal_fact = None
+    if not tombstone:
+        terminal, terminal_fact = _receipt(
+            db_session, batch, items[0], ref="terminal-receipt"
+        )
+    chain = []
+    if old is not None:
+        chain.append(_edge(db_session, batch, old, transient))
+    chain.append(_edge(db_session, batch, transient, terminal))
+    manifest = BoundedBuyReceiptDeltaManifest(
+        new_sle_ids=() if terminal_fact is None else (terminal_fact.sle_id,),
+        receipt_facts=() if terminal_fact is None else (terminal_fact,),
+        scope_receipt_facts=() if terminal_fact is None else (terminal_fact,),
+        supersession_edge_ids=tuple(edge.id for edge in chain),
+        backdate_from=old.posting_at if old is not None else transient.posting_at,
+    )
+    scope_facts, delta, retired = _bounded_buy_manifest_facts(
+        manifest, scopes=(_scope(items[0].item_id),), db=db_session,
+        parent=parent, target=target,
+    )
+    assert set(delta) == (set() if terminal is None else {terminal.id})
+    assert {fact.sle_id for fact in scope_facts[_scope(items[0].item_id)]} == (
+        set() if terminal is None else {terminal.id}
+    )
+    assert retired == (set() if old is None else {old.id})
+
+
+def test_bounded_buy_chain_rejects_missing_and_foreign_edges(db_session):
+    parent, target, batch, items, _owners = _world(db_session, item_count=2)
+    old_batch = db_session.get(models.PhysicalImportBatch, parent.physical_import_batch_id)
+    old, _ = _receipt(db_session, old_batch, items[0], ref="chain-parent")
+    transient, _ = _receipt(db_session, batch, items[0], ref="chain-middle")
+    terminal, terminal_fact = _receipt(db_session, batch, items[0], ref="chain-end")
+    first = _edge(db_session, batch, old, transient)
+    second = _edge(db_session, batch, transient, terminal)
+    foreign, _ = _receipt(db_session, batch, items[1], ref="foreign")
+    foreign_edge = _edge(db_session, batch, foreign, None)
+
+    def check(*edge_ids):
+        return _bounded_buy_manifest_facts(
+            BoundedBuyReceiptDeltaManifest(
+                new_sle_ids=(terminal.id,), receipt_facts=(terminal_fact,),
+                scope_receipt_facts=(terminal_fact,),
+                supersession_edge_ids=tuple(edge_ids), backdate_from=old.posting_at,
+            ),
+            scopes=(_scope(items[0].item_id),), db=db_session,
+            parent=parent, target=target,
+        )
+
+    with pytest.raises(CurrentReplenishmentError, match="omits.*edge"):
+        check(first.id)
+    with pytest.raises(CurrentReplenishmentError, match="omits.*edge"):
+        check(second.id)
+    with pytest.raises(CurrentReplenishmentError, match="outside or ambiguous"):
+        check(first.id, second.id, foreign_edge.id)
+
+
+@pytest.mark.parametrize("tombstone,unreported_visible", [
+    (False, ""), (True, ""), (True, "selected"), (True, "outside"),
+])
+def test_bounded_buy_parent_chain_retires_current_allocation(
+    db_session, tombstone, unreported_visible,
+):
+    parent, target, batch, items, owners = _world(db_session)
+    old_batch = db_session.get(models.PhysicalImportBatch, parent.physical_import_batch_id)
+    old, _ = _receipt(db_session, old_batch, items[0], ref="allocated-parent")
+    owner = owners[0]
+    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=parent.id, stock_ledger_entry_id=old.id,
+        receipt_doc_type=old.recorder_type, receipt_doc_ref=old.recorder_ref,
+        receipt_doc_line_no=old.line_no, supplier_order_ref=None,
+        supplier_order_line_no=None, operation_kind="supplier_receipt",
+        operation_key="test", operation_name="test",
+        evidence_hash="parent-evidence".ljust(64, "0"),
+        evidence_payload={"signed_qty": str(old.qty)}, match_rule="bounded-typed",
+        match_status="unmatched", ambiguity_count=0,
+        reason="no exact typed supplier order line",
+    ))
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=parent.id, reservation_id=owner.id, sle_id=old.id,
+        requirement_id=owner.requirement_id, allocated_qty=Decimal("4"),
+        match_rule="fifo", item_id=old.item_id, characteristic_ref="",
+        organization_ref="", planning_stock_pool="default",
+        idempotency_key=f"parent:{owner.id}:{old.id}",
+        allocation_role="replenishment_receipt", is_current=True,
+    ))
+    owner.replenishment_received_qty = Decimal("4")
+    transient, _ = _receipt(db_session, batch, items[0], ref="allocated-middle")
+    terminal = None
+    terminal_fact = None
+    if not tombstone:
+        terminal, terminal_fact = _receipt(
+            db_session, batch, items[0], quantity="3", ref="allocated-terminal",
+        )
+    first = _edge(db_session, batch, old, transient)
+    second = _edge(db_session, batch, transient, terminal)
+    if unreported_visible:
+        extra, _ = _receipt(db_session, batch, items[0], ref="unreported-visible")
+        extra.recorder_type = "Document_ПриходнаяНакладная"
+        if unreported_visible == "outside":
+            extra.warehouse_ref1c = "WH-OUTSIDE"
+        db_session.flush()
+
+    def replay():
+        return apply_current_replenishment_for_bounded_buy_scopes(
+            db_session,
+            target_generation_id=target.id,
+            parent_generation_id=parent.id,
+            target_cutoff=target.cutoff,
+            affected_scopes=(_scope(items[0].item_id),),
+            planning_pool_by_warehouse={"WH-BUY": "default"},
+            delta_manifest=BoundedBuyReceiptDeltaManifest(
+                new_sle_ids=() if terminal is None else (terminal.id,),
+                receipt_facts=() if terminal_fact is None else (terminal_fact,),
+                scope_receipt_facts=() if terminal_fact is None else (terminal_fact,),
+                supersession_edge_ids=(first.id, second.id),
+                backdate_from=old.posting_at,
+            ),
+        )
+
+    if unreported_visible == "selected":
+        with pytest.raises(CurrentReplenishmentError, match="empty scope evidence"):
+            replay()
+        return
+    result = replay()
+    assert result.delta_fact_rows == (0 if tombstone else 1)
+    current = db_session.query(models.ReservationConsumptionAllocation).filter(
+        models.ReservationConsumptionAllocation.is_current.is_(True),
+        models.ReservationConsumptionAllocation.reservation_id == owner.id,
+    ).all()
+    assert [(row.sle_id, row.allocated_qty) for row in current] == (
+        [] if tombstone else [(terminal.id, Decimal("3"))]
     )
 
 

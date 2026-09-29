@@ -2890,7 +2890,70 @@ def _bounded_buy_manifest_facts(
     }
     if set(edges) != set(value.supersession_edge_ids):
         raise CurrentReplenishmentError("BUY manifest references missing supersession edge")
+    # The physical manifest keeps every revision in a target import interval.
+    # Only its terminal, target-visible supplier revisions are typed receipt
+    # facts; an intermediate A in parent -> A -> B is not a second receipt.
+    from .physical_visibility import visible_sle_query
+
+    endpoint_ids = {
+        int(sle_id)
+        for edge in edges.values()
+        for sle_id in (edge.old_sle_id, edge.new_sle_id)
+        if sle_id is not None
+    }
+    endpoint_rows = {
+        int(row.id): row
+        for row in db.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.id.in_(sorted(endpoint_ids))
+            if endpoint_ids else models.StockLedgerEntry.id < 0
+        ).all()
+    }
+    if set(endpoint_rows) != endpoint_ids:
+        raise CurrentReplenishmentError("BUY supersession references missing SLE")
+    target_visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=upper, cutoff=target.cutoff,
+        ).filter(
+            models.StockLedgerEntry.id.in_(sorted(endpoint_ids | declared_ids))
+            if endpoint_ids or declared_ids else models.StockLedgerEntry.id < 0
+        ).all()
+    }
+    if not declared_ids.issubset(target_visible_ids):
+        raise CurrentReplenishmentError(
+            "BUY typed delta contains a non-visible target revision"
+        )
+    parent_candidate_ids = {
+        int(row.id) for row in endpoint_rows.values()
+        if int(row.ingest_batch_id) <= lower
+    }
+    parent_visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=lower, cutoff=parent.cutoff,
+        ).filter(
+            models.StockLedgerEntry.id.in_(sorted(parent_candidate_ids))
+            if parent_candidate_ids else models.StockLedgerEntry.id < 0
+        ).all()
+    }
+    # Exact incident-edge closure catches a missing P -> A or A -> B edge
+    # without inventing a synthetic P -> B transition.  It is bounded to the
+    # explicitly supplied endpoints, not a scan of the generation.
+    incident_edges = {
+        int(row.id)
+        for row in db.query(models.StockLedgerFactSupersession).filter(
+            models.StockLedgerFactSupersession.import_batch_id > lower,
+            models.StockLedgerFactSupersession.import_batch_id <= upper,
+            (
+                models.StockLedgerFactSupersession.old_sle_id.in_(sorted(endpoint_ids))
+                | models.StockLedgerFactSupersession.new_sle_id.in_(sorted(endpoint_ids))
+            ) if endpoint_ids else models.StockLedgerFactSupersession.id < 0,
+        ).all()
+    }
+    if incident_edges != set(edges):
+        raise CurrentReplenishmentError(
+            "BUY supersession chain omits a persisted target edge"
+        )
     old_ids: set[int] = set()
+    retired_parent_ids: set[int] = set()
     for edge in edges.values():
         if edge.old_sle_id is None or int(edge.old_sle_id) in old_ids:
             raise CurrentReplenishmentError("BUY manifest has duplicate supersession basis")
@@ -2898,42 +2961,59 @@ def _bounded_buy_manifest_facts(
         old = db.get(models.StockLedgerEntry, int(edge.old_sle_id))
         if old is None:
             raise CurrentReplenishmentError("BUY supersession basis SLE is missing")
-        matching = [
-            scope for scope in scopes
-            if int(old.item_id) == scope[0]
-            and _text(old.characteristic_ref) == scope[1]
-            and _text(old.organization_ref) == scope[2]
-        ]
+        from app.services.mrp_freeze import distribution_scope_for
+
+        canonical_scope = distribution_scope_for(
+            int(old.item_id), _text(old.characteristic_ref),
+            _text(old.organization_ref), mode="buy",
+        )
+        matching = [scope for scope in scopes if scope == canonical_scope]
         if len(matching) != 1:
             raise CurrentReplenishmentError(
                 "BUY supersession basis is outside or ambiguous affected scope"
             )
         if not (lower < int(edge.import_batch_id) <= upper):
             raise CurrentReplenishmentError("BUY supersession edge is outside target boundary")
-        if int(old.ingest_batch_id) > lower and int(old.id) not in declared_ids:
-            raise CurrentReplenishmentError("BUY supersession old delta SLE is missing")
-        if edge.new_sle_id is not None:
-            if int(edge.new_sle_id) not in declared_ids:
-                raise CurrentReplenishmentError("BUY supersession new SLE is missing typed evidence")
-            new = persisted.get(int(edge.new_sle_id)) or db.get(
-                models.StockLedgerEntry, int(edge.new_sle_id)
+        if int(old.ingest_batch_id) <= lower:
+            if int(old.id) not in parent_visible_ids:
+                raise CurrentReplenishmentError(
+                    "BUY supersession basis was absent from parent"
+                )
+            retired_parent_ids.add(int(old.id))
+        elif not (lower < int(old.ingest_batch_id) <= upper):
+            raise CurrentReplenishmentError(
+                "BUY transient basis is outside target import boundary"
             )
+        if int(old.id) in target_visible_ids:
+            raise CurrentReplenishmentError(
+                "BUY supersession basis remains visible in target"
+            )
+        if edge.new_sle_id is not None:
+            new = endpoint_rows[int(edge.new_sle_id)]
             if new is None or (
                 _text(new.characteristic_ref) != _text(old.characteristic_ref)
                 or _text(new.organization_ref) != _text(old.organization_ref)
                 or int(new.item_id) != int(old.item_id)
+                or _text(new.warehouse_ref1c) != _text(old.warehouse_ref1c)
             ):
                 raise CurrentReplenishmentError("BUY supersession old/new keys differ")
-        prior = (
-            db.query(models.StockLedgerFactSupersession.id)
-            .filter(
-                models.StockLedgerFactSupersession.old_sle_id == int(old.id),
-                models.StockLedgerFactSupersession.import_batch_id <= lower,
-            )
-            .first()
-        )
-        if prior is not None:
-            raise CurrentReplenishmentError("BUY supersession basis was absent from parent")
+            if not (lower < int(new.ingest_batch_id) <= upper):
+                raise CurrentReplenishmentError(
+                    "BUY replacement SLE is outside target import boundary"
+                )
+            if new.posting_at is None or (
+                _comparable_datetime(new.posting_at)
+                > _comparable_datetime(target.cutoff)
+            ):
+                raise CurrentReplenishmentError(
+                    "BUY replacement SLE is outside target cutoff"
+                )
+            if int(new.id) in target_visible_ids and (
+                _text(new.movement_kind) in {"receipt", "supplier_receipt"}
+            ) and int(new.id) not in declared_ids:
+                raise CurrentReplenishmentError(
+                    "BUY visible replacement SLE is missing typed evidence"
+                )
 
     scope_facts_by_scope: dict[DistributionScope, list[object]] = {
         scope: [] for scope in scopes
@@ -2972,7 +3052,9 @@ def _bounded_buy_manifest_facts(
         _decimal(fact.signed_qty) < 0
         or _comparable_datetime(fact.posting_at) <= _comparable_datetime(parent.cutoff)
         for fact in value.receipt_facts
-    )) and not value.scope_receipt_facts:
+    )) and not value.scope_receipt_facts and not (
+        value.supersession_edge_ids and not declared_ids
+    ):
         raise CurrentReplenishmentError(
             "BUY correction/return requires complete bounded scope evidence"
         )
@@ -2984,7 +3066,7 @@ def _bounded_buy_manifest_facts(
     return (
         {scope: tuple(rows) for scope, rows in scope_facts_by_scope.items()},
         delta_by_id,
-        old_ids,
+        retired_parent_ids,
     )
 
 
@@ -3336,6 +3418,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
     affected_scopes: Iterable[DistributionScope],
     delta_manifest: BoundedBuyReceiptDeltaManifest | Mapping[str, object],
     source_revision: int | None = None,
+    planning_pool_by_warehouse: Mapping[str, str] | None = None,
 ) -> BoundedBuyReplenishmentResult:
     """Apply typed supplier receipts to stable current BUY owners only.
 
@@ -3457,7 +3540,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
             # A declared scope may legitimately have no semantic input in a
             # multi-scope manifest.  Do not touch its marker or allocations.
             continue
-        if manifest.scope_receipt_facts:
+        if manifest.scope_receipt_facts or manifest.supersession_edge_ids:
             # A superseded fact is deliberately absent from the replacement
             # stream: the correction removes it from the basis, and its current
             # assignment is retired by this very replay.
@@ -3482,6 +3565,55 @@ def apply_current_replenishment_for_bounded_buy_scopes(
             full_facts = tuple(full_by_id.values())
         if not full_facts and not retired_here:
             continue
+        confirmed_empty_reason = ""
+        if not full_facts and retired_here:
+            # A complete, empty typed stream can retire a populated parent
+            # scope only when the canonical target prefix has no supplier
+            # receipt left for it.  This is the explicit R4 clear-out proof,
+            # rather than an unqualified empty manifest bypass.
+            from .physical_refresh_supplier_evidence import supplier_document_type_filter
+            from .physical_visibility import visible_sle_query
+            from app.services.planning_pool_resolver import (
+                PlanningPoolConfigurationError,
+                effective_planning_pool_by_warehouse,
+            )
+
+            try:
+                contour = effective_planning_pool_by_warehouse(
+                    db, planning_pool_by_warehouse,
+                )
+            except PlanningPoolConfigurationError as exc:
+                raise CurrentReplenishmentError(str(exc)) from exc
+
+            target_supplier_rows = visible_sle_query(
+                db,
+                physical_import_batch_id=int(target.physical_import_batch_id),
+                cutoff=target.cutoff,
+            ).filter(
+                models.StockLedgerEntry.item_id == int(scope[0]),
+                supplier_document_type_filter(models.StockLedgerEntry.recorder_type),
+                models.StockLedgerEntry.movement_kind.in_(
+                    ("receipt", "supplier_receipt", "expense")
+                ),
+            ).all()
+            from app.services.mrp_freeze import distribution_scope_for
+
+            if any(
+                distribution_scope_for(
+                    int(row.item_id), _text(row.characteristic_ref),
+                    _text(row.organization_ref), mode="buy",
+                ) == scope
+                and _text(contour.get(_text(row.warehouse_ref1c)))
+                for row in target_supplier_rows
+            ):
+                raise CurrentReplenishmentError(
+                    "BUY empty scope evidence contradicts target-visible supplier facts"
+                )
+            confirmed_empty_reason = (
+                "bounded_supersession_tombstone: parent receipt "
+                + ",".join(str(sle_id) for sle_id in sorted(retired_here))
+                + " has no target-visible supplier replacement"
+            )
         # SQLite strips timezone markers from persisted SLE timestamps while
         # typed import evidence commonly arrives as aware UTC.  The allocator
         # sorts the complete bounded stream, so keep its timestamp axis
@@ -3510,6 +3642,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
                 history_mode="as_occurred",
                 allow_building=True,
                 validated_visible_ids=visible_ids,
+                confirmed_empty_reason=confirmed_empty_reason,
                 revision_basis=basis,
             )
         )
