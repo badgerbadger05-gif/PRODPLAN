@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+import pytest
 
 from app.models import Item, PhysicalImportBatch, StockWarehouse
 from app.routers.sync import (
@@ -255,6 +256,15 @@ def test_fetch_warehouse_catalog_rows_merges_all_catalog_candidates(monkeypatch)
         return []
 
     monkeypatch.setattr(stock_sync.OData1CClient, "get_all", _fake_get_all)
+    monkeypatch.setattr(
+        stock_sync.OData1CClient,
+        "get_published_entity_sets",
+        lambda self: {
+            "Catalog_Склады",
+            "Catalog_СтруктурныеЕдиницы",
+            "Catalog_СтруктурныеЕдиницыПредприятия",
+        },
+    )
 
     rows, entity = stock_sync._fetch_warehouse_catalog_rows(_mk_req())
 
@@ -262,10 +272,25 @@ def test_fetch_warehouse_catalog_rows_merges_all_catalog_candidates(monkeypatch)
         "Catalog_Склады",
         "Catalog_СтруктурныеЕдиницы",
         "Catalog_СтруктурныеЕдиницыПредприятия",
-        "Catalog_СкладыПредприятия",
     ]
     assert entity == (
         "Catalog_Склады, Catalog_СтруктурныеЕдиницы, "
         "Catalog_СтруктурныеЕдиницыПредприятия"
     )
     assert {row["Ref_Key"] for row in rows} == {"WH-1", "WH-2", "WH-3"}
+
+
+def test_fetch_warehouse_catalog_rows_fails_on_truncation(monkeypatch):
+    def _truncated(self, entity_name, **kwargs):
+        self.last_result_truncated = True
+        return [{"Ref_Key": "WH-1", "Code": "01", "Description": "Склад"}]
+
+    monkeypatch.setattr(stock_sync.OData1CClient, "get_all", _truncated)
+    monkeypatch.setattr(
+        stock_sync.OData1CClient,
+        "get_published_entity_sets",
+        lambda self: {"Catalog_СтруктурныеЕдиницы"},
+    )
+
+    with pytest.raises(RuntimeError, match="was truncated"):
+        stock_sync._fetch_warehouse_catalog_rows(_mk_req())

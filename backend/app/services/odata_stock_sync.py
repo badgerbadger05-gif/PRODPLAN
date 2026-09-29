@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from .odata_client import OData1CClient
+from .odata_client import OData1CClient, get_warehouse_catalog_entities
 from .odata_client import get_stock_from_1c_odata
 from ..models import Item, StockWarehouse
 from ..schemas import ODataSyncRequest
@@ -193,12 +193,7 @@ def _upsert_warehouses_from_catalog_rows(db: Session, rows: List[Dict]) -> int:
 
 def _fetch_warehouse_catalog_rows(req: ODataSyncRequest) -> Tuple[List[Dict], str]:
     client = OData1CClient(req.base_url, req.username, req.password, req.token)
-    candidate_entities = [
-        "Catalog_Склады",
-        "Catalog_СтруктурныеЕдиницы",
-        "Catalog_СтруктурныеЕдиницыПредприятия",
-        "Catalog_СкладыПредприятия",
-    ]
+    candidate_entities = get_warehouse_catalog_entities(client)
     last_error: Optional[Exception] = None
     rows_by_ref: Dict[str, Dict] = {}
     used_entities: List[str] = []
@@ -214,6 +209,10 @@ def _fetch_warehouse_catalog_rows(req: ODataSyncRequest) -> Tuple[List[Dict], st
         except Exception as exc:
             last_error = exc
             continue
+        if client.last_result_truncated:
+            raise RuntimeError(
+                f"warehouse catalog fetch for {entity} was truncated by the page guard"
+            )
         if rows:
             used_entities.append(entity)
         for rec in rows or []:

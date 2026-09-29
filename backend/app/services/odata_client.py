@@ -7,6 +7,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from zoneinfo import ZoneInfo
@@ -22,6 +23,13 @@ WRITE_RETRY_STATUS_CODES = frozenset({429, 502, 503, 504})
 # Connection failures that provably happened *before* the request body could
 # reach 1C. Only these are safe to retry for a non-idempotent create.
 _PRE_SEND_CONNECTION_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+WAREHOUSE_CATALOG_CANDIDATES = (
+    "Catalog_Склады",
+    "Catalog_СтруктурныеЕдиницы",
+    "Catalog_СтруктурныеЕдиницыПредприятия",
+    "Catalog_СкладыПредприятия",
+)
 
 
 def _is_pre_send_connection_error(exc: urllib.error.URLError) -> bool:
@@ -46,6 +54,33 @@ class OData1CClient:
         # cut the fetch short, so callers can tell a complete selection from a
         # truncated one instead of silently treating a partial answer as whole.
         self.last_result_truncated = False
+        self._metadata_entity_sets: Optional[set[str]] = None
+
+    def get_published_entity_sets(self) -> set[str]:
+        """Return entity-set names advertised by this OData service metadata.
+
+        The result is cached on this client because metadata is stable during a
+        single sync/lookup. Discovery failures intentionally propagate so a
+        caller cannot mistake an unavailable metadata endpoint for an empty
+        catalog or retry unpublished endpoints blindly.
+        """
+        if self._metadata_entity_sets is None:
+            response = self._make_request("$metadata")
+            raw = response.get("_raw") if isinstance(response, dict) else None
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("OData $metadata response was not XML")
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                raise ValueError("OData $metadata response was invalid XML") from exc
+            self._metadata_entity_sets = {
+                element.attrib["Name"]
+                for element in root.iter()
+                if element.tag.rsplit("}", 1)[-1] == "EntitySet"
+                and element.attrib.get("Name")
+            }
+        return set(self._metadata_entity_sets)
+
 
     def _make_request(
         self,
@@ -567,6 +602,12 @@ class OData1CClient:
                 break
 
 
+def get_warehouse_catalog_entities(client: OData1CClient) -> List[str]:
+    """Select known warehouse catalogs that the OData service publishes."""
+    published = client.get_published_entity_sets()
+    return [name for name in WAREHOUSE_CATALOG_CANDIDATES if name in published]
+
+
 def _is_guid_like(value: str) -> bool:
     s = str(value or "").strip().lower()
     if len(s) != 36:
@@ -613,12 +654,7 @@ def _resolve_warehouse_mapping(
 
     # В разных конфигурациях 1С склады могут лежать в разных каталогах.
     # Пробуем типовые варианты и тихо пропускаем отсутствующие.
-    candidate_entities = [
-        "Catalog_Склады",
-        "Catalog_СтруктурныеЕдиницы",
-        "Catalog_СтруктурныеЕдиницыПредприятия",
-        "Catalog_СкладыПредприятия",
-    ]
+    candidate_entities = get_warehouse_catalog_entities(client)
 
     mapping: Dict[str, Dict[str, str]] = {}
     chunk_size = 20

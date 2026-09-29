@@ -65,8 +65,12 @@ def test_iter_by_guid_flags_truncation(monkeypatch, caplog):
 def test_warehouse_mapping_collects_catalog_errors(monkeypatch, caplog):
     """Every candidate catalog failing is an outage, not "no such warehouse"."""
     client = OData1CClient("http://1c/odata")
+    published = {"Catalog_Склады", "Catalog_СтруктурныеЕдиницы", "Catalog_СтруктурныеЕдиницыПредприятия", "Catalog_СкладыПредприятия"}
 
     def _boom(self, endpoint, params=None, **_kwargs):
+        if endpoint == "$metadata":
+            body = "".join(f"<EntitySet Name='{name}'/>" for name in published)
+            return {"_raw": f"<root>{body}</root>"}
         raise RuntimeError(f"503 from {endpoint}")
 
     monkeypatch.setattr(OData1CClient, "_make_request", _boom)
@@ -75,7 +79,7 @@ def test_warehouse_mapping_collects_catalog_errors(monkeypatch, caplog):
         mapping = _resolve_warehouse_mapping(client, [_guid(7)], errors)
 
     assert mapping == {}
-    assert len(errors) == 4                     # one per candidate catalog
+    assert len(errors) == 4                     # one per published candidate catalog
     assert all("503 from" in e for e in errors)
     assert "warehouse catalog lookup failed" in caplog.text
 
@@ -85,6 +89,8 @@ def test_warehouse_mapping_still_short_circuits_on_success(monkeypatch):
     ref = _guid(7)
 
     def _resp(self, endpoint, params=None, **_kwargs):
+        if endpoint == "$metadata":
+            return {"_raw": "<root><EntitySet Name='Catalog_Склады'/><EntitySet Name='Catalog_СтруктурныеЕдиницы'/></root>"}
         if endpoint == "Catalog_Склады":
             return {"value": [{"Ref_Key": ref, "Code": "С-1", "Description": "Склад"}]}
         raise AssertionError(f"must not query {endpoint} after a hit")
@@ -94,6 +100,31 @@ def test_warehouse_mapping_still_short_circuits_on_success(monkeypatch):
     mapping = _resolve_warehouse_mapping(client, [ref], errors)
     assert mapping[ref]["Name"] == "Склад"
     assert errors == []
+
+
+def test_warehouse_catalog_discovery_uses_namespaced_metadata_and_caches(monkeypatch):
+    client = OData1CClient("http://1c/odata")
+    calls = []
+
+    def _metadata(self, endpoint, **_kwargs):
+        calls.append(endpoint)
+        return {"_raw": "<edmx:Edmx xmlns:edmx='urn:edmx'><edmx:DataServices><Schema xmlns='urn:edm'><EntityContainer><EntitySet Name='Catalog_СтруктурныеЕдиницы'/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"}
+
+    monkeypatch.setattr(OData1CClient, "_make_request", _metadata)
+    assert odata_client.get_warehouse_catalog_entities(client) == ["Catalog_СтруктурныеЕдиницы"]
+    assert odata_client.get_warehouse_catalog_entities(client) == ["Catalog_СтруктурныеЕдиницы"]
+    assert calls == ["$metadata"]
+
+
+def test_warehouse_catalog_discovery_failure_propagates(monkeypatch):
+    client = OData1CClient("http://1c/odata")
+
+    def _boom(self, endpoint, **_kwargs):
+        raise RuntimeError("metadata unavailable")
+
+    monkeypatch.setattr(OData1CClient, "_make_request", _boom)
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        odata_client.get_warehouse_catalog_entities(client)
 
 
 def test_stock_keeps_partial_nomenclature_mapping_and_reports_the_failure(
@@ -111,6 +142,8 @@ def test_stock_keeps_partial_nomenclature_mapping_and_reports_the_failure(
     seen_chunks = {"n": 0}
 
     def _fake_make_request(self, endpoint, params=None, **_kwargs):
+        if endpoint == "$metadata":
+            return {"_raw": "<root><EntitySet Name='Catalog_СтруктурныеЕдиницы'/></root>"}
         if endpoint == "Catalog_Номенклатура":
             seen_chunks["n"] += 1
             if seen_chunks["n"] == 1:
@@ -156,9 +189,13 @@ def test_stock_diagnostics_are_clean_on_a_healthy_fetch(monkeypatch):
         OData1CClient,
         "_make_request",
         lambda self, endpoint, params=None, **_k: (
-            {"value": [{"Ref_Key": ref, "Code": "I-1", "Description": "Item", "Артикул": ""}]}
-            if endpoint == "Catalog_Номенклатура"
-            else {"value": [{"Ref_Key": _guid(9), "Code": "W-1", "Description": "Склад"}]}
+            {"_raw": "<root><EntitySet Name='Catalog_СтруктурныеЕдиницы'/></root>"}
+            if endpoint == "$metadata"
+            else (
+                {"value": [{"Ref_Key": ref, "Code": "I-1", "Description": "Item", "Артикул": ""}]}
+                if endpoint == "Catalog_Номенклатура"
+                else {"value": [{"Ref_Key": _guid(9), "Code": "W-1", "Description": "Склад"}]}
+            )
         ),
     )
     diagnostics: dict = {}

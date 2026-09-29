@@ -18,6 +18,8 @@ def test_get_stock_resolves_warehouse_name_from_catalog(monkeypatch):
 
     def _fake_make_request(self, endpoint, params=None, timeout=60, retries=4, retry_backoff_sec=1.0):
         ep = str(endpoint)
+        if ep == "$metadata":
+            return {"_raw": """<edmx:Edmx xmlns:edmx='urn:edmx'><edmx:DataServices><Schema xmlns='urn:edm'><EntityContainer><EntitySet Name='Catalog_СтруктурныеЕдиницы' EntityType='x'/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"""}
         if ep == "Catalog_Номенклатура":
             return {
                 "value": [
@@ -29,16 +31,8 @@ def test_get_stock_resolves_warehouse_name_from_catalog(monkeypatch):
                     }
                 ]
             }
-        if ep == "Catalog_Склады":
-            return {
-                "value": [
-                    {
-                        "Ref_Key": warehouse_ref,
-                        "Code": "СКЛ-01",
-                        "Description": "Склад комплектующих",
-                    }
-                ]
-            }
+        if ep == "Catalog_СтруктурныеЕдиницы":
+            return {"value": [{"Ref_Key": warehouse_ref, "Code": "СКЛ-01", "Description": "Склад комплектующих"}]}
         return {"value": []}
 
     monkeypatch.setattr(odata_client.OData1CClient, "get_all", _fake_get_all)
@@ -83,6 +77,8 @@ def test_get_stock_warehouse_resolve_skips_non_guid_refs(monkeypatch):
 
     def _fake_make_request(self, endpoint, params=None, timeout=60, retries=4, retry_backoff_sec=1.0):
         ep = str(endpoint)
+        if ep == "$metadata":
+            return {"_raw": """<edmx:Edmx xmlns:edmx='urn:edmx'><edmx:DataServices><Schema xmlns='urn:edm'><EntityContainer><EntitySet Name='Catalog_СтруктурныеЕдиницы' EntityType='x'/></EntityContainer></Schema></edmx:DataServices></edmx:Edmx>"""}
         if ep == "Catalog_Номенклатура":
             return {
                 "value": [
@@ -90,8 +86,6 @@ def test_get_stock_warehouse_resolve_skips_non_guid_refs(monkeypatch):
                     {"Ref_Key": item_ref_2, "Code": "I-2", "Description": "Item 2", "Артикул": "I-2"},
                 ]
             }
-        if ep == "Catalog_Склады":
-            return {"value": []}
         if ep == "Catalog_СтруктурныеЕдиницы":
             return {
                 "value": [
