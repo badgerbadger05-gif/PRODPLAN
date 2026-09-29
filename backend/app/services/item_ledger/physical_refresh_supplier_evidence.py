@@ -16,7 +16,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import and_, exists, or_
+from sqlalchemy import and_, exists
 from sqlalchemy.orm import Session
 
 from app import models
@@ -733,26 +733,39 @@ def _bounded_scope_receipt_facts(
     never reads another item, pool or the historical prefix at large.
     """
 
-    predicates = [
-        and_(
-            models.StockLedgerEntry.item_id == int(scope[0]),
-            models.StockLedgerEntry.characteristic_ref == scope[1],
-            models.StockLedgerEntry.organization_ref == scope[2],
-        )
-        for scope in scopes
-    ]
-    rows = (
+    # The physical row retains its 1C characteristic and organization while
+    # the frozen BUY owner carries the canonical planning pool.  Bound the SQL
+    # scan by affected item IDs, then apply the same canonical collapse as the
+    # delta and the generation-wide allocator before looking up provenance.
+    candidate_rows = (
         visible_sle_query(
             db,
             physical_import_batch_id=int(target.physical_import_batch_id),
             cutoff=_comparable_datetime(target_cutoff),
         )
         .filter(
-            or_(*predicates),
+            models.StockLedgerEntry.item_id.in_(sorted({int(scope[0]) for scope in scopes})),
             models.StockLedgerEntry.recorder_type.in_(sorted(_SUPPLIER_DOCUMENT_TYPES)),
         )
         .all()
     )
+    from app.services.mrp_freeze import distribution_scope_for
+
+    affected_scopes = set(scopes)
+    rows_and_scopes: list[tuple[models.StockLedgerEntry, DistributionScope]] = []
+    for row in candidate_rows:
+        scope = distribution_scope_for(
+            int(row.item_id), _text(row.characteristic_ref),
+            _text(row.organization_ref), mode="buy",
+        )
+        if scope not in affected_scopes:
+            continue
+        if planning_pool_by_warehouse is not None and (
+            _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c))) != scope[3]
+        ):
+            continue
+        rows_and_scopes.append((row, scope))
+    rows = [row for row, _scope in rows_and_scopes]
     evidence_by_id = _persisted_scope_evidence(
         db, [int(row.id) for row in rows if int(row.id) not in delta_facts_by_id]
     )
@@ -760,12 +773,7 @@ def _bounded_scope_receipt_facts(
 
     first_known = known_revisions_by_sle(db, rows)
     facts: list[ReceiptFact] = []
-    for row in rows:
-        scope = _scope_for_row(row, scopes)
-        if planning_pool_by_warehouse is not None:
-            pool = _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
-            if pool != scope[3]:
-                continue
+    for row, scope in rows_and_scopes:
         delta = delta_facts_by_id.get(int(row.id))
         if delta is not None:
             facts.append(delta)

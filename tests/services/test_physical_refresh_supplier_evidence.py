@@ -80,6 +80,9 @@ def _sle(
     recorder_type=None,
     content_hash=None,
     business_identity=None,
+    organization_ref="",
+    characteristic_ref="",
+    warehouse_ref1c="wh-ref-1",
 ):
     posting = posting or batch.cutoff
     row = models.StockLedgerEntry(
@@ -87,9 +90,9 @@ def _sle(
         source_content_hash=(content_hash or f"supplier-{ref}").ljust(64, "0"),
         business_identity=business_identity or f"supplier:{ref}",
         item_id=item.item_id,
-        characteristic_ref="",
-        organization_ref="",
-        warehouse_ref1c="wh-ref-1",
+        characteristic_ref=characteristic_ref,
+        organization_ref=organization_ref,
+        warehouse_ref1c=warehouse_ref1c,
         qty=Decimal(qty),
         qty_after=Decimal(qty),
         posting_at=posting,
@@ -356,6 +359,41 @@ def test_forward_manifest_uses_only_explicit_changed_sles_and_canonical_odata_ma
         "Document_ПриходнаяНакладная(guid'receipt-1')"
     ]
     assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 0
+
+
+def test_bounded_buy_stream_collapses_physical_organization_and_skips_outside_contour(
+    db_session, monkeypatch,
+):
+    parent, target, parent_batch, target_batch, item = _world(db_session)
+    outside = _sle(
+        db_session, parent_batch, item, ref="outside", organization_ref="1c-org",
+        characteristic_ref="1c-characteristic", warehouse_ref1c="outside-wh",
+    )
+    changed = _sle(
+        db_session, target_batch, item, ref="selected", organization_ref="1c-org",
+        characteristic_ref="1c-characteristic",
+    )
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((_fake_evidence(changed),)),
+    )
+
+    manifest = adapter.build_bounded_supplier_receipt_manifest(
+        db_session,
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        target_cutoff=target.cutoff,
+        odata_client=object(),
+        changed_sle_ids=(changed.id,),
+        affected_scopes=((item.item_id, "", "", "default", "buy"),),
+        backdate_from=parent.cutoff - timedelta(days=1),
+        planning_pool_by_warehouse={"wh-ref-1": "default"},
+    )
+
+    assert manifest.new_sle_ids == (changed.id,)
+    assert [fact.sle_id for fact in manifest.scope_receipt_facts] == [changed.id]
+    assert outside.id not in {fact.sle_id for fact in manifest.scope_receipt_facts}
+    assert manifest.scope_receipt_facts[0].planning_stock_pool == "default"
 
 
 def test_empty_delta_is_a_read_only_noop_without_odata_client(db_session):
