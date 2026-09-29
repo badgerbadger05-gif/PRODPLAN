@@ -2847,20 +2847,17 @@ def _bounded_buy_manifest_facts(
     }
     if set(persisted) != declared_ids:
         raise CurrentReplenishmentError("BUY manifest references missing SLE")
+    from app.services.mrp_freeze import distribution_scope_for
+
     for fact_id, fact in delta_by_id.items():
         row = persisted[fact_id]
         scope = _bounded_buy_fact_scope(fact, scopes_by_item_pool)
-        # Organization is deliberately absent from this comparison.  The scope
-        # carries the planning organization of the BUY owner while the row
-        # carries the 1C organization that posted the document; the publisher
-        # that built this scope already refused to equate the two, and the
-        # manifest builder places rows by item and characteristic for the same
-        # reason.  Everything that is genuinely the same fact on both sides -
-        # item, characteristic, signed quantity and posting instant - is still
-        # compared.
         if (
             int(row.item_id) != int(fact.item_id)
-            or _text(row.characteristic_ref) != scope[1]
+            or distribution_scope_for(
+                int(row.item_id), _text(row.characteristic_ref),
+                _text(row.organization_ref), mode="buy",
+            ) != scope
             or _decimal(row.qty) != _decimal(fact.signed_qty)
             or _comparable_datetime(row.posting_at)
             != _comparable_datetime(fact.posting_at)
@@ -2962,8 +2959,6 @@ def _bounded_buy_manifest_facts(
         old = db.get(models.StockLedgerEntry, int(edge.old_sle_id))
         if old is None:
             raise CurrentReplenishmentError("BUY supersession basis SLE is missing")
-        from app.services.mrp_freeze import distribution_scope_for
-
         canonical_scope = distribution_scope_for(
             int(old.item_id), _text(old.characteristic_ref),
             _text(old.organization_ref), mode="buy",
@@ -2991,13 +2986,14 @@ def _bounded_buy_manifest_facts(
             )
         if edge.new_sle_id is not None:
             new = endpoint_rows[int(edge.new_sle_id)]
-            if new is None or (
-                _text(new.characteristic_ref) != _text(old.characteristic_ref)
-                or _text(new.organization_ref) != _text(old.organization_ref)
-                or int(new.item_id) != int(old.item_id)
-                or _text(new.warehouse_ref1c) != _text(old.warehouse_ref1c)
-            ):
-                raise CurrentReplenishmentError("BUY supersession old/new keys differ")
+            new_scope = distribution_scope_for(
+                int(new.item_id), _text(new.characteristic_ref),
+                _text(new.organization_ref), mode="buy",
+            )
+            if sum(scope == new_scope for scope in scopes) != 1:
+                raise CurrentReplenishmentError(
+                    "BUY supersession replacement is outside or ambiguous affected scope"
+                )
             if not (lower < int(new.ingest_batch_id) <= upper):
                 raise CurrentReplenishmentError(
                     "BUY replacement SLE is outside target import boundary"
@@ -3034,8 +3030,10 @@ def _bounded_buy_manifest_facts(
         if row is None or (
             _decimal(row.qty) != _decimal(fact.signed_qty)
             or int(row.item_id) != int(fact.item_id)
-            or _text(row.characteristic_ref) != scope[1]
-            or _text(row.organization_ref) != scope[2]
+            or distribution_scope_for(
+                int(row.item_id), _text(row.characteristic_ref),
+                _text(row.organization_ref), mode="buy",
+            ) != scope
             or _comparable_datetime(row.posting_at)
             != _comparable_datetime(fact.posting_at)
         ):
