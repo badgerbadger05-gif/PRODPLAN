@@ -38,6 +38,7 @@ from .physical import (
     PHYSICAL_SEQUENCE_LOCK_KEY,
     SEED_RECORDER_TYPE,
     canonical_content_hash,
+    canonical_decimal,
     guard_physical_batch_writer,
     physical_sequence_lock_context,
 )
@@ -760,7 +761,7 @@ def retire_cutoff_snaps_absorbing_facts(
         )
 
     content_hash = canonical_content_hash(
-        [[int(snap.id), str(remainder)] for snap, remainder in plan]
+        [[int(snap.id), canonical_decimal(remainder)] for snap, remainder in plan]
     )
     guard_physical_batch_writer(db)
     batch = models.PhysicalImportBatch(
@@ -774,6 +775,7 @@ def retire_cutoff_snaps_absorbing_facts(
             "reason": str(reason),
             "retired_rows": len(plan),
             "content_hash": content_hash,
+            "quantity_format": "canonical_decimal/1",
             "previous_import_batch_id": int(previous_import_batch_id),
         },
     )

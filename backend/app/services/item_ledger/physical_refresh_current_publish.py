@@ -63,7 +63,9 @@ from app.services.item_ledger.physical_refresh_stock_bin import (
 from app.services.item_ledger.physical import (
     CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
     canonical_content_hash,
+    canonical_decimal,
 )
+from app.services.item_ledger.physical_visibility import visible_sle_query
 from app.services.item_ledger.r3_contract import business_identity_for_cutoff_balance_adjustment
 from app.services.item_ledger.physical_refresh_supplier_evidence import (
     lost_supplier_receipt_provenance_sle_ids,
@@ -555,7 +557,19 @@ def _assert_retired_cutoff_snap_remainder(
                 and _text(new.record_type) == ("Receipt" if remaining > 0 else "Expense")
             ):
                 refuse()
-        plan.append([int(old.id), str(remaining)])
+        quantity_format = _text(metadata.get("quantity_format"))
+        if quantity_format == "canonical_decimal/1":
+            serialized_remainder = canonical_decimal(remaining)
+        elif not quantity_format:
+            # Legacy writer hashed str(Decimal) before insertion.  A fully
+            # retired row has no replacement to reload, so preserve the
+            # persisted old NUMERIC scale when reconstructing its zero.
+            serialized_remainder = str(
+                remaining if new is not None else remaining.quantize(old_qty)
+            )
+        else:
+            refuse()
+        plan.append([int(old.id), serialized_remainder])
         old_dates.append(old.posting_at)
         order.append((*key, _comparable(old.posting_at), int(old.id)))
         if key in consumed and (consumed[key] > 0) != (taken > 0):
@@ -592,12 +606,24 @@ def _assert_retired_cutoff_snap_remainder(
     # A self-consistent synthetic edge is insufficient without the physical
     # document quantity it retired.  Exclude replacement revisions: the
     # canonical writer only retires snaps for newly discovered facts.
-    fresh = tuple(db.query(models.StockLedgerEntry).filter(
+    audit_retirement = _text(metadata.get("reason")) == (
+        "historical recorder audit imported the real 1C document"
+    )
+    if audit_retirement:
+        # Reconstruct the audit writer's input at its import boundary.  The
+        # mutable active flag and later supersessions cannot describe that
+        # earlier snapshot, and facts posted after the parent cutoff were not
+        # eligible for audit retirement.
+        fresh_query = visible_sle_query(
+            db, physical_import_batch_id=previous_id,
+        ).filter(models.StockLedgerEntry.posting_at <= parent_cutoff)
+    else:
+        fresh_query = db.query(models.StockLedgerEntry)
+    fresh = tuple(fresh_query.filter(
         models.StockLedgerEntry.ingest_batch_id > parent_batch_id,
         models.StockLedgerEntry.ingest_batch_id <= previous_id,
         models.StockLedgerEntry.item_id.in_({key[0] for key in consumed}),
         models.StockLedgerEntry.recorder_type.like("Document_%"),
-        models.StockLedgerEntry.active.is_(True),
     ).all())
     revision_edges = db.query(
         models.StockLedgerFactSupersession.old_sle_id,
@@ -606,8 +632,7 @@ def _assert_retired_cutoff_snap_remainder(
             models.StockLedgerFactSupersession.import_batch_id > parent_batch_id,
             models.StockLedgerFactSupersession.import_batch_id <= previous_id,
     ).all()
-    revisions = {int(old_id) for old_id, _ in revision_edges}
-    revisions.update(int(new_id) for _, new_id in revision_edges if new_id is not None)
+    revisions = {int(new_id) for _, new_id in revision_edges if new_id is not None}
     for key, dates in snap_dates.items():
         dated_facts = [fact for fact in fresh if
             int(fact.id) not in revisions

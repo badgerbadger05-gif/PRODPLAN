@@ -11,7 +11,10 @@ from app.services.item_ledger import physical_refresh_orchestrator as refresh
 from app.services.item_ledger.r3_contract import business_identity_for_cutoff_balance_adjustment
 
 
-def _retired_remainder(db, *, old_qty="10", fact_qty="7", later_fact_qty=None):
+def _retired_remainder(
+    db, *, old_qty="10", fact_qty="7", later_fact_qty=None,
+    include_fully_retired=False, audit_later_fact_qty=None,
+):
     cutoff = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
     parent_batch = models.PhysicalImportBatch(
         batch_key="retirement-proof-parent", status="completed", cutoff=cutoff,
@@ -59,6 +62,45 @@ def _retired_remainder(db, *, old_qty="10", fact_qty="7", later_fact_qty=None):
         )
         db.add(later)
         facts.append(later)
+    if audit_later_fact_qty is not None:
+        db.add(models.StockLedgerEntry(
+            ingest_batch_id=fact_batch.id, source_content_hash="after-cutoff",
+            business_identity="movement:after-cutoff", item_id=item.item_id,
+            characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+            qty=Decimal(audit_later_fact_qty), posting_at=cutoff + timedelta(hours=1),
+            record_type="Expense" if Decimal(audit_later_fact_qty) < 0 else "Receipt",
+            movement_kind="expense" if Decimal(audit_later_fact_qty) < 0 else "receipt",
+            recorder_type="Document_ПриходнаяНакладная", recorder_ref="after-cutoff",
+            line_no="1", ingest_source="document_pull",
+        ))
+    if include_fully_retired:
+        full_item = models.Item(item_code="RET-FULL", item_name="Fully retired")
+        db.add(full_item)
+        db.flush()
+        full_old = models.StockLedgerEntry(
+            ingest_batch_id=parent_batch.id, source_content_hash="full-snap",
+            business_identity=business_identity_for_cutoff_balance_adjustment(
+                "full-snap", "0", item_id=full_item.item_id,
+                characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+                snap_content_hash="full-old-hash",
+            ),
+            item_id=full_item.item_id, characteristic_ref="", organization_ref="org",
+            warehouse_ref1c="wh", qty=Decimal("5"), posting_at=cutoff,
+            record_type="Receipt", movement_kind="cutoff_balance_adjustment",
+            recorder_type="cutoff_balance_adjustment", recorder_ref="full-snap",
+            line_no="0", ingest_source="cutoff_balance_adjustment",
+        )
+        full_fact = models.StockLedgerEntry(
+            ingest_batch_id=fact_batch.id, source_content_hash="full-document",
+            business_identity="movement:full-document", item_id=full_item.item_id,
+            characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+            qty=Decimal("5"), posting_at=cutoff - timedelta(days=7),
+            record_type="Receipt", movement_kind="receipt",
+            recorder_type="Document_ПриходнаяНакладная", recorder_ref="full-document",
+            line_no="1", ingest_source="document_pull",
+        )
+        db.add_all((full_old, full_fact))
+        facts.append(full_fact)
     db.flush()
     # The maintenance writer reads persisted NUMERIC(15, 3) values; reload to
     # exercise the same decimal representation used in its batch content hash.
@@ -69,11 +111,15 @@ def _retired_remainder(db, *, old_qty="10", fact_qty="7", later_fact_qty=None):
     fact = facts[0]
     result = refresh.retire_cutoff_snaps_absorbing_facts(
         db, fact_rows=tuple(facts), previous_import_batch_id=fact_batch.id,
-        reason="test accepted document",
+        reason=("historical recorder audit imported the real 1C document"
+                if audit_later_fact_qty is not None else "test accepted document"),
     )
-    assert result is not None and result.retired_rows == result.reissued_rows == 1
+    assert result is not None
+    assert result.retired_rows == (2 if include_fully_retired else 1)
+    assert result.reissued_rows == 1
     edge = db.query(models.StockLedgerFactSupersession).filter_by(
         import_batch_id=result.import_batch_id,
+        old_sle_id=old.id,
     ).one()
     replacement = db.get(models.StockLedgerEntry, edge.new_sle_id)
     assert replacement is not None and Decimal(replacement.qty) == (
@@ -98,6 +144,18 @@ def test_canonical_retired_cutoff_remainder_is_supported(db_session):
     _validate(db_session, case)
 
 
+def test_retirement_hash_covers_scaled_zero_tombstone_and_remainder(db_session):
+    case = _retired_remainder(db_session, include_fully_retired=True)
+    replacement = case[-1]
+    batch = db_session.get(models.PhysicalImportBatch, replacement.ingest_batch_id)
+    assert batch.source_watermarks["quantity_format"] == "canonical_decimal/1"
+    edges = db_session.query(models.StockLedgerFactSupersession).filter_by(
+        import_batch_id=batch.id,
+    ).order_by(models.StockLedgerFactSupersession.id).all()
+    assert len(edges) == 2 and edges[1].new_sle_id is None
+    _validate(db_session, case)
+
+
 def test_retirement_uses_batch_net_even_when_a_fact_posts_after_the_old_snap(db_session):
     case = _retired_remainder(
         db_session, old_qty="12", fact_qty="5", later_fact_qty="5",
@@ -106,6 +164,34 @@ def test_retirement_uses_batch_net_even_when_a_fact_posts_after_the_old_snap(db_
     # Only five source units predate the old snap; the canonical rule uses the
     # whole imported batch and its earliest date, not quantity as of snap date.
     assert Decimal(case[-1].qty) == Decimal("2")
+    _validate(db_session, case)
+
+
+def test_audit_retirement_ignores_fact_posted_after_parent_cutoff(db_session):
+    case = _retired_remainder(db_session, audit_later_fact_qty="-1")
+    # The audit writer sees only the +7 pre-cutoff document.  A later -1 in
+    # the same import window must not weaken that exact witness to +6.
+    assert Decimal(case[-1].qty) == Decimal("3")
+    _validate(db_session, case)
+
+
+def test_audit_retirement_uses_visibility_before_later_supersession(db_session):
+    case = _retired_remainder(db_session, audit_later_fact_qty="-1")
+    cutoff, _, _, _, fact, _, _ = case
+    later_batch = models.PhysicalImportBatch(
+        batch_key="retirement-proof-later-revision", status="completed",
+        cutoff=cutoff + timedelta(days=2), source_watermarks={},
+        completed_at=cutoff + timedelta(days=2),
+    )
+    db_session.add(later_batch)
+    db_session.flush()
+    db_session.add(models.StockLedgerFactSupersession(
+        import_batch_id=later_batch.id, old_sle_id=fact.id, new_sle_id=None,
+    ))
+    fact.active = False
+    db_session.flush()
+    # Mutable active is now false, but the fact was visible when the audit
+    # retired the snap.  The validator must use that historical boundary.
     _validate(db_session, case)
 
 
