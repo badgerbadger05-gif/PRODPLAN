@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, text
@@ -695,6 +695,8 @@ def _run_physical_refresh_job(
     db: Session,
     target_cutoff: datetime,
     generation_key: str,
+    *,
+    standalone_supplier_repair_sle_ids: Sequence[int] = (),
 ) -> Dict[str, Any]:
     parent = _current_accepted_parent(db)
     target_cutoff = _to_utc(target_cutoff).replace(microsecond=0)
@@ -776,6 +778,10 @@ def _run_physical_refresh_job(
         discovery_lookback=_PHYSICAL_REFRESH_DISCOVERY_LOOKBACK,
         audit_all_known_recorders=False,
         database_ledger_rows=database_ledger_rows,
+        **(
+            {"standalone_supplier_repair_sle_ids": tuple(standalone_supplier_repair_sle_ids)}
+            if standalone_supplier_repair_sle_ids else {}
+        ),
     )
     return {
         "parent_generation_id": result.parent_generation_id,

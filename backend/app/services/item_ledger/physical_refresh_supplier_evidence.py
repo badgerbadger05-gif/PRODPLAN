@@ -41,6 +41,7 @@ from .supplier_receipt_allocation import (
     ReceiptFact,
     SupplierReceiptEvidenceError,
     normalize_supplier_receipt_evidence,
+    persist_supplier_receipt_provenance_for_sles,
 )
 from .supplier_receipt_odata import (
     SupplierEvidenceExtractionResult,
@@ -242,6 +243,191 @@ _REJECTED_DELTA_MESSAGE = "complete affected-scope evidence required"
 
 class BoundedSupplierEvidenceError(CurrentReplenishmentError):
     """The explicit physical delta cannot be proven safe for current BUY."""
+
+
+def persist_standalone_supplier_order_receipts(
+    db: Session,
+    *,
+    target_generation_id: int,
+    rows: Sequence[models.StockLedgerEntry],
+    odata_client: object | None,
+    require_all_exact: bool = False,
+) -> tuple[models.StockLedgerSupplierReceiptProvenance, ...]:
+    """Type exact order receipts without creating an idle BUY allocation.
+
+    The caller has already bounded these physical rows to its delta and the
+    planning contour.  Receipt documents without a current BUY reservation
+    can still settle a supplier-order line in future supply.  The canonical
+    extractor and provenance writer establish that link; the mutable order
+    mirror contributes its line identity, never its received quantity.
+    """
+    explicit = tuple(rows)
+    if not explicit:
+        return ()
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    if target is None or _text(target.status) != "building":
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier evidence requires a BUILDING generation"
+        )
+    if odata_client is None:
+        raise BoundedSupplierEvidenceError("supplier evidence requires an OData client")
+    if len({int(row.id) for row in explicit}) != len(explicit):
+        raise BoundedSupplierEvidenceError("standalone supplier SLE ids must be unique")
+    extraction = extract_supplier_document_evidence(db, odata_client, explicit)
+    if extraction.diagnostics:
+        diagnostic = extraction.diagnostics[0]
+        raise BoundedSupplierEvidenceError(
+            f"supplier document evidence diagnostic {diagnostic.code}: {diagnostic.detail}"
+        )
+    ignored = {
+        int(entry.stock_ledger_entry_id)
+        for entry in extraction.ignored_stock_ledger_entries
+    }
+    eligible = tuple(row for row in explicit if int(row.id) not in ignored)
+    if not eligible or not extraction.evidence:
+        if require_all_exact:
+            raise BoundedSupplierEvidenceError(
+                "explicit standalone supplier repair lacks exact document evidence"
+            )
+        return ()
+    try:
+        normalized = normalize_supplier_receipt_evidence(
+            db, explicit_sles=eligible, evidence=extraction.evidence,
+        )
+    except SupplierReceiptEvidenceError as exc:
+        raise BoundedSupplierEvidenceError(str(exc)) from exc
+    if any(row.match_status == "ambiguous" for row in normalized):
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier receipt has ambiguous order-line evidence"
+        )
+    exact = tuple(row for row in normalized if row.match_status == "exact")
+    if require_all_exact and {int(row.fact.sle_id) for row in exact} != {
+        int(row.id) for row in explicit
+    }:
+        raise BoundedSupplierEvidenceError(
+            "explicit standalone supplier repair requires an exact order line for every SLE"
+        )
+    if not exact:
+        return ()
+    if any(
+        not _text(row.fact.supplier_order_ref)
+        or not _text(row.fact.supplier_order_line_no).isdigit()
+        or int(row.fact.supplier_order_line_no) <= 0
+        for row in exact
+    ):
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier evidence lacks an exact order line"
+        )
+    exact_ids = {int(row.fact.sle_id) for row in exact}
+    exact_sles = tuple(row for row in eligible if int(row.id) in exact_ids)
+    exact_evidence = tuple(dict.fromkeys(row.evidence for row in exact))
+    try:
+        return persist_supplier_receipt_provenance_for_sles(
+            db,
+            ledger_generation_id=int(target.id),
+            explicit_sles=exact_sles,
+            evidence=exact_evidence,
+        )
+    except SupplierReceiptEvidenceError as exc:
+        raise BoundedSupplierEvidenceError(str(exc)) from exc
+
+
+def qualify_standalone_supplier_repair_rows(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target_generation_id: int,
+    sle_ids: Sequence[int],
+    planning_pool_by_warehouse: Mapping[str, str],
+) -> tuple[models.StockLedgerEntry, ...]:
+    """Resolve an explicit never-typed, accepted physical prefix for repair.
+
+    These rows are maintenance evidence, not an import delta.  The caller must
+    never add them to StockBin or BUY allocations.  Repeated IDs already typed
+    by the accepted parent are harmless no-ops; a row typed only by an older
+    generation belongs to the existing lost-provenance repair instead.
+    """
+    ids = tuple(int(value) for value in sle_ids)
+    if not ids:
+        return ()
+    if len(ids) > 256 or any(value <= 0 for value in ids) or len(set(ids)) != len(ids):
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier repair requires at most 256 unique positive SLE ids"
+        )
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    pointer = db.get(models.PlanningTruthState, 1)
+    if (
+        parent is None or _text(parent.status) != "accepted"
+        or target is None or _text(target.status) != "building"
+        or pointer is None
+        or int(pointer.current_generation_id or -1) != int(parent.id)
+    ):
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier repair requires a BUILDING child of the accepted pointer"
+        )
+    parent_rows = {
+        int(row.id): row
+        for row in visible_sle_query_for_generation(db, int(parent.id)).filter(
+            models.StockLedgerEntry.id.in_(ids)
+        ).all()
+    }
+    target_ids = {
+        int(row.id)
+        for row in visible_sle_query_for_generation(db, int(target.id)).filter(
+            models.StockLedgerEntry.id.in_(ids)
+        ).all()
+    }
+    if set(parent_rows) != set(ids) or target_ids != set(ids):
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier repair SLEs must be visible in parent and target"
+        )
+    rows = tuple(parent_rows[value] for value in ids)
+    if any(
+        not bool(row.active)
+        or not is_supplier_document_type(row.recorder_type)
+        or _text(row.movement_kind) not in {"receipt", "supplier_receipt", "expense"}
+        or Decimal(str(row.qty or 0)) == 0
+        or not _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
+        for row in rows
+    ):
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier repair requires active supplier facts in the selected contour"
+        )
+    buy_items = {
+        int(value)
+        for (value,) in db.query(models.ReservationEntry.item_id).filter(
+            models.ReservationEntry.item_id.in_({int(row.item_id) for row in rows}),
+            models.ReservationEntry.realization_mode == "buy",
+            models.ReservationEntry.owner_kind == "current",
+            models.ReservationEntry.is_current.is_(True),
+            models.ReservationEntry.lifecycle_status == "active",
+        ).distinct().all()
+    }
+    if buy_items:
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier repair cannot bypass a current BUY owner"
+        )
+    typed = {}
+    for provenance in db.query(models.StockLedgerSupplierReceiptProvenance).filter(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(ids)
+    ).all():
+        typed.setdefault(int(provenance.stock_ledger_entry_id), set()).add(
+            int(provenance.ledger_generation_id)
+        )
+    foreign_only = [
+        value for value in ids
+        if value in typed and int(parent.id) not in typed[value]
+        and int(target.id) not in typed[value]
+    ]
+    if foreign_only:
+        raise BoundedSupplierEvidenceError(
+            "standalone supplier repair found older typed provenance; use lost-provenance repair"
+        )
+    return tuple(
+        row for row in rows
+        if int(row.id) not in typed
+    )
 
 
 @dataclass(frozen=True)
@@ -803,6 +989,8 @@ __all__ = [
     "is_supplier_document_type",
     "supplier_document_type_filter",
     "lost_supplier_receipt_provenance_sle_ids",
+    "persist_standalone_supplier_order_receipts",
+    "qualify_standalone_supplier_repair_rows",
     "untyped_supplier_receipt_rows_in_contour",
     "untyped_supplier_receipt_sle_ids",
     "validate_bounded_supplier_receipt_manifest",

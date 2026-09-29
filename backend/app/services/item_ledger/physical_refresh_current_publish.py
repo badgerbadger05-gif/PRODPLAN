@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from threading import RLock
 from types import SimpleNamespace
 import time
@@ -59,11 +60,17 @@ from app.services.item_ledger.physical_refresh_stock_bin import (
     BoundedPhysicalDeltaManifest,
     apply_bounded_current_stock_bins,
 )
-from app.services.item_ledger.physical import CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+from app.services.item_ledger.physical import (
+    CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE,
+    canonical_content_hash,
+)
+from app.services.item_ledger.r3_contract import business_identity_for_cutoff_balance_adjustment
 from app.services.item_ledger.physical_refresh_supplier_evidence import (
     lost_supplier_receipt_provenance_sle_ids,
     build_bounded_supplier_receipt_manifest,
     is_supplier_document_type,
+    persist_standalone_supplier_order_receipts,
+    qualify_standalone_supplier_repair_rows,
 )
 from app.services.mrp_result_projection import build_mrp_result_current_payload
 from app.services.planning_truth import publication_context, publish_generation
@@ -412,13 +419,231 @@ _SUPPORTED_MOVEMENT_KINDS = frozenset({
 })
 
 
+def _assert_retired_cutoff_snap_remainder(
+    db: Session,
+    row: Any,
+    *,
+    parent_batch_id: int,
+    target_batch_id: int,
+    parent_cutoff: datetime,
+    validated_batches: dict[int, frozenset[int]],
+    require_active: bool = True,
+) -> None:
+    """Prove an old-dated synthetic row is the canonical retirement remainder.
+
+    A matching recorder string is not evidence.  The retirement writer leaves
+    a completed, content-addressed batch and old-to-new supersession edges;
+    their old quantity minus the reissued remainder must be explained by
+    newly imported physical documents on the same cell and posting axis.
+    """
+    def refuse() -> None:
+        raise ForwardPhysicalRefreshUnavailable(
+            "old-dated cutoff adjustment lacks canonical retirement proof"
+        )
+
+    batch_id = int(row.ingest_batch_id)
+    if require_active and not bool(row.active):
+        refuse()
+    if batch_id in validated_batches:
+        if int(row.id) not in validated_batches[batch_id]:
+            refuse()
+        return
+    batch = db.get(models.PhysicalImportBatch, int(row.ingest_batch_id))
+    if batch is None:
+        refuse()
+    metadata = dict(batch.source_watermarks or {})
+    previous = metadata.get("previous_import_batch_id")
+    try:
+        previous_id = int(previous)
+        retired_rows = int(metadata.get("retired_rows"))
+    except (TypeError, ValueError):
+        refuse()
+    if not (
+        _text(batch.status) == "completed"
+        and _text(metadata.get("source")) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+        and _text(metadata.get("operation")) == "retire_cutoff_snaps_absorbing_facts"
+        and parent_batch_id < previous_id < int(batch.id) <= target_batch_id
+        and retired_rows > 0
+    ):
+        refuse()
+    edges = tuple(db.query(models.StockLedgerFactSupersession).filter(
+        models.StockLedgerFactSupersession.import_batch_id == int(batch.id),
+    ).order_by(models.StockLedgerFactSupersession.id.asc()).all())
+    if len(edges) != retired_rows or len({int(e.old_sle_id) for e in edges}) != len(edges):
+        refuse()
+    old_rows = {
+        int(old.id): old for old in db.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.id.in_([int(e.old_sle_id) for e in edges]),
+        ).all()
+    }
+    replacement_ids = {int(e.new_sle_id) for e in edges if e.new_sle_id is not None}
+    replacements = {
+        int(new.id): new for new in db.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.ingest_batch_id == int(batch.id),
+        ).all()
+    }
+    if (
+        set(replacements) != replacement_ids
+        or len(replacement_ids) != sum(e.new_sle_id is not None for e in edges)
+        or int(row.id) not in replacement_ids
+    ):
+        refuse()
+
+    plan: list[list[int | str]] = []
+    consumed: dict[tuple[int, str, str], Decimal] = {}
+    snap_dates: dict[tuple[int, str, str], list[datetime]] = {}
+    source_lower_by_key: dict[tuple[int, str, str], int] = {}
+    old_dates: list[datetime] = []
+    order: list[tuple[int, str, str, datetime, int]] = []
+    for edge in edges:
+        old = old_rows.get(int(edge.old_sle_id))
+        new = replacements.get(int(edge.new_sle_id)) if edge.new_sle_id is not None else None
+        if old is None or int(old.ingest_batch_id) >= int(batch.id):
+            refuse()
+        if int(old.ingest_batch_id) > parent_batch_id:
+            _assert_retired_cutoff_snap_remainder(
+                db, old,
+                parent_batch_id=parent_batch_id,
+                target_batch_id=int(old.ingest_batch_id),
+                parent_cutoff=parent_cutoff,
+                validated_batches=validated_batches,
+                require_active=False,
+            )
+        if not (
+            _is_cutoff_adjustment(old)
+            and _text(old.recorder_type) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+            and _text(old.ingest_source) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+            and _text(old.line_no) == "0"
+            and _text(old.characteristic_ref) == ""
+            and not bool(old.active)
+            and _comparable(old.posting_at) <= _comparable(parent_cutoff)
+        ):
+            refuse()
+        prior = db.query(models.StockLedgerFactSupersession.id).filter(
+            models.StockLedgerFactSupersession.old_sle_id == int(old.id),
+            models.StockLedgerFactSupersession.import_batch_id < int(batch.id),
+        ).first()
+        if prior is not None:
+            refuse()
+        key = (int(old.item_id), _text(old.organization_ref), _text(old.warehouse_ref1c))
+        old_qty = Decimal(old.qty or 0)
+        if _text(old.record_type) != ("Receipt" if old_qty > 0 else "Expense"):
+            refuse()
+        remaining = Decimal(new.qty or 0) if new is not None else Decimal("0")
+        taken = old_qty - remaining
+        if old_qty == 0 or taken == 0 or (taken > 0) != (old_qty > 0):
+            refuse()
+        if (remaining != 0 and (remaining > 0) != (old_qty > 0)) or abs(remaining) >= abs(old_qty):
+            refuse()
+        if new is not None:
+            expected_ref = canonical_content_hash({
+                "retired_sle_id": int(old.id),
+                "item_id": key[0],
+                "organization_ref": key[1],
+                "warehouse_ref1c": key[2],
+            })[:40]
+            if not (
+                _is_cutoff_adjustment(new)
+                and _text(new.recorder_type) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+                and _text(new.ingest_source) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
+                and _text(new.line_no) == "0"
+                and _text(new.characteristic_ref) == ""
+                and _text(new.recorder_ref) == expected_ref
+                and _text(new.source_content_hash) == expected_ref
+                and (int(new.item_id), _text(new.organization_ref), _text(new.warehouse_ref1c)) == key
+                and _comparable(new.posting_at) == _comparable(old.posting_at)
+                and _text(new.record_type) == ("Receipt" if remaining > 0 else "Expense")
+            ):
+                refuse()
+        plan.append([int(old.id), str(remaining)])
+        old_dates.append(old.posting_at)
+        order.append((*key, _comparable(old.posting_at), int(old.id)))
+        if key in consumed and (consumed[key] > 0) != (taken > 0):
+            refuse()
+        consumed[key] = consumed.get(key, Decimal("0")) + taken
+        snap_dates.setdefault(key, []).append(old.posting_at)
+        source_lower_by_key[key] = max(
+            source_lower_by_key.get(key, parent_batch_id),
+            int(old.ingest_batch_id),
+        )
+    if order != sorted(order):
+        refuse()
+    content_hash = canonical_content_hash(plan)
+    if not (
+        _text(metadata.get("content_hash")) == content_hash
+        and _text(batch.batch_key) == f"cutoff-snap-retire:{content_hash[:40]}"
+        and batch.cutoff is not None
+        and _comparable(batch.cutoff) == max(_comparable(d) for d in old_dates)
+    ):
+        refuse()
+    for edge in edges:
+        if edge.new_sle_id is None:
+            continue
+        new = replacements[int(edge.new_sle_id)]
+        expected_identity = business_identity_for_cutoff_balance_adjustment(
+            new.recorder_ref, "0", item_id=int(new.item_id),
+            characteristic_ref="", organization_ref=_text(new.organization_ref),
+            warehouse_ref1c=_text(new.warehouse_ref1c),
+            snap_content_hash=content_hash,
+        )
+        if _text(new.business_identity) != expected_identity:
+            refuse()
+
+    # A self-consistent synthetic edge is insufficient without the physical
+    # document quantity it retired.  Exclude replacement revisions: the
+    # canonical writer only retires snaps for newly discovered facts.
+    fresh = tuple(db.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id > parent_batch_id,
+        models.StockLedgerEntry.ingest_batch_id <= previous_id,
+        models.StockLedgerEntry.item_id.in_({key[0] for key in consumed}),
+        models.StockLedgerEntry.recorder_type.like("Document_%"),
+        models.StockLedgerEntry.active.is_(True),
+    ).all())
+    revision_edges = db.query(
+        models.StockLedgerFactSupersession.old_sle_id,
+        models.StockLedgerFactSupersession.new_sle_id,
+    ).filter(
+            models.StockLedgerFactSupersession.import_batch_id > parent_batch_id,
+            models.StockLedgerFactSupersession.import_batch_id <= previous_id,
+    ).all()
+    revisions = {int(old_id) for old_id, _ in revision_edges}
+    revisions.update(int(new_id) for _, new_id in revision_edges if new_id is not None)
+    for key, dates in snap_dates.items():
+        dated_facts = [fact for fact in fresh if
+            int(fact.id) not in revisions
+            and int(fact.ingest_batch_id) > source_lower_by_key[key]
+            and _text(fact.recorder_type).startswith("Document_")
+            and (int(fact.item_id), _text(fact.organization_ref), _text(fact.warehouse_ref1c)) == key
+            and fact.posting_at is not None
+        ]
+        if not dated_facts:
+            refuse()
+        # The canonical retirement writer nets *the whole imported fact batch*
+        # for a cell, then uses only its earliest posting to decide which snap
+        # could have absorbed that batch.  Later facts may therefore reduce an
+        # earlier snap; a cumulative quantity-at-snap-date check is not its
+        # rule and would reject a valid retirement.
+        earliest = min(_comparable(fact.posting_at) for fact in dated_facts)
+        if any(_comparable(date) < earliest for date in dates):
+            refuse()
+        witnessed = sum((Decimal(fact.qty or 0) for fact in dated_facts), Decimal("0"))
+        taken = consumed[key]
+        if (taken > 0 and witnessed < taken) or (taken < 0 and witnessed > taken):
+            refuse()
+    validated_batches[int(batch.id)] = frozenset(replacement_ids)
+
+
 def _assert_supported_delta(
     rows: Sequence[Any],
     *,
+    db: Session,
+    parent_batch_id: int,
+    target_batch_id: int,
     parent_cutoff: datetime,
     target_cutoff: datetime,
     backdate_from: datetime | None,
 ) -> None:
+    validated_retirement_batches: dict[int, frozenset[int]] = {}
     for row in rows:
         posting_at = getattr(row, "posting_at", None)
         if posting_at is None:
@@ -440,10 +665,17 @@ def _assert_supported_delta(
             if not (
                 _text(row.recorder_type) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
                 and _text(row.ingest_source) == CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
-                and _comparable(posting_at) == _comparable(target_cutoff)
             ):
                 raise ForwardPhysicalRefreshUnavailable(
                     "cutoff balance adjustment does not match the canonical source"
+                )
+            if _comparable(posting_at) != _comparable(target_cutoff):
+                _assert_retired_cutoff_snap_remainder(
+                    db, row,
+                    parent_batch_id=parent_batch_id,
+                    target_batch_id=target_batch_id,
+                    parent_cutoff=parent_cutoff,
+                    validated_batches=validated_retirement_batches,
                 )
             continue
         if kind not in _SUPPORTED_MOVEMENT_KINDS:
@@ -540,7 +772,8 @@ def _current_owner_rows(
         for row in rows
         if _text(row.movement_kind) in NETTED_MOVEMENT_KINDS
         or (
-            _is_supplier_receipt(row)
+            is_supplier_document_type(row.recorder_type)
+            and _text(row.movement_kind) in {"receipt", "supplier_receipt", "expense"}
             and _text(row.warehouse_ref1c)
             and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
         )
@@ -815,6 +1048,32 @@ def _mapped_supplier_rows(
     )
 
 
+def _standalone_supplier_rows(
+    rows: Sequence[Any],
+    *,
+    planning_pool_by_warehouse: Mapping[str, str],
+    current_owners: Sequence[models.ReservationEntry],
+) -> tuple[Any, ...]:
+    """In-contour supplier deltas with no current BUY owner to allocate to."""
+    return tuple(
+        row for row in rows
+        if is_supplier_document_type(row.recorder_type)
+        and _text(row.movement_kind) in {"receipt", "supplier_receipt", "expense"}
+        and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
+        and (
+            _buy_scope_for_receipt(
+                row,
+                planning_pool_by_warehouse=planning_pool_by_warehouse,
+                current_owners=current_owners,
+            ) is None
+            if _is_supplier_receipt(row)
+            else not _owner_scopes_for(
+                row, current_owners, {"buy"}, scope_mode="buy",
+            )
+        )
+    )
+
+
 def _capture_bounded_future_supply(
     db: Session,
     *,
@@ -1021,6 +1280,7 @@ def publish_forward_physical_refresh_current(
     source_revision: int | str,
     planning_pool_by_warehouse: Mapping[str, str],
     custody_source_sle_ids: Sequence[int] = (),
+    standalone_supplier_repair_sle_ids: Sequence[int] = (),
     phase_hook: Callable[[str], None] | None = None,
 ) -> PhysicalRefreshCurrentPublishResult:
     """Publish a bounded delta and expose live phase progress while running."""
@@ -1039,6 +1299,7 @@ def publish_forward_physical_refresh_current(
                 source_revision=source_revision,
                 planning_pool_by_warehouse=planning_pool_by_warehouse,
                 custody_source_sle_ids=custody_source_sle_ids,
+                standalone_supplier_repair_sle_ids=standalone_supplier_repair_sle_ids,
                 phase_hook=phase_hook,
                 _phase_tracker=tracker,
             )
@@ -1067,6 +1328,7 @@ def _publish_forward_physical_refresh_current(
     source_revision: int | str,
     planning_pool_by_warehouse: Mapping[str, str],
     custody_source_sle_ids: Sequence[int] = (),
+    standalone_supplier_repair_sle_ids: Sequence[int] = (),
     phase_hook: Callable[[str], None] | None = None,
     _phase_tracker: _PhaseTracker | None = None,
 ) -> PhysicalRefreshCurrentPublishResult:
@@ -1121,7 +1383,7 @@ def _publish_forward_physical_refresh_current(
     # against discarding the candidate; the evidence itself is qualified below,
     # after this refresh has written its own receipt provenance.
     supplier_changed = bool(delta_manifest.get("supplier_future_supply_changed"))
-    if not rows and not custody_source_ids and not supplier_changed:
+    if not rows and not custody_source_ids and not supplier_changed and not standalone_supplier_repair_sle_ids:
         raise ForwardPhysicalRefreshUnavailable(
             "empty physical delta is a no-op; discard the candidate without publication"
         )
@@ -1147,11 +1409,21 @@ def _publish_forward_physical_refresh_current(
     if rows:
         _assert_supported_delta(
             rows,
+            db=db,
+            parent_batch_id=int(parent.physical_import_batch_id),
+            target_batch_id=int(target.physical_import_batch_id),
             parent_cutoff=parent.cutoff,
             target_cutoff=target.cutoff,
             backdate_from=backdate_from,
         )
     _assert_supported_basis(basis_rows)
+    standalone_repair_rows = qualify_standalone_supplier_repair_rows(
+        db,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(target.id),
+        sle_ids=standalone_supplier_repair_sle_ids,
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+    )
     # The bounded replay scope must cover both the facts this refresh adds and
     # the accepted facts it removes; folding only the former would leave the
     # removed fact's key and assignments behind.
@@ -1265,6 +1537,26 @@ def _publish_forward_physical_refresh_current(
     else:
         start_phase("buy")
     phase("buy")
+    standalone_supplier_rows = _standalone_supplier_rows(
+        rows,
+        planning_pool_by_warehouse=planning_pool_by_warehouse,
+        current_owners=current_owners,
+    )
+    if standalone_supplier_rows:
+        persist_standalone_supplier_order_receipts(
+            db,
+            target_generation_id=int(target.id),
+            rows=standalone_supplier_rows,
+            odata_client=odata_client,
+        )
+    if standalone_repair_rows:
+        persist_standalone_supplier_order_receipts(
+            db,
+            target_generation_id=int(target.id),
+            rows=standalone_repair_rows,
+            odata_client=odata_client,
+            require_all_exact=True,
+        )
     # Invariants 2-3 (planning-truth-contract): a fact is counted once and its
     # current allocations never exceed it.  Bounded to the facts this refresh
     # brought in (decision §41): history it did not touch is not its verdict.
@@ -1316,6 +1608,7 @@ def _publish_forward_physical_refresh_current(
         if isinstance(prepared_supplier_delta, SupplierFutureSupplyDelta)
         and not rows
         and not basis_rows
+        and not standalone_repair_rows
         else supplier_future_supply_delta(
             db,
             int(target.id),
@@ -1450,6 +1743,7 @@ def _publish_forward_physical_refresh_current(
                 if backdate_from is not None else None
             ),
             "superseded_facts": len(basis_rows),
+            "standalone_supplier_repaired_sles": len(standalone_repair_rows),
         },
     }
     target.status = "accepted"

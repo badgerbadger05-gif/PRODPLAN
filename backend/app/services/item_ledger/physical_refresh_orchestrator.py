@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, text
@@ -53,6 +53,9 @@ from .physical_refresh_import import (
 )
 from .r3_contract import business_identity_for_cutoff_balance_adjustment
 from .supplier_future_supply import supplier_future_supply_delta
+from .physical_refresh_supplier_evidence import (
+    qualify_standalone_supplier_repair_rows,
+)
 from .physical_refresh_generation import fork_physical_refresh_generation
 from .physical_refresh_discard import discard_physical_refresh_candidate
 from .output_repair_gate import assert_output_repair_allows
@@ -1329,6 +1332,7 @@ def run_physical_refresh(
     config_snapshot: Mapping[str, Any] | None = None,
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
     database_ledger_rows: int | None = None,
+    standalone_supplier_repair_sle_ids: Sequence[int] = (),
 ) -> PhysicalRefreshOrchestrationResult:
     """Advance physical truth and publish refreshed planning snapshots.
 
@@ -1643,7 +1647,33 @@ def run_physical_refresh(
         # movement at all therefore still has to ask whether the 1C order
         # contour moved before it discards its candidate; §57 extends freshness
         # only when this refresh found no semantic delta of any kind.
-        movement_delta = bool(input_delta_rows) or bool(custody_source_sle_ids)
+        try:
+            standalone_repair_rows = qualify_standalone_supplier_repair_rows(
+                db,
+                parent_generation_id=int(parent.id),
+                target_generation_id=int(physical_generation.id),
+                sle_ids=standalone_supplier_repair_sle_ids,
+                planning_pool_by_warehouse=pool_mapping,
+            )
+        except Exception as exc:
+            db.rollback()
+            candidate = db.get(models.LedgerGeneration, int(fork.ledger_generation_id))
+            if candidate is not None and str(candidate.status or "") == "building":
+                discard_physical_refresh_candidate(
+                    db,
+                    ledger_generation_id=int(candidate.id),
+                    reason=f"standalone supplier repair preflight failed: {exc}",
+                )
+                db.commit()
+            raise PhysicalRefreshOrchestratorError(
+                f"standalone supplier repair preflight failed: {exc}"
+            ) from exc
+        standalone_repair_ids = tuple(int(row.id) for row in standalone_repair_rows)
+        movement_delta = (
+            bool(input_delta_rows)
+            or bool(custody_source_sle_ids)
+            or bool(standalone_repair_ids)
+        )
         # Qualified here only when this tick moved no fact at all; with
         # movements the publication qualifies the contour itself, after it has
         # written its own receipt provenance.  The result is handed to the
@@ -1821,6 +1851,7 @@ def run_physical_refresh(
                 source_revision=int(physical_generation.physical_import_batch_id),
                 planning_pool_by_warehouse=pool_mapping,
                 custody_source_sle_ids=custody_source_sle_ids,
+                standalone_supplier_repair_sle_ids=standalone_repair_ids,
             )
         except Exception as exc:
             # The import/convergence checkpoint is already durable, but current
@@ -1865,6 +1896,7 @@ def run_physical_refresh(
                 "database_ledger_rows": database_ledger_rows,
                 "duration_ms": publish_duration_ms,
                 "targeted_repair": targeted_repair,
+                "standalone_supplier_repaired_sles": len(standalone_repair_ids),
                 "phase_timings": dict(getattr(current_publish, "phase_timings", ()) or ()),
             },
         }

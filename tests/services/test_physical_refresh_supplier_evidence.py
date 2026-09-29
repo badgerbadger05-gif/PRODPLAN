@@ -215,6 +215,125 @@ def _build(db_session, parent, target, item, batch, *, monkeypatch, row, evidenc
     return manifest, seen
 
 
+def test_ownerless_exact_supplier_receipt_is_typed_once_without_allocation(
+    db_session, monkeypatch,
+):
+    _parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(db_session, target_batch, item)
+    _supplier_order(db_session, item)
+    evidence = _fake_evidence(
+        row, order_ref="order-1", order_type="Document_ЗаказПоставщику",
+    )
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+
+    first = adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+    )
+    second = adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+    )
+
+    assert len(first) == 1
+    assert second == ()
+    assert first[0].match_status == "exact"
+    assert first[0].supplier_order_ref == "order-1"
+    assert first[0].supplier_order_line_no == "1"
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+
+
+def test_ownerless_unmatched_receipt_does_not_invent_order_line(db_session, monkeypatch):
+    _parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(db_session, target_batch, item)
+    evidence = _fake_evidence(row)
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+
+    assert adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+    ) == ()
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 0
+
+
+def test_ownerless_exact_supplier_return_keeps_signed_provenance(db_session, monkeypatch):
+    _parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(
+        db_session, target_batch, item, ref="return-1", qty="-2",
+        recorder_type="Document_РасходнаяНакладная",
+    )
+    _supplier_order(db_session, item)
+    evidence = _fake_evidence(
+        row, operation_key=SUPPLIER_RETURN_OPERATION, qty="-2",
+        order_ref="order-1", order_type="Document_ЗаказПоставщику",
+    )
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+
+    created = adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+    )
+    assert len(created) == 1
+    assert created[0].operation_kind == "supplier_return"
+    assert created[0].supplier_order_line_no == "1"
+    assert Decimal(created[0].evidence_payload["signed_qty"]) == Decimal("-2")
+
+
+def test_explicit_accepted_prefix_repair_skips_repeated_typing(db_session, monkeypatch):
+    parent, target, parent_batch, _target_batch, item = _world(db_session)
+    row = _sle(
+        db_session, parent_batch, item, posting=parent.cutoff - timedelta(hours=1),
+    )
+    _supplier_order(db_session, item)
+    evidence = _fake_evidence(
+        row, order_ref="order-1", order_type="Document_ЗаказПоставщику",
+    )
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+    kwargs = dict(
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        sle_ids=(row.id,),
+        planning_pool_by_warehouse={"wh-ref-1": "default"},
+    )
+    assert adapter.qualify_standalone_supplier_repair_rows(db_session, **kwargs) == (row,)
+    created = adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+        require_all_exact=True,
+    )
+    assert len(created) == 1
+    assert adapter.qualify_standalone_supplier_repair_rows(db_session, **kwargs) == ()
+    assert adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+        require_all_exact=True,
+    ) == ()
+
+
 def test_forward_manifest_uses_only_explicit_changed_sles_and_canonical_odata_matcher(db_session):
     parent, target, parent_batch, target_batch, item = _world(db_session)
     historical = _sle(db_session, parent_batch, item, ref="historical")

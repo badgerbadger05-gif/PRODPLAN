@@ -94,5 +94,13 @@ def test_automatic_refresh_passes_measured_count_to_existing_argument(monkeypatc
     )
 
     assert captured["database_ledger_rows"] == 245799
+    assert "standalone_supplier_repair_sle_ids" not in captured
     assert result["result"]["database_ledger_rows"] == 245799
     assert "database_ledger_rows_count_ms" in result["result"]
+
+    captured.clear()
+    sync_orchestrator._run_physical_refresh_job(
+        db, datetime(2026, 9, 18, tzinfo=timezone.utc), "physical-refresh:repair",
+        standalone_supplier_repair_sle_ids=(325172, 325173),
+    )
+    assert captured["standalone_supplier_repair_sle_ids"] == (325172, 325173)

@@ -213,6 +213,100 @@ def test_phase_requires_writers_stopped():
         apply_replenishment_rebase(engine, writers_stopped=False)
 
 
+def _mixed_zero_net_and_freeze_world(engine, *, foreign_allocation: bool = False):
+    """Old gross credits: one transport leg and one frozen real output."""
+    with Session(engine) as session:
+        freeze_batch = _batch(session, "mixed-basis-freeze", FREEZE_AT)
+        current_batch = _batch(session, "mixed-basis-current", CUTOFF)
+        generation = models.LedgerGeneration(
+            generation_key="mixed-basis-pointer", status="accepted", cutoff=CUTOFF,
+            accepted_at=CUTOFF, source_watermarks={}, capabilities={},
+            physical_import_batch_id=int(current_batch.id),
+            algorithm_version="mixed-basis-tests",
+        )
+        item = models.Item(item_code="MIXED-BASIS", item_name="Mixed output")
+        session.add_all((generation, item))
+        session.flush()
+        session.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
+        posted = FREEZE_AT - timedelta(days=2)
+        transport = _sle(
+            session, batch=freeze_batch, item_id=item.item_id,
+            qty=Decimal("1"), posting_at=posted, movement_kind="assembly_in",
+            recorder="mixed-transport", line_no="1",
+        )
+        _sle(
+            session, batch=freeze_batch, item_id=item.item_id,
+            qty=Decimal("-1"), posting_at=posted, movement_kind="assembly_out",
+            recorder="mixed-transport", line_no="2",
+        )
+        real = _sle(
+            session, batch=freeze_batch, item_id=item.item_id,
+            qty=Decimal("1"), posting_at=posted, movement_kind="assembly_in",
+            recorder="mixed-real", line_no="1",
+        )
+        owner = _owner(
+            session, generation=generation, freeze_batch=freeze_batch,
+            item=item, required=Decimal("10"), covered=Decimal("1"), mode="rework",
+        )
+        facts = [transport, real]
+        if foreign_allocation:
+            facts.append(_sle(
+                session, batch=current_batch, item_id=item.item_id,
+                qty=Decimal("1"), posting_at=CUTOFF + timedelta(days=1),
+                movement_kind="assembly_in", recorder="mixed-future", line_no="1",
+            ))
+        for index, fact in enumerate(facts):
+            session.add(models.ReservationConsumptionAllocation(
+                ledger_generation_id=generation.id, reservation_id=owner.id,
+                sle_id=fact.id, requirement_id=owner.requirement_id,
+                allocated_qty=Decimal("1"), match_rule="fifo",
+                fact_ref=fact.recorder_ref, fact_line_ref=fact.line_no,
+                item_id=item.item_id, characteristic_ref="", organization_ref="",
+                planning_stock_pool="default", idempotency_key=f"mixed-old-{index}",
+                allocation_role="replenishment_receipt", is_current=True,
+                event_at=posted,
+            ))
+        owner.replenishment_received_qty = Decimal(len(facts))
+        session.commit()
+        return generation.id, item.item_id, owner.id
+
+
+def test_rebase_can_clear_mixed_zero_net_and_frozen_output_without_wiping_foreign_facts():
+    engine = _engine()
+    generation_id, item_id, owner_id = _mixed_zero_net_and_freeze_world(engine)
+    scope = (item_id, "", "", "default", "make")
+    with Session(engine) as session:
+        with pytest.raises(CurrentReplenishmentError, match="complete-scope replay would delete all"):
+            apply_current_replenishment_for_bounded_make_scopes(
+                session, target_generation_id=generation_id, target_cutoff=CUTOFF,
+                affected_scopes=(scope,), at_accepted_pointer=True,
+            )
+        session.rollback()
+    with Session(engine) as session:
+        result = apply_current_replenishment_for_bounded_make_scopes(
+            session, target_generation_id=generation_id, target_cutoff=CUTOFF,
+            affected_scopes=(scope,), at_accepted_pointer=True,
+            basis_correction_reason="test rebase basis",
+        )
+        session.commit()
+        assert result.results[0].deleted == 2
+        assert "zero-net document output" in result.results[0].confirmed_empty_reason
+    assert _owner_state(engine, owner_id) == (Decimal("0"), [])
+
+    foreign_engine = _engine()
+    generation_id, item_id, _ = _mixed_zero_net_and_freeze_world(
+        foreign_engine, foreign_allocation=True,
+    )
+    with Session(foreign_engine) as session:
+        with pytest.raises(CurrentReplenishmentError, match="complete-scope replay would delete all"):
+            apply_current_replenishment_for_bounded_make_scopes(
+                session, target_generation_id=generation_id, target_cutoff=CUTOFF,
+                affected_scopes=((item_id, "", "", "default", "make"),),
+                at_accepted_pointer=True,
+                basis_correction_reason="test rebase basis",
+            )
+
+
 def test_bootstrap_credits_only_the_net_output_after_the_freeze_boundary():
     engine = _engine()
     world = _world(engine)

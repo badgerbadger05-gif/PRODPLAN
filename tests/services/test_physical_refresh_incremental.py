@@ -837,6 +837,188 @@ def test_delta_receipt_is_typed_and_allocated_when_the_fact_carries_the_1c_organ
     db_session.rollback()
 
 
+def test_ownerless_supplier_order_receipt_updates_future_supply_without_buy_allocation(
+    db_session, monkeypatch,
+):
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "STANDALONE-SUPPLIER-ORDER")
+    order = models.SupplierOrder(
+        order_number="SO-STANDALONE",
+        order_date=datetime(2026, 9, 1),
+        order_ref1c="standalone-order",
+        order_state_name="Заказан (товар в пути)",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(models.SupplierOrderItem(
+        order_id=order.order_id,
+        item_id_ref=item.item_id,
+        line_number=1,
+        destination_warehouse_ref1c="WH-BUY",
+        quantity=Decimal("4"),
+        received_qty=Decimal("0"),
+        remaining_qty=Decimal("4"),
+        delivery_date=datetime(2026, 9, 30),
+    ))
+    receipt = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT,
+        kind="receipt", warehouse="WH-BUY",
+        recorder_type="Document_ПриходнаяНакладная", ref="standalone-receipt",
+    )
+    db_session.commit()
+    evidence = SupplierDocumentEvidence(
+        receipt_doc_type=receipt.recorder_type,
+        receipt_doc_ref=receipt.recorder_ref,
+        receipt_doc_line_no=receipt.line_no,
+        operation_key=RECEIPT_OPERATION,
+        operation_name="Приобретение у поставщика",
+        supplier_order_type="Document_ЗаказПоставщику",
+        supplier_order_ref="standalone-order",
+        supplier_order_line_no="1",
+        item_id=item.item_id,
+        characteristic_ref="",
+        warehouse_ref1c="WH-BUY",
+        signed_qty=Decimal("4"),
+    )
+    _patch_payloads(monkeypatch, evidence=(evidence,))
+
+    publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (receipt,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(
+        ledger_generation_id=target.id,
+        stock_ledger_entry_id=receipt.id,
+    ).one()
+    assert provenance.match_status == "exact"
+    assert provenance.supplier_order_ref == "standalone-order"
+    assert provenance.supplier_order_line_no == "1"
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+    supply = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=target.id,
+        supply_kind="supplier_order",
+        source_ref="standalone-order",
+        source_line_ref="1",
+    ).one()
+    assert supply.ordered_qty_at_cutoff == Decimal("4")
+    assert supply.realized_qty_at_cutoff == Decimal("4")
+    assert supply.open_qty_at_cutoff == Decimal("0")
+    db_session.rollback()
+
+
+def test_standalone_supplier_selection_respects_buy_owner_in_another_pool(
+    db_session,
+):
+    parent, _target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "SUPPLIER-OTHER-POOL")
+    owner, _requirement = _buy_owner(db_session, parent, item)
+    owner.planning_stock_pool = "other"
+    receipt = _sle(
+        db_session, target_batch, item, qty="2", at=FORWARD_AT,
+        kind="receipt", warehouse="WH-BUY",
+        recorder_type="Document_ПриходнаяНакладная", ref="other-pool-receipt",
+    )
+    assert publisher._mapped_supplier_rows(
+        (receipt,), planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        current_owners=(owner,),
+    ) == (receipt,)
+    assert publisher._standalone_supplier_rows(
+        (receipt,), planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        current_owners=(owner,),
+    ) == ()
+
+
+def test_standalone_supplier_selection_includes_ownerless_return(db_session):
+    _parent, _target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "SUPPLIER-OWNERLESS-RETURN")
+    returned = _sle(
+        db_session, target_batch, item, qty="-2", at=FORWARD_AT,
+        kind="expense", warehouse="WH-BUY",
+        recorder_type="Document_РасходнаяНакладная", ref="ownerless-return",
+    )
+    assert publisher._standalone_supplier_rows(
+        (returned,), planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        current_owners=(),
+    ) == (returned,)
+
+
+def test_explicit_accepted_supplier_receipt_repair_recaptures_supply_without_stock_replay(
+    db_session, monkeypatch,
+):
+    parent, target, parent_batch, _target_batch = _generations(db_session)
+    item = _item(db_session, "REPAIR-OLD-SUPPLIER-ORDER")
+    order = models.SupplierOrder(
+        order_number="SO-REPAIR", order_date=datetime(2026, 9, 1),
+        order_ref1c="repair-order", order_state_name="Заказан (товар в пути)",
+        is_posted=True, deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(models.SupplierOrderItem(
+        order_id=order.order_id, item_id_ref=item.item_id, line_number=1,
+        destination_warehouse_ref1c="WH-BUY", quantity=Decimal("4"),
+        received_qty=Decimal("0"), remaining_qty=Decimal("4"),
+        delivery_date=datetime(2026, 9, 30),
+    ))
+    receipt = _sle(
+        db_session, parent_batch, item, qty="4",
+        at=PARENT_CUTOFF - timedelta(hours=1), kind="receipt",
+        warehouse="WH-BUY", recorder_type="Document_ПриходнаяНакладная",
+        ref="repair-old-receipt",
+    )
+    db_session.commit()
+    evidence = SupplierDocumentEvidence(
+        receipt_doc_type=receipt.recorder_type,
+        receipt_doc_ref=receipt.recorder_ref,
+        receipt_doc_line_no=receipt.line_no,
+        operation_key=RECEIPT_OPERATION,
+        operation_name="Приобретение у поставщика",
+        supplier_order_type="Document_ЗаказПоставщику",
+        supplier_order_ref="repair-order",
+        supplier_order_line_no="1",
+        item_id=item.item_id, characteristic_ref="",
+        warehouse_ref1c="WH-BUY", signed_qty=Decimal("4"),
+    )
+    _patch_payloads(monkeypatch, evidence=(evidence,))
+    assert evidence_adapter.qualify_standalone_supplier_repair_rows(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id, sle_ids=(receipt.id,),
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    ) == (receipt,)
+
+    publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (), "supersessions": ()},
+        odata_client=object(), source_revision=target.physical_import_batch_id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+        standalone_supplier_repair_sle_ids=(receipt.id,),
+    )
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+    assert db_session.query(models.StockBin).filter_by(
+        ledger_generation_id=target.id, item_id=item.item_id,
+    ).count() == 0
+    supply = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=target.id,
+        supply_kind="supplier_order",
+        source_ref="repair-order", source_line_ref="1",
+    ).one()
+    assert supply.realized_qty_at_cutoff == Decimal("4")
+    assert supply.open_qty_at_cutoff == Decimal("0")
+    db_session.rollback()
+
+
 def test_untyped_delta_receipt_owed_to_a_buy_owner_is_refused(db_session, monkeypatch):
     """The gate: a receipt against a live order may not be published untyped."""
     parent, target, _parent_batch, target_batch = _generations(db_session)

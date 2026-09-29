@@ -1100,6 +1100,7 @@ def apply_current_replenishment(
     history_mode: str = "as_occurred",
     receipt_unmatched_return_qty: Decimal = Decimal("0"),
     confirmed_empty_reason: str = "",
+    proven_zero_net_fact_ids: Iterable[int] = (),
     revision_basis: RevisionBasis = "explicit",
     basis_correction_reason: str = "",
 ) -> CurrentReplenishmentResult:
@@ -1513,7 +1514,7 @@ def apply_current_replenishment(
     baseline_dropped: set[tuple[str, str]] = set()
     for old in sorted(plan.deletions, key=lambda row: (str(row.fact_id), str(row.reserve_id))):
         budget = frozen_stock_budget.get(str(old.fact_id), Decimal("0"))
-        if budget <= 0:
+        if budget < _decimal(old.qty):
             continue
         frozen_stock_budget[str(old.fact_id)] = budget - _decimal(old.qty)
         baseline_dropped.add((str(old.fact_id), str(old.reserve_id)))
@@ -1532,6 +1533,30 @@ def apply_current_replenishment(
         confirmed_empty_reason = (
             f"{FREEZE_BASELINE_REASON}: {len(baseline_dropped)} allocations on facts "
             f"known at freeze {', '.join(boundaries)}"
+        )
+        confirmed_empty = True
+
+    # The accepted-pointer rebase can replace a superseded gross assembly
+    # basis with the canonical document net and §58 freeze basis together.
+    # The bounded adapter supplies only SLE ids whose complete, accepted
+    # document net is exactly zero; the allocator above supplies the frozen
+    # quantity.  Every old allocation must have one of those two proofs.
+    zero_net_ids = {str(int(sle_id)) for sle_id in proven_zero_net_fact_ids}
+    if (
+        complete_scope and previous and not plan.result.allocations
+        and not confirmed_empty and _text(basis_correction_reason)
+        and not allow_building
+        and zero_net_ids
+        and all(
+            str(old.fact_id) in zero_net_ids
+            or (str(old.fact_id), str(old.reserve_id)) in baseline_dropped
+            for old in previous
+        )
+    ):
+        confirmed_empty_reason = (
+            f"{_text(basis_correction_reason)}: every previous allocation "
+            "is explained by canonical zero-net document output or "
+            "covered_from_stock_at_freeze"
         )
         confirmed_empty = True
 
@@ -2513,6 +2538,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
     make_first_known = known_revisions_by_sle(db, rows)
     netted_internal_transfer_rows = 0
     netted_rows_by_scope: dict[DistributionScope, int] = {}
+    zero_net_fact_ids_by_scope: dict[DistributionScope, set[int]] = {}
     for row in rows:
         if _decimal(row.qty) <= 0:
             raise CurrentReplenishmentError(
@@ -2539,6 +2565,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
             # no production output, therefore no replenishment.
             netted_internal_transfer_rows += 1
             netted_rows_by_scope[scope] = netted_rows_by_scope.get(scope, 0) + 1
+            zero_net_fact_ids_by_scope.setdefault(scope, set()).add(int(row.id))
             continue
         requirement_id, order_ref, ambiguous = _identity_for_sle(db, row)
         if ambiguous:
@@ -2697,6 +2724,7 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 revision_basis=basis,
                 basis_correction_reason=basis_correction_reason,
                 confirmed_empty_reason=confirmed_empty_reason,
+                proven_zero_net_fact_ids=tuple(sorted(zero_net_fact_ids_by_scope.get(scope, ()))),
             )
         )
     return BoundedMakeReplenishmentResult(
