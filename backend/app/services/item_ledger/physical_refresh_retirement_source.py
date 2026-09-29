@@ -14,6 +14,21 @@ TARGETED_SOURCE = "targeted_import_window/1"
 _LEDGER_LOCAL_TZ = ZoneInfo("Europe/Moscow")
 
 
+def replaced_revision_ids(
+    db: Session, *, lower_batch_id: int, upper_batch_id: int,
+) -> set[int]:
+    """Replacement rows already represented by an earlier revision."""
+    return {
+        int(new_id) for (new_id,) in db.query(
+            models.StockLedgerFactSupersession.new_sle_id,
+        ).filter(
+            models.StockLedgerFactSupersession.import_batch_id > int(lower_batch_id),
+            models.StockLedgerFactSupersession.import_batch_id <= int(upper_batch_id),
+            models.StockLedgerFactSupersession.new_sle_id.isnot(None),
+        ).all()
+    }
+
+
 def _posting_at_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=_LEDGER_LOCAL_TZ).astimezone(timezone.utc)
@@ -63,15 +78,9 @@ def retirement_source_facts(
     )
     if item_ids is not None:
         query = query.filter(models.StockLedgerEntry.item_id.in_(item_ids))
-    replacements = {
-        int(new_id) for (new_id,) in db.query(
-            models.StockLedgerFactSupersession.new_sle_id,
-        ).filter(
-            models.StockLedgerFactSupersession.import_batch_id > lower,
-            models.StockLedgerFactSupersession.import_batch_id <= upper,
-            models.StockLedgerFactSupersession.new_sle_id.isnot(None),
-        ).all()
-    }
+    replacements = replaced_revision_ids(
+        db, lower_batch_id=lower, upper_batch_id=upper,
+    )
     return tuple(
         row for row in query.all()
         if int(row.id) not in replacements

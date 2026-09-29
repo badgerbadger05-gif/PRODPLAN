@@ -46,6 +46,7 @@ from .physical_visibility import visible_sle_query
 from .physical_refresh_retirement_source import (
     AUDIT_SOURCE,
     TARGETED_SOURCE,
+    replaced_revision_ids,
     retirement_source_facts,
 )
 from .physical_refresh_provenance import (
