@@ -66,6 +66,11 @@ from app.services.item_ledger.physical import (
     canonical_decimal,
 )
 from app.services.item_ledger.physical_visibility import visible_sle_query
+from app.services.item_ledger.physical_refresh_retirement_source import (
+    AUDIT_SOURCE,
+    TARGETED_SOURCE,
+    retirement_source_facts,
+)
 from app.services.item_ledger.r3_contract import business_identity_for_cutoff_balance_adjustment
 from app.services.item_ledger.physical_refresh_supplier_evidence import (
     lost_supplier_receipt_provenance_sle_ids,
@@ -663,34 +668,65 @@ def _assert_retired_cutoff_snap_remainder(
     audit_retirement = _text(metadata.get("reason")) == (
         "historical recorder audit imported the real 1C document"
     )
-    if audit_retirement:
-        # Reconstruct the audit writer's input at its import boundary.  The
-        # mutable active flag and later supersessions cannot describe that
-        # earlier snapshot, and facts posted after the parent cutoff were not
-        # eligible for audit retirement.
-        fresh_query = visible_sle_query(
-            db, physical_import_batch_id=previous_id,
-        ).filter(models.StockLedgerEntry.posting_at <= parent_cutoff)
+    targeted_retirement = _text(metadata.get("reason")) == (
+        "targeted convergence repair imported the real recorder"
+    )
+    explicit_source = any(metadata.get(name) is not None for name in (
+        "source_lower_batch_id", "source_upper_batch_id", "source_selection",
+    ))
+    if explicit_source:
+        try:
+            source_lower = int(metadata["source_lower_batch_id"])
+            source_upper = int(metadata["source_upper_batch_id"])
+            selection = str(metadata["source_selection"])
+        except (KeyError, TypeError, ValueError):
+            refuse()
+        if not (
+            parent_batch_id <= source_lower < source_upper <= previous_id
+            and (
+                (audit_retirement and selection == AUDIT_SOURCE and source_lower == parent_batch_id)
+                or (targeted_retirement and selection == TARGETED_SOURCE and source_upper == previous_id)
+            )
+        ):
+            refuse()
+        try:
+            fresh = retirement_source_facts(
+                db, lower_batch_id=source_lower, upper_batch_id=source_upper,
+                selection=selection,
+                parent_cutoff=parent_cutoff if audit_retirement else None,
+                item_ids={key[0] for key in consumed},
+            )
+        except ValueError:
+            refuse()
+        revisions: set[int] = set()
     else:
-        fresh_query = db.query(models.StockLedgerEntry)
-    fresh = tuple(fresh_query.filter(
-        models.StockLedgerEntry.ingest_batch_id > parent_batch_id,
-        models.StockLedgerEntry.ingest_batch_id <= previous_id,
-        models.StockLedgerEntry.item_id.in_({key[0] for key in consumed}),
-        models.StockLedgerEntry.recorder_type.like("Document_%"),
-    ).all())
-    revision_edges = db.query(
-        models.StockLedgerFactSupersession.old_sle_id,
-        models.StockLedgerFactSupersession.new_sle_id,
-    ).filter(
+        # Already persisted retirement batches used only the post-import
+        # terminal. Preserve their historical proof path; new canonical
+        # batches carry the exact audit or targeted input window above.
+        if audit_retirement:
+            fresh_query = visible_sle_query(
+                db, physical_import_batch_id=previous_id,
+            ).filter(models.StockLedgerEntry.posting_at <= parent_cutoff)
+        else:
+            fresh_query = db.query(models.StockLedgerEntry)
+        fresh = tuple(fresh_query.filter(
+            models.StockLedgerEntry.ingest_batch_id > parent_batch_id,
+            models.StockLedgerEntry.ingest_batch_id <= previous_id,
+            models.StockLedgerEntry.item_id.in_({key[0] for key in consumed}),
+            models.StockLedgerEntry.recorder_type.like("Document_%"),
+        ).all())
+        revision_edges = db.query(
+            models.StockLedgerFactSupersession.old_sle_id,
+            models.StockLedgerFactSupersession.new_sle_id,
+        ).filter(
             models.StockLedgerFactSupersession.import_batch_id > parent_batch_id,
             models.StockLedgerFactSupersession.import_batch_id <= previous_id,
-    ).all()
-    revisions = {int(new_id) for _, new_id in revision_edges if new_id is not None}
+        ).all()
+        revisions = {int(new_id) for _, new_id in revision_edges if new_id is not None}
     for key, dates in snap_dates.items():
         dated_facts = [fact for fact in fresh if
             int(fact.id) not in revisions
-            and int(fact.ingest_batch_id) > source_lower_by_key[key]
+            and (explicit_source or int(fact.ingest_batch_id) > source_lower_by_key[key])
             and _text(fact.recorder_type).startswith("Document_")
             and (int(fact.item_id), _text(fact.organization_ref), _text(fact.warehouse_ref1c)) == key
             and fact.posting_at is not None

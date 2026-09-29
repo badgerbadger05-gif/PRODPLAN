@@ -43,6 +43,11 @@ from .physical import (
     physical_sequence_lock_context,
 )
 from .physical_visibility import visible_sle_query
+from .physical_refresh_retirement_source import (
+    AUDIT_SOURCE,
+    TARGETED_SOURCE,
+    retirement_source_facts,
+)
 from .physical_refresh_provenance import (
     PhysicalRefreshProvenanceUnavailable,
     canonical_issue_backfill_source_ids,
@@ -562,22 +567,6 @@ def _global_import_terminal(db: Session) -> int:
     return int(db.query(func.max(models.PhysicalImportBatch.id)).scalar() or 0)
 
 
-def replaced_revision_ids(
-    db: Session, *, lower_batch_id: int, upper_batch_id: int
-) -> set[int]:
-    """Ids of rows that merely replace an earlier revision in a batch range."""
-    return {
-        int(value)
-        for (value,) in db.query(models.StockLedgerFactSupersession.new_sle_id)
-        .filter(
-            models.StockLedgerFactSupersession.import_batch_id > int(lower_batch_id),
-            models.StockLedgerFactSupersession.import_batch_id <= int(upper_batch_id),
-            models.StockLedgerFactSupersession.new_sle_id.isnot(None),
-        )
-        .all()
-    }
-
-
 def _retire_audit_absorbed_cutoff_snaps(
     db: Session,
     *,
@@ -610,26 +599,20 @@ def _retire_audit_absorbed_cutoff_snaps(
                 "historical audit snap retirement checkpoint changed"
             )
         return None
-    replacements = replaced_revision_ids(
-        db, lower_batch_id=parent_batch, upper_batch_id=audit_terminal,
-    )
     parent_cutoff = _utc(parent.cutoff, "parent cutoff")
-    facts = tuple(
-        row for row in visible_sle_query(
-            db, physical_import_batch_id=audit_terminal,
-        ).filter(
-            models.StockLedgerEntry.ingest_batch_id > parent_batch,
-            models.StockLedgerEntry.ingest_batch_id <= audit_terminal,
-            models.StockLedgerEntry.recorder_type.like("Document_%"),
-        ).all()
-        if int(row.id) not in replacements
-        and _posting_at_utc(row.posting_at, "audit posting_at") <= parent_cutoff
+    facts = retirement_source_facts(
+        db, lower_batch_id=parent_batch, upper_batch_id=audit_terminal,
+        selection=AUDIT_SOURCE, parent_cutoff=parent_cutoff,
     )
     retirement = retire_cutoff_snaps_absorbing_facts(
         db,
         fact_rows=facts,
         previous_import_batch_id=int(generation.physical_import_batch_id),
         reason="historical recorder audit imported the real 1C document",
+        source_lower_batch_id=parent_batch,
+        source_upper_batch_id=audit_terminal,
+        source_selection=AUDIT_SOURCE,
+        source_parent_cutoff=parent_cutoff,
     )
     if retirement is not None and retirement.retired_rows:
         generation.physical_import_batch_id = _global_import_terminal(db)
@@ -662,6 +645,10 @@ def retire_cutoff_snaps_absorbing_facts(
     fact_rows: Any,
     previous_import_batch_id: int,
     reason: str,
+    source_lower_batch_id: int | None = None,
+    source_upper_batch_id: int | None = None,
+    source_selection: str | None = None,
+    source_parent_cutoff: datetime | None = None,
 ) -> CutoffSnapRetirement | None:
     """Retire the cutoff snap that stood in for a now-imported document.
 
@@ -689,8 +676,35 @@ def retire_cutoff_snaps_absorbing_facts(
     boundary each generation was published with, so every accepted prefix keeps
     exactly the rows it was accepted with.
     """
+    input_rows = tuple(fact_rows or ())
+    explicit_source = any(value is not None for value in (
+        source_lower_batch_id, source_upper_batch_id, source_selection,
+    ))
+    if explicit_source and (
+        source_lower_batch_id is None
+        or source_upper_batch_id is None
+        or source_selection not in {AUDIT_SOURCE, TARGETED_SOURCE}
+        or int(source_upper_batch_id) > int(previous_import_batch_id)
+        or (source_selection == AUDIT_SOURCE and source_parent_cutoff is None)
+    ):
+        raise PhysicalRefreshOrchestratorError(
+            "cutoff retirement requires a complete source window"
+        )
+    if explicit_source:
+        selected = retirement_source_facts(
+            db, lower_batch_id=int(source_lower_batch_id),
+            upper_batch_id=int(source_upper_batch_id),
+            selection=str(source_selection),
+            parent_cutoff=source_parent_cutoff,
+        )
+        if {int(row.id) for row in selected} != {
+            int(row.id) for row in input_rows
+        } or len(selected) != len(input_rows):
+            raise PhysicalRefreshOrchestratorError(
+                "cutoff retirement input differs from its recorded source window"
+            )
     rows = [
-        row for row in (fact_rows or ())
+        row for row in input_rows
         if str(row.movement_kind or "") != CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
         and str(row.recorder_type or "") != CUTOFF_BALANCE_ADJUSTMENT_RECORDER_TYPE
     ]
@@ -777,6 +791,11 @@ def retire_cutoff_snaps_absorbing_facts(
             "content_hash": content_hash,
             "quantity_format": "canonical_decimal/1",
             "previous_import_batch_id": int(previous_import_batch_id),
+            **({
+                "source_lower_batch_id": int(source_lower_batch_id),
+                "source_upper_batch_id": int(source_upper_batch_id),
+                "source_selection": str(source_selection),
+            } if explicit_source else {}),
         },
     )
     db.add(batch)
@@ -1022,25 +1041,21 @@ def _repair_mismatched_recorders(
     # quantity was already in the basis the snap was computed against, so
     # retiring a snap by it would move the balance.  Only rows that replace
     # nothing count as the document the snap stood in for.
-    replacements = replaced_revision_ids(
-        db, lower_batch_id=int(start_terminal), upper_batch_id=int(terminal),
-    )
-    imported_rows = tuple(
-        row for row in db.query(models.StockLedgerEntry)
-        .filter(
-            models.StockLedgerEntry.ingest_batch_id > int(start_terminal),
-            models.StockLedgerEntry.ingest_batch_id <= int(terminal),
+    retirement = None
+    if int(terminal) > int(start_terminal):
+        imported_rows = retirement_source_facts(
+            db, lower_batch_id=int(start_terminal), upper_batch_id=int(terminal),
+            selection=TARGETED_SOURCE,
         )
-        .order_by(models.StockLedgerEntry.id.asc())
-        .all()
-        if int(row.id) not in replacements
-    )
-    retirement = retire_cutoff_snaps_absorbing_facts(
-        db,
-        fact_rows=imported_rows,
-        previous_import_batch_id=int(terminal),
-        reason="targeted convergence repair imported the real recorder",
-    )
+        retirement = retire_cutoff_snaps_absorbing_facts(
+            db,
+            fact_rows=imported_rows,
+            previous_import_batch_id=int(terminal),
+            reason="targeted convergence repair imported the real recorder",
+            source_lower_batch_id=int(start_terminal),
+            source_upper_batch_id=int(terminal),
+            source_selection=TARGETED_SOURCE,
+        )
     if retirement is not None and retirement.retired_rows:
         terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
     generation.physical_import_batch_id = int(terminal)

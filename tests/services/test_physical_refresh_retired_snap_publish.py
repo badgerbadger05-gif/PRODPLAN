@@ -9,6 +9,9 @@ import pytest
 from app import models
 from app.services.item_ledger import physical_refresh_current_publish as publish
 from app.services.item_ledger import physical_refresh_orchestrator as refresh
+from app.services.item_ledger.physical_refresh_retirement_source import (
+    AUDIT_SOURCE, TARGETED_SOURCE, retirement_source_facts,
+)
 from app.services.item_ledger.r3_contract import business_identity_for_cutoff_balance_adjustment
 
 
@@ -194,6 +197,152 @@ def test_audit_retirement_uses_visibility_before_later_supersession(db_session):
     # Mutable active is now false, but the fact was visible when the audit
     # retired the snap.  The validator must use that historical boundary.
     _validate(db_session, case)
+
+
+@pytest.mark.parametrize("selection", [AUDIT_SOURCE, TARGETED_SOURCE])
+def test_retirement_proves_its_exact_source_window(db_session, selection):
+    """An audit revision or an earlier opposite-sign audit fact is not input."""
+    cutoff = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    parent_batch = models.PhysicalImportBatch(
+        batch_key=f"source-parent-{selection}", status="completed",
+        cutoff=cutoff, source_watermarks={}, completed_at=cutoff,
+    )
+    db_session.add(parent_batch)
+    db_session.flush()
+    item = models.Item(item_code=f"SOURCE-{selection}", item_name="Source window")
+    db_session.add(item)
+    db_session.flush()
+    old = models.StockLedgerEntry(
+        ingest_batch_id=parent_batch.id, source_content_hash="source-snap",
+        business_identity=business_identity_for_cutoff_balance_adjustment(
+            "source-snap", "0", item_id=item.item_id, characteristic_ref="",
+            organization_ref="org", warehouse_ref1c="wh", snap_content_hash="source-old",
+        ),
+        item_id=item.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c="wh", qty=Decimal("5"), posting_at=cutoff,
+        record_type="Receipt", movement_kind="cutoff_balance_adjustment",
+        recorder_type="cutoff_balance_adjustment", recorder_ref="source-snap",
+        line_no="0", ingest_source="cutoff_balance_adjustment",
+    )
+    db_session.add(old)
+
+    def batch_and_fact(label, qty):
+        batch = models.PhysicalImportBatch(
+            batch_key=f"source-{selection}-{label}", status="completed",
+            cutoff=cutoff, source_watermarks={}, completed_at=cutoff,
+        )
+
+        db_session.add(batch)
+        db_session.flush()
+        fact = models.StockLedgerEntry(
+            ingest_batch_id=batch.id, source_content_hash=f"source-{label}",
+            business_identity=f"movement:source-{label}", item_id=item.item_id,
+            characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+            qty=Decimal(qty), posting_at=cutoff - timedelta(days=1),
+            record_type="Receipt" if Decimal(qty) > 0 else "Expense",
+            movement_kind="receipt" if Decimal(qty) > 0 else "expense",
+            recorder_type="Document_ПеремещениеЗапасов", recorder_ref=f"source-{label}",
+            line_no="1", ingest_source="document_pull",
+        )
+        db_session.add(fact)
+        db_session.flush()
+        return batch, fact
+
+    if selection == TARGETED_SOURCE:
+        early_batch, _ = batch_and_fact("earlier-audit-minus-3", "-3")
+        _, _ = batch_and_fact("earlier-audit-minus-2", "-2")
+        source_batch, fact = batch_and_fact("targeted-plus-1", "1")
+        source_lower = source_batch.id - 1
+        source_upper = source_batch.id
+        previous_id = source_batch.id
+        reason = "targeted convergence repair imported the real recorder"
+        assert early_batch.id < source_lower
+    else:
+        source_batch, fact = batch_and_fact("audit-A", "1")
+        forward_batch, replacement = batch_and_fact("forward-B", "1")
+        db_session.add(models.StockLedgerFactSupersession(
+            import_batch_id=forward_batch.id,
+            old_sle_id=fact.id, new_sle_id=replacement.id,
+        ))
+        fact.active = False
+        source_lower = parent_batch.id
+        source_upper = source_batch.id
+        previous_id = forward_batch.id
+        reason = "historical recorder audit imported the real 1C document"
+    db_session.flush()
+    db_session.expire_all()
+    with pytest.raises(refresh.PhysicalRefreshOrchestratorError, match="input differs"):
+        refresh.retire_cutoff_snaps_absorbing_facts(
+            db_session, fact_rows=(), previous_import_batch_id=previous_id,
+            reason=reason, source_lower_batch_id=source_lower,
+            source_upper_batch_id=source_upper, source_selection=selection,
+            source_parent_cutoff=cutoff if selection == AUDIT_SOURCE else None,
+        )
+    result = refresh.retire_cutoff_snaps_absorbing_facts(
+        db_session, fact_rows=(db_session.get(models.StockLedgerEntry, fact.id),),
+        previous_import_batch_id=previous_id, reason=reason,
+        source_lower_batch_id=source_lower,
+        source_upper_batch_id=source_upper,
+        source_selection=selection,
+        source_parent_cutoff=cutoff if selection == AUDIT_SOURCE else None,
+    )
+    assert result is not None and result.reissued_rows == 1
+    edge = db_session.query(models.StockLedgerFactSupersession).filter_by(
+        import_batch_id=result.import_batch_id,
+    ).one()
+    remainder = db_session.get(models.StockLedgerEntry, edge.new_sle_id)
+    assert Decimal(remainder.qty) == Decimal("4")
+    batch = db_session.get(models.PhysicalImportBatch, result.import_batch_id)
+    assert batch.source_watermarks["source_lower_batch_id"] == source_lower
+    assert batch.source_watermarks["source_upper_batch_id"] == source_upper
+    publish._assert_supported_delta(
+        (remainder,), db=db_session,
+        parent_batch_id=parent_batch.id, target_batch_id=result.import_batch_id,
+        parent_cutoff=cutoff, target_cutoff=cutoff + timedelta(days=1),
+        backdate_from=cutoff - timedelta(days=2),
+    )
+    batch.source_watermarks = {**batch.source_watermarks, "source_upper_batch_id": parent_batch.id}
+    db_session.flush()
+    with pytest.raises(publish.ForwardPhysicalRefreshUnavailable, match="canonical retirement proof"):
+        publish._assert_supported_delta(
+            (remainder,), db=db_session,
+            parent_batch_id=parent_batch.id, target_batch_id=result.import_batch_id,
+            parent_cutoff=cutoff, target_cutoff=cutoff + timedelta(days=1),
+            backdate_from=cutoff - timedelta(days=2),
+        )
+
+
+def test_audit_source_cutoff_uses_moscow_posting_axis(db_session):
+    """An aware UTC cutoff must not be compared directly to naive 1C time."""
+    cutoff = datetime(2026, 9, 20, 9, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(
+        batch_key="audit-moscow-boundary", status="completed", cutoff=cutoff,
+        source_watermarks={}, completed_at=cutoff,
+    )
+    db_session.add(batch)
+    db_session.flush()
+    item = models.Item(item_code="AUDIT-TZ", item_name="Audit timezone")
+    db_session.add(item)
+    db_session.flush()
+    rows = []
+    for line, hour in enumerate((11, 13), 1):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=batch.id, source_content_hash=f"tz-{line}",
+            business_identity=f"movement:tz-{line}", item_id=item.item_id,
+            characteristic_ref="", organization_ref="org", warehouse_ref1c="wh",
+            qty=Decimal("1"), posting_at=datetime(2026, 9, 20, hour),
+            record_type="Receipt", movement_kind="receipt",
+            recorder_type="Document_ПриходнаяНакладная", recorder_ref=f"tz-{line}",
+            line_no=str(line), ingest_source="document_pull",
+        )
+        rows.append(row)
+        db_session.add(row)
+    db_session.flush()
+    selected = retirement_source_facts(
+        db_session, lower_batch_id=batch.id - 1, upper_batch_id=batch.id,
+        selection=AUDIT_SOURCE, parent_cutoff=cutoff,
+    )
+    assert [row.id for row in selected] == [rows[0].id]
 
 
 def test_second_canonical_retirement_can_consume_first_remainder(db_session):
