@@ -4766,6 +4766,11 @@ export interface components {
         ItemLedgerReservationEventsResponse: {
             /** Reservation Id */
             reservation_id: number;
+            /**
+             * Quantity Basis
+             * @constant
+             */
+            quantity_basis: "historical_event_evidence";
             /** Rows */
             rows: components["schemas"]["ItemLedgerReservationEventRow"][];
             truth_meta: components["schemas"]["TruthMeta"];

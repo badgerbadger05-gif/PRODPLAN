@@ -180,6 +180,8 @@ describe('item-ledger presentation primitives', () => {
 
   it('renders reservation events with SLE and fact linkage', () => {
     render(<ItemLedgerReservationEventsTimeline rows={events} />)
+    expect(screen.getByText(/История записей\. Текущее исполнение показано в карточке резерва/)).toBeInTheDocument()
+    expect(screen.getByText(/Записано в событии:/)).toBeInTheDocument()
     expect(screen.getByText(/Погашен/)).toBeInTheDocument()
     expect(screen.getByText(/SLE #88231/)).toBeInTheDocument()
     expect(screen.getByText(/doc-1/)).toBeInTheDocument()

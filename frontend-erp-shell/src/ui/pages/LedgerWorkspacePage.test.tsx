@@ -173,6 +173,7 @@ const reservations: ItemLedgerReservationsResponse = {
 const reservationEvents: ItemLedgerReservationEventsResponse = {
   truth_meta: truthMeta,
   reservation_id: 101,
+  quantity_basis: 'historical_event_evidence',
   rows: [
     {
       id: 7,
@@ -294,6 +295,7 @@ describe('LedgerWorkspacePage', () => {
     secondEvents.resolve({
       truth_meta: truthMeta,
       reservation_id: 102,
+      quantity_basis: 'historical_event_evidence',
       rows: [
         {
           id: 8,
@@ -313,6 +315,7 @@ describe('LedgerWorkspacePage', () => {
     firstEvents.resolve({
       truth_meta: truthMeta,
       reservation_id: 101,
+      quantity_basis: 'historical_event_evidence',
       rows: [
         {
           id: 7,

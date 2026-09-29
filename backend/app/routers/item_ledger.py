@@ -19,7 +19,7 @@ their append-only event tape.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -212,6 +212,9 @@ class ItemLedgerReservationEventsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reservation_id: int
+    # ReservationEvent is the provenance tape. Current replenishment quantities
+    # come from the accepted owner and its assignment basis, not this tape.
+    quantity_basis: Literal["historical_event_evidence"]
     rows: List[ItemLedgerReservationEventRow]
     truth_meta: TruthMeta
 
@@ -760,6 +763,7 @@ def get_reservation_events(
     ]
     return {
         "reservation_id": int(reservation_id),
+        "quantity_basis": "historical_event_evidence",
         "rows": rows,
         "truth_meta": _truth_meta(truth),
     }

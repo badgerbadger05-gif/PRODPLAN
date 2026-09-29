@@ -494,6 +494,7 @@ def test_events_thread(client, seeded):
         f"/api/v1/item-ledger/{seeded['a']}/reservations/{seeded['r1']}/events"
     ).json()
     ItemLedgerReservationEventsResponse.model_validate(d)
+    assert d["quantity_basis"] == "historical_event_evidence"
     assert d["truth_meta"]["truth_status"] == "accepted"
     assert d["truth_meta"]["ledger_generation"] == 1
     kinds = [e["event_kind"] for e in d["rows"]]
