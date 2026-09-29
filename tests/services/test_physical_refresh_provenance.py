@@ -5,6 +5,7 @@ import pytest
 
 from app import models
 from app.services.item_ledger.future_supply_read import future_supply_model
+from app.services.item_ledger import physical_refresh_orchestrator as workflow
 from app.services.item_ledger.physical_refresh_provenance import (
     PhysicalRefreshProvenanceUnavailable,
     apply_bounded_current_material_custody_events,
@@ -18,6 +19,7 @@ from app.services.production_material_custody_projection import (
     _resolve_projection_baseline,
     load_compact_current_material_custody,
 )
+from app.services.production_material_custody_events import _custody_event_idempotency_key
 
 
 def _world(db):
@@ -374,4 +376,137 @@ def test_bounded_custody_tail_rejects_event_outside_explicit_sle_manifest(db_ses
             parent_generation_id=parent.id,
             target_generation_id=target.id,
             source_sle_ids=(),
+        )
+
+
+def _canonical_backfill_world(db):
+    parent, target, _current, custody = _world(db)
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    target.physical_import_batch.source_watermarks = {
+        "source": "AccumulationRegister_ЗапасыНаСкладах",
+        "recorder_type": "Document_ПеремещениеЗапасов",
+        "recorder_ref": "transfer-backfill",
+        # This is the recorder's old revision, not the global parent boundary.
+        "previous_import_batch_id": 0,
+    }
+    product = db.get(models.ProductionProduct, int(custody.product_id))
+    issue = models.ProductionMaterialIssue(
+        document_number="ISSUE-BACKFILL", product_id=product.product_id,
+        order_id=product.order_id, status="requested", direction="issue",
+        source_warehouse_ref1c="ISSUE-SOURCE",
+        warehouse_ref1c="WORKSHOP",
+    )
+    db.add(issue)
+    db.flush()
+    line = models.ProductionMaterialIssueLine(
+        issue_id=issue.issue_id, component_item_id=custody.component_item_id,
+        required_qty=Decimal("4"), issued_qty=Decimal("4"),
+        custody_event_revision=2,
+    )
+    db.add(line)
+    db.flush()
+    db.add(models.SyncLink(
+        source_system="PRODPLAN", source_doctype="material_issue",
+        source_id=issue.issue_id, target_entity="Document_ПеремещениеЗапасов",
+        target_ref_key="transfer-backfill",
+    ))
+    db.add(models.LedgerBuildBatch(
+        ledger_generation_id=target.id, stage="physical_import",
+        batch_key="backfill-audit", status="completed", algorithm_version="test",
+        metrics={"parent_physical_import_batch_id": parent.physical_import_batch_id,
+                 "physical_import_batch_id": target.physical_import_batch_id,
+                 "recorders": [{"recorder_type": "Document_ПеремещениеЗапасов",
+                                "recorder_ref": "transfer-backfill"}]},
+    ))
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="backfill-physical", business_identity="backfill-physical",
+        item_id=custody.component_item_id, characteristic_ref="",
+        organization_ref="org", warehouse_ref1c="ACTUAL-SOURCE",
+        qty=Decimal("-4"), posting_at=target.cutoff,
+        record_type="Expense", movement_kind="transfer_out",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="transfer-backfill", line_no="1", ingest_source="pull",
+        active=True,
+    )
+    db.add(sle)
+    db.flush()
+    opening = models.ProductionMaterialCustodyEvent(
+        issue_id=issue.issue_id, product_id=product.product_id,
+        component_item_id=line.component_item_id, source_kind="issue_created",
+        source_sle_id=None, effective_at=target.cutoff,
+        location_kind="transit", warehouse_ref1c="ACTUAL-SOURCE",
+        source_ref1c="ISSUE-SOURCE", source_ref2c="transfer-backfill",
+        delta_qty=Decimal("4"), document_number=issue.document_number,
+        document_line_no=str(line.line_id),
+        idempotency_key=_custody_event_idempotency_key(
+            issue_id=issue.issue_id, line_id=line.line_id, revision=1,
+            source_kind="issue_created", location_kind="transit",
+            warehouse_ref1c="ACTUAL-SOURCE", delta_qty=4,
+            source_sle_id=None,
+        ),
+    )
+    posted = models.ProductionMaterialCustodyEvent(
+        issue_id=issue.issue_id, product_id=product.product_id,
+        component_item_id=line.component_item_id, source_kind="transfer_posted",
+        source_sle_id=sle.id, effective_at=target.cutoff,
+        location_kind="transit", warehouse_ref1c="ACTUAL-SOURCE",
+        source_ref1c="ISSUE-SOURCE", source_ref2c="transfer-backfill",
+        delta_qty=Decimal("-4"), document_number=issue.document_number,
+        document_line_no=str(line.line_id), idempotency_key="backfill-posted",
+    )
+    db.add_all([opening, posted])
+    db.flush()
+    return parent, target, sle, opening, posted, custody
+
+
+def test_canonical_issue_backfill_passes_both_custody_gates_and_publisher(db_session):
+    parent, target, sle, opening, posted, custody = _canonical_backfill_world(db_session)
+    assert workflow._bounded_custody_tail_sle_ids(
+        db_session, after_event_id=0, parent_generation_id=parent.id,
+        target_generation_id=target.id, target_cutoff=target.cutoff,
+    ) == (sle.id,)
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id, source_sle_ids=(sle.id,),
+    ) == 2
+    assert custody.reserved_qty == Decimal("2")
+    assert custody.source_event_high_watermark_id == posted.id
+    assert handoff_current_material_custody_provenance(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id,
+    ).custody_event_watermark == posted.id
+
+
+@pytest.mark.parametrize("mutation", [
+    "foreign_link", "wrong_qty", "wrong_bucket", "wrong_product",
+    "reversal", "future", "incomplete_batch", "bad_key", "foreign_batch",
+])
+def test_canonical_issue_backfill_rejects_forged_or_unbounded_tail(db_session, mutation):
+    parent, target, sle, opening, posted, _custody = _canonical_backfill_world(db_session)
+    if mutation == "foreign_link":
+        opening.source_ref2c = "other-transfer"
+    elif mutation == "wrong_qty":
+        opening.delta_qty = Decimal("5")
+    elif mutation == "wrong_bucket":
+        opening.warehouse_ref1c = "OTHER-SOURCE"
+    elif mutation == "wrong_product":
+        opening.product_id += 1
+    elif mutation == "reversal":
+        opening.source_kind = "transfer_returned"
+    elif mutation == "future":
+        sle.posting_at = target.cutoff + timedelta(seconds=1)
+    elif mutation == "incomplete_batch":
+        target.physical_import_batch.source_complete = False
+    elif mutation == "bad_key":
+        opening.idempotency_key = "forged"
+    elif mutation == "foreign_batch":
+        target.physical_import_batch.source_watermarks = {"source": "foreign"}
+    db_session.flush()
+    with pytest.raises((workflow.PhysicalRefreshOrchestratorError,
+                        PhysicalRefreshProvenanceUnavailable)):
+        workflow._bounded_custody_tail_sle_ids(
+            db_session, after_event_id=0, parent_generation_id=parent.id,
+            target_generation_id=target.id, target_cutoff=target.cutoff,
         )

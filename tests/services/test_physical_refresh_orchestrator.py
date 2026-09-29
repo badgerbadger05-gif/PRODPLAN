@@ -171,13 +171,32 @@ def test_crash_recovery_discovers_completed_custody_tail_with_sequence_gaps(
         cutoff=target_cutoff,
         source_complete=True,
         source_watermarks={
-            "source": "AccumulationRegister",
+            "source": "AccumulationRegister_ЗапасыНаСкладах",
             "recorder_type": "Document_Transfer",
             "recorder_ref": "custody-crash-recorder",
             "previous_import_batch_id": int(parent_batch.id),
         },
     )
     db_session.add_all([product, batch])
+    db_session.flush()
+    candidate = models.LedgerGeneration(
+        generation_key="custody-crash-retry-candidate", status="building",
+        cutoff=target_cutoff, physical_import_batch_id=batch.id,
+        source_watermarks={"generation_kind": "physical_refresh",
+                           "parent_generation_id": parent.id},
+        algorithm_version="physical-refresh/test", replay_version="physical-refresh/test",
+    )
+    db_session.add(candidate)
+    db_session.flush()
+    db_session.add(models.LedgerBuildBatch(
+        ledger_generation_id=candidate.id, stage="physical_import",
+        batch_key="custody-crash-audit", status="completed",
+        algorithm_version="physical-refresh/test",
+        metrics={"parent_physical_import_batch_id": parent_batch.id,
+                 "physical_import_batch_id": batch.id,
+                 "recorders": [{"recorder_type": "Document_Transfer",
+                                "recorder_ref": "custody-crash-recorder"}]},
+    ))
     db_session.flush()
     entries = [
         models.StockLedgerEntry(
@@ -255,7 +274,7 @@ def test_crash_recovery_discovers_completed_custody_tail_with_sequence_gaps(
         event.remove(connection, "before_cursor_execute", capture)
 
     assert first == second == (int(entries[0].id), int(entries[1].id))
-    assert len(sle_statements) == 2
+    assert len(sle_statements) == 4
     assert all(" in (" in statement for statement in sle_statements)
     assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 2
 

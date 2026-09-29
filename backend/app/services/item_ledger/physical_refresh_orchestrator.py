@@ -42,6 +42,10 @@ from .physical import (
     physical_sequence_lock_context,
 )
 from .physical_visibility import visible_sle_query
+from .physical_refresh_provenance import (
+    PhysicalRefreshProvenanceUnavailable,
+    canonical_issue_backfill_source_ids,
+)
 from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
@@ -1087,6 +1091,7 @@ def _bounded_custody_tail_sle_ids(
     after_event_id: int,
     parent_generation_id: int | None = None,
     target_cutoff: datetime | None = None,
+    target_generation_id: int | None = None,
 ) -> tuple[int, ...]:
     """Validate and return the bounded physical identities behind an event tail.
 
@@ -1098,15 +1103,13 @@ def _bounded_custody_tail_sle_ids(
     bounded recovery proof; it never discovers the historical event stream or
     ledger prefix.
 
-    Local events, missing/inactive SLEs, incomplete batches, future postings,
-    duplicate source identities, and malformed batch lineage fail closed.
+    The one canonical issue-opening backfill is admitted only with its exact
+    transfer-out witness.  Other local events, missing/inactive SLEs,
+    incomplete batches, future postings, duplicate source identities, and
+    malformed batch lineage fail closed.
     """
     rows = (
-        db.query(
-            models.ProductionMaterialCustodyEvent.id,
-            models.ProductionMaterialCustodyEvent.source_sle_id,
-            models.ProductionMaterialCustodyEvent.component_item_id,
-        )
+        db.query(models.ProductionMaterialCustodyEvent)
         .filter(models.ProductionMaterialCustodyEvent.id > int(after_event_id))
         .order_by(models.ProductionMaterialCustodyEvent.id.asc())
         .all()
@@ -1115,22 +1118,22 @@ def _bounded_custody_tail_sle_ids(
     event_ids: list[int] = []
     event_components: dict[int, int] = {}
     event_by_source: dict[int, int] = {}
-    for event_id, source_sle_id, component_item_id in rows:
-        if source_sle_id is None:
-            raise PhysicalRefreshOrchestratorError(
-                "physical refresh custody tail contains a non-physical event "
-                f"(event_id={int(event_id)})"
-            )
-        event_ids.append(int(event_id))
-        source_ids.append(int(source_sle_id))
-        event_components[int(event_id)] = int(component_item_id)
-        event_by_source[int(source_sle_id)] = int(event_id)
+    for event in rows:
+        event_ids.append(int(event.id))
+        if event.source_sle_id is not None:
+            source_ids.append(int(event.source_sle_id))
+            event_components[int(event.id)] = int(event.component_item_id)
+            event_by_source[int(event.source_sle_id)] = int(event.id)
     if len(set(source_ids)) != len(source_ids):
         raise PhysicalRefreshOrchestratorError(
             "physical refresh custody tail contains duplicate source SLEs "
             f"(events={event_ids}, source_sle_ids={source_ids})"
         )
-    if not source_ids or parent_generation_id is None:
+    if parent_generation_id is None and any(row.source_sle_id is None for row in rows):
+        raise PhysicalRefreshOrchestratorError(
+            "physical refresh custody tail contains a non-physical event without provenance"
+        )
+    if not rows or parent_generation_id is None:
         return tuple(source_ids)
 
     parent = db.get(models.LedgerGeneration, int(parent_generation_id))
@@ -1139,6 +1142,68 @@ def _bounded_custody_tail_sle_ids(
             "physical refresh custody tail cannot resolve parent import boundary"
         )
     parent_batch_id = int(parent.physical_import_batch_id)
+    cutoff = _utc(target_cutoff, "target cutoff") if target_cutoff is not None else None
+    target = (
+        db.get(models.LedgerGeneration, int(target_generation_id))
+        if target_generation_id is not None else None
+    )
+    if target_generation_id is not None and (
+        target is None or int((target.source_watermarks or {}).get("parent_generation_id") or -1)
+        != int(parent.id)
+    ):
+        raise PhysicalRefreshOrchestratorError("custody target generation has foreign parent")
+    # A recorder batch's previous_import_batch_id is its *document revision*,
+    # not the global physical predecessor.  Completed generation checkpoints
+    # own global intervals.  They are the durable boundary for recovery.
+    candidates = [target] if target is not None else db.query(models.LedgerGeneration).filter(
+        models.LedgerGeneration.status.in_(["building", "rejected"]),
+        models.LedgerGeneration.source_watermarks["parent_generation_id"].as_integer()
+        == int(parent.id),
+        models.LedgerGeneration.cutoff <= cutoff if cutoff is not None else True,
+    ).all()
+    covered: list[tuple[int, int, set[tuple[str, str]]]] = []
+    for candidate in candidates:
+        marks = dict(candidate.source_watermarks or {})
+        if int(marks.get("parent_generation_id") or -1) != int(parent.id):
+            continue
+        if cutoff is not None and candidate.cutoff is not None and _utc(candidate.cutoff, "candidate cutoff") > cutoff:
+            continue
+        checkpoints = db.query(models.LedgerBuildBatch).filter(
+            models.LedgerBuildBatch.ledger_generation_id == int(candidate.id),
+            models.LedgerBuildBatch.stage == "physical_import",
+            models.LedgerBuildBatch.status == "completed",
+        ).all()
+        checkpoint_terminal = parent_batch_id
+        for checkpoint in checkpoints:
+            metrics = dict(checkpoint.metrics or {})
+            start = int(metrics.get("parent_physical_import_batch_id") or metrics.get("previous_import_batch_id") or 0)
+            end = int(metrics.get("physical_import_batch_id") or 0)
+            if start < parent_batch_id or end < start or end > int(candidate.physical_import_batch_id):
+                continue
+            checkpoint_terminal = max(checkpoint_terminal, end)
+            identities = {
+                (str(row.get("recorder_type") or ""), str(row.get("recorder_ref") or ""))
+                for row in metrics.get("recorders", []) if isinstance(row, dict)
+            }
+            covered.append((max(parent_batch_id, start), end, identities))
+        targeted = dict(marks.get("targeted_convergence_repair") or {})
+        targeted_end = int(targeted.get("physical_import_batch_id") or 0)
+        if targeted_end and targeted_end <= int(candidate.physical_import_batch_id):
+            # The targeted repair holds the global physical sequence lock and
+            # records its terminal.  Its actual SLE delta is still checked
+            # below against the candidate-visible prefix and batch metadata.
+            covered.append((checkpoint_terminal, targeted_end, {("*", "*")}))
+    boundary = int(target.physical_import_batch_id) if target is not None else int(
+        db.query(func.max(models.PhysicalImportBatch.id)).scalar() or parent_batch_id
+    )
+    try:
+        backfill_ids = canonical_issue_backfill_source_ids(
+            db, events=rows, physical_import_batch_id=boundary,
+            target_cutoff=cutoff or parent.cutoff,
+        )
+    except PhysicalRefreshProvenanceUnavailable as exc:
+        raise PhysicalRefreshOrchestratorError(str(exc)) from exc
+    source_ids = list(dict.fromkeys(source_ids + list(backfill_ids)))
     query = (
         db.query(
             models.StockLedgerEntry.id,
@@ -1147,6 +1212,8 @@ def _bounded_custody_tail_sle_ids(
             models.StockLedgerEntry.movement_kind,
             models.StockLedgerEntry.posting_at,
             models.StockLedgerEntry.active,
+            models.StockLedgerEntry.recorder_type,
+            models.StockLedgerEntry.recorder_ref,
             models.PhysicalImportBatch.id,
             models.PhysicalImportBatch.status,
             models.PhysicalImportBatch.source_complete,
@@ -1167,7 +1234,13 @@ def _bounded_custody_tail_sle_ids(
             "physical refresh custody tail references missing SLEs "
             f"(source_sle_ids={missing})"
         )
-    cutoff = _utc(target_cutoff, "target cutoff") if target_cutoff is not None else None
+    visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=boundary, cutoff=cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(source_ids)).all()
+    } if source_ids else set()
+    if visible_ids != set(source_ids):
+        raise PhysicalRefreshOrchestratorError("physical refresh custody tail references non-visible SLE")
     for source_id in source_ids:
         (
             _sle_id,
@@ -1176,6 +1249,8 @@ def _bounded_custody_tail_sle_ids(
             movement_kind,
             posting_at,
             active,
+            recorder_type,
+            recorder_ref,
             batch_id,
             batch_status,
             source_complete,
@@ -1187,8 +1262,8 @@ def _bounded_custody_tail_sle_ids(
                 "physical refresh custody tail references inactive SLE "
                 f"(source_sle_id={int(source_id)})"
             )
-        event_id = event_by_source[int(source_id)]
-        if int(sle_item_id) != int(event_components[event_id]):
+        event_id = event_by_source.get(int(source_id))
+        if event_id is not None and int(sle_item_id) != int(event_components[event_id]):
             raise PhysicalRefreshOrchestratorError(
                 "physical refresh custody tail has foreign source item "
                 f"(event_id={event_id}, source_sle_id={int(source_id)}, "
@@ -1219,19 +1294,20 @@ def _bounded_custody_tail_sle_ids(
         if int(ingest_batch_id) <= parent_batch_id:
             continue
         batch_marks = dict(marks or {})
-        previous = batch_marks.get("previous_import_batch_id")
-        try:
-            previous_id = int(previous)
-        except (TypeError, ValueError):
-            previous_id = -1
-        # A post-parent batch is a recoverable retry delta only when its
-        # persisted lineage identifies the preceding physical boundary.  This
-        # excludes arbitrary completed batches from another source/process.
-        if previous_id < parent_batch_id:
+        if (
+            batch_marks.get("source") != "AccumulationRegister_ЗапасыНаСкладах"
+            or batch_marks.get("recorder_type") != recorder_type
+            or batch_marks.get("recorder_ref") != recorder_ref
+            or not any(
+                start < int(batch_id) <= end
+                and ((str(recorder_type), str(recorder_ref)) in identities
+                     or ("*", "*") in identities)
+                for start, end, identities in covered
+            )
+        ):
             raise PhysicalRefreshOrchestratorError(
                 "physical refresh custody tail has foreign batch lineage "
-                f"(source_sle_id={int(source_id)}, batch_id={int(batch_id)}, "
-                f"parent_batch_id={parent_batch_id}, previous_batch_id={previous_id})"
+                f"(source_sle_id={int(source_id)}, batch_id={int(batch_id)})"
             )
     return tuple(source_ids)
 
@@ -1559,6 +1635,7 @@ def run_physical_refresh(
                 after_event_id=custody_event_start,
                 parent_generation_id=int(parent.id),
                 target_cutoff=cutoff,
+                target_generation_id=int(physical_generation.id),
             )
         ))
         # Decision §25: a real change of the supply-relevant supplier-order

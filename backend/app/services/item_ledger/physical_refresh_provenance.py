@@ -12,11 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import func
+from sqlalchemy import func, inspect
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.production_material_custody_events import _custody_event_idempotency_key
 from app.services.production_material_custody_projection import _same_1c_timestamp
+from .physical_visibility import PhysicalVisibilityError, visible_sle_query
 
 
 class PhysicalRefreshProvenanceUnavailable(ValueError):
@@ -178,6 +180,128 @@ def _custody_event_watermark(db: Session) -> int:
     )
 
 
+def canonical_issue_backfill_source_ids(
+    db: Session,
+    *,
+    events: list[models.ProductionMaterialCustodyEvent],
+    physical_import_batch_id: int,
+    target_cutoff: datetime,
+    allowed_sle_ids: set[int] | None = None,
+) -> tuple[int, ...]:
+    """Prove the one local event emitted by the transfer-recorder projector.
+
+    This is deliberately narrower than a general local-event exception.  The
+    opening must name the exact exported material issue, its line and source
+    warehouse, and equal all currently visible outbound physical movement for
+    that component/recorder.  The canonical idempotency key binds its persisted
+    revision; the physical witness must be in the caller's bounded manifest
+    when one is supplied by the current publisher.
+    """
+    witnesses: list[int] = []
+    for event in events:
+        if event.source_sle_id is not None:
+            continue
+        if (
+            event.source_kind != "issue_created"
+            or event.location_kind != "transit"
+            or not event.issue_id
+            or not event.source_ref2c
+            or not event.document_line_no
+            or Decimal(str(event.delta_qty or 0)) <= 0
+        ):
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody tail contains a non-physical event (event_id={event.id})"
+            )
+        issue = db.get(models.ProductionMaterialIssue, int(event.issue_id))
+        try:
+            line_id = int(event.document_line_no)
+        except (TypeError, ValueError):
+            line_id = -1
+        line = db.get(models.ProductionMaterialIssueLine, line_id)
+        link = (
+            db.query(models.SyncLink)
+            .filter(
+                models.SyncLink.source_system == "PRODPLAN",
+                models.SyncLink.source_doctype == "material_issue",
+                models.SyncLink.source_id == int(event.issue_id),
+                models.SyncLink.target_entity == "Document_ПеремещениеЗапасов",
+            )
+            .order_by(models.SyncLink.link_id.desc())
+            .first()
+        )
+        if (
+            issue is None or line is None or link is None
+            or int(line.issue_id) != int(issue.issue_id)
+            or str(issue.direction or "") != "issue"
+            or int(issue.product_id) != int(event.product_id)
+            or int(line.component_item_id) != int(event.component_item_id)
+            or str(link.target_ref_key or "") != str(event.source_ref2c)
+            or str(issue.source_warehouse_ref1c or "") != str(event.source_ref1c or "")
+            or str(issue.document_number or "") != str(event.document_number or "")
+        ):
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody issue backfill has foreign issue/link/line (event_id={event.id})"
+            )
+        revision = int(line.custody_event_revision or 0)
+        if revision <= 0 or not any(
+            _custody_event_idempotency_key(
+                issue_id=int(issue.issue_id), line_id=int(line.line_id),
+                revision=value, source_kind="issue_created",
+                location_kind="transit", warehouse_ref1c=str(event.warehouse_ref1c),
+                delta_qty=float(event.delta_qty), source_sle_id=None,
+            ) == str(event.idempotency_key)
+            for value in range(1, revision + 1)
+        ):
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody issue backfill idempotency key is invalid (event_id={event.id})"
+            )
+        try:
+            outbound = visible_sle_query(
+                db, physical_import_batch_id=int(physical_import_batch_id),
+                cutoff=target_cutoff,
+            ).filter(
+                models.StockLedgerEntry.recorder_type == "Document_ПеремещениеЗапасов",
+                models.StockLedgerEntry.recorder_ref == str(event.source_ref2c),
+                models.StockLedgerEntry.item_id == int(event.component_item_id),
+                models.StockLedgerEntry.warehouse_ref1c == str(event.warehouse_ref1c),
+                models.StockLedgerEntry.movement_kind == "transfer_out",
+            ).all()
+        except PhysicalVisibilityError as exc:
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody issue backfill has no complete physical boundary (event_id={event.id})"
+            ) from exc
+        if (
+            not outbound
+            or sum((-Decimal(str(row.qty)) for row in outbound), Decimal("0"))
+            != Decimal(str(event.delta_qty))
+            or not all(_same_1c_timestamp(row.posting_at, event.effective_at)
+                       for row in outbound)
+            or (allowed_sle_ids is not None
+                and not {int(row.id) for row in outbound}.issubset(allowed_sle_ids))
+        ):
+            raise PhysicalRefreshProvenanceUnavailable(
+                f"custody issue backfill has no exact bounded transfer-out (event_id={event.id})"
+            )
+        for row in outbound:
+            batch = db.get(models.PhysicalImportBatch, int(row.ingest_batch_id))
+            marks = dict(batch.source_watermarks or {}) if batch is not None else {}
+            if (
+                batch is None or batch.status != "completed" or not batch.source_complete
+                or marks.get("source") != "AccumulationRegister_ЗапасыНаСкладах"
+                or marks.get("recorder_type") != row.recorder_type
+                or marks.get("recorder_ref") != row.recorder_ref
+                or Decimal(str(row.qty)) >= 0
+                or (batch.cutoff is not None
+                    and _ordered_1c_timestamps(batch.cutoff, target_cutoff)[0]
+                    > _ordered_1c_timestamps(batch.cutoff, target_cutoff)[1])
+            ):
+                raise PhysicalRefreshProvenanceUnavailable(
+                    f"custody issue backfill has malformed physical batch (event_id={event.id})"
+                )
+            witnesses.append(int(row.id))
+    return tuple(dict.fromkeys(witnesses))
+
+
 def apply_bounded_current_material_custody_events(
     db: Session,
     *,
@@ -192,8 +316,9 @@ def apply_bounded_current_material_custody_events(
     the accepted compact manifest even though the ledger delta itself is
     bounded by the caller.  A generation-wide custody replay here would
     reintroduce the old refresh regression, so only events linked to the
-    caller's persisted SLE ids are accepted.  Local/non-SLE events and any
-    unrelated tail remain unavailable and fail closed.
+    caller's persisted SLE ids are accepted.  The canonical issue-opening
+    backfill is admitted only with an exact visible transfer-out witness in
+    those ids.  Other local events and unrelated tails fail closed.
 
     The caller owns the transaction.  Rows retain their compact identity and
     are moved to the target only by the existing provenance handoff after all
@@ -246,12 +371,18 @@ def apply_bounded_current_material_custody_events(
     if not tail:
         return 0
     if any(
-        event.source_sle_id is None or int(event.source_sle_id) not in explicit
+        event.source_sle_id is not None and int(event.source_sle_id) not in explicit
         for event in tail
     ):
         raise PhysicalRefreshProvenanceUnavailable(
             "custody event tail is not covered by the bounded physical SLE manifest"
         )
+    canonical_issue_backfill_source_ids(
+        db, events=tail,
+        physical_import_batch_id=int(target.physical_import_batch_id),
+        target_cutoff=target.cutoff,
+        allowed_sle_ids=explicit,
+    )
 
     current_rows = (
         db.query(models.ProductionMaterialCustodyProjection)
@@ -295,7 +426,12 @@ def apply_bounded_current_material_custody_events(
                 "bounded custody event would make compact current quantity negative"
             )
         if row is not None and next_qty == 0:
-            db.delete(row)
+            # A canonical opening and its transfer-out can cancel in this
+            # same tail.  The new compact cell has not been INSERTed yet.
+            if inspect(row).pending:
+                db.expunge(row)
+            else:
+                db.delete(row)
             rows_by_key.pop(key, None)
         elif row is not None:
             row.reserved_qty = next_qty
