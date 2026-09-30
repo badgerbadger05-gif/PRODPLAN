@@ -618,6 +618,8 @@ def test_compact_current_production_control_payload_uses_current_sources_and_pub
     )
 
     assert payload["meta"]["ledger_generation_id"] == target.id
+    assert payload["meta"]["root_product_options"] == []
+    assert payload["meta"]["latest_run_id"] == 999
     row = next(row for row in payload["rows"] if row["product_id"] == product.product_id)
     assert row["current_identity"] == f"production-order-line:{order.order_id}:1"
     # Item 28a: the order row keeps the coverage snapshot the current material
@@ -639,6 +641,9 @@ def test_compact_current_production_control_payload_uses_current_sources_and_pub
         payload,
     )
     assert result.changed_rows == len(payload["rows"])
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = target.id
+    db_session.flush()
+    assert list_root_product_options(db_session) == []
     assert db_session.query(models.ReplenishmentWorkItem).count() == 0
     assert db_session.query(models.AssemblyQueueLine).count() == 0
 
@@ -1005,6 +1010,11 @@ def test_compact_make_row_parity_with_legacy_builder(db_session):
         shelf_payload={"rows": []},
         accepted_run_ids=[run.run_id],
     )
+    root_options = compact["meta"]["root_product_options"]
+    assert [option["item_id"] for option in root_options] == [int(reservation.item_id)]
+    assert root_options[0]["item_name"] == "Snapshot MAKE proposal"
+    assert compact["meta"]["latest_run_id"] == run.run_id
+    assert compact["meta"]["latest_source_plan_id"] == run.source_plan_id
     compact_row = next(row for row in compact["rows"] if row.get("product_id") is None)
 
     ignored = {"work_item_id", "journal_row_key", "current_identity"}

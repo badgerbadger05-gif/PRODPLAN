@@ -1089,6 +1089,8 @@ def build_compact_current_production_control_payload(
     truth = _candidate_truth(parent)
     rows: list[dict[str, Any]] = []
     offset = 0
+    latest_run_id: int | None = None
+    latest_source_plan_id: int | None = None
     while True:
         page = list_journal(
             db,
@@ -1098,6 +1100,9 @@ def build_compact_current_production_control_payload(
             limit=_PAGE_SIZE,
             offset=offset,
         )
+        if offset == 0:
+            latest_run_id = page.get("latest_run_id")
+            latest_source_plan_id = page.get("latest_source_plan_id")
         page_rows = page.get("rows")
         if not isinstance(page_rows, list):
             raise ProductionControlJournalPromotionError(
@@ -1460,6 +1465,16 @@ def build_compact_current_production_control_payload(
             str(row.get("current_identity") or ""),
         )
     )
+    root_product_options = _root_product_options(
+        db,
+        {
+            "current_rows": {
+                int(root_id)
+                for row in direct_rows
+                for root_id in row.get("root_item_ids") or ()
+            }
+        },
+    )
     payload = {
         "meta": {
             "ledger_generation_id": int(target.id),
@@ -1467,6 +1482,9 @@ def build_compact_current_production_control_payload(
             "truth_status": "building", "read_only": True,
             "row_count": len(direct_rows),
             "accepted_run_ids": list(run_ids),
+            "root_product_options": root_product_options,
+            "latest_run_id": latest_run_id,
+            "latest_source_plan_id": latest_source_plan_id,
             "compact_source": "current_owners",
         },
         "rows": direct_rows,
