@@ -11,67 +11,57 @@ depends_on = None
 
 
 def _deduplicate(bind) -> None:
-    # Historical generations are provenance copies, not additive stock. Keep
-    # the newest deterministic row for each full physical key before enforcing
-    # the compact unique key. The accepted Ledger fold remains the writer of
-    # the resulting value on the next publication.
+    # Validate provenance copies set-wise. This function never chooses a
+    # newest/latest historical row or adds quantities. Only the exact accepted
+    # pointer selects current stock in upgrade(); BUILDING staging survives.
+    # Return at most one offending key per check instead of materializing the
+    # millions of historical StockBin rows into Python groups.
     current = bind.execute(sa.text(
         "SELECT current_generation_id FROM planning_truth_state WHERE id = 1"
     )).scalar()
-    rows = bind.execute(sa.text(
-        "SELECT b.id, b.item_id, b.characteristic_ref, b.organization_ref, "
-        "b.warehouse_ref1c, b.ledger_generation_id, g.status AS generation_status "
-        "FROM stock_bin b LEFT JOIN ledger_generation g "
-        "ON g.id = b.ledger_generation_id "
-        "ORDER BY b.item_id, b.characteristic_ref, b.organization_ref, "
-        "b.warehouse_ref1c, b.id"
-    )).mappings().all()
-    groups = {}
-    for row in rows:
-        key = (row["item_id"], row["characteristic_ref"], row["organization_ref"], row["warehouse_ref1c"])
-        groups.setdefault(key, []).append(row)
-    for key, candidates in groups.items():
-        if any(row["ledger_generation_id"] is None for row in candidates):
-            raise RuntimeError(f"R6 StockBin provenance missing for physical key {key}")
-        if any(row["generation_status"] is None for row in candidates):
-            raise RuntimeError(f"R6 StockBin generation missing for physical key {key}")
-        by_generation = {}
-        for row in candidates:
-            by_generation.setdefault(int(row["ledger_generation_id"]), 0)
-            by_generation[int(row["ledger_generation_id"])] += 1
-        if any(count != 1 for count in by_generation.values()):
-            raise RuntimeError(
-                f"R6 StockBin migration ambiguous duplicate generation for physical key {key}"
-            )
-        if current is None and len(candidates) > 1:
-            raise RuntimeError(
-                f"R6 StockBin migration ambiguous for physical key {key}: no accepted generation"
-            )
-        if current is None and any(row["generation_status"] != "building" for row in candidates):
-            raise RuntimeError(
-                f"R6 StockBin migration has non-building history without accepted pointer for {key}"
-            )
-        selected = [row for row in candidates if current is not None and row["ledger_generation_id"] == int(current)]
-        if current is not None:
-            if len(selected) > 1:
-                raise RuntimeError(
-                    f"R6 StockBin migration ambiguous for physical key {key}: "
-                    f"expected one row for accepted generation {current}, found {len(selected)}"
-                )
-            if len(selected) == 0:
-                # A key present only in historical accepted/failed copies is
-                # absent from the current accepted fold.  StockBin has no
-                # zero-row owner: retaining or synthesising one would invent
-                # a physical fact.  The cleanup below removes non-BUILDING
-                # historical copies; any BUILDING copy remains explicit
-                # staging.  Do not choose a latest historical heuristic.
-                continue
+    keys = "b.item_id, b.characteristic_ref, b.organization_ref, b.warehouse_ref1c"
+    checks = [
+        (
+            f"SELECT {keys} FROM stock_bin b WHERE b.ledger_generation_id IS NULL LIMIT 1",
+            "R6 StockBin provenance missing for physical key {key}",
+        ),
+        (
+            f"SELECT {keys} FROM stock_bin b LEFT JOIN ledger_generation g "
+            "ON g.id = b.ledger_generation_id WHERE g.status IS NULL LIMIT 1",
+            "R6 StockBin generation missing for physical key {key}",
+        ),
+        (
+            f"SELECT {keys} FROM stock_bin b "
+            f"GROUP BY b.ledger_generation_id, {keys} HAVING COUNT(*) > 1 LIMIT 1",
+            "R6 StockBin migration ambiguous duplicate generation for physical key {key}",
+        ),
+    ]
+    if current is None:
+        checks.extend([
+            (
+                f"SELECT {keys} FROM stock_bin b GROUP BY {keys} HAVING COUNT(*) > 1 LIMIT 1",
+                "R6 StockBin migration ambiguous for physical key {key}: no accepted generation",
+            ),
+            (
+                f"SELECT {keys} FROM stock_bin b JOIN ledger_generation g "
+                "ON g.id = b.ledger_generation_id WHERE g.status <> 'building' LIMIT 1",
+                "R6 StockBin migration has non-building history without accepted pointer for {key}",
+            ),
+        ])
+    for statement, message in checks:
+        row = bind.execute(sa.text(statement)).first()
+        if row is not None:
+            raise RuntimeError(message.format(key=tuple(row)))
 
 
 def upgrade() -> None:
     bind = op.get_bind()
-    op.add_column("stock_bin", sa.Column("is_current", sa.Boolean(), nullable=True))
-    bind.execute(sa.text("UPDATE stock_bin SET is_current = false"))
+    # PostgreSQL 11+ stores this constant default as metadata for old rows:
+    # avoid an UPDATE of every historical copy and its WAL/index churn. Drop
+    # the bootstrap default below to preserve the previous final schema.
+    op.add_column("stock_bin", sa.Column(
+        "is_current", sa.Boolean(), nullable=True, server_default=sa.false(),
+    ))
     _deduplicate(bind)
     if bind.execute(sa.text(
         "SELECT 1 FROM planning_truth_state WHERE id = 1 AND current_generation_id IS NOT NULL"
@@ -93,6 +83,10 @@ def upgrade() -> None:
         ")"
     ))
     with op.batch_alter_table("stock_bin") as batch:
+        batch.alter_column(
+            "is_current", existing_type=sa.Boolean(), existing_nullable=True,
+            server_default=None,
+        )
         batch.drop_constraint("ux_stock_bin_ledger_key", type_="unique")
         batch.create_unique_constraint("ux_stock_bin_generation_key", [
             "ledger_generation_id", "item_id", "characteristic_ref",
