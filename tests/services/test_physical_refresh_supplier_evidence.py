@@ -396,6 +396,73 @@ def test_bounded_buy_stream_collapses_physical_organization_and_skips_outside_co
     assert manifest.scope_receipt_facts[0].planning_stock_pool == "default"
 
 
+@pytest.mark.parametrize("evidence_state", ["valid", "missing", "malformed", "conflicting"])
+def test_bounded_buy_replay_preserves_explicit_non_supplier_expense_exclusion(
+    db_session, monkeypatch, evidence_state,
+):
+    parent, target, parent_batch, target_batch, item = _world(db_session)
+    excluded = _sle(
+        db_session, parent_batch, item, ref="processing-transfer", qty="-481",
+        recorder_type="Document_РасходнаяНакладная",
+    )
+    changed = _sle(db_session, target_batch, item, ref="new-receipt")
+    if evidence_state != "missing":
+        db_session.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=parent.id, stock_ledger_entry_id=excluded.id,
+            receipt_doc_type=excluded.recorder_type, receipt_doc_ref=excluded.recorder_ref,
+            receipt_doc_line_no=excluded.line_no, operation_kind="non_supplier_expense",
+            operation_key="8d970138-9934-11eb-e39a-fa163e61326a",
+            operation_name="unknown" if evidence_state == "malformed" else "ПередачаВПереработку",
+            match_rule="supplier-receipt-non-supplier-exclusion",
+            match_status="excluded_non_supplier", ambiguity_count=0,
+            reason="non-supplier expense operation",
+        ))
+    if evidence_state == "conflicting":
+        db_session.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=target.id, stock_ledger_entry_id=excluded.id,
+            receipt_doc_type=excluded.recorder_type, receipt_doc_ref=excluded.recorder_ref,
+            receipt_doc_line_no=excluded.line_no, operation_kind="supplier_return",
+            operation_key=SUPPLIER_RETURN_OPERATION, operation_name="Возврат поставщику",
+            match_rule="supplier-receipt-unmatched", match_status="unmatched",
+            ambiguity_count=0, reason="no supplier-order link",
+        ))
+    db_session.flush()
+    provenance_before = db_session.query(models.StockLedgerSupplierReceiptProvenance).count()
+    calls = []
+
+    def extract(db, client, rows):
+        calls.extend(int(row.id) for row in rows)
+        return _fake_result((_fake_evidence(changed),))
+
+    monkeypatch.setattr(adapter, "extract_supplier_document_evidence", extract)
+
+    def build():
+        return adapter.build_bounded_supplier_receipt_manifest(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            target_cutoff=target.cutoff, odata_client=object(), changed_sle_ids=(changed.id,),
+            affected_scopes=((item.item_id, "", "", "default", "buy"),),
+            backdate_from=parent.cutoff - timedelta(days=1),
+            planning_pool_by_warehouse={"wh-ref-1": "default"},
+        )
+
+    if evidence_state == "valid":
+        first, second = build(), build()
+        assert first == second
+        assert first.new_sle_ids == (changed.id,)
+        assert [fact.sle_id for fact in first.scope_receipt_facts] == [changed.id]
+        assert calls == [changed.id, changed.id]
+    else:
+        error = {
+            "missing": "lacks persisted supplier provenance",
+            "malformed": "invalid non-supplier exclusion",
+            "conflicting": "inconsistent across generations",
+        }[evidence_state]
+        with pytest.raises(adapter.BoundedSupplierEvidenceError, match=error):
+            build()
+        assert calls == [changed.id]
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == provenance_before
+
+
 def test_empty_delta_is_a_read_only_noop_without_odata_client(db_session):
     parent, target, _parent_batch, _target_batch, item = _world(db_session)
     manifest = adapter.build_bounded_supplier_receipt_manifest(

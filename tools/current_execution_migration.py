@@ -200,10 +200,13 @@ def _quote_identifier(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
-def _table_digest(connection, inspector, table_name: str) -> tuple[int, str]:
+def _table_digest(
+    connection, inspector, table_name: str, *, columns: list[str] | None = None,
+) -> tuple[int, str]:
     """Hash a table in bounded batches, with deterministic key ordering."""
 
-    columns = [str(column["name"]) for column in inspector.get_columns(table_name)]
+    if columns is None:
+        columns = [str(column["name"]) for column in inspector.get_columns(table_name)]
     if not columns:
         return 0, hashlib.sha256(b"").hexdigest()
     primary_key = [str(value) for value in (inspector.get_pk_constraint(table_name).get("constrained_columns") or [])]

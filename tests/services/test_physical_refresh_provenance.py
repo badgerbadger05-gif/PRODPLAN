@@ -735,8 +735,17 @@ def _canonical_backfill_world(db):
     return parent, target, sle, opening, posted, custody
 
 
-def test_canonical_issue_backfill_passes_both_custody_gates_and_publisher(db_session):
+@pytest.mark.parametrize("shared_batch", [False, True])
+def test_canonical_issue_backfill_passes_both_custody_gates_and_publisher(db_session, shared_batch):
     parent, target, sle, opening, posted, custody = _canonical_backfill_world(db_session)
+    if shared_batch:
+        target.physical_import_batch.source_watermarks = {
+            **target.physical_import_batch.source_watermarks,
+            "recorder_ref": "last-unrelated-recorder",
+            "recorders": [{"recorder_type": sle.recorder_type,
+                           "recorder_ref": sle.recorder_ref, "status": "done"}],
+        }
+        db_session.flush()
     assert workflow._bounded_custody_tail_sle_ids(
         db_session, after_event_id=0, parent_generation_id=parent.id,
         target_generation_id=target.id, target_cutoff=target.cutoff,
@@ -756,6 +765,7 @@ def test_canonical_issue_backfill_passes_both_custody_gates_and_publisher(db_ses
 @pytest.mark.parametrize("mutation", [
     "foreign_link", "wrong_qty", "wrong_bucket", "wrong_product",
     "reversal", "future", "incomplete_batch", "bad_key", "foreign_batch",
+    "missing_recorder", "incomplete_recorder", "malformed_manifest",
 ])
 def test_canonical_issue_backfill_rejects_forged_or_unbounded_tail(db_session, mutation):
     parent, target, sle, opening, posted, _custody = _canonical_backfill_world(db_session)
@@ -777,6 +787,15 @@ def test_canonical_issue_backfill_rejects_forged_or_unbounded_tail(db_session, m
         opening.idempotency_key = "forged"
     elif mutation == "foreign_batch":
         target.physical_import_batch.source_watermarks = {"source": "foreign"}
+    elif mutation in {"missing_recorder", "incomplete_recorder", "malformed_manifest"}:
+        target.physical_import_batch.source_watermarks = {
+            **target.physical_import_batch.source_watermarks,
+            "recorders": None if mutation == "malformed_manifest" else [
+                {"recorder_type": sle.recorder_type,
+                 "recorder_ref": "foreign" if mutation == "missing_recorder" else sle.recorder_ref,
+                 "status": "failed" if mutation == "incomplete_recorder" else "done"},
+            ],
+        }
     db_session.flush()
     with pytest.raises((workflow.PhysicalRefreshOrchestratorError,
                         PhysicalRefreshProvenanceUnavailable)):

@@ -52,6 +52,7 @@ from .physical_refresh_retirement_source import (
 from .physical_refresh_provenance import (
     PhysicalRefreshProvenanceUnavailable,
     canonical_issue_backfill_source_ids,
+    physical_batch_has_recorder,
 )
 from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
 from .physical_refresh_import import (
@@ -1317,8 +1318,9 @@ def _bounded_custody_tail_sle_ids(
         batch_marks = dict(marks or {})
         if (
             batch_marks.get("source") != "AccumulationRegister_ЗапасыНаСкладах"
-            or batch_marks.get("recorder_type") != recorder_type
-            or batch_marks.get("recorder_ref") != recorder_ref
+            or not physical_batch_has_recorder(
+                batch_marks, recorder_type=recorder_type, recorder_ref=recorder_ref,
+            )
             or not any(
                 start < int(batch_id) <= end
                 and ((str(recorder_type), str(recorder_ref)) in identities

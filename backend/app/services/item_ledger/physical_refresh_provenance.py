@@ -29,6 +29,30 @@ class PhysicalRefreshProvenanceUnavailable(ValueError):
     """The current compact owner cannot be safely handed to a target."""
 
 
+def physical_batch_has_recorder(
+    marks: dict, *, recorder_type: str, recorder_ref: str,
+) -> bool:
+    """Prove membership in a single-recorder or shared historical batch.
+
+    Window imports share a batch across recorders. Their scalar recorder
+    fields retain only the last pull, while the completed recorder manifest
+    identifies every member. A malformed manifest cannot use scalar fallback.
+    """
+    if "recorders" in marks:
+        manifest = marks["recorders"]
+        return isinstance(manifest, list) and any(
+            isinstance(row, dict)
+            and row.get("recorder_type") == recorder_type
+            and row.get("recorder_ref") == recorder_ref
+            and row.get("status") in {"done", "empty"}
+            for row in manifest
+        )
+    return (
+        marks.get("recorder_type") == recorder_type
+        and marks.get("recorder_ref") == recorder_ref
+    )
+
+
 @dataclass(frozen=True)
 class CompactProvenanceHandoffResult:
     parent_generation_id: int
@@ -292,8 +316,9 @@ def canonical_issue_backfill_source_ids(
             if (
                 batch is None or batch.status != "completed" or not batch.source_complete
                 or marks.get("source") != "AccumulationRegister_ЗапасыНаСкладах"
-                or marks.get("recorder_type") != row.recorder_type
-                or marks.get("recorder_ref") != row.recorder_ref
+                or not physical_batch_has_recorder(
+                    marks, recorder_type=row.recorder_type, recorder_ref=row.recorder_ref,
+                )
                 or Decimal(str(row.qty)) >= 0
                 or (batch.cutoff is not None
                     and _ordered_1c_timestamps(batch.cutoff, target_cutoff)[0]

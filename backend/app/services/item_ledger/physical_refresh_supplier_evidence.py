@@ -45,6 +45,7 @@ from .supplier_receipt_allocation import (
 )
 from .supplier_receipt_odata import (
     SupplierEvidenceExtractionResult,
+    _is_non_supplier_expense_operation,
     extract_supplier_document_evidence,
 )
 
@@ -667,7 +668,9 @@ def _validate_manifest_shape(
     return normalized
 
 
-_SUPPLIER_OPERATION_KINDS = ("supplier_receipt", "correction", "supplier_return")
+_SUPPLIER_OPERATION_KINDS = (
+    "supplier_receipt", "correction", "supplier_return", "non_supplier_expense",
+)
 
 
 def _persisted_scope_evidence(
@@ -701,11 +704,13 @@ def _persisted_scope_evidence(
             _text(row.receipt_doc_ref), _text(row.receipt_doc_line_no),
             _text(row.supplier_order_ref), _text(row.supplier_order_line_no),
             _text(row.operation_kind), _text(row.correction_receipt_ref),
+            _text(row.match_status), _text(row.operation_key), _text(row.operation_name),
         )
         previous_signature = (
             _text(previous.receipt_doc_ref), _text(previous.receipt_doc_line_no),
             _text(previous.supplier_order_ref), _text(previous.supplier_order_line_no),
             _text(previous.operation_kind), _text(previous.correction_receipt_ref),
+            _text(previous.match_status), _text(previous.operation_key), _text(previous.operation_name),
         )
         if signature != previous_signature:
             raise BoundedSupplierEvidenceError(
@@ -785,7 +790,24 @@ def _bounded_scope_receipt_facts(
                 f"for SLE {int(row.id)}; explicit maintenance replay is required"
             )
         if _text(evidence.match_status) == "excluded_non_supplier":
+            if (
+                _text(evidence.operation_kind) != "non_supplier_expense"
+                or _text(evidence.match_rule) != "supplier-receipt-non-supplier-exclusion"
+                or evidence.supplier_order_ref is not None
+                or evidence.supplier_order_line_no is not None
+                or not _is_non_supplier_expense_operation(
+                    _text(row.recorder_type), _text(evidence.operation_key),
+                    _text(evidence.operation_name),
+                )
+            ):
+                raise BoundedSupplierEvidenceError(
+                    f"bounded BUY scope has invalid non-supplier exclusion for SLE {int(row.id)}"
+                )
             continue
+        if _text(evidence.operation_kind) == "non_supplier_expense":
+            raise BoundedSupplierEvidenceError(
+                f"bounded BUY scope has invalid non-supplier classification for SLE {int(row.id)}"
+            )
         if _text(evidence.match_status) == "ambiguous":
             raise BoundedSupplierEvidenceError(
                 "bounded BUY scope evidence has ambiguous supplier-order "

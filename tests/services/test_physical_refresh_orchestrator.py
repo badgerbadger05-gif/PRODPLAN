@@ -141,8 +141,11 @@ def _accepted_parent(db_session, *, generation_key="accepted-parent"):
     return parent, parent_batch
 
 
+@pytest.mark.parametrize("batch_shape", [
+    "single", "shared", "shared-missing", "shared-incomplete", "no-checkpoint",
+])
 def test_crash_recovery_discovers_completed_custody_tail_with_sequence_gaps(
-    db_session,
+    db_session, batch_shape,
 ):
     parent, parent_batch = _accepted_parent(
         db_session, generation_key="custody-crash-recovery"
@@ -221,6 +224,25 @@ def test_crash_recovery_discovers_completed_custody_tail_with_sequence_gaps(
     ]
     db_session.add_all(entries)
     db_session.flush()
+    if batch_shape.startswith("shared"):
+        # Window imports persist all recorder membership while scalar fields
+        # retain only the last recorder, as in staged batch 15855.
+        batch.source_watermarks = {
+            **batch.source_watermarks,
+            "recorder_ref": "last-unrelated-recorder",
+            "recorders": [
+                {"recorder_type": "Document_Transfer",
+                 "recorder_ref": "custody-crash-recorder",
+                 "status": "failed" if batch_shape == "shared-incomplete" else "done"},
+                {"recorder_type": "Document_Transfer",
+                 "recorder_ref": "last-unrelated-recorder", "status": "done"},
+            ] if batch_shape != "shared-missing" else [],
+        }
+    if batch_shape == "no-checkpoint":
+        checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+            ledger_generation_id=candidate.id, stage="physical_import",
+        ).one()
+        checkpoint.status = "building"
     db_session.add_all([
         models.ProductionMaterialCustodyEvent(
             id=4588,
@@ -248,6 +270,14 @@ def test_crash_recovery_discovers_completed_custody_tail_with_sequence_gaps(
         ),
     ])
     db_session.flush()
+
+    if batch_shape in {"shared-missing", "shared-incomplete", "no-checkpoint"}:
+        with pytest.raises(workflow.PhysicalRefreshOrchestratorError, match="foreign batch lineage"):
+            workflow._bounded_custody_tail_sle_ids(
+                db_session, after_event_id=4263,
+                parent_generation_id=parent.id, target_cutoff=target_cutoff,
+            )
+        return
 
     sle_statements = []
     connection = db_session.connection()
