@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from sqlalchemy import bindparam, create_engine, inspect, text
+from sqlalchemy import types as sqltypes
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -200,18 +201,131 @@ def _quote_identifier(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
+_DIGEST_BATCH_ROWS = 512
+_DIGEST_BATCH_BYTES = 1024 * 1024
+
+
+def _default_psycopg2_json_codec(connection) -> bool:
+    """Prove the effective native JSON loaders are psycopg2's defaults."""
+    dialect = getattr(connection, "dialect", None)
+    if getattr(dialect, "driver", None) != "psycopg2":
+        return False
+    if getattr(dialect, "_json_deserializer", None) is not None:
+        return False
+    try:
+        import psycopg2
+        from psycopg2 import extensions
+
+        raw = connection.connection.driver_connection
+        if type(raw) is not extensions.connection:
+            return False
+        if raw.cursor_factory not in (None, extensions.cursor):
+            return False
+        # CAST JSON AS TEXT must also retain the default text transport codec;
+        # a registered custom TEXT loader could otherwise change the value.
+        for oid, default in ((25, psycopg2.STRING), (114, extensions.JSON), (3802, extensions.JSONB)):
+            effective = raw.string_types.get(oid, extensions.string_types.get(oid))
+            if effective is not default:
+                return False
+    except (ImportError, AttributeError):
+        return False
+    return True
+
+
+def _digest_fetch_plan(connection, definitions, table_name: str, columns: list[str]):
+    """Bound scalar/raw-JSON transport; decoded JSON stays one row at a time.
+
+    Arrays, binary and unknown types always remain one-row streaming. JSON
+    batches are permitted only as bounded raw text with a proven default
+    psycopg2 codec; no batch of decoded object graphs is ever accumulated.
+    """
+    # SQLite does not enforce declared varchar widths or numeric precision;
+    # unknown dialects cannot supply the PostgreSQL schema bounds used here.
+    if getattr(getattr(connection, "dialect", None), "name", None) != "postgresql":
+        return 1, ()
+    by_name = {str(column["name"]): column for column in definitions}
+    estimated_row_bytes = 256
+    text_columns = []
+    json_columns = []
+    for column in columns:
+        datatype = by_name.get(column, {}).get("type")
+        if isinstance(datatype, (sqltypes.Integer, sqltypes.Boolean)):
+            estimated_row_bytes += 256
+        elif isinstance(datatype, (sqltypes.Date, sqltypes.DateTime, sqltypes.Time, sqltypes.Uuid)):
+            estimated_row_bytes += 512
+        elif isinstance(datatype, sqltypes.Numeric) and not isinstance(datatype, sqltypes.Float):
+            precision = datatype.precision
+            if type(precision) is not int or precision <= 0:
+                return 1, ()
+            estimated_row_bytes += 256 + 3 * (precision + abs(datatype.scale or 0) + 32)
+        elif isinstance(datatype, sqltypes.String):
+            length = datatype.length
+            if length is None:
+                text_columns.append(column)
+            elif type(length) is int and length >= 0:
+                # varchar length counts characters: UTF-8 wire <=4 bytes,
+                # decoded unicode <=4, JSON control escapes <=6 per char.
+                estimated_row_bytes += 192 + 14 * length
+            else:
+                return 1, ()
+        elif isinstance(datatype, sqltypes.JSON):
+            json_columns.append(column)
+        else:
+            return 1, ()
+    if json_columns and not _default_psycopg2_json_codec(connection):
+        return 1, ()
+    if text_columns or json_columns:
+        # A content MAX is a bound only while its snapshot cannot change.
+        # Under READ COMMITTED a writer may add a wide value after the probe.
+        if getattr(getattr(connection, "dialect", None), "name", None) != "postgresql":
+            return 1, ()
+        if connection.get_isolation_level().upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+            return 1, ()
+        expressions = ", ".join([
+            *(f"MAX(octet_length({_quote_identifier(column)}))" for column in text_columns),
+            *(f"MAX(octet_length(CAST({_quote_identifier(column)} AS TEXT)))" for column in json_columns),
+        ])
+        maxima = connection.execute(text(
+            f"SELECT {expressions} FROM {_quote_identifier(table_name)}"
+        )).one()
+        for maximum in maxima:
+            if maximum is not None and (type(maximum) is not int or maximum < 0):
+                return 1, ()
+            # Octet length bounds raw bytes; account conservatively for
+            # decoded Unicode objects and escaped JSON as well as wire data.
+            estimated_row_bytes += 192 + 11 * (maximum or 0)
+    fetch_size = max(1, min(_DIGEST_BATCH_ROWS, _DIGEST_BATCH_BYTES // estimated_row_bytes))
+    return fetch_size, tuple(json_columns) if fetch_size > 1 else ()
+
+
+def _digest_fetch_size(connection, definitions, table_name: str, columns: list[str]) -> int:
+    return _digest_fetch_plan(connection, definitions, table_name, columns)[0]
+
+
 def _table_digest(
     connection, inspector, table_name: str, *, columns: list[str] | None = None,
 ) -> tuple[int, str]:
     """Hash a table in bounded batches, with deterministic key ordering."""
 
+    definitions = inspector.get_columns(table_name)
     if columns is None:
-        columns = [str(column["name"]) for column in inspector.get_columns(table_name)]
+        columns = [str(column["name"]) for column in definitions]
     if not columns:
         return 0, hashlib.sha256(b"").hexdigest()
     primary_key = [str(value) for value in (inspector.get_pk_constraint(table_name).get("constrained_columns") or [])]
     ordering = primary_key or columns
-    select_list = ", ".join(_quote_identifier(column) for column in columns)
+    fetch_size, raw_json_columns = _digest_fetch_plan(connection, definitions, table_name, columns)
+    if raw_json_columns and (not primary_key or set(raw_json_columns).intersection(primary_key)):
+        # Without a PK, ORDER BY uses all source columns. CAST aliases must
+        # not replace native JSONB ordering with lexical text ordering or make
+        # unorderable JSON silently pass. A JSONB PK also has native ordering.
+        # Retain the original native stream in either case.
+        fetch_size, raw_json_columns = 1, ()
+    select_list = ", ".join(
+        f"CAST({_quote_identifier(column)} AS TEXT) AS {_quote_identifier(column)}"
+        if column in raw_json_columns else _quote_identifier(column)
+        for column in columns
+    )
     order_by = ", ".join(_quote_identifier(column) for column in ordering)
     statement = text(
         f"SELECT {select_list} FROM {_quote_identifier(table_name)} "
@@ -219,15 +333,17 @@ def _table_digest(
     )
     digest = hashlib.sha256()
     count = 0
-    # Some restored production tables contain large JSON/TOAST values.  A
-    # fixed-size fetchmany batch retains every decoded value in that batch
-    # while each row is also serialized for hashing.  Keep both the DB cursor
-    # and Python-side row buffer to one row so manifest memory is independent
-    # of table row count (apart from the largest individual row).
-    result = connection.execution_options(stream_results=True, yield_per=1).execute(statement)
+    # Wide/unknown values retain one-row behavior. Proven bounded scalar rows
+    # can use a limited batch, avoiding millions of server FETCH round trips.
+    result = connection.execution_options(stream_results=True, yield_per=fetch_size).execute(statement)
     try:
         for row in result:
-            values = [row._mapping[column] for column in columns]
+            values = [
+                json.loads(row._mapping[column])
+                if column in raw_json_columns and row._mapping[column] is not None
+                else row._mapping[column]
+                for column in columns
+            ]
             encoded = json.dumps(values, ensure_ascii=False, sort_keys=False, default=str, separators=(",", ":")).encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
@@ -336,8 +452,6 @@ def _current_dependencies(connection, table_names: set[str]) -> list[dict[str, A
 def build_manifest(engine: Engine) -> dict[str, Any]:
     """Build a deterministic, read-only migration manifest for one database."""
 
-    inspector = inspect(engine)
-    table_names = set(inspector.get_table_names())
     categories: dict[str, dict[str, dict[str, Any]]] = {
         "preserve": {},
         "migrate": {},
@@ -346,6 +460,11 @@ def build_manifest(engine: Engine) -> dict[str, Any]:
     }
     known_schema_tables = _known_schema_tables()
     with engine.connect() as connection:
+        if connection.dialect.name == "postgresql":
+            connection = connection.execution_options(isolation_level="REPEATABLE READ")
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+        inspector = inspect(connection)
+        table_names = set(inspector.get_table_names())
         for table_name in sorted(table_names):
             count, checksum = _table_digest(connection, inspector, table_name)
             if table_name in _PRESERVE_REASONS:

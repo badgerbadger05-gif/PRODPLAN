@@ -155,3 +155,27 @@ parent. Нулевой вход отмечается `no_op` и не засчи�
 pointer, balance convergence, нулевой custody-хвост и 11 готовых scopes.
 BUILDING или foreign terminal до запуска требуют отдельной поддержанной
 recovery-процедуры на локальной копии; runner не очищает их автоматически.
+
+## §58, физический fold и API после миграции
+
+После подтверждённого `verify-after`, head `20260925_01` и необходимого
+physical refresh использовать `tools/local_cutover_postflight.py`:
+
+```powershell
+python tools/local_cutover_postflight.py rebase --database prodplan_weekend_20261002 --port 55441 --generation <accepted-id> --writers-stopped --max-seconds <upfront-budget> --output output/rehearsal/rebase.json
+python tools/local_cutover_postflight.py fold --database prodplan_weekend_20261002 --port 55441 --generation <accepted-id> --writers-stopped --max-seconds <upfront-budget> --output output/rehearsal/physical-fold.json
+python tools/local_cutover_postflight.py api --database prodplan_weekend_20261002 --port 55441 --generation <accepted-id> --writers-stopped --max-seconds <upfront-budget> --output output/rehearsal/api.json
+```
+
+`rebase` использует только существующий canonical allocator и обязательно
+republish в той же транзакции, даже при нуле changed pairs. Изменение frozen
+или operator fingerprint и превышение бюджета откатывают транзакцию.
+`fold` читает каноническую physical visibility и fold с full key и последним
+SLE witness; `api` исполняет GET без lifespan, с SQL/ORM/network guards.
+Эти receipts не заменяют визуальный smoke и проверку переноса fenced источника.
+
+Инвентаризация R10 сохраняет прежний row-JSON SHA и порядок, но читает
+доказанно ограниченные scalar строки пакетами. Малый JSON в стабильном
+snapshot передаётся как ограниченный raw text и декодируется по одной строке
+перед хешем. Wide/unknown/custom-codec и небезопасный JSON primary key остаются
+в native one-row режиме. Это не исключение строк или колонок из проверки.
