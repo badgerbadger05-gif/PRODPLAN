@@ -33,7 +33,7 @@ def _read_owner_document(name: str) -> str:
 # Рабочий каталог держит внутри репозитория посторонние чекауты: worktree фоновых
 # задач и распакованные копии для деплоя. Это не исходники проекта, и канон по
 # ним не проверяется — иначе сторож ловит копию самого себя.
-_SCRATCH_DIRS = {".tmp", ".claude", ".git", "node_modules", "__pycache__", ".venv"}
+_SCRATCH_DIRS = {".tmp", ".claude", ".git", ".kilo", "node_modules", "__pycache__", ".venv"}
 
 
 def _python_sources(root: Path):
