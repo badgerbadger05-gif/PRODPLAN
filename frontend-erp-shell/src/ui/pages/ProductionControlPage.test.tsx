@@ -606,11 +606,12 @@ describe('ProductionControlPage — characterization', () => {
     expect(within(rowFor('Вал')).getByRole('checkbox')).not.toBeChecked()
   })
 
-  it('activates the exact current production row from a stable identity link', async () => {
-    renderPage(['/production-control?current_identity=production%3Aorder%3A102'])
+  it.each(['current_identity', 'active_current_identity'])('opens the full journal and activates the saved row from %s', async (parameter) => {
+    renderPage([`/production-control?${parameter}=production%3Aorder%3A102`])
     await screen.findByText('MRP run: 77')
 
-    expect(vi.mocked(listProductionOrders).mock.calls[0][0].get('current_identity')).toBe('production:order:102')
+    expect(vi.mocked(listProductionOrders).mock.calls[0][0].get('current_identity')).toBeNull()
+    expect(screen.getByTestId('location-search').textContent).toContain('active_current_identity=production%3Aorder%3A102')
     expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
     expect(rowFor('Кронштейн')).toHaveAttribute('aria-selected', 'false')
   })
@@ -628,7 +629,8 @@ describe('ProductionControlPage — characterization', () => {
       expect(params.get('product_id')).toBe('101')
       expect(params.get('order_id')).toBe('5')
       expect(params.get('active_product_id')).toBeNull()
-      expect(params.get('current_identity')).toBe('production:order:102')
+      expect(params.get('active_current_identity')).toBe('production:order:102')
+      expect(params.get('current_identity')).toBeNull()
     })
   })
 
