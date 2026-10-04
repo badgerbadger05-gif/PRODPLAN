@@ -588,7 +588,7 @@ describe('ProductionControlPage — characterization', () => {
   it('switches and selects compact MRP rows without legacy locators without reloading the journal', async () => {
     const user = userEvent.setup()
     const rows = fakeRows().map((row) => ({ ...row, product_id: null, work_item_id: null }))
-    vi.mocked(listProductionOrders).mockResolvedValue({ rows, total: 2, latest_run_id: 77, truth_meta: fakeTruthMeta })
+    vi.mocked(listProductionOrders).mockResolvedValue({ rows, total: 2, limit: 100, offset: 0, latest_run_id: 77, truth_meta: fakeTruthMeta })
     renderPage()
     await screen.findByText('MRP run: 77')
     const initialCalls = vi.mocked(listProductionOrders).mock.calls.length
@@ -643,10 +643,10 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Настройки' }))
     expect(await screen.findByRole('heading', { name: 'Настройки журнала' })).toBeVisible()
     expect(getProductionControlSettings).toHaveBeenCalled()
-    await user.click(screen.getByRole('button', { name: 'Закрыть', exact: true }))
-    await user.click(screen.getByRole('button', { name: 'Корневое изделие', exact: true }))
+    await user.click(screen.getByRole('button', { name: 'Закрыть' }))
+    await user.click(screen.getByRole('button', { name: 'Корневое изделие' }))
     expect(screen.getByText('Корневое изделие плана')).toBeVisible()
-    await user.click(screen.getByRole('button', { name: 'Закрыть', exact: true }))
+    await user.click(screen.getByRole('button', { name: 'Закрыть' }))
     await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: 'Печать маршрутных' }))
     await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalled())
