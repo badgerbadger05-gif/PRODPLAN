@@ -161,8 +161,9 @@ class OData1CClient:
                     f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
                 )
 
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
                 # Network errors may be transient too (DNS/connection reset)
+                # urlopen/read can raise timeout/reset directly, without URLError.
                 if attempt < int(retries):
                     time.sleep(max(0.1, min(float(retry_backoff_sec) * (2 ** attempt), 30.0)))
                     last_err = e

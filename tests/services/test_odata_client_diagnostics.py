@@ -6,6 +6,8 @@ there is just less data".
 """
 
 import logging
+import json
+import urllib.error
 
 import pytest
 
@@ -15,6 +17,59 @@ from app.services.odata_client import OData1CClient, _resolve_warehouse_mapping
 
 def _guid(n: int) -> str:
     return f"{n:08d}-0000-0000-0000-000000000000"
+
+
+@pytest.mark.parametrize("timeout_during_read", [False, True])
+@pytest.mark.parametrize("network_error", [TimeoutError, ConnectionResetError])
+def test_direct_timeout_retries_the_same_catalog_batch(monkeypatch, timeout_during_read, network_error):
+    requested = []
+    expected = {"value": [{"Ref_Key": _guid(7), "Code": "007"}]}
+
+    class Response:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            if timeout_during_read and len(requested) == 1:
+                raise network_error("transport interrupted")
+            return json.dumps(expected).encode()
+
+    def open_request(request, timeout):
+        requested.append((request.full_url, request.get_method()))
+        if not timeout_during_read and len(requested) == 1:
+            raise network_error("transport interrupted")
+        return Response()
+
+    monkeypatch.setattr(odata_client.urllib.request, "urlopen", open_request)
+    monkeypatch.setattr(odata_client.time, "sleep", lambda seconds: None)
+    result = OData1CClient("http://1c/odata")._make_request(
+        "Catalog_Номенклатура", {"$filter": f"Ref_Key eq guid'{_guid(7)}'"}, retries=1,
+    )
+    assert result == expected
+    assert len(requested) == 2
+    assert requested[0] == requested[1]
+    assert requested[0][1] == "GET"
+
+
+@pytest.mark.parametrize("network_error", [TimeoutError, ConnectionResetError])
+def test_direct_timeout_exhaustion_fails_without_partial_result(monkeypatch, network_error):
+    calls = []
+
+    def unavailable(request, timeout):
+        calls.append(request.full_url)
+        raise network_error("transport interrupted")
+
+    monkeypatch.setattr(odata_client.urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(odata_client.time, "sleep", lambda seconds: None)
+    with pytest.raises(urllib.error.URLError, match="transport interrupted"):
+        OData1CClient("http://1c/odata")._make_request("Catalog_Номенклатура", retries=1)
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
 
 
 def test_get_all_flags_max_pages_truncation(monkeypatch, caplog):
