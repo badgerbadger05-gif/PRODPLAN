@@ -1597,27 +1597,14 @@ describe('ProductionControlPage — characterization', () => {
     expect(produceOrderLine).not.toHaveBeenCalled()
   })
 
-  it('offers explicit close only for one selected row with the backend action', async () => {
-    vi.mocked(closeProductionOrder).mockResolvedValue({
-      status: 'ok', dry_run: false, orders_requested: 1, orders_eligible: 1,
-      orders_closed: 1, orders_error: 0,
-    })
+  it('uses Produce for completion and never offers a separate legacy close command', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
     await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
-    const closeButton = screen.getByRole('button', { name: 'Закрыть в 1С' })
-    expect(closeButton).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Произвести' })).toHaveAttribute(
-      'title',
-      expect.not.stringContaining('завершить'),
-    )
-    await user.click(closeButton)
-    await waitFor(() => expect(closeProductionOrder).toHaveBeenCalledWith(101, {
-      dry_run: false,
-      current_identity: 'production:order:101',
-      expected_source_revision: 'rev-7',
-    }))
+    expect(screen.queryByRole('button', { name: 'Закрыть в 1С' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Произвести' })).toHaveAttribute('title', expect.stringContaining('завершить заказ'))
+    expect(closeProductionOrder).not.toHaveBeenCalled()
   })
 
   it('"Синхронизировать" reads order completion and transfer state from 1C', async () => {

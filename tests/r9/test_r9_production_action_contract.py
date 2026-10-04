@@ -155,19 +155,20 @@ def test_produce_uses_current_identity_before_fake_1c_steps(monkeypatch, db_sess
     assert calls == ["manufacture", "piecework"]
 
 
-def test_produce_does_not_close_order_after_documents_are_queued(monkeypatch, db_session):
-    """Produce/read-back remains a fact command; close is an explicit action."""
+@pytest.mark.parametrize("partial", [False, True])
+def test_produce_finishes_with_resumable_operator_order_completion(monkeypatch, db_session, partial):
+    """Decision §12.3: completion follows both exports within Produce."""
     generation = _accepted_generation(db_session)
     _current_production_scope(db_session, generation)
     db_session.commit()
     import app.routers.production_control as router
 
     close_calls = []
-    monkeypatch.setattr(
-        router,
-        "produce_line",
-        lambda *args, **kwargs: {"manufacture_id": 8, "order_id": 9},
-    )
+    produce_options = []
+    def produce_stub(*args, **kwargs):
+        produce_options.append(kwargs)
+        return {"manufacture_id": 8, "order_id": 9}
+    monkeypatch.setattr(router, "produce_line", produce_stub)
     monkeypatch.setattr(
         router,
         "export_manufactures_to_1c",
@@ -182,8 +183,8 @@ def test_produce_does_not_close_order_after_documents_are_queued(monkeypatch, db
     monkeypatch.setattr(
         production_export,
         "finalize_produced_orders_to_1c",
-        lambda *args, **kwargs: close_calls.append(True) or {
-            "message": "legacy auto-close",
+        lambda *args, **kwargs: close_calls.append((args[1], kwargs)) or {
+            "message": "operator completion",
             "resume_required": False,
         },
     )
@@ -193,6 +194,7 @@ def test_produce_does_not_close_order_after_documents_are_queued(monkeypatch, db
         ProduceLinePayload(
             qty=1,
             request_key="produce-once",
+            partial=partial,
             current_identity="order:77",
             expected_source_revision="accepted:g1",
         ),
@@ -200,7 +202,8 @@ def test_produce_does_not_close_order_after_documents_are_queued(monkeypatch, db
     )
 
     assert result["ledger_readback"] == "queued"
-    assert close_calls == []
+    assert close_calls == [([9], {"manufacture_ids": [8]})]
+    assert produce_options[0]["complete_order"] is (not partial)
 
 
 def test_accepted_production_fact_is_not_hidden_by_closed_order_status(db_session, monkeypatch):

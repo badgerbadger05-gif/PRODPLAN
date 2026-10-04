@@ -2136,15 +2136,12 @@ def post_produce_line(
                     "1С не создала и не провела СдельныйНаряд",
                 )
             )
-        # Produce creates and posts execution documents, then queues the
-        # accepted Item Ledger read-back.  It must not close the order: closure
-        # is a separate explicit operator action at /close.
-        completion = {
-            "status": "pending_ledger_fact",
-            "orders_closed": 0,
-            "resume_required": False,
-            "message": "Выпуск и сдельный оформлены. Ожидается подтверждение факта в принятом Ledger; заказ остаётся открытым.",
-        }
+        # Decision §12.3: explicit Produce completes after both document exports.
+        # The existing finalizer preserves partial output and resumable read-back.
+        from app.services.one_c_production_order_export import finalize_produced_orders_to_1c
+        completion = finalize_produced_orders_to_1c(
+            db, [int(command["order_id"])], manufacture_ids=[manufacture_id],
+        )
         return {
             **command,
             "order_completion": completion,
