@@ -3,7 +3,7 @@ import { productionRowId } from './model'
 
 type Props = {
   rows: OrderRow[]
-  selectedIds: Set<number>
+  selectedIds: Set<number | string>
   loading: boolean
   onExportTo1C: () => void
   onSyncFrom1C: () => void
@@ -40,13 +40,18 @@ export function ProductionCommandBar({
 }: Props) {
   const selectedRows = rows.filter((row) => selectedIds.has(productionRowId(row)))
   const selectedOrders = selectedRows.filter((row) => row.product_id != null)
+  const canLaunch = selectedRows.length > 0 && selectedRows.every((row) =>
+    (row.product_id != null || row.work_item_id != null)
+    && Boolean(row.current_identity && row.source_revision)
+    && !row.selection_disabled_reason,
+  )
   const canProduce = selectedOrders.length === 1 && selectedRows.length === 1
   const canClose = canProduce
     && selectedRows[0]?.available_actions?.includes('close_1c')
     && Boolean(selectedRows[0]?.current_identity && selectedRows[0]?.source_revision)
   return (
     <div className="commandBar">
-      <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
+      <button className="primary" onClick={onExportTo1C} disabled={!canLaunch || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
       <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный; факт будет принят после read-back Ledger">Произвести</button>
       <button onClick={onClose} disabled={!canClose || loading} title="Явно завершить выбранный заказ в 1С">Закрыть в 1С</button>
       <button onClick={onPiecework} disabled={!canProduce || loading}

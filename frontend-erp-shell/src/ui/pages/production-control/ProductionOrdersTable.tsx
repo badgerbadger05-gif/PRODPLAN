@@ -10,12 +10,12 @@ type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
   activeIdentity?: string | null
-  selectedIds: Set<number>
+  selectedIds: Set<number | string>
   launchQtyByWorkItem: Readonly<Record<number, number>>
   sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
   outputFactsAvailable: boolean
-  onSelectIds: (ids: Set<number>) => void
-  onActivate: (id: number) => void
+  onSelectIds: (ids: Set<number | string>) => void
+  onActivate: (id: number | string) => void
   onOpenMaterials: (row: OrderRow) => void
   onChangeStatus: (row: OrderRow, status: string) => void
   onToggleSort: (key: ProductionOrderSortKey) => void

@@ -158,3 +158,22 @@ def test_get_order_line_materials_returns_503_when_future_supply_capability_miss
     payload = response.json()
     assert payload["detail"]["code"] == "planning_truth_unavailable"
     assert payload["detail"]["cutoff"] == "2026-09-07T05:32:21+00:00"
+
+
+def test_make_locators_isolate_missing_and_ambiguous_reservation_owners(monkeypatch):
+    from types import SimpleNamespace
+    from app.routers.production_control import _current_make_work_item_ids
+    from app.services.item_ledger import reservation_current
+
+    class Rows:
+        def __init__(self, rows): self.rows = rows
+        def filter(self, *args): return self
+        def all(self): return self.rows
+
+    owners = [SimpleNamespace(id=1, requirement_id=10, item_id=20),
+              SimpleNamespace(id=2, requirement_id=11, item_id=21),
+              SimpleNamespace(id=3, requirement_id=11, item_id=21)]
+    monkeypatch.setattr(reservation_current, 'current_reservation_query', lambda *a, **k: Rows(owners))
+    db = SimpleNamespace(query=lambda *a: Rows([SimpleNamespace(id=100, reservation_id=1)]))
+    rows = [{'source_mrp_requirement_id': r, 'item_id': i} for r, i in [(10, 20), (11, 21), (12, 22)]]
+    assert _current_make_work_item_ids(db, generation_id=1704, rows=rows) == {(10, 20): 100}

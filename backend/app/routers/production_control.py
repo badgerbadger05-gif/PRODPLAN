@@ -1436,13 +1436,15 @@ def _current_make_work_item_ids(
         models.ReservationEntry.realization_mode == "make",
         models.ReservationEntry.lifecycle_status == "active",
     ).all()
-    owners = {
-        (int(row.requirement_id), int(row.item_id)): row
-        for row in reservations
-        if (int(row.requirement_id), int(row.item_id)) in keys
-    }
-    if len(owners) != len(keys):
-        return {}
+    owner_candidates: dict[tuple[int, int], list[Any]] = {}
+    for reservation in reservations:
+        key = (int(reservation.requirement_id), int(reservation.item_id))
+        if key in keys:
+            owner_candidates.setdefault(key, []).append(reservation)
+    # Missing or ambiguous ownership blocks only that row, never unrelated
+    # current rows in the same journal page.
+    owners = {key: candidates[0] for key, candidates in owner_candidates.items()
+              if len(candidates) == 1}
     work_rows = db.query(models.ReplenishmentWorkItem).filter(
         models.ReplenishmentWorkItem.reservation_id.in_(
             [int(row.id) for row in owners.values()]

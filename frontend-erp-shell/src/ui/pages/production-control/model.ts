@@ -149,15 +149,15 @@ export function nextProductionSort(
 
 export function activeProductionRow(
   rows: readonly OrderRow[],
-  activeId: number | null,
+  activeId: number | string | null,
 ): OrderRow | null {
   return rows.find((row) => productionRowId(row) === activeId) ?? rows[0] ?? null
 }
 
-export function productionRowId(row: OrderRow): number {
+export function productionRowId(row: OrderRow): number | string {
   if (row.product_id != null) return row.product_id
   if (row.work_item_id != null) return -row.work_item_id
-  return 0
+  return row.current_identity || row.journal_row_key || 0
 }
 
 export function productionRowProductIds(row: OrderRow): number[] {
@@ -169,18 +169,18 @@ export function productionRowProductIds(row: OrderRow): number[] {
 
 export function selectedProductionRows(
   rows: readonly OrderRow[],
-  selectedIds: ReadonlySet<number>,
+  selectedIds: ReadonlySet<number | string>,
 ): OrderRow[] {
   return rows.filter((row) => selectedIds.has(productionRowId(row)))
 }
 
-export function productionRow(rows: readonly OrderRow[], productId: number | null): OrderRow | null {
+export function productionRow(rows: readonly OrderRow[], productId: number | string | null): OrderRow | null {
   return rows.find((row) => productionRowId(row) === productId) ?? null
 }
 
 export function deletableProductionRows(
   rows: readonly OrderRow[],
-  selectedIds: ReadonlySet<number>,
+  selectedIds: ReadonlySet<number | string>,
 ): OrderRow[] {
   return selectedProductionRows(rows, selectedIds).filter(
     (row) => row.product_id != null && row.order_id != null && !row.order_ref1c,

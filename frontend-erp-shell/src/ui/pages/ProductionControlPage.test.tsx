@@ -58,6 +58,7 @@ vi.mock('../../services/itemLedger', () => ({
 }))
 
 import {
+  getProductionControlSettings,
   listProductionOrders,
   listDrumSchedule,
   listAssemblyQueue,
@@ -584,6 +585,27 @@ describe('ProductionControlPage — characterization', () => {
     expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
   })
 
+  it('switches and selects compact MRP rows without legacy locators without reloading the journal', async () => {
+    const user = userEvent.setup()
+    const rows = fakeRows().map((row) => ({ ...row, product_id: null, work_item_id: null }))
+    vi.mocked(listProductionOrders).mockResolvedValue({ rows, total: 2, latest_run_id: 77, truth_meta: fakeTruthMeta })
+    renderPage()
+    await screen.findByText('MRP run: 77')
+    const initialCalls = vi.mocked(listProductionOrders).mock.calls.length
+    await user.click(rowFor('Вал'))
+    expect(rowFor('Вал')).toHaveAttribute('aria-selected', 'true')
+    expect(rowFor('Кронштейн')).toHaveAttribute('aria-selected', 'false')
+    expect(vi.mocked(listProductionOrders).mock.calls.length).toBe(initialCalls)
+    await user.click(within(rowFor('Вал')).getByRole('checkbox'))
+    expect(within(rowFor('Вал')).getByRole('checkbox')).toBeChecked()
+    expect(within(rowFor('Кронштейн')).getByRole('checkbox')).not.toBeChecked()
+    expect(screen.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Выбрать все' }))
+    expect(within(rowFor('Кронштейн')).getByRole('checkbox')).toBeChecked()
+    await user.click(screen.getByRole('button', { name: 'Снять выбор' }))
+    expect(within(rowFor('Вал')).getByRole('checkbox')).not.toBeChecked()
+  })
+
   it('activates the exact current production row from a stable identity link', async () => {
     renderPage(['/production-control?current_identity=production%3Aorder%3A102'])
     await screen.findByText('MRP run: 77')
@@ -608,6 +630,28 @@ describe('ProductionControlPage — characterization', () => {
       expect(params.get('active_product_id')).toBeNull()
       expect(params.get('current_identity')).toBe('production:order:102')
     })
+  })
+
+  it('refreshes the journal, opens settings and root filter, and prints the exact selected current order', async () => {
+    const user = userEvent.setup()
+    const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false, focus: vi.fn(), print: vi.fn() }
+    const open = vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    renderPage()
+    await screen.findByText('MRP run: 77')
+    await user.click(screen.getByRole('button', { name: 'Обновить' }))
+    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(2))
+    await user.click(screen.getByRole('button', { name: 'Настройки' }))
+    expect(await screen.findByRole('heading', { name: 'Настройки журнала' })).toBeVisible()
+    expect(getProductionControlSettings).toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Закрыть', exact: true }))
+    await user.click(screen.getByRole('button', { name: 'Корневое изделие', exact: true }))
+    expect(screen.getByText('Корневое изделие плана')).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Закрыть', exact: true }))
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Печать маршрутных' }))
+    await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalled())
+    expect(open).toHaveBeenCalled()
+    open.mockRestore()
   })
 
   it('loads production root products from a single snapshot-driven endpoint', async () => {

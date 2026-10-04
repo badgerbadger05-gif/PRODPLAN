@@ -86,11 +86,11 @@ export function ProductionControlPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const focusProductId = searchParams.get('product_id')
   const focusOrderId = searchParams.get('order_id')
-  const focusCurrentIdentity = searchParams.get('current_identity')?.trim() || null
+  const focusCurrentIdentity = useRef(searchParams.get('current_identity')?.trim() || null).current
   const initialUrlState = useRef(parseProductionControlUrlState(searchParams))
   const [rows, setRows] = useState<OrderRow[]>([])
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
-  const [activeId, setActiveId] = useState<number | null>(
+  const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
+  const [activeId, setActiveId] = useState<number | string | null>(
     initialUrlState.current.activeProductId,
   )
   const [activeCurrentIdentity, setActiveCurrentIdentity] = useState<string | null>(
@@ -163,7 +163,7 @@ export function ProductionControlPage() {
       filters,
       view,
       offset,
-      activeProductId: activeId,
+      activeProductId: typeof activeId === 'number' ? activeId : null,
       activeCurrentIdentity,
     }), { replace: true })
     // URL params are cloned from the current render, but changes to external
@@ -200,6 +200,7 @@ export function ProductionControlPage() {
       setTruthMeta(data.truth_meta)
       setOffset(data.offset ?? nextOffset)
       setActiveId((current) => {
+        if (current != null && data.rows?.some((row) => productionRowId(row) === current)) return current
         if (initialUrlState.current.activeCurrentIdentity) {
           const focused = data.rows?.find((row) => row.current_identity === initialUrlState.current.activeCurrentIdentity)
           if (focused) return productionRowId(focused)
@@ -209,9 +210,6 @@ export function ProductionControlPage() {
         if (current && data.rows?.some((row) => productionRowId(row) === current)) return current
         return data.rows?.[0] ? productionRowId(data.rows[0]) : null
       })
-      if (initialUrlState.current.activeCurrentIdentity && data.rows?.some((row) => row.current_identity === initialUrlState.current.activeCurrentIdentity)) {
-        setActiveCurrentIdentity(initialUrlState.current.activeCurrentIdentity)
-      }
     } catch (e) {
       if (requestSeq !== listRequestSeq.current) return
       setTruthMeta(truthBadgeMetaFromApiError(e))
@@ -486,7 +484,10 @@ export function ProductionControlPage() {
     const workItemIds = productIds == null
       ? selectedRows.flatMap((row) => row.product_id != null || row.work_item_id == null ? [] : [row.work_item_id])
       : []
-    if (!ids.length && !workItemIds.length) return
+    if (!ids.length && !workItemIds.length) {
+      setError('Для выбранных строк недоступен рабочий объект запуска. Обновите журнал; запуск заблокирован.')
+      return
+    }
     if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
