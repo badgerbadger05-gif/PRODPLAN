@@ -385,8 +385,9 @@ beforeEach(() => {
   })
   vi.mocked(listProductionOperations).mockResolvedValue({ rows: [], total: 0 })
   vi.mocked(materializeMakeWorkItems).mockResolvedValue({ status: 'ok', created: [], reused: [] })
-  vi.mocked(openPaintWeldChains).mockImplementation(async (productIds) => ({
+  vi.mocked(openPaintWeldChains).mockImplementation(async (productIds, currentIdentities, sourceRevision) => ({
     status: 'ok', product_ids: productIds, entries: [], errors: [],
+    current_identities: currentIdentities, source_revision: sourceRevision,
   }))
   vi.mocked(closePaintWeldChain).mockResolvedValue({ status: 'ok' })
   vi.mocked(getPendingChainCommand).mockReset().mockResolvedValue({ command: null, message: '' })
@@ -1147,10 +1148,13 @@ describe('ProductionControlPage — characterization', () => {
       materialized_order_qty: 0,
       launchable_qty: 10,
     } as OrderRow
-    vi.mocked(listProductionOrders).mockResolvedValue({
-      rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
-      truth_meta: fakeTruthMeta,
-    })
+    vi.mocked(listProductionOrders).mockImplementation(async (params) => ({
+      rows: params.get('product_id') === '901'
+        ? [{ ...proposal, product_id: 901, order_id: 801, status: 'created', source_revision: 'rev-8' }]
+        : [proposal],
+      total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
+    }))
     vi.mocked(getWorkItemMaterials).mockImplementation(async (_workItemId, quantity) => ({
       ...fakeMaterials(),
       product_id: null,
@@ -1192,10 +1196,52 @@ describe('ProductionControlPage — characterization', () => {
       launch_qty: 6,
       expected_materialized_qty: 0,
     }], ['production:order:101'], 'rev-7'))
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/текущие строки исполнения недоступны/i))
-    expect(postMaterialIssues).not.toHaveBeenCalled()
+    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([901], ['production:order:101'], 'rev-8'))
+    await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
+      [901], 'erp-shell', undefined, ['production:order:101'], 'rev-8',
+    ))
+    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
+    expect(vi.mocked(listProductionOrders).mock.calls.some(([params]) => params.get('product_id') === '901')).toBe(true)
+    expect(screen.queryByText(/текущие строки исполнения недоступны/i)).not.toBeInTheDocument()
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })
+
+  it.each(['missing_identity', 'missing_revision', 'ambiguous', 'unaccepted'])(
+    'stops after materialization when the refreshed owner is %s', async (failure) => {
+      const proposal = {
+        ...fakeRows()[0], product_id: null, order_id: null, work_item_id: 701,
+        order_number: 'MRP-R-701', order_prodplan_number: 'MRP-R-701',
+        status: 'not_created', launchable_qty: 10, materialized_order_qty: 0,
+      } as OrderRow
+      const created = {
+        ...proposal, product_id: 901, order_id: 801, status: 'created',
+        current_identity: failure === 'missing_identity' ? null : 'production:order:901',
+        source_revision: failure === 'missing_revision' ? null : 'rev-8',
+      } as OrderRow
+      vi.mocked(listProductionOrders).mockImplementation(async (params) => ({
+        rows: params.get('product_id') === '901'
+          ? failure === 'ambiguous' ? [created, created] : [created]
+          : [proposal],
+        total: params.get('product_id') === '901' && failure === 'ambiguous' ? 2 : 1,
+        limit: 100, offset: 0, latest_run_id: null,
+        truth_meta: { ...fakeTruthMeta, truth_status: failure === 'unaccepted' ? 'unavailable' : 'accepted' },
+      }))
+      vi.mocked(materializeMakeWorkItems).mockResolvedValue({
+        status: 'ok', created: [{ work_item_id: 701, product_id: 901, order_id: 801,
+          requirement_id: 701, qty: 10 }], reused: [],
+      })
+      const user = userEvent.setup()
+      renderPage()
+      await user.click(await screen.findByRole('checkbox', { name: /MRP-R-701/ }))
+      await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+      await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/текущ/i))
+      expect(openPaintWeldChains).not.toHaveBeenCalled()
+      expect(postMaterialIssues).not.toHaveBeenCalled()
+      expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+      expect(materializeMakeWorkItems).toHaveBeenCalledTimes(1)
+      expect(screen.getByText('MRP run: —')).toBeVisible()
+    },
+  )
 
   it('shows materialization refusal and does not continue a partially created selection', async () => {
     const proposal = {
@@ -1415,6 +1461,7 @@ describe('ProductionControlPage — characterization', () => {
     })
     vi.mocked(openPaintWeldChains).mockResolvedValue({
       status: 'ok', product_ids: [101, 102], entries: [], errors: [],
+      current_identities: ['production:order:101', 'production:order:102'], source_revision: 'rev-7',
     })
     const user = userEvent.setup()
     renderPage()

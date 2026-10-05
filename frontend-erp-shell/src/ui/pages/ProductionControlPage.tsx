@@ -344,8 +344,20 @@ export function ProductionControlPage() {
     }
   }
 
-  function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
+  function requestMaterialIssues(
+    sourceWarehouseRef: string | undefined,
+    productIds: number[],
+    context?: { identities: string[]; sourceRevision: string },
+  ) {
     const requested = Array.from(new Set(productIds))
+    if (context) {
+      if (!context.sourceRevision || context.identities.length !== requested.length
+        || context.identities.some((identity) => !identity)
+        || new Set(context.identities).size !== requested.length) {
+        throw new Error('Текущие строки материалов недоступны: требуется полный identity и единая revision')
+      }
+      return postMaterialIssues(requested, 'erp-shell', sourceWarehouseRef, context.identities, context.sourceRevision)
+    }
     const actionRows = rows.filter((row) => row.product_id != null && requested.includes(row.product_id))
     const identities = actionRows.map((row) => row.current_identity)
     const revisions = new Set(actionRows.map((row) => row.source_revision).filter(Boolean))
@@ -353,6 +365,7 @@ export function ProductionControlPage() {
       actionRows.length !== requested.length
       || identities.length !== requested.length
       || identities.some((identity) => !identity)
+      || actionRows.some((row) => !row.source_revision)
       || revisions.size !== 1
     ) {
       throw new Error('Текущие строки материалов недоступны: требуется полный identity и единая revision')
@@ -392,15 +405,33 @@ export function ProductionControlPage() {
     if (printWindow && !printWindow.closed) printWindow.close()
   }
 
-  function currentActionSelection(ids: number[]) {
+  function currentActionSelection(ids: number[], sourceRows: readonly OrderRow[] = rows) {
     const requested = Array.from(new Set(ids))
-    const selected = rows.filter((row) => row.product_id != null && requested.includes(row.product_id))
+    const selected = sourceRows.filter((row) => row.product_id != null && requested.includes(row.product_id))
     const identities = selected.map((row) => row.current_identity)
     const revisions = new Set(selected.map((row) => row.source_revision).filter(Boolean))
-    if (selected.length !== requested.length || identities.some((identity) => !identity) || revisions.size !== 1) {
+    if (selected.length !== requested.length || identities.some((identity) => !identity)
+      || selected.some((row) => !row.source_revision)
+      || new Set(identities).size !== requested.length || revisions.size !== 1) {
       throw new Error('Текущие строки исполнения недоступны: требуется полный identity и единая revision')
     }
     return { identities: identities as string[], sourceRevision: Array.from(revisions)[0] as string }
+  }
+
+  async function refreshActionSelection(ids: number[]) {
+    // Materialization returns new locators. Resolve their current owners from
+    // the backend without narrowing the visible journal or reusing this render's rows.
+    const refreshed = await Promise.all(Array.from(new Set(ids)).map(async (productId) => {
+      const data = await listProductionOrders(new URLSearchParams({
+        product_id: String(productId), limit: '2', offset: '0',
+      }))
+      if (data.truth_meta?.truth_status !== 'accepted' || data.total !== 1
+        || data.rows.length !== 1 || data.rows[0].product_id !== productId) {
+        throw new Error('Текущая строка созданного заказа недоступна. Обновите журнал и повторите запуск.')
+      }
+      return data.rows[0]
+    }))
+    return currentActionSelection(ids, refreshed)
   }
 
   function renderRouteSheets(ids: number[], printWindow: Window | null, currentIdentities?: string[], sourceRevision?: string) {
@@ -491,6 +522,7 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     let printWindow: Window | null = null
+    let materializationAttempted = false
     try {
       if (workItemIds.length) {
         const proposalRows = selectedRows.filter((row) => row.work_item_id != null && workItemIds.includes(row.work_item_id))
@@ -499,10 +531,12 @@ export function ProductionControlPage() {
         if (
           proposalRows.length !== workItemIds.length
           || proposalIdentities.some((identity) => !identity)
+          || proposalRows.some((row) => !row.source_revision)
           || proposalRevisions.size !== 1
         ) {
           throw new Error('Текущие MRP-строки недоступны: требуется полный identity и единая revision')
         }
+        materializationAttempted = true
         const materialized = await materializeMakeWorkItems(workItemIds.map((workItemId) => {
           const row = selectedRows.find((item) => item.work_item_id === workItemId)
           const launchQty = launchQtyByWorkItem[workItemId] ?? row?.launchable_qty
@@ -534,11 +568,17 @@ export function ProductionControlPage() {
       )) {
         return
       }
-      const chainContext = currentActionSelection(ids)
+      const chainContext = workItemIds.length
+        ? await refreshActionSelection(ids)
+        : currentActionSelection(ids)
       const chains = await openPaintWeldChains(ids, chainContext.identities, chainContext.sourceRevision)
       ids = Array.from(new Set(chains.product_ids ?? ids))
+      const materialContext = {
+        identities: chains.current_identities ?? [],
+        sourceRevision: chains.source_revision ?? '',
+      }
       printWindow = prepareRouteSheetWindow()
-      const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
+      const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids, materialContext)
       const selectionRequired = issueResult.selection_required ?? []
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
       if (selectionRequired.length > 0) {
@@ -584,7 +624,11 @@ export function ProductionControlPage() {
       renderRouteSheets(ids, printWindow, chains.current_identities, chains.source_revision ?? chainContext.sourceRevision)
     } catch (e) {
       closeRouteSheetWindow(printWindow)
-      setError(e instanceof Error ? e.message : String(e))
+      const message = e instanceof Error ? e.message : String(e)
+      // A local order may already exist even when a later launch step fails.
+      // Refresh its displayed state so retry does not materialize the old proposal again.
+      if (materializationAttempted) await load(offsetRef.current)
+      setError(message)
     } finally {
       endDangerousMutation()
       setLoading(false)
@@ -996,7 +1040,7 @@ export function ProductionControlPage() {
       <div className="topLine">
         <div className="breadcrumbs">Производство / Журнал заказов на производство</div>
         <div className="runBadge">
-          MRP run: {runId ?? (loading ? 'загрузка…' : error ? 'недоступен' : '—')}
+          MRP run: {runId ?? (loading ? 'загрузка…' : error && rows.length === 0 ? 'недоступен' : '—')}
         </div>
         <TruthBadge meta={truthMeta} />
       </div>
