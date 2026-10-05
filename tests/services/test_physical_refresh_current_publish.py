@@ -259,6 +259,30 @@ def test_in_window_supersession_keeps_full_stock_manifest_but_one_business_fact(
     assert observed["custody"] == (b.id,)
     assert observed["allocation"] == {b.id}
     db_session.rollback()
+    result = publisher.publish_forward_physical_refresh_current(
+        db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+        delta_manifest={"rows": (a, b), "supersessions": (edge,), "backdate_from": posting},
+        odata_client=None, source_revision=final_batch.id,
+        planning_pool_by_warehouse={"wh": "pool"},
+        custody_source_sle_ids=(a.id, b.id),
+    )
+    assert result.input_delta_rows == 2
+    assert set(observed["custody"]) == {a.id, b.id}
+    assert observed["allocation"] == {b.id}
+    db_session.rollback()
+    # Persisted edges alone do not authorize a retired custody source.
+    with pytest.raises(
+        publisher.ForwardPhysicalRefreshUnavailable,
+        match=f"custody source lost target physical visibility.*{a.id}",
+    ):
+        publisher.publish_forward_physical_refresh_current(
+            db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+            delta_manifest={"rows": (b,), "supersessions": ()},
+            odata_client=None, source_revision=final_batch.id,
+            planning_pool_by_warehouse={"wh": "pool"},
+            custody_source_sle_ids=(a.id, b.id),
+        )
+    db_session.rollback()
     with pytest.raises(
         publisher.ForwardPhysicalRefreshUnavailable,
         match=f"custody source lost target physical visibility.*{a.id}",
@@ -273,6 +297,66 @@ def test_in_window_supersession_keeps_full_stock_manifest_but_one_business_fact(
             custody_source_sle_ids=(a.id,),
         )
     db_session.rollback()
+
+
+@pytest.mark.parametrize("terminal_tombstone", [False, True])
+@pytest.mark.parametrize("missing", [None, "intermediate_source", "terminal_source", "terminal_edge"])
+def test_custody_visibility_requires_complete_persisted_retirement_chain(
+    db_session, terminal_tombstone, missing,
+):
+    parent, target = _generations(db_session)
+    item = models.Item(item_code="CP-CUSTODY-CHAIN", item_name="Custody revision chain")
+    db_session.add(item)
+    db_session.flush()
+    entries = []
+    for index in range(3):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash=f"custody-chain-{index}",
+            business_identity=f"custody-chain-{index}",
+            item_id=item.item_id, characteristic_ref="", organization_ref="org",
+            warehouse_ref1c="wh", qty=Decimal("5"),
+            posting_at=parent.cutoff + timedelta(hours=1), record_type="Receipt",
+            movement_kind="transfer_in", recorder_type="Document_Transfer",
+            recorder_ref="custody-chain", line_no="1", ingest_source="test",
+            active=index == 2 and not terminal_tombstone,
+        )
+        db_session.add(row)
+        entries.append(row)
+    db_session.flush()
+    edges = []
+    for index in range(3 if terminal_tombstone else 2):
+        edge = models.StockLedgerFactSupersession(
+            import_batch_id=target.physical_import_batch_id,
+            old_sle_id=entries[index].id,
+            new_sle_id=entries[index + 1].id if index < 2 else None,
+        )
+        db_session.add(edge)
+        edges.append(edge)
+    db_session.flush()
+    source_ids = {row.id for row in entries}
+    declared_edges = tuple(edges)
+    if missing == "intermediate_source":
+        source_ids.remove(entries[1].id)
+    elif missing == "terminal_source":
+        source_ids.remove(entries[2].id)
+    elif missing == "terminal_edge":
+        declared_edges = tuple(edges[:-1])
+
+    def validate():
+        publisher._assert_bounded_custody_source_visibility(
+            db_session, source_ids=source_ids, parent=parent, target=target,
+            supersessions=declared_edges,
+        )
+
+    if missing is None:
+        validate()
+    else:
+        with pytest.raises(
+            publisher.ForwardPhysicalRefreshUnavailable,
+            match="custody source lost target physical visibility",
+        ):
+            validate()
 
 
 def test_in_window_tombstone_is_physical_delta_with_no_visible_fact(db_session):

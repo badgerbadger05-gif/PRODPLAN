@@ -420,6 +420,77 @@ def _partition_persisted_rows(
     return ordered, tuple(row for row in ordered if int(row.id) in visible_ids)
 
 
+def _assert_bounded_custody_source_visibility(
+    db: Session,
+    *,
+    source_ids: set[int],
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+    supersessions: Sequence[Any],
+) -> None:
+    """Require a visible fact or its complete, declared retirement chain.
+
+    Custody refolds must see transient events as well as their final facts.
+    A retired source is admissible only with the exact persisted in-window
+    edge and every successor explicitly carried to a visible fact/tombstone.
+    """
+    visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db, physical_import_batch_id=int(target.physical_import_batch_id),
+            cutoff=target.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(source_ids)).all()
+    }
+    retired_ids = source_ids - visible_ids
+    if not retired_ids:
+        return
+    entries = {
+        int(row.id): row for row in db.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.id.in_(retired_ids),
+        ).all()
+    }
+    declared = {
+        int(edge.id): (edge.old_sle_id, edge.new_sle_id, edge.import_batch_id)
+        for edge in supersessions
+    }
+    edges_by_old: dict[int, list[Any]] = {}
+    for edge in db.query(models.StockLedgerFactSupersession).filter(
+        models.StockLedgerFactSupersession.old_sle_id.in_(retired_ids),
+        models.StockLedgerFactSupersession.import_batch_id > int(parent.physical_import_batch_id),
+        models.StockLedgerFactSupersession.import_batch_id <= int(target.physical_import_batch_id),
+    ).all():
+        edges_by_old.setdefault(int(edge.old_sle_id), []).append(edge)
+    for source_id in sorted(retired_ids):
+        cursor = source_id
+        visited: set[int] = set()
+        while cursor not in visible_ids:
+            row = entries.get(cursor)
+            edges = edges_by_old.get(cursor, ())
+            if (
+                cursor in visited or row is None or bool(row.active)
+                or row.posting_at is None
+                or _comparable(row.posting_at) > _comparable(target.cutoff)
+                or len(edges) != 1
+                or declared.get(int(edges[0].id)) != (
+                    edges[0].old_sle_id, edges[0].new_sle_id, edges[0].import_batch_id,
+                )
+                or int(edges[0].import_batch_id) < int(row.ingest_batch_id)
+            ):
+                raise ForwardPhysicalRefreshUnavailable(
+                    "bounded custody source lost target physical visibility "
+                    f"(sle_ids={[source_id]})"
+                )
+            visited.add(cursor)
+            successor = edges[0].new_sle_id
+            if successor is None:
+                break
+            if int(successor) not in source_ids:
+                raise ForwardPhysicalRefreshUnavailable(
+                    "bounded custody source lost target physical visibility "
+                    f"(sle_ids={[source_id]}; undeclared_successor={int(successor)})"
+                )
+            cursor = int(successor)
+
+
 def _persisted_basis_rows(
     db: Session,
     rows: Sequence[Any],
@@ -1630,18 +1701,10 @@ def _publish_forward_physical_refresh_current(
     # removed fact's key and assignments behind.
     scoped_rows = tuple(physical_rows) + tuple(basis_rows)
     if custody_source_ids:
-        explicit_custody_ids = set(custody_source_ids)
-        visible_custody_ids = {
-            int(row.id) for row in visible_sle_query(
-                db, physical_import_batch_id=int(target.physical_import_batch_id),
-                cutoff=target.cutoff,
-            ).filter(models.StockLedgerEntry.id.in_(explicit_custody_ids)).all()
-        }
-        if visible_custody_ids != explicit_custody_ids:
-            raise ForwardPhysicalRefreshUnavailable(
-                "bounded custody source lost target physical visibility "
-                f"(sle_ids={sorted(explicit_custody_ids - visible_custody_ids)[:8]})"
-            )
+        _assert_bounded_custody_source_visibility(
+            db, source_ids=set(custody_source_ids), parent=parent, target=target,
+            supersessions=supersessions,
+        )
     if _phase_tracker is not None:
         _phase_tracker.complete("validation")
         _phase_tracker.begin("custody")
