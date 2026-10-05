@@ -354,6 +354,47 @@ def test_retry_backfill_is_proved_by_corrected_candidate_not_restored_parent(db_
     ) == (corrected.id,)
 
 
+@pytest.mark.parametrize("missing_edge", [False, True])
+def test_custody_tail_carries_exact_reimport_chain_into_publication(db_session, missing_edge):
+    from tests.services.test_physical_refresh_provenance import _canonical_backfill_world
+
+    parent, target, old, opening, posted, _ = _canonical_backfill_world(db_session)
+    old.ingest_batch_id = parent.physical_import_batch_id
+    old.posting_at = parent.cutoff
+    old.active = False
+    opening.effective_at = parent.cutoff
+    posted.effective_at = parent.cutoff
+    parent.physical_import_batch.source_watermarks = target.physical_import_batch.source_watermarks
+    replacement = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash=old.source_content_hash, business_identity=old.business_identity,
+        item_id=old.item_id, characteristic_ref=old.characteristic_ref,
+        organization_ref=old.organization_ref, warehouse_ref1c=old.warehouse_ref1c,
+        qty=old.qty, posting_at=old.posting_at, record_type=old.record_type,
+        movement_kind=old.movement_kind, recorder_type=old.recorder_type,
+        recorder_ref=old.recorder_ref, line_no=old.line_no, ingest_source="test", active=True,
+    )
+    db_session.add(replacement)
+    db_session.flush()
+    if not missing_edge:
+        db_session.add(models.StockLedgerFactSupersession(
+            old_sle_id=old.id, new_sle_id=replacement.id,
+            import_batch_id=target.physical_import_batch_id,
+        ))
+    db_session.flush()
+    if missing_edge:
+        with pytest.raises(workflow.PhysicalRefreshOrchestratorError):
+            workflow._bounded_custody_tail_sle_ids(
+                db_session, after_event_id=0, parent_generation_id=parent.id,
+                target_generation_id=target.id, target_cutoff=target.cutoff,
+            )
+    else:
+        assert workflow._bounded_custody_tail_sle_ids(
+            db_session, after_event_id=0, parent_generation_id=parent.id,
+            target_generation_id=target.id, target_cutoff=target.cutoff,
+        ) == (old.id, replacement.id)
+
+
 def test_custody_tail_recovery_rejects_local_or_foreign_lineage(
     db_session,
 ):

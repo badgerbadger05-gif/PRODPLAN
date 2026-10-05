@@ -522,14 +522,50 @@ def apply_bounded_current_material_custody_events(
         raise PhysicalRefreshProvenanceUnavailable(
             "custody event tail extends beyond the target cutoff"
         )
-    visible_tail_ids = {
-        int(row.id) for row in visible_sle_query(
-            db, physical_import_batch_id=target_batch, cutoff=target.cutoff,
-        ).filter(models.StockLedgerEntry.id.in_(
-            [int(event.source_sle_id) for event in tail if event.source_sle_id is not None]
-        )).all()
-    } if tail else set()
-    terminal_correction_ids = connected_ids - set(edge_by_old)
+    visible_tail_sources = {
+        int(event.source_sle_id): source
+        for event in tail
+        if event.source_sle_id is not None
+        and (source := _visible_source_sle_for_event(
+            db, event=event, physical_import_batch_id=target_batch,
+            cutoff=target.cutoff,
+        )) is not None
+    }
+    # A tail can predate this refresh while still awaiting publication. Keep
+    # its original source id as the logical witness for an exact reimport, so
+    # the tail fold applies its delta once rather than dropping it as inactive.
+    visible_tail_ids = set(visible_tail_sources)
+    for original_id, source in visible_tail_sources.items():
+        witness_id = original_id
+        visited = set()
+        while witness_id != int(source.id) and witness_id in edge_by_old:
+            if witness_id in visited:
+                break
+            visited.add(witness_id)
+            successor = edge_by_old[witness_id].new_sle_id
+            if successor is None:
+                break
+            witness_id = int(successor)
+        if witness_id != int(source.id):
+            raise PhysicalRefreshProvenanceUnavailable(
+                "custody tail exact reimport lacks a bounded supersession "
+                f"(old_sle_id={original_id}, new_sle_id={int(source.id)})"
+            )
+    tail_chain_ids = set(tail_source_ids)
+    while True:
+        successors = {
+            int(edge_by_old[old_id].new_sle_id)
+            for old_id in tail_chain_ids if old_id in edge_by_old
+            and edge_by_old[old_id].new_sle_id is not None
+        }
+        if successors <= tail_chain_ids:
+            break
+        tail_chain_ids.update(successors)
+    if not tail_chain_ids <= explicit:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody tail correction chain is absent from the bounded SLE manifest"
+        )
+    terminal_correction_ids = (connected_ids | tail_chain_ids) - set(edge_by_old)
     terminal_visible_ids = {
         int(row.id) for row in visible_sle_query(
             db, physical_import_batch_id=target_batch, cutoff=target.cutoff,
@@ -543,7 +579,7 @@ def apply_bounded_current_material_custody_events(
     # churn; the canonical resolver proves that every fact field is unchanged.
     reimport_event_source_ids = {
         int(source.id)
-        for event in corrected_events
+        for event in (*corrected_events, *tail)
         if (source := _visible_source_sle_for_event(
             db, event=event, physical_import_batch_id=target_batch,
             cutoff=target.cutoff,

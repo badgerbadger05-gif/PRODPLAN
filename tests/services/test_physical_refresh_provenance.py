@@ -308,6 +308,74 @@ def test_bounded_custody_exact_reimport_keeps_original_events_and_balances(db_se
     assert load_compact_current_material_custody(db_session, consumer="exact-reimport")[0] == target.id
 
 
+def _unpublished_tail_reimport_world(db):
+    parent, target, workshop, transit, explicit = _replace_revision_with_exact_reimport(db)
+    opening = db.query(models.ProductionMaterialCustodyEvent).filter_by(
+        source_kind="issue_created",
+    ).one()
+    manifest = db.get(models.ProductionMaterialCustodyProjectionManifest, parent.id)
+    manifest.source_event_high_watermark_id = opening.id
+    transit.source_event_high_watermark_id = opening.id
+    transit.reserved_qty = Decimal("112")
+    product_id, component_id = workshop.product_id, workshop.component_item_id
+    db.delete(workshop)
+    db.flush()
+    return parent, target, transit, explicit, product_id, component_id
+
+
+def test_bounded_custody_unpublished_tail_exact_reimport_folds_once(db_session):
+    parent, target, transit, explicit, product_id, component_id = _unpublished_tail_reimport_world(db_session)
+    event_ids = [row.id for row in db_session.query(models.ProductionMaterialCustodyEvent)]
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    ) == 2
+    workshop = db_session.query(models.ProductionMaterialCustodyProjection).filter_by(
+        product_id=product_id, component_item_id=component_id,
+        location_kind="workshop", is_current=True,
+    ).one()
+    assert transit.reserved_qty == Decimal("48")
+    assert workshop.reserved_qty == Decimal("64")
+    assert [row.id for row in db_session.query(models.ProductionMaterialCustodyEvent)] == event_ids
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    ) == 0
+    assert transit.reserved_qty == Decimal("48")
+    assert workshop.reserved_qty == Decimal("64")
+    handoff_current_material_custody_provenance(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+    )
+    _accept(db_session, target)
+    assert load_compact_current_material_custody(db_session, consumer="tail-reimport")[0] == target.id
+
+
+@pytest.mark.parametrize("mutation", ["qty", "hash", "missing_successor"])
+def test_bounded_custody_unpublished_tail_correction_requires_new_event(db_session, mutation):
+    parent, target, transit, explicit, _product_id, _component_id = _unpublished_tail_reimport_world(db_session)
+    replacement = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id == target.physical_import_batch_id,
+        models.StockLedgerEntry.movement_kind == "transfer_out",
+    ).one()
+    if mutation == "qty":
+        replacement.qty = Decimal("-56")
+    elif mutation == "hash":
+        replacement.source_content_hash = "corrected-without-event"
+    else:
+        explicit.remove(replacement.id)
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="no event for target-visible transfer|tail correction chain is absent|lacks a bounded supersession"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+    assert transit.reserved_qty == Decimal("112")
+    assert db_session.query(models.ProductionMaterialCustodyProjection).filter_by(
+        location_kind="workshop", is_current=True,
+    ).count() == 0
+
+
 @pytest.mark.parametrize("mutation", ["qty", "hash", "warehouse", "movement", "posting"])
 def test_bounded_custody_reimport_requires_identical_physical_fact(db_session, mutation):
     parent, target, workshop, transit, explicit = _replace_revision_with_exact_reimport(db_session)

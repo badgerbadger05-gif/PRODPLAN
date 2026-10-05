@@ -1226,6 +1226,32 @@ def _bounded_custody_tail_sle_ids(
     except PhysicalRefreshProvenanceUnavailable as exc:
         raise PhysicalRefreshOrchestratorError(str(exc)) from exc
     source_ids = list(dict.fromkeys(source_ids + list(backfill_ids)))
+    # A durable tail may name the parent's recorder revision while this
+    # candidate has already reimported/corrected it. Carry the whole bounded
+    # chain into publication; its intermediate facts need not remain visible.
+    edges = db.query(models.StockLedgerFactSupersession).filter(
+        models.StockLedgerFactSupersession.import_batch_id > parent_batch_id,
+        models.StockLedgerFactSupersession.import_batch_id <= boundary,
+    ).all() if source_ids else []
+    edge_by_old: dict[int, models.StockLedgerFactSupersession] = {}
+    for edge in edges:
+        old_id = int(edge.old_sle_id)
+        if old_id in edge_by_old:
+            raise PhysicalRefreshOrchestratorError("custody source has multiple bounded successors")
+        edge_by_old[old_id] = edge
+    for seed in tuple(source_ids):
+        seen: set[int] = set()
+        cursor = seed
+        while cursor in edge_by_old:
+            if cursor in seen:
+                raise PhysicalRefreshOrchestratorError("custody source has a cyclic bounded supersession")
+            seen.add(cursor)
+            successor = edge_by_old[cursor].new_sle_id
+            if successor is None:
+                break
+            cursor = int(successor)
+            if cursor not in source_ids:
+                source_ids.append(cursor)
     query = (
         db.query(
             models.StockLedgerEntry.id,
@@ -1261,7 +1287,7 @@ def _bounded_custody_tail_sle_ids(
             db, physical_import_batch_id=boundary, cutoff=cutoff,
         ).filter(models.StockLedgerEntry.id.in_(source_ids)).all()
     } if source_ids else set()
-    if visible_ids != set(source_ids):
+    if set(source_ids) - visible_ids - set(edge_by_old):
         raise PhysicalRefreshOrchestratorError("physical refresh custody tail references non-visible SLE")
     for source_id in source_ids:
         (
@@ -1279,7 +1305,7 @@ def _bounded_custody_tail_sle_ids(
             batch_cutoff,
             marks,
         ) = by_id[int(source_id)]
-        if not bool(active):
+        if not bool(active) and source_id not in edge_by_old:
             raise PhysicalRefreshOrchestratorError(
                 "physical refresh custody tail references inactive SLE "
                 f"(source_sle_id={int(source_id)})"
