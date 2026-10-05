@@ -291,11 +291,11 @@ def _piecework_operation_defaults(
     if not spec_operations:
         return PieceworkOperationDefaults(spec_ref1c=spec_ref)
 
-    # Structural unit of the piecework order = the line's resolved workshop
-    # (production kind / manual assignment), not the stage chain. The document
-    # has always carried a single unit (the first operation's stage used to
-    # pick it), so this loses no granularity and keeps the piecework order
-    # consistent with the journal and the transfers.
+    # Workshop warehouse of the line (production kind / manual assignment),
+    # resolved from the workshop binding. It documents the stock location and
+    # is kept on the entry for journal consistency; the piecework document
+    # itself is labor-only, so its department is decided in
+    # _build_header_payload (production unit, never this warehouse).
     structural_unit_ref = None
     workshop_id = resolve_workshop_for_product(db, product, spec_id=spec_id) if product else None
     binding = warehouse_binding_for_workshop(db, workshop_id)
@@ -538,7 +538,12 @@ def _build_header_payload(
         raise ValueError(
             f"manufacture_id={entry.manufacture_id}: не найдена операция спецификации для сдельного наряда"
         )
-    structural_unit_ref = structural_unit_ref or entry.structural_unit_ref1c
+    # Сдельный наряд — документ только труда: складских движений он не делает,
+    # а зарплатный учёт разносит начисления по этому подразделению. Привязка
+    # цеха даёт склады (места хранения), поэтому в наряд всегда идёт
+    # производственное подразделение, как в штатных ЗСНФ; склад цеха остаётся
+    # только в СборкаЗапасов.
+    structural_unit_ref = structural_unit_ref or DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
     base_link_key = int(entry.manufacture_id) % 2_000_000_000
 
     comment = (
@@ -823,7 +828,7 @@ def export_piecework_to_1c(
                 config = _load_odata_config()
                 payload = _build_header_payload(entry, operation_ref=operation_ref, time_norm=time_norm, price=price,
                     organization_ref=organization_ref or _config_ref1c(config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C),
-                    structural_unit_ref=structural_unit_ref or entry.structural_unit_ref1c or _config_ref1c(
+                    structural_unit_ref=structural_unit_ref or _config_ref1c(
                         config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C),
                     business_operation_ref=business_operation_ref)
                 result["payloads"].append({"manufacture_id": entry.manufacture_id, "payload": payload})
@@ -941,7 +946,7 @@ def export_chain_piecework_to_1c(
         config = _load_odata_config()
         payloads = [_build_header_payload(entry, operation_ref="",
             organization_ref=organization_ref or _config_ref1c(config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C),
-            structural_unit_ref=entry.structural_unit_ref1c or _config_ref1c(
+            structural_unit_ref=_config_ref1c(
                 config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C),
             business_operation_ref=business_operation_ref) for entry in ordered]
         payload = _merge_chain_payloads(weld_payload=payloads[0], paint_payload=payloads[1])
@@ -1166,7 +1171,7 @@ def _export_checked_piecework(db, entries, *, dry_run, combined=False, standalon
         for entry in entries:
             payload = _build_header_payload(entry, operation_ref="", business_operation_ref=business_operation_ref, organization_ref=organization_ref or _config_ref1c(
                 config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C),
-                structural_unit_ref=structural_unit_ref or entry.structural_unit_ref1c or _config_ref1c(
+                structural_unit_ref=structural_unit_ref or _config_ref1c(
                     config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C))
             target_qty = entry.qty if standalone else float(db.query(func.sum(ProductionManufacture.qty)).filter(
                 ProductionManufacture.product_id == entry.product_id,

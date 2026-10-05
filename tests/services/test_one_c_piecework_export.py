@@ -863,3 +863,32 @@ def test_live_post_error_recorded_in_sync_link(db_session, monkeypatch):
         target_entity="Document_СдельныйНаряд",
     ).one()
     assert link.status == "error"
+
+
+def test_piecework_department_is_production_not_workshop_warehouse(db_session, monkeypatch):
+    """Привязка цеха отдаёт склад (место хранения), а сдельный наряд — документ
+    труда: зарплатный учёт разносит начисления по его подразделению, поэтому в
+    шапке и строках всегда производственное подразделение, как в штатных ЗСНФ."""
+    db = db_session
+    item = _mk_item(db, code="PW-UNIT-PROD", ref1c="item-ref-unit-prod")
+    m = _mk_manufacture(db, item, exported_ref1c="ref-unit-prod")
+
+    class _Binding:
+        production_warehouse_ref1c = "warehouse-painted-output"
+        warehouse_ref1c = "warehouse-paint-shop"
+
+    monkeypatch.setattr(exporter, "resolve_workshop_for_product", lambda *a, **k: 2)
+    monkeypatch.setattr(exporter, "warehouse_binding_for_workshop", lambda *a, **k: _Binding())
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+
+    result = exporter.export_piecework_to_1c(
+        db, [m.manufacture_id],
+        operation_ref="op-ref",
+        dry_run=True,
+    )
+
+    payload = result["payloads"][0]["payload"]
+    expected = exporter.DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    assert payload["СтруктурнаяЕдиница_Key"] == expected
+    assert payload["Операции"][0]["СтруктурнаяЕдиница_Key"] == expected
+    assert payload["Операции"][0]["ПодразделениеЗавершающегоЭтапа_Key"] == expected
