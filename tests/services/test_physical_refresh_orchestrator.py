@@ -309,6 +309,51 @@ def test_crash_recovery_discovers_completed_custody_tail_with_sequence_gaps(
     assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 2
 
 
+def test_retry_backfill_is_proved_by_corrected_candidate_not_restored_parent(db_session):
+    from app.services.item_ledger.physical_refresh_provenance import canonical_issue_backfill_source_ids, PhysicalRefreshProvenanceUnavailable
+    from app.services.production_material_custody_events import _custody_event_idempotency_key
+    from tests.services.test_physical_refresh_provenance import _canonical_backfill_world
+
+    parent, target, corrected, opening, posted, _ = _canonical_backfill_world(db_session)
+    at = parent.cutoff - timedelta(days=1)
+    old = models.StockLedgerEntry(
+        ingest_batch_id=parent.physical_import_batch_id,
+        source_content_hash="restored-64", business_identity=corrected.business_identity,
+        item_id=corrected.item_id, characteristic_ref="", organization_ref="org",
+        warehouse_ref1c=corrected.warehouse_ref1c, qty=Decimal("-64"),
+        posting_at=at, record_type="Expense", movement_kind="transfer_out",
+        recorder_type=corrected.recorder_type, recorder_ref=corrected.recorder_ref,
+        line_no=corrected.line_no, ingest_source="test", active=False,
+    )
+    db_session.add(old)
+    db_session.flush()
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=old.id, new_sle_id=corrected.id,
+        import_batch_id=target.physical_import_batch_id,
+    ))
+    corrected.qty = Decimal("-56")
+    corrected.posting_at = at
+    opening.delta_qty = Decimal("56")
+    opening.effective_at = at
+    posted.delta_qty = Decimal("-56")
+    posted.effective_at = at
+    opening.idempotency_key = _custody_event_idempotency_key(
+        issue_id=opening.issue_id, line_id=int(opening.document_line_no), revision=1,
+        source_kind="issue_created", location_kind="transit",
+        warehouse_ref1c=opening.warehouse_ref1c, delta_qty=56, source_sle_id=None,
+    )
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable, match="no exact bounded transfer-out"):
+        canonical_issue_backfill_source_ids(
+            db_session, events=[opening], physical_import_batch_id=parent.physical_import_batch_id,
+            target_cutoff=target.cutoff,
+        )
+    assert canonical_issue_backfill_source_ids(
+        db_session, events=[opening], physical_import_batch_id=target.physical_import_batch_id,
+        target_cutoff=target.cutoff, allowed_sle_ids={corrected.id},
+    ) == (corrected.id,)
+
+
 def test_custody_tail_recovery_rejects_local_or_foreign_lineage(
     db_session,
 ):
@@ -707,8 +752,9 @@ def test_run_physical_refresh_no_work_on_lock_contention(db_session, monkeypatch
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
 
+@pytest.mark.parametrize("custody_gate_rejects", [False, True])
 def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
-    db_session, monkeypatch
+    db_session, monkeypatch, custody_gate_rejects
 ):
     parent, parent_batch = _accepted_parent(db_session)
     forked_batch = models.PhysicalImportBatch(
@@ -766,6 +812,25 @@ def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
 
     target_cutoff = parent.cutoff + timedelta(days=1)
     calls = []
+    db_session.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=parent.id, cutoff=parent.cutoff, status="complete",
+        source_event_high_watermark_id=0,
+    ))
+    db_session.commit()
+
+    original_custody_gate = workflow._bounded_custody_tail_sle_ids
+
+    def custody_gate(db, **kwargs):
+        # A retry opening can only be proved after importing its corrected
+        # document into this candidate, never against the restored parent.
+        assert calls == ["fork", "audit", "import", "balance"]
+        assert kwargs["target_generation_id"] == physical.id
+        calls.append("custody-gate")
+        if custody_gate_rejects:
+            raise workflow.PhysicalRefreshOrchestratorError("unproved custody tail")
+        return original_custody_gate(db, **kwargs)
+
+    monkeypatch.setattr(workflow, "_bounded_custody_tail_sle_ids", custody_gate)
     commit_calls = []
     original_commit = db_session.commit
 
@@ -840,6 +905,17 @@ def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
     monkeypatch.setattr(workflow, "publish_forward_physical_refresh_current", _publish)
     monkeypatch.setattr(db_session, "commit", _commit)
 
+    if custody_gate_rejects:
+        with pytest.raises(workflow.PhysicalRefreshOrchestratorError, match="unproved custody tail"):
+            workflow.run_physical_refresh(
+                db_session, generation_key="happy-path", target_cutoff=target_cutoff,
+                client=object(), balance_snapshot={}, started_by="pytest",
+            )
+        assert "publish" not in calls
+        assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
+        assert db_session.get(models.LedgerGeneration, physical.id).status == "rejected"
+        return
+
     result = workflow.run_physical_refresh(
         db_session,
         generation_key="happy-path",
@@ -849,7 +925,7 @@ def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
         started_by="pytest",
     )
 
-    assert calls == ["fork", "audit", "import", "balance", "publish"]
+    assert calls == ["fork", "audit", "import", "balance", "custody-gate", "publish"]
     assert commit_calls == ["commit", "commit"]
     assert result.published is True
     assert result.published_generation_id == physical.id

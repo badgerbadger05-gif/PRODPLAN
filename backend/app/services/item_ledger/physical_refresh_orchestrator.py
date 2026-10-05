@@ -1399,18 +1399,10 @@ def run_physical_refresh(
             if parent_custody_manifest is not None
             else 0
         )
-        preexisting_custody_tail_sle_ids: tuple[int, ...] = ()
-        if parent_custody_manifest is not None:
-            # A previous process may have committed the import/custody event
-            # tail before crashing.  Validate that bounded tail now and carry
-            # it into the new current publication instead of rejecting a
-            # recoverable retry at startup.
-            preexisting_custody_tail_sle_ids = _bounded_custody_tail_sle_ids(
-                db,
-                after_event_id=custody_event_start,
-                parent_generation_id=int(parent.id),
-                target_cutoff=cutoff,
-            )
+        # Validate the entire unpublished custody tail against the completed
+        # candidate below. A rejected recorder revision can leave an opening
+        # whose quantity differs from the restored parent's document. Only a
+        # fresh bounded import can prove that opening; the parent cannot.
         pool_mapping = effective_planning_pool_by_warehouse(
             db,
             planning_pool_by_warehouse,
@@ -1652,16 +1644,22 @@ def run_physical_refresh(
             int(evidence["input_delta_rows"]),
             int(delta["input_delta_rows"]),
         )
-        custody_source_sle_ids = tuple(dict.fromkeys(
-            preexisting_custody_tail_sle_ids
-            + _bounded_custody_tail_sle_ids(
+        try:
+            custody_source_sle_ids = _bounded_custody_tail_sle_ids(
                 db,
                 after_event_id=custody_event_start,
                 parent_generation_id=int(parent.id),
                 target_cutoff=cutoff,
                 target_generation_id=int(physical_generation.id),
             )
-        ))
+        except PhysicalRefreshOrchestratorError as exc:
+            db.rollback()
+            discard_physical_refresh_candidate(
+                db, ledger_generation_id=int(fork.ledger_generation_id),
+                reason=f"custody candidate validation failed: {exc}",
+            )
+            db.commit()
+            raise
         # Decision §25: a real change of the supply-relevant supplier-order
         # fields is accepted only by a new physical generation.  A tick with no
         # movement at all therefore still has to ask whether the 1C order

@@ -274,6 +274,68 @@ def test_bounded_custody_revision_requires_complete_physical_basis(db_session):
     assert Decimal(str(workshop.reserved_qty)) == Decimal("64")
 
 
+def _replace_revision_with_exact_reimport(db):
+    parent, target, workshop, transit, explicit, tail = _custody_revision_world(db)
+    for event in tail:
+        replacement = db.get(models.StockLedgerEntry, event.source_sle_id)
+        edge = db.query(models.StockLedgerFactSupersession).filter_by(
+            new_sle_id=replacement.id,
+        ).one()
+        original = db.get(models.StockLedgerEntry, edge.old_sle_id)
+        replacement.source_content_hash = original.source_content_hash
+        replacement.qty = original.qty
+        db.delete(event)
+    db.flush()
+    return parent, target, workshop, transit, explicit
+
+
+def test_bounded_custody_exact_reimport_keeps_original_events_and_balances(db_session):
+    parent, target, workshop, transit, explicit = _replace_revision_with_exact_reimport(db_session)
+    original_event_ids = [row.id for row in db_session.query(models.ProductionMaterialCustodyEvent)]
+    original_row_ids = (workshop.id, transit.id)
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        source_sle_ids=tuple(explicit),
+    ) == 0
+    assert Decimal(str(transit.reserved_qty)) == Decimal("48")
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("64")
+    assert (workshop.id, transit.id) == original_row_ids
+    assert [row.id for row in db_session.query(models.ProductionMaterialCustodyEvent)] == original_event_ids
+    handoff_current_material_custody_provenance(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+    )
+    _accept(db_session, target)
+    assert load_compact_current_material_custody(db_session, consumer="exact-reimport")[0] == target.id
+
+
+@pytest.mark.parametrize("mutation", ["qty", "hash", "warehouse", "movement", "posting"])
+def test_bounded_custody_reimport_requires_identical_physical_fact(db_session, mutation):
+    parent, target, workshop, transit, explicit = _replace_revision_with_exact_reimport(db_session)
+    replacement = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.ingest_batch_id == target.physical_import_batch_id,
+        models.StockLedgerEntry.movement_kind == "transfer_out",
+    ).one()
+    if mutation == "qty":
+        replacement.qty = Decimal("-56")
+    elif mutation == "hash":
+        replacement.source_content_hash = "corrected-hash"
+    elif mutation == "warehouse":
+        replacement.warehouse_ref1c = "FOREIGN"
+    elif mutation == "movement":
+        replacement.movement_kind = "assembly_out"
+    else:
+        replacement.posting_at += timedelta(seconds=1)
+    db_session.flush()
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable,
+                       match="no event for target-visible transfer"):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+            source_sle_ids=tuple(explicit),
+        )
+    assert Decimal(str(transit.reserved_qty)) == Decimal("48")
+    assert Decimal(str(workshop.reserved_qty)) == Decimal("64")
+
+
 def test_bounded_custody_revision_rejects_mismatched_compact_parent(db_session):
     parent, target, workshop, transit, explicit, _tail = _custody_revision_world(db_session)
     transit.reserved_qty = Decimal("47.999")
@@ -803,3 +865,44 @@ def test_canonical_issue_backfill_rejects_forged_or_unbounded_tail(db_session, m
             db_session, after_event_id=0, parent_generation_id=parent.id,
             target_generation_id=target.id, target_cutoff=target.cutoff,
         )
+
+
+def test_discard_removes_only_candidate_proven_backfill_opening(db_session):
+    from app.services.item_ledger.physical_refresh_discard import discard_physical_refresh_candidate
+
+    parent, target, sle, opening, posted, custody = _canonical_backfill_world(db_session)
+    local = models.ProductionMaterialCustodyEvent(
+        issue_id=opening.issue_id, product_id=opening.product_id,
+        component_item_id=opening.component_item_id, source_kind="issue_created",
+        effective_at=target.cutoff, location_kind="transit",
+        warehouse_ref1c=opening.warehouse_ref1c, delta_qty=Decimal("7"),
+        idempotency_key="operator-opening", source_ref2c=None,
+    )
+    db_session.add(local)
+    db_session.commit()
+    retained_qty = custody.reserved_qty
+    result = discard_physical_refresh_candidate(
+        db_session, ledger_generation_id=target.id, reason="failed publication",
+    )
+    db_session.flush()
+    assert result.deleted_custody_events == 2
+    assert [row.id for row in db_session.query(models.ProductionMaterialCustodyEvent)] == [local.id]
+    assert custody.reserved_qty == retained_qty
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
+
+
+def test_discard_retains_backfill_proven_by_accepted_physical_fact(db_session):
+    from app.services.item_ledger.physical_refresh_discard import discard_physical_refresh_candidate
+
+    parent, target, sle, opening, posted, custody = _canonical_backfill_world(db_session)
+    sle.ingest_batch_id = parent.physical_import_batch_id
+    sle.posting_at = parent.cutoff
+    opening.effective_at = parent.cutoff
+    posted.effective_at = parent.cutoff
+    parent.physical_import_batch.source_watermarks = target.physical_import_batch.source_watermarks
+    db_session.commit()
+    result = discard_physical_refresh_candidate(
+        db_session, ledger_generation_id=target.id, reason="failed publication",
+    )
+    assert result.deleted_custody_events == 0
+    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 2

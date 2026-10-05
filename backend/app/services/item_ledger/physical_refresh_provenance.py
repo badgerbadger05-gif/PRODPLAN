@@ -20,6 +20,7 @@ from app.services.production_material_custody_events import _custody_event_idemp
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
     _same_1c_timestamp,
+    _visible_source_sle_for_event,
     replay_bounded_material_custody_cells,
 )
 from .physical_visibility import PhysicalVisibilityError, visible_sle_query
@@ -537,7 +538,20 @@ def apply_bounded_current_material_custody_events(
     tail_event_source_ids = {
         int(event.source_sle_id) for event in tail if event.source_sle_id is not None
     }
-    missing_terminal_events = terminal_visible_ids - tail_event_source_ids
+    # Exact recorder reimports preserve the original custody event and its
+    # stable physical identity. A new technical SLE id alone requires no audit
+    # churn; the canonical resolver proves that every fact field is unchanged.
+    reimport_event_source_ids = {
+        int(source.id)
+        for event in corrected_events
+        if (source := _visible_source_sle_for_event(
+            db, event=event, physical_import_batch_id=target_batch,
+            cutoff=target.cutoff,
+        )) is not None
+    }
+    missing_terminal_events = (
+        terminal_visible_ids - tail_event_source_ids - reimport_event_source_ids
+    )
     if missing_terminal_events:
         raise PhysicalRefreshProvenanceUnavailable(
             "custody correction has no event for target-visible transfer "

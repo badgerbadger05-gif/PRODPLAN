@@ -50,6 +50,10 @@ from app import models
 
 from .physical import guard_physical_batch_writer
 from .physical_visibility import visible_sle_query
+from .physical_refresh_provenance import (
+    PhysicalRefreshProvenanceUnavailable,
+    canonical_issue_backfill_source_ids,
+)
 
 
 ALGORITHM_VERSION = "ledger-physical-refresh-discard/1"
@@ -363,6 +367,39 @@ def discard_physical_refresh_candidate(
     expected_fingerprint = _fingerprint(db, cut)
     conflicts_before = _live_revision_conflicts(db)
 
+    # The transfer projector also emits a local-looking reservation opening
+    # when an old exported issue has no opening. Its exact physical witnesses
+    # bind it to this candidate even though source_sle_id is NULL. Prove that
+    # relationship before deleting the candidate's physical boundary.
+    parent_manifest = db.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+    )
+    backfill_ids: list[int] = []
+    if parent_manifest is not None and parent_manifest.status == "complete":
+        openings = db.query(models.ProductionMaterialCustodyEvent).filter(
+            models.ProductionMaterialCustodyEvent.id
+            > int(parent_manifest.source_event_high_watermark_id),
+            models.ProductionMaterialCustodyEvent.source_sle_id.is_(None),
+            models.ProductionMaterialCustodyEvent.source_kind == "issue_created",
+            models.ProductionMaterialCustodyEvent.source_ref2c.is_not(None),
+        ).all()
+        for opening in openings:
+            try:
+                witnesses = canonical_issue_backfill_source_ids(
+                    db, events=[opening],
+                    physical_import_batch_id=boundary_before,
+                    target_cutoff=generation.cutoff,
+                )
+            except PhysicalRefreshProvenanceUnavailable:
+                # Ordinary operator reservations and unproved tails are never
+                # part of a physical rollback.
+                continue
+            if witnesses and db.query(models.StockLedgerEntry.id).filter(
+                models.StockLedgerEntry.id.in_(witnesses),
+                models.StockLedgerEntry.ingest_batch_id <= cut,
+            ).first() is None:
+                backfill_ids.append(int(opening.id))
+
     deleted_generation_rows: dict[str, int] = {}
     for model in _generation_scoped_tables():
         removed = db.query(model).filter(
@@ -392,24 +429,21 @@ def discard_physical_refresh_candidate(
     # the pair on the next import, because it still recognises the orphan by its
     # stable physical identity.  That is how one rolled-back candidate silently
     # blocked every launch with a negative workshop reservation.
+    doomed_predicate = models.ProductionMaterialCustodyEvent.source_sle_id.in_(
+        db.query(models.StockLedgerEntry.id).filter(
+            models.StockLedgerEntry.ingest_batch_id > cut
+        )
+    ) | models.ProductionMaterialCustodyEvent.id.in_(backfill_ids)
     doomed_custody = db.query(
         models.ProductionMaterialCustodyEvent.id,
         models.ProductionMaterialCustodyEvent.source_ref2c,
     ).filter(
-        models.ProductionMaterialCustodyEvent.source_sle_id.in_(
-            db.query(models.StockLedgerEntry.id).filter(
-                models.StockLedgerEntry.ingest_batch_id > cut
-            )
-        )
+        doomed_predicate
     ).all()
     deleted_custody_events = db.query(
         models.ProductionMaterialCustodyEvent
     ).filter(
-        models.ProductionMaterialCustodyEvent.source_sle_id.in_(
-            db.query(models.StockLedgerEntry.id).filter(
-                models.StockLedgerEntry.ingest_batch_id > cut
-            )
-        )
+        doomed_predicate
     ).delete(synchronize_session=False)
     db.flush()
     restored_scopes = _restore_manifests_invalidated_by(db, doomed_custody)

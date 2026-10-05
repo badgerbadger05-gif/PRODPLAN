@@ -5,6 +5,7 @@ import logging
 import hashlib
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 from sqlalchemy import exists, func, or_, tuple_
@@ -310,7 +311,25 @@ def _visible_source_sle_for_event(
         .filter(models.StockLedgerEntry.line_no == line_no)
         .all()
     )
-    return candidates[0] if len(candidates) == 1 else None
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    # An exact reimport may change the technical row id, but never the fact.
+    # Do not let a reused content hash disguise a quantity or cell correction.
+    if (
+        Decimal(str(candidate.qty)) != Decimal(str(original.qty))
+        or int(candidate.item_id) != int(original.item_id)
+        or any(
+            str(getattr(candidate, field) or "") != str(getattr(original, field) or "")
+            for field in (
+                "warehouse_ref1c", "characteristic_ref", "organization_ref",
+                "record_type", "movement_kind",
+            )
+        )
+        or not _same_1c_timestamp(candidate.posting_at, original.posting_at)
+    ):
+        return None
+    return candidate
 
 
 def _custody_fold_anchor(
@@ -544,23 +563,11 @@ def _select_visible_custody_events(
             ),
         )
 
-    visible_sle_ids = visible_sle_query(
-        db,
-        physical_import_batch_id=int(generation.physical_import_batch_id),
-        cutoff=generation.cutoff,
-    ).with_entities(models.StockLedgerEntry.id)
-
     query = (
         db.query(models.ProductionMaterialCustodyEvent)
         .filter(models.ProductionMaterialCustodyEvent.effective_at > baseline_cutoff)
         .filter(models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff)
         .filter(models.ProductionMaterialCustodyEvent.id <= target_high_watermark_id)
-        .filter(
-            or_(
-                models.ProductionMaterialCustodyEvent.source_sle_id.is_(None),
-                models.ProductionMaterialCustodyEvent.source_sle_id.in_(visible_sle_ids),
-            )
-        )
     )
     if selected_keys is not None:
         query = query.filter(_custody_cell_predicate(
@@ -572,7 +579,15 @@ def _select_visible_custody_events(
     visible = [
         event
         for event in events
-        if not _is_reimport_duplicate_physical_event(
+        if (
+            event.source_sle_id is None
+            or _visible_source_sle_for_event(
+                db, event=event,
+                physical_import_batch_id=int(generation.physical_import_batch_id),
+                cutoff=generation.cutoff,
+            ) is not None
+        )
+        and not _is_reimport_duplicate_physical_event(
             db,
             event,
             original_high_watermark_id=baseline_high_watermark_id,

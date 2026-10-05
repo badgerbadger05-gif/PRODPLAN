@@ -17,7 +17,10 @@ from app.models import (
     LedgerGeneration,
     PhysicalImportBatch,
     PlanningTruthState,
+    ProductionMaterialCustodyEvent,
     ProductionMaterialCustodyProjectionManifest,
+    ProductionOrder,
+    ProductionProduct,
     SpecComponent,
     Specification,
     StockBin,
@@ -196,3 +199,68 @@ def test_qty_must_be_positive(client, db_session):
     _mk_item(db_session, "P1", "12-345")
     resp = client.get("/api/v1/release-feasibility/analyze", params={"article": "12-345", "qty": 0})
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("endpoint", ["search", "analyze"])
+def test_unpublished_custody_tail_returns_structured_unavailable(client, db_session, endpoint):
+    product_item = _mk_item(db_session, "P1", "10716")
+    material = _mk_item(db_session, "M1", "M-1", stock=100.0)
+    _mk_spec(db_session, product_item, {material: 2.0})
+    order = ProductionOrder(order_number="CUSTODY-TAIL", order_date=CUTOFF)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id, item_id=product_item.item_id,
+        quantity=1, remaining_qty=1,
+    )
+    db_session.add(product)
+    db_session.flush()
+    event = ProductionMaterialCustodyEvent(
+        product_id=product.product_id,
+        component_item_id=material.item_id,
+        source_kind="issue_created",
+        effective_at=CUTOFF,
+        location_kind="transit",
+        warehouse_ref1c=MAIN_WAREHOUSE,
+        delta_qty=2,
+        idempotency_key="release-feasibility-unpublished-tail",
+    )
+    db_session.add(event)
+    db_session.flush()
+    generation_id = db_session.query(PlanningTruthState).one().current_generation_id
+    params = {"q": "10716"} if endpoint == "search" else {"article": "10716", "qty": 1}
+
+    resp = client.get(f"/api/v1/release-feasibility/{endpoint}", params=params)
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {
+        "code": "material_custody_snapshot_unavailable",
+        "status": "unavailable",
+        "product_id": None,
+        "component_item_id": None,
+        "manifest_generation_id": None,
+        "expected_generation_id": generation_id,
+        "stored_generation_id": generation_id,
+        "reason": "compact current custody has an unpublished event tail",
+    }
+    # GET must leave the unpublished event and publication marker intact.
+    assert db_session.query(ProductionMaterialCustodyEvent).count() == 1
+    assert db_session.query(ProductionMaterialCustodyProjectionManifest).one().source_event_high_watermark_id == 0
+
+
+@pytest.mark.parametrize("endpoint", ["search", "analyze"])
+def test_stale_truth_returns_structured_unavailable(client, db_session, monkeypatch, endpoint):
+    product = _mk_item(db_session, "P1", "10716", stock=100.0)
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "1")
+    params = {"q": "10716"} if endpoint == "search" else {"item_id": product.item_id, "qty": 1}
+
+    resp = client.get(f"/api/v1/release-feasibility/{endpoint}", params=params)
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["code"] == "planning_truth_unavailable"
+    assert detail["truth_status"] == "stale"
+    assert detail["ready"] is False
+    assert detail["ledger_generation"] == db_session.query(PlanningTruthState).one().current_generation_id
+    assert detail["cutoff"].startswith("2026-08-21T00:00:00")
+    assert "exceeded freshness threshold" in detail["reason"]

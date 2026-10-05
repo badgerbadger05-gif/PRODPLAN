@@ -12,9 +12,12 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from ..database import get_db
+from ..services.planning_truth import PlanningTruthUnavailable
+from ..services.production_material_custody_projection import MaterialCustodySnapshotUnavailable
 from ..services.release_feasibility import (
     DEFAULT_MAX_DEPTH,
     analyze_release,
@@ -33,7 +36,10 @@ def search_items(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    items = find_items(db, q, limit=int(limit))
+    try:
+        items = find_items(db, q, limit=int(limit))
+    except (PlanningTruthUnavailable, MaterialCustodySnapshotUnavailable) as exc:
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     return {"items": items, "meta": {"q": str(q or "").strip(), "count": len(items)}}
 
 
@@ -77,6 +83,8 @@ def analyze(
             max_depth=int(max_depth),
             include_tree=bool(include_tree),
         )
+    except (PlanningTruthUnavailable, MaterialCustodySnapshotUnavailable) as exc:
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - защитный контур
