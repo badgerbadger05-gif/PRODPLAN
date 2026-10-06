@@ -444,6 +444,7 @@ def preview_materials(
     ledger_generation_id: int | None = None,
     _product_override: ProductionProduct | None = None,
     _bulk_context: _BulkPreviewContext | None = None,
+    _current_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Return the BOM components required for a production line plus per-component
@@ -462,7 +463,7 @@ def preview_materials(
     Order-level field `coverage` aggregates per-component labels per the plan
     rules (any shortage -> shortage, else any partial -> partial, else ready).
     """
-    allow_building_read = ledger_generation_id is not None
+    allow_building_read = ledger_generation_id is not None and not _current_only
     if ledger_generation_id is None:
         truth = require_accepted_truth(
             db,
@@ -530,10 +531,13 @@ def preview_materials(
     else:
         from .production_material_custody_projection import load_material_custody_projection
 
-        reservation_state = load_material_custody_projection(
-            db,
-            ledger_generation_id=int(ledger_generation_id),
-        )
+        if _current_only:
+            from .production_material_custody_projection import load_compact_current_material_custody
+            custody_generation, reservation_state = load_compact_current_material_custody(db, consumer="production.current_materials")
+            if custody_generation != int(ledger_generation_id):
+                raise ValueError("Поколение текущего снимка материалов изменилось")
+        else:
+            reservation_state = load_material_custody_projection(db, ledger_generation_id=int(ledger_generation_id))
     # Components held by OTHER lines are unavailable; components this line
     # already holds (in transit or delivered to its workshop) count as its own
     # coverage instead of re-entering the pool.
@@ -661,6 +665,7 @@ def preview_materials_bulk(
     product_ids: Sequence[int],
     *,
     ledger_generation_id: int,
+    _current_only: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Preview bounded production products with shared Ledger read context.
 
@@ -706,12 +711,15 @@ def preview_materials_bulk(
         db,
         sorted(component_ids),
         ledger_generation_id=generation_id,
-        allow_building_read=True,
+        allow_building_read=not _current_only,
     )
-    custody = load_material_custody_projection(
-        db,
-        ledger_generation_id=generation_id,
-    )
+    if _current_only:
+        from .production_material_custody_projection import load_compact_current_material_custody
+        custody_generation, custody = load_compact_current_material_custody(db, consumer="production.current_materials_bulk")
+        if custody_generation != generation_id:
+            raise ValueError("Поколение текущего снимка материалов изменилось")
+    else:
+        custody = load_material_custody_projection(db, ledger_generation_id=generation_id)
     reservation_orders = _reservation_orders_by_item(
         db,
         custody,
@@ -721,11 +729,11 @@ def preview_materials_bulk(
         db,
         sorted(component_ids),
         ledger_generation_id=generation_id,
-        current_only=False,
+        current_only=_current_only,
     )
     context = _BulkPreviewContext(
         ledger_generation_id=generation_id,
-        allow_building_read=True,
+        allow_building_read=not _current_only,
         positions=positions,
         custody=custody,
         future_supply_eta=future_supply_eta,
@@ -739,6 +747,7 @@ def preview_materials_bulk(
             ledger_generation_id=generation_id,
             _product_override=products_by_id[product_id],
             _bulk_context=context,
+            _current_only=_current_only,
         )
         for product_id in ids
     }
@@ -754,6 +763,7 @@ def preview_make_work_item_materials(
     ledger_generation_id: int,
     order_number: str,
     run_id: int | None = None,
+    _current_only: bool = False,
 ) -> Dict[str, Any]:
     """Preview one saved MAKE obligation without creating an executor order."""
     item = db.get(Item, int(item_id))
@@ -773,6 +783,7 @@ def preview_make_work_item_materials(
     payload = preview_materials(
         db, -int(work_item_id), ledger_generation_id=int(ledger_generation_id),
         _product_override=preview_product,
+        _current_only=_current_only,
     )
     payload["work_item_id"] = int(work_item_id)
     payload["product_id"] = None

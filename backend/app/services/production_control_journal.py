@@ -436,6 +436,7 @@ def materialize_make_work_items(
     *,
     initiated_by: Optional[str] = None,
     launch_requests: Optional[Mapping[int, Mapping[str, float]]] = None,
+    _commit: bool = True,
 ) -> Dict[str, Any]:
     """
     Materialize canonical make work items into internal production orders.
@@ -680,7 +681,8 @@ def materialize_make_work_items(
         # authorize or stamp this mutation through legacy covered/remaining
         # caches; the generation reconciliation worker owns projections.
 
-    db.commit()
+    if _commit:
+        db.commit()
     return {
         "status": "ok",
         "created": created,

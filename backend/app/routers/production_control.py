@@ -1941,6 +1941,20 @@ def get_order_line_materials(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/work-items/{work_item_id}/materials/prepare", response_model=ProductionMaterialsResponse)
+async def prepare_work_item_materials(
+    work_item_id: int, qty: float = Query(gt=0),
+    current_identity: str = Query(min_length=1), expected_source_revision: str = Query(min_length=1),
+):
+    """Prepare and persist a selected quantity through the bounded worker."""
+    from starlette.concurrency import run_in_threadpool
+    from ..services.production_control_command_worker import run_command
+    return await run_in_threadpool(run_command, "materials", {
+        "work_item_id": work_item_id, "qty": qty,
+        "current_identity": current_identity, "expected_source_revision": expected_source_revision,
+    })
+
+
 @router.get("/work-items/{work_item_id}/materials", response_model=ProductionMaterialsResponse)
 def get_work_item_materials(
     work_item_id: int,
@@ -2016,7 +2030,12 @@ def get_work_item_materials(
         if requested_qty <= 0:
             raise HTTPException(status_code=400, detail="Количество запуска вне доступного остатка")
         if stored_qty is None or abs(float(stored_qty) - requested_qty) > 1e-6:
-            raise CurrentExecutionUnavailable("current work-item material coverage is not persisted for requested quantity")
+            from decimal import Decimal
+            key = format(Decimal(str(requested_qty)).normalize(), "f")
+            saved = (current_payload.get("_material_quantity_snapshots") or {}).get(key)
+            if not saved or saved.get("source_revision") != str(current_manifest.source_revision):
+                raise CurrentExecutionUnavailable("current work-item material coverage is not persisted for requested quantity")
+            persisted_material = saved["payload"]
         persisted = public_materials_payload(dict(persisted_material))
         persisted["work_item_id"] = int(work_item_id)
         # The API keeps the accepted-generation provenance field, but it is
@@ -2296,10 +2315,16 @@ def post_export_piecework_to_1c(
 
 
 @router.post("/orders/from-work-items", response_model=OrdersFromWorkItemsResponse)
-def post_orders_from_work_items(
+async def post_orders_from_work_items(
     payload: OrdersFromWorkItemsPayload,
     db: Session = Depends(get_db),
 ):
+    from starlette.concurrency import run_in_threadpool
+    from ..services.production_control_command_worker import run_command
+    return await run_in_threadpool(run_command, "materialize", payload.model_dump())
+
+
+def _materialize_orders_from_work_items(payload: OrdersFromWorkItemsPayload, db: Session):
     """
     Materialize selected current-generation make work items into orders.
 
@@ -2318,6 +2343,7 @@ def post_orders_from_work_items(
     if not selected_ids:
         raise HTTPException(status_code=400, detail="Не выбраны рабочие строки")
     try:
+        db.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
         manifest, current_rows = _require_current_production_identities(
             db,
             identities=[str(identity) for identity in payload.current_identities],
@@ -2341,14 +2367,25 @@ def post_orders_from_work_items(
             if work_id is None:
                 raise CurrentExecutionUnavailable("current MRP proposal locator is missing or ambiguous")
             current_work_ids.add(int(work_id))
+            request = launch_requests.get(int(work_id))
+            if request is not None:
+                already_applied = abs(float(row_payload.get("materialized_order_qty") or 0)
+                    - request["expected_materialized_qty"] - request["launch_qty"]) <= 1e-6
+                if not already_applied and request["launch_qty"] > float(row_payload.get("launchable_qty") or 0) + 1e-6:
+                    raise HTTPException(400, detail="Количество запуска превышает текущий доступный остаток")
         if current_work_ids != set(selected_ids):
             raise HTTPException(status_code=409, detail={"code": "production_current_locator_stale"})
-        return materialize_make_work_items(
+        result = materialize_make_work_items(
             db,
             selected_ids,
             initiated_by=payload.initiated_by,
             launch_requests=launch_requests or None,
+            _commit=False,
         )
+        from ..services.production_control_journal_projection import publish_local_make_changes
+        if result["created"] or result["reused"]:
+            publish_local_make_changes(db, selected_ids)
+        return result
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
     except HTTPException:

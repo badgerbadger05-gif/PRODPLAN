@@ -240,4 +240,28 @@ describe('production-control current action transport', () => {
       expected_source_revision: 'rev-7',
     })
   })
+
+  it('prepares a missing partial quantity in the worker with the same identity and revision', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+        code: 'production_control_current_unavailable',
+        reason: 'current work-item material coverage is not persisted for requested quantity',
+      } }), { status: 503, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ qty: 200, components: [] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await getWorkItemMaterials(701, 200, 1742, 'mrp:492056', 'rev-7')).toMatchObject({ qty: 200 })
+    expect(fetchMock.mock.calls[1]![0]).toContain('/materials/prepare?qty=200')
+    expect(fetchMock.mock.calls[1]![0]).toContain('expected_source_revision=rev-7')
+    expect(fetchMock.mock.calls[1]![1]).toMatchObject({ method: 'POST' })
+  })
+
+  it('keeps stale or unavailable truth fail-closed without requesting a calculation', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: {
+      code: 'production_control_current_unavailable', reason: 'current scope unavailable',
+    } }), { status: 503, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(getWorkItemMaterials(701, 200, 1742, 'mrp:492056', 'rev-7')).rejects.toThrow()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
 })

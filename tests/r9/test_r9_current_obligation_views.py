@@ -16,7 +16,7 @@ from app.routers.production_control import (
     get_orders_journal,
     list_root_products,
     get_order_line_materials,
-    post_orders_from_work_items,
+    _materialize_orders_from_work_items,
 )
 from app.routers.purchase_control import (
     PurchaseControlSelectionSummaryRequest,
@@ -320,7 +320,7 @@ def test_r9_production_get_resolves_work_item_through_stable_reservation_owner(
     assert result.total == 1
     assert result.rows[0].work_item_id == old_work.id
     with pytest.raises(Exception) as caught:
-        post_orders_from_work_items(
+        _materialize_orders_from_work_items(
             OrdersFromWorkItemsPayload(
                 work_item_ids=[old_work.id + 1000],
                 current_identities=["mrp-reservation:stable"],

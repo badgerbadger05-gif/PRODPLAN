@@ -2113,6 +2113,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/work-items/{work_item_id}/materials/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Prepare Work Item Materials
+         * @description Prepare and persist a selected quantity through the bounded worker.
+         */
+        post: operations["prepare_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_prepare_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/work-items/{work_item_id}/materials": {
         parameters: {
             query?: never;
@@ -2260,12 +2280,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /**
-         * Post Orders From Work Items
-         * @description Materialize selected current-generation make work items into orders.
-         *
-         *     Frozen requirement, reservation and work-item quantities are not changed.
-         */
+        /** Post Orders From Work Items */
         post: operations["post_orders_from_work_items_api_v1_production_control_orders_from_work_items_post"];
         delete?: never;
         options?: never;
@@ -10954,6 +10969,41 @@ export interface operations {
             header?: never;
             path: {
                 product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProductionMaterialsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_prepare_post: {
+        parameters: {
+            query: {
+                qty: number;
+                current_identity: string;
+                expected_source_revision: string;
+            };
+            header?: never;
+            path: {
+                work_item_id: number;
             };
             cookie?: never;
         };

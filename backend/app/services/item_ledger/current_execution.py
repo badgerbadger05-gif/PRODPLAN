@@ -731,7 +731,7 @@ def _wall_clock_instant(value: Any) -> Any:
 # The computed-at stamp of the coverage moves with every publication; the
 # coverage itself (scalars and the persisted snapshot the material readers
 # serve) stays compared.
-_PRODUCTION_CALCULATION_ARTIFACTS = frozenset({"material_coverage_calculated_at"})
+_PRODUCTION_CALCULATION_ARTIFACTS = frozenset({"material_coverage_calculated_at", "_material_quantity_snapshots"})
 
 # Derived digests of rows that are published themselves; the staged schedule
 # row has no column for them, so they are technical and never a change.
@@ -1859,6 +1859,8 @@ def publish_current_production_control_from_payload(
     db: Session,
     generation_id: int,
     payload: Mapping[str, Any],
+    *,
+    source_revision: str | None = None,
 ) -> CurrentExecutionPublishResult:
     """Publish the production journal directly into its compact current owner."""
     generation = db.get(models.LedgerGeneration, int(generation_id))
@@ -1943,7 +1945,7 @@ def publish_current_production_control_from_payload(
     summary["total_rows"] = len(current_rows)
     return publish_current_execution_scope(
         db,
-        source_revision=f"accepted:g{int(generation.id)}:production_control_journal",
+        source_revision=source_revision or f"accepted:g{int(generation.id)}:production_control_journal",
         source_generation_id=int(generation.id),
         scope_key="production:all-live-orders",
         rows=current_rows,

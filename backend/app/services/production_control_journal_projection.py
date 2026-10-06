@@ -99,11 +99,166 @@ def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     row = dict(payload)
     row.pop("material_coverage_snapshot", None)
     row.pop("_route_sheet_snapshot", None)
+    row.pop("_material_quantity_snapshots", None)
     # reservation_id is an internal compatibility locator.  It remains in
     # the saved/current payload for mutation resolution, but is not part of
     # the public journal DTO (which deliberately forbids extra fields).
     row.pop("reservation_id", None)
     return row
+
+
+def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str:
+    """Publish bounded local executors and their residual MAKE rows atomically.
+
+    Called by the command worker, never by a public GET. Frozen obligations
+    and accepted physical truth stay unchanged; existing canonical builders
+    own every quantity, status, material and route-sheet result.
+    """
+    from .planning_truth import require_accepted_truth
+    from .mrp_mutation_guard import require_current_run, require_selected_make_work_items
+    from .production_control_journal import _active_mrp_products_for_requirement
+    from .production_control_material_availability import preview_materials_bulk, preview_make_work_item_materials
+    from .item_ledger.current_execution import (
+        require_current_execution_scope, load_current_execution_rows,
+        publish_current_production_control_from_payload,
+    )
+
+    truth = require_accepted_truth(db, "production.local_make_publish")
+    manifest = require_current_execution_scope(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
+    records = load_current_execution_rows(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
+    payloads = {str(row.business_identity): deepcopy(dict(row.payload)) for row in records}
+    for work_id in sorted(set(map(int, work_item_ids))):
+        work = db.get(models.ReplenishmentWorkItem, work_id)
+        if work is None:
+            raise ValueError("Рабочая строка не найдена")
+        run, generation_id = require_current_run(db, work.run_id, consumer="production.local_make_publish")
+        owner = require_selected_make_work_items(db, [work], run=run, generation_id=generation_id)[work.id]
+        identity = f"mrp-reservation:{owner.current_identity}"
+        previous = payloads.get(identity)
+        if previous is None:
+            raise ValueError("Текущая строка MRP недоступна")
+        requirement = db.get(models.MrpRequirement, work.requirement_id)
+        products = [product for product, _ in _active_mrp_products_for_requirement(db, requirement)]
+        ids = [int(product.product_id) for product in products]
+        materials = preview_materials_bulk(db, ids, ledger_generation_id=generation_id, _current_only=True)
+        routes = build_route_sheet_snapshot_payloads(db, product_ids=ids, ledger_generation_id=generation_id)
+        for product in products:
+            page = list_journal(db, truth=truth, _accepted_run_ids_override=[run.run_id],
+                                _material_coverage_by_product=materials, product_id=product.product_id, limit=2)
+            if len(page["rows"]) != 1:
+                raise ValueError("Созданная строка заказа недоступна для публикации")
+            row = dict(page["rows"][0])
+            row["material_coverage_snapshot"] = materials[product.product_id]
+            row["_route_sheet_snapshot"] = routes[product.product_id]
+            row["root_item_ids"] = list(previous.get("root_item_ids") or [])
+            row["current_identity"] = _candidate_business_identity(row)
+            row.pop("journal_row_key", None)
+            row.pop("work_item_id", None)
+            payloads[row["current_identity"]] = _compact_business_payload(row)
+        remaining = replenishment_remaining(owner.replenishment_required_qty, owner.replenishment_received_qty)
+        source = SimpleNamespace(id=work.id, reservation_id=owner.id, item_id=work.item_id,
+                                 requirement_id=work.requirement_id, run_id=run.run_id,
+                                 replenishment_required_qty=owner.replenishment_required_qty,
+                                 replenishment_fulfilled_qty=owner.replenishment_received_qty,
+                                 replenishment_remaining_qty=remaining)
+        shelves = {}
+        if previous.get("launch_source") == "shelf_pull":
+            require_current_execution_scope(db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps")
+            for saved in load_current_execution_rows(db, entity_kind="shelf_projection", scope_key="shelf:all-live-mrps"):
+                shelf = saved.payload
+                if int(shelf.get("item_id") or 0) == work.item_id:
+                    shelves[work.item_id] = _ShelfPull(work.item_id, str(shelf["warehouse_ref1c"]),
+                         float(shelf["pull_qty"]), float(shelf["materialized_qty"]),
+                         date.fromisoformat(shelf["first_shortage_date"]) if shelf.get("first_shortage_date") else None,
+                         date.fromisoformat(shelf["latest_start_date"]) if shelf.get("latest_start_date") else None)
+                    break
+            if not shelves:
+                raise ValueError("Текущий снимок полки недоступен")
+        proposals = _build_make_proposals_from_work_like(db, ledger_generation_id=generation_id,
+                     run_ids=[run.run_id], work_items=[source],
+                     readiness_pull_by_run_item=_drum_readiness_pull_by_run_item(db, generation_id), shelf_by_item=shelves)
+        if proposals:
+            row = dict(proposals[0])
+            row["current_identity"] = identity
+            row["reservation_id"] = owner.id
+            row["root_item_ids"] = list(previous.get("root_item_ids") or [])
+            if row.get("spec_id") is not None and row.get("launchable_qty", 0) > 0:
+                snapshot = preview_make_work_item_materials(db, work_item_id=work.id,
+                           item_id=work.item_id, quantity=row["launchable_qty"], spec_id=row["spec_id"],
+                           ledger_generation_id=generation_id, order_number=row["order_number"], run_id=run.run_id, _current_only=True)
+                snapshot.pop("work_item_id", None)
+                row["material_coverage_snapshot"] = _compact_business_payload(snapshot)
+                row.update(coverage_status=snapshot["coverage_status"], coverage_label=snapshot["coverage_label"],
+                           material_coverage_status=snapshot["coverage_status"], material_coverage_label=snapshot["coverage_label"])
+            row.pop("journal_row_key", None)
+            row.pop("work_item_id", None)
+            payloads[identity] = _compact_business_payload(row)
+        else:
+            payloads.pop(identity, None)
+    rows = [payloads[key] for key in sorted(payloads)]
+    prefix = f"accepted:g{truth.generation_id}:production_control_journal:local"
+    meta = dict(manifest.summary or {})
+    meta.pop("row_count", None)
+    publish_current_production_control_from_payload(db, int(truth.generation_id),
+        {"meta": meta, "rows": rows, "summary": {"total_rows": len(rows)}}, source_revision=prefix)
+    db.flush()
+    revision = f"{prefix}:{manifest.content_hash[:20]}"
+    manifest.source_revision = revision
+    db.flush()
+    return revision
+
+
+def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float,
+                                  current_identity: str, expected_source_revision: str) -> dict[str, Any]:
+    """Command-worker preparation of a quantity-specific persisted preview."""
+    from decimal import Decimal
+    from fastapi import HTTPException
+    from .mrp_mutation_guard import require_current_run, require_selected_make_work_items
+    from .production_control_material_availability import preview_make_work_item_materials, public_materials_payload
+    from .item_ledger.current_execution import require_current_execution_scope
+
+    db.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
+    manifest = require_current_execution_scope(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
+    if str(manifest.source_revision) != expected_source_revision:
+        raise HTTPException(409, detail={"code": "production_current_revision_stale", "expected_source_revision": manifest.source_revision})
+    work = db.get(models.ReplenishmentWorkItem, work_item_id)
+    if work is None:
+        raise ValueError("Рабочая строка не найдена")
+    run, generation_id = require_current_run(db, work.run_id, consumer="production.prepare_materials")
+    require_selected_make_work_items(db, [work], run=run, generation_id=generation_id)
+    record = db.query(models.CurrentExecutionRow).filter_by(entity_kind="production_control_journal",
+             scope_key="production:all-live-orders", business_identity=current_identity,
+             result_status="accepted", result_ready=True).with_for_update().one_or_none()
+    if record is None:
+        raise ValueError("Текущая строка MRP недоступна")
+    row = dict(record.payload)
+    if int(row.get("source_mrp_requirement_id") or 0) != work.requirement_id or int(row.get("item_id") or 0) != work.item_id:
+        raise ValueError("Текущая строка MRP не совпадает с выбранным резервом")
+    quantity = Decimal(str(qty))
+    if not quantity.is_finite() or quantity <= 0 or quantity > Decimal(str(row.get("launchable_qty") or 0)) + Decimal("0.000001"):
+        raise HTTPException(400, detail="Количество запуска вне доступного остатка")
+    key = format(quantity.normalize(), "f")
+    variants = dict(row.get("_material_quantity_snapshots") or {})
+    saved = variants.get(key)
+    if saved and saved.get("source_revision") == expected_source_revision:
+        snapshot = saved["payload"]
+    else:
+        snapshot = preview_make_work_item_materials(db, work_item_id=work.id, item_id=work.item_id,
+                   quantity=float(quantity), spec_id=row.get("spec_id"), ledger_generation_id=generation_id,
+                   order_number=str(row.get("order_number") or ""), run_id=run.run_id, _current_only=True)
+        snapshot.pop("work_item_id", None)
+        snapshot = _compact_business_payload(snapshot)
+        variants[key] = {"source_revision": expected_source_revision, "payload": snapshot}
+        for obsolete in sorted(set(variants) - {key})[:-3]:
+            variants.pop(obsolete)
+        row["_material_quantity_snapshots"] = variants
+        record.payload = jsonable_encoder(row)
+        db.flush()
+    public = public_materials_payload(dict(snapshot))
+    generation = db.get(models.LedgerGeneration, generation_id)
+    public.update(work_item_id=work_item_id, ledger_generation_id=generation_id,
+                  truth_status="accepted", cutoff=generation.cutoff.isoformat())
+    return public
 
 
 _GENERATION_REFERENCE_KEYS = frozenset({

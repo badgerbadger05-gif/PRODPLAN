@@ -12,10 +12,11 @@ import type {
   TransferIssuesResponse,
   ReturnLeftoversResult,
 } from '../domain/productionControl'
-import { api, apiText } from '../lib/api'
-import type { components } from '../lib/apiTypes'
+import { api, apiText, ApiError } from '../lib/api'
+import type { components, operations } from '../lib/apiTypes'
 
 type ApiSchemas = components['schemas']
+type PreparedWorkMaterials = operations['prepare_work_item_materials_api_v1_production_control_work_items__work_item_id__materials_prepare_post']['responses'][200]['content']['application/json']
 
 export type PendingChainCommand = ApiSchemas['PendingChainCommandResponse']
 
@@ -157,7 +158,7 @@ export function getOrderMaterials(productId: number) {
   return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
 }
 
-export function getWorkItemMaterials(
+export async function getWorkItemMaterials(
   workItemId: number,
   quantity: number,
   ledgerGenerationId: number,
@@ -170,7 +171,24 @@ export function getWorkItemMaterials(
   })
   if (currentIdentity) params.set('current_identity', currentIdentity)
   if (expectedSourceRevision) params.set('expected_source_revision', expectedSourceRevision)
-  return api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
+  try {
+    return await api<MaterialsResponse>(`/v1/production-control/work-items/${workItemId}/materials?${params}`)
+  } catch (error) {
+    const detail = error instanceof ApiError && error.detail && typeof error.detail === 'object'
+      ? error.detail as { code?: string; reason?: string } : null
+    if (!(error instanceof ApiError) || error.status !== 503
+      || detail?.code !== 'production_control_current_unavailable'
+      || detail.reason !== 'current work-item material coverage is not persisted for requested quantity') throw error
+    const prepared = await api<PreparedWorkMaterials>(`/v1/production-control/work-items/${workItemId}/materials/prepare?${params}`, { method: 'POST' })
+    // The existing OpenAPI material DTO exposes component dictionaries. Check
+    // the shared view's required fields before narrowing that transport shape.
+    if (!prepared.components.every((row) => typeof row.component_item_id === 'number'
+      && typeof row.item_name === 'string' && typeof row.qty_per_unit === 'number'
+      && typeof row.available_qty === 'number' && typeof row.required_qty === 'number')) {
+      throw new Error('Сервер вернул неполный состав комплектующих')
+    }
+    return { ...prepared, components: prepared.components as MaterialsResponse['components'] }
+  }
 }
 
 export function updateOrderStatus(
