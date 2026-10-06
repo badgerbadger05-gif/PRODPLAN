@@ -1115,6 +1115,121 @@ def test_a_bounded_typed_row_round_trips_through_the_rebuild(db_session):
     assert str(rebuilt.operation_key) == RECEIPT_OPERATION
 
 
+def _superseded_supplier_revision_fixture(db, *, persist_edge: bool):
+    from app.services.item_ledger.supplier_receipt_allocation import (
+        build_supplier_receipt_provenance,
+    )
+
+    generation, _req = _persistence_fixture(db, legacy_received=0)
+    old = db.query(models.StockLedgerEntry).one()
+    replacement_batch = models.PhysicalImportBatch(
+        batch_key=f"supplier-replacement-{int(generation.id)}-{int(persist_edge)}",
+        status="completed",
+        source_watermarks={},
+    )
+    replacement = models.StockLedgerEntry(
+        ingest_batch=replacement_batch,
+        source_content_hash=old.source_content_hash,
+        business_identity="movement:Document_Receipt:doc:1",
+        item_id=old.item_id,
+        characteristic_ref=old.characteristic_ref,
+        organization_ref=old.organization_ref,
+        warehouse_ref1c=old.warehouse_ref1c,
+        qty=old.qty,
+        posting_at=old.posting_at,
+        known_at=old.known_at + datetime.timedelta(days=1),
+        record_type=old.record_type,
+        movement_kind=old.movement_kind,
+        recorder_type=old.recorder_type,
+        recorder_ref=old.recorder_ref,
+        line_no=old.line_no,
+        active=True,
+    )
+    db.add_all([replacement_batch, replacement])
+    generation.physical_import_batch = replacement_batch
+    db.flush()
+    if persist_edge:
+        old.active = False
+        db.add(models.StockLedgerFactSupersession(
+            old_sle_id=int(old.id),
+            new_sle_id=int(replacement.id),
+            import_batch_id=int(replacement_batch.id),
+        ))
+
+    common = {
+        "ledger_generation_id": int(generation.id),
+        "receipt_doc_type": "Document_Receipt",
+        "receipt_doc_ref": "doc",
+        "receipt_doc_line_no": "1",
+        "operation_kind": "supplier_receipt",
+        "item_id": int(old.item_id),
+        "signed_qty": old.qty,
+        "match_status": "exact",
+        "supplier_order_type": SUPPLIER_ORDER_TYPE,
+        "supplier_order_ref": "order-1",
+        "supplier_order_line_no": "1",
+        "characteristic_ref": old.characteristic_ref,
+        "warehouse_ref1c": old.warehouse_ref1c,
+    }
+    historical = build_supplier_receipt_provenance(
+        **common,
+        stock_ledger_entry_id=int(old.id),
+        operation_key=f"{RECEIPT_OPERATION}-9934-11eb-e39a-fa163e61326a",
+        operation_name="ПоступлениеОтПоставщика",
+        match_rule="supplier-receipt-exact-line",
+    )
+    current = build_supplier_receipt_provenance(
+        **common,
+        stock_ledger_entry_id=int(replacement.id),
+        operation_key=RECEIPT_OPERATION,
+        operation_name="приобретение у поставщика",
+        match_rule="bounded-typed",
+    )
+    db.add_all([historical, current])
+    db.commit()
+    return generation, old, replacement, historical
+
+
+def test_persisted_rebuild_replays_only_visible_supplier_revision(db_session):
+    generation, old, replacement, historical = _superseded_supplier_revision_fixture(
+        db_session, persist_edge=True,
+    )
+    historical_hash = str(historical.evidence_hash)
+
+    result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        cycle_id="obligation-rebuild",
+        writer_mode="current",
+    )
+    db_session.commit()
+
+    assert result.provenance_count == 1
+    assert result.exact_fact_count == 1
+    rows = db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+        ledger_generation_id=int(generation.id)
+    ).order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id).all()
+    assert [int(row.stock_ledger_entry_id) for row in rows] == [int(old.id), int(replacement.id)]
+    assert str(rows[0].evidence_hash) == historical_hash
+    assert str(rows[1].operation_key) == RECEIPT_OPERATION
+
+
+def test_persisted_rebuild_keeps_genuine_visible_evidence_conflict_fail_closed(
+    db_session,
+):
+    generation, _old, _replacement, _historical = _superseded_supplier_revision_fixture(
+        db_session, persist_edge=False,
+    )
+
+    with pytest.raises(SupplierReceiptEvidenceError, match="conflicting evidence"):
+        rebuild_supplier_receipt_coverage_from_persisted_provenance(
+            db_session,
+            ledger_generation_id=int(generation.id),
+            cycle_id="obligation-rebuild",
+            writer_mode="current",
+        )
+
+
 def test_a_row_whose_payload_predates_the_contract_is_still_readable(db_session):
     """Rows already on disk stay readable: no data migration needed.
 
