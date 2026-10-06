@@ -216,6 +216,7 @@ def canonical_issue_backfill_source_ids(
     physical_import_batch_id: int,
     target_cutoff: datetime,
     allowed_sle_ids: set[int] | None = None,
+    parent_cutoff: datetime | None = None,
 ) -> tuple[int, ...]:
     """Prove the one local event emitted by the transfer-recorder projector.
 
@@ -229,6 +230,9 @@ def canonical_issue_backfill_source_ids(
     witnesses: list[int] = []
     for event in events:
         if event.source_sle_id is not None:
+            continue
+        if parent_cutoff is not None and not event.source_ref2c:
+            _prove_forward_local_custody_command(db, event, parent_cutoff, target_cutoff)
             continue
         if (
             event.source_kind != "issue_created"
@@ -332,6 +336,48 @@ def canonical_issue_backfill_source_ids(
     return tuple(dict.fromkeys(witnesses))
 
 
+def _prove_forward_local_custody_command(db, event, parent_cutoff, target_cutoff):
+    """Admit only an exact canonical operator command after accepted cutoff.
+
+    A local write can wait behind an unpublished physical event. It is folded
+    in the same bounded publication, never treated as a physical stock fact.
+    Backdated, foreign, malformed and observational events still fail closed.
+    """
+    def reject():
+        raise PhysicalRefreshProvenanceUnavailable(f"custody tail has an unproved local command (event_id={event.id})")
+    if event.effective_at is None or event.source_kind not in {"issue_created", "terminal_release"}:
+        reject()
+    left, right = _ordered_1c_timestamps(event.effective_at, parent_cutoff)
+    future, boundary = _ordered_1c_timestamps(event.effective_at, target_cutoff)
+    if left <= right or future > boundary:
+        reject()
+    issue = db.get(models.ProductionMaterialIssue, event.issue_id) if event.issue_id else None
+    try:
+        line = db.get(models.ProductionMaterialIssueLine, int(event.document_line_no))
+    except (TypeError, ValueError):
+        line = None
+    qty = Decimal(str(event.delta_qty or 0))
+    if (issue is None or line is None or line.issue_id != issue.issue_id
+        or issue.direction != "issue" or issue.product_id != event.product_id
+        or line.component_item_id != event.component_item_id
+        or str(issue.document_number or '') != str(event.document_number or '')
+        or str(issue.source_warehouse_ref1c or '') != str(event.source_ref1c or '')
+        or event.location_kind not in {'transit', 'workshop'}
+        or (event.source_kind == 'issue_created' and qty <= 0)
+        or (event.source_kind == 'terminal_release' and qty >= 0)):
+        reject()
+    warehouse = issue.source_warehouse_ref1c if event.location_kind == 'transit' else issue.warehouse_ref1c
+    if not warehouse or str(warehouse) != str(event.warehouse_ref1c):
+        reject()
+    if event.source_kind == 'issue_created' and event.location_kind == 'workshop' and issue.source_warehouse_ref1c != issue.warehouse_ref1c:
+        reject()
+    if not any(_custody_event_idempotency_key(issue_id=issue.issue_id, line_id=line.line_id,
+           revision=revision, source_kind=event.source_kind, location_kind=event.location_kind,
+           warehouse_ref1c=event.warehouse_ref1c, delta_qty=float(qty), source_sle_id=None)
+           == event.idempotency_key for revision in range(1, int(line.custody_event_revision or 0) + 1)):
+        reject()
+
+
 def apply_bounded_current_material_custody_events(
     db: Session,
     *,
@@ -410,6 +456,7 @@ def apply_bounded_current_material_custody_events(
         physical_import_batch_id=int(target.physical_import_batch_id),
         target_cutoff=target.cutoff,
         allowed_sle_ids=explicit,
+        parent_cutoff=parent.cutoff,
     )
 
     parent_batch = int(parent.physical_import_batch_id)

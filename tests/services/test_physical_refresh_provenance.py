@@ -11,6 +11,7 @@ from app.services.item_ledger.physical_refresh_provenance import (
     apply_bounded_current_material_custody_events,
     handoff_current_future_supply_provenance,
     handoff_current_material_custody_provenance,
+    canonical_issue_backfill_source_ids,
 )
 from app.services.production_material_custody_projection import (
     _event_high_watermark_id_at_cutoff,
@@ -82,6 +83,42 @@ def _world(db):
     db.add_all([current, custody, manifest])
     db.flush()
     return parent, target, current, custody
+
+
+@pytest.mark.parametrize('mutation', ['valid', 'bad_key', 'backdated', 'future', 'foreign_warehouse'])
+def test_forward_operator_custody_waiting_behind_physical_tail_is_proved(db_session, mutation):
+    parent, target, _, custody = _world(db_session)
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    product = db_session.get(models.ProductionProduct, custody.product_id)
+    issue = models.ProductionMaterialIssue(document_number='LOCAL-COMMAND', product_id=product.product_id,
+        order_id=product.order_id, status='posted', direction='issue', source_warehouse_ref1c='WH', warehouse_ref1c='WH')
+    db_session.add(issue); db_session.flush()
+    line = models.ProductionMaterialIssueLine(issue_id=issue.issue_id, component_item_id=custody.component_item_id,
+        required_qty=4, issued_qty=4, custody_event_revision=1)
+    db_session.add(line); db_session.flush()
+    event = models.ProductionMaterialCustodyEvent(issue_id=issue.issue_id, product_id=product.product_id,
+        component_item_id=line.component_item_id, source_kind='issue_created', source_sle_id=None,
+        effective_at=parent.cutoff+timedelta(hours=1), location_kind='workshop', warehouse_ref1c='WH',
+        source_ref1c='WH', delta_qty=Decimal('4'), document_number=issue.document_number,
+        document_line_no=str(line.line_id), idempotency_key=_custody_event_idempotency_key(
+            issue_id=issue.issue_id,line_id=line.line_id,revision=1,source_kind='issue_created',
+            location_kind='workshop',warehouse_ref1c='WH',delta_qty=4,source_sle_id=None))
+    if mutation == 'bad_key':event.idempotency_key='forged'
+    elif mutation == 'backdated':event.effective_at=parent.cutoff
+    elif mutation == 'future':event.effective_at=target.cutoff+timedelta(hours=1)
+    elif mutation == 'foreign_warehouse':event.warehouse_ref1c='FOREIGN'
+    db_session.add(event);db_session.flush()
+    if mutation == 'valid':
+        assert canonical_issue_backfill_source_ids(db_session, events=[event], physical_import_batch_id=target.physical_import_batch_id,
+                   parent_cutoff=parent.cutoff, target_cutoff=target.cutoff)==()
+        assert apply_bounded_current_material_custody_events(db_session,parent_generation_id=parent.id,
+                   target_generation_id=target.id,source_sle_ids=())==1
+        assert custody.reserved_qty==Decimal('6')
+    else:
+        with pytest.raises(PhysicalRefreshProvenanceUnavailable):
+            canonical_issue_backfill_source_ids(db_session, events=[event],physical_import_batch_id=target.physical_import_batch_id,
+                        parent_cutoff=parent.cutoff,target_cutoff=target.cutoff)
 
 
 def _building_generation(db, *, key: str, cutoff: datetime) -> models.LedgerGeneration:

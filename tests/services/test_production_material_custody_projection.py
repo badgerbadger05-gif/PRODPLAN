@@ -248,9 +248,12 @@ def test_current_accepted_custody_folds_local_events_after_cutoff(db_session):
     assert state.reserved_at_warehouse("WH-SRC", component.item_id) == 5
 
 
-def test_local_issue_event_advances_compact_current_custody_without_rebuild(db_session):
+@pytest.mark.parametrize("moscow_cutoff", [False, True])
+def test_local_issue_event_advances_compact_current_custody_without_rebuild(db_session, moscow_cutoff):
     cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
     generation = _generation(db_session, key="custody-compact-local", cutoff=cutoff)
+    if moscow_cutoff:
+        generation.cutoff = cutoff.astimezone(timezone(timedelta(hours=3)))
     product, _parent, component = _product(db_session, item_code="COMPACTLOCAL")
     manifest = _manifest(
         db_session, generation_id=generation.id, source_event_high_watermark_id=0

@@ -1222,6 +1222,7 @@ def _bounded_custody_tail_sle_ids(
         backfill_ids = canonical_issue_backfill_source_ids(
             db, events=rows, physical_import_batch_id=boundary,
             target_cutoff=cutoff or parent.cutoff,
+            parent_cutoff=parent.cutoff,
         )
     except PhysicalRefreshProvenanceUnavailable as exc:
         raise PhysicalRefreshOrchestratorError(str(exc)) from exc

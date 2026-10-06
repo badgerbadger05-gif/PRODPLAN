@@ -1441,7 +1441,10 @@ def apply_local_custody_event_to_current(
         or event.effective_at is None
     ):
         return False
-    if event.effective_at.replace(tzinfo=None) <= generation.cutoff.replace(tzinfo=None):
+    event_time, cutoff_time = event.effective_at, generation.cutoff
+    if event_time.tzinfo is None or cutoff_time.tzinfo is None:
+        event_time, cutoff_time = event_time.replace(tzinfo=None), cutoff_time.replace(tzinfo=None)
+    if event_time <= cutoff_time:
         return False
     manifest = (
         db.query(models.ProductionMaterialCustodyProjectionManifest)

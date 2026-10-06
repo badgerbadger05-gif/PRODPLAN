@@ -50,10 +50,6 @@ from app import models
 
 from .physical import guard_physical_batch_writer
 from .physical_visibility import visible_sle_query
-from .physical_refresh_provenance import (
-    PhysicalRefreshProvenanceUnavailable,
-    canonical_issue_backfill_source_ids,
-)
 
 
 ALGORITHM_VERSION = "ledger-physical-refresh-discard/1"
@@ -346,6 +342,7 @@ def discard_physical_refresh_candidate(
     conservative one; a caller that clears backoff has to say so.
     """
     text_reason = str(reason or "").strip()
+    from .physical_refresh_provenance import PhysicalRefreshProvenanceUnavailable, canonical_issue_backfill_source_ids
     if not text_reason:
         raise ValueError("reason is required when discarding a candidate")
     text_origin = str(origin or "").strip()

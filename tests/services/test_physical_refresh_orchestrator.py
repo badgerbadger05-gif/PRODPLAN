@@ -474,7 +474,7 @@ def test_custody_tail_recovery_rejects_local_event(db_session):
         warehouse_ref1c="WH", delta_qty=Decimal("1"), idempotency_key="custody-local-event",
     ))
     db_session.flush()
-    with pytest.raises(workflow.PhysicalRefreshOrchestratorError, match="non-physical event"):
+    with pytest.raises(workflow.PhysicalRefreshOrchestratorError, match="unproved local command"):
         workflow._bounded_custody_tail_sle_ids(
             db_session, after_event_id=0,
             parent_generation_id=parent.id, target_cutoff=parent.cutoff,
