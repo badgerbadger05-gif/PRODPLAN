@@ -559,17 +559,14 @@ def _build_rows(
     run_ids = tuple(sorted({int(value) for value in accepted_run_ids}))
     from app.services.production_control_material_availability import (
         _active_product_ids,
-        preview_materials,
+        preview_materials_bulk,
     )
 
-    material_coverage_by_product = {
-        product_id: preview_materials(
-            db,
-            product_id,
-            ledger_generation_id=int(generation.id),
-        )
-        for product_id in _active_product_ids(db)
-    }
+    material_coverage_by_product = preview_materials_bulk(
+        db,
+        _active_product_ids(db),
+        ledger_generation_id=int(generation.id),
+    )
     rows: list[dict[str, Any]] = []
     offset = 0
     total = 0
@@ -608,7 +605,7 @@ def _build_rows(
         readiness_pull_by_run_item=readiness_pull,
     )
     from app.services.production_control_material_availability import (
-        preview_make_work_item_materials,
+        preview_make_work_items_materials_bulk,
         preview_make_work_items_coverage,
     )
 
@@ -616,6 +613,28 @@ def _build_rows(
     proposal_coverage = preview_make_work_items_coverage(
         db,
         proposal_rows,
+        ledger_generation_id=int(generation.id),
+    )
+    detailed_inputs = [
+        {
+            "work_item_id": int(row["work_item_id"]),
+            "item_id": int(row["item_id"]),
+            "quantity": float(row["launchable_qty"]),
+            "spec_id": int(row["spec_id"]),
+            "order_number": f"MRP-R-{int(row['source_mrp_requirement_id'])}",
+            "run_id": (
+                int(row["source_run_id"])
+                if row.get("source_run_id") is not None
+                else None
+            ),
+        }
+        for row in proposal_rows
+        if row.get("spec_id") is not None
+        and row.get("launchable_qty") not in (None, 0)
+    ]
+    detailed_snapshots = preview_make_work_items_materials_bulk(
+        db,
+        detailed_inputs,
         ledger_generation_id=int(generation.id),
     )
     for row in proposal_rows:
@@ -630,16 +649,9 @@ def _build_rows(
         # Current GETs must not replay BOM/ledger/custody; a different requested
         # quantity is therefore rejected until a worker publishes that quantity.
         if row.get("spec_id") is not None and row.get("launchable_qty") not in (None, 0):
-            row["material_coverage_snapshot"] = preview_make_work_item_materials(
-                db,
-                work_item_id=int(row["work_item_id"]),
-                item_id=int(row["item_id"]),
-                quantity=float(row["launchable_qty"]),
-                spec_id=int(row["spec_id"]),
-                ledger_generation_id=int(generation.id),
-                order_number=f"MRP-R-{int(row['source_mrp_requirement_id'])}",
-                run_id=int(row["source_run_id"]) if row.get("source_run_id") is not None else None,
-            )
+            row["material_coverage_snapshot"] = detailed_snapshots[
+                int(row["work_item_id"])
+            ]
         source_run_id = row.get("source_run_id")
         pull = (
             readiness_pull.get((int(source_run_id), int(row["item_id"])))

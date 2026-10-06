@@ -693,6 +693,26 @@ def preview_materials_bulk(
     if missing:
         raise ValueError(f"Строка заказа не найдена: {missing[0]}")
 
+    return _preview_material_products_bulk(
+        db,
+        products_by_id,
+        ledger_generation_id=int(ledger_generation_id),
+        _current_only=_current_only,
+    )
+
+
+def _preview_material_products_bulk(
+    db: Session,
+    products_by_id: Mapping[int, ProductionProduct],
+    *,
+    ledger_generation_id: int,
+    _current_only: bool = False,
+) -> Dict[int, Dict[str, Any]]:
+    """Render already-resolved product objects through one shared read context."""
+    ids = tuple(products_by_id)
+    if not ids:
+        return {}
+
     resolved: dict[
         int,
         tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]],
@@ -792,6 +812,83 @@ def preview_make_work_item_materials(
     # work-item reader checks.  ``public_materials_payload`` shapes the HTTP
     # response, not the stored row.
     return payload
+
+
+def preview_make_work_items_materials_bulk(
+    db: Session,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    ledger_generation_id: int,
+) -> Dict[int, Dict[str, Any]]:
+    """Render detailed MAKE snapshots with one transaction-bounded read context.
+
+    This is the batch equivalent of :func:`preview_make_work_item_materials`.
+    It still delegates every row to :func:`preview_materials`; only the
+    immutable Ledger positions, custody state and future-supply inputs are
+    shared for this call.
+    """
+    normalized: list[tuple[int, int, float, int | None, str, int | None]] = []
+    seen: set[int] = set()
+    for row in rows:
+        work_item_id = int(row["work_item_id"])
+        if work_item_id <= 0 or work_item_id in seen:
+            raise ValueError("Строки MAKE должны иметь уникальный положительный идентификатор")
+        seen.add(work_item_id)
+        normalized.append((
+            work_item_id,
+            int(row["item_id"]),
+            float(row["quantity"]),
+            int(row["spec_id"]) if row.get("spec_id") is not None else None,
+            str(row.get("order_number") or ""),
+            int(row["run_id"]) if row.get("run_id") is not None else None,
+        ))
+    if not normalized:
+        return {}
+
+    item_ids = sorted({item_id for _work_id, item_id, *_rest in normalized})
+    items = {
+        int(item.item_id): item
+        for item in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
+    }
+    missing = [item_id for item_id in item_ids if item_id not in items]
+    if missing:
+        raise ValueError(f"Номенклатура расчётной строки не найдена: {missing[0]}")
+
+    products_by_id: dict[int, ProductionProduct] = {}
+    work_id_by_product_id: dict[int, int] = {}
+    for work_item_id, item_id, quantity, spec_id, order_number, run_id in normalized:
+        product_id = -work_item_id
+        preview_product = ProductionProduct(
+            product_id=product_id,
+            order_id=product_id,
+            item_id=item_id,
+            quantity=quantity,
+            produced_qty=0,
+            remaining_qty=quantity,
+            spec_id=spec_id,
+        )
+        set_committed_value(preview_product, "item", items[item_id])
+        set_committed_value(preview_product, "order", ProductionOrder(
+            order_number=order_number,
+            source="mrp" if run_id is not None else "1c",
+            source_run_id=run_id,
+        ))
+        products_by_id[product_id] = preview_product
+        work_id_by_product_id[product_id] = work_item_id
+
+    previews = _preview_material_products_bulk(
+        db,
+        products_by_id,
+        ledger_generation_id=int(ledger_generation_id),
+    )
+    result: Dict[int, Dict[str, Any]] = {}
+    for product_id, payload in previews.items():
+        work_item_id = work_id_by_product_id[int(product_id)]
+        snapshot = dict(payload)
+        snapshot["work_item_id"] = work_item_id
+        snapshot["product_id"] = None
+        result[work_item_id] = snapshot
+    return result
 
 
 def preview_make_work_items_coverage(

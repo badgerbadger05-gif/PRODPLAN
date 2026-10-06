@@ -1,3 +1,4 @@
+import copy
 import datetime
 from decimal import Decimal
 
@@ -1116,12 +1117,15 @@ def test_a_bounded_typed_row_round_trips_through_the_rebuild(db_session):
 
 
 def _superseded_supplier_revision_fixture(db, *, persist_edge: bool):
+    from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
     from app.services.item_ledger.supplier_receipt_allocation import (
         build_supplier_receipt_provenance,
     )
 
     generation, _req = _persistence_fixture(db, legacy_received=0)
     old = db.query(models.StockLedgerEntry).one()
+    old.organization_ref = DEFAULT_ORGANIZATION_REF1C
+    old.recorder_type = "Document_ПриходнаяНакладная"
     replacement_batch = models.PhysicalImportBatch(
         batch_key=f"supplier-replacement-{int(generation.id)}-{int(persist_edge)}",
         status="completed",
@@ -1158,7 +1162,7 @@ def _superseded_supplier_revision_fixture(db, *, persist_edge: bool):
 
     common = {
         "ledger_generation_id": int(generation.id),
-        "receipt_doc_type": "Document_Receipt",
+        "receipt_doc_type": "Document_ПриходнаяНакладная",
         "receipt_doc_ref": "doc",
         "receipt_doc_line_no": "1",
         "operation_kind": "supplier_receipt",
@@ -1190,11 +1194,47 @@ def _superseded_supplier_revision_fixture(db, *, persist_edge: bool):
     return generation, old, replacement, historical
 
 
-def test_persisted_rebuild_replays_only_visible_supplier_revision(db_session):
-    generation, old, replacement, historical = _superseded_supplier_revision_fixture(
+def test_persisted_rebuild_cleans_only_building_clone_to_visible_revision(db_session):
+    from app.services.item_ledger.generation_lifecycle import (
+        _supplier_provenance_checkpoint,
+    )
+
+    generation, _old, replacement, _historical = _superseded_supplier_revision_fixture(
         db_session, persist_edge=True,
     )
-    historical_hash = str(historical.evidence_hash)
+    child_rows = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(ledger_generation_id=int(generation.id)).all()
+    parent = models.LedgerGeneration(
+        generation_key="supplier-accepted-parent",
+        status="accepted",
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        algorithm_version="test/1",
+    )
+    db_session.add(parent)
+    db_session.flush()
+    excluded = {"id", "ledger_generation_id", "created_at"}
+    for source in child_rows:
+        values = {
+            column.name: copy.deepcopy(getattr(source, column.name))
+            for column in models.StockLedgerSupplierReceiptProvenance.__table__.columns
+            if column.name not in excluded
+        }
+        db_session.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=int(parent.id), **values,
+        ))
+    db_session.commit()
+    parent_before = [
+        (int(row.stock_ledger_entry_id), str(row.evidence_hash))
+        for row in db_session.query(
+            models.StockLedgerSupplierReceiptProvenance
+        ).filter_by(ledger_generation_id=int(parent.id)).order_by(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        )
+    ]
+    assert len(parent_before) == 2
 
     result = rebuild_supplier_receipt_coverage_from_persisted_provenance(
         db_session,
@@ -1209,9 +1249,20 @@ def test_persisted_rebuild_replays_only_visible_supplier_revision(db_session):
     rows = db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
         ledger_generation_id=int(generation.id)
     ).order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id).all()
-    assert [int(row.stock_ledger_entry_id) for row in rows] == [int(old.id), int(replacement.id)]
-    assert str(rows[0].evidence_hash) == historical_hash
-    assert str(rows[1].operation_key) == RECEIPT_OPERATION
+    assert [int(row.stock_ledger_entry_id) for row in rows] == [int(replacement.id)]
+    assert str(rows[0].operation_key) == RECEIPT_OPERATION
+    parent_after = [
+        (int(row.stock_ledger_entry_id), str(row.evidence_hash))
+        for row in db_session.query(
+            models.StockLedgerSupplierReceiptProvenance
+        ).filter_by(ledger_generation_id=int(parent.id)).order_by(
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+        )
+    ]
+    assert parent_after == parent_before
+    _supplier_provenance_checkpoint(
+        db_session, generation, require_full_coverage=False,
+    )
 
 
 def test_persisted_rebuild_keeps_genuine_visible_evidence_conflict_fail_closed(

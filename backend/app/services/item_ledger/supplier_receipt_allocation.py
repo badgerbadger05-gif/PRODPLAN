@@ -1101,7 +1101,6 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     evidence: Iterable[SupplierDocumentEvidence],
     cycle_id: str,
     writer_mode: str = "historical",
-    preserve_provenance_entry_ids: Iterable[int] = (),
 ) -> SupplierReceiptBuildResult:
     """Persist provenance and rebuild supplier coverage rows idempotently."""
     rows = tuple(evidence)
@@ -1135,9 +1134,6 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         for row in db.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
             ledger_generation_id=ledger_generation_id
         ).all()
-    }
-    preserved_provenance_entry_ids = {
-        int(value) for value in preserve_provenance_entry_ids
     }
     touched_provenance_entry_ids: set[int] = set()
 
@@ -1211,12 +1207,6 @@ def _rebuild_supplier_receipt_coverage_unsafe(
 
     for stale_entry_id, stale_provenance in provenance_by_entry.items():
         if stale_entry_id in touched_provenance_entry_ids:
-            continue
-        # A generation may retain provenance for an earlier physical revision.
-        # Supersession visibility, not row order or the mutable ``active`` flag,
-        # decides which revision this rebuild may replay.  Invisible revision
-        # evidence remains immutable history and is outside the stale sweep.
-        if stale_entry_id in preserved_provenance_entry_ids:
             continue
         # The sweep may only remove what this rebuild is authoritative for.
         # ``excluded_non_supplier`` rows are outside its input by construction
@@ -1734,18 +1724,6 @@ def rebuild_supplier_receipt_coverage_from_persisted_provenance(
         )
         .all()
     )
-    preserved_invisible_entry_ids = tuple(
-        int(row[0])
-        for row in base_query.with_entities(
-            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
-        )
-        .filter(
-            ~models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
-                db.query(visible_sle_ids.c.id)
-            )
-        )
-        .all()
-    )
     needs_sle = [
         int(row.stock_ledger_entry_id) for row in rows if _needs_physical_row(row)
     ]
@@ -1775,5 +1753,4 @@ def rebuild_supplier_receipt_coverage_from_persisted_provenance(
             evidence=tuple(evidence),
             cycle_id=cycle_id,
             writer_mode=writer_mode,
-            preserve_provenance_entry_ids=preserved_invisible_entry_ids,
         )

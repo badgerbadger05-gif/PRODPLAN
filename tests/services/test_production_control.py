@@ -2340,6 +2340,38 @@ def test_bulk_material_preview_preserves_own_vs_other_custody_semantics(
     assert bulk[product_two.product_id]["components"][0]["reserved_qty"] == 5.0
 
 
+def test_bulk_material_preview_matches_scalar_for_paint_weld_basis(
+    db_session, monkeypatch,
+):
+    parent, spec, _components = _make_basic_spec(
+        db_session,
+        parent_name="BulkPaintWeldParent",
+        child_specs=[("BULK-PW-COMP", "Paint/weld component", 100, 2)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=3)
+    generation_id = int(db_session.info["production_journal_generation_id"])
+
+    monkeypatch.setattr(
+        material_availability,
+        "_paint_weld_material_basis",
+        lambda _db, selected: (int(spec.spec_id), parent, int(selected.product_id)),
+    )
+    scalar = preview_materials(
+        db_session,
+        product.product_id,
+        ledger_generation_id=generation_id,
+    )
+    bulk = preview_materials_bulk(
+        db_session,
+        [product.product_id],
+        ledger_generation_id=generation_id,
+    )
+
+    assert bulk[product.product_id] == scalar
+    assert scalar["coverage_basis"] == "welded_bom"
+    assert scalar["coverage_basis_item_id"] == parent.item_id
+
+
 @pytest.mark.parametrize(
     "bad_qty",
     [None, "", True, math.nan, math.inf, -math.inf],

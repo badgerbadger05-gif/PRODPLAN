@@ -673,6 +673,112 @@ def test_candidate_payload_contains_unmaterialized_make_proposal(db_session):
     assert db_session.query(models.ProductionOrder).count() == 0
 
 
+def test_bulk_make_material_snapshots_match_scalar_and_load_custody_once(
+    db_session, monkeypatch,
+):
+    generation = _building_generation(db_session, "production-journal-make-bulk")
+    run_a, work_a = _make_proposal(db_session, generation, "-bulk-a")
+    run_b, work_b = _make_proposal(db_session, generation, "-bulk-b")
+    specs = {
+        int(item_id): int(spec_id)
+        for item_id, spec_id in db_session.query(
+            models.DefaultSpecification.item_id,
+            models.DefaultSpecification.spec_id,
+        ).filter(
+            models.DefaultSpecification.item_id.in_([work_a.item_id, work_b.item_id])
+        )
+    }
+    inputs = [
+        {
+            "work_item_id": int(work_a.id),
+            "item_id": int(work_a.item_id),
+            "quantity": 3.0,
+            "spec_id": specs[int(work_a.item_id)],
+            "order_number": "MRP-BULK-A",
+            "run_id": int(run_a.run_id),
+        },
+        {
+            "work_item_id": int(work_b.id),
+            "item_id": int(work_b.item_id),
+            "quantity": 7.0,
+            "spec_id": specs[int(work_b.item_id)],
+            "order_number": "MRP-BULK-B",
+            "run_id": int(run_b.run_id),
+        },
+    ]
+    scalar = {
+        row["work_item_id"]: material_availability.preview_make_work_item_materials(
+            db_session,
+            ledger_generation_id=int(generation.id),
+            **row,
+        )
+        for row in inputs
+    }
+
+    from app.services import production_material_custody_projection as custody_projection
+
+    original_loader = custody_projection.load_material_custody_projection
+    custody_loads = 0
+
+    def tracked_loader(*args, **kwargs):
+        nonlocal custody_loads
+        custody_loads += 1
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        custody_projection,
+        "load_material_custody_projection",
+        tracked_loader,
+    )
+    bulk = material_availability.preview_make_work_items_materials_bulk(
+        db_session,
+        inputs,
+        ledger_generation_id=int(generation.id),
+    )
+
+    assert bulk == scalar
+    assert bulk[work_a.id]["line_quantity"] == 3.0
+    assert bulk[work_b.id]["line_quantity"] == 7.0
+    assert bulk[work_a.id]["work_item_id"] == work_a.id
+    assert bulk[work_a.id]["product_id"] is None
+    assert custody_loads == 1
+
+
+def test_candidate_builder_loads_custody_per_bulk_phase_not_per_make_row(
+    db_session, monkeypatch,
+):
+    generation = _building_generation(db_session, "production-journal-bounded-loads")
+    run_a, _work_a = _make_proposal(db_session, generation, "-loads-a")
+    run_b, _work_b = _make_proposal(db_session, generation, "-loads-b")
+
+    from app.services import production_material_custody_projection as custody_projection
+
+    original_loader = custody_projection.load_material_custody_projection
+    custody_loads = 0
+
+    def tracked_loader(*args, **kwargs):
+        nonlocal custody_loads
+        custody_loads += 1
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        custody_projection,
+        "load_material_custody_projection",
+        tracked_loader,
+    )
+    candidate = _build_candidate(
+        db_session,
+        generation.id,
+        accepted_run_ids=[run_a.run_id, run_b.run_id],
+    )
+
+    make_rows = [row for row in candidate.rows if row.row_kind == "production_proposal"]
+    assert len(make_rows) == 2
+    # One load for bulk scalar coverage and one for the complete detailed
+    # snapshot batch. Adding another MAKE row must not add another custody fold.
+    assert custody_loads == 2
+
+
 def test_compact_current_production_control_payload_uses_stable_reservation_not_work_item(
     db_session,
 ):
