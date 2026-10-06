@@ -371,17 +371,11 @@ def test_rebase_finds_live_run_through_multiple_accepted_fact_forks(
     assert result["remaining_root_lines"][0]["qty"] == "2.000"
 
 
-def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
+def test_rebase_reads_stable_current_reservation_owner_after_unrelated_refresh(
     db_session,
     monkeypatch,
 ):
-    """A retained run stays anchored to its own generation across refreshes.
-
-    Rebase is a business operation on that run, not a read of the latest
-    technical generation.  The reservation therefore remains discoverable by
-    run identity after two fact/obligation refresh generations have advanced
-    the truth pointer without copying or retargeting the retained rows.
-    """
+    """R11 current ownership wins over anchor and legacy duplicate provenance."""
     generation, plan, run, _line = _world(
         db_session,
         accepted_qty=Decimal("8"),
@@ -410,6 +404,8 @@ def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
             replenishment_received_qty=Decimal("2"),
             realized_qty=Decimal("2"),
             lifecycle_status="active",
+            owner_kind="legacy",
+            is_current=False,
         )
     )
     db_session.flush()
@@ -447,6 +443,8 @@ def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
             reserved_qty=Decimal("99"),
             replenishment_required_qty=Decimal("99"),
             lifecycle_status="active",
+            owner_kind="legacy",
+            is_current=False,
         )
     )
     db_session.flush()
@@ -476,6 +474,24 @@ def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
         db_session.add_all([physical, current])
         db_session.flush()
     db_session.get(models.PlanningTruthState, 1).current_generation_id = int(current.id)
+    db_session.add(
+        models.ReservationEntry(
+            ledger_generation_id=int(current.id),
+            item_id=1,
+            run_id=int(run.run_id),
+            requirement_id=int(requirement.id),
+            priority_period_from=date(2026, 8, 1),
+            priority_period_to=date(2026, 8, 31),
+            reserved_qty=Decimal("5"),
+            replenishment_required_qty=Decimal("5"),
+            replenishment_received_qty=Decimal("2"),
+            realized_qty=Decimal("2"),
+            lifecycle_status="active",
+            current_identity=f"reservation:req:{int(requirement.id)}:mode:buy",
+            owner_kind="current",
+            is_current=True,
+        )
+    )
     db_session.commit()
 
     _stub_publication(monkeypatch, db_session)
@@ -489,11 +505,12 @@ def test_rebase_reads_retained_reservations_by_run_after_unrelated_refresh(
     assert result["status"] == "rebased"
     correction = {int(row["item_id"]): row for row in result["component_correction"]}
     assert correction[1]["old_remaining"] == "3.000"
-    # The retained reservation was not copied/retargeted by the refreshes.
+    # Anchor and stale copies remain historical evidence; only the current
+    # owner at the accepted pointer supplied the denominator.
     retained_rows = db_session.query(models.ReservationEntry).filter_by(
         run_id=int(run.run_id),
     ).all()
-    assert len(retained_rows) == 2
+    assert len(retained_rows) == 3
     assert {int(row.ledger_generation_id) for row in retained_rows} == {
-        int(generation.id), int(stale_generation.id)
+        int(generation.id), int(stale_generation.id), int(current.id)
     }
