@@ -333,6 +333,9 @@ def test_dry_run_exports_closed_run_order_netted_by_current_mrp(
         reserved_qty=Decimal("100"),
         replenishment_required_qty=Decimal("100"),
         lifecycle_status="active",
+        is_current=True,
+        owner_kind="current",
+        current_identity=f"reservation:req:{requirement.id}:mode:make",
     )
     db.add(reservation)
     db.flush()

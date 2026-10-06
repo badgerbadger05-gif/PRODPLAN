@@ -130,6 +130,7 @@ def _historical_materialized_order(
     )
     db.add_all([source_run, live_run])
     db.flush()
+    db.add(models.PlanningLivePointer(plan_id=plan.id, run_id=live_run.run_id))
     old_requirement = models.MrpRequirement(
         run_id=int(source_run.run_id),
         item_id=int(item.item_id),
@@ -162,6 +163,9 @@ def _historical_materialized_order(
         reserved_qty=current_remaining,
         replenishment_required_qty=current_remaining,
         lifecycle_status="active",
+        is_current=True,
+        owner_kind="current",
+        current_identity=f"reservation:req:{current_requirement.id}:mode:make",
     )
     db.add(reservation)
     db.flush()
@@ -303,6 +307,14 @@ def test_guard_accepts_closed_run_order_netted_by_current_make_work(db_session):
     )
 
     assert generation_id == int(generation.id)
+
+
+def test_guard_accepts_closed_run_order_with_inherited_current_owner_after_physical_fork(db_session):
+    parent = _generation(db_session, key="closed-run-parent", cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc))
+    order, product, _ = _historical_materialized_order(db_session, parent)
+    child = _generation(db_session, key="closed-run-child", cutoff=datetime(2026, 9, 3, tzinfo=timezone.utc), parent=parent)
+    assert require_materialized_orders(db_session, [order], consumer="test") == child.id
+    assert product.ledger_generation_id == parent.id
 
 
 def test_guard_rejects_closed_run_order_above_current_make_remainder(db_session):

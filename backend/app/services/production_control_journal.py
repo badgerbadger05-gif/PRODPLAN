@@ -46,6 +46,8 @@ from .planning_truth import PlanningTruthReadiness, require_accepted_truth
 from .paint_weld_pairs import is_welded_blocked
 from .mrp_mutation_guard import (
     MrpMutationLineageError,
+    require_current_run,
+    require_selected_make_work_items,
 )
 from .bom_specification_resolver import BomSpecificationResolver
 from .item_ledger.production_output_cache import (
@@ -53,6 +55,7 @@ from .item_ledger.production_output_cache import (
     update_accepted_product_output_cache,
 )
 from .item_ledger.r3_contract import current_live_run
+from .item_ledger.reservation import replenishment_remaining
 from .production_material_custody_events import append_material_issue_custody_event
 
 
@@ -455,57 +458,12 @@ def materialize_make_work_items(
     if len(run_ids) != 1:
         raise MrpMutationLineageError("selected work items have mixed or empty runs")
     selected_run_id = run_ids.pop()
-    truth = require_accepted_truth(
+    run, generation_id = require_current_run(
         db,
-        "production_control.materialize_make_work_items",
+        selected_run_id,
+        consumer="production_control.materialize_make_work_items",
     )
-    generation_id = int(truth.generation_id)
-    run = db.get(PlanningRun, selected_run_id)
-    if run is None or str(run.status or "").upper() != "FIXED_SNAPSHOT":
-        raise MrpMutationLineageError(
-            f"planning run {selected_run_id} is not a FIXED_SNAPSHOT"
-        )
-    if run.active_freeze_version is None:
-        raise MrpMutationLineageError(
-            f"planning run {selected_run_id} has no active freeze"
-        )
-    if any(
-        int(row.ledger_generation_id) != generation_id
-        or row.replenishment_method != "make"
-        for row in selected
-    ):
-        raise MrpMutationLineageError(
-            "selected work items are not current-generation make obligations"
-        )
-    selected_reservations = [
-        db.get(ReservationEntry, int(row.reservation_id)) for row in selected
-    ]
-    if any(
-        reservation is None
-        or int(reservation.ledger_generation_id) != generation_id
-        or str(reservation.lifecycle_status) != "active"
-        or str(reservation.realization_mode) != "make"
-        or int(reservation.requirement_id) != int(work.requirement_id)
-        or int(reservation.item_id) != int(work.item_id)
-        or int(reservation.run_id) != int(work.run_id)
-        for work, reservation in zip(selected, selected_reservations)
-    ):
-        raise MrpMutationLineageError(
-            "selected work items have invalid reservation lineage"
-        )
-    selected_requirements = [
-        db.get(MrpRequirement, int(row.requirement_id)) for row in selected
-    ]
-    if any(
-        requirement is None
-        or int(requirement.run_id) != int(run.run_id)
-        or requirement.freeze_version is None
-        or int(requirement.freeze_version) != int(run.active_freeze_version)
-        for requirement in selected_requirements
-    ):
-        raise MrpMutationLineageError(
-            "selected work items are outside the current active freeze"
-        )
+    current_owners = require_selected_make_work_items(db, selected, run=run, generation_id=generation_id)
 
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
@@ -561,7 +519,10 @@ def materialize_make_work_items(
             })
             continue
 
-        net_qty = _to_float(work.replenishment_remaining_qty)
+        owner = current_owners[work_id]
+        net_qty = _to_float(replenishment_remaining(
+            owner.replenishment_required_qty or 0, owner.replenishment_received_qty or 0,
+        ))
         if net_qty <= 1e-9:
             skipped.append(
                 {

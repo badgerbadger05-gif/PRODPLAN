@@ -94,9 +94,12 @@ def _scope(db, *, key: str, optimal_batch: str = "4", remaining: str = "8"):
         realization_mode="make",
         reserved_qty=10,
         replenishment_required_qty=10,
-        replenishment_received_qty=2,
-        realized_qty=2,
+        replenishment_received_qty=Decimal("10") - Decimal(remaining),
+        realized_qty=Decimal("10") - Decimal(remaining),
         lifecycle_status="active",
+        is_current=True,
+        owner_kind="current",
+        current_identity=f"reservation:req:{requirement.id}:mode:make",
     )
     db.add(reservation)
     db.flush()

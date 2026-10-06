@@ -1,5 +1,7 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+
+import pytest
 
 from app import models
 from app.services.production_control_journal import cancel_local_order, materialize_make_work_items
@@ -50,6 +52,7 @@ def _scope(db):
     )
     db.add(run)
     db.flush()
+    db.add(models.PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
     requirement = models.MrpRequirement(
         run_id=run.run_id,
         item_id=item.item_id,
@@ -80,6 +83,9 @@ def _scope(db):
         replenishment_received_qty=2,
         realized_qty=2,
         lifecycle_status="active",
+        is_current=True,
+        owner_kind="current",
+        current_identity=f"reservation:req:{requirement.id}:mode:make",
     )
     db.add(reservation)
     db.flush()
@@ -105,6 +111,94 @@ def _scope(db):
     )
     db.commit()
     return work, requirement, reservation
+
+
+def _advance_physical_truth(db):
+    pointer = db.get(models.PlanningTruthState, 1)
+    parent = db.get(models.LedgerGeneration, pointer.current_generation_id)
+    cutoff = parent.cutoff + timedelta(days=1)
+    batch = models.PhysicalImportBatch(
+        batch_key=f"make-fork-batch-{parent.id}", status="completed", cutoff=cutoff,
+    )
+    child = models.LedgerGeneration(
+        generation_key=f"make-fork-{parent.id}", status="accepted", cutoff=cutoff,
+        accepted_at=cutoff, physical_import_batch=batch, algorithm_version="test",
+        source_watermarks={"parent_generation_id": parent.id, "generation_kind": "physical_refresh"},
+        capabilities=dict(parent.capabilities),
+    )
+    db.add(child)
+    db.flush()
+    pointer.current_generation_id = child.id
+    db.commit()
+    return child
+
+
+def test_launch_inherited_make_obligation_and_export_after_two_physical_forks(db_session):
+    from app.services.mrp_mutation_guard import require_materialized_orders
+
+    work, requirement, reservation = _scope(db_session)
+    anchor = work.ledger_generation_id
+    child = _advance_physical_truth(db_session)
+    request = {work.id: {"launch_qty": 3, "expected_materialized_qty": 0}}
+    result = materialize_make_work_items(db_session, [work.id], launch_requests=request)
+    assert [row["qty"] for row in result["created"]] == [3.0]
+    order = db_session.get(models.ProductionOrder, result["created"][0]["order_id"])
+    assert require_materialized_orders(db_session, [order], consumer="test.launch") == child.id
+    second_child = _advance_physical_truth(db_session)
+    retry = materialize_make_work_items(db_session, [work.id], launch_requests=request)
+    assert retry["created"] == []
+    assert retry["reused"][0]["product_id"] == result["created"][0]["product_id"]
+    assert require_materialized_orders(db_session, [order], consumer="test.launch") == second_child.id
+    assert work.ledger_generation_id == reservation.ledger_generation_id == anchor
+    assert work.replenishment_remaining_qty == Decimal("8")
+    assert requirement.net_required_qty == reservation.replenishment_required_qty == Decimal("10")
+
+
+def test_launch_after_fork_uses_current_realization_without_rewriting_old_work_item(db_session):
+    work, _, reservation = _scope(db_session)
+    _advance_physical_truth(db_session)
+    reservation.replenishment_received_qty = Decimal("5")
+    reservation.realized_qty = Decimal("5")
+    db_session.commit()
+    too_much = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 8, "expected_materialized_qty": 0},
+    })
+    assert too_much["created"] == []
+    assert "доступно к запуску 5" in too_much["errors"][0]
+    result = materialize_make_work_items(db_session, [work.id])
+    assert [row["qty"] for row in result["created"]] == [4.0, 1.0]
+    assert work.replenishment_remaining_qty == Decimal("8")
+
+
+@pytest.mark.parametrize("mutation", ["not_current", "closed", "wrong_item", "wrong_freeze", "retired_pointer", "foreign_generation"])
+def test_launch_inherited_make_obligation_rejects_invalid_owner_before_creating_order(db_session, mutation):
+    from app.services.mrp_mutation_guard import MrpMutationLineageError
+
+    work, requirement, reservation = _scope(db_session)
+    _advance_physical_truth(db_session)
+    if mutation == "not_current":
+        reservation.is_current = False
+    elif mutation == "closed":
+        reservation.lifecycle_status = "closed"
+    elif mutation == "wrong_item":
+        requirement.item_id += 999
+    elif mutation == "wrong_freeze":
+        requirement.freeze_version += 1
+    elif mutation == "retired_pointer":
+        db_session.get(models.PlanningLivePointer, work.plan_id).status = "retired"
+    else:
+        foreign = models.LedgerGeneration(
+            generation_key="foreign-make", status="accepted", cutoff=datetime(2026, 7, 28),
+            physical_import_batch_id=db_session.get(models.LedgerGeneration, work.ledger_generation_id).physical_import_batch_id,
+            algorithm_version="test", source_watermarks={}, capabilities={},
+        )
+        db_session.add(foreign)
+        db_session.flush()
+        work.ledger_generation_id = foreign.id
+    db_session.commit()
+    with pytest.raises(MrpMutationLineageError):
+        materialize_make_work_items(db_session, [work.id])
+    assert db_session.query(models.ProductionOrder).count() == 0
 
 
 def test_materialize_make_work_item_is_idempotent_and_does_not_mutate_truth(db_session):
@@ -204,69 +298,12 @@ def test_materialize_reuses_exact_requirement_after_physical_generation_advances
     first = materialize_make_work_items(db_session, [work.id])
     first_product_ids = [row["product_id"] for row in first["created"]]
 
-    cutoff = datetime(2026, 7, 27, 8, tzinfo=timezone.utc)
-    physical = models.PhysicalImportBatch(
-        batch_key="make-work-item-physical-next", status="completed", cutoff=cutoff
-    )
-    generation = models.LedgerGeneration(
-        generation_key="make-work-item-generation-next",
-        status="accepted",
-        cutoff=cutoff,
-        accepted_at=cutoff,
-        physical_import_batch=physical,
-        algorithm_version="test",
-        source_watermarks={},
-        capabilities={
-            "physical_ledger": True,
-            "reservation_replay": True,
-            "execution_allocations": True,
-        },
-    )
-    db_session.add_all([physical, generation])
-    db_session.flush()
-    reservation = models.ReservationEntry(
-        ledger_generation_id=generation.id,
-        item_id=work.item_id,
-        characteristic_ref="",
-        organization_ref="",
-        planning_stock_pool="default",
-        run_id=work.run_id,
-        freeze_version=1,
-        requirement_id=requirement.id,
-        priority_period_from=requirement.period_from,
-        priority_period_to=requirement.period_to,
-        realization_mode="make",
-        reserved_qty=10,
-        covered_from_stock_at_freeze_qty=0,
-        replenishment_required_qty=10,
-        replenishment_received_qty=2,
-        realized_qty=2,
-        lifecycle_status="active",
-    )
-    db_session.add(reservation)
-    db_session.flush()
-    next_work = models.ReplenishmentWorkItem(
-        ledger_generation_id=generation.id,
-        reservation_id=reservation.id,
-        plan_id=work.plan_id,
-        run_id=work.run_id,
-        requirement_id=requirement.id,
-        item_id=work.item_id,
-        replenishment_method="make",
-        replenishment_required_qty=10,
-        replenishment_fulfilled_qty=2,
-        replenishment_remaining_qty=8,
-    )
-    db_session.add(next_work)
-    truth = db_session.get(models.PlanningTruthState, 1)
-    truth.current_generation_id = generation.id
-    db_session.commit()
-
-    second = materialize_make_work_items(db_session, [next_work.id])
+    _advance_physical_truth(db_session)
+    second = materialize_make_work_items(db_session, [work.id])
 
     assert second["created"] == []
     assert [row["product_id"] for row in second["reused"]] == first_product_ids
-    assert {row["work_item_id"] for row in second["reused"]} == {next_work.id}
+    assert {row["work_item_id"] for row in second["reused"]} == {work.id}
 
 
 def test_materialize_counts_previous_mrp_run_of_same_plan_and_retries(db_session):

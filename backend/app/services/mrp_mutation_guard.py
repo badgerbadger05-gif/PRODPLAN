@@ -20,6 +20,8 @@ from app.services.item_ledger.live_plan_scope import (
     sealed_run_anchor,
 )
 from app.services.item_ledger.r3_contract import current_live_run
+from app.services.item_ledger.reservation_current import current_reservation_query
+from app.services.item_ledger.reservation import replenishment_remaining
 from app.services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -166,6 +168,54 @@ def require_selected_requirements(
             )
 
 
+def require_selected_make_work_items(
+    db: Session,
+    rows: Sequence[models.ReplenishmentWorkItem],
+    *,
+    run: models.PlanningRun,
+    generation_id: int,
+) -> dict[int, models.ReservationEntry]:
+    """Prove current MAKE ownership without re-anchoring frozen obligations."""
+    lineage = set(_accepted_lineage(db, generation_id))
+    owner_ids = {int(row.reservation_id) for row in rows}
+    owners = {
+        int(owner.id): owner for owner in current_reservation_query(
+            db, generation_id=generation_id,
+        ).filter(models.ReservationEntry.id.in_(owner_ids)).all()
+    }
+    locators: dict[int, list[int]] = {}
+    for work in db.query(models.ReplenishmentWorkItem).filter(
+        models.ReplenishmentWorkItem.reservation_id.in_(owner_ids),
+        models.ReplenishmentWorkItem.replenishment_method == "make",
+    ).all():
+        locators.setdefault(int(work.reservation_id), []).append(int(work.id))
+    for work in rows:
+        owner = owners.get(int(work.reservation_id))
+        requirement = db.get(models.MrpRequirement, int(work.requirement_id))
+        if (
+            owner is None or requirement is None
+            or work.replenishment_method != "make"
+            or int(work.ledger_generation_id) not in lineage
+            or int(owner.ledger_generation_id) not in lineage
+            or str(owner.lifecycle_status) != "active"
+            or str(owner.realization_mode) != "make"
+            or int(work.run_id) != int(run.run_id)
+            or work.plan_id != run.source_plan_id
+            or int(owner.run_id) != int(work.run_id)
+            or int(owner.requirement_id) != int(work.requirement_id)
+            or int(owner.item_id) != int(work.item_id)
+            or owner.freeze_version != run.active_freeze_version
+            or int(requirement.run_id) != int(run.run_id)
+            or int(requirement.item_id) != int(work.item_id)
+            or requirement.freeze_version != run.active_freeze_version
+            or locators.get(int(owner.id)) != [int(work.id)]
+        ):
+            raise MrpMutationLineageError(
+                f"work item {work.id} is not a unique current MAKE obligation of the active freeze"
+            )
+    return {int(work.id): owners[int(work.reservation_id)] for work in rows}
+
+
 def _current_make_work_for_historical_product(
     db: Session,
     *,
@@ -230,14 +280,14 @@ def _current_make_work_for_historical_product(
             == models.ReplenishmentWorkItem.requirement_id,
         )
         .filter(
-            models.ReplenishmentWorkItem.ledger_generation_id
-            == int(generation_id),
             models.ReplenishmentWorkItem.plan_id
             == int(source_run.source_plan_id),
             models.ReplenishmentWorkItem.run_id == int(live_run.run_id),
             models.ReplenishmentWorkItem.item_id == int(product.item_id),
             models.ReplenishmentWorkItem.replenishment_method == "make",
-            models.ReservationEntry.ledger_generation_id == int(generation_id),
+            models.ReservationEntry.id.in_(current_reservation_query(
+                db, generation_id=generation_id,
+            ).with_entities(models.ReservationEntry.id)),
             models.ReservationEntry.lifecycle_status == "active",
             models.ReservationEntry.realization_mode == "make",
             models.MrpRequirement.run_id == int(live_run.run_id),
@@ -252,6 +302,7 @@ def _current_make_work_for_historical_product(
             f"historical production product {product.product_id} has no current "
             "MAKE obligation for the same plan and item"
         )
+    owners = require_selected_make_work_items(db, [work], run=live_run, generation_id=generation_id)
 
     open_products = (
         db.query(models.ProductionProduct)
@@ -275,7 +326,10 @@ def _current_make_work_for_historical_product(
         (accepted_product_output(row).remaining_qty for row in open_products),
         start=Decimal("0"),
     )
-    current_remaining = Decimal(str(work.replenishment_remaining_qty or 0))
+    owner = owners[int(work.id)]
+    current_remaining = replenishment_remaining(
+        owner.replenishment_required_qty or 0, owner.replenishment_received_qty or 0,
+    )
     if open_qty - current_remaining > Decimal("0.000001"):
         raise MrpMutationLineageError(
             f"historical open production quantity {open_qty} exceeds current "
@@ -314,6 +368,8 @@ def require_materialized_orders(
     # the accepted generation's sealed lineage.
     allowed_generation_ids = set(_accepted_lineage(db, generation_id))
     historical_run = str(run.status or "").upper() == "CLOSED"
+    if not historical_run:
+        run, generation_id = require_current_run(db, run.run_id, consumer=consumer)
     if historical_run:
         generation = db.get(models.LedgerGeneration, generation_id)
         try:
@@ -374,6 +430,10 @@ def require_materialized_orders(
                     product.ledger_generation_id is None
                     or int(product.ledger_generation_id) != generation_id
                 ):
+                    if product.ledger_generation_id is None or int(product.ledger_generation_id) not in allowed_generation_ids:
+                        raise MrpMutationLineageError(
+                            f"production product {product.product_id} is null, mixed or stale Ledger lineage"
+                        )
                     current_work = (
                         db.query(models.ReplenishmentWorkItem)
                         .join(
@@ -382,14 +442,14 @@ def require_materialized_orders(
                             == models.ReplenishmentWorkItem.reservation_id,
                         )
                         .filter(
-                            models.ReplenishmentWorkItem.ledger_generation_id
-                            == generation_id,
                             models.ReplenishmentWorkItem.run_id == int(run.run_id),
                             models.ReplenishmentWorkItem.requirement_id
                             == int(requirement.id),
                             models.ReplenishmentWorkItem.replenishment_method == "make",
-                            models.ReservationEntry.ledger_generation_id
-                            == generation_id,
+                            models.ReplenishmentWorkItem.item_id == int(product.item_id),
+                            models.ReservationEntry.id.in_(current_reservation_query(
+                                db, generation_id=generation_id,
+                            ).with_entities(models.ReservationEntry.id)),
                             models.ReservationEntry.lifecycle_status == "active",
                             models.ReservationEntry.realization_mode == "make",
                         )
@@ -399,6 +459,7 @@ def require_materialized_orders(
                         raise MrpMutationLineageError(
                             f"production product {product.product_id} is null, mixed or stale Ledger lineage"
                         )
+                    require_selected_make_work_items(db, [current_work], run=run, generation_id=generation_id)
             else:
                 raise MrpMutationLineageError(
                     f"production product {product.product_id} has no current MRP source"

@@ -434,6 +434,8 @@ def test_old_generation_issue_remains_exportable_when_same_mrp_work_is_current(
     db.add(plan)
     db.flush()
     run.source_plan_id = plan.id
+    from app.models import PlanningLivePointer
+    db.add(PlanningLivePointer(plan_id=plan.id, run_id=run.run_id))
 
     cutoff = datetime(2026, 5, 21, tzinfo=timezone.utc)
     batch = PhysicalImportBatch(
@@ -448,7 +450,7 @@ def test_old_generation_issue_remains_exportable_when_same_mrp_work_is_current(
         status="accepted",
         cutoff=cutoff,
         accepted_at=cutoff,
-        source_watermarks={},
+        source_watermarks={"parent_generation_id": old_generation_id, "generation_kind": "physical_refresh"},
         capabilities={
             "physical_ledger": True,
             "reservation_replay": True,
@@ -477,6 +479,9 @@ def test_old_generation_issue_remains_exportable_when_same_mrp_work_is_current(
         replenishment_received_qty=0,
         realized_qty=0,
         lifecycle_status="active",
+        is_current=True,
+        owner_kind="current",
+        current_identity=f"reservation:req:{requirement.id}:mode:make",
     )
     db.add(reservation)
     db.flush()
