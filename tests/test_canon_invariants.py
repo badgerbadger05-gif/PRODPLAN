@@ -660,6 +660,11 @@ def test_direct_1c_writer_registry_is_exact() -> None:
             "patch_sostav",
             "patch",
         ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "patch_production_kind",
+            "patch",
+        ),
     }
 
 

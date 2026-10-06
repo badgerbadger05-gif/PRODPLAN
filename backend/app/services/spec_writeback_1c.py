@@ -8,7 +8,8 @@ PATCH заменяет весь массив. PRODPLAN не хранит все 
 
 Чистые helper-функции (без I/O) держат ошибкоопасную логику мутации и легко тестируются.
 Оркестрация (`SpecWriteback`) по умолчанию dry_run=True: ничего не пишет, возвращает
-предпросмотр payload. Первый реальный write — только против unf_demo под присмотром.
+предпросмотр payload. Отдельный guarded-путь меняет только заголовочный
+`ВидПроизводства_Key` после полного fresh-read и проверяет полный read-back.
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ from .specification_sync import _norm_component_spec_ref
 SOSTAV = "Состав"
 SPEC_ENTITY = "Catalog_Спецификации"
 ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+PRODUCTION_KIND_FIELD = "ВидПроизводства_Key"
+OPERATIONS_FIELD = "Операции"
 
 
 class SpecWritebackError(RuntimeError):
@@ -161,6 +164,19 @@ class SpecWriteback:
             raise ValueError(f"Спецификация не найдена в 1С: {spec_ref}")
         return list(records[0].get(SOSTAV) or [])
 
+    def read_specification(self, spec_ref: str) -> Dict[str, Any]:
+        """Read the complete current 1C object used by guarded header writes."""
+        records = self.client.get_all(
+            SPEC_ENTITY,
+            filter_query=f"Ref_Key eq guid'{spec_ref}'",
+            select_fields=None,
+        )
+        if len(records) != 1:
+            raise SpecWritebackError(
+                f"Ожидалась ровно 1 спецификация в 1С: {spec_ref}; найдено {len(records)}"
+            )
+        return copy.deepcopy(records[0])
+
     def patch_sostav(self, spec_ref: str, new_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         payload = {SOSTAV: renumber(new_rows)}
         if self.dry_run:
@@ -169,10 +185,186 @@ class SpecWriteback:
         resp = self.client.patch(endpoint, payload)
         return {"dry_run": False, "spec_ref": spec_ref, "response": resp}
 
+    def patch_production_kind(self, spec_ref: str, target_kind_ref: str) -> Dict[str, Any]:
+        """PATCH exactly the sanctioned specification header field."""
+        payload = {PRODUCTION_KIND_FIELD: target_kind_ref}
+        if self.dry_run:
+            return {"dry_run": True, "spec_ref": spec_ref, "would_patch": payload}
+        endpoint = f"{SPEC_ENTITY}(guid'{spec_ref}')"
+        response = self.client.patch(endpoint, payload)
+        return {
+            "dry_run": False,
+            "spec_ref": spec_ref,
+            "endpoint": endpoint,
+            "payload": payload,
+            "response": response,
+        }
+
     def apply_to_sostav(self, spec_ref: str, mutate: Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]) -> Dict[str, Any]:
         rows = self.read_sostav(spec_ref)
         new_rows = mutate(rows)
         return self.patch_sostav(spec_ref, new_rows)
+
+
+def _validate_kind_change_source(
+    record: Dict[str, Any],
+    *,
+    spec_ref: str,
+    expected_owner_ref: str,
+    expected_code: str,
+    old_kind_ref: str,
+    target_kind_ref: str,
+    expected_operation_ref: str,
+    expected_data_version: Optional[str],
+) -> str:
+    """Validate the fresh full object and return ``source`` or ``already_applied``."""
+    checks = (
+        ("Ref_Key", spec_ref),
+        ("Owner_Key", expected_owner_ref),
+        ("Code", expected_code),
+    )
+    for field, expected in checks:
+        if _norm_key(record.get(field)) != _norm_key(expected):
+            raise SpecWritebackError(
+                f"kind_change: drift {field}: ожидалось {expected!r}, "
+                f"получено {record.get(field)!r} (spec={spec_ref})"
+            )
+
+    for field in ("DeletionMark", "Недействителен", "ЭтоШаблон"):
+        if bool(record.get(field)):
+            raise SpecWritebackError(
+                f"kind_change: спецификация недопустима для записи: {field}=true (spec={spec_ref})"
+            )
+
+    operations = record.get(OPERATIONS_FIELD)
+    if not isinstance(operations, list) or len(operations) != 1:
+        count = len(operations) if isinstance(operations, list) else "not_a_list"
+        raise SpecWritebackError(
+            f"kind_change: ожидалась ровно 1 операция, получено {count} (spec={spec_ref})"
+        )
+    actual_operation_ref = operations[0].get("Операция_Key")
+    if _norm_key(actual_operation_ref) != _norm_key(expected_operation_ref):
+        raise SpecWritebackError(
+            f"kind_change: drift Операция_Key: ожидалось {expected_operation_ref!r}, "
+            f"получено {actual_operation_ref!r} (spec={spec_ref})"
+        )
+
+    actual_kind = _norm_key(record.get(PRODUCTION_KIND_FIELD))
+    if actual_kind == _norm_key(target_kind_ref):
+        return "already_applied"
+    if actual_kind != _norm_key(old_kind_ref):
+        raise SpecWritebackError(
+            f"kind_change: drift {PRODUCTION_KIND_FIELD}: ожидался исходный "
+            f"{old_kind_ref!r} или целевой {target_kind_ref!r}, "
+            f"получено {record.get(PRODUCTION_KIND_FIELD)!r} (spec={spec_ref})"
+        )
+    if expected_data_version is not None and str(record.get("DataVersion") or "") != str(expected_data_version):
+        raise SpecWritebackError(
+            f"kind_change: drift DataVersion: ожидалось {expected_data_version!r}, "
+            f"получено {record.get('DataVersion')!r} (spec={spec_ref})"
+        )
+    return "source"
+
+
+def _without_kind_write_fields(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Comparable full object excluding the intended field and 1C revision marker."""
+    comparable = copy.deepcopy(record)
+    comparable.pop(PRODUCTION_KIND_FIELD, None)
+    comparable.pop("DataVersion", None)
+    return comparable
+
+
+def writeback_change_production_kind(
+    client: Any,
+    *,
+    spec_ref: str,
+    expected_owner_ref: str,
+    expected_code: str,
+    old_kind_ref: str,
+    target_kind_ref: str,
+    expected_operation_ref: str,
+    expected_data_version: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Guarded, resumable header-only production-kind change.
+
+    The full 1C object is read immediately before the write.  Only
+    ``ВидПроизводства_Key`` is PATCHed.  A real write is accepted only when a second
+    full read shows the target kind and every other field is byte-for-byte
+    equivalent apart from 1C's ``DataVersion`` marker.
+    """
+    def _run() -> Dict[str, Any]:
+        required = {
+            "spec_ref": spec_ref,
+            "expected_owner_ref": expected_owner_ref,
+            "expected_code": expected_code,
+            "old_kind_ref": old_kind_ref,
+            "target_kind_ref": target_kind_ref,
+            "expected_operation_ref": expected_operation_ref,
+        }
+        empty = [name for name, value in required.items() if not str(value or "").strip()]
+        if empty:
+            raise SpecWritebackError(
+                f"kind_change: пустые обязательные поля: {', '.join(empty)}"
+            )
+        if _norm_key(old_kind_ref) == _norm_key(target_kind_ref):
+            raise SpecWritebackError("kind_change: исходный и целевой виды производства совпадают")
+
+        sb = SpecWriteback(client, dry_run=dry_run)
+        before = sb.read_specification(spec_ref)
+        state = _validate_kind_change_source(
+            before,
+            spec_ref=spec_ref,
+            expected_owner_ref=expected_owner_ref,
+            expected_code=expected_code,
+            old_kind_ref=old_kind_ref,
+            target_kind_ref=target_kind_ref,
+            expected_operation_ref=expected_operation_ref,
+            expected_data_version=expected_data_version,
+        )
+        common = {
+            "op": "change_production_kind",
+            "spec_ref": str(before.get("Ref_Key") or spec_ref),
+            "spec_code": str(before.get("Code") or ""),
+            "owner_ref": str(before.get("Owner_Key") or ""),
+            "old_kind_ref": old_kind_ref,
+            "target_kind_ref": target_kind_ref,
+            "operation_ref": expected_operation_ref,
+            "before_data_version": before.get("DataVersion"),
+        }
+        if state == "already_applied":
+            return {**common, "status": "already_applied", "dry_run": bool(dry_run)}
+
+        payload = {PRODUCTION_KIND_FIELD: target_kind_ref}
+        if dry_run:
+            return {
+                **common,
+                "status": "dry_run",
+                "dry_run": True,
+                "would_patch": payload,
+            }
+
+        patch_result = sb.patch_production_kind(spec_ref, target_kind_ref)
+        after = sb.read_specification(spec_ref)
+        if _norm_key(after.get(PRODUCTION_KIND_FIELD)) != _norm_key(target_kind_ref):
+            raise SpecWritebackError(
+                f"kind_change: read-back не подтвердил {PRODUCTION_KIND_FIELD}={target_kind_ref!r} "
+                f"(spec={spec_ref})"
+            )
+        if _without_kind_write_fields(after) != _without_kind_write_fields(before):
+            raise SpecWritebackError(
+                f"kind_change: read-back обнаружил изменение полей кроме "
+                f"{PRODUCTION_KIND_FIELD} и DataVersion (spec={spec_ref})"
+            )
+        return {
+            **common,
+            "status": "updated",
+            "dry_run": False,
+            "after_data_version": after.get("DataVersion"),
+            "patch": patch_result,
+        }
+
+    return _guard("kind_change", _run)
 
 
 def _dominant_stage(rows: List[Dict[str, Any]]) -> Optional[str]:
