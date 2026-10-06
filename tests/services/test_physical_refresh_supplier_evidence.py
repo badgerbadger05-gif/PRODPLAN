@@ -508,8 +508,7 @@ def test_order_line_zero_with_multiple_canonical_lines_is_ambiguous(db_session, 
     parent, target, _parent_batch, target_batch, item = _world(db_session)
     _supplier_order(db_session, item, line_numbers=(1, 2))
     row = _sle(db_session, target_batch, item)
-    with pytest.raises(adapter.BoundedSupplierEvidenceError, match="ambiguous"):
-        _build(
+    manifest, _seen = _build(
             db_session, parent, target, item, target_batch, monkeypatch=monkeypatch,
             row=row, evidence=_fake_evidence(
                 row,
@@ -517,6 +516,9 @@ def test_order_line_zero_with_multiple_canonical_lines_is_ambiguous(db_session, 
                 order_type="Document_ЗаказПоставщику",
             ),
         )
+    assert manifest.receipt_facts[0].supplier_order_ref == ""
+    assert manifest.receipt_facts[0].supplier_order_line_no == ""
+    assert manifest.receipt_facts[0].signed_qty == row.qty
 
 
 def test_one_document_evidence_maps_to_two_aggregate_delta_sles(db_session, monkeypatch):

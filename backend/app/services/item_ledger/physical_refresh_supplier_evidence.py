@@ -808,11 +808,7 @@ def _bounded_scope_receipt_facts(
             raise BoundedSupplierEvidenceError(
                 f"bounded BUY scope has invalid non-supplier classification for SLE {int(row.id)}"
             )
-        if _text(evidence.match_status) == "ambiguous":
-            raise BoundedSupplierEvidenceError(
-                "bounded BUY scope evidence has ambiguous supplier-order "
-                f"evidence for SLE {int(row.id)}"
-            )
+        ambiguous = _text(evidence.match_status) == "ambiguous"
         facts.append(ReceiptFact(
             sle_id=int(row.id),
             posting_at=row.posting_at,
@@ -820,8 +816,8 @@ def _bounded_scope_receipt_facts(
             known_revisions=first_known.get(int(row.id), ()),
             signed_qty=Decimal(str(row.qty)),
             item_id=int(row.item_id),
-            supplier_order_ref=_text(evidence.supplier_order_ref),
-            supplier_order_line_no=_text(evidence.supplier_order_line_no),
+            supplier_order_ref="" if ambiguous else _text(evidence.supplier_order_ref),
+            supplier_order_line_no="" if ambiguous else _text(evidence.supplier_order_line_no),
             receipt_ref=_text(evidence.receipt_doc_ref),
             receipt_line_no=_text(evidence.receipt_doc_line_no),
             correction_receipt_ref=_text(evidence.correction_receipt_ref) or None,
@@ -960,15 +956,13 @@ def build_bounded_supplier_receipt_manifest(
                 raise BoundedSupplierEvidenceError(
                     f"{_REJECTED_DELTA_MESSAGE}: supplier operation is not a forward receipt"
                 )
-            if normalized.match_status == "ambiguous":
-                raise BoundedSupplierEvidenceError(
-                    f"ambiguous supplier-order evidence for SLE {normalized.fact.sle_id}"
-                )
             row = db.get(models.StockLedgerEntry, int(normalized.fact.sle_id))
             if row is None:
                 raise BoundedSupplierEvidenceError("supplier evidence references missing SLE")
             scope = _scope_for_row(row, scopes)
             fact = replace(normalized.fact, planning_stock_pool=scope[3])
+            if normalized.match_status == "ambiguous":
+                fact = replace(fact, supplier_order_ref="", supplier_order_line_no="")
             if fact.sle_id in seen_sle_ids:
                 raise BoundedSupplierEvidenceError("supplier evidence maps one SLE more than once")
             seen_sle_ids.add(fact.sle_id)

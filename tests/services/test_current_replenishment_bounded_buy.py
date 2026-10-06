@@ -582,7 +582,8 @@ def test_bounded_buy_two_successive_targets_reuse_old_typed_evidence(db_session)
     assert {row.reservation_id for row in allocations} == {owners[0].id}
 
 
-def test_bounded_buy_successive_targets_reuse_consistent_unmatched_evidence(db_session):
+@pytest.mark.parametrize('ambiguous', [False, True])
+def test_bounded_buy_successive_targets_reuse_consistent_unmatched_evidence(db_session, ambiguous):
     parent, target1, batch1, items, owners = _world(db_session)
     row1, fact1 = _receipt(
         db_session,
@@ -595,6 +596,14 @@ def test_bounded_buy_successive_targets_reuse_consistent_unmatched_evidence(db_s
     )
     _call(db_session, parent, target1, fact1)
     db_session.flush()
+    if ambiguous:
+        saved = db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(stock_ledger_entry_id=row1.id).one()
+        saved.match_status = 'ambiguous'
+        saved.ambiguity_count = 2
+        saved.reason = 'multiple supplier lines; preserve provenance and use FIFO'
+        saved.supplier_order_ref = 'do-not-guess-this-order'
+        saved.supplier_order_line_no = '0'
+        db_session.flush()
     target1.status = "accepted"
     target1.accepted_at = target1.cutoff
     db_session.get(models.PlanningTruthState, 1).current_generation_id = target1.id
@@ -626,6 +635,8 @@ def test_bounded_buy_successive_targets_reuse_consistent_unmatched_evidence(db_s
     db_session.commit()
 
     assert result.delta_fact_rows == 1
+    if ambiguous:
+        assert saved.match_status == 'ambiguous'
     assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 2
     allocations = db_session.query(models.ReservationConsumptionAllocation).filter(
         models.ReservationConsumptionAllocation.is_current.is_(True)

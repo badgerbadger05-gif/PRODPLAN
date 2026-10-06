@@ -3173,7 +3173,7 @@ def _bounded_current_buy_basis_facts(
                 "current BUY allocation lacks typed parent supplier evidence"
             )
         else:
-            if str(evidence.match_status) in {"ambiguous", "excluded_non_supplier"}:
+            if str(evidence.match_status) == "excluded_non_supplier":
                 raise CurrentReplenishmentError(
                     "current BUY allocation has ambiguous or excluded supplier evidence"
                 )
@@ -3184,8 +3184,8 @@ def _bounded_current_buy_basis_facts(
                 known_revisions=basis_first_known.get(int(sle_id), ()),
                 signed_qty=_decimal(sle.qty),
                 item_id=int(sle.item_id),
-                supplier_order_ref=_text(evidence.supplier_order_ref),
-                supplier_order_line_no=_text(evidence.supplier_order_line_no),
+                supplier_order_ref="" if str(evidence.match_status) == "ambiguous" else _text(evidence.supplier_order_ref),
+                supplier_order_line_no="" if str(evidence.match_status) == "ambiguous" else _text(evidence.supplier_order_line_no),
                 receipt_ref=_text(evidence.receipt_doc_ref),
                 receipt_line_no=_text(evidence.receipt_doc_line_no),
                 correction_receipt_ref=_text(evidence.correction_receipt_ref) or None,
@@ -3324,13 +3324,14 @@ def _ensure_bounded_supplier_evidence(
         )
         existing = existing_by_id.get(int(fact_id))
         if existing is not None:
-            if _text(existing.match_status) in {"ambiguous", "excluded_non_supplier"}:
+            if _text(existing.match_status) == "excluded_non_supplier":
                 raise CurrentReplenishmentError(
                     f"typed supplier evidence for SLE {fact_id} is ambiguous or excluded"
                 )
             actual_signature = (
                 _text(existing.receipt_doc_ref), _text(existing.receipt_doc_line_no),
-                _text(existing.supplier_order_ref), _text(existing.supplier_order_line_no),
+                "" if _text(existing.match_status) == "ambiguous" else _text(existing.supplier_order_ref),
+                "" if _text(existing.match_status) == "ambiguous" else _text(existing.supplier_order_line_no),
                 _text(existing.operation_kind), _text(existing.correction_receipt_ref),
             )
             if actual_signature != expected_signature:
