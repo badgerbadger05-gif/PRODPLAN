@@ -111,6 +111,18 @@ def _accepted_parent_with_future_supply(
         evidence_status=supply.evidence_status,
     ))
     db.add(models.PlanningTruthState(id=1, current_generation_id=int(parent.id)))
+    # This accepted fixture has no material custody. State the complete empty
+    # owner explicitly so publication can preserve a proven local event tail.
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=int(parent.id),
+        baseline_generation_id=int(parent.id),
+        cutoff=CUTOFF,
+        status="complete",
+        is_baseline=True,
+        source_event_high_watermark_id=0,
+        observed_at=CUTOFF,
+        built_at=CUTOFF,
+    ))
     db.flush()
     return parent
 
