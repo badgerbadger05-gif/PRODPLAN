@@ -300,13 +300,16 @@ def _cutoff_seed_from_compact_owner(
     manifest: models.ProductionMaterialCustodyProjectionManifest,
     generation: models.LedgerGeneration,
 ) -> _CustodyCutoffSeed:
-    """Prove and reverse the exact persisted future-local event tail.
+    """Prove and reverse the exact persisted future-local event subset.
 
     The compact current cells and their manifest advance synchronously when a
     local issue/release is appended after the accepted physical cutoff.  The
-    accepted cutoff view is therefore the persisted cells minus that exact
-    append-only tail.  No issue quantities, order state or current UI state are
-    consulted; a physical/backdated/malformed/interleaved tail fails closed.
+    accepted cutoff view is therefore the persisted cells minus every exact
+    future-local event in the covered append-only prefix. Physical events may
+    be appended after a local hold while the compact owner advances; event id
+    order is not cutoff membership. No issue quantities, order state or current
+    UI state are consulted, and physical/backdated/malformed future events fail
+    closed.
     """
     _require_manifest_cutoff(manifest, generation)
     if generation.cutoff is None:
@@ -358,27 +361,10 @@ def _cutoff_seed_from_compact_owner(
         .scalar()
         or 0
     )
-    interleaved_future = (
-        db.query(models.ProductionMaterialCustodyEvent.id)
-        .filter(models.ProductionMaterialCustodyEvent.id <= cutoff_watermark)
-        .filter(models.ProductionMaterialCustodyEvent.effective_at > generation.cutoff)
-        .first()
-    )
-    if interleaved_future is not None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=int(manifest.ledger_generation_id),
-            expected_generation_id=int(generation.id),
-            stored_generation_id=int(manifest.ledger_generation_id),
-            reason=(
-                "custody compact future-local events are interleaved with the "
-                "cutoff event prefix"
-            ),
-        )
-
     future_tail = tuple(
         db.query(models.ProductionMaterialCustodyEvent)
-        .filter(models.ProductionMaterialCustodyEvent.id > cutoff_watermark)
         .filter(models.ProductionMaterialCustodyEvent.id <= live_watermark)
+        .filter(models.ProductionMaterialCustodyEvent.effective_at > generation.cutoff)
         .order_by(models.ProductionMaterialCustodyEvent.id.asc())
         .all()
     )
@@ -400,8 +386,8 @@ def _cutoff_seed_from_compact_owner(
                 expected_generation_id=int(generation.id),
                 stored_generation_id=int(manifest.ledger_generation_id),
                 reason=(
-                    "custody compact watermark tail is not an exact future-local "
-                    "non-physical event suffix"
+                    "custody compact watermark contains a future event that is "
+                    "not exact future-local non-physical custody"
                 ),
             )
 
@@ -425,7 +411,7 @@ def _cutoff_seed_from_compact_owner(
                 manifest_generation_id=int(manifest.ledger_generation_id),
                 expected_generation_id=int(generation.id),
                 stored_generation_id=int(manifest.ledger_generation_id),
-                reason="custody future-local tail reversal produced a negative cutoff cell",
+                reason="custody future-local reversal produced a negative cutoff cell",
             )
         if previous == 0:
             seed.pop(key, None)

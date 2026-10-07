@@ -28,6 +28,7 @@ from app.services.production_material_custody_projection import (
     build_material_custody_projection,
     publish_current_material_custody,
     validate_material_custody_projection,
+    _cutoff_seed_from_compact_owner,
     _same_1c_timestamp,
     load_current_accepted_material_custody,
     load_compact_current_material_custody,
@@ -1846,6 +1847,211 @@ def test_same_cutoff_rebase_rewinds_and_reapplies_future_local_tail_once(db_sess
         product.produced_qty,
         product.remaining_qty,
     ) == product_quantities_before
+
+
+def test_compact_cutoff_seed_partitions_interleaved_future_hold_from_later_physical_event(
+    db_session,
+):
+    cutoff = datetime(2026, 10, 7, 12, 5, 54, tzinfo=timezone.utc)
+    base = _generation(db_session, key="custody-interleaved-base", cutoff=cutoff)
+    held_product, _held_parent, held_component = _product(
+        db_session, item_code="INTERLEAVED-HOLD"
+    )
+    physical_product, _physical_parent, physical_component = _product(
+        db_session, item_code="INTERLEAVED-PHYSICAL"
+    )
+    manifest = _manifest(
+        db_session, generation_id=base.id, source_event_high_watermark_id=0
+    )
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=held_product.product_id,
+        component_id=held_component.item_id,
+        qty=10,
+        source_event_high_watermark_id=0,
+    )
+    hold_issue = ProductionMaterialIssue(
+        document_number="MT-INTERLEAVED-HOLD",
+        product_id=held_product.product_id,
+        order_id=held_product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-MAIN",
+        ledger_generation_id=base.id,
+    )
+    db_session.add(hold_issue)
+    db_session.flush()
+    hold_line = ProductionMaterialIssueLine(
+        issue_id=hold_issue.issue_id,
+        component_item_id=held_component.item_id,
+        required_qty=Decimal("5"),
+        issued_qty=Decimal("5"),
+        unit="шт",
+        line_status="issued",
+    )
+    db_session.add(hold_line)
+    db_session.flush()
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=hold_issue,
+        line=hold_line,
+        delta_qty=5,
+        source_kind="issue_created",
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        effective_at=cutoff + timedelta(minutes=1),
+    )
+    future_event = (
+        db_session.query(ProductionMaterialCustodyEvent)
+        .filter_by(issue_id=hold_issue.issue_id, source_kind="issue_created")
+        .one()
+    )
+
+    physical_issue = ProductionMaterialIssue(
+        document_number="MT-INTERLEAVED-PHYSICAL",
+        product_id=physical_product.product_id,
+        order_id=physical_product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-SRC",
+        ledger_generation_id=base.id,
+    )
+    db_session.add(physical_issue)
+    physical_sle = StockLedgerEntry(
+        ingest_batch_id=base.physical_import_batch_id,
+        source_content_hash="interleaved-physical",
+        business_identity="interleaved-physical",
+        item_id=physical_component.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-MAIN",
+        qty=Decimal("4"),
+        posting_at=cutoff - timedelta(minutes=1),
+        record_type="Receipt",
+        movement_kind="transfer_in",
+        recorder_type="Document_Transfer",
+        recorder_ref="interleaved-physical",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(physical_sle)
+    db_session.flush()
+    _event(
+        db_session,
+        source_kind="transfer_posted",
+        issue_id=physical_issue.issue_id,
+        product_id=physical_product.product_id,
+        component_id=physical_component.item_id,
+        location="workshop",
+        warehouse="WH-MAIN",
+        qty=4,
+        key="custody:interleaved:physical",
+        effective_at=cutoff - timedelta(minutes=1),
+        source_sle_id=physical_sle.id,
+    )
+    db_session.flush()
+    physical_event = (
+        db_session.query(ProductionMaterialCustodyEvent)
+        .filter_by(idempotency_key="custody:interleaved:physical")
+        .one()
+    )
+    assert int(physical_event.id) > int(future_event.id)
+
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=physical_product.product_id,
+        component_id=physical_component.item_id,
+        qty=4,
+        source_event_high_watermark_id=physical_event.id,
+    )
+    manifest.source_event_high_watermark_id = int(physical_event.id)
+    db_session.query(ProductionMaterialCustodyProjection).filter_by(
+        ledger_generation_id=base.id
+    ).update(
+        {"source_event_high_watermark_id": int(physical_event.id)},
+        synchronize_session=False,
+    )
+    db_session.flush()
+
+    seed = _cutoff_seed_from_compact_owner(
+        db_session, manifest=manifest, generation=base
+    )
+    assert seed.cutoff_high_watermark_id == physical_event.id
+    assert [event.id for event in seed.future_local_events] == [future_event.id]
+    assert seed.rows[
+        (held_product.product_id, held_component.item_id, "workshop", "WH-MAIN")
+    ] == pytest.approx(10)
+    assert seed.rows[
+        (
+            physical_product.product_id,
+            physical_component.item_id,
+            "workshop",
+            "WH-MAIN",
+        )
+    ] == pytest.approx(4)
+
+    same_cutoff = _building_generation(
+        db_session,
+        key="custody-interleaved-same-cutoff",
+        cutoff=cutoff,
+        parent=base,
+    )
+    build_material_custody_projection(
+        db_session, ledger_generation_id=same_cutoff.id
+    )
+    same_cutoff.status = "accepted"
+    same_cutoff.accepted_at = cutoff
+    publish_current_material_custody(
+        db_session, ledger_generation_id=same_cutoff.id
+    )
+    publish_generation(db_session, same_cutoff, expected_parent_id=base.id)
+    _generation_id, current = load_compact_current_material_custody(
+        db_session, consumer="test.interleaved.same"
+    )
+    assert current.for_product(held_product.product_id).at_workshop[
+        held_component.item_id
+    ] == pytest.approx(15)
+    assert current.for_product(physical_product.product_id).at_workshop[
+        physical_component.item_id
+    ] == pytest.approx(4)
+
+    advancing = _building_generation(
+        db_session,
+        key="custody-interleaved-advancing",
+        cutoff=cutoff + timedelta(minutes=2),
+        parent=same_cutoff,
+    )
+    build_material_custody_projection(
+        db_session, ledger_generation_id=advancing.id
+    )
+    advancing_state = load_material_custody_projection(
+        db_session, ledger_generation_id=advancing.id
+    )
+    assert advancing_state.for_product(held_product.product_id).at_workshop[
+        held_component.item_id
+    ] == pytest.approx(15)
+    assert advancing_state.for_product(physical_product.product_id).at_workshop[
+        physical_component.item_id
+    ] == pytest.approx(4)
+    advancing.status = "accepted"
+    advancing.accepted_at = advancing.cutoff
+    publish_current_material_custody(
+        db_session, ledger_generation_id=advancing.id
+    )
+    publish_generation(db_session, advancing, expected_parent_id=same_cutoff.id)
+    _generation_id, current = load_compact_current_material_custody(
+        db_session, consumer="test.interleaved.advancing"
+    )
+    assert current.for_product(held_product.product_id).at_workshop[
+        held_component.item_id
+    ] == pytest.approx(15)
+    assert current.for_product(physical_product.product_id).at_workshop[
+        physical_component.item_id
+    ] == pytest.approx(4)
 
 
 def test_advancing_cutoff_absorbs_only_due_tail_and_preserves_later_hold(db_session):
