@@ -665,6 +665,34 @@ describe('ProductionControlPage — characterization', () => {
     expect(listRootProductOptions).toHaveBeenCalledTimes(1)
   })
 
+  it('opens launch printing before asynchronous export and names internal reserves', async () => {
+    const user = userEvent.setup()
+    const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false, focus: vi.fn(), print: vi.fn() }
+    const open = vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    let release: (() => void) | undefined
+    vi.mocked(openPaintWeldChains).mockImplementation((productIds, identities, sourceRevision) => new Promise((resolve) => {
+      release = () => resolve({ status: 'ok', entries: [], errors: [], product_ids: productIds, current_identities: identities, source_revision: sourceRevision })
+    }))
+    vi.mocked(exportMaterialIssuesTo1C).mockResolvedValue({
+      status: 'ok', issues_created: 1, issues_error: 0,
+      issues_internal_reserve: 1, issues_other_skipped: 0,
+      skipped_rows: [{ issue_id: 2, code: 'internal_reserve' }],
+      parent_orders_export: { orders_created: 0, orders_already_linked: 1, orders_error: 0 },
+    })
+    renderPage()
+    await screen.findByText('MRP run: 77')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalled())
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(open.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(openPaintWeldChains).mock.invocationCallOrder[0])
+    release?.()
+    expect(await screen.findByText(/заказов уже было 1/)).toHaveTextContent('материал уже на участке')
+    expect(screen.queryByText(/пропущено 1/)).not.toBeInTheDocument()
+    await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalled())
+    open.mockRestore()
+  })
+
   it('restores the mechshop queue without replacing the production journal', async () => {
     const user = userEvent.setup()
     renderPage()

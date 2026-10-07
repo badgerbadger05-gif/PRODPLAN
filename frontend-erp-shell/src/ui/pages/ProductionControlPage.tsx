@@ -521,7 +521,7 @@ export function ProductionControlPage() {
     setLoading(true)
     setError('')
     setMessage('')
-    let printWindow: Window | null = null
+    let printWindow: Window | null = prepareRouteSheetWindow()
     let materializationAttempted = false
     try {
       if (workItemIds.length) {
@@ -566,6 +566,7 @@ export function ProductionControlPage() {
       if (weldedNames.length > 0 && !window.confirm(
         `Будет открыта цепочка сварка → окраска. Сначала будет запущена сварная деталь: ${Array.from(new Set(weldedNames)).join(', ')}. Продолжить?`,
       )) {
+        closeRouteSheetWindow(printWindow)
         return
       }
       const chainContext = workItemIds.length
@@ -577,7 +578,6 @@ export function ProductionControlPage() {
         identities: chains.current_identities ?? [],
         sourceRevision: chains.source_revision ?? '',
       }
-      printWindow = prepareRouteSheetWindow()
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids, materialContext)
       const selectionRequired = issueResult.selection_required ?? []
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
@@ -603,12 +603,14 @@ export function ProductionControlPage() {
       const transfersCreated = Number(result.issues_created ?? 0)
       const transfersExisting = Number(result.issues_already_linked ?? 0)
       const errored = Number(result.issues_error ?? 0) + Number(parent.orders_error ?? 0)
-      const skipped = (result.skipped_rows as unknown[])?.length ?? 0
+      const skipped = Number(result.issues_other_skipped ?? (result.skipped_rows as unknown[])?.length ?? 0)
+      const internalReserves = Number(result.issues_internal_reserve ?? 0)
       const summary =
         `Запуск в 1С: заказов проведено ${ordersCreated}` +
         (ordersExisting ? `, заказов уже было ${ordersExisting}` : '') +
         `; перемещений создано ${transfersCreated}` +
         (transfersExisting ? `, перемещений уже было ${transfersExisting}` : '') +
+        (internalReserves ? `; заявок без перемещения ${internalReserves} — материал уже на участке` : '') +
         (skipped ? `, пропущено ${skipped}` : '') +
         (errored ? `, ошибок ${errored}` : '')
       if (errored > 0 || result.status === 'partial_error' || parent.status === 'partial_error') {

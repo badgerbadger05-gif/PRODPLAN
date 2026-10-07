@@ -501,6 +501,7 @@ def _collect_export_entries(
                 {
                     "issue_id": int(issue.issue_id),
                     "reason": "source=destination: внутренний резерв, в 1С не выгружается",
+                    "code": "internal_reserve",
                 }
             )
             continue
@@ -881,6 +882,8 @@ def export_material_issues_to_1c(
         "issues_created": 0,
         "issues_error": 0,
         "skipped_rows": skipped,
+        "issues_internal_reserve": sum(row.get("code") == "internal_reserve" for row in skipped),
+        "issues_other_skipped": sum(row.get("code") != "internal_reserve" for row in skipped),
         "entries": [],
         "parent_orders_export": parent_export,
     }

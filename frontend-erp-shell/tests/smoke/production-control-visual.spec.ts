@@ -188,6 +188,8 @@ test.use({
 test('launches an existing order with retained MRP work item without recreating it', async ({ page }) => {
   const posts: { path: string; body: Record<string, unknown> }[] = []
   const base = '/api/v1/production-control'
+  let releaseLaunch: (() => void) | undefined
+  const launchGate = new Promise<void>((resolve) => { releaseLaunch = resolve })
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const { pathname } = new URL(request.url())
@@ -196,7 +198,8 @@ test('launches an existing order with retained MRP work item without recreating 
       await route.fulfill({ json: {
         rows: [{ ...orders[0], work_item_id: 701, journal_row_key: 'work-item:701',
           quantity: 20, remaining_qty: 20, materialized_order_qty: 20, launchable_qty: 20,
-          status: 'created', issue_status: 'not_requested', available_actions: [] }],
+          status: 'created', issue_status: 'not_requested', available_actions: [],
+          current_identity: 'production:order:101', source_revision: 'rev-7' }],
         total: 1, limit: 100, offset: 0, latest_run_id: 77,
         truth_meta: { ledger_generation: 77, cutoff: '2026-07-31T00:00:00Z', truth_status: 'accepted' },
       } })
@@ -205,13 +208,14 @@ test('launches an existing order with retained MRP work item without recreating 
     } else if (pathname === `${base}/orders/101/materials`) {
       await route.fulfill({ json: materials })
     } else if (pathname === `${base}/orders/open-paint-weld-chains`) {
-      await route.fulfill({ json: { product_ids: [101] } })
+      await launchGate
+      await route.fulfill({ json: { product_ids: [101], current_identities: ['production:order:101'], source_revision: 'rev-7' } })
     } else if (pathname === `${base}/orders/from-work-items`) {
       await route.fulfill({ json: { created: [], reused: [], errors: ['доступно к запуску 0, запрошено 20'] } })
     } else if (pathname === `${base}/material-issues`) {
       await route.fulfill({ json: { created: [{ issue_id: 1 }], errors: [] } })
     } else if (pathname === `${base}/material-issues/export-to-1c`) {
-      await route.fulfill({ json: { status: 'ok', issues_created: 1, parent_orders_export: { orders_created: 1 } } })
+      await route.fulfill({ json: { status: 'ok', issues_created: 1, issues_internal_reserve: 1, issues_other_skipped: 0, parent_orders_export: { orders_created: 1 } } })
     } else if (pathname === `${base}/route-sheets/print`) {
       await route.fulfill({ contentType: 'text/html', body: '<html><body>Маршрутный лист</body></html>' })
     } else {
@@ -220,8 +224,13 @@ test('launches an existing order with retained MRP work item without recreating 
   })
   await page.goto('/#/production-control')
   await page.getByRole('checkbox', { name: /ПП-000101/ }).check()
+  const popupPromise = page.waitForEvent('popup')
   await page.getByRole('button', { name: 'Запустить в 1С' }).click()
+  const popup = await popupPromise
+  await expect(popup.getByText('Загрузка...')).toBeVisible()
+  releaseLaunch?.()
   await expect(page.getByText(/Запуск в 1С: заказов проведено 1/)).toBeVisible()
+  await expect(page.getByText(/материал уже на участке/)).toBeVisible()
   expect(posts.some(({ path }) => path.endsWith('/from-work-items'))).toBe(false)
   expect(posts.find(({ path }) => path === `${base}/material-issues`)?.body.product_ids).toEqual([101])
   expect(posts.find(({ path }) => path.endsWith('/export-to-1c'))?.body.issue_ids).toEqual([1])

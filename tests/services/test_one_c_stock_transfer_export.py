@@ -1136,3 +1136,15 @@ def test_parent_summary_reports_existing_1c_order_without_reexport(db_session, m
     assert result["orders_created"]==0
     assert result["orders_already_linked"]==1
     assert result["orders_error"]==0
+
+
+def test_launch_labels_same_warehouse_issue_as_internal_reserve(db_session):
+    parent = _mk_item(db_session, code="TR-LOCAL", ref1c="parent-local")
+    comp = _mk_item(db_session, code="TR-LOCAL-C", ref1c="component-local")
+    issue = _mk_issue(db_session, parent=parent, component=comp, source_wh="same-warehouse", dest_wh="same-warehouse")
+    result = exporter.export_material_issues_to_1c(db_session,[issue.issue_id],dry_run=True)
+    assert result["issues_internal_reserve"] == 1
+    assert result["issues_other_skipped"] == 0
+    assert result["skipped_rows"][0]["code"] == "internal_reserve"
+    assert result["issues_created"] == 0
+    assert result["parent_orders_export"]["orders_already_linked"] == 1
