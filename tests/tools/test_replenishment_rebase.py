@@ -18,6 +18,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.item_ledger.current_replenishment import (
     ASSEMBLY_OUTPUT_SOURCE_KEY,
     BASIS_CORRECTED_REASON,
@@ -69,7 +70,7 @@ def _sle(
     row = models.StockLedgerEntry(
         ingest_batch_id=int(batch.id),
         source_content_hash=f"{recorder}-{line_no}".ljust(64, "0")[:64],
-        item_id=int(item_id), characteristic_ref="", organization_ref="",
+        item_id=int(item_id), characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c=warehouse, qty=qty, posting_at=posting_at,
         record_type="Receipt" if qty > 0 else "Expense",
         movement_kind=movement_kind,

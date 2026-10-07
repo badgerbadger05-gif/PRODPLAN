@@ -126,6 +126,7 @@ def known_at_freeze(
 #: at their freeze (decision §58).  It is neither an allocation nor free
 #: surplus: it is the fact's own quantity, already counted as somebody's stock.
 FROZEN_STOCK_REASON = "covered_from_stock_at_freeze"
+CONSUMED_BEFORE_FREEZE_REASON = "physically_consumed_before_freeze"
 
 
 def replenishment_available_from_fact(
@@ -437,9 +438,16 @@ def allocate_historical_facts(
             left = place(fact, left, compatible, "fifo")
 
         if left > 0:
-            surplus.append(
-                SurplusFact(fact.fact_id, left, "no_live_replenishment_demand")
-            )
+            unavailable = Decimal("0")
+            if fact.freeze_available_qty and compatible:
+                for begin, end in available_parts[fact.fact_id]:
+                    if all(known_at_freeze(fact.known_revisions, owner.known_batch_id, owner.baseline_at)
+                           and eligible_start(fact, owner) >= end for owner in compatible):
+                        unavailable += end - begin
+            if unavailable:
+                surplus.append(SurplusFact(fact.fact_id, unavailable, CONSUMED_BEFORE_FREEZE_REASON))
+            if left > unavailable:
+                surplus.append(SurplusFact(fact.fact_id, left - unavailable, "no_live_replenishment_demand"))
 
     realization_rows = tuple(
         ReserveRealization(row.reserve_id, row.reserved_qty, realized[row.reserve_id])

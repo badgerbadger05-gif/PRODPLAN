@@ -32,6 +32,7 @@ from .historical_replay_core import (
     ReserveRealization,
     plan_allocation_changes,
     FROZEN_STOCK_REASON,
+    CONSUMED_BEFORE_FREEZE_REASON,
     SurplusFact,
 )
 from .reservation import reservation_business_identity
@@ -1508,7 +1509,7 @@ def apply_current_replenishment(
     # decision about what a pre-freeze fact means.
     frozen_stock_budget: dict[str, Decimal] = {}
     for row in plan.result.surplus:
-        if _text(row.reason) != FROZEN_STOCK_REASON:
+        if _text(row.reason) not in (FROZEN_STOCK_REASON, CONSUMED_BEFORE_FREEZE_REASON):
             continue
         frozen_stock_budget[str(row.fact_id)] = (
             frozen_stock_budget.get(str(row.fact_id), Decimal("0")) + _decimal(row.qty)
