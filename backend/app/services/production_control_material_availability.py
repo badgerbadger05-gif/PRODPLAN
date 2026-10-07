@@ -896,6 +896,7 @@ def preview_make_work_items_coverage(
     rows: Sequence[Mapping[str, Any]],
     *,
     ledger_generation_id: int,
+    _current_only: bool = False,
 ) -> Dict[int, Dict[str, str]]:
     """Calculate proposal material coverage in bulk for one Ledger generation.
 
@@ -1015,12 +1016,23 @@ def preview_make_work_items_coverage(
         db,
         sorted(component_ids),
         ledger_generation_id=int(ledger_generation_id),
-        allow_building_read=True,
+        allow_building_read=not _current_only,
     )
-    custody = load_material_custody_projection(
-        db,
-        ledger_generation_id=int(ledger_generation_id),
-    )
+    if _current_only:
+        from .production_material_custody_projection import (
+            load_compact_current_material_custody,
+        )
+
+        custody_generation, custody = load_compact_current_material_custody(
+            db, consumer="production.current_make_coverage"
+        )
+        if custody_generation != int(ledger_generation_id):
+            raise ValueError("Поколение текущего снимка материалов изменилось")
+    else:
+        custody = load_material_custody_projection(
+            db,
+            ledger_generation_id=int(ledger_generation_id),
+        )
     reserved_by_item = custody.total_by_item()
 
     result: Dict[int, Dict[str, str]] = {}

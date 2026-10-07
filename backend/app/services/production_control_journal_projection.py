@@ -1251,6 +1251,7 @@ def build_compact_current_production_control_payload(
                 db,
                 coverage_product_ids,
                 ledger_generation_id=int(parent.id),
+                _current_only=True,
             )
         )
     truth = _candidate_truth(parent)
@@ -1535,6 +1536,7 @@ def build_compact_current_production_control_payload(
         db,
         canonical_proposals,
         ledger_generation_id=int(parent.id),
+        _current_only=True,
     )
     # Preserve the same row-level BOM membership used by ordinary production
     # lines.  A run may have multiple roots; assigning the complete run root
@@ -1604,6 +1606,7 @@ def build_compact_current_production_control_payload(
                         int(proposal["source_run_id"])
                         if proposal.get("source_run_id") is not None else None
                     ),
+                    _current_only=True,
                 )
                 # A synthetic locator (``-reservation_id``) is not a work item.
                 snapshot.pop("work_item_id", None)

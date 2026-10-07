@@ -9,7 +9,9 @@ from app.services import production_control_material_availability as material_av
 from app.services.planning_truth import publish_generation
 from app.services.production_control_material_availability import get_materials_snapshot
 from app.services.production_material_custody_projection import (
+    MaterialCustodySnapshotUnavailable,
     initialize_material_custody_baseline,
+    load_material_custody_projection,
 )
 from types import SimpleNamespace
 
@@ -646,6 +648,155 @@ def test_compact_current_production_control_payload_uses_current_sources_and_pub
     assert list_root_product_options(db_session) == []
     assert db_session.query(models.ReplenishmentWorkItem).count() == 0
     assert db_session.query(models.AssemblyQueueLine).count() == 0
+
+
+def test_compact_production_payload_reads_working_current_custody_after_physical_tail(
+    db_session,
+):
+    """Bounded publication must not reinterpret its mutable parent as history.
+
+    The custody writer applies target-visible physical events to the compact
+    current owner before dependent DTOs are built, while planning truth still
+    points at the accepted parent. The parent's manifest therefore covers a
+    physical event after its immutable cutoff. Historical readers must keep
+    rejecting that shape; the compact production builder reads the explicit
+    working current owner instead.
+    """
+    parent = _building_generation(db_session, "production-compact-custody-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    _item, _order, product = _journal_line(db_session)
+    run, work = _make_proposal(
+        db_session, parent, tag="-compact-current-custody"
+    )
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    reservation.owner_kind = "current"
+    reservation.is_current = True
+    reservation.current_identity = (
+        f"reservation:req:{reservation.requirement_id}:mode:make"
+    )
+    db_session.delete(work)
+    component = models.Item(
+        item_code="COMPACT-CUSTODY-COMP",
+        item_name="Compact custody component",
+        item_article="COMPACT-CUSTODY-COMP",
+        unit="шт",
+        status="active",
+    )
+    db_session.add(component)
+    db_session.flush()
+
+    local_event = models.ProductionMaterialCustodyEvent(
+        product_id=int(product.product_id),
+        component_item_id=int(component.item_id),
+        source_kind="issue_created",
+        effective_at=parent.cutoff + timedelta(minutes=1),
+        location_kind="workshop",
+        warehouse_ref1c="WH-CURRENT",
+        delta_qty=2,
+        idempotency_key="compact-custody-local",
+    )
+    physical_sle = models.StockLedgerEntry(
+        ingest_batch_id=int(parent.physical_import_batch_id),
+        source_content_hash="compact-custody-physical",
+        business_identity="compact-custody-physical",
+        item_id=int(component.item_id),
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-CURRENT",
+        qty=5,
+        posting_at=parent.cutoff + timedelta(minutes=2),
+        record_type="Receipt",
+        movement_kind="transfer_in",
+        recorder_type="Document_Transfer",
+        recorder_ref="compact-custody-physical",
+        line_no="1",
+        ingest_source="document_pull",
+    )
+    db_session.add_all([local_event, physical_sle])
+    db_session.flush()
+    physical_event = models.ProductionMaterialCustodyEvent(
+        product_id=int(product.product_id),
+        component_item_id=int(component.item_id),
+        source_kind="transfer_posted",
+        source_sle_id=int(physical_sle.id),
+        effective_at=physical_sle.posting_at,
+        location_kind="workshop",
+        warehouse_ref1c="WH-CURRENT",
+        delta_qty=5,
+        idempotency_key="compact-custody-physical",
+    )
+    db_session.add(physical_event)
+    db_session.flush()
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
+    )
+    manifest.source_event_high_watermark_id = int(physical_event.id)
+    db_session.add(models.ProductionMaterialCustodyProjection(
+        ledger_generation_id=int(parent.id),
+        product_id=int(product.product_id),
+        component_item_id=int(component.item_id),
+        location_kind="workshop",
+        warehouse_ref1c="WH-CURRENT",
+        reserved_qty=7,
+        source_event_high_watermark_id=int(physical_event.id),
+        is_current=True,
+    ))
+    target = _building_generation(db_session, "production-compact-custody-target")
+    target.cutoff = parent.cutoff + timedelta(minutes=3)
+    target.physical_import_batch.cutoff = target.cutoff
+    db_session.flush()
+
+    with pytest.raises(
+        MaterialCustodySnapshotUnavailable,
+        match="not exact future-local non-physical custody",
+    ):
+        load_material_custody_projection(
+            db_session, ledger_generation_id=int(parent.id)
+        )
+
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        assembly_payload={
+            "queue_rows": [{
+                "entity_kind": "assembly_queue",
+                "business_identity": "plan-line:compact-current-custody",
+                "payload": {
+                    "run_id": int(run.run_id),
+                    "item_id": int(reservation.item_id),
+                },
+            }],
+        },
+        drum_payload={"rows": []},
+        shelf_payload={
+            "rows": [{
+                "entity_kind": "shelf_projection",
+                "payload": {
+                    "item_id": int(reservation.item_id),
+                    "materialized_qty": 4,
+                    "pull_qty": 4,
+                    "warehouse_ref1c": "WH-CURRENT",
+                },
+            }],
+        },
+        accepted_run_ids=[int(run.run_id)],
+    )
+
+    row = next(
+        value for value in payload["rows"]
+        if value.get("product_id") == int(product.product_id)
+    )
+    assert payload["meta"]["ledger_generation_id"] == int(target.id)
+    assert isinstance(row["material_coverage_snapshot"], dict)
+    proposal = next(value for value in payload["rows"] if value.get("product_id") is None)
+    assert proposal["reservation_id"] == int(reservation.id)
+    assert isinstance(proposal["material_coverage_snapshot"], dict)
+    assert manifest.source_event_high_watermark_id == int(physical_event.id)
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
 
 def test_candidate_payload_contains_unmaterialized_make_proposal(db_session):
