@@ -91,3 +91,71 @@ def senior_hold_qty(reserved_qty: Any, allocations: Iterable[Any]) -> Decimal:
         consumed += quantity
     return max(reserved - consumed, Decimal("0"))
 
+
+def unconsumed_receipt_qty(rows: Iterable[Any]) -> dict[int, Decimal]:
+    """Surviving units of visible receipt lines in one planning stock pool.
+
+    Signed physical movements deplete prior receipts FIFO, including opening
+    stock and adjustments. Internal transport of a document has zero pool
+    delta and does not spend the same units again. This is inventory evidence
+    for pre-freeze facts, never a second calculation of planning demand.
+    The caller supplies one exact batch/cutoff and selected warehouse pool.
+    """
+    from collections import defaultdict, deque
+    from datetime import timezone
+    from .document_net_output import net_document_output_qty
+
+    rows = tuple(rows)
+    output = net_document_output_qty(rows)
+    groups = defaultdict(list)
+    for row in rows:
+        at = _value(row, "posting_at")
+        if at is None:
+            raise CurrentPhysicalStateError("physical movement has no posting time")
+        at = at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+        key = _key(row)[:3]
+        document = (str(_value(row, "recorder_type", "") or ""),
+                    str(_value(row, "recorder_ref", "") or f"__sle__:{row.id}"))
+        groups[(key, at, document)].append(row)
+    lots = defaultdict(deque)
+    debt = defaultdict(lambda: Decimal("0"))
+    for (key, _at, _document), movements in sorted(
+        groups.items(), key=lambda entry: (entry[0][1], min(int(row.id) for row in entry[1]))
+    ):
+        delta = sum((Decimal(str(row.qty)) for row in movements), Decimal("0"))
+        if delta < 0:
+            left = -delta
+            while left and lots[key]:
+                lot = lots[key][0]
+                take = min(left, lot[1])
+                lot[1] -= take
+                left -= take
+                if not lot[1]:
+                    lots[key].popleft()
+            debt[key] += left
+        elif delta > 0:
+            # Canonical document output owns which assembly-in line represents
+            # the net receipt; production-warehouse pass-through is not a lot.
+            positive = sorted((row for row in movements if row.qty > 0),
+                              key=lambda row: (not bool(output.get(int(row.id))), int(row.id)))
+            left = delta
+            for row in positive:
+                capacity = output.get(int(row.id), Decimal("0")) if row.movement_kind == "assembly_in" else Decimal(str(row.qty))
+                portion = min(left, capacity)
+                if not portion:
+                    continue
+                offset = min(debt[key], portion)
+                debt[key] -= offset
+                if portion > offset:
+                    lots[key].append([int(row.id), portion - offset])
+                left -= portion
+                if not left:
+                    break
+            if left:
+                raise CurrentPhysicalStateError("positive physical delta has no qualified receipt line")
+    result = {}
+    for queue in lots.values():
+        for sle_id, quantity in queue:
+            result[sle_id] = result.get(sle_id, Decimal("0")) + quantity
+    return result
+

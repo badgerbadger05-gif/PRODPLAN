@@ -297,3 +297,23 @@ def test_manifest_ignores_fixed_snapshot_runs_from_other_generation(db_session):
         ("retain", parents[0][0].id, parents[0][1].run_id),
         ("retain", parents[1][0].id, parents[1][1].run_id),
     ]
+
+
+def test_successors_preserve_parent_fifo_when_same_period_plan_ids_disagree(db_session):
+    accepted,target,parents=_fixture(db_session,plans=2)
+    # Reverse plan ids relative to immutable parent run order, as when an
+    # additional August plan was fixed before the main August plan.
+    parents[0][1].source_plan_id=None
+    db_session.flush()
+    parents[1][1].source_plan_id=parents[0][0].id
+    db_session.flush()
+    parents[0][1].source_plan_id=parents[1][0].id
+    item=models.Item(item_code="FIFO-SAME-PERIOD",item_name="FIFO",replenishment_method="Production")
+    db_session.add(item)
+    db_session.flush()
+    for plan, _run in parents:
+        db_session.add(models.ProductionPlanLine(plan_id=plan.id,item_id=item.item_id,qty=3,bucket_date=plan.period_to,accepted_output_qty=0,remaining_output_qty=3))
+    db_session.commit()
+    result=_create(db_session,accepted,target,replace_plan_ids=[p.id for p,_ in parents])
+    replacements=sorted((row for row in result.entries if row["action"]=="replace"),key=lambda row:row["candidate_run_id"])
+    assert [row["parent_run_id"] for row in replacements]==[run.run_id for _,run in parents]

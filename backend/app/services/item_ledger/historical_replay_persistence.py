@@ -6,7 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
 
@@ -36,6 +36,81 @@ _NO_POOL_SENTINEL_PREFIX = "__no_pool__"
 
 def _decimal(value: Any) -> Decimal:
     return Decimal(str(value or 0))
+
+
+def attach_pre_freeze_physical_availability(
+    db: Session, facts: Iterable[Fact], reserves: Iterable[Reserve],
+) -> tuple[Fact, ...]:
+    """Qualify old MAKE receipts by signed stock at each exact owner freeze.
+
+    Uses the same batch visibility, line-revision identity and warehouse
+    contour as the frozen stock. Consumed receipts are not free stock merely
+    because their positive document lines still exist in physical history.
+    """
+    from dataclasses import replace
+    from .historical_replay_core import known_at_freeze, _utc
+    from .physical_visibility import known_revisions_by_sle
+    from .current_physical import unconsumed_receipt_qty
+    from app.services.mrp_stock_helpers import planning_warehouse_scope, apply_planning_warehouse_scope
+
+    facts, reserves = tuple(facts), tuple(reserves)
+    owners_by_item = {}
+    for owner in reserves:
+        owners_by_item.setdefault(owner.item_id, []).append(owner)
+    old_facts = [fact for fact in facts if fact.mode == "make" and any(
+        known_at_freeze(fact.known_revisions, owner.known_batch_id, owner.baseline_at)
+        for owner in owners_by_item.get(fact.item_id, ())
+    )]
+    if not old_facts:
+        return facts
+    source_rows = {int(row.id): row for row in db.query(StockLedgerEntry).filter(
+        StockLedgerEntry.id.in_([int(fact.fact_id) for fact in old_facts])
+    ).all()}
+    if len(source_rows) != len(old_facts):
+        raise ValueError("old receipt availability lacks its exact physical source")
+    revisions = known_revisions_by_sle(db, source_rows.values(), _include_sle_ids=True)
+    boundaries = sorted({(int(owner.known_batch_id), _utc(owner.baseline_at))
+                         for owner in reserves if owner.known_batch_id is not None and owner.baseline_at is not None})
+    item_ids = tuple(sorted({fact.item_id for fact in old_facts}))
+    warehouse_scope = planning_warehouse_scope(db)
+    cache = db.info.setdefault("pre_freeze_physical_availability", {})
+    snapshots = {}
+    for batch, baseline in boundaries:
+        key = (batch, baseline, item_ids, warehouse_scope.organization_ref,
+               tuple(sorted(warehouse_scope.selected_refs)),
+               tuple(sorted(warehouse_scope.ignored_refs)),
+               tuple(sorted(warehouse_scope.finished_refs)))
+        if key not in cache:
+            query = visible_sle_query(db, physical_import_batch_id=batch, cutoff=baseline).filter(
+                StockLedgerEntry.item_id.in_(item_ids), StockLedgerEntry.qty != 0)
+            rows = apply_planning_warehouse_scope(query, warehouse_scope,
+                warehouse_column=StockLedgerEntry.warehouse_ref1c,
+                organization_column=StockLedgerEntry.organization_ref).all()
+            remaining = unconsumed_receipt_qty(rows)
+            net = net_document_output_qty(rows)
+            cache[key] = (remaining, net)
+        snapshots[(batch, baseline)] = cache[key]
+    qualified = {}
+    for fact in old_facts:
+        available, known = [], []
+        for (batch, baseline), (remaining, net) in snapshots.items():
+            if not known_at_freeze(fact.known_revisions, batch, baseline):
+                continue
+            visible = [revision for revision in revisions[int(fact.fact_id)]
+                       if revision[0] <= batch and (revision[1] is None or revision[1] > batch)
+                       and (revision[2] is None or _utc(revision[2]) <= baseline)]
+            if len(visible) != 1:
+                raise ValueError("old receipt has ambiguous visible freeze revision")
+            sle_id = int(visible[0][3])
+            old_qty = net.get(sle_id, Decimal("0"))
+            quantity = min(fact.qty, remaining.get(sle_id, Decimal("0")) + max(fact.qty - old_qty, Decimal("0")))
+            # Outside the planning contour, an old output cannot be stock.
+            if sle_id not in net:
+                quantity = Decimal("0")
+            available.append((batch, baseline, quantity))
+            known.append((batch, baseline, old_qty))
+        qualified[fact.fact_id] = replace(fact, freeze_available_qty=tuple(available), freeze_known_qty=tuple(known))
+    return tuple(qualified.get(fact.fact_id, fact) for fact in facts)
 
 
 def bucket_capacity_for_mode(
@@ -404,6 +479,7 @@ def run_historical_replay(
         ))
         sle_by_core_id[core_id] = row
 
+    facts = attach_pre_freeze_physical_availability(db, facts, reserves)
     result = allocate_historical_facts(facts, reserves)
     cycle_id = f"historical-replay:g{generation.id}"
     inserted_events = 0

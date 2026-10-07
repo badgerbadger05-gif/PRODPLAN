@@ -1239,14 +1239,14 @@ def _extra_fixed_plan(db, accepted, cutoff, *, name, code, qty=3):
         run_id=int(run.run_id), item_id=item.item_id,
         total_required_qty=Decimal(str(qty)), net_required_qty=Decimal(str(qty)),
         period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
-        planning_stock_pool="selected", characteristic_ref="",
+        planning_stock_pool="default", characteristic_ref="",
         organization_ref="", freeze_version=1,
     )
     db.add(requirement)
     db.flush()
     owner = models.ReservationEntry(
         ledger_generation_id=accepted.id, item_id=item.item_id,
-        characteristic_ref="", organization_ref="", planning_stock_pool="selected",
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
         run_id=int(run.run_id), freeze_version=1, requirement_id=requirement.id,
         priority_period_from=plan.period_from, priority_period_to=plan.period_to,
         realization_mode="buy", reserved_qty=Decimal(str(qty)),

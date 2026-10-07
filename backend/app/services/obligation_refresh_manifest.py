@@ -121,7 +121,10 @@ def _current_parents(db: Session, parent_generation_id: int) -> list[models.Plan
     rows = (
         db.query(models.PlanningRun)
         .filter(models.PlanningRun.run_id.in_(live_run_ids or (0,)))
-        .order_by(models.PlanningRun.source_plan_id, models.PlanningRun.run_id)
+        # Successor ids inherit the existing FIFO order. Creating same-period
+        # replacements by plan id could reverse their stock claims even though
+        # their period and saved root obligations had not changed.
+        .order_by(models.PlanningRun.period_from, models.PlanningRun.period_to, models.PlanningRun.run_id)
         .all()
     )
     seen: set[int] = set()

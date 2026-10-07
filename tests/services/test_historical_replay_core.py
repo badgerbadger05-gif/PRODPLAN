@@ -184,3 +184,55 @@ def test_invalid_consume_mode_is_rejected() -> None:
             [fact("legacy", "1", flow="consume")],
             [reserve("only", 10, "1")],
         )
+
+
+def test_consumed_old_receipt_cannot_replenish_successor():
+    from dataclasses import replace
+    baseline = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    owner = replace(reserve("successor", 1, "259"), known_batch_id=12, baseline_at=baseline)
+    old = replace(fact("june-receipt", "100"), known_revisions=((1, None, datetime(2026, 6, 3, tzinfo=timezone.utc)),),
+                  freeze_available_qty=((12, baseline, Decimal("0")),))
+    result = allocate_historical_facts([old], [owner])
+    assert result.allocated_qty == 0
+    assert result.surplus_qty == 100
+
+
+def test_surviving_old_stock_is_available_once_across_successor_freezes():
+    from dataclasses import replace
+    first = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    second = datetime(2026, 10, 7, tzinfo=timezone.utc)
+    owners = [replace(reserve("august", 1, "34"), known_batch_id=12, baseline_at=first),
+              replace(reserve("september", 2, "105", period_from=date(2026, 9, 1)), known_batch_id=13, baseline_at=second)]
+    old = replace(fact("old-receipt", "100"), known_revisions=((1, None, datetime(2026, 6, 3, tzinfo=timezone.utc)),),
+                  freeze_available_qty=((12, first, Decimal("17")), (13, second, Decimal("17"))))
+    result = allocate_historical_facts([old], owners)
+    assert result.allocated_qty == 17
+    assert [(x.reserve_id, x.qty) for x in result.allocations] == [("august", Decimal("17"))]
+
+
+def test_frozen_coverage_uses_surviving_receipt_without_absorbing_spent_receipts():
+    from dataclasses import replace
+    baseline = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    owner = replace(reserve("successor", 1, "259"), known_batch_id=12, baseline_at=baseline,
+                    covered_from_stock_at_freeze_qty=Decimal("17"))
+    rows = [replace(fact("spent", "100"), known_revisions=((1, None, datetime(2026, 6, 3, tzinfo=timezone.utc)),),
+                    freeze_available_qty=((12, baseline, Decimal("0")),)),
+            replace(fact("surviving", "44"), known_revisions=((1, None, datetime(2026, 8, 20, tzinfo=timezone.utc)),),
+                    freeze_available_qty=((12, baseline, Decimal("17")),))]
+    result = allocate_historical_facts(rows, [owner])
+    assert result.allocated_qty == 0
+    assert sum(x.qty for x in result.surplus if x.reason == "covered_from_stock_at_freeze") == 17
+
+
+def test_receipt_increase_after_freeze_is_not_absorbed_by_old_stock_coverage():
+    from dataclasses import replace
+    baseline = datetime(2026, 10, 6, tzinfo=timezone.utc)
+    owner = replace(reserve("successor", 1, "259"), known_batch_id=12, baseline_at=baseline,
+                    covered_from_stock_at_freeze_qty=Decimal("17"))
+    row = replace(fact("corrected-receipt", "150"),
+                  known_revisions=((1, None, datetime(2026, 6, 3, tzinfo=timezone.utc)),),
+                  freeze_available_qty=((12, baseline, Decimal("50")),),
+                  freeze_known_qty=((12, baseline, Decimal("100")),))
+    result = allocate_historical_facts([row], [owner])
+    assert result.allocated_qty == 50
+    assert not any(x.reason == "covered_from_stock_at_freeze" for x in result.surplus)

@@ -340,6 +340,13 @@ def _input_checksum(
                 "pool": _text(row.planning_stock_pool),
                 "requirement": row.requirement_id,
                 "order": row.order_ref,
+                **({"freeze_physical_availability": [
+                    [batch, _comparable_datetime(baseline).isoformat(), canonical_decimal_text(quantity)]
+                    for batch, baseline, quantity in row.freeze_available_qty
+                ], "freeze_known_quantity": [
+                    [batch, _comparable_datetime(baseline).isoformat(), canonical_decimal_text(quantity)]
+                    for batch, baseline, quantity in row.freeze_known_qty
+                ]} if row.freeze_available_qty else {}),
             }
             for row in sorted(facts, key=lambda item: str(item.fact_id))
         ],
@@ -2710,13 +2717,17 @@ def apply_current_replenishment_for_bounded_make_scopes(
                 "this scope are internal transport of their own document"
             )
             scopes_confirmed_empty_by_netting += 1
+        from .historical_replay_persistence import attach_pre_freeze_physical_availability
+        qualified_facts = attach_pre_freeze_physical_availability(
+            db, facts_by_scope[scope], reserves_by_scope[scope]
+        )
         results.append(
             apply_current_replenishment(
                 db,
                 generation_id=int(target.id),
                 source_key=ASSEMBLY_OUTPUT_SOURCE_KEY,
                 source_revision=revision,
-                facts=tuple(facts_by_scope[scope]),
+                facts=qualified_facts,
                 reserves=reserves_by_scope[scope],
                 complete_scope=True,
                 distribution_scope=scope,

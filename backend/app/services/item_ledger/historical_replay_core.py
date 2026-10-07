@@ -34,6 +34,11 @@ class Fact:
     # ``(ingest_batch, superseding batch or None, posting_at)``
     # (``physical_visibility.known_revisions_by_sle``).
     known_revisions: Tuple[Tuple[Optional[int], Optional[int], Optional[datetime]], ...] = ()
+    # At each exact freeze boundary, only the physically surviving part of an
+    # old receipt remains available. An empty tuple is the pure caller seam;
+    # production adapters supply every boundary which knew this fact.
+    freeze_available_qty: Tuple[Tuple[int, datetime, Decimal], ...] = ()
+    freeze_known_qty: Tuple[Tuple[int, datetime, Decimal], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -295,6 +300,53 @@ def allocate_historical_facts(
     realized = {row.reserve_id: Decimal("0") for row in ordered_reserves}
     allocations: list[Allocation] = []
     surplus: list[SurplusFact] = []
+    # Receipt units are consumed once. Keeping intervals also prevents two
+    # owners with different freeze dates from claiming the same surviving tail.
+    available_parts = {fact.fact_id: [(Decimal("0"), fact.qty)] for fact in fact_rows}
+
+    def eligible_start(fact: Fact, reserve: Reserve) -> Decimal:
+        if not fact.freeze_available_qty or not known_at_freeze(
+            fact.known_revisions, reserve.known_batch_id, reserve.baseline_at
+        ):
+            return Decimal("0")
+        for batch, baseline, quantity in fact.freeze_available_qty:
+            if batch == reserve.known_batch_id and _utc(baseline) == _utc(reserve.baseline_at):
+                if quantity < 0 or quantity > fact.qty:
+                    raise ValueError("pre-freeze physical availability is outside fact quantity")
+                return fact.qty - quantity
+        raise ValueError("known receipt has no exact pre-freeze physical availability")
+
+    def eligible_end(fact: Fact, reserve: Reserve, coverage: bool) -> Decimal:
+        if coverage:
+            for batch, baseline, quantity in fact.freeze_known_qty:
+                if batch == reserve.known_batch_id and _utc(baseline) == _utc(reserve.baseline_at):
+                    return min(fact.qty, quantity)
+        return fact.qty
+
+    def eligible_qty(fact: Fact, reserve: Reserve, *, coverage: bool = False) -> Decimal:
+        start = eligible_start(fact, reserve)
+        stop = eligible_end(fact, reserve, coverage)
+        return sum((max(min(end, stop) - max(begin, start), Decimal("0"))
+                    for begin, end in available_parts[fact.fact_id]), Decimal("0"))
+
+    def take_parts(fact: Fact, reserve: Reserve, requested: Decimal, *, coverage: bool = False) -> Decimal:
+        start = eligible_start(fact, reserve)
+        stop = eligible_end(fact, reserve, coverage)
+        left = requested
+        kept = []
+        for begin, end in available_parts[fact.fact_id]:
+            eligible = max(begin, start)
+            take = min(left, max(min(end, stop) - eligible, Decimal("0")))
+            if take:
+                if begin < eligible:
+                    kept.append((begin, eligible))
+                if eligible + take < end:
+                    kept.append((eligible + take, end))
+                left -= take
+            else:
+                kept.append((begin, end))
+        available_parts[fact.fact_id] = kept
+        return requested - left
 
     def place(
         fact: Fact,
@@ -311,7 +363,9 @@ def allocate_historical_facts(
             available = remaining[reserve.reserve_id]
             if available <= 0:
                 continue
-            take = min(left, available)
+            take = take_parts(fact, reserve, min(left, available))
+            if take <= 0:
+                continue
             allocations.append(
                 Allocation(
                     fact.fact_id,
@@ -352,18 +406,22 @@ def allocate_historical_facts(
         for reserve in compatible:
             if left <= 0:
                 break
-            left, absorbed = replenishment_available_from_fact(
-                left,
+            _eligible_left, absorbed = replenishment_available_from_fact(
+                eligible_qty(fact, reserve, coverage=True),
                 fact.known_revisions,
                 reserve.known_batch_id,
                 reserve.baseline_at,
                 coverage_left[reserve.reserve_id],
             )
             if absorbed > 0:
+                taken = take_parts(fact, reserve, absorbed, coverage=True)
+                assert taken == absorbed
                 coverage_left[reserve.reserve_id] -= absorbed
                 surplus.append(
                     SurplusFact(fact.fact_id, absorbed, FROZEN_STOCK_REASON)
                 )
+                left -= absorbed
+        left = sum((end - begin for begin, end in available_parts[fact.fact_id]), Decimal("0"))
         exact = [reserve for reserve in compatible if _is_addressed_match(fact, reserve)]
         # One requirement may legitimately have several dated reserve slices.
         # An order reference shared by different requirements is ambiguous and

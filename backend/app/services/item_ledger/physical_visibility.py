@@ -106,7 +106,7 @@ def take_known_revisions_metrics(db: Session) -> dict[str, int]:
 
 
 def known_revisions_by_sle(
-    db: Session, rows: Any
+    db: Session, rows: Any, *, _include_sle_ids: bool = False
 ) -> dict[int, tuple[Revision, ...]]:
     """Every revision of each fact's document line, for the freeze test (§53).
 
@@ -189,6 +189,7 @@ def known_revisions_by_sle(
             int(batch_id),
             int(superseded_batch) if superseded_batch is not None else None,
             posting_at,
+            int(sle_id),
         )
         by_id[int(sle_id)] = revision
         if str(recorder_ref or "").strip():
@@ -225,11 +226,12 @@ def known_revisions_by_sle(
                 int(values[8]),
                 int(values[10]) if values[10] is not None else None,
                 values[9],
+                int(values[0]),
             )
 
     result: dict[int, tuple[Revision, ...]] = {}
     for row in facts:
-        own = by_id.get(int(row.id), (int(row.ingest_batch_id), None, row.posting_at))
+        own = by_id.get(int(row.id), (int(row.ingest_batch_id), None, row.posting_at, int(row.id)))
         document = (
             str(getattr(row, "recorder_type", "") or ""),
             str(getattr(row, "recorder_ref", "") or ""),
@@ -256,7 +258,10 @@ def known_revisions_by_sle(
         result[int(row.id)] = tuple(sorted(
             revisions, key=lambda value: (value[0], value[1] or 0),
         ))
-    return result
+    if _include_sle_ids:
+        return result
+    return {sle_id: tuple(revision[:3] for revision in revisions)
+            for sle_id, revisions in result.items()}
 
 
 def visible_sles(

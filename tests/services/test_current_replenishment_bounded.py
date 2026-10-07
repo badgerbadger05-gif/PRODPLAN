@@ -491,3 +491,51 @@ def test_an_assembly_out_leg_alone_opens_the_make_scope(db_session):
         planning_pool_by_warehouse={"WH-MAKE": "default"},
         current_owners=current_owners,
     ) == ((int(items[0].item_id), "", "", "default", "make"),)
+
+
+@pytest.mark.parametrize("covered", [Decimal("0"), Decimal("17")])
+def test_bounded_successor_uses_signed_pre_freeze_stock_once(db_session, covered):
+    from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+    parent, target, items, owners, facts = _world(db_session)
+    item, owner, old = items[0], owners[items[0].item_id], facts[items[0].item_id]
+    db_session.add(models.StockWarehouse(warehouse_ref1c="WH-MAKE", warehouse_name="Planning", is_selected=True))
+    owner.reserved_qty = Decimal("259") + covered
+    owner.covered_from_stock_at_freeze_qty = covered
+    owner.replenishment_required_qty = Decimal("259")
+    old.ingest_batch_id = parent.physical_import_batch_id
+    old.posting_at = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    old.organization_ref = DEFAULT_ORGANIZATION_REF1C
+    old.qty = Decimal("100")
+    old.qty_after = Decimal("137")
+    db_session.add(models.MrpFreezeBaseline(run_id=owner.run_id, freeze_version=1, item_id=item.item_id,
+        characteristic_ref="", organization_ref="", planning_stock_pool="selected",
+        baseline_at=parent.cutoff, physical_import_batch_id=parent.physical_import_batch_id,
+        frozen_basis_generation_id=parent.id, stock_qty=17))
+    last_receipt = None
+    for day, quantity, kind in [(1,37,"receipt"),(3,61,"assembly_in"),(4,44,"assembly_in"),
+                                (5,-215,"assembly_out"),(6,-10,"expense")]:
+        row = models.StockLedgerEntry(ingest_batch_id=parent.physical_import_batch_id,
+            source_content_hash=("signed-freeze-"+str(day)).ljust(64,"0"),
+            business_identity="signed-freeze:"+str(day), item_id=item.item_id,
+            characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="WH-MAKE",
+            qty=Decimal(quantity), qty_after=0, posting_at=datetime(2026,9,day,tzinfo=timezone.utc),
+            known_at=parent.cutoff, record_type="Receipt" if quantity>0 else "Expense",
+            movement_kind=kind, recorder_type="Assembly", recorder_ref="signed-"+str(day),
+            line_no="1", ingest_source="pull")
+        db_session.add(row)
+        if day == 4:
+            last_receipt = row
+    db_session.commit()
+    args=dict(target_generation_id=target.id,parent_generation_id=parent.id,target_cutoff=target.cutoff,
+              affected_scopes=(_scope(item.item_id),),source_revision=1)
+    result=apply_current_replenishment_for_bounded_make_scopes(db_session,**args)
+    db_session.commit()
+    assert owner.replenishment_received_qty == 17-covered
+    assert owner.replenishment_required_qty == 259
+    assert owner.covered_from_stock_at_freeze_qty == covered
+    rows=db_session.query(models.ReservationConsumptionAllocation).filter_by(
+        reservation_id=owner.id,is_current=True,allocation_role="replenishment_receipt").all()
+    assert sum((row.allocated_qty for row in rows),Decimal("0"))==17-covered
+    assert all(row.sle_id==last_receipt.id for row in rows)
+    again=apply_current_replenishment_for_bounded_make_scopes(db_session,**args)
+    assert again.results[0].inserted==0 and again.results[0].updated==0

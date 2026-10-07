@@ -358,7 +358,8 @@ def test_retained_stock_shortage_only_clips_to_zero_free_s0(db_session):
     db_session.add(retained_requirement)
     db_session.flush()
     db_session.add(models.ReservationEntry(
-        ledger_generation_id=target.id,
+        ledger_generation_id=accepted.id,
+        owner_kind="current", is_current=True,
         item_id=item.item_id,
         characteristic_ref="",
         organization_ref="",
@@ -449,7 +450,8 @@ def test_dynamic_retained_hold_releases_stock_when_consumption_arrives(db_sessio
     db_session.add(retained_requirement)
     db_session.flush()
     reservation = models.ReservationEntry(
-        ledger_generation_id=target.id,
+        ledger_generation_id=accepted.id,
+        owner_kind="current", is_current=True,
         item_id=item.item_id,
         characteristic_ref="",
         organization_ref="",
@@ -814,7 +816,8 @@ def test_candidate_freeze_rejects_retained_reservation_with_pool_qualifier(db_se
     db_session.add(retained_requirement)
     db_session.flush()
     db_session.add(models.ReservationEntry(
-        ledger_generation_id=target.id,
+        ledger_generation_id=accepted.id,
+        owner_kind="current", is_current=True,
         item_id=item.item_id,
         characteristic_ref="reserved-dimension",
         organization_ref="",

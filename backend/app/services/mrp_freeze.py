@@ -1323,7 +1323,8 @@ def freeze_candidate_snapshots(
             row
             for row in db.query(ReservationEntry).filter(
                 ReservationEntry.run_id.in_(retained_run_ids),
-                ReservationEntry.ledger_generation_id == target_id,
+                ReservationEntry.is_current.is_(True),
+                ReservationEntry.owner_kind == "current",
                 ReservationEntry.lifecycle_status == "active",
             ).all()
         ]
