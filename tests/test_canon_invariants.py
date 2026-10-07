@@ -665,6 +665,26 @@ def test_direct_1c_writer_registry_is_exact() -> None:
             "patch_production_kind",
             "patch",
         ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_promote_material_rows",
+            "patch",
+        ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_create_specification",
+            "post",
+        ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_default_specification",
+            "post",
+        ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_default_specification",
+            "patch",
+        ),
     }
 
 

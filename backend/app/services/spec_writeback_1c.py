@@ -8,14 +8,20 @@ PATCH заменяет весь массив. PRODPLAN не хранит все 
 
 Чистые helper-функции (без I/O) держат ошибкоопасную логику мутации и легко тестируются.
 Оркестрация (`SpecWriteback`) по умолчанию dry_run=True: ничего не пишет, возвращает
-предпросмотр payload. Отдельный guarded-путь меняет только заголовочный
-`ВидПроизводства_Key` после полного fresh-read и проверяет полный read-back.
+предпросмотр payload. Guarded-пути после полного fresh-read и полного read-back
+владеют изменением заголовка, атомарным batch состава, созданием спецификации и
+записью основной спецификации по полному ключу номенклатура + характеристика.
 """
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import math
+import uuid
 from collections import Counter
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .specification_sync import _norm_component_spec_ref
 
@@ -24,6 +30,25 @@ SPEC_ENTITY = "Catalog_Спецификации"
 ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 PRODUCTION_KIND_FIELD = "ВидПроизводства_Key"
 OPERATIONS_FIELD = "Операции"
+DEFAULT_SPEC_ENTITY = "InformationRegister_СпецификацииПоУмолчанию"
+MATERIAL_ROW_TYPE = "Материал"
+ASSEMBLY_ROW_TYPE = "Сборка"
+
+# Category migration may promote a material row or attach/replace the pin on an
+# existing assembly row.  Both result in an explicitly pinned assembly.  Adding
+# any other transition requires a separate 1C transport proof.
+ALLOWED_COMPONENT_TYPE_TRANSITIONS = frozenset(
+    {
+        (MATERIAL_ROW_TYPE, ASSEMBLY_ROW_TYPE),
+        (ASSEMBLY_ROW_TYPE, ASSEMBLY_ROW_TYPE),
+    }
+)
+
+# Fields returned by 1C but forbidden in a create payload.  Ref_Key is replaced
+# with a caller-preallocated UUID, which makes a retry observable/idempotent.
+SPEC_CREATE_READONLY_FIELDS = frozenset(
+    {"Code", "DataVersion", "Predefined", "PredefinedDataName"}
+)
 
 
 class SpecWritebackError(RuntimeError):
@@ -43,6 +68,137 @@ def _guard(op: str, fn: "Callable[[], Any]") -> Any:
 
 def _norm_key(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _require_guid(value: Any, *, field: str, allow_zero: bool = True) -> str:
+    raw = str(value or "").strip()
+    try:
+        normalized = str(uuid.UUID(raw))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise SpecWritebackError(f"{field}: некорректный GUID {value!r}") from exc
+    if not allow_zero and normalized == ZERO_GUID:
+        raise SpecWritebackError(f"{field}: нулевой GUID недопустим")
+    return normalized
+
+
+def specification_before_hash(record: Mapping[str, Any]) -> str:
+    """Stable SHA-256 of the complete 1C before-image, including DataVersion."""
+    encoded = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _without_data_version(record: Mapping[str, Any]) -> Dict[str, Any]:
+    comparable = copy.deepcopy(dict(record))
+    comparable.pop("DataVersion", None)
+    return comparable
+
+
+def _validate_active_specification(record: Mapping[str, Any], *, op: str, spec_ref: str) -> None:
+    if _norm_key(record.get("Ref_Key")) != _norm_key(spec_ref):
+        raise SpecWritebackError(
+            f"{op}: drift Ref_Key: ожидалось {spec_ref!r}, получено {record.get('Ref_Key')!r}"
+        )
+    for field in ("DeletionMark", "Недействителен", "ЭтоШаблон"):
+        if bool(record.get(field)):
+            raise SpecWritebackError(
+                f"{op}: спецификация недопустима для записи: {field}=true (spec={spec_ref})"
+            )
+
+
+@dataclass(frozen=True)
+class MaterialAssemblyRowChange:
+    """Exact identity and before/after state of one composition row.
+
+    Sanctioned transitions are ``Материал -> Сборка`` and the pin-only
+    ``Сборка -> Сборка``.  The row identity includes ``LineNumber``,
+    nomenclature and characteristic, so non-zero characteristics cannot be
+    accidentally collapsed into the zero one.
+    """
+
+    line_number: str
+    nomenclature_key: str
+    characteristic_key: str
+    old_row_type: str
+    old_specification_key: str
+    new_specification_key: str
+
+
+def _coerce_material_assembly_change(
+    value: MaterialAssemblyRowChange | Mapping[str, Any],
+    *,
+    index: int,
+) -> MaterialAssemblyRowChange:
+    if isinstance(value, MaterialAssemblyRowChange):
+        change = value
+    elif isinstance(value, Mapping):
+        required = {
+            "line_number",
+            "nomenclature_key",
+            "characteristic_key",
+            "old_row_type",
+            "old_specification_key",
+            "new_specification_key",
+        }
+        missing = sorted(required.difference(value))
+        if missing:
+            raise SpecWritebackError(
+                f"composition_batch: change[{index}] не содержит: {', '.join(missing)}"
+            )
+        change = MaterialAssemblyRowChange(
+            line_number=str(value["line_number"]),
+            nomenclature_key=str(value["nomenclature_key"]),
+            characteristic_key=str(value["characteristic_key"]),
+            old_row_type=str(value["old_row_type"]),
+            old_specification_key=str(value["old_specification_key"] or ZERO_GUID),
+            new_specification_key=str(value["new_specification_key"]),
+        )
+    else:
+        raise SpecWritebackError(
+            f"composition_batch: change[{index}] должен быть объектом строки"
+        )
+
+    line_number = str(change.line_number or "").strip()
+    if not line_number:
+        raise SpecWritebackError(f"composition_batch: change[{index}] пустой LineNumber")
+    item_ref = _require_guid(
+        change.nomenclature_key,
+        field=f"composition_batch.change[{index}].nomenclature_key",
+        allow_zero=False,
+    )
+    characteristic_ref = _require_guid(
+        change.characteristic_key,
+        field=f"composition_batch.change[{index}].characteristic_key",
+    )
+    old_spec_ref = _require_guid(
+        change.old_specification_key or ZERO_GUID,
+        field=f"composition_batch.change[{index}].old_specification_key",
+    )
+    target_ref = _require_guid(
+        change.new_specification_key,
+        field=f"composition_batch.change[{index}].new_specification_key",
+        allow_zero=False,
+    )
+    transition = (str(change.old_row_type or "").strip(), ASSEMBLY_ROW_TYPE)
+    if transition not in ALLOWED_COMPONENT_TYPE_TRANSITIONS:
+        raise SpecWritebackError(
+            f"composition_batch: недопустимый переход типа строки {transition!r}; "
+            f"разрешены {MATERIAL_ROW_TYPE!r} -> {ASSEMBLY_ROW_TYPE!r} и "
+            f"{ASSEMBLY_ROW_TYPE!r} -> {ASSEMBLY_ROW_TYPE!r}"
+        )
+    return MaterialAssemblyRowChange(
+        line_number=line_number,
+        nomenclature_key=item_ref,
+        characteristic_key=characteristic_ref,
+        old_row_type=str(change.old_row_type or "").strip(),
+        old_specification_key=old_spec_ref,
+        new_specification_key=target_ref,
+    )
 
 
 def _row_matches(row: Dict[str, Any], nomenclature_key: str, child_spec_key: Optional[str]) -> bool:
@@ -365,6 +521,624 @@ def writeback_change_production_kind(
         }
 
     return _guard("kind_change", _run)
+
+
+def writeback_promote_material_rows(
+    client: Any,
+    *,
+    parent_spec_ref: str,
+    row_changes: Sequence[MaterialAssemblyRowChange | Mapping[str, Any]],
+    expected_before: Optional[Mapping[str, Any]] = None,
+    expected_before_hash: Optional[str] = None,
+    expected_data_version: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Atomically make exact parent rows explicitly pinned assemblies.
+
+    One call owns one parent specification and emits at most one PATCH containing
+    the complete fresh ``Состав`` array.  Unknown row fields and every existing
+    ``LineNumber`` are copied byte-for-byte.  Each target specification is read
+    once and must be active and owned by the row nomenclature.  Direct cycles
+    (the parent itself or another specification of the parent's owner) are
+    rejected.
+
+    A real source-state write requires at least one complete before-image proof:
+    the full object, its SHA-256, or its DataVersion.  Rows already in the exact
+    target state are resumable and do not require the now-stale source proof.
+    """
+
+    def _run_promote_material_rows() -> Dict[str, Any]:
+        normalized_parent_ref = _require_guid(
+            parent_spec_ref, field="composition_batch.parent_spec_ref", allow_zero=False
+        )
+        if not row_changes:
+            raise SpecWritebackError("composition_batch: пустой список row_changes")
+        changes = [
+            _coerce_material_assembly_change(value, index=index)
+            for index, value in enumerate(row_changes)
+        ]
+        identities = [
+            (
+                change.line_number,
+                _norm_key(change.nomenclature_key),
+                _norm_key(change.characteristic_key),
+            )
+            for change in changes
+        ]
+        if len(set(identities)) != len(identities):
+            raise SpecWritebackError("composition_batch: повторная identity целевой строки")
+
+        sb = SpecWriteback(client, dry_run=dry_run)
+        before = sb.read_specification(normalized_parent_ref)
+        _validate_active_specification(
+            before, op="composition_batch", spec_ref=normalized_parent_ref
+        )
+        parent_owner_ref = _require_guid(
+            before.get("Owner_Key"),
+            field="composition_batch.parent.Owner_Key",
+            allow_zero=False,
+        )
+        rows = before.get(SOSTAV)
+        if not isinstance(rows, list):
+            raise SpecWritebackError("composition_batch: fresh Состав не является массивом")
+
+        new_rows = copy.deepcopy(rows)
+        source_indexes: List[int] = []
+        row_states: List[str] = []
+        for change in changes:
+            matches = [
+                index
+                for index, row in enumerate(rows)
+                if str(row.get("LineNumber") or "").strip() == change.line_number
+                and _norm_key(row.get("Номенклатура_Key"))
+                == _norm_key(change.nomenclature_key)
+                and _norm_key(row.get("Характеристика_Key"))
+                == _norm_key(change.characteristic_key)
+            ]
+            if len(matches) != 1:
+                raise SpecWritebackError(
+                    "composition_batch: ожидалась ровно одна строка по "
+                    f"LineNumber/item/characteristic, найдено {len(matches)} "
+                    f"(line={change.line_number}, item={change.nomenclature_key}, "
+                    f"characteristic={change.characteristic_key})"
+                )
+            row_index = matches[0]
+            row = rows[row_index]
+            actual_type = str(row.get("ТипСтрокиСостава") or "").strip()
+            actual_pin = _require_guid(
+                row.get("Спецификация_Key") or ZERO_GUID,
+                field=f"composition_batch.Состав[{change.line_number}].Спецификация_Key",
+            )
+            if (
+                actual_type == ASSEMBLY_ROW_TYPE
+                and _norm_key(actual_pin) == _norm_key(change.new_specification_key)
+            ):
+                row_states.append("already_applied")
+                continue
+            if (
+                actual_type != change.old_row_type
+                or _norm_key(actual_pin) != _norm_key(change.old_specification_key)
+            ):
+                raise SpecWritebackError(
+                    "composition_batch: drift строки "
+                    f"{change.line_number}: ожидались type={change.old_row_type!r}, "
+                    f"pin={change.old_specification_key!r} либо уже применённые "
+                    f"type={ASSEMBLY_ROW_TYPE!r}, pin={change.new_specification_key!r}; "
+                    f"получено type={actual_type!r}, pin={actual_pin!r}"
+                )
+            row_states.append("source")
+            source_indexes.append(row_index)
+            new_rows[row_index]["ТипСтрокиСостава"] = ASSEMBLY_ROW_TYPE
+            new_rows[row_index]["Спецификация_Key"] = change.new_specification_key
+
+        # Validate each distinct child exactly once, even for already-applied rows.
+        child_records: Dict[str, Dict[str, Any]] = {}
+        for change in changes:
+            target_norm = _norm_key(change.new_specification_key)
+            child = child_records.get(target_norm)
+            if child is None:
+                if target_norm == _norm_key(normalized_parent_ref):
+                    raise SpecWritebackError(
+                        "composition_batch: циклическая ссылка на родительскую спецификацию"
+                    )
+                child = sb.read_specification(change.new_specification_key)
+                _validate_active_specification(
+                    child,
+                    op="composition_batch.target",
+                    spec_ref=change.new_specification_key,
+                )
+                child_records[target_norm] = child
+            child_owner = _require_guid(
+                child.get("Owner_Key"),
+                field=f"composition_batch.target[{change.new_specification_key}].Owner_Key",
+                allow_zero=False,
+            )
+            if _norm_key(child_owner) != _norm_key(change.nomenclature_key):
+                raise SpecWritebackError(
+                    "composition_batch: target specification owner mismatch: "
+                    f"target={change.new_specification_key}, owner={child_owner}, "
+                    f"row_item={change.nomenclature_key}"
+                )
+            child_characteristic = _require_guid(
+                child.get("ХарактеристикаПродукции_Key") or ZERO_GUID,
+                field=(
+                    "composition_batch.target"
+                    f"[{change.new_specification_key}].ХарактеристикаПродукции_Key"
+                ),
+            )
+            if _norm_key(child_characteristic) != _norm_key(change.characteristic_key):
+                raise SpecWritebackError(
+                    "composition_batch: target specification characteristic mismatch: "
+                    f"target={change.new_specification_key}, "
+                    f"target_characteristic={child_characteristic}, "
+                    f"row_characteristic={change.characteristic_key}"
+                )
+            if _norm_key(child_owner) == _norm_key(parent_owner_ref):
+                raise SpecWritebackError(
+                    "composition_batch: запрещён прямой цикл через спецификацию "
+                    f"того же owner={parent_owner_ref}"
+                )
+
+        common = {
+            "op": "promote_material_rows",
+            "parent_spec_ref": normalized_parent_ref,
+            "before_data_version": before.get("DataVersion"),
+            "row_count": len(changes),
+            "source_count": row_states.count("source"),
+            "already_applied_count": row_states.count("already_applied"),
+            "validated_target_count": len(child_records),
+        }
+        if not source_indexes:
+            return {**common, "status": "already_applied", "dry_run": bool(dry_run)}
+
+        if expected_before is None and not expected_before_hash and expected_data_version is None:
+            raise SpecWritebackError(
+                "composition_batch: требуется expected_before, expected_before_hash "
+                "или expected_data_version"
+            )
+        if expected_before is not None and dict(expected_before) != before:
+            raise SpecWritebackError("composition_batch: fresh object отличается от expected_before")
+        if expected_before_hash:
+            actual_hash = specification_before_hash(before)
+            if actual_hash.lower() != str(expected_before_hash).strip().lower():
+                raise SpecWritebackError(
+                    "composition_batch: fresh object hash отличается от expected_before_hash"
+                )
+        if expected_data_version is not None and str(before.get("DataVersion") or "") != str(
+            expected_data_version
+        ):
+            raise SpecWritebackError(
+                "composition_batch: drift DataVersion: "
+                f"ожидалось {expected_data_version!r}, получено {before.get('DataVersion')!r}"
+            )
+
+        payload = {SOSTAV: new_rows}
+        if dry_run:
+            return {
+                **common,
+                "status": "dry_run",
+                "dry_run": True,
+                "would_patch": payload,
+            }
+
+        endpoint = f"{SPEC_ENTITY}(guid'{normalized_parent_ref}')"
+        response = client.patch(endpoint, payload)
+        after = sb.read_specification(normalized_parent_ref)
+        expected_after = copy.deepcopy(before)
+        expected_after[SOSTAV] = new_rows
+        if _without_data_version(after) != _without_data_version(expected_after):
+            raise SpecWritebackError(
+                "composition_batch: read-back изменил объект вне намеренных "
+                "ТипСтрокиСостава/Спецификация_Key либо не подтвердил payload"
+            )
+        return {
+            **common,
+            "status": "updated",
+            "dry_run": False,
+            "after_data_version": after.get("DataVersion"),
+            "endpoint": endpoint,
+            "payload": payload,
+            "response": response,
+        }
+
+    return _guard("composition_batch", _run_promote_material_rows)
+
+
+def _strip_spec_create_transport_fields(template: Mapping[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for key, value in template.items():
+        key_text = str(key)
+        if (
+            key_text in SPEC_CREATE_READONLY_FIELDS
+            or key_text == "odata.metadata"
+            or "@" in key_text
+        ):
+            continue
+        payload[key_text] = copy.deepcopy(value)
+    return payload
+
+
+def build_specification_create_payload(
+    template: Mapping[str, Any],
+    *,
+    new_spec_ref: str,
+    new_owner_ref: str,
+    material_ref: str,
+    material_characteristic_ref: str,
+    material_quantity: Any,
+    operation_ref: str,
+    operation_time: Any,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a lossless, transport-safe one-material/one-operation clone payload.
+
+    The caller supplies the complete freshly read template and explicitly
+    approves the new owner, material, quantity, operation and time.  The helper
+    does not infer business values.  A preallocated UUID is assigned to the
+    header and every tabular row; server-owned identity/version fields are
+    removed before transport.
+    """
+    spec_ref = _require_guid(new_spec_ref, field="spec_create.new_spec_ref", allow_zero=False)
+    owner_ref = _require_guid(new_owner_ref, field="spec_create.new_owner_ref", allow_zero=False)
+    material_key = _require_guid(material_ref, field="spec_create.material_ref", allow_zero=False)
+    characteristic_key = _require_guid(
+        material_characteristic_ref,
+        field="spec_create.material_characteristic_ref",
+    )
+    operation_key = _require_guid(
+        operation_ref, field="spec_create.operation_ref", allow_zero=False
+    )
+    if _norm_key(owner_ref) == _norm_key(material_key):
+        raise SpecWritebackError("spec_create: запрещён прямой цикл owner -> material")
+    try:
+        material_quantity_float = float(material_quantity)
+        operation_time_float = float(operation_time)
+        if (
+            not math.isfinite(material_quantity_float)
+            or not math.isfinite(operation_time_float)
+            or material_quantity_float <= 0
+            or operation_time_float <= 0
+        ):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SpecWritebackError(
+            "spec_create: material_quantity и operation_time должны быть положительными"
+        ) from exc
+
+    payload = _strip_spec_create_transport_fields(template)
+    for field in ("DeletionMark", "Недействителен", "ЭтоШаблон"):
+        if bool(payload.get(field)):
+            raise SpecWritebackError(f"spec_create: template {field}=true")
+    composition = payload.get(SOSTAV)
+    operations = payload.get(OPERATIONS_FIELD)
+    if not isinstance(composition, list) or len(composition) != 1:
+        raise SpecWritebackError("spec_create: template должен содержать ровно 1 строку Состав")
+    if not isinstance(operations, list) or len(operations) != 1:
+        raise SpecWritebackError("spec_create: template должен содержать ровно 1 строку Операции")
+    if str(composition[0].get("ТипСтрокиСостава") or "").strip() != MATERIAL_ROW_TYPE:
+        raise SpecWritebackError(
+            f"spec_create: разрешён только template row type {MATERIAL_ROW_TYPE!r}"
+        )
+    production_kind_ref = _require_guid(
+        payload.get(PRODUCTION_KIND_FIELD),
+        field=f"spec_create.template.{PRODUCTION_KIND_FIELD}",
+        allow_zero=False,
+    )
+
+    payload["Ref_Key"] = spec_ref
+    payload["Owner_Key"] = owner_ref
+    payload[PRODUCTION_KIND_FIELD] = production_kind_ref
+    if description is not None:
+        payload["Description"] = str(description)
+    material_row = payload[SOSTAV][0]
+    material_row.update(
+        {
+            "Ref_Key": spec_ref,
+            "ТипСтрокиСостава": MATERIAL_ROW_TYPE,
+            "Номенклатура_Key": material_key,
+            "Характеристика_Key": characteristic_key,
+            "Спецификация_Key": ZERO_GUID,
+            "Количество": material_quantity,
+        }
+    )
+    operation_row = payload[OPERATIONS_FIELD][0]
+    operation_row.update(
+        {
+            "Ref_Key": spec_ref,
+            "Операция_Key": operation_key,
+            "НормаВремени": operation_time,
+        }
+    )
+    for value in payload.values():
+        if isinstance(value, list):
+            for row in value:
+                if isinstance(row, dict):
+                    row["Ref_Key"] = spec_ref
+    return payload
+
+
+def _spec_create_business_projection(record: Mapping[str, Any]) -> Dict[str, Any]:
+    """Comparable business data; tabular Ref_Key is transport identity only."""
+    projected = _strip_spec_create_transport_fields(record)
+    for value in projected.values():
+        if isinstance(value, list):
+            for row in value:
+                if isinstance(row, dict):
+                    row.pop("Ref_Key", None)
+                    for key in list(row):
+                        if "@" in str(key):
+                            row.pop(key, None)
+    return projected
+
+
+def _verify_created_specification(
+    actual: Mapping[str, Any],
+    *,
+    expected_payload: Mapping[str, Any],
+) -> None:
+    expected = _spec_create_business_projection(expected_payload)
+    actual_projection = _spec_create_business_projection(actual)
+    missing_or_changed = {
+        field: {"expected": expected_value, "actual": actual_projection.get(field)}
+        for field, expected_value in expected.items()
+        if actual_projection.get(field) != expected_value
+    }
+    if missing_or_changed:
+        raise SpecWritebackError(
+            "spec_create: read-back не подтвердил все business fields: "
+            + ", ".join(sorted(missing_or_changed))
+        )
+
+
+def writeback_create_specification(
+    client: Any,
+    *,
+    template: Mapping[str, Any],
+    new_spec_ref: str,
+    new_owner_ref: str,
+    material_ref: str,
+    material_characteristic_ref: str,
+    material_quantity: Any,
+    operation_ref: str,
+    operation_time: Any,
+    description: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Create a specification via canonical ``client.post`` with UUID idempotence."""
+
+    def _run_create_specification() -> Dict[str, Any]:
+        payload = build_specification_create_payload(
+            template,
+            new_spec_ref=new_spec_ref,
+            new_owner_ref=new_owner_ref,
+            material_ref=material_ref,
+            material_characteristic_ref=material_characteristic_ref,
+            material_quantity=material_quantity,
+            operation_ref=operation_ref,
+            operation_time=operation_time,
+            description=description,
+        )
+        spec_ref = payload["Ref_Key"]
+        sb = SpecWriteback(client, dry_run=dry_run)
+        existing = client.get_all(
+            SPEC_ENTITY,
+            filter_query=f"Ref_Key eq guid'{spec_ref}'",
+            select_fields=None,
+        )
+        if len(existing) > 1:
+            raise SpecWritebackError(
+                f"spec_create: preallocated Ref_Key {spec_ref} вернул {len(existing)} объектов"
+            )
+        if existing:
+            _verify_created_specification(existing[0], expected_payload=payload)
+            return {
+                "op": "create_specification",
+                "status": "already_applied",
+                "dry_run": bool(dry_run),
+                "spec_ref": spec_ref,
+            }
+        if dry_run:
+            return {
+                "op": "create_specification",
+                "status": "dry_run",
+                "dry_run": True,
+                "spec_ref": spec_ref,
+                "would_post": payload,
+            }
+        response = client.post(SPEC_ENTITY, payload)
+        after = sb.read_specification(spec_ref)
+        _verify_created_specification(after, expected_payload=payload)
+        return {
+            "op": "create_specification",
+            "status": "created",
+            "dry_run": False,
+            "spec_ref": spec_ref,
+            "payload": payload,
+            "response": response,
+            "after_data_version": after.get("DataVersion"),
+        }
+
+    return _guard("spec_create", _run_create_specification)
+
+
+def _read_default_specification_record(
+    client: Any,
+    *,
+    nomenclature_key: str,
+    characteristic_key: str,
+) -> Optional[Dict[str, Any]]:
+    # Demo 1C rejects an AND comparison on Характеристика_Key.  Query the exact
+    # owner, then enforce the full composite key locally.
+    records = client.get_all(
+        DEFAULT_SPEC_ENTITY,
+        filter_query=f"Номенклатура_Key eq guid'{nomenclature_key}'",
+        select_fields=None,
+        order_by=None,
+    )
+    matches = [
+        copy.deepcopy(record)
+        for record in records
+        if _norm_key(record.get("Номенклатура_Key")) == _norm_key(nomenclature_key)
+        and _norm_key(record.get("Характеристика_Key")) == _norm_key(characteristic_key)
+    ]
+    if len(matches) > 1:
+        raise SpecWritebackError(
+            "default_spec: неоднозначная запись по composite key "
+            f"({nomenclature_key}, {characteristic_key})"
+        )
+    return matches[0] if matches else None
+
+
+def writeback_default_specification(
+    client: Any,
+    *,
+    nomenclature_key: str,
+    characteristic_key: str,
+    target_spec_ref: str,
+    expected_old_spec_ref: Optional[str] = None,
+    expect_absent: bool = False,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Guarded default-register upsert for its full composite business key."""
+
+    def _run_default_specification() -> Dict[str, Any]:
+        item_ref = _require_guid(
+            nomenclature_key, field="default_spec.nomenclature_key", allow_zero=False
+        )
+        characteristic_ref = _require_guid(
+            characteristic_key, field="default_spec.characteristic_key"
+        )
+        target_ref = _require_guid(
+            target_spec_ref, field="default_spec.target_spec_ref", allow_zero=False
+        )
+        if expect_absent == (expected_old_spec_ref is not None):
+            raise SpecWritebackError(
+                "default_spec: укажите ровно одно из expected_old_spec_ref или expect_absent=true"
+            )
+        expected_old = None
+        if expected_old_spec_ref is not None:
+            expected_old = _require_guid(
+                expected_old_spec_ref,
+                field="default_spec.expected_old_spec_ref",
+                allow_zero=False,
+            )
+
+        sb = SpecWriteback(client, dry_run=dry_run)
+        target = sb.read_specification(target_ref)
+        _validate_active_specification(target, op="default_spec.target", spec_ref=target_ref)
+        if _norm_key(target.get("Owner_Key")) != _norm_key(item_ref):
+            raise SpecWritebackError(
+                "default_spec: target specification owner mismatch: "
+                f"target_owner={target.get('Owner_Key')!r}, item={item_ref!r}"
+            )
+        target_characteristic = _require_guid(
+            target.get("ХарактеристикаПродукции_Key") or ZERO_GUID,
+            field="default_spec.target.ХарактеристикаПродукции_Key",
+        )
+        if _norm_key(target_characteristic) != _norm_key(characteristic_ref):
+            raise SpecWritebackError(
+                "default_spec: target specification characteristic mismatch: "
+                f"target_characteristic={target_characteristic!r}, "
+                f"composite_characteristic={characteristic_ref!r}"
+            )
+
+        before = _read_default_specification_record(
+            client,
+            nomenclature_key=item_ref,
+            characteristic_key=characteristic_ref,
+        )
+        if before is not None and _norm_key(before.get("Спецификация_Key")) == _norm_key(target_ref):
+            return {
+                "op": "write_default_specification",
+                "status": "already_applied",
+                "dry_run": bool(dry_run),
+                "nomenclature_key": item_ref,
+                "characteristic_key": characteristic_ref,
+                "target_spec_ref": target_ref,
+            }
+        if expect_absent and before is not None:
+            raise SpecWritebackError("default_spec: ожидалось отсутствие записи, но она существует")
+        if not expect_absent:
+            if before is None:
+                raise SpecWritebackError("default_spec: ожидаемая старая запись отсутствует")
+            if _norm_key(before.get("Спецификация_Key")) != _norm_key(expected_old):
+                raise SpecWritebackError(
+                    "default_spec: drift Спецификация_Key: "
+                    f"ожидалось {expected_old!r}, получено {before.get('Спецификация_Key')!r}"
+                )
+
+        full_payload = {
+            "Номенклатура_Key": item_ref,
+            "Характеристика_Key": characteristic_ref,
+            "Спецификация_Key": target_ref,
+        }
+        if expect_absent:
+            endpoint = DEFAULT_SPEC_ENTITY
+            write_payload = full_payload
+            method = "post"
+        else:
+            endpoint = (
+                f"{DEFAULT_SPEC_ENTITY}(Номенклатура_Key=guid'{item_ref}',"
+                f"Характеристика_Key=guid'{characteristic_ref}')"
+            )
+            write_payload = {"Спецификация_Key": target_ref}
+            method = "patch"
+        if dry_run:
+            return {
+                "op": "write_default_specification",
+                "status": "dry_run",
+                "dry_run": True,
+                "method": method,
+                "endpoint": endpoint,
+                "would_write": write_payload,
+            }
+
+        if method == "post":
+            response = client.post(endpoint, write_payload)
+        else:
+            response = client.patch(endpoint, write_payload)
+        after = _read_default_specification_record(
+            client,
+            nomenclature_key=item_ref,
+            characteristic_key=characteristic_ref,
+        )
+        if after is None:
+            raise SpecWritebackError("default_spec: read-back не нашёл composite key")
+        actual_business = {
+            "Номенклатура_Key": after.get("Номенклатура_Key"),
+            "Характеристика_Key": after.get("Характеристика_Key"),
+            "Спецификация_Key": after.get("Спецификация_Key"),
+        }
+        if {
+            key: _norm_key(value) for key, value in actual_business.items()
+        } != {key: _norm_key(value) for key, value in full_payload.items()}:
+            raise SpecWritebackError("default_spec: read-back не подтвердил composite record")
+        if before is not None:
+            expected_after = copy.deepcopy(before)
+            expected_after["Спецификация_Key"] = target_ref
+            comparable_after = copy.deepcopy(after)
+            for key in list(comparable_after):
+                if "@" in str(key) or key == "odata.metadata":
+                    comparable_after.pop(key, None)
+            comparable_expected = copy.deepcopy(expected_after)
+            for key in list(comparable_expected):
+                if "@" in str(key) or key == "odata.metadata":
+                    comparable_expected.pop(key, None)
+            if comparable_after != comparable_expected:
+                raise SpecWritebackError(
+                    "default_spec: read-back изменил поля кроме Спецификация_Key"
+                )
+        return {
+            "op": "write_default_specification",
+            "status": "updated" if before is not None else "created",
+            "dry_run": False,
+            "method": method,
+            "endpoint": endpoint,
+            "payload": write_payload,
+            "response": response,
+        }
+
+    return _guard("default_spec", _run_default_specification)
 
 
 def _dominant_stage(rows: List[Dict[str, Any]]) -> Optional[str]:
