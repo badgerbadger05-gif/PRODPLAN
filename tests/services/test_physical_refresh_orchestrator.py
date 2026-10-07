@@ -141,6 +141,129 @@ def _accepted_parent(db_session, *, generation_key="accepted-parent"):
     return parent, parent_batch
 
 
+def _terminal_boundary_world(db_session, *, key: str, exact_cutoff: bool = False):
+    parent, _ = _accepted_parent(db_session, generation_key=f"{key}-parent")
+    target_cutoff = parent.cutoff + timedelta(days=1)
+    auxiliary = models.PhysicalImportBatch(
+        batch_key=f"{key}-auxiliary",
+        status="completed",
+        source_complete=True,
+        cutoff=target_cutoff if exact_cutoff else parent.cutoff + timedelta(hours=2),
+        completed_at=target_cutoff,
+        source_watermarks={"source": "targeted_recorder_repair"},
+    )
+    generation = models.LedgerGeneration(
+        generation_key=f"{key}-generation",
+        status="building",
+        cutoff=target_cutoff,
+        physical_import_batch=auxiliary,
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        algorithm_version="physical-refresh/test",
+        replay_version="physical-refresh/test",
+    )
+    db_session.add_all([auxiliary, generation])
+    db_session.flush()
+    convergence = bootstrap.BalanceConvergenceResult(
+        ledger_generation_id=int(generation.id),
+        cutoff=target_cutoff.isoformat(),
+        checked_at=target_cutoff.isoformat(),
+        valid=True,
+        content_hash=f"{key}-balance",
+        compared=17,
+        mismatched=0,
+        matched=17,
+        terminal_batch_id=int(auxiliary.id),
+        deltas=(),
+    )
+    return generation, auxiliary, convergence
+
+
+def test_terminal_boundary_seals_auxiliary_prefix_at_generation_cutoff(db_session):
+    generation, auxiliary, convergence = _terminal_boundary_world(
+        db_session, key="terminal-seal"
+    )
+    auxiliary_cutoff = auxiliary.cutoff
+
+    boundary = workflow._ensure_terminal_physical_boundary(
+        db_session, generation=generation, convergence=convergence
+    )
+
+    assert int(boundary.id) > int(auxiliary.id)
+    assert int(generation.physical_import_batch_id) == int(boundary.id)
+    assert workflow._utc(boundary.cutoff, "boundary") == workflow._utc(
+        generation.cutoff, "generation"
+    )
+    assert boundary.status == "completed"
+    assert boundary.source_complete is True
+    assert boundary.source_watermarks["source"] == workflow._TERMINAL_BOUNDARY_SOURCE
+    assert boundary.source_watermarks["previous_import_batch_id"] == auxiliary.id
+    assert boundary.source_watermarks["convergence"]["content_hash"] == "terminal-seal-balance"
+    assert db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=boundary.id
+    ).count() == 0
+    assert auxiliary.cutoff == auxiliary_cutoff
+
+
+def test_terminal_boundary_reuses_existing_exact_boundary(db_session):
+    generation, exact, convergence = _terminal_boundary_world(
+        db_session, key="terminal-exact", exact_cutoff=True
+    )
+    before = db_session.query(models.PhysicalImportBatch).count()
+
+    boundary = workflow._ensure_terminal_physical_boundary(
+        db_session, generation=generation, convergence=convergence
+    )
+
+    assert boundary.id == exact.id
+    assert db_session.query(models.PhysicalImportBatch).count() == before
+
+
+def test_terminal_boundary_retry_reuses_same_zero_row_boundary(db_session):
+    generation, auxiliary, convergence = _terminal_boundary_world(
+        db_session, key="terminal-retry"
+    )
+    first = workflow._ensure_terminal_physical_boundary(
+        db_session, generation=generation, convergence=convergence
+    )
+    generation.physical_import_batch_id = auxiliary.id
+    db_session.flush()
+
+    second = workflow._ensure_terminal_physical_boundary(
+        db_session, generation=generation, convergence=convergence
+    )
+
+    assert second.id == first.id
+    assert generation.physical_import_batch_id == first.id
+    assert db_session.query(models.PhysicalImportBatch).filter_by(
+        batch_key=first.batch_key
+    ).count() == 1
+
+
+def test_terminal_boundary_retry_with_changed_evidence_fails_closed(db_session):
+    generation, auxiliary, convergence = _terminal_boundary_world(
+        db_session, key="terminal-mismatch"
+    )
+    boundary = workflow._ensure_terminal_physical_boundary(
+        db_session, generation=generation, convergence=convergence
+    )
+    boundary.source_watermarks = {
+        **dict(boundary.source_watermarks),
+        "evidence_hash": "changed",
+    }
+    generation.physical_import_batch_id = auxiliary.id
+    db_session.flush()
+
+    with pytest.raises(
+        workflow.PhysicalRefreshOrchestratorError,
+        match="retry evidence changed",
+    ):
+        workflow._ensure_terminal_physical_boundary(
+            db_session, generation=generation, convergence=convergence
+        )
+
+    assert generation.physical_import_batch_id == auxiliary.id
+
+
 @pytest.mark.parametrize("batch_shape", [
     "single", "shared", "shared-missing", "shared-incomplete", "no-checkpoint",
 ])
@@ -1292,6 +1415,11 @@ def test_run_physical_refresh_true_noop_discards_lightweight_candidate(db_sessio
     monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *a, **k: fork_result)
     monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *a, **k: object())
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *a, **k: import_result)
+    monkeypatch.setattr(
+        workflow,
+        "_ensure_terminal_physical_boundary",
+        lambda *a, **k: pytest.fail("true no-op created a terminal boundary"),
+    )
     monkeypatch.setattr(
         bootstrap,
         "_aggregate_sles_for_convergence",

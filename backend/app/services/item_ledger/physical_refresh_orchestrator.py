@@ -569,6 +569,209 @@ def _global_import_terminal(db: Session) -> int:
     return int(db.query(func.max(models.PhysicalImportBatch.id)).scalar() or 0)
 
 
+_TERMINAL_BOUNDARY_SOURCE = "physical_refresh_terminal_boundary"
+
+
+def _terminal_boundary_evidence(
+    *,
+    generation: models.LedgerGeneration,
+    previous_import_batch_id: int,
+    convergence: BalanceConvergenceResult,
+) -> tuple[str, dict[str, Any]]:
+    """Return the immutable proof for a zero-row refresh boundary."""
+    if not bool(convergence.valid) or int(convergence.mismatched or 0):
+        raise PhysicalRefreshOrchestratorError(
+            "physical terminal boundary requires valid balance convergence"
+        )
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    proof = {
+        "source": _TERMINAL_BOUNDARY_SOURCE,
+        "generation_id": int(generation.id),
+        "previous_import_batch_id": int(previous_import_batch_id),
+        "target_cutoff": cutoff.isoformat(),
+        "zero_delta_rows": True,
+        "convergence": {
+            "valid": True,
+            "content_hash": str(convergence.content_hash or ""),
+            "checked_at": str(convergence.checked_at or ""),
+            "compared": int(convergence.compared or 0),
+            "matched": int(convergence.matched or 0),
+            "mismatched": int(convergence.mismatched or 0),
+        },
+    }
+    evidence_hash = canonical_content_hash(proof)
+    return (
+        f"physical-refresh-terminal:{int(generation.id)}:{evidence_hash[:40]}",
+        {**proof, "evidence_hash": evidence_hash},
+    )
+
+
+def _validate_terminal_boundary(
+    db: Session,
+    *,
+    batch: models.PhysicalImportBatch,
+    generation: models.LedgerGeneration,
+    expected_batch_key: str,
+    expected_watermarks: Mapping[str, Any],
+) -> None:
+    """Fail closed when a retry finds a boundary with different evidence."""
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    if (
+        str(batch.batch_key or "") != expected_batch_key
+        or str(batch.status or "") != "completed"
+        or not bool(batch.source_complete)
+        or batch.completed_at is None
+        or batch.cutoff is None
+        or _utc(batch.cutoff, "physical terminal cutoff") != cutoff
+        or dict(batch.source_watermarks or {}) != dict(expected_watermarks)
+        or int(batch.id) != _global_import_terminal(db)
+    ):
+        raise PhysicalRefreshOrchestratorError(
+            "physical terminal boundary retry evidence changed"
+        )
+    row_count = db.query(models.StockLedgerEntry.id).filter(
+        models.StockLedgerEntry.ingest_batch_id == int(batch.id)
+    ).count()
+    if row_count:
+        raise PhysicalRefreshOrchestratorError(
+            "physical terminal boundary unexpectedly owns ledger rows"
+        )
+
+
+def _ensure_terminal_physical_boundary(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    convergence: BalanceConvergenceResult,
+) -> models.PhysicalImportBatch:
+    """Seal an auxiliary import tail at the generation's exact cutoff.
+
+    Targeted recorder repair may append legitimate physical batches whose own
+    cutoff is the repaired fact's timestamp. They remain part of the global
+    prefix, but do not certify that the complete prefix was checked at the
+    refresh cutoff. A publishing refresh therefore terminates that prefix with
+    one zero-row batch carrying the already-proved balance convergence.
+
+    This helper is called only after the true no-op return. It never changes an
+    old batch, never weakens the stock publisher's exact boundary check, and
+    treats a retry as idempotent only when all persisted proof fields match.
+    """
+    if str(generation.status or "") != "building":
+        raise PhysicalRefreshOrchestratorError(
+            "physical terminal boundary requires a building generation"
+        )
+    if generation.cutoff is None or generation.physical_import_batch_id is None:
+        raise PhysicalRefreshOrchestratorError(
+            "physical terminal boundary is missing generation provenance"
+        )
+    current = db.get(
+        models.PhysicalImportBatch, int(generation.physical_import_batch_id)
+    )
+    if (
+        current is None
+        or str(current.status or "") != "completed"
+        or not bool(current.source_complete)
+        or current.completed_at is None
+        or current.cutoff is None
+    ):
+        raise PhysicalRefreshOrchestratorError(
+            "physical terminal boundary requires a complete import prefix"
+        )
+
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    current_watermarks = dict(current.source_watermarks or {})
+    if current_watermarks.get("source") == _TERMINAL_BOUNDARY_SOURCE:
+        previous_id = int(current_watermarks.get("previous_import_batch_id") or 0)
+        batch_key, watermarks = _terminal_boundary_evidence(
+            generation=generation,
+            previous_import_batch_id=previous_id,
+            convergence=convergence,
+        )
+        _validate_terminal_boundary(
+            db,
+            batch=current,
+            generation=generation,
+            expected_batch_key=batch_key,
+            expected_watermarks=watermarks,
+        )
+        return current
+
+    if _utc(current.cutoff, "physical import cutoff") == cutoff:
+        if int(current.id) != _global_import_terminal(db):
+            raise PhysicalRefreshOrchestratorError(
+                "exact physical boundary is not the global import terminal"
+            )
+        return current
+
+    previous_id = int(current.id)
+    batch_key, watermarks = _terminal_boundary_evidence(
+        generation=generation,
+        previous_import_batch_id=previous_id,
+        convergence=convergence,
+    )
+    existing = db.query(models.PhysicalImportBatch).filter(
+        models.PhysicalImportBatch.batch_key == batch_key
+    ).one_or_none()
+    if existing is not None:
+        _validate_terminal_boundary(
+            db,
+            batch=existing,
+            generation=generation,
+            expected_batch_key=batch_key,
+            expected_watermarks=watermarks,
+        )
+        generation.physical_import_batch_id = int(existing.id)
+        db.flush()
+        return existing
+
+    if previous_id != _global_import_terminal(db):
+        raise PhysicalRefreshOrchestratorError(
+            "physical import prefix advanced before terminal boundary seal"
+        )
+    guard_physical_batch_writer(db)
+    existing = db.query(models.PhysicalImportBatch).filter(
+        models.PhysicalImportBatch.batch_key == batch_key
+    ).one_or_none()
+    if existing is not None:
+        _validate_terminal_boundary(
+            db,
+            batch=existing,
+            generation=generation,
+            expected_batch_key=batch_key,
+            expected_watermarks=watermarks,
+        )
+        generation.physical_import_batch_id = int(existing.id)
+        db.flush()
+        return existing
+    if previous_id != _global_import_terminal(db):
+        raise PhysicalRefreshOrchestratorError(
+            "physical import prefix advanced while sealing terminal boundary"
+        )
+
+    boundary = models.PhysicalImportBatch(
+        batch_key=batch_key,
+        status="completed",
+        cutoff=generation.cutoff,
+        completed_at=datetime.now(timezone.utc),
+        source_complete=True,
+        source_watermarks=watermarks,
+    )
+    db.add(boundary)
+    db.flush()
+    generation.physical_import_batch_id = int(boundary.id)
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        "physical_terminal_boundary": {
+            "physical_import_batch_id": int(boundary.id),
+            "previous_import_batch_id": previous_id,
+            "target_cutoff": cutoff.isoformat(),
+            "evidence_hash": str(watermarks["evidence_hash"]),
+        },
+    }
+    db.flush()
+    return boundary
+
+
 def _retire_audit_absorbed_cutoff_snaps(
     db: Session,
     *,
@@ -1836,6 +2039,30 @@ def run_physical_refresh(
                 repaired_scopes=repaired_scopes,
                 verified_cutoff=verified_cutoff,
             )
+        try:
+            _ensure_terminal_physical_boundary(
+                db,
+                generation=physical_generation,
+                convergence=convergence,
+            )
+        except Exception as exc:
+            # The import/convergence checkpoint is durable, while the terminal
+            # seal belongs to the publication transaction. Roll back a partial
+            # seal, then reject the candidate through the canonical discard so
+            # the accepted parent remains the only visible physical owner.
+            db.rollback()
+            reason = f"physical terminal boundary failed: {exc}"
+            candidate = db.get(
+                models.LedgerGeneration, int(fork.ledger_generation_id)
+            )
+            if candidate is not None and str(candidate.status or "") == "building":
+                discard_physical_refresh_candidate(
+                    db,
+                    ledger_generation_id=int(candidate.id),
+                    reason=reason,
+                )
+                db.commit()
+            raise PhysicalRefreshOrchestratorError(reason) from exc
         delta = _physical_refresh_delta_rows(
             db,
             parent=parent,
