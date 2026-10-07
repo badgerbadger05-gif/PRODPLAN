@@ -748,24 +748,21 @@ def _chain_export_parent_orders(
     exporting any material_issue, ensure its parent production_order is in
     1C — auto-export the missing ones first.
 
-    Returns the parent-export summary (or None when no parents needed export).
+    Returns the parent summary including documents already created by an
+    earlier launch step. None means no parent orders were selected.
     """
     parent_rows = (
-        db.query(ProductionOrder.order_id)
+        db.query(ProductionOrder.order_id, ProductionOrder.order_ref1c)
         .join(ProductionMaterialIssue, ProductionMaterialIssue.order_id == ProductionOrder.order_id)
         .join(ProductionProduct, ProductionProduct.product_id == ProductionMaterialIssue.product_id)
         .filter(ProductionMaterialIssue.issue_id.in_(list(issue_ids)))
-        .filter(
-            (ProductionOrder.order_ref1c.is_(None))
-            | (ProductionOrder.order_ref1c == "")
-            | (ProductionOrder.order_ref1c == EMPTY_REF1C)
-        )
         .distinct()
         .all()
     )
-    mrp_order_ids = [int(row.order_id) for row in parent_rows]
-    if not mrp_order_ids:
+    if not parent_rows:
         return None
+    mrp_order_ids = [int(row.order_id) for row in parent_rows if not _clean_ref1c(row.order_ref1c)]
+    existing_count = len(parent_rows) - len(mrp_order_ids)
     mrp_summary = (
         export_production_orders_to_1c(
             db,
@@ -779,9 +776,9 @@ def _chain_export_parent_orders(
         **mrp_summary,
         "status": str(mrp_summary.get("status") or "ok"),
         "dry_run": bool(dry_run),
-        "orders_requested": len(mrp_order_ids),
+        "orders_requested": len(parent_rows),
         "orders_created": int(mrp_summary.get("orders_created") or 0),
-        "orders_already_linked": int(mrp_summary.get("orders_already_linked") or 0),
+        "orders_already_linked": existing_count + int(mrp_summary.get("orders_already_linked") or 0),
         "orders_error": int(mrp_summary.get("orders_error") or 0),
     }
 

@@ -1121,3 +1121,18 @@ def test_shadow_number_offset_moves_transfer_into_dedicated_band(
     monkeypatch.setenv("PRODPLAN_MATERIAL_ISSUE_NUMBER_OFFSET", "100000000")
 
     assert material_issue_number(db, issue) == f"MT{100000000 + issue.issue_id:09d}"
+
+
+def test_parent_summary_reports_existing_1c_order_without_reexport(db_session, monkeypatch):
+    parent = _mk_item(db_session, code="TR-EXISTS", ref1c="parent-exists")
+    comp = _mk_item(db_session, code="TR-EXISTS-C", ref1c="component-exists")
+    issue = _mk_issue(db_session, parent=parent, component=comp)
+    issue.order.order_ref1c = "b3e06fa0-c24b-11f1-80dc-9ee51454587f"
+    def forbidden(*args, **kwargs):
+        raise AssertionError("existing parent must not be created again")
+    monkeypatch.setattr(exporter,"export_production_orders_to_1c",forbidden)
+    result=exporter._chain_export_parent_orders(db_session,[issue.issue_id,issue.issue_id],dry_run=False)
+    assert result["orders_requested"]==1
+    assert result["orders_created"]==0
+    assert result["orders_already_linked"]==1
+    assert result["orders_error"]==0
