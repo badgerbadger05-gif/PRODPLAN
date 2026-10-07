@@ -27,10 +27,12 @@ from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
     build_material_custody_projection,
     publish_current_material_custody,
+    validate_material_custody_projection,
     _same_1c_timestamp,
     load_current_accepted_material_custody,
     load_compact_current_material_custody,
     load_material_custody_projection,
+    require_published_current_material_custody,
 )
 from app.services.planning_truth import publish_generation
 from app.services.production_material_custody_events import append_material_issue_custody_event
@@ -75,6 +77,35 @@ def _generation(db, *, key: str, cutoff: datetime) -> LedgerGeneration:
     db.add_all([batch, generation])
     db.flush()
     publish_generation(db, generation)
+    db.flush()
+    return generation
+
+
+def _building_generation(
+    db,
+    *,
+    key: str,
+    cutoff: datetime,
+    parent: LedgerGeneration,
+) -> LedgerGeneration:
+    batch = PhysicalImportBatch(
+        batch_key=key,
+        status="completed",
+        cutoff=cutoff,
+        completed_at=cutoff,
+        source_watermarks={"explicit_empty_prefix": True},
+    )
+    generation = LedgerGeneration(
+        generation_key=key,
+        status="building",
+        cutoff=cutoff,
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities=dict(parent.capabilities or {}),
+        physical_import_batch=batch,
+        algorithm_version="test",
+        replay_version="test",
+    )
+    db.add_all([batch, generation])
     db.flush()
     return generation
 
@@ -1664,3 +1695,299 @@ def test_terminal_custody_release_is_published_only_at_new_cutoff(db_session, te
         build_material_custody_projection(db_session, ledger_generation_id=next_target.id)
         assert load_material_custody_projection(db_session, ledger_generation_id=next_target.id).for_product(product.product_id).total(component.item_id) == 0
         assert sle.qty == -100
+
+
+def test_same_cutoff_rebase_rewinds_and_reapplies_future_local_tail_once(db_session):
+    cutoff = datetime(2026, 10, 7, 12, 5, 54, tzinfo=timezone.utc)
+    base = _generation(db_session, key="custody-future-tail-base", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="FUTURETAIL")
+    product_quantities_before = (
+        product.quantity,
+        product.produced_qty,
+        product.remaining_qty,
+    )
+    manifest = _manifest(
+        db_session,
+        generation_id=base.id,
+        source_event_high_watermark_id=0,
+    )
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        qty=10,
+        source_event_high_watermark_id=0,
+    )
+    issue = ProductionMaterialIssue(
+        document_number="MT-FUTURE-TAIL",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-MAIN",
+        ledger_generation_id=base.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    line = ProductionMaterialIssueLine(
+        issue_id=issue.issue_id,
+        component_item_id=component.item_id,
+        required_qty=Decimal("5"),
+        issued_qty=Decimal("5"),
+        unit="шт",
+        line_status="issued",
+    )
+    db_session.add(line)
+    db_session.flush()
+
+    before_events = db_session.query(ProductionMaterialCustodyEvent).count()
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=5,
+        source_kind="issue_created",
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        effective_at=cutoff + timedelta(minutes=1),
+    )
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=-2,
+        source_kind="terminal_release",
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        effective_at=cutoff + timedelta(minutes=2),
+    )
+    original_events = [
+        (row.id, row.source_kind, row.effective_at, row.delta_qty, row.idempotency_key)
+        for row in db_session.query(ProductionMaterialCustodyEvent)
+        .order_by(ProductionMaterialCustodyEvent.id)
+        .all()
+    ]
+    assert len(original_events) == before_events + 2
+    assert manifest.source_event_high_watermark_id == original_events[-1][0]
+
+    first = _building_generation(
+        db_session,
+        key="custody-future-tail-first",
+        cutoff=cutoff,
+        parent=base,
+    )
+    built = build_material_custody_projection(
+        db_session, ledger_generation_id=first.id
+    )
+    assert built["source_event_high_watermark_id"] == 0
+    assert (
+        load_material_custody_projection(
+            db_session, ledger_generation_id=first.id
+        ).for_product(product.product_id).at_workshop[component.item_id]
+        == pytest.approx(10)
+    )
+    validate_material_custody_projection(db_session, ledger_generation_id=first.id)
+    first.status = "accepted"
+    first.accepted_at = cutoff
+    assert publish_current_material_custody(db_session, ledger_generation_id=first.id) == 1
+    assert require_published_current_material_custody(
+        db_session, ledger_generation_id=first.id
+    ) == 1
+    assert (
+        load_material_custody_projection(
+            db_session, ledger_generation_id=first.id
+        ).for_product(product.product_id).at_workshop[component.item_id]
+        == pytest.approx(10)
+    )
+    publish_generation(db_session, first, expected_parent_id=base.id)
+
+    assert (
+        load_material_custody_projection(
+            db_session, ledger_generation_id=first.id
+        ).for_product(product.product_id).at_workshop[component.item_id]
+        == pytest.approx(10)
+    )
+    current_generation_id, current = load_compact_current_material_custody(
+        db_session, consumer="test.future_tail.first"
+    )
+    assert current_generation_id == first.id
+    assert current.for_product(product.product_id).at_workshop[component.item_id] == pytest.approx(13)
+
+    second = _building_generation(
+        db_session,
+        key="custody-future-tail-second",
+        cutoff=cutoff,
+        parent=first,
+    )
+    build_material_custody_projection(db_session, ledger_generation_id=second.id)
+    validate_material_custody_projection(db_session, ledger_generation_id=second.id)
+    second.status = "accepted"
+    second.accepted_at = cutoff
+    assert publish_current_material_custody(db_session, ledger_generation_id=second.id) == 1
+    publish_generation(db_session, second, expected_parent_id=first.id)
+    _generation_id, current = load_compact_current_material_custody(
+        db_session, consumer="test.future_tail.second"
+    )
+    assert current.for_product(product.product_id).at_workshop[component.item_id] == pytest.approx(13)
+    assert [
+        (row.id, row.source_kind, row.effective_at, row.delta_qty, row.idempotency_key)
+        for row in db_session.query(ProductionMaterialCustodyEvent)
+        .order_by(ProductionMaterialCustodyEvent.id)
+        .all()
+    ] == original_events
+    assert manifest.is_baseline is False
+    assert db_session.get(
+        ProductionMaterialCustodyProjectionManifest, second.id
+    ).is_baseline is False
+    assert (
+        product.quantity,
+        product.produced_qty,
+        product.remaining_qty,
+    ) == product_quantities_before
+
+
+def test_advancing_cutoff_absorbs_only_due_tail_and_preserves_later_hold(db_session):
+    cutoff = datetime(2026, 10, 7, 12, 5, 54, tzinfo=timezone.utc)
+    base = _generation(db_session, key="custody-advance-base", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="ADVANCETAIL")
+    _manifest(db_session, generation_id=base.id, source_event_high_watermark_id=0)
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        qty=10,
+        source_event_high_watermark_id=0,
+    )
+    issue = ProductionMaterialIssue(
+        document_number="MT-ADVANCE-TAIL",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="draft",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-MAIN",
+        ledger_generation_id=base.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    line = ProductionMaterialIssueLine(
+        issue_id=issue.issue_id,
+        component_item_id=component.item_id,
+        required_qty=Decimal("5"),
+        issued_qty=Decimal("5"),
+        unit="шт",
+        line_status="issued",
+    )
+    db_session.add(line)
+    db_session.flush()
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=5,
+        source_kind="issue_created",
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        effective_at=cutoff + timedelta(minutes=1),
+    )
+    assert append_material_issue_custody_event(
+        db_session,
+        issue=issue,
+        line=line,
+        delta_qty=-2,
+        source_kind="terminal_release",
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        effective_at=cutoff + timedelta(minutes=2),
+    )
+
+    target = _building_generation(
+        db_session,
+        key="custody-advance-target",
+        cutoff=cutoff + timedelta(minutes=1, seconds=30),
+        parent=base,
+    )
+    build_material_custody_projection(db_session, ledger_generation_id=target.id)
+    assert (
+        load_material_custody_projection(
+            db_session, ledger_generation_id=target.id
+        ).for_product(product.product_id).at_workshop[component.item_id]
+        == pytest.approx(15)
+    )
+    target.status = "accepted"
+    target.accepted_at = target.cutoff
+    publish_current_material_custody(db_session, ledger_generation_id=target.id)
+    publish_generation(db_session, target, expected_parent_id=base.id)
+    assert (
+        load_material_custody_projection(
+            db_session, ledger_generation_id=target.id
+        ).for_product(product.product_id).at_workshop[component.item_id]
+        == pytest.approx(15)
+    )
+    _generation_id, current = load_compact_current_material_custody(
+        db_session, consumer="test.advance_tail"
+    )
+    assert current.for_product(product.product_id).at_workshop[component.item_id] == pytest.approx(13)
+
+
+def test_compact_cutoff_seed_rejects_physical_or_backdated_tail(db_session):
+    cutoff = datetime(2026, 10, 7, 12, 5, 54, tzinfo=timezone.utc)
+    base = _generation(db_session, key="custody-malformed-tail", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="BADTAIL")
+    manifest = _manifest(
+        db_session, generation_id=base.id, source_event_high_watermark_id=0
+    )
+    _seed_projection(
+        db_session,
+        generation_id=base.id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        qty=10,
+        source_event_high_watermark_id=0,
+    )
+    issue = ProductionMaterialIssue(
+        document_number="MT-BAD-TAIL",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WH-MAIN",
+        source_warehouse_ref1c="WH-SRC",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    _event(
+        db_session,
+        source_kind="transfer_posted",
+        issue_id=issue.issue_id,
+        product_id=product.product_id,
+        component_id=component.item_id,
+        location="workshop",
+        warehouse="WH-MAIN",
+        qty=1,
+        key="custody:bad:physical",
+        effective_at=cutoff + timedelta(minutes=1),
+        source_sle_id=None,
+    )
+    db_session.flush()
+    event = db_session.query(ProductionMaterialCustodyEvent).filter_by(
+        idempotency_key="custody:bad:physical"
+    ).one()
+    manifest.source_event_high_watermark_id = int(event.id)
+    db_session.query(ProductionMaterialCustodyProjection).filter_by(
+        ledger_generation_id=base.id
+    ).update({"source_event_high_watermark_id": int(event.id)})
+    db_session.flush()
+
+    target = _building_generation(
+        db_session,
+        key="custody-malformed-target",
+        cutoff=cutoff,
+        parent=base,
+    )
+    with pytest.raises(MaterialCustodySnapshotUnavailable) as caught:
+        build_material_custody_projection(db_session, ledger_generation_id=target.id)
+    assert "future-local non-physical" in caught.value.detail["reason"]

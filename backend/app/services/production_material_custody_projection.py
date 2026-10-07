@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 import hashlib
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Any, Iterable, Mapping, Sequence, Tuple
 
 from sqlalchemy import exists, func, or_, tuple_
 from sqlalchemy.orm import Session
@@ -28,6 +29,13 @@ def _same_1c_timestamp(left: datetime, right: datetime) -> bool:
     if left.tzinfo is None or right.tzinfo is None:
         return left.replace(tzinfo=None) == right.replace(tzinfo=None)
     return left.astimezone(timezone.utc) == right.astimezone(timezone.utc)
+
+
+def _after_1c_timestamp(left: datetime, right: datetime) -> bool:
+    """Whether one 1C wall-clock value is strictly after another."""
+    if left.tzinfo is None or right.tzinfo is None:
+        return left.replace(tzinfo=None) > right.replace(tzinfo=None)
+    return left.astimezone(timezone.utc) > right.astimezone(timezone.utc)
 
 
 class MaterialCustodySnapshotUnavailable(RuntimeError):
@@ -60,6 +68,33 @@ class MaterialCustodySnapshotUnavailable(RuntimeError):
 _LOCATION_TRANSIT = "transit"
 _LOCATION_WORKSHOP = "workshop"
 ProjectionRowKey = Tuple[int, int, str, str]
+
+
+@dataclass(frozen=True)
+class _CustodyCutoffSeed:
+    """One immutable cutoff view reconstructed from the compact current owner.
+
+    ``ProductionMaterialCustodyProjection`` is also the compact synchronous
+    owner.  Local operational commands intentionally advance that owner past
+    the accepted physical cutoff.  A historical/rebase fold must not mistake
+    its live watermark for the cutoff watermark, nor may it infer a baseline
+    from mutable issues.  This descriptor proves the persisted append-only
+    local tail and reverses only those exact signed deltas in memory.
+    """
+
+    generation_id: int
+    manifest: models.ProductionMaterialCustodyProjectionManifest | None
+    generation: models.LedgerGeneration
+    cutoff_high_watermark_id: int
+    live_high_watermark_id: int
+    rows: Mapping[ProjectionRowKey, float]
+    future_local_events: tuple[models.ProductionMaterialCustodyEvent, ...]
+
+    def __iter__(self):
+        """Compatibility tuple view for existing internal diagnostics/tests."""
+        yield self.generation_id
+        yield self.manifest
+        yield self.generation
 
 
 def _custody_cell_predicate(model: Any, keys: set[ProjectionRowKey]) -> Any:
@@ -130,6 +165,28 @@ def _projection_rows_by_key(
         for key, value in values.items()
         if value > _EPSILON
     }
+
+
+def _state_from_projection_values(
+    rows: Mapping[ProjectionRowKey, float],
+) -> MaterialCustodyState:
+    state = MaterialCustodyState()
+    for (product_id, component_id, location, warehouse), raw_qty in rows.items():
+        qty = float(raw_qty)
+        if qty <= _EPSILON:
+            continue
+        product = _ensure_material_custody_product_state(state, product_id)
+        if location == _LOCATION_TRANSIT:
+            bucket = product.in_transit
+        elif location == _LOCATION_WORKSHOP:
+            bucket = product.at_workshop
+        else:
+            raise ValueError(f"unsupported custody projection location {location!r}")
+        bucket[component_id] = bucket.get(component_id, 0.0) + qty
+        state.by_warehouse_item[(warehouse, component_id)] = (
+            state.by_warehouse_item.get((warehouse, component_id), 0.0) + qty
+        )
+    return state
 
 
 def _read_manifest(
@@ -235,6 +292,217 @@ def _event_high_watermark_id_at_cutoff(
         .scalar()
     )
     return int(watermark or 0)
+
+
+def _cutoff_seed_from_compact_owner(
+    db: Session,
+    *,
+    manifest: models.ProductionMaterialCustodyProjectionManifest,
+    generation: models.LedgerGeneration,
+) -> _CustodyCutoffSeed:
+    """Prove and reverse the exact persisted future-local event tail.
+
+    The compact current cells and their manifest advance synchronously when a
+    local issue/release is appended after the accepted physical cutoff.  The
+    accepted cutoff view is therefore the persisted cells minus that exact
+    append-only tail.  No issue quantities, order state or current UI state are
+    consulted; a physical/backdated/malformed/interleaved tail fails closed.
+    """
+    _require_manifest_cutoff(manifest, generation)
+    if generation.cutoff is None:
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=int(manifest.ledger_generation_id),
+            expected_generation_id=int(generation.id),
+            stored_generation_id=int(manifest.ledger_generation_id),
+            reason="custody cutoff seed generation has no cutoff",
+        )
+
+    live_watermark = int(manifest.source_event_high_watermark_id or 0)
+    stream_watermark = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
+        .scalar()
+        or 0
+    )
+    if live_watermark > stream_watermark:
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=int(manifest.ledger_generation_id),
+            expected_generation_id=int(generation.id),
+            stored_generation_id=int(manifest.ledger_generation_id),
+            reason="custody compact watermark is ahead of the event stream",
+        )
+
+    rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .filter_by(ledger_generation_id=int(generation.id))
+        .all()
+    )
+    row_watermarks = {
+        int(row.source_event_high_watermark_id)
+        for row in rows
+        if row.source_event_high_watermark_id is not None
+    }
+    if len(row_watermarks) > 1 or (
+        row_watermarks and next(iter(row_watermarks)) != live_watermark
+    ):
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=int(manifest.ledger_generation_id),
+            expected_generation_id=int(generation.id),
+            stored_generation_id=int(manifest.ledger_generation_id),
+            reason="custody compact rows do not share the manifest watermark",
+        )
+
+    cutoff_watermark = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
+        .filter(models.ProductionMaterialCustodyEvent.id <= live_watermark)
+        .filter(models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff)
+        .scalar()
+        or 0
+    )
+    interleaved_future = (
+        db.query(models.ProductionMaterialCustodyEvent.id)
+        .filter(models.ProductionMaterialCustodyEvent.id <= cutoff_watermark)
+        .filter(models.ProductionMaterialCustodyEvent.effective_at > generation.cutoff)
+        .first()
+    )
+    if interleaved_future is not None:
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=int(manifest.ledger_generation_id),
+            expected_generation_id=int(generation.id),
+            stored_generation_id=int(manifest.ledger_generation_id),
+            reason=(
+                "custody compact future-local events are interleaved with the "
+                "cutoff event prefix"
+            ),
+        )
+
+    future_tail = tuple(
+        db.query(models.ProductionMaterialCustodyEvent)
+        .filter(models.ProductionMaterialCustodyEvent.id > cutoff_watermark)
+        .filter(models.ProductionMaterialCustodyEvent.id <= live_watermark)
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+        .all()
+    )
+    for event in future_tail:
+        if (
+            event.source_sle_id is not None
+            or str(event.source_kind or "")
+            not in {"issue_created", "terminal_release"}
+            or event.effective_at is None
+            or not _after_1c_timestamp(event.effective_at, generation.cutoff)
+            or str(event.location_kind or "")
+            not in {_LOCATION_TRANSIT, _LOCATION_WORKSHOP}
+            or not str(event.warehouse_ref1c or "")
+        ):
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=int(event.component_item_id),
+                manifest_generation_id=int(manifest.ledger_generation_id),
+                expected_generation_id=int(generation.id),
+                stored_generation_id=int(manifest.ledger_generation_id),
+                reason=(
+                    "custody compact watermark tail is not an exact future-local "
+                    "non-physical event suffix"
+                ),
+            )
+
+    seed: dict[ProjectionRowKey, Decimal] = {
+        _projection_row_key(row): Decimal(str(row.reserved_qty or 0))
+        for row in rows
+        if Decimal(str(row.reserved_qty or 0)) > 0
+    }
+    for event in reversed(future_tail):
+        key = (
+            int(event.product_id),
+            int(event.component_item_id),
+            str(event.location_kind),
+            str(event.warehouse_ref1c or ""),
+        )
+        previous = seed.get(key, Decimal("0")) - Decimal(str(event.delta_qty or 0))
+        if previous < 0:
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=int(event.component_item_id),
+                manifest_generation_id=int(manifest.ledger_generation_id),
+                expected_generation_id=int(generation.id),
+                stored_generation_id=int(manifest.ledger_generation_id),
+                reason="custody future-local tail reversal produced a negative cutoff cell",
+            )
+        if previous == 0:
+            seed.pop(key, None)
+        else:
+            seed[key] = previous
+
+    return _CustodyCutoffSeed(
+        generation_id=int(generation.id),
+        manifest=manifest,
+        generation=generation,
+        cutoff_high_watermark_id=cutoff_watermark,
+        live_high_watermark_id=live_watermark,
+        rows={key: float(value) for key, value in seed.items()},
+        future_local_events=future_tail,
+    )
+
+
+def _projection_cutoff_seed(
+    db: Session,
+    *,
+    manifest: models.ProductionMaterialCustodyProjectionManifest,
+    generation: models.LedgerGeneration,
+) -> _CustodyCutoffSeed:
+    """Return the persisted snapshot, rewinding only the compact current owner."""
+    pointer = db.get(models.PlanningTruthState, 1)
+    is_current_owner = bool(
+        pointer is not None
+        and pointer.current_generation_id is not None
+        and int(pointer.current_generation_id) == int(generation.id)
+    )
+    cutoff_watermark = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
+        .filter(
+            models.ProductionMaterialCustodyEvent.id
+            <= int(manifest.source_event_high_watermark_id or 0)
+        )
+        .filter(models.ProductionMaterialCustodyEvent.effective_at <= generation.cutoff)
+        .scalar()
+        or 0
+    )
+    if is_current_owner or int(manifest.source_event_high_watermark_id or 0) > cutoff_watermark:
+        return _cutoff_seed_from_compact_owner(
+            db,
+            manifest=manifest,
+            generation=generation,
+        )
+
+    _require_manifest_cutoff(manifest, generation)
+    watermark = int(manifest.source_event_high_watermark_id or 0)
+    rows = (
+        db.query(models.ProductionMaterialCustodyProjection)
+        .filter_by(ledger_generation_id=int(generation.id))
+        .all()
+    )
+    row_watermarks = {
+        int(row.source_event_high_watermark_id)
+        for row in rows
+        if row.source_event_high_watermark_id is not None
+    }
+    if len(row_watermarks) > 1 or (
+        row_watermarks and next(iter(row_watermarks)) != watermark
+    ):
+        raise MaterialCustodySnapshotUnavailable(
+            manifest_generation_id=int(manifest.ledger_generation_id),
+            expected_generation_id=int(generation.id),
+            stored_generation_id=int(manifest.ledger_generation_id),
+            reason="custody snapshot rows do not share the manifest watermark",
+        )
+    return _CustodyCutoffSeed(
+        generation_id=int(generation.id),
+        manifest=manifest,
+        generation=generation,
+        cutoff_high_watermark_id=watermark,
+        live_high_watermark_id=watermark,
+        rows=_projection_rows_by_key(rows),
+        future_local_events=(),
+    )
 
 
 def _is_reimport_duplicate_physical_event(
@@ -440,7 +708,7 @@ def _resolve_projection_baseline(
     *,
     generation: models.LedgerGeneration,
     target_high_watermark_id: int,
-) -> tuple[int, models.ProductionMaterialCustodyProjectionManifest, models.LedgerGeneration]:
+) -> _CustodyCutoffSeed:
     """Newest baseline whose own window no later append has changed.
 
     Starting from the newest manifest is only correct while every event dated
@@ -489,7 +757,12 @@ def _resolve_projection_baseline(
                 reason="custody snapshot baseline Ledger generation is missing",
             )
         _require_manifest_cutoff(manifest, baseline_generation)
-        watermark = int(manifest.source_event_high_watermark_id)
+        seed = _projection_cutoff_seed(
+            db,
+            manifest=manifest,
+            generation=baseline_generation,
+        )
+        watermark = int(seed.cutoff_high_watermark_id)
         if watermark > int(target_high_watermark_id):
             rewound_past.append(baseline_generation_id)
             continue
@@ -509,7 +782,7 @@ def _resolve_projection_baseline(
                 ", ".join(str(value) for value in rewound_past),
                 baseline_generation_id,
             )
-        return baseline_generation_id, manifest, baseline_generation
+        return seed
     raise MaterialCustodySnapshotUnavailable(
         expected_generation_id=int(generation.id),
         stored_generation_id=candidates[-1],
@@ -716,18 +989,28 @@ def _build_projection_from_seed_and_events(
     baseline_cutoff: datetime,
     target_high_watermark_id: int,
     selected_keys: set[ProjectionRowKey] | None = None,
+    baseline_seed_rows: Mapping[ProjectionRowKey, float] | None = None,
 ) -> tuple[MaterialCustodyState, dict[ProjectionRowKey, float]]:
-    baseline_query = (
-        db.query(models.ProductionMaterialCustodyProjection)
-        .filter_by(ledger_generation_id=int(baseline_generation_id))
-    )
-    if selected_keys is not None:
-        baseline_query = baseline_query.filter(_custody_cell_predicate(
-            models.ProductionMaterialCustodyProjection, selected_keys,
-        ))
-    baseline_rows = baseline_query.all()
-    state = _state_from_projection_rows(baseline_rows)
-    projection_rows = _projection_rows_by_key(baseline_rows)
+    if baseline_seed_rows is None:
+        baseline_query = (
+            db.query(models.ProductionMaterialCustodyProjection)
+            .filter_by(ledger_generation_id=int(baseline_generation_id))
+        )
+        if selected_keys is not None:
+            baseline_query = baseline_query.filter(_custody_cell_predicate(
+                models.ProductionMaterialCustodyProjection, selected_keys,
+            ))
+        baseline_rows = baseline_query.all()
+        state = _state_from_projection_rows(baseline_rows)
+        projection_rows = _projection_rows_by_key(baseline_rows)
+    else:
+        projection_rows = {
+            key: float(value)
+            for key, value in baseline_seed_rows.items()
+            if (selected_keys is None or key in selected_keys)
+            and float(value) > _EPSILON
+        }
+        state = _state_from_projection_values(projection_rows)
 
     events = _select_visible_custody_events(
         db,
@@ -932,7 +1215,12 @@ def replay_bounded_material_custody_cells(
     target_hwm = _event_high_watermark_id_at_cutoff(db, cutoff=target.cutoff)
     for baseline_manifest, baseline_generation in candidates:
         _require_manifest_cutoff(baseline_manifest, baseline_generation)
-        baseline_hwm = int(baseline_manifest.source_event_high_watermark_id)
+        seed = _projection_cutoff_seed(
+            db,
+            manifest=baseline_manifest,
+            generation=baseline_generation,
+        )
+        baseline_hwm = int(seed.cutoff_high_watermark_id)
         if baseline_hwm > parent_hwm or baseline_hwm > target_hwm:
             continue
         if _late_events_behind_baseline(
@@ -949,6 +1237,7 @@ def replay_bounded_material_custody_cells(
             baseline_cutoff=baseline_generation.cutoff,
             target_high_watermark_id=parent_hwm,
             selected_keys=keys,
+            baseline_seed_rows=seed.rows,
         )
         _, target_rows = _build_projection_from_seed_and_events(
             db, generation=target,
@@ -957,6 +1246,7 @@ def replay_bounded_material_custody_cells(
             baseline_cutoff=baseline_generation.cutoff,
             target_high_watermark_id=target_hwm,
             selected_keys=keys,
+            baseline_seed_rows=seed.rows,
         )
         return int(baseline_generation.id), parent_rows, target_rows, target_hwm
     raise MaterialCustodySnapshotUnavailable(
@@ -1055,22 +1345,22 @@ def build_material_custody_projection(
             reason="custody projection rows exist without a manifest",
         )
 
-    baseline_generation_id, baseline_manifest, baseline_generation = (
-        _resolve_projection_baseline(
-            db,
-            generation=generation,
-            target_high_watermark_id=target_high_watermark_id,
-        )
+    baseline = _resolve_projection_baseline(
+        db,
+        generation=generation,
+        target_high_watermark_id=target_high_watermark_id,
     )
-    baseline_high_watermark_id = int(baseline_manifest.source_event_high_watermark_id)
+    baseline_generation_id = int(baseline.generation_id)
+    baseline_high_watermark_id = int(baseline.cutoff_high_watermark_id)
 
     _, target_rows = _build_projection_from_seed_and_events(
         db,
         generation=generation,
         baseline_generation_id=baseline_generation_id,
         baseline_high_watermark_id=baseline_high_watermark_id,
-        baseline_cutoff=baseline_generation.cutoff,
+        baseline_cutoff=baseline.generation.cutoff,
         target_high_watermark_id=target_high_watermark_id,
+        baseline_seed_rows=baseline.rows,
     )
 
     # Terminal state releases custody, never physical stock or frozen MRP
@@ -1084,8 +1374,9 @@ def build_material_custody_projection(
             db, generation=generation,
             baseline_generation_id=baseline_generation_id,
             baseline_high_watermark_id=baseline_high_watermark_id,
-            baseline_cutoff=baseline_generation.cutoff,
+            baseline_cutoff=baseline.generation.cutoff,
             target_high_watermark_id=target_high_watermark_id,
+            baseline_seed_rows=baseline.rows,
         )
 
     for product_id, comp_id, location, warehouse in sorted(target_rows):
@@ -1223,12 +1514,15 @@ def validate_material_custody_projection(
         )
     _require_manifest_cutoff(manifest, generation)
 
-    observed_watermark = _event_high_watermark_id_at_cutoff(
+    seed = _projection_cutoff_seed(
         db,
-        cutoff=generation.cutoff,
+        manifest=manifest,
+        generation=generation,
     )
-    target_watermark = int(manifest.source_event_high_watermark_id)
-    if target_watermark != observed_watermark:
+    observed_watermark = _event_high_watermark_id_at_cutoff(db, cutoff=generation.cutoff)
+    cutoff_watermark = int(seed.cutoff_high_watermark_id)
+    live_watermark = int(seed.live_high_watermark_id)
+    if cutoff_watermark != observed_watermark:
         raise MaterialCustodySnapshotUnavailable(
             manifest_generation_id=int(manifest.ledger_generation_id),
             expected_generation_id=int(generation.id),
@@ -1236,88 +1530,33 @@ def validate_material_custody_projection(
             reason="custody snapshot manifest watermark mismatches visible custody events",
         )
 
-    rows = (
-        db.query(models.ProductionMaterialCustodyProjection)
-        .filter_by(ledger_generation_id=int(generation.id))
-        .all()
-    )
-    distinct_counts = {
-        int(row.source_event_high_watermark_id)
-        for row in rows
-        if row.source_event_high_watermark_id is not None
-    }
-    if len(distinct_counts) > 1:
-        raise MaterialCustodySnapshotUnavailable(
-            expected_generation_id=int(generation.id),
-            stored_generation_id=int(generation.id),
-            reason="custody snapshot row provenance is malformed",
-        )
-    if distinct_counts and next(iter(distinct_counts)) != target_watermark:
-        raise MaterialCustodySnapshotUnavailable(
-            expected_generation_id=int(generation.id),
-            stored_generation_id=int(generation.id),
-            reason="custody snapshot row watermark mismatches generation manifest",
-        )
-
     if bool(manifest.is_baseline):
         return {
             "ledger_generation_id": int(generation.id),
             "baseline_generation_id": None,
-            "source_event_high_watermark_id": target_watermark,
-            "projection_rows": len(rows),
+            "source_event_high_watermark_id": live_watermark,
+            "cutoff_event_high_watermark_id": cutoff_watermark,
+            "projection_rows": len(seed.rows),
             "valid": True,
             "baseline": True,
         }
 
-    baseline_generation_id = _latest_projection_manifest(
+    baseline = _resolve_projection_baseline(
         db,
-        cutoff=generation.cutoff,
-        current_generation_id=int(generation.id),
+        generation=generation,
+        target_high_watermark_id=cutoff_watermark,
     )
-    if baseline_generation_id is None:
-        if target_watermark == 0 and not rows:
-            raise MaterialCustodySnapshotUnavailable(
-                expected_generation_id=int(generation.id),
-                stored_generation_id=None,
-                reason=(
-                    "custody snapshot baseline is missing; no completed manifest exists "
-                    "for earlier Ledger generation"
-                ),
-            )
-        raise MaterialCustodySnapshotUnavailable(
-            expected_generation_id=int(generation.id),
-            stored_generation_id=None,
-            reason="custody snapshot baseline is missing; no completed manifest exists for earlier Ledger generation",
-        )
-
-    baseline_manifest = _read_manifest(db, generation_id=baseline_generation_id)
-    if baseline_manifest is None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=None,
-            reason="custody snapshot baseline manifest record is missing",
-        )
-    baseline_generation = db.get(models.LedgerGeneration, baseline_generation_id)
-    if baseline_generation is None or baseline_generation.cutoff is None:
-        raise MaterialCustodySnapshotUnavailable(
-            manifest_generation_id=baseline_generation_id,
-            expected_generation_id=int(generation.id),
-            stored_generation_id=baseline_generation_id,
-            reason="custody snapshot baseline Ledger generation is missing",
-        )
-
-    baseline_high_watermark_id = int(baseline_manifest.source_event_high_watermark_id)
     _, expected_rows = _build_projection_from_seed_and_events(
         db,
         generation=generation,
-        baseline_generation_id=baseline_generation_id,
-        baseline_high_watermark_id=baseline_high_watermark_id,
-        baseline_cutoff=baseline_generation.cutoff,
-        target_high_watermark_id=target_watermark,
+        baseline_generation_id=int(baseline.generation_id),
+        baseline_high_watermark_id=int(baseline.cutoff_high_watermark_id),
+        baseline_cutoff=baseline.generation.cutoff,
+        target_high_watermark_id=cutoff_watermark,
+        baseline_seed_rows=baseline.rows,
     )
 
-    observed_rows = _projection_rows_by_key(rows)
+    observed_rows = dict(seed.rows)
     if observed_rows != expected_rows:
         raise MaterialCustodySnapshotUnavailable(
             expected_generation_id=int(generation.id),
@@ -1327,8 +1566,9 @@ def validate_material_custody_projection(
 
     return {
         "ledger_generation_id": int(generation.id),
-        "baseline_generation_id": int(baseline_generation_id),
-        "source_event_high_watermark_id": target_watermark,
+        "baseline_generation_id": int(baseline.generation_id),
+        "source_event_high_watermark_id": live_watermark,
+        "cutoff_event_high_watermark_id": cutoff_watermark,
         "projection_rows": len(observed_rows),
         "valid": True,
     }
@@ -1346,18 +1586,147 @@ def publish_current_material_custody(
     events alone cannot reconstruct a deleted baseline projection.
     """
     generation_id = int(ledger_generation_id)
+    pointer = lock_current_custody_marker(db)
+    generation = db.get(models.LedgerGeneration, generation_id)
+    manifest = _read_manifest(db, generation_id=generation_id)
     candidate = db.query(models.ProductionMaterialCustodyProjection).filter_by(
         ledger_generation_id=generation_id,
         is_current=False,
     ).all()
+    if generation is None or generation.cutoff is None:
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=None,
+            reason="cannot publish custody without a target generation and cutoff",
+        )
     if not candidate:
-        manifest = _read_manifest(db, generation_id=generation_id)
         if manifest is None or str(manifest.status) != "complete":
             raise MaterialCustodySnapshotUnavailable(
                 expected_generation_id=generation_id,
                 stored_generation_id=None,
                 reason="cannot publish custody without a complete candidate manifest",
             )
+
+    if manifest is not None:
+        candidate_seed = _projection_cutoff_seed(
+            db,
+            manifest=manifest,
+            generation=generation,
+        )
+    else:
+        candidate_watermarks = {
+            int(row.source_event_high_watermark_id or 0) for row in candidate
+        }
+        if len(candidate_watermarks) > 1:
+            raise MaterialCustodySnapshotUnavailable(
+                expected_generation_id=generation_id,
+                stored_generation_id=generation_id,
+                reason="legacy candidate custody rows have mixed watermarks",
+            )
+        candidate_watermark = next(iter(candidate_watermarks), 0)
+        candidate_seed = _CustodyCutoffSeed(
+            generation_id=generation_id,
+            manifest=None,
+            generation=generation,
+            cutoff_high_watermark_id=candidate_watermark,
+            live_high_watermark_id=candidate_watermark,
+            rows=_projection_rows_by_key(candidate),
+            future_local_events=(),
+        )
+    observed_cutoff_watermark = _event_high_watermark_id_at_cutoff(
+        db, cutoff=generation.cutoff,
+    )
+    if int(candidate_seed.cutoff_high_watermark_id) != int(observed_cutoff_watermark):
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason="candidate custody cutoff moved before publication",
+        )
+
+    current_generation_id = (
+        int(pointer.current_generation_id)
+        if pointer is not None and pointer.current_generation_id is not None
+        else None
+    )
+    future_local_events: tuple[models.ProductionMaterialCustodyEvent, ...] = ()
+    old_seed: _CustodyCutoffSeed | None = None
+    if current_generation_id is not None and current_generation_id != generation_id:
+        old_generation = db.get(models.LedgerGeneration, current_generation_id)
+        old_manifest = _read_manifest(db, generation_id=current_generation_id)
+        if old_generation is None or old_manifest is None:
+            raise MaterialCustodySnapshotUnavailable(
+                expected_generation_id=generation_id,
+                stored_generation_id=current_generation_id,
+                reason="compact current custody owner lost its generation or manifest",
+            )
+        old_seed = _cutoff_seed_from_compact_owner(
+            db,
+            manifest=old_manifest,
+            generation=old_generation,
+        )
+        future_local_events = tuple(
+            event
+            for event in old_seed.future_local_events
+            if event.effective_at is not None
+            and _after_1c_timestamp(event.effective_at, generation.cutoff)
+        )
+
+    candidate_by_key = {_projection_row_key(row): row for row in candidate}
+    candidate_values = {
+        key: Decimal(str(row.reserved_qty or 0))
+        for key, row in candidate_by_key.items()
+    }
+    for event in future_local_events:
+        key = (
+            int(event.product_id), int(event.component_item_id),
+            str(event.location_kind), str(event.warehouse_ref1c or ""),
+        )
+        next_qty = candidate_values.get(key, Decimal("0")) + Decimal(
+            str(event.delta_qty or 0)
+        )
+        if next_qty < 0:
+            raise MaterialCustodySnapshotUnavailable(
+                product_id=int(event.product_id),
+                component_item_id=int(event.component_item_id),
+                expected_generation_id=generation_id,
+                stored_generation_id=current_generation_id,
+                reason="future-local custody tail would make published current state negative",
+            )
+        row = candidate_by_key.get(key)
+        if next_qty == 0:
+            candidate_values.pop(key, None)
+            if row is not None:
+                db.delete(row)
+                candidate_by_key.pop(key, None)
+        elif row is not None:
+            row.reserved_qty = next_qty
+            candidate_values[key] = next_qty
+        else:
+            row = models.ProductionMaterialCustodyProjection(
+                ledger_generation_id=generation_id,
+                product_id=key[0],
+                component_item_id=key[1],
+                location_kind=key[2],
+                warehouse_ref1c=key[3],
+                reserved_qty=next_qty,
+                source_event_high_watermark_id=int(candidate_seed.cutoff_high_watermark_id),
+                is_current=False,
+            )
+            db.add(row)
+            candidate_by_key[key] = row
+            candidate_values[key] = next_qty
+
+    published_watermark = max(
+        int(candidate_seed.cutoff_high_watermark_id),
+        int(old_seed.live_high_watermark_id) if old_seed is not None else 0,
+    )
+    if manifest is not None:
+        manifest.source_event_high_watermark_id = published_watermark
+    for row in candidate_by_key.values():
+        row.source_event_high_watermark_id = published_watermark
+    db.flush()
+    candidate = list(candidate_by_key.values())
+
     old = db.query(models.ProductionMaterialCustodyProjection).filter(
         models.ProductionMaterialCustodyProjection.is_current.is_(True),
         models.ProductionMaterialCustodyProjection.ledger_generation_id != generation_id,
@@ -1404,7 +1773,7 @@ def publish_current_material_custody(
     for row in candidate:
         row.is_current = True
     db.flush()
-    return len(candidate)
+    return len(candidate_by_key)
 
 
 def apply_local_custody_event_to_current(
@@ -1572,11 +1941,13 @@ def load_material_custody_projection(
         )
     _require_manifest_cutoff(manifest, generation)
 
-    observed_watermark = _event_high_watermark_id_at_cutoff(
+    seed = _projection_cutoff_seed(
         db,
-        cutoff=generation.cutoff,
+        manifest=manifest,
+        generation=generation,
     )
-    target_watermark = int(manifest.source_event_high_watermark_id)
+    observed_watermark = _event_high_watermark_id_at_cutoff(db, cutoff=generation.cutoff)
+    target_watermark = int(seed.cutoff_high_watermark_id)
     stale_cache = target_watermark != observed_watermark
     if stale_cache and bool(manifest.is_baseline):
         # The cutover baseline is stated, not derived: nothing older exists to
@@ -1588,13 +1959,8 @@ def load_material_custody_projection(
             reason="custody snapshot manifest watermark mismatches visible custody events",
         )
 
-    existing_rows = (
-        db.query(models.ProductionMaterialCustodyProjection)
-        .filter_by(ledger_generation_id=int(generation.id))
-        .all()
-    )
     if bool(manifest.is_baseline):
-        return _state_from_projection_rows(existing_rows)
+        return _state_from_projection_values(seed.rows)
     if stale_cache:
         # Events dated inside this generation's window were appended after its
         # projection was built — a recorder re-pull projecting an older posting,
@@ -1604,43 +1970,23 @@ def load_material_custody_projection(
         # went dark on this, which is a far worse answer than a slightly more
         # expensive read.
         target_watermark = observed_watermark
-        existing_rows = []
-    if existing_rows:
-        distinct_counts = {
-            int(row.source_event_high_watermark_id)
-            for row in existing_rows
-            if row.source_event_high_watermark_id is not None
-        }
-        if len(distinct_counts) > 1:
-            raise MaterialCustodySnapshotUnavailable(
-                expected_generation_id=int(generation.id),
-                stored_generation_id=int(generation.id),
-                reason="custody snapshot row provenance is malformed",
-            )
-        if distinct_counts and next(iter(distinct_counts)) != target_watermark:
-            raise MaterialCustodySnapshotUnavailable(
-                expected_generation_id=int(generation.id),
-                stored_generation_id=int(generation.id),
-                reason="custody snapshot row watermark mismatches generation manifest",
-            )
-        return _state_from_projection_rows(existing_rows)
+    elif seed.rows or manifest.baseline_generation_id is not None:
+        return _state_from_projection_values(seed.rows)
 
-    baseline_generation_id, baseline_manifest, baseline_generation = (
-        _resolve_projection_baseline(
-            db,
-            generation=generation,
-            target_high_watermark_id=target_watermark,
-        )
+    baseline = _resolve_projection_baseline(
+        db,
+        generation=generation,
+        target_high_watermark_id=target_watermark,
     )
-    baseline_high_watermark_id = int(baseline_manifest.source_event_high_watermark_id)
 
     state, _ = _build_projection_from_seed_and_events(
         db,
         generation=generation,
-        baseline_generation_id=baseline_generation_id,
-        baseline_high_watermark_id=baseline_high_watermark_id,
-        baseline_cutoff=baseline_generation.cutoff,
+        baseline_generation_id=int(baseline.generation_id),
+        baseline_high_watermark_id=int(baseline.cutoff_high_watermark_id),
+        baseline_cutoff=baseline.generation.cutoff,
         target_high_watermark_id=target_watermark,
+        baseline_seed_rows=baseline.rows,
     )
     return state
 
@@ -1732,14 +2078,15 @@ def load_current_accepted_material_custody(
             reason="accepted custody Ledger generation has no cutoff",
         )
 
-    # The tail is defined by date, not by append order.  Everything dated at or
-    # before the cutoff belongs to the accepted projection, which refolds itself
-    # when such an event arrives late — a document projected days after it was
-    # posted is ordinary traffic.  Selecting by id instead made every one of
-    # those events an error and blocked the launch of production orders.
+    # Cutoff membership is defined by date.  The compact owner's watermark is
+    # still the exact append frontier it has already applied, so only later ids
+    # may be folded as the live tail; replaying its own future-local suffix here
+    # would count every issue twice.  Events dated at/before the cutoff are
+    # reconstructed by ``load_material_custody_projection`` instead.
     tail = (
         db.query(models.ProductionMaterialCustodyEvent)
         .filter(
+            models.ProductionMaterialCustodyEvent.id > manifest_watermark,
             models.ProductionMaterialCustodyEvent.effective_at > generation.cutoff
         )
         .order_by(models.ProductionMaterialCustodyEvent.id.asc())
