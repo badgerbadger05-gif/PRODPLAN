@@ -93,10 +93,55 @@ def specification_before_hash(record: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _line_number_as_int(value: Any, *, field: str) -> int:
+    raw = str(value if value is not None else "").strip()
+    if not raw or not raw.isdecimal():
+        raise SpecWritebackError(f"{field}: некорректный LineNumber {value!r}")
+    return int(raw)
+
+
+def _validate_unique_line_numbers(rows: Sequence[Mapping[str, Any]], *, field: str) -> None:
+    numbers = [
+        _line_number_as_int(row.get("LineNumber"), field=f"{field}[{index}]")
+        for index, row in enumerate(rows)
+    ]
+    if len(set(numbers)) != len(numbers):
+        raise SpecWritebackError(f"{field}: дублирующийся LineNumber")
+
+
+def _normalize_tabular_array_order(value: Any, *, field: str) -> Any:
+    """Sort 1C tabular arrays by numeric LineNumber for comparison only.
+
+    No field or row is removed. Arrays without LineNumber retain their order.
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: _normalize_tabular_array_order(child, field=f"{field}.{key}")
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        normalized = [
+            _normalize_tabular_array_order(child, field=f"{field}[{index}]")
+            for index, child in enumerate(value)
+        ]
+        if normalized and all(
+            isinstance(row, Mapping) and "LineNumber" in row for row in normalized
+        ):
+            _validate_unique_line_numbers(normalized, field=field)
+            return sorted(
+                normalized,
+                key=lambda row: _line_number_as_int(
+                    row.get("LineNumber"), field=f"{field}.LineNumber"
+                ),
+            )
+        return normalized
+    return copy.deepcopy(value)
+
+
 def _without_data_version(record: Mapping[str, Any]) -> Dict[str, Any]:
     comparable = copy.deepcopy(dict(record))
     comparable.pop("DataVersion", None)
-    return comparable
+    return _normalize_tabular_array_order(comparable, field="specification")
 
 
 def _validate_active_specification(record: Mapping[str, Any], *, op: str, spec_ref: str) -> None:
@@ -581,6 +626,9 @@ def writeback_promote_material_rows(
         rows = before.get(SOSTAV)
         if not isinstance(rows, list):
             raise SpecWritebackError("composition_batch: fresh Состав не является массивом")
+        if not all(isinstance(row, Mapping) for row in rows):
+            raise SpecWritebackError("composition_batch: fresh Состав содержит не-объект")
+        _validate_unique_line_numbers(rows, field="composition_batch.Состав")
 
         new_rows = copy.deepcopy(rows)
         source_indexes: List[int] = []

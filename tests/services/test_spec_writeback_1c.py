@@ -290,6 +290,27 @@ class _GuardedClient:
         return {"ok": True}
 
 
+class _ReorderingGuardedClient(_GuardedClient):
+    def __init__(self, specs, *, mutate_quantity=False):
+        super().__init__(specs)
+        self.mutate_quantity = mutate_quantity
+
+    def patch(self, endpoint, payload):
+        response = super().patch(endpoint, payload)
+        if endpoint.startswith(wb.SPEC_ENTITY):
+            ref = re.search(r"guid'([^']+)'", endpoint).group(1).lower()
+            record = self.specs[ref]
+            record["Состав"] = sorted(
+                record["Состав"], key=lambda row: int(row["LineNumber"])
+            )
+            record["Операции"] = sorted(
+                record["Операции"], key=lambda row: int(row["LineNumber"])
+            )
+            if self.mutate_quantity:
+                record["Состав"][-1]["Количество"] += 1
+        return response
+
+
 def _change(line, characteristic, *, item=ITEM_A, target=TARGET_A, old_pin=wb.ZERO_GUID):
     return {
         "line_number": str(line),
@@ -340,6 +361,89 @@ def test_guarded_batch_is_one_parent_patch_and_preserves_unknown_fields_and_line
     assert payload_rows[0]["ТипСтрокиСостава"] == "Сборка"
     assert payload_rows[0]["Спецификация_Key"] == TARGET_A
     assert payload_rows[2] == parent_rows[2]
+
+
+def test_guarded_batch_accepts_readback_reordering_by_numeric_line_number():
+    row_two = _guarded_row(
+        "2", ITEM_B, wb.ZERO_GUID, "Сборка", TARGET_B, UnknownUntouched="keep"
+    )
+    row_one = _guarded_row(
+        "1", ITEM_A, wb.ZERO_GUID, "Материал", wb.ZERO_GUID, UnknownTarget="keep"
+    )
+    parent = _full_spec(PARENT_SPEC, PARENT_OWNER, [row_two, row_one])
+    parent["Операции"] = [
+        {"LineNumber": "2", "Операция_Key": OPERATION, "Unknown": "second"},
+        {"LineNumber": "1", "Операция_Key": OPERATION, "Unknown": "first"},
+    ]
+    client = _ReorderingGuardedClient(
+        {
+            PARENT_SPEC: parent,
+            TARGET_A: _full_spec(TARGET_A, ITEM_A),
+        }
+    )
+
+    result = wb.writeback_promote_material_rows(
+        client,
+        parent_spec_ref=PARENT_SPEC,
+        row_changes=[_change("1", wb.ZERO_GUID)],
+        expected_data_version="v1",
+        dry_run=False,
+    )
+
+    assert result["status"] == "updated"
+    payload_rows = client.patches[0][1]["Состав"]
+    assert [row["LineNumber"] for row in payload_rows] == ["2", "1"]
+    assert payload_rows[0]["UnknownUntouched"] == "keep"
+    assert payload_rows[1]["UnknownTarget"] == "keep"
+    assert [row["LineNumber"] for row in client.specs[PARENT_SPEC]["Состав"]] == [
+        "1",
+        "2",
+    ]
+
+
+def test_guarded_batch_rejects_reordered_readback_with_changed_quantity():
+    row_two = _guarded_row("2", ITEM_B, wb.ZERO_GUID, "Сборка", TARGET_B)
+    row_one = _guarded_row("1", ITEM_A, wb.ZERO_GUID, "Материал", wb.ZERO_GUID)
+    parent = _full_spec(PARENT_SPEC, PARENT_OWNER, [row_two, row_one])
+    parent["Операции"] = [{"LineNumber": "1", "Операция_Key": OPERATION}]
+    client = _ReorderingGuardedClient(
+        {
+            PARENT_SPEC: parent,
+            TARGET_A: _full_spec(TARGET_A, ITEM_A),
+        },
+        mutate_quantity=True,
+    )
+
+    with pytest.raises(wb.SpecWritebackError, match="read-back изменил объект"):
+        wb.writeback_promote_material_rows(
+            client,
+            parent_spec_ref=PARENT_SPEC,
+            row_changes=[_change("1", wb.ZERO_GUID)],
+            expected_data_version="v1",
+            dry_run=False,
+        )
+
+
+def test_guarded_batch_rejects_duplicate_line_numbers_before_write():
+    rows = [
+        _guarded_row("1", ITEM_A, wb.ZERO_GUID, "Материал", wb.ZERO_GUID),
+        _guarded_row("1", ITEM_B, wb.ZERO_GUID, "Материал", wb.ZERO_GUID),
+    ]
+    client = _GuardedClient(
+        {
+            PARENT_SPEC: _full_spec(PARENT_SPEC, PARENT_OWNER, rows),
+            TARGET_A: _full_spec(TARGET_A, ITEM_A),
+        }
+    )
+    with pytest.raises(wb.SpecWritebackError, match="дублирующийся LineNumber"):
+        wb.writeback_promote_material_rows(
+            client,
+            parent_spec_ref=PARENT_SPEC,
+            row_changes=[_change("1", wb.ZERO_GUID)],
+            expected_data_version="v1",
+            dry_run=False,
+        )
+    assert client.patches == []
 
 
 def test_guarded_batch_rejects_stale_data_version_before_patch():
