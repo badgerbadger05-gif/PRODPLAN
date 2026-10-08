@@ -2309,6 +2309,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/orders/refresh-current": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post Refresh Current Orders */
+        post: operations["post_refresh_current_orders_api_v1_production_control_orders_refresh_current_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/orders/export-to-1c": {
         parameters: {
             query?: never;
@@ -3752,6 +3769,20 @@ export interface components {
             current_identity?: string | null;
             /** Expected Source Revision */
             expected_source_revision?: string | null;
+        };
+        /** CurrentProductionRefreshResponse */
+        CurrentProductionRefreshResponse: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "refreshed";
+            /** Product Ids */
+            product_ids: number[];
+            /** Current Identities */
+            current_identities: string[];
+            /** Source Revision */
+            source_revision: string;
         };
         /** DeleteResponse */
         DeleteResponse: {
@@ -6391,6 +6422,17 @@ export interface components {
              * @default false
              */
             dry_run: boolean;
+        };
+        /** RefreshProductionOrdersPayload */
+        RefreshProductionOrdersPayload: {
+            /** Product Ids */
+            product_ids: number[];
+            /** Initiated By */
+            initiated_by?: string | null;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
         };
         /** RemoveRequest */
         RemoveRequest: {
@@ -11334,6 +11376,39 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_refresh_current_orders_api_v1_production_control_orders_refresh_current_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RefreshProductionOrdersPayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CurrentProductionRefreshResponse"];
                 };
             };
             /** @description Validation Error */

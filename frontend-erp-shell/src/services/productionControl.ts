@@ -250,6 +250,16 @@ export function exportMaterialIssuesTo1C(issueIds: number[]) {
   })
 }
 
+export function refreshCurrentProductionOrders(productIds: number[], currentIdentities: string[], sourceRevision: string) {
+  const payload: ApiSchemas['RefreshProductionOrdersPayload'] = {
+    product_ids: productIds, current_identities: currentIdentities,
+    expected_source_revision: sourceRevision,
+  }
+  return api<ApiSchemas['CurrentProductionRefreshResponse']>('/v1/production-control/orders/refresh-current', {
+    method: 'POST', body: JSON.stringify(payload),
+  })
+}
+
 export function markMaterialIssueAssembled(issueId: number) {
   return api(`/v1/production-control/material-issues/${issueId}/assembled`, {
     method: 'POST',

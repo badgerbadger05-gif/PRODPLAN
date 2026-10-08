@@ -36,6 +36,7 @@ vi.mock('../../services/productionControl', () => ({
   postMaterialIssues: vi.fn(),
   fetchRouteSheetsPrintHtml: vi.fn(),
   exportMaterialIssuesTo1C: vi.fn(),
+  refreshCurrentProductionOrders: vi.fn(),
   markMaterialIssueAssembled: vi.fn(),
   syncExecutionFrom1C: vi.fn(),
   produceOrderLine: vi.fn(),
@@ -70,6 +71,7 @@ import {
   updateOrderStatus,
   postMaterialIssues,
   exportMaterialIssuesTo1C,
+  refreshCurrentProductionOrders,
   syncExecutionFrom1C,
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
@@ -253,13 +255,10 @@ beforeEach(() => {
   vi.spyOn(window, 'open').mockReturnValue(null)
   vi.spyOn(window, 'confirm').mockReturnValue(true)
 
-  vi.mocked(listProductionOrders).mockResolvedValue({
-    rows: fakeRows(),
-    total: 2,
-    limit: 100,
-    offset: 0,
-    latest_run_id: 77,
-    truth_meta: fakeTruthMeta,
+  vi.mocked(listProductionOrders).mockImplementation(async (params) => {
+    const scoped = params.get("limit") === "2" && params.get("product_id")
+    const rows = scoped ? fakeRows().filter((row) => String(row.product_id) === params.get("product_id")) : fakeRows()
+    return { rows, total: rows.length, limit: 100, offset: 0, latest_run_id: 77, truth_meta: scoped ? { ...fakeTruthMeta, truth_status: "accepted" } : fakeTruthMeta }
   })
   vi.mocked(listDrumSchedule).mockResolvedValue({
     schedule_from: '2026-09-03',
@@ -389,6 +388,7 @@ beforeEach(() => {
     status: 'ok', product_ids: productIds, entries: [], errors: [],
     current_identities: currentIdentities, source_revision: sourceRevision,
   }))
+  vi.mocked(refreshCurrentProductionOrders).mockResolvedValue({ status: 'refreshed', product_ids: [101], current_identities: ['production:order:101'], source_revision: 'rev-8' })
   vi.mocked(closePaintWeldChain).mockResolvedValue({ status: 'ok' })
   vi.mocked(getPendingChainCommand).mockReset().mockResolvedValue({ command: null, message: '' })
   vi.mocked(updateOrderStatus).mockResolvedValue({} as never)
@@ -642,7 +642,7 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
     await screen.findByText('MRP run: 77')
     await user.click(screen.getByRole('button', { name: 'Обновить' }))
-    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(3))
     await user.click(screen.getByRole('button', { name: 'Настройки' }))
     expect(await screen.findByRole('heading', { name: 'Настройки журнала' })).toBeVisible()
     expect(getProductionControlSettings).toHaveBeenCalled()
@@ -663,6 +663,47 @@ describe('ProductionControlPage — characterization', () => {
 
     expect(listRootProductOptions).toHaveBeenCalledWith()
     expect(listRootProductOptions).toHaveBeenCalledTimes(1)
+  })
+
+  it('prints with the publication revision returned after 1C export', async () => {
+    const user = userEvent.setup()
+    const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false, focus: vi.fn(), print: vi.fn() }
+    vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    let published = false
+    vi.mocked(listProductionOrders).mockImplementation(async (params) => {
+      const row = { ...fakeRows()[0], source_revision: published ? 'published-rev' : 'rev-7',
+        order_one_c_number: published ? 'PP059717709' : null, order_ref1c: published ? 'created-ref' : null }
+      return { rows: [row], total: 1, limit: Number(params.get('limit') ?? 100), offset: 0,
+        latest_run_id: 77, truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' } }
+    })
+    vi.mocked(exportMaterialIssuesTo1C).mockImplementation(async () => {
+      published = true
+      return { status: 'ok', issues_created: 1, parent_orders_export: { orders_created: 1 } }
+    })
+    renderPage()
+    await screen.findByText('MRP run: 77')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalledWith([101], ['production:order:101'], 'published-rev'))
+    expect((await screen.findAllByText(/PP059717709/)).length).toBeGreaterThan(0)
+  })
+
+  it('keeps a completed 1C export distinct from pending publication and closes stale printing', async () => {
+    const user = userEvent.setup()
+    const printWindow = { document: { write: vi.fn() }, close: vi.fn(), closed: false }
+    vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    vi.mocked(exportMaterialIssuesTo1C).mockResolvedValue({ status: 'ok', issues_created: 1,
+      projection_refresh_error: 'Ledger refresh busy', parent_orders_export: { orders_created: 1 } })
+    renderPage()
+    await screen.findByText('MRP run: 77')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    expect(await screen.findByText(/Документы созданы в 1С, но данные журнала и печати/)).toBeVisible()
+    expect(fetchRouteSheetsPrintHtml).not.toHaveBeenCalled()
+    expect(printWindow.close).toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Обновить' }))
+    await waitFor(() => expect(refreshCurrentProductionOrders).toHaveBeenCalledWith([101], ['production:order:101'], 'rev-7'))
+    expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
   })
 
   it('opens launch printing before asynchronous export and names internal reserves', async () => {
@@ -701,7 +742,7 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.getByRole('button', { name: 'Все заказы' })).toHaveAttribute('aria-pressed', 'true')
     await user.click(screen.getByRole('button', { name: 'Очередь мехцеха' }))
 
-    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(4))
     const params = vi.mocked(listProductionOrders).mock.calls[1][0]
     expect(params.get('planning_contour')).toBe('mrp')
     expect(params.get('launch_source')).toBe('drum_readiness')

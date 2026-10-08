@@ -19,6 +19,7 @@ import type { ProductionResource } from '../../domain/resources'
 import {
   deleteProductionOrder,
   exportMaterialIssuesTo1C,
+  refreshCurrentProductionOrders,
   fetchRouteSheetsPrintHtml,
   getOrderMaterials,
   getWorkItemMaterials,
@@ -617,13 +618,17 @@ export function ProductionControlPage() {
         const detail = firstExportProblem(result, parent)
         throw new Error(`${summary}${detail ? `. ${detail}` : ''}`)
       }
+      if (result.projection_refresh_error) {
+        throw new Error(`Документы созданы в 1С, но данные журнала и печати ещё не обновлены. Нажмите «Обновить»; повторная выгрузка не требуется. ${String(result.projection_refresh_error)}`)
+      }
       setMessage(
         printWindow
           ? `${summary}. Открыта печать маршрутных листов.`
           : `${summary}. Печать не открыта: браузер заблокировал окно.`,
       )
       await load(offsetRef.current)
-      renderRouteSheets(ids, printWindow, chains.current_identities, chains.source_revision ?? chainContext.sourceRevision)
+      const printContext = await refreshActionSelection(ids)
+      renderRouteSheets(ids, printWindow, printContext.identities, printContext.sourceRevision)
     } catch (e) {
       closeRouteSheetWindow(printWindow)
       const message = e instanceof Error ? e.message : String(e)
@@ -1016,8 +1021,22 @@ export function ProductionControlPage() {
   }, [activeRow?.journal_row_key, activeRow?.product_id, activeRow?.work_item_id, activeRow?.current_identity, activeRow?.source_revision, activeRow?.launchable_qty, activeRow?.quantity, launchQtyByWorkItem, loadMaterials, loadWorkItemMaterials, materialsRefreshToken, truthMeta?.ledger_generation])
 
   async function refreshJournal() {
-    await load(offsetRef.current)
-    setMaterialsRefreshToken((current) => current + 1)
+    setLoading(true)
+    setError('')
+    try {
+      const sourceRows = selectedRows.length ? selectedRows : activeRow ? [activeRow] : []
+      const ids = sourceRows.flatMap(productionRowProductIds)
+      if (ids.length && (view === 'orders' || view === 'mechshop')) {
+        const context = await refreshActionSelection(ids)
+        await refreshCurrentProductionOrders(ids, context.identities, context.sourceRevision)
+      }
+      await load(offsetRef.current)
+      setMaterialsRefreshToken((current) => current + 1)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
   }
 
   function changeView(nextView: ProductionControlView) {

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
@@ -107,6 +108,102 @@ def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _current_executor_payloads(db, truth, product_ids, run_ids, roots_by_product, *, material_snapshots=None):
+    from .production_control_material_availability import preview_materials_bulk
+    ids = sorted(set(map(int, product_ids)))
+    materials = (material_snapshots if material_snapshots is not None else
+                 preview_materials_bulk(db, ids, ledger_generation_id=truth.generation_id, _current_only=True))
+    routes = build_route_sheet_snapshot_payloads(db, product_ids=ids, ledger_generation_id=truth.generation_id)
+    result = {}
+    for product_id in ids:
+        page = list_journal(db, truth=truth, _accepted_run_ids_override=run_ids,
+                            _material_coverage_by_product=materials, product_id=product_id, limit=2)
+        if len(page["rows"]) != 1:
+            raise ValueError("Строка заказа недоступна для публикации")
+        row = dict(page["rows"][0])
+        row["material_coverage_snapshot"] = materials[product_id]
+        row["_route_sheet_snapshot"] = routes[product_id]
+        row["root_item_ids"] = list(roots_by_product.get(product_id) or [])
+        row["current_identity"] = _candidate_business_identity(row)
+        row.pop("journal_row_key", None)
+        row.pop("work_item_id", None)
+        result[row["current_identity"]] = _compact_business_payload(row)
+    return result
+
+
+def _publish_local_payloads(db, truth, manifest, payloads):
+    from .item_ledger.current_execution import publish_current_production_control_from_payload
+    rows = [payloads[key] for key in sorted(payloads)]
+    prefix = f"accepted:g{truth.generation_id}:production_control_journal:local"
+    meta = dict(manifest.summary or {})
+    meta.pop("row_count", None)
+    publish_current_production_control_from_payload(db, int(truth.generation_id),
+        {"meta": meta, "rows": rows, "summary": {"total_rows": len(rows)}}, source_revision=prefix)
+    db.flush()
+    revision = f"{prefix}:{manifest.content_hash[:20]}"
+    manifest.source_revision = revision
+    db.flush()
+    return revision
+
+
+def publish_current_executor_changes(db: Session, product_ids: Sequence[int], *,
+                                     expected_source_revision: str | None = None,
+                                     current_identities: Sequence[str] | None = None) -> dict[str, Any]:
+    """Worker publication after operational changes, including 1C export.
+
+    Refreshes saved journal/material/print results for current executors only.
+    It neither exports documents nor changes frozen obligations or proposals.
+    """
+    from fastapi import HTTPException
+    from .planning_truth import require_accepted_truth
+    from .production_control_journal import _accepted_fixed_run_ids
+    from .item_ledger.current_execution import require_current_execution_scope, load_current_execution_rows
+    db.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
+    truth = require_accepted_truth(db, "production.executor_publish")
+    manifest = require_current_execution_scope(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
+    if expected_source_revision is not None and manifest.source_revision != expected_source_revision:
+        raise HTTPException(409, detail="Снимок журнала изменился. Обновите журнал.")
+    records = load_current_execution_rows(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
+    by_product = {int(row.payload["product_id"]): row for row in records if row.payload.get("product_id") is not None}
+    ids = sorted(set(map(int, product_ids)))
+    if not ids or any(pid not in by_product for pid in ids):
+        raise ValueError("Текущая строка выбранного заказа недоступна")
+    if current_identities is not None and set(current_identities) != {by_product[pid].business_identity for pid in ids}:
+        raise ValueError("Текущие строки не совпадают с выбранными заказами")
+    # A shared paint/weld sheet contains both orders and both transfers.
+    order_ids = {int(by_product[pid].payload["order_id"]) for pid in ids}
+    links = db.query(models.PaintWeldChainLink).filter(or_(
+        models.PaintWeldChainLink.painted_order_id.in_(order_ids),
+        models.PaintWeldChainLink.welded_order_id.in_(order_ids))).all()
+    related = {int(value) for link in links for value in (link.painted_order_id, link.welded_order_id)}
+    ids = sorted(set(ids) | {pid for pid, row in by_product.items() if int(row.payload.get("order_id") or 0) in related})
+    payloads = {str(row.business_identity): deepcopy(dict(row.payload)) for row in records}
+    # 1C document references and issue lifecycle are operational metadata.
+    # Keep the already accepted material calculation when its quantity/spec
+    # basis is unchanged; an unpublished physical tail must not prevent a
+    # successful export's number from appearing in the journal and print.
+    material_snapshots = {pid: deepcopy(by_product[pid].payload.get("material_coverage_snapshot")) for pid in ids}
+    products = {int(product.product_id): product for product in db.query(models.ProductionProduct)
+                .filter(models.ProductionProduct.product_id.in_(ids)).all()}
+    recalculated = [pid for pid in ids if not material_snapshots[pid]
+                    or Decimal(str(products[pid].quantity)) != Decimal(str(by_product[pid].payload.get("quantity")))
+                    or products[pid].spec_id != by_product[pid].payload.get("spec_id")
+                    or products[pid].spec_revision_hash != by_product[pid].payload.get("spec_revision_hash")]
+    if recalculated:
+        from .production_control_material_availability import preview_materials_bulk
+        material_snapshots.update(preview_materials_bulk(db, recalculated,
+                                  ledger_generation_id=truth.generation_id, _current_only=True))
+    updated = _current_executor_payloads(db, truth, ids,
+        _accepted_fixed_run_ids(db, ledger_generation_id=truth.generation_id),
+        {pid: by_product[pid].payload.get("root_item_ids") for pid in ids}, material_snapshots=material_snapshots)
+    for pid in ids:
+        payloads.pop(str(by_product[pid].business_identity), None)
+    payloads.update(updated)
+    revision = _publish_local_payloads(db, truth, manifest, payloads)
+    return {"status": "refreshed", "product_ids": ids,
+            "current_identities": sorted(updated), "source_revision": revision}
+
+
 def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str:
     """Publish bounded local executors and their residual MAKE rows atomically.
 
@@ -117,10 +214,9 @@ def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str
     from .planning_truth import require_accepted_truth
     from .mrp_mutation_guard import require_current_run, require_selected_make_work_items
     from .production_control_journal import _active_mrp_products_for_requirement
-    from .production_control_material_availability import preview_materials_bulk, preview_make_work_item_materials
+    from .production_control_material_availability import preview_make_work_item_materials
     from .item_ledger.current_execution import (
         require_current_execution_scope, load_current_execution_rows,
-        publish_current_production_control_from_payload,
     )
 
     truth = require_accepted_truth(db, "production.local_make_publish")
@@ -140,21 +236,8 @@ def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str
         requirement = db.get(models.MrpRequirement, work.requirement_id)
         products = [product for product, _ in _active_mrp_products_for_requirement(db, requirement)]
         ids = [int(product.product_id) for product in products]
-        materials = preview_materials_bulk(db, ids, ledger_generation_id=generation_id, _current_only=True)
-        routes = build_route_sheet_snapshot_payloads(db, product_ids=ids, ledger_generation_id=generation_id)
-        for product in products:
-            page = list_journal(db, truth=truth, _accepted_run_ids_override=[run.run_id],
-                                _material_coverage_by_product=materials, product_id=product.product_id, limit=2)
-            if len(page["rows"]) != 1:
-                raise ValueError("Созданная строка заказа недоступна для публикации")
-            row = dict(page["rows"][0])
-            row["material_coverage_snapshot"] = materials[product.product_id]
-            row["_route_sheet_snapshot"] = routes[product.product_id]
-            row["root_item_ids"] = list(previous.get("root_item_ids") or [])
-            row["current_identity"] = _candidate_business_identity(row)
-            row.pop("journal_row_key", None)
-            row.pop("work_item_id", None)
-            payloads[row["current_identity"]] = _compact_business_payload(row)
+        payloads.update(_current_executor_payloads(db, truth, ids, [run.run_id],
+                         {pid: previous.get("root_item_ids") for pid in ids}))
         remaining = replenishment_remaining(owner.replenishment_required_qty, owner.replenishment_received_qty)
         source = SimpleNamespace(id=work.id, reservation_id=owner.id, item_id=work.item_id,
                                  requirement_id=work.requirement_id, run_id=run.run_id,
@@ -195,17 +278,7 @@ def publish_local_make_changes(db: Session, work_item_ids: Sequence[int]) -> str
             payloads[identity] = _compact_business_payload(row)
         else:
             payloads.pop(identity, None)
-    rows = [payloads[key] for key in sorted(payloads)]
-    prefix = f"accepted:g{truth.generation_id}:production_control_journal:local"
-    meta = dict(manifest.summary or {})
-    meta.pop("row_count", None)
-    publish_current_production_control_from_payload(db, int(truth.generation_id),
-        {"meta": meta, "rows": rows, "summary": {"total_rows": len(rows)}}, source_revision=prefix)
-    db.flush()
-    revision = f"{prefix}:{manifest.content_hash[:20]}"
-    manifest.source_revision = revision
-    db.flush()
-    return revision
+    return _publish_local_payloads(db, truth, manifest, payloads)
 
 
 def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float,

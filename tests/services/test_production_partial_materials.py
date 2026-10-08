@@ -131,3 +131,61 @@ def test_current_material_worker_uses_compact_custody_without_historical_replay(
                  ledger_generation_id=work.ledger_generation_id, _current_only=True)
     assert result[created['product_id']]['qty'] == 3
     assert calls == ['production.current_materials_bulk']
+
+
+def test_executor_publication_refreshes_1c_number_and_print_without_proposal(db_session, monkeypatch):
+    from app.services.production_control_journal import materialize_make_work_items
+    from app.services.production_control_journal_projection import publish_current_executor_changes, _candidate_business_identity
+    work, req, owner = _scope(db_session)
+    db_session.get(models.Item,work.item_id).optimal_batch=8
+    db_session.flush()
+    created=materialize_make_work_items(db_session,[work.id],launch_requests={work.id:{'launch_qty':8,'expected_materialized_qty':0}})['created'][0]
+    product=db_session.get(models.ProductionProduct,created['product_id']);order=product.order
+    original={'product_id':product.product_id,'order_id':order.order_id,'item_id':product.item_id,
+              'source_mrp_requirement_id':req.id,'source_mrp_allocation_key':product.source_mrp_allocation_key,
+              'line_number':1,'quantity':8,'spec_id':product.spec_id,'spec_revision_hash':product.spec_revision_hash,'order_ref1c':None,'order_one_c_number':None,'root_item_ids':[product.item_id],
+              'material_coverage_snapshot':{'qty':8,'components':[],'coverage_status':'ready'},'_route_sheet_snapshot':{'version':1,'sheet':{'one_c_number':''}}}
+    identity=_candidate_business_identity(original)
+    original['current_identity']=identity
+    publish_current_production_control_from_payload(db_session,work.ledger_generation_id,{'meta':{},'rows':[original]})
+    # The external write is already durable; no proposal remains after a full launch.
+    order.order_ref1c='created-1c-ref'
+    db_session.add(models.SyncLink(source_system='PRODPLAN',target_system='1C',source_doctype='production_order',source_id=order.order_id,
+        target_entity='Document_ЗаказНаПроизводство',target_ref_key=order.order_ref1c,target_number='PP059717709',status='success'))
+    issue=models.ProductionMaterialIssue(product_id=product.product_id,order_id=order.order_id,document_number='LOCAL-TRANSFER',
+        status='exported',source_warehouse_ref1c='source',warehouse_ref1c='destination',ledger_generation_id=work.ledger_generation_id)
+    db_session.add(issue);db_session.flush()
+    db_session.add(models.SyncLink(source_system='PRODPLAN',target_system='1C',source_doctype='material_issue',source_id=issue.issue_id,
+        target_entity='Document_ПеремещениеЗапасов',target_ref_key='transfer-ref',target_number='MT059717709',status='success'))
+    db_session.commit()
+    before=(owner.reserved_qty,owner.covered_from_stock_at_freeze_qty,owner.replenishment_required_qty,owner.replenishment_received_qty)
+    monkeypatch.setattr('app.services.production_control_material_availability.preview_materials_bulk',
+                        lambda *a,**kw:pytest.fail('operational export must preserve accepted material math'))
+    # Journal and printing use their real builders; they must pick up the 1C link.
+    result=publish_current_executor_changes(db_session,[product.product_id])
+    db_session.commit()
+    record=db_session.query(models.CurrentExecutionRow).filter_by(entity_kind='production_control_journal',business_identity=identity).one()
+    assert record.payload['order_one_c_number']=='PP059717709'
+    assert record.payload['order_ref1c']=='created-1c-ref'
+    assert record.payload['_route_sheet_snapshot']['sheet']['one_c_number']=='PP059717709'
+    assert 'MT059717709' in record.payload['_route_sheet_snapshot']['sheet']['transfer_rows'][0]['transfer_number']
+    assert before==(owner.reserved_qty,owner.covered_from_stock_at_freeze_qty,owner.replenishment_required_qty,owner.replenishment_received_qty)
+    assert result['current_identities']==[identity]
+    again=publish_current_executor_changes(db_session,[product.product_id],current_identities=[identity],expected_source_revision=result['source_revision'])
+    assert again['source_revision']==result['source_revision']
+    with pytest.raises(HTTPException) as error:
+        publish_current_executor_changes(db_session,[product.product_id],expected_source_revision='stale')
+    assert error.value.status_code==409
+
+
+def test_export_snapshot_failure_preserves_success_and_requires_explicit_refresh(monkeypatch):
+    from types import SimpleNamespace
+    from app.routers.production_control import _refresh_exported_executors
+    from app.services import production_control_command_worker
+    calls=[]
+    def busy(*args):raise HTTPException(409,detail={'message':'Ledger refresh busy'})
+    monkeypatch.setattr(production_control_command_worker,'run_command',busy)
+    result=_refresh_exported_executors(SimpleNamespace(commit=lambda:calls.append('committed')),[19487],{'status':'ok','issues_created':1})
+    assert calls==['committed']
+    assert result['issues_created']==1 and result['status']=='ok'
+    assert result['projection_refresh_error']=='Ledger refresh busy'

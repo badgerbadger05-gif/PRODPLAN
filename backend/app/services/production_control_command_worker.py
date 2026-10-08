@@ -45,6 +45,9 @@ def _execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
         from .production_control_journal_projection import publish_local_make_changes
         db.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
         result = {"source_revision": publish_local_make_changes(db, arguments["work_item_ids"])}
+    elif action == "refresh-executors":
+        from .production_control_journal_projection import publish_current_executor_changes
+        result = publish_current_executor_changes(db, **arguments)
     else:
         raise ValueError("Неизвестная команда подготовки данных")
     db.commit()

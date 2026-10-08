@@ -1231,6 +1231,17 @@ class OpenPaintWeldChainsPayload(BaseModel):
     expected_source_revision: Optional[str] = None
 
 
+class RefreshProductionOrdersPayload(OpenPaintWeldChainsPayload):
+    product_ids: List[int] = Field(min_length=1, max_length=100)
+
+
+class CurrentProductionRefreshResponse(BaseModel):
+    status: Literal["refreshed"]
+    product_ids: List[int]
+    current_identities: List[str]
+    source_revision: str
+
+
 class ExportProductionOrdersPayload(BaseModel):
     order_ids: List[int]
     dry_run: bool = True
@@ -2550,6 +2561,36 @@ def post_open_paint_weld_chains(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+@router.post("/orders/refresh-current", response_model=CurrentProductionRefreshResponse)
+async def post_refresh_current_orders(payload: RefreshProductionOrdersPayload, db: Session = Depends(get_db)):
+    from ..services.production_control_command_worker import run_command
+    _require_current_production_identities(db, identities=payload.current_identities,
+        expected_source_revision=payload.expected_source_revision,
+        locator_key="product_id", locator_values=set(payload.product_ids))
+    db.rollback()  # The worker owns the publication transaction and its lock.
+    return await run_in_threadpool(run_command, "refresh-executors", {
+        "product_ids": payload.product_ids, "current_identities": payload.current_identities,
+        "expected_source_revision": payload.expected_source_revision,
+    })
+
+
+def _refresh_exported_executors(db: Session, product_ids: list[int], result: dict) -> dict:
+    from ..services.production_control_command_worker import run_command
+    # The external operation has succeeded independently of read-model work.
+    # Persist/release its transaction before starting the bounded worker.
+    db.commit()
+    try:
+        result["current_projection"] = run_command("refresh-executors", {"product_ids": product_ids})
+    except HTTPException as exc:
+        detail = exc.detail
+        result["projection_refresh_error"] = str(detail.get("message") or detail.get("reason") or detail) if isinstance(detail, dict) else str(detail)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("1C export completed but executor publication failed")
+        result["projection_refresh_error"] = "Воркер обновления журнала временно недоступен"
+    return result
+
+
 @router.post("/orders/export-to-1c", response_model=dict)
 def post_export_production_orders_to_1c(
     payload: ExportProductionOrdersPayload,
@@ -2578,11 +2619,16 @@ def post_export_production_orders_to_1c(
             locator_key="order_id",
             locator_values={int(value) for value in payload.order_ids},
         )
-        return export_production_orders_to_1c(
+        result = export_production_orders_to_1c(
             db,
             [int(x) for x in payload.order_ids],
             dry_run=bool(payload.dry_run),
         )
+        if not payload.dry_run:
+            ids = [int(row[0]) for row in db.query(models.ProductionProduct.product_id)
+                   .filter(models.ProductionProduct.order_id.in_(payload.order_ids)).all()]
+            return _refresh_exported_executors(db, ids, result)
+        return result
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
     except HTTPException:
@@ -2677,11 +2723,16 @@ def post_export_material_issues_to_1c(
     if not payload.issue_ids:
         raise HTTPException(status_code=400, detail="Не выбраны документы выдачи")
     try:
-        return export_material_issues_to_1c(
+        result = export_material_issues_to_1c(
             db,
             [int(x) for x in payload.issue_ids],
             dry_run=bool(payload.dry_run),
         )
+        if not payload.dry_run:
+            ids = sorted({int(row[0]) for row in db.query(models.ProductionMaterialIssue.product_id)
+                          .filter(models.ProductionMaterialIssue.issue_id.in_(payload.issue_ids)).all()})
+            return _refresh_exported_executors(db, ids, result)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
