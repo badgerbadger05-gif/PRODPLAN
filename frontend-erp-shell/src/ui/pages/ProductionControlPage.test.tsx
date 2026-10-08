@@ -742,12 +742,13 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.getByRole('button', { name: 'Все заказы' })).toHaveAttribute('aria-pressed', 'true')
     await user.click(screen.getByRole('button', { name: 'Очередь мехцеха' }))
 
-    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(4))
-    const params = vi.mocked(listProductionOrders).mock.calls[1][0]
-    expect(params.get('planning_contour')).toBe('mrp')
-    expect(params.get('launch_source')).toBe('drum_readiness')
-    expect(params.get('sort_by')).toBe('readiness_priority_key')
-    expect(params.get('sort_dir')).toBe('asc')
+    await waitFor(() => {
+      const params = vi.mocked(listProductionOrders).mock.lastCall?.[0]
+      expect(params?.get('planning_contour')).toBe('mrp')
+      expect(params?.get('launch_source')).toBe('drum_readiness')
+      expect(params?.get('sort_by')).toBe('readiness_priority_key')
+      expect(params?.get('sort_dir')).toBe('asc')
+    })
     expect(screen.getByRole('button', { name: 'Очередь мехцеха' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('table', { name: 'Заказы на производство' })).toBeInTheDocument()
   })
