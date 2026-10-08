@@ -19,6 +19,7 @@ from app.services.production_material_custody_projection import (
     _require_manifest_cutoff,
     _resolve_projection_baseline,
     load_compact_current_material_custody,
+    replay_bounded_material_custody_cells,
 )
 from app.services.production_material_custody_events import _custody_event_idempotency_key
 from app.services.production_control_common import DONE_STATE_KEY
@@ -710,6 +711,146 @@ def test_bounded_late_physical_transfer_replays_terminal_history_once(db_session
     assert db_session.get(
         models.ProductionMaterialCustodyProjection, unrelated.id
     ) is None
+
+
+def _late_manual_receipt_after_terminal_world(db):
+    parent, target, _current, unrelated = _world(db)
+    parent.cutoff = datetime(2026, 10, 8, tzinfo=timezone.utc)
+    parent.physical_import_batch.cutoff = parent.cutoff
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    manifest = db.get(models.ProductionMaterialCustodyProjectionManifest, parent.id)
+    manifest.cutoff = parent.cutoff
+    baseline = _building_generation(
+        db, key="manual-terminal-baseline",
+        cutoff=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    baseline.status = "accepted"
+    baseline.accepted_at = baseline.cutoff
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=baseline.id, baseline_generation_id=baseline.id,
+        cutoff=baseline.cutoff, status="complete", is_baseline=True,
+        source_event_high_watermark_id=0,
+    ))
+    product = db.get(models.ProductionProduct, unrelated.product_id)
+    order = db.get(models.ProductionOrder, product.order_id)
+    order.order_state_key = DONE_STATE_KEY
+    order.updated_at = datetime(2026, 8, 26, 14, 44)
+    opening = models.ProductionMaterialCustodyEvent(
+        product_id=product.product_id,
+        component_item_id=unrelated.component_item_id,
+        source_kind="issue_created", effective_at=datetime(2026, 8, 20, 15, 49),
+        location_kind="workshop", warehouse_ref1c="MANUAL-WH",
+        delta_qty=Decimal("29.440"), idempotency_key="manual-opening-29.440",
+    )
+    old_release = models.ProductionMaterialCustodyEvent(
+        product_id=product.product_id,
+        component_item_id=unrelated.component_item_id,
+        source_kind="terminal_release", effective_at=datetime(2026, 9, 8, 12, 38),
+        location_kind="workshop", warehouse_ref1c="MANUAL-WH",
+        source_ref2c="order-terminal-v1:done:2026-08-26T14:44:31",
+        delta_qty=Decimal("-29.440"), idempotency_key="manual-release-29.440",
+    )
+    db.add_all([opening, old_release])
+    db.flush()
+    manifest.source_event_high_watermark_id = old_release.id
+    unrelated.source_event_high_watermark_id = old_release.id
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="late-manual-30", business_identity="late-manual-30",
+        item_id=unrelated.component_item_id, characteristic_ref="",
+        organization_ref="org", warehouse_ref1c="MANUAL-WH",
+        qty=Decimal("30.000"), posting_at=datetime(2026, 8, 21, 14, 50),
+        record_type="Receipt", movement_kind="transfer_in",
+        recorder_type="Document_Transfer", recorder_ref="late-manual",
+        line_no="1", ingest_source="test", active=True,
+    )
+    db.add(sle)
+    db.flush()
+    receipt = models.ProductionMaterialCustodyEvent(
+        product_id=product.product_id,
+        component_item_id=unrelated.component_item_id,
+        source_kind="transfer_posted", source_sle_id=sle.id,
+        effective_at=sle.posting_at, location_kind="workshop",
+        warehouse_ref1c="MANUAL-WH", delta_qty=Decimal("30.000"),
+        idempotency_key="late-manual-event-30",
+    )
+    db.add(receipt)
+    db.flush()
+    key = (
+        product.product_id, unrelated.component_item_id, "workshop", "MANUAL-WH",
+    )
+    return parent, target, unrelated, sle, receipt, key, opening.effective_at
+
+
+def test_terminal_release_guard_uses_persisted_numeric_quantum(db_session):
+    parent, target, _unrelated, sle, receipt, key, earliest = (
+        _late_manual_receipt_after_terminal_world(db_session)
+    )
+    _baseline, _parent_cells, target_cells, _watermark = (
+        replay_bounded_material_custody_cells(
+            db_session, parent=parent, target=target, keys={key},
+            earliest_changed_at=earliest,
+        )
+    )
+    replayed = Decimal(str(target_cells[key]))
+    assert replayed != Decimal("30.000")
+    assert replayed.quantize(Decimal("0.001")) == Decimal("30.000")
+
+    source_qty = sle.qty
+    apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id, source_sle_ids=(sle.id,),
+    )
+
+    assert sle.qty == source_qty == Decimal("30.000")
+    releases = db_session.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id > receipt.id,
+        models.ProductionMaterialCustodyEvent.location_kind == "workshop",
+        models.ProductionMaterialCustodyEvent.warehouse_ref1c == "MANUAL-WH",
+    ).all()
+    assert len(releases) == 1
+    assert releases[0].delta_qty == Decimal("-30.000")
+    assert not db_session.query(models.ProductionMaterialCustodyProjection.id).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+        models.ProductionMaterialCustodyProjection.product_id == key[0],
+        models.ProductionMaterialCustodyProjection.component_item_id == key[1],
+        models.ProductionMaterialCustodyProjection.location_kind == key[2],
+        models.ProductionMaterialCustodyProjection.warehouse_ref1c == key[3],
+    ).first()
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id, source_sle_ids=(sle.id,),
+    ) == 0
+
+
+def test_terminal_release_guard_rejects_wrong_persisted_delta(db_session, monkeypatch):
+    from app.services.item_ledger import physical_refresh_provenance as provenance
+
+    parent, target, _unrelated, sle, receipt, key, _earliest = (
+        _late_manual_receipt_after_terminal_world(db_session)
+    )
+
+    def wrong_release(db, *, generation, cells):
+        db.add(models.ProductionMaterialCustodyEvent(
+            product_id=key[0], component_item_id=key[1],
+            source_kind="terminal_release", effective_at=generation.cutoff,
+            location_kind=key[2], warehouse_ref1c=key[3],
+            source_ref2c="order-terminal-v1:done:wrong-delta",
+            delta_qty=Decimal("-29.999"), idempotency_key="wrong-release-delta",
+        ))
+        db.flush()
+        return 1
+
+    monkeypatch.setattr(provenance, "_append_terminal_custody_releases", wrong_release)
+    with pytest.raises(
+        PhysicalRefreshProvenanceUnavailable,
+        match="terminal observation appended a foreign event",
+    ):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id,
+            target_generation_id=target.id, source_sle_ids=(sle.id,),
+        )
 
 
 def test_new_physical_cutoff_releases_unrelated_closed_current_hold_only(db_session):

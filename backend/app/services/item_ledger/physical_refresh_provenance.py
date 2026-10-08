@@ -841,7 +841,8 @@ def apply_bounded_current_material_custody_events(
                 or str(event.source_kind or "") != "terminal_release"
                 or not str(event.source_ref2c or "").startswith("order-terminal-v1:")
                 or not _same_1c_timestamp(event.effective_at, target.cutoff)
-                or Decimal(str(event.delta_qty or 0)) != -basis
+                or Decimal(str(event.delta_qty or 0)).quantize(Decimal("0.001"))
+                != (-basis).quantize(Decimal("0.001"))
             ):
                 raise PhysicalRefreshProvenanceUnavailable(
                     "bounded custody terminal observation appended a foreign event"
