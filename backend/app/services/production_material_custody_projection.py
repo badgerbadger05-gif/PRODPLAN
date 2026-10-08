@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import exists, func, or_, tuple_
 from sqlalchemy.orm import Session
@@ -22,6 +23,7 @@ from .item_ledger.physical_visibility import visible_sle_query
 logger = logging.getLogger(__name__)
 
 _EPSILON = 1.0e-9
+_MOSCOW = ZoneInfo("Europe/Moscow")
 
 
 def _same_1c_timestamp(left: datetime, right: datetime) -> bool:
@@ -36,6 +38,13 @@ def _after_1c_timestamp(left: datetime, right: datetime) -> bool:
     if left.tzinfo is None or right.tzinfo is None:
         return left.replace(tzinfo=None) > right.replace(tzinfo=None)
     return left.astimezone(timezone.utc) > right.astimezone(timezone.utc)
+
+
+def _moscow_wall_time(value: datetime) -> datetime:
+    """Return the canonical naive Moscow wall clock used by 1C timestamps."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=None)
+    return value.astimezone(_MOSCOW).replace(tzinfo=None)
 
 
 class MaterialCustodySnapshotUnavailable(RuntimeError):
@@ -1422,9 +1431,11 @@ def _append_terminal_custody_releases(
     accepted_cutoff = db.query(func.max(models.LedgerGeneration.cutoff)).filter(
         models.LedgerGeneration.status == "accepted",
     ).scalar()
-    cutoff = generation.cutoff.replace(tzinfo=None)
-    if accepted_cutoff is not None and cutoff <= accepted_cutoff.replace(tzinfo=None):
+    if accepted_cutoff is not None and not _after_1c_timestamp(
+        generation.cutoff, accepted_cutoff,
+    ):
         return 0
+    cutoff_wall = _moscow_wall_time(generation.cutoff)
     product_ids = {key[0] for key in cells}
     if not product_ids:
         return 0
@@ -1437,7 +1448,11 @@ def _append_terminal_custody_releases(
         state = str(order.order_state_key or "").lower()
         terminal = bool(order.deletion_mark) or state == DONE_STATE_KEY
         observed_at = order.updated_at
-        if terminal and observed_at is not None and observed_at.replace(tzinfo=None) <= cutoff:
+        if (
+            terminal
+            and observed_at is not None
+            and _moscow_wall_time(observed_at) <= cutoff_wall
+        ):
             observations[int(product.product_id)] = order
     count = 0
     for key, balance in sorted(cells.items()):

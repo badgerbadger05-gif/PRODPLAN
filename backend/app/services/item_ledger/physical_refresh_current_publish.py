@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -1440,6 +1441,7 @@ def production_affected_item_ids(
     rows: Sequence[Any],
     stock_result: Any,
     custody_source_sle_ids: Sequence[int],
+    custody_event_id_range: tuple[int, int] | None = None,
 ) -> tuple[int, ...]:
     """Every item whose material basis this bounded refresh may have changed.
 
@@ -1450,6 +1452,8 @@ def production_affected_item_ids(
       receipt is how a supplier line's open future supply moves in this path);
     * the items whose compact ``StockBin`` this refresh restamped;
     * the components of the custody events this refresh folded.
+      The exact old/new custody watermark range includes source-SLE-free
+      terminal releases produced for unrelated closed current holds.
 
     Future supply rows themselves (``LedgerFutureSupplyCurrent``) and
     competing demand change only in an obligation refresh or a full accept,
@@ -1470,6 +1474,22 @@ def production_affected_item_ids(
                 models.ProductionMaterialCustodyEvent.source_sle_id.in_(source_ids)
             ).distinct()
         )
+    if custody_event_id_range is not None:
+        lower, upper = (int(value) for value in custody_event_id_range)
+        if upper < lower:
+            raise ForwardPhysicalRefreshUnavailable(
+                "custody event watermark moved backwards during publication"
+            )
+        if upper > lower:
+            items.update(
+                int(item_id)
+                for (item_id,) in db.query(
+                    models.ProductionMaterialCustodyEvent.component_item_id
+                ).filter(
+                    models.ProductionMaterialCustodyEvent.id > lower,
+                    models.ProductionMaterialCustodyEvent.id <= upper,
+                ).distinct()
+            )
     return tuple(sorted(items))
 
 
@@ -1709,8 +1729,13 @@ def _publish_forward_physical_refresh_current(
         _phase_tracker.complete("validation")
         _phase_tracker.begin("custody")
     # Transfer custody events can be discovered while ingesting an exact
-    # recorder re-pull.  Fold only that explicit SLE-linked tail before any
-    # compact payload reader runs; unrelated/local tails remain fail-closed.
+    # recorder re-pull. Fold the proven tail and canonical terminal releases
+    # before any compact payload reader runs; foreign tails remain fail-closed.
+    custody_watermark_before = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
+        .scalar()
+        or 0
+    )
     custody_event_rows = apply_bounded_current_material_custody_events(
         db,
         parent_generation_id=int(parent.id),
@@ -1720,6 +1745,11 @@ def _publish_forward_physical_refresh_current(
             + tuple(int(row.id) for row in basis_rows)
             + custody_source_ids
         )),
+    )
+    custody_watermark_after = int(
+        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0))
+        .scalar()
+        or 0
     )
     if _phase_tracker is not None:
         _phase_tracker.complete("custody")
@@ -1957,6 +1987,9 @@ def _publish_forward_physical_refresh_current(
             custody_source_sle_ids=tuple(dict.fromkeys(
                 tuple(int(row.id) for row in rows) + custody_source_ids
             )),
+            custody_event_id_range=(
+                custody_watermark_before, custody_watermark_after,
+            ),
         ),
     )
     if _phase_tracker is not None:

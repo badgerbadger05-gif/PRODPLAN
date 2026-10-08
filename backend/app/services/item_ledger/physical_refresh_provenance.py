@@ -19,6 +19,7 @@ from app import models
 from app.services.production_material_custody_events import _custody_event_idempotency_key
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
+    _append_terminal_custody_releases,
     _same_1c_timestamp,
     _visible_source_sle_for_event,
     replay_bounded_material_custody_cells,
@@ -648,6 +649,28 @@ def apply_bounded_current_material_custody_events(
                     f"(event_id={int(event.id)}, sle_id={int(event.source_sle_id)})"
                 )
 
+    # A physical event can be discovered after the accepted compact owner was
+    # published even though its posting belongs inside the parent's window.
+    # Applying that raw delta to the parent's terminal-clipped quantity revives
+    # or drives negative a cell whose earlier opening/release chronology the
+    # compact value no longer carries. Refold only those exact physical keys
+    # through the canonical bounded replay, alongside revision keys. Events
+    # after the parent cutoff remain the ordinary forward tail below.
+    late_physical_events = [
+        event for event in tail
+        if event.source_sle_id is not None
+        and int(event.source_sle_id) in visible_tail_ids
+        and _ordered_1c_timestamps(event.effective_at, parent.cutoff)[0]
+        <= _ordered_1c_timestamps(event.effective_at, parent.cutoff)[1]
+    ]
+    replay_keys = correction_keys | {
+        (
+            int(event.product_id), int(event.component_item_id),
+            str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
+        )
+        for event in late_physical_events
+    }
+
     current_rows = (
         db.query(models.ProductionMaterialCustodyProjection)
         .filter(models.ProductionMaterialCustodyProjection.is_current.is_(True))
@@ -675,19 +698,23 @@ def apply_bounded_current_material_custody_events(
         ): row
         for row in current_rows
     }
-    if correction_keys:
+    if replay_keys:
+        replay_events = tuple(corrected_events) + tuple(
+            event for event in tail
+            if event.source_sle_id is not None
+            and (
+                int(event.source_sle_id) in connected_ids
+                or event in late_physical_events
+            )
+        )
         earliest = min(
             event.effective_at.replace(tzinfo=None)
-            for event in (*corrected_events, *(
-                event for event in tail
-                if event.source_sle_id is not None
-                and int(event.source_sle_id) in connected_ids
-            ))
+            for event in replay_events
         )
         try:
             baseline_id, parent_cells, target_cells, target_watermark = (
                 replay_bounded_material_custody_cells(
-                    db, parent=parent, target=target, keys=correction_keys,
+                    db, parent=parent, target=target, keys=replay_keys,
                     earliest_changed_at=earliest,
                 )
             )
@@ -696,7 +723,7 @@ def apply_bounded_current_material_custody_events(
                 f"custody correction has no canonical bounded replay basis "
                 f"(old_sle_ids={sorted(int(event.source_sle_id) for event in corrected_events)})"
             ) from exc
-        for key in correction_keys:
+        for key in replay_keys:
             stored = Decimal(str(rows_by_key[key].reserved_qty)) if key in rows_by_key else Decimal(0)
             expected = Decimal(str(parent_cells.get(key, 0)))
             if stored.quantize(Decimal("0.001")) != expected.quantize(Decimal("0.001")):
@@ -705,6 +732,8 @@ def apply_bounded_current_material_custody_events(
                     f"(key={key}, baseline_generation_id={baseline_id}, "
                     f"stored={stored}, replayed={expected})"
                 )
+
+        for key in replay_keys:
             result = Decimal(str(target_cells.get(key, 0)))
             row = rows_by_key.get(key)
             if result <= 0:
@@ -730,7 +759,7 @@ def apply_bounded_current_material_custody_events(
             str(event.location_kind or ""),
             str(event.warehouse_ref1c or ""),
         )
-        if key in correction_keys or (
+        if key in replay_keys or (
             event.source_sle_id is not None
             and int(event.source_sle_id) not in visible_tail_ids
         ):
@@ -769,6 +798,75 @@ def apply_bounded_current_material_custody_events(
             raise PhysicalRefreshProvenanceUnavailable(
                 "bounded custody event has no current basis"
             )
+
+    # Observe terminal ownership only after replay and forward events have
+    # produced the complete working current state. This includes closed holds
+    # unrelated to the physical delta: a new physical cutoff is the canonical
+    # observation boundary for every current custody cell. The existing event
+    # producer decides which orders are terminal/current/future/unknown. Apply
+    # only events created by this exact call and only when their signed delta is
+    # the complete current cell balance; no generic clipping or second release
+    # formula exists here.
+    release_basis = {
+        key: Decimal(str(row.reserved_qty or 0))
+        for key, row in rows_by_key.items()
+        if Decimal(str(row.reserved_qty or 0)) > 0
+    }
+    before_release_watermark = int(observed_watermark)
+    generated_release_count = _append_terminal_custody_releases(
+        db, generation=target, cells=release_basis,
+    )
+    if generated_release_count:
+        db.flush()
+        generated_releases = (
+            db.query(models.ProductionMaterialCustodyEvent)
+            .filter(
+                models.ProductionMaterialCustodyEvent.id
+                > before_release_watermark
+            )
+            .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+            .all()
+        )
+        generated_keys: set[tuple[int, int, str, str]] = set()
+        for event in generated_releases:
+            key = (
+                int(event.product_id), int(event.component_item_id),
+                str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
+            )
+            basis = release_basis.get(key)
+            if (
+                basis is None
+                or key in generated_keys
+                or event.source_sle_id is not None
+                or str(event.source_kind or "") != "terminal_release"
+                or not str(event.source_ref2c or "").startswith("order-terminal-v1:")
+                or not _same_1c_timestamp(event.effective_at, target.cutoff)
+                or Decimal(str(event.delta_qty or 0)) != -basis
+            ):
+                raise PhysicalRefreshProvenanceUnavailable(
+                    "bounded custody terminal observation appended a foreign event"
+                )
+            generated_keys.add(key)
+        if len(generated_releases) != int(generated_release_count):
+            raise PhysicalRefreshProvenanceUnavailable(
+                "bounded custody terminal observation count changed"
+            )
+        for key in generated_keys:
+            row = rows_by_key.pop(key, None)
+            if row is None:
+                raise PhysicalRefreshProvenanceUnavailable(
+                    "bounded custody terminal observation lost its current cell"
+                )
+            if inspect(row).pending:
+                db.expunge(row)
+            else:
+                db.delete(row)
+        tail = (
+            db.query(models.ProductionMaterialCustodyEvent)
+            .filter(models.ProductionMaterialCustodyEvent.id > previous_watermark)
+            .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+            .all()
+        )
 
     watermark = int(tail[-1].id) if tail else previous_watermark
     for row in rows_by_key.values():

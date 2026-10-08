@@ -21,6 +21,7 @@ from app.services.production_material_custody_projection import (
     load_compact_current_material_custody,
 )
 from app.services.production_material_custody_events import _custody_event_idempotency_key
+from app.services.production_control_common import DONE_STATE_KEY
 
 
 def _world(db):
@@ -541,6 +542,295 @@ def test_bounded_custody_revision_uses_canonical_terminal_clipping(db_session):
     ).first()
 
 
+def _late_physical_after_terminal_world(db):
+    """Closed transit opening, then a physical transfer discovered much later."""
+    parent, target, _current, unrelated = _world(db)
+    parent.cutoff = datetime(2026, 10, 8, tzinfo=timezone.utc)
+    parent.physical_import_batch.cutoff = parent.cutoff
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    manifest = db.get(models.ProductionMaterialCustodyProjectionManifest, parent.id)
+    manifest.cutoff = parent.cutoff
+
+    baseline = _building_generation(
+        db, key="late-terminal-explicit-baseline",
+        cutoff=datetime(2026, 9, 1, tzinfo=timezone.utc),
+    )
+    baseline.status = "accepted"
+    baseline.accepted_at = baseline.cutoff
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=baseline.id, baseline_generation_id=baseline.id,
+        cutoff=baseline.cutoff, status="complete", is_baseline=True,
+        source_event_high_watermark_id=0,
+    ))
+
+    product = db.get(models.ProductionProduct, int(unrelated.product_id))
+    order = db.get(models.ProductionOrder, int(product.order_id))
+    order.order_state_key = DONE_STATE_KEY
+    order.updated_at = datetime(2026, 9, 30, 13, 17, tzinfo=timezone.utc)
+    issue = models.ProductionMaterialIssue(
+        document_number="MT-LATE-TERMINAL", product_id=product.product_id,
+        order_id=order.order_id, status="posted", direction="issue",
+        source_warehouse_ref1c="TRANSIT", warehouse_ref1c="WORKSHOP",
+    )
+    db.add(issue)
+    db.flush()
+    line = models.ProductionMaterialIssueLine(
+        issue_id=issue.issue_id,
+        component_item_id=int(unrelated.component_item_id),
+        required_qty=Decimal("43.906"), issued_qty=Decimal("43.906"),
+        custody_event_revision=1,
+    )
+    db.add(line)
+    db.flush()
+    opening = models.ProductionMaterialCustodyEvent(
+        issue_id=issue.issue_id, product_id=product.product_id,
+        component_item_id=line.component_item_id, source_kind="issue_created",
+        effective_at=datetime(2026, 9, 8, 13, 21),
+        location_kind="transit", warehouse_ref1c="TRANSIT",
+        source_ref1c="TRANSIT", delta_qty=Decimal("43.906"),
+        idempotency_key="late-terminal-opening",
+        document_number=issue.document_number, document_line_no=str(line.line_id),
+    )
+    db.add(opening)
+    db.flush()
+    old_release = models.ProductionMaterialCustodyEvent(
+        issue_id=None, product_id=product.product_id,
+        component_item_id=line.component_item_id, source_kind="terminal_release",
+        effective_at=datetime(2026, 9, 30, 13, 42),
+        location_kind="transit", warehouse_ref1c="TRANSIT",
+        source_ref1c=order.order_ref1c,
+        source_ref2c="order-terminal-v1:done:2026-09-30T13:17:00",
+        delta_qty=Decimal("-43.906"), idempotency_key="late-terminal-old-release",
+        document_number=order.order_number,
+    )
+    db.add(old_release)
+    db.flush()
+    manifest.source_event_high_watermark_id = int(old_release.id)
+    unrelated.source_event_high_watermark_id = int(old_release.id)
+
+    def physical(qty, warehouse, movement, line_no):
+        sle = models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash=f"late-terminal-{line_no}",
+            business_identity=f"late-terminal-{line_no}",
+            item_id=int(line.component_item_id), characteristic_ref="",
+            organization_ref="org", warehouse_ref1c=warehouse,
+            qty=Decimal(qty), posting_at=datetime(2026, 9, 8, 14, 16),
+            record_type="Expense" if Decimal(qty) < 0 else "Receipt",
+            movement_kind=movement, recorder_type="Document_Transfer",
+            recorder_ref="late-terminal-transfer", line_no=line_no,
+            ingest_source="test", active=True,
+        )
+        db.add(sle)
+        db.flush()
+        event = models.ProductionMaterialCustodyEvent(
+            issue_id=issue.issue_id, product_id=product.product_id,
+            component_item_id=line.component_item_id,
+            source_kind="transfer_posted", source_sle_id=sle.id,
+            effective_at=sle.posting_at, location_kind=(
+                "transit" if Decimal(qty) < 0 else "workshop"
+            ), warehouse_ref1c=warehouse, delta_qty=Decimal(qty),
+            idempotency_key=f"late-terminal-event-{line_no}",
+            document_number=issue.document_number,
+            document_line_no=str(line.line_id),
+        )
+        db.add(event)
+        db.flush()
+        return sle, event
+
+    outbound, outbound_event = physical(
+        "-43.906", "TRANSIT", "transfer_out", "1"
+    )
+    inbound, inbound_event = physical(
+        "43.906", "WORKSHOP", "transfer_in", "2"
+    )
+    return (
+        parent, target, unrelated, outbound, inbound,
+        opening, old_release, outbound_event, inbound_event,
+    )
+
+
+def test_bounded_late_physical_transfer_replays_terminal_history_once(db_session):
+    (
+        parent, target, unrelated, outbound, inbound,
+        opening, old_release, outbound_event, inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    source_quantities = (outbound.qty, inbound.qty)
+
+    folded = apply_bounded_current_material_custody_events(
+        db_session,
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        source_sle_ids=(outbound.id, inbound.id),
+    )
+
+    assert folded == 4  # two physical events plus both closed current cells
+    assert (outbound.qty, inbound.qty) == source_quantities == (
+        Decimal("-43.906"), Decimal("43.906")
+    )
+    assert not db_session.query(models.ProductionMaterialCustodyProjection.id).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+        models.ProductionMaterialCustodyProjection.product_id == opening.product_id,
+        models.ProductionMaterialCustodyProjection.component_item_id
+        == opening.component_item_id,
+        models.ProductionMaterialCustodyProjection.location_kind.in_((
+            "transit", "workshop",
+        )),
+        models.ProductionMaterialCustodyProjection.warehouse_ref1c.in_((
+            "TRANSIT", "WORKSHOP",
+        )),
+    ).first()
+    generated = db_session.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id > inbound_event.id,
+    ).all()
+    assert len(generated) == 2
+    assert all(event.source_kind == "terminal_release" for event in generated)
+    assert all(event.location_kind == "workshop" for event in generated)
+    assert all(
+        event.source_ref2c.startswith("order-terminal-v1:")
+        for event in generated
+    )
+    generated_by_warehouse = {
+        event.warehouse_ref1c: event.delta_qty for event in generated
+    }
+    assert generated_by_warehouse == {
+        "WORKSHOP": Decimal("-43.906"),
+        "WH": Decimal("-2"),
+    }
+    assert apply_bounded_current_material_custody_events(
+        db_session,
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        source_sle_ids=(outbound.id, inbound.id),
+    ) == 0
+    assert db_session.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id > inbound_event.id,
+    ).count() == 2
+    assert db_session.get(
+        models.ProductionMaterialCustodyProjection, unrelated.id
+    ) is None
+
+
+def test_new_physical_cutoff_releases_unrelated_closed_current_hold_only(db_session):
+    parent, target, _current, closed = _world(db_session)
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    closed_product = db_session.get(models.ProductionProduct, closed.product_id)
+    closed_order = db_session.get(models.ProductionOrder, closed_product.order_id)
+    closed_order.order_state_key = DONE_STATE_KEY
+    closed_order.updated_at = parent.cutoff.replace(tzinfo=None) + timedelta(hours=1)
+
+    def current_cell(tag, *, state, observed_at):
+        item = models.Item(item_code=f"TERMINAL-{tag}", item_name=tag)
+        order = models.ProductionOrder(
+            order_number=f"ORDER-{tag}", order_date=parent.cutoff,
+            order_ref1c=f"order-{tag}", order_state_key=state,
+            updated_at=observed_at,
+        )
+        db_session.add_all([item, order])
+        db_session.flush()
+        product = models.ProductionProduct(
+            order_id=order.order_id, item_id=item.item_id, quantity=1,
+            remaining_qty=1, produced_qty=0,
+        )
+        db_session.add(product)
+        db_session.flush()
+        row = models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=parent.id, product_id=product.product_id,
+            component_item_id=item.item_id, location_kind="workshop",
+            warehouse_ref1c=f"WH-{tag}", reserved_qty=Decimal("5"),
+            source_event_high_watermark_id=0, is_current=True,
+        )
+        db_session.add(row)
+        db_session.flush()
+        return order, row
+
+    _open_order, open_row = current_cell(
+        "OPEN", state=None,
+        observed_at=parent.cutoff.replace(tzinfo=None),
+    )
+    _future_order, future_row = current_cell(
+        "FUTURE", state=DONE_STATE_KEY,
+        observed_at=(
+            target.cutoff.astimezone(timezone(timedelta(hours=3)))
+            .replace(tzinfo=None) + timedelta(hours=1)
+        ),
+    )
+    unknown_order, unknown_row = current_cell(
+        "UNKNOWN", state=DONE_STATE_KEY,
+        observed_at=parent.cutoff.replace(tzinfo=None),
+    )
+    db_session.query(models.ProductionOrder).filter_by(
+        order_id=unknown_order.order_id
+    ).update({"updated_at": None})
+    db_session.flush()
+
+    assert apply_bounded_current_material_custody_events(
+        db_session,
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        source_sle_ids=(),
+    ) == 1
+    assert db_session.get(models.ProductionMaterialCustodyProjection, closed.id) is None
+    assert db_session.get(models.ProductionMaterialCustodyProjection, open_row.id) is not None
+    assert db_session.get(models.ProductionMaterialCustodyProjection, future_row.id) is not None
+    assert db_session.get(models.ProductionMaterialCustodyProjection, unknown_row.id) is not None
+    releases = db_session.query(models.ProductionMaterialCustodyEvent).filter_by(
+        source_kind="terminal_release"
+    ).all()
+    assert len(releases) == 1
+    assert releases[0].product_id == closed.product_id
+    assert releases[0].delta_qty == Decimal("-2")
+    assert apply_bounded_current_material_custody_events(
+        db_session,
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        source_sle_ids=(),
+    ) == 0
+    assert db_session.query(models.ProductionMaterialCustodyEvent).filter_by(
+        source_kind="terminal_release"
+    ).count() == 1
+
+
+def test_bounded_unknown_forward_negative_tail_still_fails_closed(db_session):
+    parent, target, _current, custody = _world(db_session)
+    target.cutoff = parent.cutoff + timedelta(days=1)
+    target.physical_import_batch.cutoff = target.cutoff
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="unknown-forward-negative",
+        business_identity="unknown-forward-negative",
+        item_id=int(custody.component_item_id), characteristic_ref="",
+        organization_ref="org", warehouse_ref1c="UNKNOWN",
+        qty=Decimal("-1"), posting_at=parent.cutoff + timedelta(hours=1),
+        record_type="Expense", movement_kind="transfer_out",
+        recorder_type="Document_Transfer", recorder_ref="unknown-negative",
+        line_no="1", ingest_source="test", active=True,
+    )
+    db_session.add(sle)
+    db_session.flush()
+    db_session.add(models.ProductionMaterialCustodyEvent(
+        product_id=int(custody.product_id),
+        component_item_id=int(custody.component_item_id),
+        source_kind="transfer_posted", source_sle_id=sle.id,
+        effective_at=sle.posting_at, location_kind="transit",
+        warehouse_ref1c="UNKNOWN", delta_qty=Decimal("-1"),
+        idempotency_key="unknown-forward-negative-event",
+    ))
+    db_session.flush()
+    with pytest.raises(
+        PhysicalRefreshProvenanceUnavailable,
+        match="bounded custody event would make compact current quantity negative",
+    ):
+        apply_bounded_current_material_custody_events(
+            db_session,
+            parent_generation_id=parent.id,
+            target_generation_id=target.id,
+            source_sle_ids=(sle.id,),
+        )
+
+
 def _accept(db, generation: models.LedgerGeneration) -> None:
     generation.status = "accepted"
     generation.accepted_at = generation.cutoff
@@ -744,6 +1034,8 @@ def test_custody_handoff_rejects_unpublished_event_tail(db_session):
 
 def test_bounded_custody_tail_folds_only_explicit_sle_and_handoff_reuses_it(db_session):
     parent, target, _current, custody = _world(db_session)
+    target.cutoff = parent.cutoff + timedelta(hours=1)
+    target.physical_import_batch.cutoff = target.cutoff
     sle = models.StockLedgerEntry(
         ingest_batch_id=target.physical_import_batch_id,
         source_content_hash="custody-tail-sle",

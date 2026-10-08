@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -28,7 +29,10 @@ from app.services.production_material_custody_projection import (
     build_material_custody_projection,
     publish_current_material_custody,
     validate_material_custody_projection,
+    _after_1c_timestamp,
+    _append_terminal_custody_releases,
     _cutoff_seed_from_compact_owner,
+    _moscow_wall_time,
     _same_1c_timestamp,
     load_current_accepted_material_custody,
     load_compact_current_material_custody,
@@ -50,6 +54,118 @@ def test_same_1c_timestamp_accepts_postgres_aware_and_legacy_naive_wall_time():
 
     assert _same_1c_timestamp(naive, aware)
     assert not _same_1c_timestamp(naive, aware.replace(minute=50))
+
+
+def test_terminal_cutoff_boundary_compares_mixed_offsets_as_instants():
+    accepted_moscow = datetime(
+        2026, 9, 30, 10, 0, tzinfo=timezone(timedelta(hours=3))
+    )
+    same_instant_utc = datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc)
+    advancing_utc = datetime(2026, 9, 30, 7, 5, tzinfo=timezone.utc)
+
+    assert not _after_1c_timestamp(same_instant_utc, accepted_moscow)
+    assert _after_1c_timestamp(advancing_utc, accepted_moscow)
+    assert _moscow_wall_time(same_instant_utc) == datetime(2026, 9, 30, 10, 0)
+    assert _moscow_wall_time(advancing_utc) == datetime(2026, 9, 30, 10, 5)
+
+
+@pytest.mark.parametrize(
+    ("target_cutoff", "order_updated_at", "expected"),
+    [
+        (
+            datetime(2026, 9, 30, 7, 5, tzinfo=timezone.utc),
+            datetime(2026, 9, 30, 10, 2),
+            1,
+        ),
+        (
+            datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc),
+            datetime(2026, 9, 30, 9, 59),
+            0,
+        ),
+        (
+            datetime(2026, 9, 30, 7, 5, tzinfo=timezone.utc),
+            datetime(2026, 9, 30, 10, 6),
+            0,
+        ),
+    ],
+    ids=("advancing", "same-instant", "future-observation"),
+)
+def test_terminal_release_producer_uses_instant_cutoff_and_moscow_observation(
+    target_cutoff, order_updated_at, expected,
+):
+    accepted_cutoff = datetime(
+        2026, 9, 30, 10, 0, tzinfo=timezone(timedelta(hours=3))
+    )
+    product = SimpleNamespace(product_id=17)
+    order = SimpleNamespace(
+        order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
+        deletion_mark=False,
+        updated_at=order_updated_at,
+        order_ref1c="order-ref",
+        order_number="ORDER-17",
+    )
+
+    class Query:
+        def __init__(self, kind):
+            self.kind = kind
+
+        def filter(self, *_args, **_kwargs):
+            return self
+
+        def filter_by(self, **_kwargs):
+            return self
+
+        def join(self, *_args, **_kwargs):
+            return self
+
+        def scalar(self):
+            assert self.kind == "accepted-cutoff"
+            return accepted_cutoff
+
+        def all(self):
+            assert self.kind == "products"
+            return [(product, order)]
+
+        def first(self):
+            assert self.kind == "idempotency"
+            return None
+
+    class DB:
+        def __init__(self):
+            self.query_count = 0
+            self.added = []
+
+        def query(self, *_entities):
+            self.query_count += 1
+            return Query(
+                "accepted-cutoff" if self.query_count == 1
+                else "products" if self.query_count == 2
+                else "idempotency"
+            )
+
+        def add(self, value):
+            self.added.append(value)
+
+        def flush(self):
+            return None
+
+    db = DB()
+    count = _append_terminal_custody_releases(
+        db,
+        generation=SimpleNamespace(cutoff=target_cutoff),
+        cells={(17, 23, "workshop", "WH"): Decimal("43.906")},
+    )
+
+    assert count == expected
+    assert len(db.added) == expected
+    if expected:
+        event = db.added[0]
+        assert event.delta_qty == Decimal("-43.906")
+        assert event.source_kind == "terminal_release"
+        assert event.source_ref2c.startswith("order-terminal-v1:done:")
+        assert event.effective_at == target_cutoff
+        assert event.product_id == 17
+        assert event.component_item_id == 23
 
 
 def _generation(db, *, key: str, cutoff: datetime) -> LedgerGeneration:

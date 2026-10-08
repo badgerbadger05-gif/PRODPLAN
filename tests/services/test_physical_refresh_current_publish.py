@@ -129,6 +129,122 @@ def _patch_safe_pipeline(monkeypatch, phases):
     monkeypatch.setattr(publisher, "_fixed_run_ids", lambda db: (1,))
 
 
+def test_production_affected_items_include_source_free_terminal_release_range(
+    db_session,
+):
+    product_item = models.Item(item_code="CUSTODY-PRODUCT", item_name="product")
+    component = models.Item(item_code="CUSTODY-COMPONENT", item_name="component")
+    order = models.ProductionOrder(
+        order_number="CUSTODY-ORDER", order_date=datetime(2026, 9, 1),
+    )
+    db_session.add_all([product_item, component, order])
+    db_session.flush()
+    product = models.ProductionProduct(
+        order_id=order.order_id, item_id=product_item.item_id,
+        quantity=1, remaining_qty=1, produced_qty=0,
+    )
+    db_session.add(product)
+    db_session.flush()
+    before = models.ProductionMaterialCustodyEvent(
+        product_id=product.product_id, component_item_id=component.item_id,
+        source_kind="issue_created", effective_at=datetime(2026, 9, 1),
+        location_kind="workshop", warehouse_ref1c="WH", delta_qty=1,
+        idempotency_key="affected-before",
+    )
+    release = models.ProductionMaterialCustodyEvent(
+        product_id=product.product_id, component_item_id=component.item_id,
+        source_kind="terminal_release", source_sle_id=None,
+        source_ref2c="order-terminal-v1:done:2026-09-02T00:00:00",
+        effective_at=datetime(2026, 9, 2), location_kind="workshop",
+        warehouse_ref1c="WH", delta_qty=-1,
+        idempotency_key="affected-release",
+    )
+    db_session.add_all([before, release])
+    db_session.flush()
+
+    affected = publisher.production_affected_item_ids(
+        db_session,
+        rows=(),
+        stock_result=SimpleNamespace(changed_keys=()),
+        custody_source_sle_ids=(),
+        custody_event_id_range=(int(before.id), int(release.id)),
+    )
+
+    assert affected == (int(component.item_id),)
+
+
+def test_bounded_publish_recomputes_materials_for_generated_terminal_release(
+    db_session, monkeypatch,
+):
+    parent, target = _generations(db_session)
+    physical_item = models.Item(item_code="TERMINAL-PHYSICAL", item_name="physical")
+    component = models.Item(item_code="TERMINAL-RELEASED", item_name="released")
+    product_item = models.Item(item_code="TERMINAL-ROOT", item_name="root")
+    order = models.ProductionOrder(
+        order_number="TERMINAL-ORDER", order_date=parent.cutoff,
+    )
+    db_session.add_all([physical_item, component, product_item, order])
+    db_session.flush()
+    product = models.ProductionProduct(
+        order_id=order.order_id, item_id=product_item.item_id,
+        quantity=1, remaining_qty=1, produced_qty=0,
+    )
+    db_session.add(product)
+    db_session.flush()
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="terminal-publish-sle",
+        business_identity="terminal-publish-sle",
+        item_id=physical_item.item_id, characteristic_ref="",
+        organization_ref="org", warehouse_ref1c="wh", qty=1,
+        posting_at=target.cutoff, record_type="Receipt",
+        movement_kind="transfer_in", recorder_type="Document_Transfer",
+        recorder_ref="terminal-publish", line_no="1", ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.commit()
+
+    phases = []
+    _patch_safe_pipeline(monkeypatch, phases)
+
+    def custody(db, **_kwargs):
+        db.add(models.ProductionMaterialCustodyEvent(
+            product_id=product.product_id, component_item_id=component.item_id,
+            source_kind="terminal_release", source_sle_id=None,
+            source_ref2c="order-terminal-v1:done:2026-09-02T00:00:00",
+            effective_at=target.cutoff, location_kind="workshop",
+            warehouse_ref1c="WH", delta_qty=-1,
+            idempotency_key="terminal-publish-release",
+        ))
+        db.flush()
+        return 1
+
+    captured = {}
+
+    def production(*_args, **kwargs):
+        captured["affected_item_ids"] = tuple(kwargs["affected_item_ids"])
+        return {"rows": [], "meta": {}}
+
+    monkeypatch.setattr(
+        publisher, "apply_bounded_current_material_custody_events", custody,
+    )
+    monkeypatch.setattr(
+        publisher, "build_compact_current_production_control_payload", production,
+    )
+
+    publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (sle,), "supersessions": ()},
+        odata_client=None,
+        source_revision=target.physical_import_batch_id,
+        planning_pool_by_warehouse={"wh": "default"},
+    )
+
+    assert int(component.item_id) in captured["affected_item_ids"]
+
+
 def test_forward_publish_is_atomic_and_pointer_is_last(db_session, monkeypatch):
     parent, target = _generations(db_session)
     item = models.Item(item_code="CP-1", item_name="Current publish item")
