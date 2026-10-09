@@ -512,6 +512,36 @@ def test_known_non_supplier_expense_operations_are_ignored_without_evidence_or_d
     assert result.diagnostics == ()
 
 
+@pytest.mark.parametrize("name", ["ВозвратОтПереработчика", " Возврат от переработчика "])
+def test_processing_return_is_physical_receipt_but_not_supplier_receipt(db_session, name):
+    item = _item(db_session)
+    entry = _sle(item, ref="processor-return", qty="14")
+    result = extract_supplier_document_evidence(db_session, _Client({
+        "Document_ПриходнаяНакладная(guid'processor-return')":
+            _doc("processor-return", "8d96f3f0", name, qty="14"),
+    }), [entry])
+    assert result.evidence == ()
+    assert result.diagnostics == ()
+    assert result.ignored_stock_ledger_entries == (SupplierReceiptExclusion(
+        entry.id, "8d96f3f0-9934-11eb-e39a-fa163e61326a", name.strip()),)
+    assert entry.qty == Decimal("14")
+
+
+@pytest.mark.parametrize("key,name", [
+    ("8d97069c", "ВозвратОтПереработчика"),
+    ("8d96f3f0", "ПоступлениеОтПоставщика"),
+])
+def test_processing_return_requires_both_operation_key_and_name(db_session, key, name):
+    item = _item(db_session)
+    entry = _sle(item, ref="wrong-processing-operation")
+    result = extract_supplier_document_evidence(db_session, _Client({
+        "Document_ПриходнаяНакладная(guid'wrong-processing-operation')":
+            _doc("wrong-processing-operation", key, name),
+    }), [entry])
+    assert result.ignored_stock_ledger_entries == ()
+    assert result.diagnostics
+
+
 def test_supplier_return_operation_still_honors_receipt_matching(db_session):
     item = _item(db_session)
     entry = _sle(

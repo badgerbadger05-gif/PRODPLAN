@@ -180,6 +180,8 @@ class BoundedBuyReceiptDeltaManifest:
     scope_receipt_facts: tuple[object, ...] = ()
     supersession_edge_ids: tuple[int, ...] = ()
     backdate_from: datetime | None = None
+    # Typed document exclusions are evidence only, never receipt quantities.
+    excluded_supplier_entries: tuple[tuple[int, str, str], ...] = ()
 
 
 def _decimal(value: object) -> Decimal:
@@ -231,6 +233,10 @@ def _normalise_bounded_buy_manifest(
                     int(item) for item in value.get("supersession_edge_ids", ())
                 ),
                 backdate_from=raw_backdate,
+                excluded_supplier_entries=tuple(
+                    (int(item[0]), str(item[1]), str(item[2]))
+                    for item in value.get("excluded_supplier_entries", ())
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise CurrentReplenishmentError("bounded BUY manifest is malformed") from exc
@@ -244,6 +250,14 @@ def _normalise_bounded_buy_manifest(
         raise CurrentReplenishmentError(
             "bounded BUY manifest has duplicate supersession IDs"
         )
+    try:
+        excluded_ids = [int(item[0]) for item in result.excluded_supplier_entries]
+        malformed = any(len(item) != 3 or int(item[0]) <= 0 or not _text(item[1]) or not _text(item[2])
+                        for item in result.excluded_supplier_entries)
+    except (TypeError, ValueError, IndexError) as exc:
+        raise CurrentReplenishmentError("bounded BUY exclusion evidence is malformed") from exc
+    if malformed or len(set(excluded_ids)) != len(excluded_ids) or set(excluded_ids).intersection(result.new_sle_ids):
+        raise CurrentReplenishmentError("bounded BUY exclusion evidence is malformed or duplicated")
     return result
 
 

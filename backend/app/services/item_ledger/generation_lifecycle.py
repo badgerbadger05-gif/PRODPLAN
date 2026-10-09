@@ -490,6 +490,13 @@ def _persist_non_supplier_receipt_rows(
         if row.id is not None
     }
 
+    existing = {
+        int(row.stock_ledger_entry_id): row
+        for row in db.query(models.StockLedgerSupplierReceiptProvenance).filter(
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id == generation_id,
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(tuple(candidate_by_id)),
+        )
+    }
     seen_ids: set[int] = set()
     for ignored_id, operation_key, operation_name in ignored_stock_ledger_entries:
         entry_id = int(ignored_id)
@@ -500,6 +507,18 @@ def _persist_non_supplier_receipt_rows(
         if entry_id in seen_ids:
             continue
         row = candidate_by_id[entry_id]
+        from .supplier_receipt_odata import non_supplier_operation_kind
+        kind = non_supplier_operation_kind(row.recorder_type, operation_key, operation_name)
+        if kind is None:
+            raise GenerationValidationError("non-supplier exclusion has unsupported document operation")
+        prior = existing.get(entry_id)
+        if prior is not None:
+            if prior.match_status != "excluded_non_supplier" or prior.operation_kind != kind:
+                raise GenerationValidationError("non-supplier exclusion conflicts with existing supplier typing")
+            if non_supplier_operation_kind(row.recorder_type, prior.operation_key, prior.operation_name) != kind:
+                raise GenerationValidationError("existing non-supplier exclusion has unsupported document operation")
+            seen_ids.add(entry_id)
+            continue
         # The same row builder as every other provenance writer, so an
         # exclusion carries the same evidence payload shape as a receipt.
         from .supplier_receipt_allocation import (
@@ -512,7 +531,7 @@ def _persist_non_supplier_receipt_rows(
             receipt_doc_type=row.recorder_type,
             receipt_doc_ref=row.recorder_ref,
             receipt_doc_line_no=row.line_no,
-            operation_kind="non_supplier_expense",
+            operation_kind=kind,
             operation_key=operation_key,
             operation_name=operation_name,
             item_id=int(row.item_id),
@@ -522,7 +541,7 @@ def _persist_non_supplier_receipt_rows(
             characteristic_ref=row.characteristic_ref,
             warehouse_ref1c=row.warehouse_ref1c,
             ambiguity_count=0,
-            reason="non-supplier expense operation",
+            reason="non-supplier receipt operation" if kind == "non_supplier_receipt" else "non-supplier expense operation",
         ))
         seen_ids.add(entry_id)
 
@@ -929,7 +948,7 @@ def _supplier_provenance_checkpoint(
             "supplier receipt evidence has an invalid classification"
         )
     if any(
-        str(row.operation_kind or "") != "non_supplier_expense"
+        str(row.operation_kind or "") not in {"non_supplier_expense", "non_supplier_receipt"}
         or not str(row.operation_key or "").strip()
         or not str(row.operation_name or "").strip()
         or str(row.match_rule or "") != "supplier-receipt-non-supplier-exclusion"

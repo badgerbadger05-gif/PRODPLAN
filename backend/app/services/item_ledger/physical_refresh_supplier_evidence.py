@@ -46,6 +46,7 @@ from .supplier_receipt_allocation import (
 from .supplier_receipt_odata import (
     SupplierEvidenceExtractionResult,
     _is_non_supplier_expense_operation,
+    non_supplier_operation_kind,
     extract_supplier_document_evidence,
 )
 
@@ -236,6 +237,80 @@ def untyped_supplier_receipt_rows_in_contour(
     if limit and int(limit) > 0:
         query = query.limit(int(limit))
     return tuple(query.all())
+
+
+def repair_non_supplier_receipt_provenance(
+    db: Session, *, expected_generation_id: int, sle_ids: Sequence[int],
+    planning_pool_by_warehouse: Mapping[str, str], odata_client: object,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Explicit metadata maintenance; never allocate or change physical stock.
+
+    Only known non-supplier operations may be added, from exact accepted SLEs
+    and the canonical document extractor. Existing supplier typing or current
+    quantity assignments require a different repair and are rejected.
+    The operator owns the cluster/lifecycle lock and transaction for apply.
+    """
+    ids = tuple(int(value) for value in sle_ids)
+    if not ids or len(ids) > 256 or len(set(ids)) != len(ids) or min(ids) <= 0:
+        raise BoundedSupplierEvidenceError("non-supplier repair requires 1-256 unique positive SLE ids")
+    pointer_query = db.query(models.PlanningTruthState).filter_by(id=1)
+    pointer = pointer_query.one_or_none() if dry_run else pointer_query.with_for_update().one_or_none()
+    if pointer is None or int(pointer.current_generation_id or -1) != int(expected_generation_id):
+        raise BoundedSupplierEvidenceError("non-supplier repair accepted pointer changed")
+    generation = db.get(models.LedgerGeneration, int(expected_generation_id))
+    if generation is None or generation.status != "accepted":
+        raise BoundedSupplierEvidenceError("non-supplier repair requires accepted physical truth")
+    rows = tuple(visible_sle_query_for_generation(db, int(generation.id)).filter(
+        models.StockLedgerEntry.id.in_(ids)).all())
+    if {int(row.id) for row in rows} != set(ids) or any(
+        not is_supplier_document_type(row.recorder_type)
+        or not _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c)))
+        or Decimal(str(row.qty)) == 0 for row in rows
+    ):
+        raise BoundedSupplierEvidenceError("non-supplier repair facts must be accepted in the selected contour")
+    if db.query(models.ReservationConsumptionAllocation.id).filter(
+        models.ReservationConsumptionAllocation.is_current.is_(True),
+        models.ReservationConsumptionAllocation.sle_id.in_(ids),
+    ).first() is not None:
+        raise BoundedSupplierEvidenceError("non-supplier repair cannot erase a current quantity assignment")
+    extraction = extract_supplier_document_evidence(db, odata_client, rows)
+    exclusions = tuple((int(entry.stock_ledger_entry_id), entry.operation_key, entry.operation_name)
+                       for entry in extraction.ignored_stock_ledger_entries)
+    if extraction.diagnostics or extraction.evidence or {entry[0] for entry in exclusions} != set(ids):
+        raise BoundedSupplierEvidenceError("non-supplier repair lacks explicit canonical exclusion evidence")
+    existing = _persisted_scope_evidence(db, ids)
+    row_by_id = {int(row.id): row for row in rows}
+    for sle_id, key, name in exclusions:
+        row = row_by_id[sle_id]
+        kind = non_supplier_operation_kind(row.recorder_type, key, name)
+        if kind is None or (kind == "non_supplier_receipt" and Decimal(str(row.qty)) <= 0) or (
+            kind == "non_supplier_expense" and Decimal(str(row.qty)) >= 0
+        ):
+            raise BoundedSupplierEvidenceError("non-supplier repair operation contradicts physical sign")
+        previous = existing.get(sle_id)
+        if previous is not None and (previous.match_status != "excluded_non_supplier"
+                                     or previous.operation_kind != kind
+                                     or previous.match_rule != "supplier-receipt-non-supplier-exclusion"
+                                     or previous.supplier_order_ref is not None
+                                     or previous.supplier_order_line_no is not None):
+            raise BoundedSupplierEvidenceError("non-supplier repair conflicts with prior supplier typing")
+    if db.query(models.StockLedgerSupplierReceiptProvenance.id).filter(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(ids),
+        models.StockLedgerSupplierReceiptProvenance.operation_kind.notin_(_SUPPLIER_OPERATION_KINDS),
+    ).first() is not None:
+        raise BoundedSupplierEvidenceError("non-supplier repair cannot overwrite unknown prior typing")
+    owned = {int(row.stock_ledger_entry_id) for row in db.query(models.StockLedgerSupplierReceiptProvenance).filter(
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id == generation.id,
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(ids))}
+    missing = tuple(value for value in ids if value not in owned)
+    if not dry_run and missing:
+        from .generation_lifecycle import _persist_non_supplier_receipt_rows
+        _persist_non_supplier_receipt_rows(db, generation_id=int(generation.id), supplier_candidates=rows,
+                                         ignored_stock_ledger_entries=exclusions)
+    return {"generation_id": int(generation.id), "sle_ids": ids, "dry_run": dry_run,
+            "would_create": len(missing), "created": 0 if dry_run else len(missing),
+            "stock_mutations": 0, "allocation_mutations": 0, "idempotent": not missing}
 
 
 _FORWARD_OPERATION = RECEIPT_OPERATION
@@ -631,7 +706,7 @@ def _validate_manifest_shape(
         )
     if bounded_replay and not normalized.scope_receipt_facts and not (
         normalized.supersession_edge_ids and not normalized.new_sle_ids
-    ):
+    ) and not normalized.excluded_supplier_entries:
         raise BoundedSupplierEvidenceError(
             f"{_REJECTED_DELTA_MESSAGE}: complete scope evidence is required"
         )
@@ -644,6 +719,25 @@ def _validate_manifest_shape(
     scopes_by_key: dict[tuple[int, str], list[DistributionScope]] = {}
     for scope in scopes:
         scopes_by_key.setdefault((scope[0], scope[3]), []).append(scope)
+    for sle_id, operation_key, operation_name in normalized.excluded_supplier_entries:
+        row = db.get(models.StockLedgerEntry, int(sle_id))
+        if row is None:
+            raise BoundedSupplierEvidenceError("supplier exclusion references missing SLE")
+        _scope_for_row(row, scopes)
+        kind = non_supplier_operation_kind(_text(row.recorder_type), operation_key, operation_name)
+        if kind is None or (
+            kind == "non_supplier_receipt" and Decimal(str(row.qty)) <= 0
+        ) or (kind == "non_supplier_expense" and Decimal(str(row.qty)) >= 0):
+            raise BoundedSupplierEvidenceError("supplier exclusion contradicts its document operation or sign")
+        lower_bound = normalized.backdate_from if bounded_replay else parent.cutoff
+        if not int(parent.physical_import_batch_id) < int(row.ingest_batch_id) <= int(target.physical_import_batch_id):
+            raise BoundedSupplierEvidenceError("supplier exclusion is outside target import boundary")
+        posting = _comparable_datetime(row.posting_at)
+        if posting is None or posting > _comparable_datetime(target_cutoff) or (
+            posting < _comparable_datetime(lower_bound) if bounded_replay
+            else posting <= _comparable_datetime(lower_bound)
+        ):
+            raise BoundedSupplierEvidenceError("supplier exclusion is outside declared cutoff")
     for fact in normalized.receipt_facts:
         if not isinstance(fact, ReceiptFact):
             raise BoundedSupplierEvidenceError("supplier manifest contains untyped receipt evidence")
@@ -669,7 +763,7 @@ def _validate_manifest_shape(
 
 
 _SUPPLIER_OPERATION_KINDS = (
-    "supplier_receipt", "correction", "supplier_return", "non_supplier_expense",
+    "supplier_receipt", "correction", "supplier_return", "non_supplier_expense", "non_supplier_receipt",
 )
 
 
@@ -728,6 +822,7 @@ def _bounded_scope_receipt_facts(
     scopes: tuple[DistributionScope, ...],
     delta_facts_by_id: dict[int, ReceiptFact],
     planning_pool_by_warehouse: Mapping[str, str] | None,
+    excluded_sle_ids: Sequence[int] = (),
 ) -> tuple[ReceiptFact, ...]:
     """Return the complete signed supplier stream of the affected BUY scopes.
 
@@ -772,13 +867,16 @@ def _bounded_scope_receipt_facts(
         rows_and_scopes.append((row, scope))
     rows = [row for row, _scope in rows_and_scopes]
     evidence_by_id = _persisted_scope_evidence(
-        db, [int(row.id) for row in rows if int(row.id) not in delta_facts_by_id]
+        db, [int(row.id) for row in rows if int(row.id) not in delta_facts_by_id
+             and int(row.id) not in excluded_sle_ids]
     )
     from .physical_visibility import known_revisions_by_sle
 
     first_known = known_revisions_by_sle(db, rows)
     facts: list[ReceiptFact] = []
     for row, scope in rows_and_scopes:
+        if int(row.id) in excluded_sle_ids:
+            continue
         delta = delta_facts_by_id.get(int(row.id))
         if delta is not None:
             facts.append(delta)
@@ -791,20 +889,20 @@ def _bounded_scope_receipt_facts(
             )
         if _text(evidence.match_status) == "excluded_non_supplier":
             if (
-                _text(evidence.operation_kind) != "non_supplier_expense"
+                _text(evidence.operation_kind) not in {"non_supplier_expense", "non_supplier_receipt"}
                 or _text(evidence.match_rule) != "supplier-receipt-non-supplier-exclusion"
                 or evidence.supplier_order_ref is not None
                 or evidence.supplier_order_line_no is not None
-                or not _is_non_supplier_expense_operation(
+                or non_supplier_operation_kind(
                     _text(row.recorder_type), _text(evidence.operation_key),
                     _text(evidence.operation_name),
-                )
+                ) != _text(evidence.operation_kind)
             ):
                 raise BoundedSupplierEvidenceError(
                     f"bounded BUY scope has invalid non-supplier exclusion for SLE {int(row.id)}"
                 )
             continue
-        if _text(evidence.operation_kind) == "non_supplier_expense":
+        if _text(evidence.operation_kind) in {"non_supplier_expense", "non_supplier_receipt"}:
             raise BoundedSupplierEvidenceError(
                 f"bounded BUY scope has invalid non-supplier classification for SLE {int(row.id)}"
             )
@@ -918,6 +1016,7 @@ def build_bounded_supplier_receipt_manifest(
         return BoundedBuyReceiptDeltaManifest()
     facts: list[ReceiptFact] = []
     seen_sle_ids: set[int] = set()
+    excluded_entries: tuple[tuple[int, str, str], ...] = ()
     if rows:
         if odata_client is None:
             raise BoundedSupplierEvidenceError("supplier evidence requires an OData client")
@@ -933,14 +1032,15 @@ def build_bounded_supplier_receipt_manifest(
             int(entry.stock_ledger_entry_id)
             for entry in extraction.ignored_stock_ledger_entries
         }
-        if excluded_ids:
-            raise BoundedSupplierEvidenceError(
-                f"supplier SLEs are excluded non-supplier documents: {sorted(excluded_ids)}"
-            )
+        excluded_entries = tuple(
+            (int(entry.stock_ledger_entry_id), entry.operation_key, entry.operation_name)
+            for entry in extraction.ignored_stock_ledger_entries
+        )
+        eligible_rows = tuple(row for row in rows if int(row.id) not in excluded_ids)
         try:
             normalized_rows = normalize_supplier_receipt_evidence(
                 db,
-                explicit_sles=rows,
+                explicit_sles=eligible_rows,
                 evidence=extraction.evidence,
             )
         except SupplierReceiptEvidenceError as exc:
@@ -967,7 +1067,7 @@ def build_bounded_supplier_receipt_manifest(
                 raise BoundedSupplierEvidenceError("supplier evidence maps one SLE more than once")
             seen_sle_ids.add(fact.sle_id)
             facts.append(fact)
-        expected_ids = {int(row.id) for row in rows}
+        expected_ids = {int(row.id) for row in eligible_rows}
         if seen_sle_ids != expected_ids:
             missing = sorted(expected_ids - seen_sle_ids)
             raise BoundedSupplierEvidenceError(
@@ -983,6 +1083,7 @@ def build_bounded_supplier_receipt_manifest(
             scopes=scopes,
             delta_facts_by_id={int(fact.sle_id): fact for fact in delta_facts},
             planning_pool_by_warehouse=planning_pool_by_warehouse,
+            excluded_sle_ids=tuple(entry[0] for entry in excluded_entries),
         )
         missing = sorted(seen_sle_ids - {int(fact.sle_id) for fact in scope_facts})
         if missing:
@@ -996,6 +1097,7 @@ def build_bounded_supplier_receipt_manifest(
         scope_receipt_facts=scope_facts,
         supersession_edge_ids=tuple(int(value) for value in supersession_edge_ids),
         backdate_from=backdate_from,
+        excluded_supplier_entries=excluded_entries,
     )
     return validate_bounded_supplier_receipt_manifest(
         db,

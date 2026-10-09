@@ -1843,6 +1843,12 @@ def _publish_forward_physical_refresh_current(
         )
         if _phase_tracker is not None:
             _phase_tracker.complete("supplier_manifest")
+        if buy_manifest.excluded_supplier_entries:
+            from .generation_lifecycle import _persist_non_supplier_receipt_rows
+            _persist_non_supplier_receipt_rows(
+                db, generation_id=int(target.id), supplier_candidates=tuple(supplier_rows),
+                ignored_stock_ledger_entries=buy_manifest.excluded_supplier_entries,
+            )
         start_phase("buy")
         buy_result = apply_current_replenishment_for_bounded_buy_scopes(
             db,

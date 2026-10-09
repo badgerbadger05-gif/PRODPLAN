@@ -3275,7 +3275,7 @@ class StockLedgerSupplierReceiptProvenance(Base):
         ),
         CheckConstraint(
             "operation_kind IN ('supplier_receipt', 'correction', "
-            "'supplier_return', 'transfer', 'non_supplier_expense', 'unknown')",
+            "'supplier_return', 'transfer', 'non_supplier_expense', 'non_supplier_receipt', 'unknown')",
             name="ck_supplier_receipt_provenance_operation_kind",
         ),
         CheckConstraint(
@@ -3291,7 +3291,7 @@ class StockLedgerSupplierReceiptProvenance(Base):
             "AND reason IS NOT NULL) "
             "OR (match_status = 'excluded_non_supplier' AND supplier_order_ref IS NULL "
             "AND supplier_order_line_no IS NULL AND ambiguity_count = 0 "
-            "AND operation_kind = 'non_supplier_expense' "
+            "AND operation_kind IN ('non_supplier_expense', 'non_supplier_receipt') "
             "AND operation_key IS NOT NULL AND operation_name IS NOT NULL "
             "AND reason IS NOT NULL)",
             name="ck_supplier_receipt_provenance_match_evidence",

@@ -52,26 +52,39 @@ def _operation_name_compact(value: object) -> str:
     return _operation_name_normalized(value).replace(" ", "")
 
 
-def _is_non_supplier_expense_operation(
+def non_supplier_operation_kind(
     recorder_type: str,
     operation_key: str,
     operation_name: str,
-) -> bool:
-    if recorder_type != "Document_РасходнаяНакладная":
-        return False
+) -> str | None:
 
     operation_key = _guid(operation_key)
     normalized = _operation_name_normalized(operation_name)
     compact = _operation_name_compact(operation_name)
 
+    if recorder_type == "Document_ПриходнаяНакладная":
+        if operation_key.startswith("8d96f3f0") and (
+            normalized == "возврат от переработчика" or compact == "возвратотпереработчика"
+        ):
+            return "non_supplier_receipt"
+        return None
+    if recorder_type != "Document_РасходнаяНакладная":
+        return None
     for (
         allowed_prefix,
         allowed_names,
     ) in _NON_SUPPLIER_EXPENSE_OPERATION_PREFIXES.items():
         if not operation_key.startswith(allowed_prefix):
             continue
-        return normalized in allowed_names or compact in allowed_names
-    return False
+        if normalized in allowed_names or compact in allowed_names:
+            return "non_supplier_expense"
+    return None
+
+
+def _is_non_supplier_expense_operation(
+    recorder_type: str, operation_key: str, operation_name: str,
+) -> bool:
+    return non_supplier_operation_kind(recorder_type, operation_key, operation_name) == "non_supplier_expense"
 
 
 @dataclass(frozen=True)
@@ -391,7 +404,7 @@ def extract_supplier_document_evidence(
             continue
 
         operation_key, operation_name = _operation(doc)
-        if _is_non_supplier_expense_operation(
+        if non_supplier_operation_kind(
             recorder_type,
             operation_key,
             operation_name,

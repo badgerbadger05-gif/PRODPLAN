@@ -14,7 +14,84 @@ from app.services.item_ledger.supplier_receipt_allocation import (
 from app.services.item_ledger.supplier_receipt_odata import (
     SupplierEvidenceDiagnostic,
     SupplierEvidenceExtractionResult,
+    SupplierReceiptExclusion,
 )
+
+
+def _processing_extraction(row):
+    return SupplierEvidenceExtractionResult(evidence=(), diagnostics=(), fetched_document_count=1,
+        ignored_stock_ledger_entries=(SupplierReceiptExclusion(
+            row.id, "8d96f3f0-9934-11eb-e39a-fa163e61326a", "ВозвратОтПереработчика"),))
+
+
+@pytest.mark.parametrize("backdate", [False, True])
+def test_bounded_processing_return_has_no_buy_quantity(db_session, monkeypatch, backdate):
+    parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(db_session, target_batch, item, qty="14")
+    monkeypatch.setattr(adapter, "extract_supplier_document_evidence", lambda *args: _processing_extraction(row))
+    before = db_session.query(models.StockLedgerSupplierReceiptProvenance).count()
+    result = adapter.build_bounded_supplier_receipt_manifest(db_session,
+        parent_generation_id=parent.id, target_generation_id=target.id,
+        target_cutoff=target.cutoff, odata_client=object(), changed_sle_ids=(row.id,),
+        affected_scopes=((item.item_id, "", "", "default", "buy"),),
+        backdate_from=parent.cutoff - timedelta(days=1) if backdate else None,
+        planning_pool_by_warehouse={"wh-ref-1": "default"})
+    assert result.new_sle_ids == result.receipt_facts == result.scope_receipt_facts == ()
+    assert result.excluded_supplier_entries == ((row.id, "8d96f3f0-9934-11eb-e39a-fa163e61326a", "ВозвратОтПереработчика"),)
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == before
+    assert row.qty == Decimal("14")
+
+
+def test_processing_return_exclusion_rejects_negative_receipt(db_session, monkeypatch):
+    parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(db_session, target_batch, item, qty="-14")
+    monkeypatch.setattr(adapter, "extract_supplier_document_evidence", lambda *args: _processing_extraction(row))
+    with pytest.raises(adapter.BoundedSupplierEvidenceError, match="sign"):
+        adapter.build_bounded_supplier_receipt_manifest(db_session,
+            parent_generation_id=parent.id, target_generation_id=target.id,
+            target_cutoff=target.cutoff, odata_client=object(), changed_sle_ids=(row.id,),
+            affected_scopes=((item.item_id, "", "", "default", "buy"),))
+
+
+def test_explicit_processing_return_repair_is_metadata_only_and_idempotent(db_session, monkeypatch):
+    parent, _target, parent_batch, _target_batch, item = _world(db_session)
+    row = _sle(db_session, parent_batch, item, qty="14")
+    monkeypatch.setattr(adapter, "extract_supplier_document_evidence", lambda *args: _processing_extraction(row))
+    args = dict(expected_generation_id=parent.id, sle_ids=(row.id,),
+                planning_pool_by_warehouse={"wh-ref-1": "default"}, odata_client=object())
+    dry = adapter.repair_non_supplier_receipt_provenance(db_session, **args)
+    assert dry["would_create"] == 1 and dry["created"] == 0
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 0
+    applied = adapter.repair_non_supplier_receipt_provenance(db_session, **args, dry_run=False)
+    assert applied["created"] == 1
+    provenance = db_session.query(models.StockLedgerSupplierReceiptProvenance).one()
+    assert provenance.operation_kind == "non_supplier_receipt"
+    assert provenance.match_status == "excluded_non_supplier"
+    assert provenance.supplier_order_ref is None
+    assert Decimal(provenance.evidence_payload["signed_qty"]) == Decimal("14")
+    assert row.qty == Decimal("14")
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+    repeated = adapter.repair_non_supplier_receipt_provenance(db_session, **args, dry_run=False)
+    assert repeated["created"] == 0 and repeated["idempotent"]
+
+
+def test_existing_processing_return_exclusion_does_not_block_supplier_scope(db_session, monkeypatch):
+    parent, target, parent_batch, target_batch, item = _world(db_session)
+    old = _sle(db_session, parent_batch, item, qty="14", ref="processor-return")
+    monkeypatch.setattr(adapter, "extract_supplier_document_evidence", lambda *args: _processing_extraction(old))
+    adapter.repair_non_supplier_receipt_provenance(db_session, expected_generation_id=parent.id,
+        sle_ids=(old.id,), planning_pool_by_warehouse={"wh-ref-1": "default"},
+        odata_client=object(), dry_run=False)
+    changed = _sle(db_session, target_batch, item, qty="16", ref="new-supplier-receipt")
+    monkeypatch.setattr(adapter, "extract_supplier_document_evidence", lambda *args: _fake_result((_fake_evidence(changed),)))
+    result = adapter.build_bounded_supplier_receipt_manifest(db_session,
+        parent_generation_id=parent.id, target_generation_id=target.id,
+        target_cutoff=target.cutoff, odata_client=object(), changed_sle_ids=(changed.id,),
+        affected_scopes=((item.item_id, "", "", "default", "buy"),),
+        backdate_from=parent.cutoff - timedelta(days=1), planning_pool_by_warehouse={"wh-ref-1": "default"})
+    assert [fact.sle_id for fact in result.scope_receipt_facts] == [changed.id]
+    assert result.scope_receipt_facts[0].signed_qty == Decimal("16")
+    assert old.qty == Decimal("14")
 
 
 def _world(db_session):

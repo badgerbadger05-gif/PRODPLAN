@@ -865,6 +865,58 @@ def test_mapped_supplier_receipt_uses_exact_current_buy_owner(db_session, monkey
     assert result.affected_scopes == (f"{item.item_id}:::default:buy",)
 
 
+def test_processor_return_updates_stock_and_exclusion_without_buy_credit(db_session, monkeypatch):
+    from app.services.item_ledger import physical_refresh_supplier_evidence as evidence
+    from app.services.item_ledger.supplier_receipt_odata import SupplierEvidenceExtractionResult, SupplierReceiptExclusion
+
+    parent, target = _generations(db_session)
+    item = models.Item(item_code="PROCESSOR-RETURN", item_name="Processor return")
+    db_session.add(item)
+    db_session.flush()
+    run = models.PlanningRun(status="FIXED_SNAPSHOT", ledger_generation_id=parent.id)
+    db_session.add(run)
+    db_session.flush()
+    requirement = models.MrpRequirement(run_id=run.run_id, item_id=item.item_id,
+        period_from=parent.cutoff.date(), period_to=target.cutoff.date())
+    db_session.add(requirement)
+    db_session.flush()
+    owner = models.ReservationEntry(ledger_generation_id=parent.id, item_id=item.item_id,
+        characteristic_ref="", organization_ref="", planning_stock_pool="default", run_id=run.run_id,
+        requirement_id=requirement.id, priority_period_from=parent.cutoff.date(), priority_period_to=target.cutoff.date(),
+        realization_mode="buy", reserved_qty=Decimal("1"), replenishment_required_qty=Decimal("1"),
+        current_identity="processor-return-buy-owner", owner_kind="current", is_current=True)
+    db_session.add(owner)
+    db_session.add(models.StockBin(ledger_generation_id=parent.id, item_id=item.item_id,
+        warehouse_ref1c="wh", characteristic_ref="", organization_ref="", on_hand=Decimal("0"), is_current=True))
+    row = models.StockLedgerEntry(ingest_batch_id=target.physical_import_batch_id,
+        source_content_hash="processor-return", business_identity="processor-return", item_id=item.item_id,
+        characteristic_ref="", organization_ref="", warehouse_ref1c="wh", qty=Decimal("14"),
+        posting_at=target.cutoff - timedelta(hours=1), record_type="Receipt", movement_kind="receipt",
+        recorder_type="Document_ПриходнаяНакладная", recorder_ref="processor-return", line_no="1", ingest_source="test")
+    db_session.add(row)
+    db_session.commit()
+    _patch_safe_pipeline(monkeypatch, [])
+    monkeypatch.setattr(publisher, "apply_bounded_current_stock_bins", stock_bin.apply_bounded_current_stock_bins)
+    monkeypatch.setattr(evidence, "extract_supplier_document_evidence", lambda *args:
+        SupplierEvidenceExtractionResult(evidence=(), diagnostics=(), fetched_document_count=1,
+            ignored_stock_ledger_entries=(SupplierReceiptExclusion(row.id,
+                "8d96f3f0-9934-11eb-e39a-fa163e61326a", "ВозвратОтПереработчика"),)))
+    publisher.publish_forward_physical_refresh_current(db_session,
+        target_generation_id=target.id, parent_generation_id=parent.id,
+        delta_manifest={"rows": (row,), "supersessions": ()}, odata_client=object(),
+        source_revision=1, planning_pool_by_warehouse={"wh": "default"})
+    bins = db_session.query(models.StockBin).filter_by(is_current=True, item_id=item.item_id).all()
+    assert sum((bin.on_hand for bin in bins), Decimal(0)) == Decimal("14")
+    assert row.qty == Decimal("14")
+    assert owner.reserved_qty == Decimal("1")
+    assert owner.replenishment_received_qty == Decimal("0")
+    assert db_session.query(models.ReservationConsumptionAllocation).filter_by(is_current=True).count() == 0
+    provenance = db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+        ledger_generation_id=target.id, stock_ledger_entry_id=row.id).one()
+    assert provenance.operation_kind == "non_supplier_receipt"
+    assert provenance.match_status == "excluded_non_supplier"
+
+
 def test_assembly_without_owner_or_pool_is_stock_output_only(db_session, monkeypatch):
     parent, target = _generations(db_session)
     item = models.Item(item_code="CP-7", item_name="Current publish item")
