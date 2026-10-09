@@ -341,6 +341,50 @@ def test_materialize_counts_previous_mrp_run_of_same_plan_and_retries(db_session
     assert old_product.source_mrp_requirement_id == older_requirement.id
 
 
+@pytest.mark.parametrize("state", ["fully_produced", "done_order", "cancelled_line"])
+def test_materialize_ignores_finished_retained_executor_without_changing_its_lifecycle(db_session, state):
+    from app.services.production_control_common import DONE_STATE_KEY
+    from app.services.production_control_journal import _active_open_qty_by_requirement
+
+    work, requirement, reservation = _scope(db_session)
+    first = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 3, "expected_materialized_qty": 0},
+    })
+    product = db_session.get(models.ProductionProduct, first["created"][0]["product_id"])
+    order = product.order
+    order.order_ref1c = "already-exported-retained-order"
+    current_run = db_session.get(models.PlanningRun, requirement.run_id)
+    older_run = models.PlanningRun(status="SUPERSEDED", config_snapshot={}, source_plan_id=current_run.source_plan_id)
+    db_session.add(older_run)
+    db_session.flush()
+    older_req = models.MrpRequirement(run_id=older_run.run_id, item_id=requirement.item_id,
+        total_required_qty=3, net_required_qty=3, bom_level=0, freeze_version=1,
+        period_from=requirement.period_from, period_to=requirement.period_to)
+    db_session.add(older_req)
+    db_session.flush()
+    product.source_mrp_requirement_id = older_req.id
+    order.source_run_id = older_run.run_id
+    if state == "fully_produced":
+        product.produced_qty = 3
+        product.remaining_qty = 999  # The compatibility remainder is not truth.
+    elif state == "done_order":
+        order.order_state_key = DONE_STATE_KEY
+    else:
+        product.control_state.status = "cancelled"
+    db_session.commit()
+    frozen = (reservation.reserved_qty, reservation.covered_from_stock_at_freeze_qty,
+              reservation.replenishment_required_qty, reservation.replenishment_received_qty)
+    old_state = (order.order_state_key, product.produced_qty, product.remaining_qty)
+    scope = {(current_run.source_plan_id, requirement.item_id): requirement.id}
+    assert _active_open_qty_by_requirement(db_session, scope).get(requirement.id, 0) == 0
+    result = materialize_make_work_items(db_session, [work.id])
+    assert result["reused"] == []
+    assert sum(row["qty"] for row in result["created"]) == 8
+    assert old_state == (order.order_state_key, product.produced_qty, product.remaining_qty)
+    assert frozen == (reservation.reserved_qty, reservation.covered_from_stock_at_freeze_qty,
+                      reservation.replenishment_required_qty, reservation.replenishment_received_qty)
+
+
 def test_materialize_does_not_count_orders_of_another_plan(db_session):
     work, requirement, _reservation = _scope(db_session)
     first = materialize_make_work_items(db_session, [work.id], launch_requests={

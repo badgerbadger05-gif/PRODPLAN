@@ -87,6 +87,55 @@ def test_materialization_and_read_model_publication_rollback_as_one_command(db_s
     assert db_session.query(models.ProductionOrder).count() == before
 
 
+def test_local_launch_publishes_new_executor_when_retained_order_is_fully_produced(db_session, monkeypatch):
+    from app.services.production_control_journal import materialize_make_work_items
+    from app.services.production_control_journal_projection import publish_local_make_changes
+
+    work, identity, _revision = _current(db_session)
+    current_run = db_session.get(models.PlanningRun, work.run_id)
+    old = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 3, "expected_materialized_qty": 0},
+    })["created"][0]
+    old_product = db_session.get(models.ProductionProduct, old["product_id"])
+    older_run = models.PlanningRun(status="SUPERSEDED", config_snapshot={}, source_plan_id=current_run.source_plan_id)
+    db_session.add(older_run)
+    db_session.flush()
+    req = db_session.get(models.MrpRequirement, work.requirement_id)
+    older_req = models.MrpRequirement(run_id=older_run.run_id, item_id=req.item_id,
+        total_required_qty=3, net_required_qty=3, bom_level=0, freeze_version=1,
+        period_from=req.period_from, period_to=req.period_to)
+    db_session.add(older_req)
+    db_session.flush()
+    old_product.source_mrp_requirement_id = older_req.id
+    old_product.order.source_run_id = older_run.run_id
+    old_product.order.order_ref1c = "completed-retained-1c-order"
+    old_product.produced_qty = 3
+    old_product.remaining_qty = 0
+    db_session.commit()
+
+    def materials(db, ids, **kwargs):
+        assert old_product.product_id not in ids
+        return {pid: {"qty": float(db.get(models.ProductionProduct, pid).quantity),
+                      "components": [], "coverage_status": "ready"} for pid in ids}
+    monkeypatch.setattr("app.services.production_control_material_availability.preview_materials_bulk", materials)
+    monkeypatch.setattr("app.services.production_control_journal_projection.build_route_sheet_snapshot_payloads",
+        lambda db, product_ids, **kwargs: {pid: {"version": 1, "sheet": {}} for pid in product_ids})
+    monkeypatch.setattr("app.services.production_control_material_availability.preview_make_work_item_materials",
+        lambda *args, **kwargs: {"qty": kwargs["quantity"], "components": [], "coverage_status": "ready", "coverage_label": "Обеспечен"})
+    result = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {"launch_qty": 3, "expected_materialized_qty": 0},
+    }, _commit=False)
+    new_pid = result["created"][0]["product_id"]
+    publish_local_make_changes(db_session, [work.id])
+    db_session.commit()
+    rows = db_session.query(models.CurrentExecutionRow).filter_by(entity_kind="production_control_journal").all()
+    assert any(row.payload.get("product_id") == new_pid for row in rows)
+    assert not any(row.payload.get("product_id") == old_product.product_id for row in rows)
+    assert next(row for row in rows if row.business_identity == identity).payload["launchable_qty"] == 5
+    assert old_product.order.order_ref1c == "completed-retained-1c-order"
+    assert old_product.order.order_state_key is None
+
+
 def test_command_worker_does_not_race_physical_publication(monkeypatch):
     from app.services import production_control_command_worker as worker
     from app.services.item_ledger import physical_refresh_orchestrator as physical

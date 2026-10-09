@@ -52,6 +52,7 @@ from .mrp_mutation_guard import (
 from .bom_specification_resolver import BomSpecificationResolver
 from .item_ledger.production_output_cache import (
     accepted_product_output,
+    accepted_product_remaining_expr,
     update_accepted_product_output_cache,
 )
 from .item_ledger.r3_contract import current_live_run
@@ -202,7 +203,11 @@ def _active_mrp_product_scope(db: Session):
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .join(MrpRequirement, MrpRequirement.id == ProductionProduct.source_mrp_requirement_id)
         .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionOrder.source == "mrp", ProductionOrder.deletion_mark.is_(False))
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
+        .filter(accepted_product_remaining_expr(ProductionProduct.quantity, ProductionProduct.produced_qty) > 0)
     )
 
 
