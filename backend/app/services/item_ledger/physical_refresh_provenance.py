@@ -20,10 +20,14 @@ from app.services.production_material_custody_events import _custody_event_idemp
 from app.services.production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
     _append_terminal_custody_releases,
+    _moscow_wall_time,
+    _projection_baseline_candidates,
     _same_1c_timestamp,
     _visible_source_sle_for_event,
     replay_bounded_material_custody_cells,
 )
+from app.services.production_control_common import DONE_STATE_KEY
+from app.services.item_ledger.recorder_identity import build_recorder_identity_index
 from .physical_visibility import PhysicalVisibilityError, visible_sle_query
 
 
@@ -208,6 +212,164 @@ def _custody_event_watermark(db: Session) -> int:
         .scalar()
         or 0
     )
+
+
+def _prebaseline_manual_workshop_declaration_keys(
+    db: Session,
+    *,
+    events: list[models.ProductionMaterialCustodyEvent],
+    rows_by_key: dict[tuple[int, int, str, str], models.ProductionMaterialCustodyProjection],
+    parent: models.LedgerGeneration,
+    target: models.LedgerGeneration,
+    parent_batch: int,
+) -> set[tuple[int, int, str, str]]:
+    """Prove first manual receipts that predate every retained replay baseline.
+
+    A targeted repair can discover an old, positive manual transfer whose
+    exact physical row was already visible to the accepted parent.  When that
+    receipt predates the first retained custody baseline, bounded replay has
+    no earlier seed by construction.  Admit only the original declaration of
+    one otherwise empty workshop cell.  Revisions, issues, transit rows,
+    ambiguous order attribution, and orders not observed DONE at the parent
+    cutoff remain on the ordinary replay path and therefore fail closed when
+    no canonical basis exists.
+    """
+    if not events:
+        return set()
+
+    baseline_cutoffs = []
+    for generation_id in _projection_baseline_candidates(
+        db, cutoff=parent.cutoff, current_generation_id=int(target.id),
+    ):
+        generation = db.get(models.LedgerGeneration, int(generation_id))
+        if generation is not None and generation.cutoff is not None:
+            baseline_cutoffs.append(generation.cutoff)
+    if not baseline_cutoffs:
+        return set()
+
+    by_key: dict[
+        tuple[int, int, str, str],
+        list[models.ProductionMaterialCustodyEvent],
+    ] = {}
+    for event in events:
+        key = (
+            int(event.product_id), int(event.component_item_id),
+            str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
+        )
+        by_key.setdefault(key, []).append(event)
+
+    declarations: set[tuple[int, int, str, str]] = set()
+    parent_cutoff_wall = _moscow_wall_time(parent.cutoff)
+    for key, key_events in by_key.items():
+        # Multiple tail facts on one key are chronology, not a first
+        # declaration.  Likewise an existing compact cell always has a basis
+        # that must be reconstructed rather than appended to.
+        if len(key_events) != 1 or key in rows_by_key:
+            continue
+        event = key_events[0]
+        qty = Decimal(str(event.delta_qty or 0))
+        if (
+            event.source_sle_id is None
+            or event.issue_id is not None
+            or str(event.source_kind or "") != "transfer_posted"
+            or str(event.location_kind or "") != "workshop"
+            or qty <= 0
+            or not str(event.source_ref2c or "").strip()
+            or event.source_ref1c is not None
+            or event.document_number is not None
+            or event.effective_at is None
+        ):
+            continue
+        event_moment, parent_moment = _ordered_1c_timestamps(
+            event.effective_at, parent.cutoff,
+        )
+        if event_moment > parent_moment:
+            continue
+        if not all(
+            _ordered_1c_timestamps(event.effective_at, cutoff)[0]
+            < _ordered_1c_timestamps(event.effective_at, cutoff)[1]
+            for cutoff in baseline_cutoffs
+        ):
+            continue
+
+        prior = (
+            db.query(models.ProductionMaterialCustodyEvent.id)
+            .filter(models.ProductionMaterialCustodyEvent.id < int(event.id))
+            .filter(models.ProductionMaterialCustodyEvent.product_id == key[0])
+            .filter(models.ProductionMaterialCustodyEvent.component_item_id == key[1])
+            .filter(models.ProductionMaterialCustodyEvent.location_kind == key[2])
+            .filter(models.ProductionMaterialCustodyEvent.warehouse_ref1c == key[3])
+            .first()
+        )
+        if prior is not None:
+            continue
+
+        source = db.get(models.StockLedgerEntry, int(event.source_sle_id))
+        parent_source = _visible_source_sle_for_event(
+            db, event=event, physical_import_batch_id=int(parent_batch),
+            cutoff=parent.cutoff,
+        )
+        if (
+            source is None or parent_source is None
+            or int(parent_source.id) != int(source.id)
+            or str(source.recorder_type or "") != "Document_ПеремещениеЗапасов"
+            or str(source.record_type or "") != "Receipt"
+            or str(source.movement_kind or "") != "transfer_in"
+            or str(source.recorder_ref or "").strip()
+            != str(event.source_ref2c or "").strip()
+            or int(source.item_id) != key[1]
+            or str(source.warehouse_ref1c or "") != key[3]
+            or Decimal(str(source.qty or 0)) != qty
+            or not _same_1c_timestamp(source.posting_at, event.effective_at)
+            or str(event.document_line_no or "") != str(source.line_no or "")
+        ):
+            continue
+
+        recorder_ref = str(source.recorder_ref or "").strip()
+        pulls = (
+            db.query(models.StockRecorderPull)
+            .filter(models.StockRecorderPull.recorder_type == source.recorder_type)
+            .filter(models.StockRecorderPull.recorder_ref == recorder_ref)
+            .all()
+        )
+        if (
+            len(pulls) != 1
+            or str(pulls[0].status or "") != "done"
+            or str(pulls[0].source or "") != "physical_refresh_targeted_repair"
+            or not str(pulls[0].order_ref or "").strip()
+        ):
+            continue
+        if (
+            db.query(models.SyncLink.link_id)
+            .filter(models.SyncLink.target_ref_key == recorder_ref)
+            .first()
+            is not None
+        ):
+            continue
+
+        product = db.get(models.ProductionProduct, key[0])
+        order = (
+            db.get(models.ProductionOrder, int(product.order_id))
+            if product is not None else None
+        )
+        identity = build_recorder_identity_index(db, [recorder_ref])
+        if (
+            product is None or order is None
+            or identity.order_ids.get(recorder_ref, set()) != {int(order.order_id)}
+            or str(order.order_ref1c or "").strip()
+            != str(pulls[0].order_ref or "").strip()
+            or str(order.order_state_key or "") != DONE_STATE_KEY
+            or order.updated_at is None
+            or _moscow_wall_time(order.updated_at)
+            < _moscow_wall_time(event.effective_at)
+            or _moscow_wall_time(order.updated_at) > parent_cutoff_wall
+            or db.query(models.ProductionProduct.product_id)
+            .filter(models.ProductionProduct.order_id == int(order.order_id))
+            .count() != 1
+        ):
+            continue
+        declarations.add(key)
+    return declarations
 
 
 def canonical_issue_backfill_source_ids(
@@ -663,13 +825,6 @@ def apply_bounded_current_material_custody_events(
         and _ordered_1c_timestamps(event.effective_at, parent.cutoff)[0]
         <= _ordered_1c_timestamps(event.effective_at, parent.cutoff)[1]
     ]
-    replay_keys = correction_keys | {
-        (
-            int(event.product_id), int(event.component_item_id),
-            str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
-        )
-        for event in late_physical_events
-    }
 
     current_rows = (
         db.query(models.ProductionMaterialCustodyProjection)
@@ -698,13 +853,35 @@ def apply_bounded_current_material_custody_events(
         ): row
         for row in current_rows
     }
+    declaration_keys = _prebaseline_manual_workshop_declaration_keys(
+        db,
+        events=late_physical_events,
+        rows_by_key=rows_by_key,
+        parent=parent,
+        target=target,
+        parent_batch=parent_batch,
+    )
+    late_physical_keys = {
+        (
+            int(event.product_id), int(event.component_item_id),
+            str(event.location_kind or ""), str(event.warehouse_ref1c or ""),
+        )
+        for event in late_physical_events
+    }
+    # Declaration classification is complete before replay selection.  A
+    # replay failure is never reinterpreted as a declaration.
+    replay_keys = correction_keys | (late_physical_keys - declaration_keys)
     if replay_keys:
         replay_events = tuple(corrected_events) + tuple(
             event for event in tail
             if event.source_sle_id is not None
             and (
                 int(event.source_sle_id) in connected_ids
-                or event in late_physical_events
+                or (
+                    int(event.product_id), int(event.component_item_id),
+                    str(event.location_kind or ""),
+                    str(event.warehouse_ref1c or ""),
+                ) in replay_keys
             )
         )
         earliest = min(

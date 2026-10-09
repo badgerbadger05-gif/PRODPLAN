@@ -853,6 +853,250 @@ def test_terminal_release_guard_rejects_wrong_persisted_delta(db_session, monkey
         )
 
 
+def _prebaseline_manual_receipt_world(db, *, replayable_count=0, declaration_count=1):
+    parent, target, _current, _existing = _world(db)
+    parent.cutoff = datetime(2026, 10, 9, 13, 22, 5)
+    parent.physical_import_batch.cutoff = parent.cutoff
+    target.cutoff = datetime(2026, 10, 9, 14, 27, 24)
+    target.physical_import_batch.cutoff = target.cutoff
+    parent_manifest = db.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id,
+    )
+    parent_manifest.cutoff = parent.cutoff
+
+    baseline = _building_generation(
+        db, key="prebaseline-manual-explicit",
+        cutoff=datetime(2026, 6, 2, 17, 12),
+    )
+    baseline.status = "accepted"
+    baseline.accepted_at = baseline.cutoff
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=baseline.id, baseline_generation_id=baseline.id,
+        cutoff=baseline.cutoff, status="complete", is_baseline=True,
+        source_event_high_watermark_id=0,
+    ))
+
+    entries = []
+    events = []
+    rows = []
+
+    def receipt(index, *, before_baseline, done):
+        item = models.Item(
+            item_code=f"PREBASELINE-{index:03d}", item_name=f"receipt {index}",
+        )
+        order = models.ProductionOrder(
+            order_number=f"PREBASELINE-ORDER-{index:03d}",
+            order_date=datetime(2026, 6, 1),
+            order_ref1c=f"prebaseline-order-{index:03d}",
+            order_state_key=DONE_STATE_KEY if done else None,
+            updated_at=(
+                datetime(2026, 6, 26, 12, 0)
+                if done else datetime(2026, 7, 2, 12, 0)
+            ),
+        )
+        db.add_all([item, order])
+        db.flush()
+        product = models.ProductionProduct(
+            order_id=order.order_id, item_id=item.item_id,
+            quantity=Decimal("1"), remaining_qty=Decimal("1"),
+            produced_qty=Decimal("0"),
+        )
+        db.add(product)
+        db.flush()
+        recorder_ref = f"prebaseline-transfer-{index:03d}"
+        posting_at = (
+            datetime(2026, 6, 1, 10, 0) + timedelta(minutes=index)
+            if before_baseline
+            else datetime(2026, 7, 1, 10, 0) + timedelta(minutes=index)
+        )
+        sle = models.StockLedgerEntry(
+            ingest_batch_id=parent.physical_import_batch_id,
+            source_content_hash=f"prebaseline-source-{index:03d}",
+            business_identity=f"prebaseline-business-{index:03d}",
+            item_id=item.item_id, characteristic_ref="", organization_ref="org",
+            warehouse_ref1c=f"PREBASELINE-WH-{index:03d}",
+            qty=Decimal("2.000"), posting_at=posting_at,
+            record_type="Receipt", movement_kind="transfer_in",
+            recorder_type="Document_ПеремещениеЗапасов",
+            recorder_ref=recorder_ref, line_no="1", ingest_source="pull",
+            active=True,
+        )
+        db.add(sle)
+        db.flush()
+        event = models.ProductionMaterialCustodyEvent(
+            issue_id=None, product_id=product.product_id,
+            component_item_id=item.item_id, source_kind="transfer_posted",
+            source_sle_id=sle.id, effective_at=posting_at,
+            location_kind="workshop", warehouse_ref1c=sle.warehouse_ref1c,
+            source_ref1c=None, source_ref2c=recorder_ref,
+            delta_qty=Decimal("2.000"),
+            idempotency_key=f"prebaseline-event-{index:03d}",
+            document_number=None, document_line_no="1",
+        )
+        db.add(event)
+        if before_baseline:
+            db.add(models.StockRecorderPull(
+                recorder_type=sle.recorder_type, recorder_ref=recorder_ref,
+                status="done", source="physical_refresh_targeted_repair",
+                order_ref=order.order_ref1c,
+            ))
+        db.flush()
+        entries.append(sle)
+        events.append(event)
+        rows.append((item, order, product, sle, event))
+
+    for index in range(declaration_count):
+        receipt(index, before_baseline=True, done=True)
+    for index in range(declaration_count, declaration_count + replayable_count):
+        receipt(index, before_baseline=False, done=False)
+    db.flush()
+    return parent, target, baseline, entries, events, rows
+
+
+def test_prebaseline_manual_declarations_mix_with_47_replayable_keys(db_session):
+    parent, target, baseline, entries, events, rows = (
+        _prebaseline_manual_receipt_world(
+            db_session, replayable_count=47, declaration_count=4,
+        )
+    )
+    source_quantities = tuple(row.qty for row in entries)
+    event_quantities = tuple(row.delta_qty for row in events)
+    frozen_order_quantities = tuple(
+        (row[2].quantity, row[2].remaining_qty, row[2].produced_qty)
+        for row in rows
+    )
+
+    folded = apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        source_sle_ids=tuple(row.id for row in entries),
+    )
+
+    assert folded == 55  # 51 physical facts plus four terminal releases.
+    assert tuple(row.qty for row in entries) == source_quantities
+    assert tuple(row.delta_qty for row in events) == event_quantities
+    assert tuple(
+        (row[2].quantity, row[2].remaining_qty, row[2].produced_qty)
+        for row in rows
+    ) == frozen_order_quantities
+    current = db_session.query(models.ProductionMaterialCustodyProjection).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True),
+        models.ProductionMaterialCustodyProjection.product_id.in_(
+            [row[2].product_id for row in rows]
+        ),
+    ).all()
+    assert len(current) == 47
+    assert {row.product_id for row in current} == {
+        row[2].product_id for row in rows[4:]
+    }
+    assert {Decimal(str(row.reserved_qty)) for row in current} == {Decimal("2")}
+    releases = db_session.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.source_kind == "terminal_release",
+        models.ProductionMaterialCustodyEvent.product_id.in_(
+            [row[2].product_id for row in rows[:4]]
+        ),
+    ).all()
+    assert len(releases) == 4
+    assert all(Decimal(str(row.delta_qty)) == Decimal("-2.000") for row in releases)
+    assert baseline.cutoff > max(row[4].effective_at for row in rows[:4])
+    assert baseline.cutoff < min(row[4].effective_at for row in rows[4:])
+    event_count = db_session.query(models.ProductionMaterialCustodyEvent.id).count()
+    assert apply_bounded_current_material_custody_events(
+        db_session, parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        source_sle_ids=tuple(row.id for row in entries),
+    ) == 0
+    assert db_session.query(models.ProductionMaterialCustodyEvent.id).count() == event_count
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "open", "terminal_before_receipt", "ambiguous_product", "missing_pull",
+        "sync_link", "existing_cell", "prior_history", "transit", "negative",
+    ],
+)
+def test_prebaseline_manual_declaration_exception_stays_fail_closed(
+    db_session, mutation,
+):
+    parent, target, _baseline, entries, events, rows = (
+        _prebaseline_manual_receipt_world(
+            db_session, replayable_count=0, declaration_count=1,
+        )
+    )
+    item, order, product, sle, event = rows[0]
+    if mutation == "open":
+        order.order_state_key = None
+    elif mutation == "terminal_before_receipt":
+        order.updated_at = event.effective_at - timedelta(seconds=1)
+    elif mutation == "ambiguous_product":
+        db_session.add(models.ProductionProduct(
+            order_id=order.order_id, item_id=item.item_id, line_number=2,
+            quantity=Decimal("1"), remaining_qty=Decimal("1"),
+            produced_qty=Decimal("0"),
+        ))
+    elif mutation == "missing_pull":
+        db_session.query(models.StockRecorderPull).filter_by(
+            recorder_ref=sle.recorder_ref,
+        ).delete(synchronize_session=False)
+    elif mutation == "sync_link":
+        db_session.add(models.SyncLink(
+            source_system="PRODPLAN", source_doctype="material_issue",
+            source_id=999001, target_system="1C",
+            target_entity="Document_ПеремещениеЗапасов",
+            target_ref_key=sle.recorder_ref, status="success",
+        ))
+    elif mutation == "existing_cell":
+        db_session.add(models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=parent.id, product_id=product.product_id,
+            component_item_id=item.item_id, location_kind="workshop",
+            warehouse_ref1c=sle.warehouse_ref1c, reserved_qty=Decimal("1"),
+            source_event_high_watermark_id=0, is_current=True,
+        ))
+    elif mutation == "prior_history":
+        db_session.delete(event)
+        db_session.flush()
+        prior = models.ProductionMaterialCustodyEvent(
+            product_id=product.product_id, component_item_id=item.item_id,
+            source_kind="baseline", effective_at=event.effective_at - timedelta(days=1),
+            location_kind="workshop", warehouse_ref1c=sle.warehouse_ref1c,
+            delta_qty=Decimal("1"), idempotency_key="prebaseline-prior-history",
+        )
+        db_session.add(prior)
+        db_session.flush()
+        parent_manifest = db_session.get(
+            models.ProductionMaterialCustodyProjectionManifest, parent.id,
+        )
+        parent_manifest.source_event_high_watermark_id = prior.id
+        for current_row in db_session.query(
+            models.ProductionMaterialCustodyProjection
+        ).filter_by(is_current=True):
+            current_row.source_event_high_watermark_id = prior.id
+        # Preserve the tested receipt as the tail fact after prior history.
+        event = models.ProductionMaterialCustodyEvent(
+            issue_id=None, product_id=product.product_id,
+            component_item_id=item.item_id, source_kind="transfer_posted",
+            source_sle_id=sle.id, effective_at=sle.posting_at,
+            location_kind="workshop", warehouse_ref1c=sle.warehouse_ref1c,
+            source_ref2c=sle.recorder_ref, delta_qty=Decimal("2.000"),
+            idempotency_key="prebaseline-event-recreated",
+            document_line_no=sle.line_no,
+        )
+        db_session.add(event)
+    elif mutation == "transit":
+        event.location_kind = "transit"
+    else:
+        event.delta_qty = Decimal("-2.000")
+    db_session.flush()
+
+    with pytest.raises(PhysicalRefreshProvenanceUnavailable):
+        apply_bounded_current_material_custody_events(
+            db_session, parent_generation_id=parent.id,
+            target_generation_id=target.id,
+            source_sle_ids=tuple(row.id for row in entries),
+        )
+
+
 def test_new_physical_cutoff_releases_unrelated_closed_current_hold_only(db_session):
     parent, target, _current, closed = _world(db_session)
     target.cutoff = parent.cutoff + timedelta(days=1)
