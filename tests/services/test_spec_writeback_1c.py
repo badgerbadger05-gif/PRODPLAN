@@ -20,6 +20,8 @@ OLD_PIN = "60000000-0000-0000-0000-000000000001"
 KIND = "70000000-0000-0000-0000-000000000001"
 OPERATION = "80000000-0000-0000-0000-000000000001"
 MATERIAL = "90000000-0000-0000-0000-000000000001"
+UOM = "90000000-0000-0000-0000-000000000002"
+OPERATION_B = "80000000-0000-0000-0000-000000000002"
 
 
 def _row(nom, qty, stage, spec, **extra):
@@ -192,11 +194,13 @@ def _full_spec(
     version="v1",
     description="spec",
     characteristic=wb.ZERO_GUID,
+    etag='W/"v1"',
 ):
     return {
         "Ref_Key": ref,
         "Owner_Key": owner,
         "DataVersion": version,
+        "@odata.etag": etag,
         "Code": "AUTO",
         "Description": description,
         "DeletionMark": False,
@@ -251,12 +255,13 @@ class _GuardedClient:
             ]
         raise AssertionError(entity)
 
-    def patch(self, endpoint, payload):
-        self.patches.append((endpoint, copy.deepcopy(payload)))
+    def patch(self, endpoint, payload, if_match=None):
+        self.patches.append((endpoint, copy.deepcopy(payload), if_match))
         if endpoint.startswith(wb.SPEC_ENTITY):
             ref = re.search(r"guid'([^']+)'", endpoint).group(1).lower()
             self.specs[ref].update(copy.deepcopy(payload))
             self.specs[ref]["DataVersion"] = "v2"
+            self.specs[ref]["@odata.etag"] = 'W/"v2"'
         else:
             refs = re.findall(r"guid'([^']+)'", endpoint)
             item, characteristic = (value.lower() for value in refs)
@@ -295,8 +300,8 @@ class _ReorderingGuardedClient(_GuardedClient):
         super().__init__(specs)
         self.mutate_quantity = mutate_quantity
 
-    def patch(self, endpoint, payload):
-        response = super().patch(endpoint, payload)
+    def patch(self, endpoint, payload, **kwargs):
+        response = super().patch(endpoint, payload, **kwargs)
         if endpoint.startswith(wb.SPEC_ENTITY):
             ref = re.search(r"guid'([^']+)'", endpoint).group(1).lower()
             record = self.specs[ref]
@@ -344,6 +349,9 @@ def test_guarded_batch_is_one_parent_patch_and_preserves_unknown_fields_and_line
             _change("40", CHAR_A, target=TARGET_B, old_pin=OLD_PIN),
         ],
         expected_data_version="v1",
+        expected_etag='W/"v1"',
+        concurrency_runtime_validated=True,
+        parent_edit_policy="safe_unused_editable",
         dry_run=False,
     )
 
@@ -387,6 +395,9 @@ def test_guarded_batch_accepts_readback_reordering_by_numeric_line_number():
         parent_spec_ref=PARENT_SPEC,
         row_changes=[_change("1", wb.ZERO_GUID)],
         expected_data_version="v1",
+        expected_etag='W/"v1"',
+        concurrency_runtime_validated=True,
+        parent_edit_policy="safe_unused_editable",
         dry_run=False,
     )
 
@@ -420,6 +431,9 @@ def test_guarded_batch_rejects_reordered_readback_with_changed_quantity():
             parent_spec_ref=PARENT_SPEC,
             row_changes=[_change("1", wb.ZERO_GUID)],
             expected_data_version="v1",
+            expected_etag='W/"v1"',
+            concurrency_runtime_validated=True,
+            parent_edit_policy="safe_unused_editable",
             dry_run=False,
         )
 
@@ -511,6 +525,9 @@ def test_guarded_batch_pins_existing_assembly_and_guards_expected_old_pin():
         parent_spec_ref=PARENT_SPEC,
         row_changes=[change],
         expected_data_version="v1",
+        expected_etag='W/"v1"',
+        concurrency_runtime_validated=True,
+        parent_edit_policy="safe_unused_editable",
         dry_run=False,
     )
 
@@ -764,3 +781,429 @@ def test_default_writer_rejects_target_with_other_product_characteristic():
             target_spec_ref=TARGET_A,
             expect_absent=True,
         )
+
+
+# ---------- lossless merged create / guarded compensation ----------
+
+
+def _merged_inputs():
+    header = _creation_template()
+    header["UnknownMergedHeader"] = {"preserve": [1, 2]}
+    composition = []
+    for index, item in enumerate((MATERIAL, ITEM_B, PARENT_OWNER), start=1):
+        composition.append(
+            {
+                "Ref_Key": OLD_PIN,
+                "LineNumber": str(index * 10),
+                "ТипСтрокиСостава": "Материал",
+                "Номенклатура_Key": item,
+                "Характеристика_Key": wb.ZERO_GUID,
+                "Спецификация_Key": wb.ZERO_GUID,
+                "ЕдиницаИзмерения": UOM,
+                "Количество": index * 1.25,
+                "КоличествоПродукции": 2.5,
+                "Этап_Key": KIND,
+                "UnknownMaterial": {"index": index},
+            }
+        )
+    operations = [
+        {
+            "Ref_Key": OLD_PIN,
+            "LineNumber": "1",
+            "Операция_Key": OPERATION,
+            "НормаВремени": 0.5,
+            "Количество": 1,
+            "КоличествоПродукции": 2.5,
+            "Этап_Key": KIND,
+            "UnknownOperation": "first occurrence",
+        },
+        {
+            "Ref_Key": OLD_PIN,
+            "LineNumber": "2",
+            "Операция_Key": OPERATION,
+            "НормаВремени": 0.75,
+            "Количество": 2,
+            "КоличествоПродукции": 2.5,
+            "Этап_Key": KIND,
+            "UnknownOperation": "second occurrence",
+        },
+        {
+            "Ref_Key": OLD_PIN,
+            "LineNumber": "3",
+            "Операция_Key": OPERATION_B,
+            "НормаВремени": 1.25,
+            "Количество": 3,
+            "КоличествоПродукции": 2.5,
+            "Этап_Key": KIND,
+            "UnknownOperation": "third",
+        },
+    ]
+    provenance = []
+    for index, operation in enumerate(operations, start=1):
+        provenance.append(
+            {
+                "source_spec_ref": OLD_PIN,
+                "source_operation_ref": operation["Операция_Key"],
+                "source_line_number": operation["LineNumber"],
+                "source_occurrence": index,
+                "source_edge_identity": f"edge:{index}",
+                "target_occurrence": index,
+            }
+        )
+    return header, composition, operations, provenance
+
+
+def _merged_kwargs():
+    header, composition, operations, provenance = _merged_inputs()
+    return {
+        "header_template": header,
+        "new_spec_ref": TARGET_A,
+        "new_owner_ref": ITEM_A,
+        "production_kind_ref": KIND,
+        "product_characteristic_ref": wb.ZERO_GUID,
+        "composition_rows": composition,
+        "operation_rows": operations,
+        "operation_provenance": provenance,
+        "description": "merged",
+    }
+
+
+def test_merged_create_preserves_three_rows_three_ops_unknown_fields_and_denominators():
+    payload = wb.build_merged_specification_create_payload(**_merged_kwargs())
+    assert payload["Ref_Key"] == TARGET_A
+    assert payload["UnknownMergedHeader"] == {"preserve": [1, 2]}
+    assert len(payload["Состав"]) == len(payload["Операции"]) == 3
+    assert [row["КоличествоПродукции"] for row in payload["Состав"]] == [2.5] * 3
+    assert [row["КоличествоПродукции"] for row in payload["Операции"]] == [2.5] * 3
+    assert [row["Операция_Key"] for row in payload["Операции"]] == [
+        OPERATION,
+        OPERATION,
+        OPERATION_B,
+    ]
+    assert payload["Операции"][1]["UnknownOperation"] == "second occurrence"
+    assert all(row["Ref_Key"] == TARGET_A for row in payload["Состав"] + payload["Операции"])
+    for readonly in ("Code", "DataVersion", "Predefined", "PredefinedDataName"):
+        assert readonly not in payload
+
+
+def test_merged_create_preview_is_default_and_never_posts():
+    client = _GuardedClient({})
+    result = wb.writeback_create_merged_specification(client, **_merged_kwargs())
+    assert result["status"] == "preview"
+    assert client.posts == []
+
+
+def test_merged_create_is_uuid_idempotent_and_rejects_collision():
+    client = _GuardedClient({})
+    kwargs = _merged_kwargs()
+    created = wb.writeback_create_merged_specification(
+        client, **kwargs, mutation_mode=wb.MUTATION_APPLY_GUARDED
+    )
+    assert created["status"] == "created"
+    repeated = wb.writeback_create_merged_specification(
+        client, **kwargs, mutation_mode=wb.MUTATION_APPLY_GUARDED
+    )
+    assert repeated["status"] == "already_applied"
+    assert len(client.posts) == 1
+
+    collision = _GuardedClient({TARGET_A: _full_spec(TARGET_A, ITEM_A)})
+    with pytest.raises(wb.SpecWritebackError, match="read-back"):
+        wb.writeback_create_merged_specification(collision, **kwargs)
+
+
+def test_merged_create_fails_when_post_readback_is_missing():
+    class MissingReadbackClient(_GuardedClient):
+        def post(self, endpoint, payload):
+            self.posts.append((endpoint, copy.deepcopy(payload)))
+            return {"ok": True}
+
+    client = MissingReadbackClient({})
+    with pytest.raises(wb.SpecWritebackError, match="Ожидалась ровно 1"):
+        wb.writeback_create_merged_specification(
+            client, **_merged_kwargs(), mutation_mode=wb.MUTATION_APPLY_GUARDED
+        )
+
+
+def test_merged_create_rejects_named_operation_substitution():
+    kwargs = _merged_kwargs()
+    kwargs["operation_provenance"][0]["source_operation_ref"] = OPERATION_B
+    with pytest.raises(wb.SpecWritebackError, match="named operation GUID changed"):
+        wb.build_merged_specification_create_payload(**kwargs)
+
+
+def test_merged_create_preserves_valid_onec_node_row_with_explicit_pin():
+    kwargs = _merged_kwargs()
+    row = kwargs["composition_rows"][0]
+    row["ТипСтрокиСостава"] = wb.NODE_ROW_TYPE
+    row["Спецификация_Key"] = TARGET_B
+    payload = wb.build_merged_specification_create_payload(**kwargs)
+    assert payload["Состав"][0]["ТипСтрокиСостава"] == "Узел"
+    assert payload["Состав"][0]["Спецификация_Key"] == TARGET_B
+
+
+def test_version_clone_can_preserve_empty_operations_or_zero_existing_time():
+    empty = _merged_kwargs()
+    empty["operation_rows"] = []
+    empty["operation_provenance"] = []
+    empty["require_operations"] = False
+    payload = wb.build_merged_specification_create_payload(**empty)
+    assert payload["Операции"] == []
+
+    zero = _merged_kwargs()
+    zero["operation_rows"][0]["НормаВремени"] = 0
+    zero["allow_zero_operation_time"] = True
+    payload = wb.build_merged_specification_create_payload(**zero)
+    assert payload["Операции"][0]["НормаВремени"] == 0
+
+    legacy = _merged_kwargs()
+    legacy["composition_rows"][0]["Спецификация_Key"] = TARGET_B
+    legacy["composition_rows"][1]["ТипСтрокиСостава"] = "Сборка"
+    legacy["composition_rows"][1]["Спецификация_Key"] = wb.ZERO_GUID
+    legacy["preserve_existing_row_semantics"] = True
+    payload = wb.build_merged_specification_create_payload(**legacy)
+    assert payload["Состав"][0]["Спецификация_Key"] == TARGET_B
+    assert payload["Состав"][1]["Спецификация_Key"] == wb.ZERO_GUID
+
+
+def test_parent_unknown_or_used_requires_version_and_does_not_patch():
+    row = _guarded_row("1", ITEM_A, wb.ZERO_GUID, "Сборка", OLD_PIN)
+    client = _GuardedClient(
+        {
+            PARENT_SPEC: _full_spec(PARENT_SPEC, PARENT_OWNER, [row]),
+            TARGET_A: _full_spec(TARGET_A, ITEM_A),
+        }
+    )
+    change = _change("1", wb.ZERO_GUID, old_pin=OLD_PIN)
+    change["old_row_type"] = "Сборка"
+    blocked = wb.writeback_promote_material_rows(
+        client,
+        parent_spec_ref=PARENT_SPEC,
+        row_changes=[change],
+        expected_data_version="v1",
+        parent_edit_policy="unknown",
+        dry_run=False,
+    )
+    assert blocked["status"] == "blocked_requires_parent_version"
+    versioned = wb.writeback_promote_material_rows(
+        client,
+        parent_spec_ref=PARENT_SPEC,
+        row_changes=[change],
+        expected_data_version="v1",
+        parent_edit_policy="used_or_historical",
+        dry_run=False,
+    )
+    assert versioned["status"] == "new_parent_version_required"
+    assert client.patches == []
+
+
+def test_parent_standard_onec_contract_sends_raw_data_version_if_match():
+    row = _guarded_row("1", ITEM_A, wb.ZERO_GUID, "Сборка", OLD_PIN)
+    client = _GuardedClient(
+        {
+            PARENT_SPEC: _full_spec(PARENT_SPEC, PARENT_OWNER, [row], version="RAW-V1"),
+            TARGET_A: _full_spec(TARGET_A, ITEM_A),
+        }
+    )
+    change = _change("1", wb.ZERO_GUID, old_pin=OLD_PIN)
+    change["old_row_type"] = "Сборка"
+    result = wb.writeback_promote_material_rows(
+        client,
+        parent_spec_ref=PARENT_SPEC,
+        row_changes=[change],
+        expected_data_version="RAW-V1",
+        expected_if_match="RAW-V1",
+        concurrency_contract=wb.CONCURRENCY_ONEC_STANDARD_ODATA_V3,
+        concurrency_runtime_validated=True,
+        parent_edit_policy="safe_unused_editable",
+        dry_run=False,
+    )
+    assert result["status"] == "updated"
+    assert client.patches[0][2] == "RAW-V1"
+
+
+def test_data_version_is_not_reinterpreted_as_etag():
+    assert wb.explicit_odata_etag({"DataVersion": "AAAA"}) is None
+    assert wb.explicit_odata_etag({"DataVersion": "AAAA", "@odata.etag": 'W/"x"'}) == 'W/"x"'
+
+
+def test_standard_onec_contract_uses_raw_data_version_as_if_match():
+    guard = wb.resolve_write_concurrency_guard(
+        {"DataVersion": "AAAAAAAAAAE="},
+        contract=wb.CONCURRENCY_ONEC_STANDARD_ODATA_V3,
+        runtime_validated=False,
+    )
+    assert guard.if_match == "AAAAAAAAAAE="
+    assert guard.source_field == "DataVersion"
+    assert guard.documented_contract is True
+    assert guard.runtime_validated is False
+
+
+def test_guarded_default_preview_and_etag_bound_apply():
+    defaults = [
+        {
+            "Номенклатура_Key": ITEM_A,
+            "Характеристика_Key": wb.ZERO_GUID,
+            "Спецификация_Key": OLD_PIN,
+            "DataVersion": "d1",
+            "@odata.etag": 'W/"d1"',
+            "Unknown": "keep",
+        }
+    ]
+    client = _GuardedClient({TARGET_A: _full_spec(TARGET_A, ITEM_A)}, defaults)
+    preview = wb.writeback_default_specification_guarded(
+        client,
+        nomenclature_key=ITEM_A,
+        characteristic_key=wb.ZERO_GUID,
+        target_spec_ref=TARGET_A,
+        expected_old_spec_ref=OLD_PIN,
+    )
+    assert preview["mutation_mode"] == wb.MUTATION_PREVIEW
+    assert preview["conditional_write"] == {
+        "contract": wb.CONCURRENCY_EXPLICIT_ETAG,
+        "source_field": "explicit OData ETag metadata",
+        "documented_contract": False,
+        "runtime_validated": False,
+    }
+    assert client.patches == []
+    with pytest.raises(wb.SpecWritebackError, match="conditional-write token mismatch"):
+        wb.writeback_default_specification_guarded(
+            client,
+            nomenclature_key=ITEM_A,
+            characteristic_key=wb.ZERO_GUID,
+            target_spec_ref=TARGET_A,
+            expected_old_spec_ref=OLD_PIN,
+            expected_etag='W/"wrong"',
+            concurrency_runtime_validated=True,
+            mutation_mode=wb.MUTATION_APPLY_GUARDED,
+        )
+    applied = wb.writeback_default_specification_guarded(
+        client,
+        nomenclature_key=ITEM_A,
+        characteristic_key=wb.ZERO_GUID,
+        target_spec_ref=TARGET_A,
+        expected_old_spec_ref=OLD_PIN,
+        expected_etag='W/"d1"',
+        concurrency_runtime_validated=True,
+        mutation_mode=wb.MUTATION_APPLY_GUARDED,
+    )
+    assert applied["status"] == "updated"
+    assert client.patches[-1][2] == 'W/"d1"'
+    assert client.defaults[0]["Unknown"] == "keep"
+
+
+def test_preview_batch_blocks_only_bad_root_and_performs_no_mutations():
+    client = _GuardedClient({})
+    valid = {"root_id": "valid", **_merged_kwargs(), "expected_old_default_ref": OLD_PIN}
+    invalid = dict(valid)
+    invalid["root_id"] = "bad"
+    invalid["operation_rows"] = []
+    result = wb.preview_specification_replacement_batch(client, [invalid, valid])
+    assert result["summary"] == {"total": 2, "preview_ready": 1, "blocked": 1}
+    assert [row["status"] for row in result["roots"]] == ["blocked", "preview_ready"]
+    assert client.posts == [] and client.patches == []
+
+
+def test_compensation_preflights_all_entries_and_aborts_on_concurrent_change():
+    after_rows = [_guarded_row("1", ITEM_A, wb.ZERO_GUID, "Сборка", TARGET_A)]
+    before_rows = [_guarded_row("1", ITEM_A, wb.ZERO_GUID, "Сборка", OLD_PIN)]
+    defaults = [
+        {
+            "Номенклатура_Key": ITEM_A,
+            "Характеристика_Key": wb.ZERO_GUID,
+            "Спецификация_Key": TARGET_A,
+            "DataVersion": "d2",
+            "@odata.etag": 'W/"d2"',
+        }
+    ]
+    client = _GuardedClient(
+        {PARENT_SPEC: _full_spec(PARENT_SPEC, PARENT_OWNER, after_rows, version="changed")},
+        defaults,
+    )
+    journal = [
+        {
+            "kind": "parent_composition",
+            "spec_ref": PARENT_SPEC,
+            "before_sostav": before_rows,
+            "after_sostav": after_rows,
+            "after_data_version": "v2",
+            "after_etag": 'W/"v2"',
+            "concurrency_runtime_validated": True,
+        },
+        {
+            "kind": "default_specification",
+            "nomenclature_key": ITEM_A,
+            "characteristic_key": wb.ZERO_GUID,
+            "before_spec_ref": OLD_PIN,
+            "after_spec_ref": TARGET_A,
+            "after_data_version": "d2",
+            "after_etag": 'W/"d2"',
+            "concurrency_runtime_validated": True,
+        },
+    ]
+    with pytest.raises(wb.SpecWritebackError, match="DataVersion drift"):
+        wb.compensate_specification_writeback(
+            client, journal=journal, mutation_mode=wb.MUTATION_APPLY_GUARDED
+        )
+    assert client.patches == []
+
+
+def test_compensation_restores_default_and_parent_with_after_etags_only():
+    after_rows = [_guarded_row("1", ITEM_A, wb.ZERO_GUID, "Сборка", TARGET_A)]
+    before_rows = [_guarded_row("1", ITEM_A, wb.ZERO_GUID, "Сборка", OLD_PIN)]
+    defaults = [
+        {
+            "Номенклатура_Key": ITEM_A,
+            "Характеристика_Key": wb.ZERO_GUID,
+            "Спецификация_Key": TARGET_A,
+            "DataVersion": "d2",
+            "@odata.etag": 'W/"d2"',
+        }
+    ]
+    client = _GuardedClient(
+        {
+            PARENT_SPEC: _full_spec(
+                PARENT_SPEC,
+                PARENT_OWNER,
+                after_rows,
+                version="v2",
+                etag='W/"v2"',
+            )
+        },
+        defaults,
+    )
+    journal = [
+        {
+            "kind": "parent_composition",
+            "spec_ref": PARENT_SPEC,
+            "before_sostav": before_rows,
+            "after_sostav": after_rows,
+            "after_data_version": "v2",
+            "after_etag": 'W/"v2"',
+            "concurrency_runtime_validated": True,
+        },
+        {
+            "kind": "default_specification",
+            "nomenclature_key": ITEM_A,
+            "characteristic_key": wb.ZERO_GUID,
+            "before_spec_ref": OLD_PIN,
+            "after_spec_ref": TARGET_A,
+            "after_data_version": "d2",
+            "after_etag": 'W/"d2"',
+            "concurrency_runtime_validated": True,
+        },
+    ]
+    preview = wb.compensate_specification_writeback(client, journal=journal)
+    assert preview["status"] == "preview" and preview["apply_capable"] is True
+    assert client.patches == []
+    applied = wb.compensate_specification_writeback(
+        client, journal=journal, mutation_mode=wb.MUTATION_APPLY_GUARDED
+    )
+    assert applied == {
+        "status": "compensated",
+        "mutation_mode": wb.MUTATION_APPLY_GUARDED,
+        "steps": 2,
+        "delete_specifications": [],
+    }
+    assert client.defaults[0]["Спецификация_Key"] == OLD_PIN
+    assert client.specs[PARENT_SPEC]["Состав"] == before_rows
+    assert [patch[2] for patch in client.patches] == ['W/"d2"', 'W/"v2"']

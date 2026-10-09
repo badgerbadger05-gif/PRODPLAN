@@ -24,6 +24,10 @@ WRITE_RETRY_STATUS_CODES = frozenset({429, 502, 503, 504})
 # reach 1C. Only these are safe to retry for a non-idempotent create.
 _PRE_SEND_CONNECTION_ERRORS = (ConnectionRefusedError, socket.gaierror)
 
+
+class ODataConcurrencyError(RuntimeError):
+    """1C rejected an If-Match precondition; the caller must fresh-read again."""
+
 WAREHOUSE_CATALOG_CANDIDATES = (
     "Catalog_Склады",
     "Catalog_СтруктурныеЕдиницы",
@@ -222,6 +226,7 @@ class OData1CClient:
         idempotent: bool,
         retries: int,
         retry_backoff_sec: float,
+        request_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Perform a write with retry policy driven by idempotency.
 
@@ -236,6 +241,8 @@ class OData1CClient:
             request = urllib.request.Request(url, data=body, method=method)
             for k, v in self._build_headers().items():
                 request.add_header(k, v)
+            for key, value in (request_headers or {}).items():
+                request.add_header(str(key), str(value))
             try:
                 from datetime import datetime as _dt
                 print(f"[OData] {_dt.now(timezone.utc).isoformat()} {method} {url}")
@@ -251,6 +258,10 @@ class OData1CClient:
                 except Exception:
                     pass
                 code = int(getattr(e, "code", 0) or 0)
+                if code == 412:
+                    raise ODataConcurrencyError(
+                        f"HTTP Error 412: concurrent change. URL: {url}. Details: {err_data}"
+                    ) from e
                 if idempotent and code in WRITE_RETRY_STATUS_CODES and attempt < retries:
                     wait_s = self._retry_wait_seconds(e, attempt, retry_backoff_sec)
                     logger.warning(
@@ -330,12 +341,19 @@ class OData1CClient:
         timeout: int = 60,
         retries: int = 3,
         retry_backoff_sec: float = 1.0,
+        if_match: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Field update on an existing object — idempotent, so retried."""
+        """Field update; ``if_match`` binds it to a verified OData ETag."""
         endpoint_clean = (endpoint or "").lstrip("/")
         endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
         url = f"{self.base_url}/{endpoint_quoted}"
         body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+        request_headers: Dict[str, str] = {}
+        if if_match is not None:
+            normalized_if_match = str(if_match).strip()
+            if not normalized_if_match:
+                raise ValueError("if_match must be a non-empty OData ETag")
+            request_headers["If-Match"] = normalized_if_match
         return self._send_write(
             "PATCH",
             url,
@@ -344,6 +362,7 @@ class OData1CClient:
             idempotent=True,
             retries=retries,
             retry_backoff_sec=retry_backoff_sec,
+            request_headers=request_headers,
         )
 
     @staticmethod

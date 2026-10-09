@@ -33,6 +33,8 @@ OPERATIONS_FIELD = "Операции"
 DEFAULT_SPEC_ENTITY = "InformationRegister_СпецификацииПоУмолчанию"
 MATERIAL_ROW_TYPE = "Материал"
 ASSEMBLY_ROW_TYPE = "Сборка"
+NODE_ROW_TYPE = "Узел"
+EXPENSE_ROW_TYPE = "Расход"
 
 # Category migration may promote a material row or attach/replace the pin on an
 # existing assembly row.  Both result in an explicitly pinned assembly.  Adding
@@ -49,10 +51,23 @@ ALLOWED_COMPONENT_TYPE_TRANSITIONS = frozenset(
 SPEC_CREATE_READONLY_FIELDS = frozenset(
     {"Code", "DataVersion", "Predefined", "PredefinedDataName"}
 )
+MUTATION_PREVIEW = "preview"
+MUTATION_APPLY_GUARDED = "apply_guarded"
+CONCURRENCY_EXPLICIT_ETAG = "explicit_odata_etag"
+CONCURRENCY_ONEC_STANDARD_ODATA_V3 = "onec_standard_odata_v3"
 
 
 class SpecWritebackError(RuntimeError):
     """Не удалось записать исправление состава в 1С."""
+
+
+@dataclass(frozen=True)
+class WriteConcurrencyGuard:
+    contract: str
+    if_match: str
+    source_field: str
+    documented_contract: bool
+    runtime_validated: bool
 
 
 def _guard(op: str, fn: "Callable[[], Any]") -> Any:
@@ -91,6 +106,87 @@ def specification_before_hash(record: Mapping[str, Any]) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def explicit_odata_etag(record: Mapping[str, Any]) -> Optional[str]:
+    """Return only an explicit OData ETag; never reinterpret DataVersion as one."""
+    for field in ("@odata.etag", "odata.etag"):
+        value = str(record.get(field) or "").strip()
+        if value:
+            return value
+    metadata = record.get("__metadata")
+    if isinstance(metadata, Mapping):
+        value = str(metadata.get("etag") or "").strip()
+        if value:
+            return value
+    return None
+
+
+def resolve_write_concurrency_guard(
+    record: Mapping[str, Any],
+    *,
+    contract: str,
+    runtime_validated: bool = False,
+) -> WriteConcurrencyGuard:
+    """Resolve the documented conditional-write token without guessing dialects.
+
+    Standard 1C OData v3 documents raw ``DataVersion`` as the ``If-Match``
+    value.  Generic OData uses an explicit ETag.  The two contracts remain
+    separate, and local documentation does not imply that a particular live
+    publication has passed a conditional PATCH probe.
+    """
+    normalized = str(contract or "").strip()
+    if normalized == CONCURRENCY_ONEC_STANDARD_ODATA_V3:
+        value = str(record.get("DataVersion") or "").strip()
+        source_field = "DataVersion"
+        documented = True
+    elif normalized == CONCURRENCY_EXPLICIT_ETAG:
+        value = str(explicit_odata_etag(record) or "").strip()
+        source_field = "explicit OData ETag metadata"
+        documented = False
+    else:
+        raise SpecWritebackError(
+            f"unknown conditional-write contract {normalized!r}"
+        )
+    if not value:
+        raise SpecWritebackError(
+            f"conditional-write contract {normalized!r} has no {source_field}"
+        )
+    return WriteConcurrencyGuard(
+        contract=normalized,
+        if_match=value,
+        source_field=source_field,
+        documented_contract=documented,
+        runtime_validated=bool(runtime_validated),
+    )
+
+
+def _require_mutation_mode(mode: str) -> str:
+    normalized = str(mode or "").strip()
+    if normalized not in {MUTATION_PREVIEW, MUTATION_APPLY_GUARDED}:
+        raise SpecWritebackError(
+            f"mutation_mode должен быть {MUTATION_PREVIEW!r} или "
+            f"{MUTATION_APPLY_GUARDED!r}"
+        )
+    return normalized
+
+
+def _positive_finite(value: Any, *, field: str) -> None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SpecWritebackError(f"{field}: требуется положительное число") from exc
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise SpecWritebackError(f"{field}: требуется положительное конечное число")
+
+
+def _nonnegative_finite(value: Any, *, field: str) -> None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SpecWritebackError(f"{field}: требуется неотрицательное число") from exc
+    if not math.isfinite(numeric) or numeric < 0:
+        raise SpecWritebackError(f"{field}: требуется неотрицательное конечное число")
 
 
 def _line_number_as_int(value: Any, *, field: str) -> int:
@@ -141,6 +237,11 @@ def _normalize_tabular_array_order(value: Any, *, field: str) -> Any:
 def _without_data_version(record: Mapping[str, Any]) -> Dict[str, Any]:
     comparable = copy.deepcopy(dict(record))
     comparable.pop("DataVersion", None)
+    comparable.pop("@odata.etag", None)
+    comparable.pop("odata.etag", None)
+    metadata = comparable.get("__metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("etag", None)
     return _normalize_tabular_array_order(comparable, field="specification")
 
 
@@ -576,6 +677,11 @@ def writeback_promote_material_rows(
     expected_before: Optional[Mapping[str, Any]] = None,
     expected_before_hash: Optional[str] = None,
     expected_data_version: Optional[str] = None,
+    expected_etag: Optional[str] = None,
+    expected_if_match: Optional[str] = None,
+    concurrency_contract: str = CONCURRENCY_EXPLICIT_ETAG,
+    concurrency_runtime_validated: bool = False,
+    parent_edit_policy: str = "unknown",
     dry_run: bool = True,
 ) -> Dict[str, Any]:
     """Atomically make exact parent rows explicitly pinned assemblies.
@@ -590,6 +696,9 @@ def writeback_promote_material_rows(
     A real source-state write requires at least one complete before-image proof:
     the full object, its SHA-256, or its DataVersion.  Rows already in the exact
     target state are resumable and do not require the now-stale source proof.
+    An actual PATCH additionally requires ``safe_unused_editable`` parent policy
+    and an explicit conditional-write contract used as ``If-Match``.  Generic
+    ETag and documented standard-1C raw DataVersion contracts are not mixed.
     """
 
     def _run_promote_material_rows() -> Dict[str, Any]:
@@ -760,6 +869,27 @@ def writeback_promote_material_rows(
                 f"ожидалось {expected_data_version!r}, получено {before.get('DataVersion')!r}"
             )
 
+        policy = str(parent_edit_policy or "unknown").strip()
+        if policy not in {
+            "safe_unused_editable",
+            "used_or_historical",
+            "unknown",
+        }:
+            raise SpecWritebackError(
+                f"composition_batch: неизвестный parent_edit_policy={policy!r}"
+            )
+        if policy != "safe_unused_editable":
+            return {
+                **common,
+                "status": (
+                    "new_parent_version_required"
+                    if policy == "used_or_historical"
+                    else "blocked_requires_parent_version"
+                ),
+                "dry_run": bool(dry_run),
+                "parent_edit_policy": policy,
+            }
+
         payload = {SOSTAV: new_rows}
         if dry_run:
             return {
@@ -769,8 +899,30 @@ def writeback_promote_material_rows(
                 "would_patch": payload,
             }
 
+        guard = resolve_write_concurrency_guard(
+            before,
+            contract=concurrency_contract,
+            runtime_validated=concurrency_runtime_validated,
+        )
+        if not guard.runtime_validated:
+            raise SpecWritebackError(
+                "composition_batch: conditional-write contract is documented "
+                "but this 1C publication is not runtime-validated"
+            )
+        if expected_etag is not None and expected_if_match is not None:
+            raise SpecWritebackError(
+                "composition_batch: specify only expected_if_match"
+            )
+        normalized_expected = str(
+            expected_if_match if expected_if_match is not None else expected_etag or ""
+        ).strip()
+        if not normalized_expected or guard.if_match != normalized_expected:
+            raise SpecWritebackError(
+                "composition_batch: fresh conditional-write token differs from expected_if_match"
+            )
+
         endpoint = f"{SPEC_ENTITY}(guid'{normalized_parent_ref}')"
-        response = client.patch(endpoint, payload)
+        response = client.patch(endpoint, payload, if_match=normalized_expected)
         after = sb.read_specification(normalized_parent_ref)
         expected_after = copy.deepcopy(before)
         expected_after[SOSTAV] = new_rows
@@ -804,6 +956,266 @@ def _strip_spec_create_transport_fields(template: Mapping[str, Any]) -> Dict[str
             continue
         payload[key_text] = copy.deepcopy(value)
     return payload
+
+
+def _strip_tabular_transport_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        str(key): copy.deepcopy(value)
+        for key, value in row.items()
+        if str(key) != "odata.metadata" and "@" not in str(key)
+    }
+
+
+def build_merged_specification_create_payload(
+    header_template: Mapping[str, Any],
+    *,
+    new_spec_ref: str,
+    new_owner_ref: str,
+    production_kind_ref: str,
+    product_characteristic_ref: str,
+    composition_rows: Sequence[Mapping[str, Any]],
+    operation_rows: Sequence[Mapping[str, Any]],
+    operation_provenance: Sequence[Mapping[str, Any]],
+    description: Optional[str] = None,
+    require_operations: bool = True,
+    allow_zero_operation_time: bool = False,
+    preserve_existing_row_semantics: bool = False,
+) -> Dict[str, Any]:
+    """Build a transport-safe arbitrary-row specification without losing fields.
+
+    Quantities, times, stages and named-operation GUIDs are caller-approved
+    normalized values.  This owner validates them and preserves every other raw
+    business field.  Provenance is audit input only and is never written into 1C.
+    """
+    spec_ref = _require_guid(
+        new_spec_ref, field="merged_spec_create.new_spec_ref", allow_zero=False
+    )
+    owner_ref = _require_guid(
+        new_owner_ref, field="merged_spec_create.new_owner_ref", allow_zero=False
+    )
+    kind_ref = _require_guid(
+        production_kind_ref,
+        field="merged_spec_create.production_kind_ref",
+        allow_zero=False,
+    )
+    characteristic_ref = _require_guid(
+        product_characteristic_ref,
+        field="merged_spec_create.product_characteristic_ref",
+    )
+    if not composition_rows:
+        raise SpecWritebackError("merged_spec_create: состав должен быть непустым")
+    if require_operations and not operation_rows:
+        raise SpecWritebackError("merged_spec_create: операции должны быть непустыми")
+    if len(operation_provenance) != len(operation_rows):
+        raise SpecWritebackError(
+            "merged_spec_create: operation_provenance должен соответствовать операциям"
+        )
+
+    composition = [_strip_tabular_transport_fields(row) for row in composition_rows]
+    operations = [_strip_tabular_transport_fields(row) for row in operation_rows]
+    _validate_unique_line_numbers(composition, field="merged_spec_create.Состав")
+    _validate_unique_line_numbers(operations, field="merged_spec_create.Операции")
+
+    for index, row in enumerate(composition):
+        prefix = f"merged_spec_create.Состав[{index}]"
+        row_type = str(row.get("ТипСтрокиСостава") or "").strip()
+        if row_type not in {
+            MATERIAL_ROW_TYPE,
+            ASSEMBLY_ROW_TYPE,
+            NODE_ROW_TYPE,
+            EXPENSE_ROW_TYPE,
+        }:
+            raise SpecWritebackError(f"{prefix}: недопустимый тип строки {row_type!r}")
+        item_ref = _require_guid(
+            row.get("Номенклатура_Key"), field=f"{prefix}.Номенклатура_Key", allow_zero=False
+        )
+        if _norm_key(item_ref) == _norm_key(owner_ref):
+            raise SpecWritebackError(f"{prefix}: запрещён прямой цикл owner -> component")
+        _require_guid(
+            row.get("Характеристика_Key") or ZERO_GUID,
+            field=f"{prefix}.Характеристика_Key",
+        )
+        pinned = _require_guid(
+            row.get("Спецификация_Key") or ZERO_GUID,
+            field=f"{prefix}.Спецификация_Key",
+        )
+        if (
+            not preserve_existing_row_semantics
+            and row_type == MATERIAL_ROW_TYPE
+            and pinned != ZERO_GUID
+        ):
+            raise SpecWritebackError(f"{prefix}: материал не может иметь specification pin")
+        if (
+            not preserve_existing_row_semantics
+            and row_type in {ASSEMBLY_ROW_TYPE, NODE_ROW_TYPE}
+            and pinned == ZERO_GUID
+        ):
+            raise SpecWritebackError(f"{prefix}: сборка должна иметь explicit specification pin")
+        _require_guid(
+            row.get("Этап_Key"), field=f"{prefix}.Этап_Key", allow_zero=False
+        )
+        _require_guid(
+            row.get("ЕдиницаИзмерения"),
+            field=f"{prefix}.ЕдиницаИзмерения",
+            allow_zero=False,
+        )
+        _positive_finite(row.get("Количество"), field=f"{prefix}.Количество")
+        _positive_finite(
+            row.get("КоличествоПродукции"),
+            field=f"{prefix}.КоличествоПродукции",
+        )
+        row["Ref_Key"] = spec_ref
+
+    provenance_identities: set[Tuple[str, str, str, str, int]] = set()
+    target_identities: set[Tuple[str, int]] = set()
+    for index, (row, provenance) in enumerate(zip(operations, operation_provenance)):
+        prefix = f"merged_spec_create.Операции[{index}]"
+        operation_ref = _require_guid(
+            row.get("Операция_Key"), field=f"{prefix}.Операция_Key", allow_zero=False
+        )
+        _require_guid(row.get("Этап_Key"), field=f"{prefix}.Этап_Key", allow_zero=False)
+        _positive_finite(row.get("Количество"), field=f"{prefix}.Количество")
+        _positive_finite(
+            row.get("КоличествоПродукции"),
+            field=f"{prefix}.КоличествоПродукции",
+        )
+        if allow_zero_operation_time:
+            _nonnegative_finite(
+                row.get("НормаВремени"), field=f"{prefix}.НормаВремени"
+            )
+        else:
+            _positive_finite(
+                row.get("НормаВремени"), field=f"{prefix}.НормаВремени"
+            )
+        source_spec = _require_guid(
+            provenance.get("source_spec_ref"),
+            field=f"{prefix}.provenance.source_spec_ref",
+            allow_zero=False,
+        )
+        source_operation = _require_guid(
+            provenance.get("source_operation_ref"),
+            field=f"{prefix}.provenance.source_operation_ref",
+            allow_zero=False,
+        )
+        if _norm_key(source_operation) != _norm_key(operation_ref):
+            raise SpecWritebackError(f"{prefix}: named operation GUID changed")
+        edge_identity = str(provenance.get("source_edge_identity") or "").strip()
+        source_line = str(provenance.get("source_line_number") or "").strip()
+        occurrence = int(provenance.get("source_occurrence") or 0)
+        if not edge_identity or not source_line or occurrence <= 0:
+            raise SpecWritebackError(f"{prefix}: incomplete operation provenance")
+        identity = (
+            edge_identity,
+            _norm_key(source_spec),
+            _norm_key(source_operation),
+            source_line,
+            occurrence,
+        )
+        if identity in provenance_identities:
+            raise SpecWritebackError(f"{prefix}: duplicate operation provenance")
+        provenance_identities.add(identity)
+        target_line = str(row.get("LineNumber") or "").strip()
+        target_occurrence = int(provenance.get("target_occurrence") or 0)
+        target_identity = (target_line, target_occurrence)
+        if target_occurrence <= 0 or target_identity in target_identities:
+            raise SpecWritebackError(f"{prefix}: duplicate target line/occurrence")
+        target_identities.add(target_identity)
+        row["Ref_Key"] = spec_ref
+
+    payload = _strip_spec_create_transport_fields(header_template)
+    for field in ("DeletionMark", "Недействителен", "ЭтоШаблон"):
+        if bool(payload.get(field)):
+            raise SpecWritebackError(f"merged_spec_create: template {field}=true")
+    payload.update(
+        {
+            "Ref_Key": spec_ref,
+            "Owner_Key": owner_ref,
+            PRODUCTION_KIND_FIELD: kind_ref,
+            "ХарактеристикаПродукции_Key": characteristic_ref,
+            SOSTAV: composition,
+            OPERATIONS_FIELD: operations,
+        }
+    )
+    if description is not None:
+        payload["Description"] = str(description)
+    return payload
+
+
+def writeback_create_merged_specification(
+    client: Any,
+    *,
+    header_template: Mapping[str, Any],
+    new_spec_ref: str,
+    new_owner_ref: str,
+    production_kind_ref: str,
+    product_characteristic_ref: str,
+    composition_rows: Sequence[Mapping[str, Any]],
+    operation_rows: Sequence[Mapping[str, Any]],
+    operation_provenance: Sequence[Mapping[str, Any]],
+    description: Optional[str] = None,
+    require_operations: bool = True,
+    allow_zero_operation_time: bool = False,
+    preserve_existing_row_semantics: bool = False,
+    mutation_mode: str = MUTATION_PREVIEW,
+) -> Dict[str, Any]:
+    """Preview or explicitly create one lossless merged specification."""
+
+    def _run() -> Dict[str, Any]:
+        mode = _require_mutation_mode(mutation_mode)
+        payload = build_merged_specification_create_payload(
+            header_template,
+            new_spec_ref=new_spec_ref,
+            new_owner_ref=new_owner_ref,
+            production_kind_ref=production_kind_ref,
+            product_characteristic_ref=product_characteristic_ref,
+            composition_rows=composition_rows,
+            operation_rows=operation_rows,
+            operation_provenance=operation_provenance,
+            description=description,
+            require_operations=require_operations,
+            allow_zero_operation_time=allow_zero_operation_time,
+            preserve_existing_row_semantics=preserve_existing_row_semantics,
+        )
+        spec_ref = payload["Ref_Key"]
+        existing = client.get_all(
+            SPEC_ENTITY,
+            filter_query=f"Ref_Key eq guid'{spec_ref}'",
+            select_fields=None,
+        )
+        if len(existing) > 1:
+            raise SpecWritebackError(
+                f"merged_spec_create: preallocated Ref_Key {spec_ref} неоднозначен"
+            )
+        if existing:
+            _verify_created_specification(existing[0], expected_payload=payload)
+            return {
+                "op": "create_merged_specification",
+                "status": "already_applied",
+                "mutation_mode": mode,
+                "spec_ref": spec_ref,
+            }
+        common = {
+            "op": "create_merged_specification",
+            "spec_ref": spec_ref,
+            "operation_provenance_hash": specification_before_hash(
+                {"operation_provenance": list(operation_provenance)}
+            ),
+        }
+        if mode == MUTATION_PREVIEW:
+            return {**common, "status": "preview", "would_post": payload}
+        response = client.post(SPEC_ENTITY, payload)
+        after = SpecWriteback(client, dry_run=False).read_specification(spec_ref)
+        _verify_created_specification(after, expected_payload=payload)
+        return {
+            **common,
+            "status": "created",
+            "payload": payload,
+            "response": response,
+            "after_data_version": after.get("DataVersion"),
+            "after_etag": explicit_odata_etag(after),
+        }
+
+    return _guard("merged_spec_create", _run)
 
 
 def build_specification_create_payload(
@@ -1187,6 +1599,337 @@ def writeback_default_specification(
         }
 
     return _guard("default_spec", _run_default_specification)
+
+
+def writeback_default_specification_guarded(
+    client: Any,
+    *,
+    nomenclature_key: str,
+    characteristic_key: str,
+    target_spec_ref: str,
+    expected_old_spec_ref: str,
+    expected_etag: Optional[str] = None,
+    expected_if_match: Optional[str] = None,
+    concurrency_contract: str = CONCURRENCY_EXPLICIT_ETAG,
+    concurrency_runtime_validated: bool = False,
+    mutation_mode: str = MUTATION_PREVIEW,
+) -> Dict[str, Any]:
+    """ETag-bound default switch; conditional creation is intentionally absent."""
+
+    def _run() -> Dict[str, Any]:
+        mode = _require_mutation_mode(mutation_mode)
+        preview = writeback_default_specification(
+            client,
+            nomenclature_key=nomenclature_key,
+            characteristic_key=characteristic_key,
+            target_spec_ref=target_spec_ref,
+            expected_old_spec_ref=expected_old_spec_ref,
+            dry_run=True,
+        )
+        if preview.get("status") == "already_applied":
+            return {**preview, "mutation_mode": mode}
+        before = _read_default_specification_record(
+            client,
+            nomenclature_key=nomenclature_key,
+            characteristic_key=characteristic_key,
+        )
+        if before is None:
+            raise SpecWritebackError("default_spec_guarded: source record disappeared")
+        guard = resolve_write_concurrency_guard(
+            before,
+            contract=concurrency_contract,
+            runtime_validated=concurrency_runtime_validated,
+        )
+        if mode == MUTATION_PREVIEW:
+            return {
+                **preview,
+                "mutation_mode": mode,
+                "conditional_write": {
+                    "contract": guard.contract,
+                    "source_field": guard.source_field,
+                    "documented_contract": guard.documented_contract,
+                    "runtime_validated": guard.runtime_validated,
+                },
+                "before_data_version": before.get("DataVersion"),
+            }
+        if not guard.runtime_validated:
+            raise SpecWritebackError(
+                "default_spec_guarded: conditional-write contract is not runtime-validated"
+            )
+        if expected_etag is not None and expected_if_match is not None:
+            raise SpecWritebackError("default_spec_guarded: specify only expected_if_match")
+        normalized_if_match = str(
+            expected_if_match if expected_if_match is not None else expected_etag or ""
+        ).strip()
+        if not normalized_if_match or guard.if_match != normalized_if_match:
+            raise SpecWritebackError(
+                "default_spec_guarded: conditional-write token mismatch"
+            )
+        response = client.patch(
+            preview["endpoint"],
+            preview["would_write"],
+            if_match=normalized_if_match,
+        )
+        after = _read_default_specification_record(
+            client,
+            nomenclature_key=nomenclature_key,
+            characteristic_key=characteristic_key,
+        )
+        if after is None or _norm_key(after.get("Спецификация_Key")) != _norm_key(
+            target_spec_ref
+        ):
+            raise SpecWritebackError("default_spec_guarded: read-back mismatch")
+        return {
+            "op": "write_default_specification_guarded",
+            "status": "updated",
+            "mutation_mode": mode,
+            "endpoint": preview["endpoint"],
+            "response": response,
+            "after_data_version": after.get("DataVersion"),
+            "after_etag": explicit_odata_etag(after),
+        }
+
+    return _guard("default_spec_guarded", _run)
+
+
+def preview_specification_replacement_batch(
+    client: Any,
+    roots: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Read-only per-root orchestration; one bad root never hides valid siblings."""
+    results: List[Dict[str, Any]] = []
+    for index, root in enumerate(roots):
+        root_id = str(root.get("root_id") or f"root-{index}")
+        try:
+            create = writeback_create_merged_specification(
+                client,
+                header_template=root["header_template"],
+                new_spec_ref=root["new_spec_ref"],
+                new_owner_ref=root["new_owner_ref"],
+                production_kind_ref=root["production_kind_ref"],
+                product_characteristic_ref=root.get(
+                    "product_characteristic_ref", ZERO_GUID
+                ),
+                composition_rows=root["composition_rows"],
+                operation_rows=root["operation_rows"],
+                operation_provenance=root["operation_provenance"],
+                description=root.get("description"),
+                mutation_mode=MUTATION_PREVIEW,
+            )
+            results.append(
+                {
+                    "root_id": root_id,
+                    "status": "preview_ready",
+                    "create": create,
+                    "default": {
+                        "nomenclature_key": root["new_owner_ref"],
+                        "characteristic_key": root.get(
+                            "product_characteristic_ref", ZERO_GUID
+                        ),
+                        "expected_old_spec_ref": root["expected_old_default_ref"],
+                        "target_spec_ref": root["new_spec_ref"],
+                    },
+                    "parents": copy.deepcopy(list(root.get("parents") or [])),
+                }
+            )
+        except (KeyError, SpecWritebackError, TypeError, ValueError) as exc:
+            results.append(
+                {"root_id": root_id, "status": "blocked", "error": str(exc)}
+            )
+    return {
+        "mutation_mode": MUTATION_PREVIEW,
+        "network_mutations": False,
+        "roots": results,
+        "summary": {
+            "total": len(results),
+            "preview_ready": sum(row["status"] == "preview_ready" for row in results),
+            "blocked": sum(row["status"] == "blocked" for row in results),
+        },
+    }
+
+
+def compensate_specification_writeback(
+    client: Any,
+    *,
+    journal: Sequence[Mapping[str, Any]],
+    mutation_mode: str = MUTATION_PREVIEW,
+) -> Dict[str, Any]:
+    """Restore guarded pointers/compositions without deleting any specification.
+
+    Every current after-state is preflighted before the first reverse PATCH, so
+    a concurrent change aborts the whole local compensation attempt.
+    """
+
+    def _run() -> Dict[str, Any]:
+        mode = _require_mutation_mode(mutation_mode)
+        prepared: List[Dict[str, Any]] = []
+        for reverse_index, entry in enumerate(reversed(list(journal))):
+            kind = str(entry.get("kind") or "")
+            if kind == "parent_composition":
+                spec_ref = _require_guid(
+                    entry.get("spec_ref"),
+                    field=f"compensation[{reverse_index}].spec_ref",
+                    allow_zero=False,
+                )
+                current = SpecWriteback(client, dry_run=True).read_specification(spec_ref)
+                if str(current.get("DataVersion") or "") != str(
+                    entry.get("after_data_version") or ""
+                ):
+                    raise SpecWritebackError(
+                        f"compensation: parent {spec_ref} after DataVersion drift"
+                    )
+                if _normalize_tabular_array_order(
+                    current.get(SOSTAV), field="compensation.current.Состав"
+                ) != _normalize_tabular_array_order(
+                    entry.get("after_sostav"), field="compensation.after.Состав"
+                ):
+                    raise SpecWritebackError(
+                        f"compensation: parent {spec_ref} no longer has recorded after-state"
+                    )
+                guard = resolve_write_concurrency_guard(
+                    current,
+                    contract=entry.get(
+                        "concurrency_contract", CONCURRENCY_EXPLICIT_ETAG
+                    ),
+                    runtime_validated=bool(entry.get("concurrency_runtime_validated")),
+                )
+                expected_if_match = str(
+                    entry.get("after_if_match") or entry.get("after_etag") or ""
+                ).strip()
+                prepared.append(
+                    {
+                        "kind": kind,
+                        "identity": spec_ref,
+                        "endpoint": f"{SPEC_ENTITY}(guid'{spec_ref}')",
+                        "payload": {SOSTAV: copy.deepcopy(list(entry["before_sostav"]))},
+                        "guard": guard,
+                        "expected_if_match": expected_if_match,
+                        "before_sostav": copy.deepcopy(list(entry["before_sostav"])),
+                    }
+                )
+            elif kind == "default_specification":
+                item_ref = _require_guid(
+                    entry.get("nomenclature_key"),
+                    field=f"compensation[{reverse_index}].nomenclature_key",
+                    allow_zero=False,
+                )
+                characteristic_ref = _require_guid(
+                    entry.get("characteristic_key"),
+                    field=f"compensation[{reverse_index}].characteristic_key",
+                )
+                current = _read_default_specification_record(
+                    client,
+                    nomenclature_key=item_ref,
+                    characteristic_key=characteristic_ref,
+                )
+                if current is None or _norm_key(
+                    current.get("Спецификация_Key")
+                ) != _norm_key(entry.get("after_spec_ref")):
+                    raise SpecWritebackError(
+                        f"compensation: default ({item_ref}, {characteristic_ref}) drift"
+                    )
+                if entry.get("after_data_version") is not None and str(
+                    current.get("DataVersion") or ""
+                ) != str(entry.get("after_data_version") or ""):
+                    raise SpecWritebackError("compensation: default after DataVersion drift")
+                guard = resolve_write_concurrency_guard(
+                    current,
+                    contract=entry.get(
+                        "concurrency_contract", CONCURRENCY_EXPLICIT_ETAG
+                    ),
+                    runtime_validated=bool(entry.get("concurrency_runtime_validated")),
+                )
+                expected_if_match = str(
+                    entry.get("after_if_match") or entry.get("after_etag") or ""
+                ).strip()
+                prepared.append(
+                    {
+                        "kind": kind,
+                        "identity": f"{item_ref}:{characteristic_ref}",
+                        "endpoint": (
+                            f"{DEFAULT_SPEC_ENTITY}(Номенклатура_Key=guid'{item_ref}',"
+                            f"Характеристика_Key=guid'{characteristic_ref}')"
+                        ),
+                        "payload": {"Спецификация_Key": entry["before_spec_ref"]},
+                        "guard": guard,
+                        "expected_if_match": expected_if_match,
+                        "nomenclature_key": item_ref,
+                        "characteristic_key": characteristic_ref,
+                        "before_spec_ref": entry["before_spec_ref"],
+                    }
+                )
+            else:
+                raise SpecWritebackError(
+                    f"compensation: unsupported journal kind {kind!r}"
+                )
+
+        apply_capable = all(
+            row["guard"].runtime_validated
+            and row["expected_if_match"]
+            and row["guard"].if_match == row["expected_if_match"]
+            for row in prepared
+        )
+        if mode == MUTATION_PREVIEW:
+            return {
+                "status": "preview",
+                "mutation_mode": mode,
+                "network_mutations": False,
+                "apply_capable": apply_capable,
+                "steps": [
+                    {
+                        "kind": row["kind"],
+                        "identity": row["identity"],
+                        "conditional_write": {
+                            "contract": row["guard"].contract,
+                            "source_field": row["guard"].source_field,
+                            "runtime_validated": row["guard"].runtime_validated,
+                            "token_verified": bool(
+                                row["expected_if_match"]
+                                and row["guard"].if_match
+                                == row["expected_if_match"]
+                            ),
+                        },
+                    }
+                    for row in prepared
+                ],
+                "delete_specifications": [],
+            }
+        if not apply_capable:
+            raise SpecWritebackError(
+                "compensation: apply requires runtime-validated matching "
+                "conditional-write tokens for every step"
+            )
+        for row in prepared:
+            client.patch(
+                row["endpoint"], row["payload"], if_match=row["expected_if_match"]
+            )
+        for row in prepared:
+            if row["kind"] == "parent_composition":
+                after = SpecWriteback(client, dry_run=True).read_specification(row["identity"])
+                if _normalize_tabular_array_order(
+                    after.get(SOSTAV), field="compensation.readback.Состав"
+                ) != _normalize_tabular_array_order(
+                    row["before_sostav"], field="compensation.expected.Состав"
+                ):
+                    raise SpecWritebackError("compensation: parent read-back mismatch")
+            else:
+                after = _read_default_specification_record(
+                    client,
+                    nomenclature_key=row["nomenclature_key"],
+                    characteristic_key=row["characteristic_key"],
+                )
+                if after is None or _norm_key(after.get("Спецификация_Key")) != _norm_key(
+                    row["before_spec_ref"]
+                ):
+                    raise SpecWritebackError("compensation: default read-back mismatch")
+        return {
+            "status": "compensated",
+            "mutation_mode": mode,
+            "steps": len(prepared),
+            "delete_specifications": [],
+        }
+
+    return _guard("compensation", _run)
 
 
 def _dominant_stage(rows: List[Dict[str, Any]]) -> Optional[str]:

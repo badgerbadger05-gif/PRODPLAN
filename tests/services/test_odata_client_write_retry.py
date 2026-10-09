@@ -14,7 +14,7 @@ from email.message import Message
 import pytest
 
 import app.services.odata_client as odata_client
-from app.services.odata_client import OData1CClient
+from app.services.odata_client import OData1CClient, ODataConcurrencyError
 
 
 class _FakeResponse:
@@ -56,6 +56,7 @@ def sent(monkeypatch):
             "url": request.full_url,
             "data": request.data,
             "timeout": timeout,
+            "headers": dict(request.header_items()),
         })
         outcome = calls_ref["responses"].pop(0)
         if isinstance(outcome, Exception):
@@ -112,6 +113,20 @@ def test_patch_retries_gateway_errors_and_keeps_payload(sent):
     assert len(sent["calls"]) == 2
     assert sent["calls"][0]["method"] == "PATCH"
     assert sent["calls"][0]["data"] == sent["calls"][1]["data"]
+
+
+def test_patch_sends_if_match_on_every_attempt(sent):
+    sent["responses"] = [_http_error(503), _FakeResponse()]
+    _client().patch("Catalog_X(guid'1')", {"a": 1}, if_match='W/"etag-1"')
+    assert len(sent["calls"]) == 2
+    assert all(call["headers"]["If-match"] == 'W/"etag-1"' for call in sent["calls"])
+
+
+def test_patch_412_is_a_non_retryable_concurrency_conflict(sent):
+    sent["responses"] = [_http_error(412), _FakeResponse()]
+    with pytest.raises(ODataConcurrencyError, match="concurrent change"):
+        _client().patch("Catalog_X(guid'1')", {"a": 1}, if_match='W/"stale"')
+    assert len(sent["calls"]) == 1
 
 
 def test_document_create_is_never_retried_after_the_request_left(sent):
