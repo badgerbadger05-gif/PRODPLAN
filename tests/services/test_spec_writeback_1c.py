@@ -1038,6 +1038,90 @@ def test_standard_onec_contract_uses_raw_data_version_as_if_match():
     assert guard.runtime_validated is False
 
 
+def test_known_projection_accepts_full_fresh_fields_and_tabular_reordering_only():
+    expected = {
+        "Ref_Key": PARENT_SPEC,
+        "DataVersion": "DV1",
+        "Состав": [
+            {"LineNumber": "2", "Количество": 2, "Номенклатура_Key": ITEM_B},
+            {"LineNumber": "1", "Количество": 1, "Номенклатура_Key": ITEM_A},
+        ],
+        "Операции": [
+            {"LineNumber": "1", "Операция_Key": OPERATION, "НормаВремени": 0.5}
+        ],
+    }
+    fresh = {
+        "@odata.etag": 'W/"transport"',
+        "Ref_Key": PARENT_SPEC,
+        "DataVersion": "DV1",
+        "UnknownFullBusinessHeader": {"must": "clone"},
+        "Состав": [
+            {
+                "LineNumber": "1",
+                "Количество": 1.0,
+                "Номенклатура_Key": ITEM_A,
+                "UnknownFreshRow": "clone",
+            },
+            {"LineNumber": "2", "Количество": 2, "Номенклатура_Key": ITEM_B},
+        ],
+        "Операции": [
+            {
+                "LineNumber": "1",
+                "Операция_Key": OPERATION,
+                "НормаВремени": 0.5,
+                "Operation@navigationLinkUrl": "transport",
+                "Расценка": 77,
+            }
+        ],
+    }
+    result = wb.compare_known_snapshot_projection(expected, fresh)
+    assert result["known_equal"] is True
+    assert "UnknownFullBusinessHeader" in result["additional_business_fields"]
+    assert "Состав[LineNumber=1].UnknownFreshRow" in result["additional_business_fields"]
+    assert "Операции[LineNumber=1].Расценка" in result["additional_business_fields"]
+    assert all("navigationLinkUrl" not in path for path in result["additional_business_fields"])
+
+
+def test_known_projection_rejects_known_quantity_and_operation_guid_changes():
+    expected = {
+        "Ref_Key": PARENT_SPEC,
+        "DataVersion": "DV1",
+        "Состав": [{"LineNumber": "1", "Количество": 1}],
+        "Операции": [{"LineNumber": "1", "Операция_Key": OPERATION}],
+    }
+    fresh = copy.deepcopy(expected)
+    fresh["Состав"][0]["Количество"] = 2
+    fresh["Операции"][0]["Операция_Key"] = OPERATION_B
+    result = wb.compare_known_snapshot_projection(expected, fresh)
+    assert result["known_equal"] is False
+    assert {row["path"] for row in result["differences"]} == {
+        "Состав[LineNumber=1].Количество",
+        "Операции[LineNumber=1].Операция_Key",
+    }
+
+
+def test_full_guard_hash_ignores_transport_and_numeric_line_order():
+    left = {
+        "Ref_Key": PARENT_SPEC,
+        "DataVersion": "DV1",
+        "@odata.etag": "transport-a",
+        "Состав": [
+            {"LineNumber": "10", "Количество": 10},
+            {"LineNumber": "2", "Количество": 2},
+        ],
+    }
+    right = {
+        "Ref_Key": PARENT_SPEC,
+        "DataVersion": "DV1",
+        "@odata.etag": "transport-b",
+        "Состав": [
+            {"LineNumber": "2", "Количество": 2},
+            {"LineNumber": "10", "Количество": 10},
+        ],
+    }
+    assert wb.specification_guard_hash(left) == wb.specification_guard_hash(right)
+
+
 def test_guarded_default_preview_and_etag_bound_apply():
     defaults = [
         {

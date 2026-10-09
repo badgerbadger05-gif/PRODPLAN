@@ -108,6 +108,131 @@ def specification_before_hash(record: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _is_transport_field(key: Any) -> bool:
+    text = str(key)
+    return text == "odata.metadata" or text == "__metadata" or "@" in text
+
+
+def _business_record(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _business_record(child)
+            for key, child in value.items()
+            if not _is_transport_field(key)
+        }
+    if isinstance(value, list):
+        rows = [_business_record(child) for child in value]
+        if rows and all(isinstance(row, Mapping) and "LineNumber" in row for row in rows):
+            _validate_unique_line_numbers(rows, field="guard_hash")
+            rows.sort(
+                key=lambda row: _line_number_as_int(
+                    row.get("LineNumber"), field="guard_hash.LineNumber"
+                )
+            )
+        return rows
+    return copy.deepcopy(value)
+
+
+def specification_guard_hash(record: Mapping[str, Any]) -> str:
+    """Hash all full business fields, ignoring transport metadata and row order."""
+    encoded = json.dumps(
+        _business_record(record),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compare_known_snapshot_projection(
+    expected_known: Mapping[str, Any],
+    fresh_full: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Compare every known field while allowing fresh-only full business fields.
+
+    Arrays with LineNumber are matched by numeric line identity.  Added or
+    removed rows are business drift.  Fresh-only business fields are returned
+    for audit and become part of the rebased full guard hash.
+    """
+    differences: List[Dict[str, Any]] = []
+    additional_business_fields: List[str] = []
+
+    def walk(expected: Any, actual: Any, path: str) -> None:
+        if isinstance(expected, Mapping):
+            if not isinstance(actual, Mapping):
+                differences.append({"path": path, "expected": expected, "actual": actual})
+                return
+            expected_keys = [key for key in expected if not _is_transport_field(key)]
+            for key in expected_keys:
+                child_path = f"{path}.{key}" if path else str(key)
+                if key not in actual:
+                    differences.append(
+                        {"path": child_path, "expected": expected[key], "actual": "<missing>"}
+                    )
+                else:
+                    walk(expected[key], actual[key], child_path)
+            for key in actual:
+                if key not in expected and not _is_transport_field(key):
+                    additional_business_fields.append(
+                        f"{path}.{key}" if path else str(key)
+                    )
+            return
+        if isinstance(expected, list):
+            if not isinstance(actual, list):
+                differences.append({"path": path, "expected": expected, "actual": actual})
+                return
+            expected_has_lines = all(
+                isinstance(row, Mapping) and "LineNumber" in row for row in expected
+            )
+            actual_has_lines = all(
+                isinstance(row, Mapping) and "LineNumber" in row for row in actual
+            )
+            if expected_has_lines and actual_has_lines:
+                expected_by_line = {
+                    _line_number_as_int(row.get("LineNumber"), field=path): row
+                    for row in expected
+                }
+                actual_by_line = {
+                    _line_number_as_int(row.get("LineNumber"), field=path): row
+                    for row in actual
+                }
+                if set(expected_by_line) != set(actual_by_line):
+                    differences.append(
+                        {
+                            "path": path,
+                            "expected_lines": sorted(expected_by_line),
+                            "actual_lines": sorted(actual_by_line),
+                        }
+                    )
+                    return
+                for line in sorted(expected_by_line):
+                    walk(
+                        expected_by_line[line],
+                        actual_by_line[line],
+                        f"{path}[LineNumber={line}]",
+                    )
+                return
+            if len(expected) != len(actual):
+                differences.append(
+                    {"path": path, "expected_length": len(expected), "actual_length": len(actual)}
+                )
+                return
+            for index, (expected_child, actual_child) in enumerate(zip(expected, actual)):
+                walk(expected_child, actual_child, f"{path}[{index}]")
+            return
+        if expected != actual:
+            differences.append({"path": path, "expected": expected, "actual": actual})
+
+    walk(expected_known, fresh_full, "")
+    return {
+        "known_equal": not differences,
+        "differences": differences,
+        "additional_business_fields": sorted(set(additional_business_fields)),
+        "fresh_full_guard_hash": specification_guard_hash(fresh_full),
+    }
+
+
 def explicit_odata_etag(record: Mapping[str, Any]) -> Optional[str]:
     """Return only an explicit OData ETag; never reinterpret DataVersion as one."""
     for field in ("@odata.etag", "odata.etag"):
