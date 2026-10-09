@@ -36,6 +36,7 @@ MATERIAL_ROW_TYPE = "Материал"
 ASSEMBLY_ROW_TYPE = "Сборка"
 NODE_ROW_TYPE = "Узел"
 EXPENSE_ROW_TYPE = "Расход"
+ONEC_SPEC_DESCRIPTION_MAX_LENGTH = 100
 
 # Category migration may promote a material row or attach/replace the pin on an
 # existing assembly row.  Both result in an explicitly pinned assembly.  Adding
@@ -1092,6 +1093,11 @@ def _strip_tabular_transport_fields(row: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def normalize_specification_description(value: Any) -> str:
+    """Apply the live 1C Catalog_Спецификации wire limit deterministically."""
+    return str(value or "")[:ONEC_SPEC_DESCRIPTION_MAX_LENGTH]
+
+
 def build_merged_specification_create_payload(
     header_template: Mapping[str, Any],
     *,
@@ -1263,7 +1269,7 @@ def build_merged_specification_create_payload(
         }
     )
     if description is not None:
-        payload["Description"] = str(description)
+        payload["Description"] = normalize_specification_description(description)
     return payload
 
 
@@ -1415,7 +1421,7 @@ def build_specification_create_payload(
     payload["Owner_Key"] = owner_ref
     payload[PRODUCTION_KIND_FIELD] = production_kind_ref
     if description is not None:
-        payload["Description"] = str(description)
+        payload["Description"] = normalize_specification_description(description)
     material_row = payload[SOSTAV][0]
     material_row.update(
         {

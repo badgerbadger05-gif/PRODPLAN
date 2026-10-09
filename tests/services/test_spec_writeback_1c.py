@@ -886,6 +886,21 @@ def test_merged_create_preserves_three_rows_three_ops_unknown_fields_and_denomin
         assert readonly not in payload
 
 
+def test_specification_description_is_truncated_to_live_wire_limit_before_post():
+    kwargs = _merged_kwargs()
+    kwargs["description"] = "Д" * 120
+    payload = wb.build_merged_specification_create_payload(**kwargs)
+    assert payload["Description"] == "Д" * 100
+    assert len(payload["Description"]) == wb.ONEC_SPEC_DESCRIPTION_MAX_LENGTH
+    actual = copy.deepcopy(payload)
+    actual["Code"] = "SERVER"
+    actual["DataVersion"] = "DV"
+    wb._verify_created_specification(actual, expected_payload=payload)
+    actual["Description"] = "Д" * 99 + "X"
+    with pytest.raises(wb.SpecWritebackError, match="Description"):
+        wb._verify_created_specification(actual, expected_payload=payload)
+
+
 def test_merged_create_preview_is_default_and_never_posts():
     client = _GuardedClient({})
     result = wb.writeback_create_merged_specification(client, **_merged_kwargs())
