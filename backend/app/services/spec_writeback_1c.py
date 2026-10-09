@@ -21,6 +21,7 @@ import math
 import uuid
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .specification_sync import _norm_component_spec_ref
@@ -1445,7 +1446,11 @@ def build_specification_create_payload(
 def _spec_create_business_projection(record: Mapping[str, Any]) -> Dict[str, Any]:
     """Comparable business data; tabular Ref_Key is transport identity only."""
     projected = _strip_spec_create_transport_fields(record)
-    for value in projected.values():
+    numeric_fields = {
+        SOSTAV: {"Количество", "КоличествоПродукции", "ДоляСтоимости"},
+        OPERATIONS_FIELD: {"НормаВремени", "Количество", "КоличествоПродукции"},
+    }
+    for table_field, value in projected.items():
         if isinstance(value, list):
             for row in value:
                 if isinstance(row, dict):
@@ -1453,7 +1458,26 @@ def _spec_create_business_projection(record: Mapping[str, Any]) -> Dict[str, Any
                     for key in list(row):
                         if "@" in str(key):
                             row.pop(key, None)
-    return projected
+                    for key in numeric_fields.get(table_field, set()):
+                        if key not in row:
+                            continue
+                        raw = row[key]
+                        if isinstance(raw, bool):
+                            raise SpecWritebackError(
+                                f"spec_create: {table_field}.{key} boolean is not numeric"
+                            )
+                        try:
+                            number = Decimal(str(raw))
+                        except (InvalidOperation, ValueError, TypeError) as exc:
+                            raise SpecWritebackError(
+                                f"spec_create: {table_field}.{key} is not numeric: {raw!r}"
+                            ) from exc
+                        if not number.is_finite():
+                            raise SpecWritebackError(
+                                f"spec_create: {table_field}.{key} is not finite"
+                            )
+                        row[key] = format(number.normalize(), "f")
+    return _normalize_tabular_array_order(projected, field="spec_create.readback")
 
 
 def _verify_created_specification(

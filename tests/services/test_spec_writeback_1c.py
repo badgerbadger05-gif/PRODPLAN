@@ -911,6 +911,43 @@ def test_merged_create_is_uuid_idempotent_and_rejects_collision():
         wb.writeback_create_merged_specification(collision, **kwargs)
 
 
+def test_created_spec_readback_normalizes_only_known_numeric_transport_fields_and_row_order():
+    expected = wb.build_merged_specification_create_payload(**_merged_kwargs())
+    for row in expected["Состав"]:
+        row["Количество"] = str(row["Количество"])
+        row["КоличествоПродукции"] = str(row["КоличествоПродукции"])
+    for row in expected["Операции"]:
+        row["НормаВремени"] = str(row["НормаВремени"])
+        row["Количество"] = str(row["Количество"])
+        row["КоличествоПродукции"] = str(row["КоличествоПродукции"])
+    actual = copy.deepcopy(expected)
+    actual["Code"] = "SERVER"
+    actual["DataVersion"] = "DV"
+    actual["Состав"].reverse()
+    actual["Операции"].reverse()
+    for row in actual["Состав"]:
+        row["Количество"] = float(row["Количество"])
+        row["КоличествоПродукции"] = float(row["КоличествоПродукции"])
+    for row in actual["Операции"]:
+        row["НормаВремени"] = float(row["НормаВремени"])
+        row["Количество"] = float(row["Количество"])
+        row["КоличествоПродукции"] = float(row["КоличествоПродукции"])
+    wb._verify_created_specification(actual, expected_payload=expected)
+
+    changed_quantity = copy.deepcopy(actual)
+    changed_quantity["Состав"][0]["Количество"] += 0.1
+    with pytest.raises(wb.SpecWritebackError, match="Состав"):
+        wb._verify_created_specification(changed_quantity, expected_payload=expected)
+
+    changed_operation = copy.deepcopy(actual)
+    current_operation = changed_operation["Операции"][0]["Операция_Key"]
+    changed_operation["Операции"][0]["Операция_Key"] = (
+        OPERATION_B if current_operation == OPERATION else OPERATION
+    )
+    with pytest.raises(wb.SpecWritebackError, match="Операции"):
+        wb._verify_created_specification(changed_operation, expected_payload=expected)
+
+
 def test_merged_create_fails_when_post_readback_is_missing():
     class MissingReadbackClient(_GuardedClient):
         def post(self, endpoint, payload):
