@@ -37,7 +37,7 @@ TABLES = (
 # absence explicitly instead of silently omitting unavailable tables.
 OPTIONAL_TABLES = frozenset({"production_order_lines"})
 SOURCE_REVISION = "20260909_02"
-TARGET_REVISION = "20260925_01"
+TARGET_REVISION = "20261009_01"
 PURCHASE_ADDITIONS = frozenset({
     "current_execution_scope_id", "current_execution_source_revision",
 })

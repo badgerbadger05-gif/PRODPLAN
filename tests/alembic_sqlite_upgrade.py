@@ -78,7 +78,7 @@ def _tables() -> dict[str, list[str]]:
     return tables
 
 
-def main(db_path: str, *, round_trip: bool = False, step_down: bool = False) -> int:
+def main(db_path: str, *, round_trip: bool = False, step_down: bool = False, downgrade_to: str = "-1") -> int:
     sys.path.insert(0, str(BACKEND))
     os.chdir(BACKEND)
     os.environ["DATABASE_URL"] = "sqlite:///" + db_path.replace("\\", "/")
@@ -98,7 +98,7 @@ def main(db_path: str, *, round_trip: bool = False, step_down: bool = False) -> 
     # обратимость новой головы проверяется на один шаг: вниз и снова вверх.
     stepped: dict[str, list[str]] | None = None
     if step_down:
-        command.downgrade(config, "-1")
+        command.downgrade(config, downgrade_to)
         stepped = _tables()
         command.upgrade(config, "head")
 
@@ -117,5 +117,6 @@ if __name__ == "__main__":
             sys.argv[1],
             round_trip="--round-trip" in sys.argv[2:],
             step_down="--step-down" in sys.argv[2:],
+            downgrade_to=sys.argv[sys.argv.index("--downgrade-to") + 1] if "--downgrade-to" in sys.argv else "-1",
         )
     )

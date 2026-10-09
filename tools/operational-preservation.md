@@ -20,7 +20,7 @@ python tools/operational_preservation.py verify-after --before output/rehearsal/
 ```
 
 Первый шаг принимает только source revision `20260909_02`; второй требует
-target `20260925_01` и прежнее имя БД. Проверять следует **до** rebase/refresh,
+target `20261009_01` и прежнее имя БД. Проверять следует **до** rebase/refresh,
 которые закономерно обновляют ряд operational compatibility fields. Возврат
 0 и `status=passed` обязательны. Существующий receipt не перезаписывается.
 При переносе результата на сервер нужен отдельный контроль транспортировки
@@ -158,7 +158,7 @@ recovery-процедуры на локальной копии; runner не оч
 
 ## §58, физический fold и API после миграции
 
-После подтверждённого `verify-after`, head `20260925_01` и необходимого
+После подтверждённого `verify-after`, head `20261009_01` и необходимого
 physical refresh использовать `tools/local_cutover_postflight.py`:
 
 ```powershell

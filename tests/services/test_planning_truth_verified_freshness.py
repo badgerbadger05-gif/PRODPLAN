@@ -276,8 +276,8 @@ def test_obligation_successor_keeps_the_verification_of_its_parent(
     assert int(pointer.verified_generation_id) == int(successor.id)
 
 
-def test_verified_freshness_migration_is_linear_head_and_reversible(tmp_path):
-    """The columns arrive at head and the revision steps back cleanly."""
+def test_verified_freshness_migration_is_in_linear_chain_and_reversible(tmp_path):
+    """The columns survive later heads and their own revision reverses cleanly."""
     path = (
         REPO_ROOT
         / "backend/alembic/versions/20260925_01_planning_truth_verified_freshness.py"
@@ -292,7 +292,8 @@ def test_verified_freshness_migration_is_linear_head_and_reversible(tmp_path):
     config = Config(str(REPO_ROOT / "backend" / "alembic.ini"))
     config.set_main_option("script_location", str(REPO_ROOT / "backend" / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert list(script.get_heads()) == ["20260925_01"]
+    assert len(script.get_heads()) == 1
+    assert module.revision in {row.revision for row in script.iterate_revisions(script.get_current_head(), None)}
 
     result = subprocess.run(
         [
@@ -300,6 +301,8 @@ def test_verified_freshness_migration_is_linear_head_and_reversible(tmp_path):
             str(REPO_ROOT / "tests" / "alembic_sqlite_upgrade.py"),
             str(tmp_path / "verified-freshness.db"),
             "--step-down",
+            "--downgrade-to",
+            module.down_revision,
         ],
         cwd=str(REPO_ROOT),
         capture_output=True,
