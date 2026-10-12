@@ -1875,6 +1875,20 @@ def run_physical_refresh(
             int(delta["input_delta_rows"]),
         )
         try:
+            # Local commands may advance the accepted compact custody owner
+            # while this lifecycle is fetching 1C data. Already adopted local
+            # events must not be revalidated as an unproved physical tail.
+            latest_custody_manifest = (
+                db.query(models.ProductionMaterialCustodyProjectionManifest)
+                .populate_existing()
+                .filter_by(ledger_generation_id=int(parent.id))
+                .one_or_none()
+            )
+            if latest_custody_manifest is not None:
+                latest_watermark = int(latest_custody_manifest.source_event_high_watermark_id or 0)
+                if str(latest_custody_manifest.status or "") != "complete" or latest_watermark < custody_event_start:
+                    raise PhysicalRefreshOrchestratorError("accepted custody publication marker regressed or became incomplete")
+                custody_event_start = latest_watermark
             custody_source_sle_ids = _bounded_custody_tail_sle_ids(
                 db,
                 after_event_id=custody_event_start,

@@ -235,9 +235,14 @@ describe('production-control current action transport', () => {
       current_identities: ['production:order:101'],
       expected_source_revision: 'rev-7',
     })
-    expect(JSON.parse(String((fetchMock.mock.calls[2]![1] as RequestInit).body))).toMatchObject({
+    expect(fetchMock.mock.calls[2]![0]).toBe(
+      '/api/v1/production-control/route-sheets/print?product_ids=101&current_identities=production%3Aorder%3A101&expected_source_revision=rev-7&auto_print=true',
+    )
+    expect((fetchMock.mock.calls[2]![1] as RequestInit | undefined)?.method).toBeUndefined()
+    expect(JSON.parse(String((fetchMock.mock.calls[3]![1] as RequestInit).body))).toMatchObject({
       current_identities: ['production:order:101'],
       expected_source_revision: 'rev-7',
+      mark_printed: true,
     })
   })
 

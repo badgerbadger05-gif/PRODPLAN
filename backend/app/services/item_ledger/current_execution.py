@@ -15,9 +15,10 @@ import hashlib
 import json
 import re
 from types import SimpleNamespace
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
+from sqlalchemy import and_, case
 from sqlalchemy.orm import Session
 
 from app import models
@@ -1046,6 +1047,9 @@ def load_current_execution_rows(
     *,
     entity_kind: str,
     scope_key: str | None = None,
+    business_identities: Sequence[str] | None = None,
+    product_ids: Sequence[int] | None = None,
+    order_ids: Sequence[int] | None = None,
 ) -> list[models.CurrentExecutionRow]:
     query = db.query(models.CurrentExecutionRow).filter(
         models.CurrentExecutionRow.entity_kind == str(entity_kind),
@@ -1054,6 +1058,12 @@ def load_current_execution_rows(
     )
     if scope_key is not None:
         query = query.filter(models.CurrentExecutionRow.scope_key == str(scope_key))
+    if business_identities is not None:
+        query = query.filter(models.CurrentExecutionRow.business_identity.in_(list(business_identities)))
+    if product_ids is not None:
+        query = query.filter(models.CurrentExecutionRow.payload["product_id"].as_integer().in_(list(product_ids)))
+    if order_ids is not None:
+        query = query.filter(models.CurrentExecutionRow.payload["order_id"].as_integer().in_(list(order_ids)))
     return query.order_by(
         models.CurrentExecutionRow.business_identity.asc(),
         models.CurrentExecutionRow.id.asc(),
@@ -1073,13 +1083,102 @@ def get_current_execution_scope(
     ).one_or_none()
 
 
-def load_current_execution_coherent(
+def _pending_planning_truth_state(db: Session) -> models.PlanningTruthState | None:
+    return next(
+        (
+            value
+            for value in tuple(db.new) + tuple(db.dirty)
+            if isinstance(value, models.PlanningTruthState)
+            and int(value.id or 0) == 1
+        ),
+        None,
+    )
+
+
+def _validate_current_execution_snapshot(
+    manifest: models.CurrentExecutionScope | None,
+    truth_pointer: models.PlanningTruthState | None,
+    generation: models.LedgerGeneration | None,
+) -> models.CurrentExecutionScope:
+    if manifest is None:
+        raise CurrentExecutionUnavailable("current execution manifest is missing")
+    if not bool(manifest.result_ready):
+        raise CurrentExecutionUnavailable("current execution manifest is not ready")
+    expected_generation_id = int(truth_pointer.current_generation_id or 0) if truth_pointer else 0
+    semantic_generation_id = expected_generation_id or int(manifest.source_generation_id or 0)
+    if expected_generation_id and int(manifest.source_generation_id or 0) != expected_generation_id:
+        raise CurrentExecutionUnavailable("current execution manifest is stale for accepted truth")
+    if semantic_generation_id and (
+        generation is None
+        or int(generation.id or 0) != semantic_generation_id
+        or str(generation.status or "") != "accepted"
+    ):
+        raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    return manifest
+
+
+def load_current_execution_mvcc_rows(
     db: Session,
     *,
     entity_kind: str,
     scope_key: str,
+    business_identities: Sequence[str],
 ) -> tuple[models.CurrentExecutionScope, list[models.CurrentExecutionRow]]:
-    """Read one current scope and its rows under one publication boundary.
+    """Read one persisted scope and requested rows from one MVCC snapshot.
+
+    This read-only path intentionally takes no publication row lock.  Scope,
+    exact rows, accepted-truth pointer and semantic generation are selected by
+    one statement, so an in-flight publisher remains invisible as one whole
+    uncommitted version instead of delaying an operator print.
+    """
+    if _pending_planning_truth_state(db) is not None:
+        raise CurrentExecutionUnavailable("current execution read has a pending truth move")
+    identities = sorted({str(value).strip() for value in business_identities if str(value).strip()})
+    scope_model = models.CurrentExecutionScope
+    row_model = models.CurrentExecutionRow
+    truth_model = models.PlanningTruthState
+    generation_model = models.LedgerGeneration
+    semantic_generation_id = case(
+        (truth_model.current_generation_id > 0, truth_model.current_generation_id),
+        else_=scope_model.source_generation_id,
+    )
+    result = (
+        db.query(scope_model, row_model, truth_model, generation_model)
+        .outerjoin(
+            row_model,
+            and_(
+                row_model.entity_kind == scope_model.entity_kind,
+                row_model.scope_key == scope_model.scope_key,
+                row_model.result_status == "accepted",
+                row_model.result_ready.is_(True),
+                row_model.business_identity.in_(identities),
+            ),
+        )
+        .outerjoin(truth_model, truth_model.id == 1)
+        .outerjoin(generation_model, generation_model.id == semantic_generation_id)
+        .filter(
+            scope_model.entity_kind == str(entity_kind),
+            scope_model.scope_key == str(scope_key),
+        )
+        .order_by(row_model.business_identity.asc(), row_model.id.asc())
+        .populate_existing()
+        .all()
+    )
+    if not result:
+        raise CurrentExecutionUnavailable("current execution manifest is missing")
+    manifest, _, truth_pointer, generation = result[0]
+    manifest = _validate_current_execution_snapshot(manifest, truth_pointer, generation)
+    rows = [row for _, row, _, _ in result if row is not None]
+    return manifest, rows
+
+
+def _require_current_execution_manifest(
+    db: Session,
+    *,
+    entity_kind: str,
+    scope_key: str,
+) -> models.CurrentExecutionScope:
+    """Validate only the manifest under its publication boundary.
 
     The manifest is the publication lock.  A publisher locks it before
     replacing current rows, so this reader either locks the old complete
@@ -1089,7 +1188,6 @@ def load_current_execution_coherent(
     manifest.
     """
     scope_model = models.CurrentExecutionScope
-    row_model = models.CurrentExecutionRow
     # Lock the manifest in its own statement.  At READ COMMITTED PostgreSQL
     # rechecks a row after waiting for the publisher, while an outer-join
     # statement can retain its pre-wait snapshot for the nullable rows and
@@ -1110,7 +1208,6 @@ def load_current_execution_coherent(
         raise CurrentExecutionUnavailable("current execution manifest is missing")
     if not bool(manifest.result_ready):
         raise CurrentExecutionUnavailable("current execution manifest is not ready")
-
     # Read the accepted-truth pointer after acquiring the publication lock.
     # Sessions in this repository intentionally use autoflush=False.  If the
     # caller has already moved the pointer in this same transaction, a
@@ -1118,15 +1215,7 @@ def load_current_execution_coherent(
     # that pending move, allowing a stale scope to pass.  Preserve a pending
     # identity-map value; otherwise refresh the committed pointer for the
     # concurrent-session publication boundary.
-    pending_truth = next(
-        (
-            value
-            for value in tuple(db.new) + tuple(db.dirty)
-            if isinstance(value, models.PlanningTruthState)
-            and int(value.id or 0) == 1
-        ),
-        None,
-    )
+    pending_truth = _pending_planning_truth_state(db)
     if pending_truth is not None:
         truth_pointer = pending_truth
     else:
@@ -1157,6 +1246,18 @@ def load_current_execution_coherent(
         )
         if generation is None or str(generation.status or "") != "accepted":
             raise CurrentExecutionUnavailable("current execution semantic pointer is not accepted")
+    return _validate_current_execution_snapshot(manifest, truth_pointer, generation if 'generation' in locals() else None)
+
+
+def load_current_execution_coherent(
+    db: Session,
+    *,
+    entity_kind: str,
+    scope_key: str,
+) -> tuple[models.CurrentExecutionScope, list[models.CurrentExecutionRow]]:
+    """Read the manifest and rows under the same publication lock."""
+    manifest = _require_current_execution_manifest(db, entity_kind=entity_kind, scope_key=scope_key)
+    row_model = models.CurrentExecutionRow
     rows = (
         db.query(row_model)
         .filter(
@@ -1178,10 +1279,9 @@ def require_current_execution_scope(
     scope_key: str,
 ) -> models.CurrentExecutionScope:
     """Return only a scope whose manifest matches the accepted semantic pointer."""
-    manifest, _rows = load_current_execution_coherent(
+    return _require_current_execution_manifest(
         db, entity_kind=entity_kind, scope_key=scope_key,
     )
-    return manifest
 
 
 def invalidate_current_execution_scope(

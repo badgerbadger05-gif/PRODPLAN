@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
+from sqlalchemy.exc import DBAPIError
 
 
 def run_command(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -54,19 +55,25 @@ def _execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    from .item_ledger.physical_refresh_orchestrator import _acquire_lifecycle_lock, _release_lifecycle_lock
-    lock = _acquire_lifecycle_lock(db)
-    if not lock:
-        raise HTTPException(409, detail={"code": "production_ledger_refresh_busy",
-            "message": "Сейчас обновляется Ledger. Дождитесь завершения обновления и повторите действие."})
+def _lock_command_publication(db) -> None:
+    """Share the short current-owner boundary, not the network import lock."""
+    from app import models
     try:
+        db.query(models.PlanningTruthState).filter_by(id=1).with_for_update(nowait=True).one()
+    except DBAPIError as exc:
+        if getattr(exc.orig, "pgcode", None) != "55P03":
+            raise
+        raise HTTPException(409, detail={"code": "production_ledger_publication_busy",
+            "message": "Публикуется новое состояние журнала. Обновление продолжится автоматически."}) from exc
+
+
+def execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _lock_command_publication(db)
         return _execute(db, action, arguments)
     except Exception:
         db.rollback()
         raise
-    finally:
-        _release_lifecycle_lock(lock)
 
 
 def main() -> None:

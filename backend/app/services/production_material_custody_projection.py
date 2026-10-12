@@ -1418,6 +1418,7 @@ def build_material_custody_projection(
 def _append_terminal_custody_releases(
     db: Session, *, generation: models.LedgerGeneration,
     cells: dict[ProjectionRowKey, float],
+    allow_same_current_repair: bool = False,
 ) -> int:
     """Record confirmed terminal ownership at a new physical cutoff only.
 
@@ -1431,8 +1432,10 @@ def _append_terminal_custody_releases(
     accepted_cutoff = db.query(func.max(models.LedgerGeneration.cutoff)).filter(
         models.LedgerGeneration.status == "accepted",
     ).scalar()
-    if accepted_cutoff is not None and not _after_1c_timestamp(
-        generation.cutoff, accepted_cutoff,
+    if (
+        not allow_same_current_repair
+        and accepted_cutoff is not None
+        and not _after_1c_timestamp(generation.cutoff, accepted_cutoff)
     ):
         return 0
     cutoff_wall = _moscow_wall_time(generation.cutoff)
@@ -2180,11 +2183,52 @@ def load_compact_current_material_custody(
             reason="compact current custody manifest is missing or incomplete",
         )
     watermark = int(manifest.source_event_high_watermark_id)
-    observed = int(
-        db.query(func.coalesce(func.max(models.ProductionMaterialCustodyEvent.id), 0)).scalar()
-        or 0
+    generation = db.get(models.LedgerGeneration, generation_id)
+    if generation is None or generation.cutoff is None:
+        raise MaterialCustodySnapshotUnavailable(
+            expected_generation_id=generation_id,
+            stored_generation_id=generation_id,
+            reason="accepted custody Ledger generation has no cutoff",
+        )
+    tail = (
+        db.query(models.ProductionMaterialCustodyEvent)
+        .filter(models.ProductionMaterialCustodyEvent.id > watermark)
+        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
+        .all()
     )
-    if observed != watermark:
+    physical_source_ids = {
+        int(event.source_sle_id)
+        for event in tail
+        if event.source_sle_id is not None
+    }
+    visible_source_ids: set[int] = set()
+    known_source_ids: set[int] = set()
+    if physical_source_ids:
+        known_source_ids = {
+            int(sle_id)
+            for (sle_id,) in db.query(models.StockLedgerEntry.id)
+            .filter(models.StockLedgerEntry.id.in_(physical_source_ids))
+            .all()
+        }
+        visible_source_ids = {
+            int(sle_id)
+            for (sle_id,) in visible_sle_query(
+                db,
+                physical_import_batch_id=int(generation.physical_import_batch_id),
+                cutoff=generation.cutoff,
+            )
+            .with_entities(models.StockLedgerEntry.id)
+            .filter(models.StockLedgerEntry.id.in_(physical_source_ids))
+            .all()
+        }
+    authoritative_tail = [
+        event
+        for event in tail
+        if event.source_sle_id is None
+        or int(event.source_sle_id) not in known_source_ids
+        or int(event.source_sle_id) in visible_source_ids
+    ]
+    if authoritative_tail:
         raise MaterialCustodySnapshotUnavailable(
             expected_generation_id=generation_id,
             stored_generation_id=generation_id,

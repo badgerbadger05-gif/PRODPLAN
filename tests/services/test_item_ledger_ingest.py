@@ -265,6 +265,68 @@ def test_pull_replace_by_recorder_idempotent(db_session):
     assert db_session.query(models.StockLedgerEntry).count() == 2
 
 
+def test_exact_repull_rolls_back_partial_custody_fold_before_deferring(
+    db_session, monkeypatch,
+):
+    from app.services import production_material_custody_events as custody_events
+    from app.services.item_ledger import physical_refresh_provenance as provenance
+
+    _setup(db_session)
+    client = FakeODataClient({
+        "trn-savepoint": [
+            _line("1", "Receipt", "ref-item-1", "wh-1", 5),
+        ]
+    })
+    pull_recorder_movements(
+        db_session, TRANSFER, "trn-savepoint", client=client,
+    )
+    generation_id = int(db_session.info["item_ledger_generation_id"])
+    generation = db_session.get(models.LedgerGeneration, generation_id)
+    manifest = models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=generation_id,
+        cutoff=generation.cutoff,
+        status="complete",
+        source_event_high_watermark_id=0,
+    )
+    db_session.add(manifest)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda *args, **kwargs: 1,
+    )
+    invalidations = []
+    monkeypatch.setattr(
+        custody_events,
+        "invalidate_material_custody_dependents",
+        lambda *args, **kwargs: invalidations.append(kwargs["source_revision"]),
+    )
+
+    def partial_fold(db, **_kwargs):
+        current = db.get(
+            models.ProductionMaterialCustodyProjectionManifest, generation_id
+        )
+        current.source_event_high_watermark_id = 99
+        db.flush()
+        raise provenance.PhysicalRefreshProvenanceUnavailable("deferred test tail")
+
+    monkeypatch.setattr(
+        provenance, "apply_accepted_current_material_custody_events", partial_fold,
+    )
+
+    result = pull_recorder_movements(
+        db_session, TRANSFER, "trn-savepoint", client=client,
+    )
+
+    db_session.refresh(manifest)
+    assert manifest.source_event_high_watermark_id == 0
+    assert result.diagnostics == [
+        "custody publication deferred: deferred test tail"
+    ]
+    assert invalidations == ["custody:transfer:trn-savepoint"]
+
+
 def test_pull_replace_by_recorder_updates_qty(db_session):
     item1, _ = _setup(db_session)
     c1 = FakeODataClient({"asm-1": [_line("1", "Receipt", "ref-item-1", "wh-1", 5)]})

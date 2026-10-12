@@ -601,6 +601,123 @@ def test_local_tail_does_not_skip_unseen_physical_event(db_session):
         )
 
 
+@pytest.mark.parametrize("batch_status", ["building", "rejected"])
+def test_compact_current_ignores_physical_tail_outside_accepted_prefix(
+    db_session, batch_status,
+):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key=f"custody-staged-tail-{batch_status}", cutoff=cutoff)
+    product, _parent, component = _product(
+        db_session, item_code=f"STAGEDTAIL{batch_status.upper()}"
+    )
+    _manifest(db_session, generation_id=generation.id, source_event_high_watermark_id=0)
+    db_session.add(ProductionMaterialCustodyProjection(
+        ledger_generation_id=generation.id,
+        product_id=product.product_id,
+        component_item_id=component.item_id,
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        reserved_qty=Decimal("4"),
+        source_event_high_watermark_id=0,
+        is_current=True,
+    ))
+    staged_batch = PhysicalImportBatch(
+        batch_key=f"custody-staged-source-{batch_status}",
+        status=batch_status,
+        cutoff=cutoff + timedelta(minutes=1),
+        source_watermarks={},
+    )
+    db_session.add(staged_batch)
+    db_session.flush()
+    staged_sle = StockLedgerEntry(
+        ingest_batch_id=staged_batch.id,
+        source_content_hash="staged-tail",
+        business_identity=f"staged-tail:{batch_status}",
+        item_id=component.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-MAIN",
+        qty=Decimal("1"),
+        qty_after=Decimal("1"),
+        posting_at=cutoff,
+        known_at=cutoff + timedelta(minutes=1),
+        record_type="Receipt",
+        movement_kind="transfer_in",
+        recorder_type="Transfer",
+        recorder_ref=f"staged-{batch_status}",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(staged_sle)
+    db_session.flush()
+    db_session.add(ProductionMaterialCustodyEvent(
+        product_id=product.product_id,
+        component_item_id=component.item_id,
+        source_kind="transfer_posted",
+        source_sle_id=staged_sle.id,
+        effective_at=cutoff,
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        delta_qty=Decimal("1"),
+        idempotency_key=f"custody-staged-tail:{batch_status}",
+    ))
+    db_session.flush()
+
+    generation_id, state = load_compact_current_material_custody(
+        db_session, consumer=f"test.compact.staged.{batch_status}"
+    )
+
+    assert generation_id == generation.id
+    assert state.reserved_at_warehouse("WH-MAIN", component.item_id) == 4
+
+
+def test_compact_current_rejects_unpublished_tail_from_accepted_physical_prefix(
+    db_session,
+):
+    cutoff = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    generation = _generation(db_session, key="custody-accepted-tail", cutoff=cutoff)
+    product, _parent, component = _product(db_session, item_code="ACCEPTEDTAIL")
+    _manifest(db_session, generation_id=generation.id, source_event_high_watermark_id=0)
+    accepted_sle = StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="accepted-tail",
+        business_identity="accepted-tail",
+        item_id=component.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH-MAIN",
+        qty=Decimal("1"),
+        qty_after=Decimal("1"),
+        posting_at=cutoff,
+        known_at=cutoff,
+        record_type="Receipt",
+        movement_kind="transfer_in",
+        recorder_type="Transfer",
+        recorder_ref="accepted-tail",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(accepted_sle)
+    db_session.flush()
+    db_session.add(ProductionMaterialCustodyEvent(
+        product_id=product.product_id,
+        component_item_id=component.item_id,
+        source_kind="transfer_posted",
+        source_sle_id=accepted_sle.id,
+        effective_at=cutoff,
+        location_kind="workshop",
+        warehouse_ref1c="WH-MAIN",
+        delta_qty=Decimal("1"),
+        idempotency_key="custody-accepted-tail:event",
+    ))
+    db_session.flush()
+
+    with pytest.raises(MaterialCustodySnapshotUnavailable, match="unpublished event tail"):
+        load_compact_current_material_custody(
+            db_session, consumer="test.compact.accepted-tail"
+        )
+
+
 def test_current_accepted_custody_refolds_an_event_dated_inside_the_cutoff(
     db_session,
 ):

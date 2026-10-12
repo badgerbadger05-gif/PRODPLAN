@@ -240,27 +240,36 @@ def test_local_launch_publishes_new_executor_when_retained_order_is_fully_produc
 
 def test_command_worker_does_not_race_physical_publication(monkeypatch):
     from app.services import production_control_command_worker as worker
-    from app.services.item_ledger import physical_refresh_orchestrator as physical
-    monkeypatch.setattr(physical, '_acquire_lifecycle_lock', lambda db: None)
+    def busy(db):
+        raise HTTPException(409, detail={"code": "production_ledger_publication_busy"})
+    monkeypatch.setattr(worker, '_lock_command_publication', busy)
     monkeypatch.setattr(worker, '_execute', lambda *a: pytest.fail('busy Ledger must not write'))
     with pytest.raises(HTTPException) as error:
-        worker.execute(object(), 'materials', {})
+        from types import SimpleNamespace
+        worker.execute(SimpleNamespace(rollback=lambda: None), 'materials', {})
     assert error.value.status_code == 409
 
 
-def test_command_worker_rolls_back_before_releasing_shared_lock(monkeypatch):
+def test_command_worker_rolls_back_failed_publication_transaction(monkeypatch):
     from types import SimpleNamespace
     from app.services import production_control_command_worker as worker
-    from app.services.item_ledger import physical_refresh_orchestrator as physical
     calls = []
-    monkeypatch.setattr(physical, '_acquire_lifecycle_lock', lambda db: True)
-    monkeypatch.setattr(physical, '_release_lifecycle_lock', lambda lock: calls.append('release'))
+    monkeypatch.setattr(worker, '_lock_command_publication', lambda db: calls.append('lock'))
     def fail(*args):
         raise ValueError('failed command')
     monkeypatch.setattr(worker, '_execute', fail)
     with pytest.raises(ValueError):
         worker.execute(SimpleNamespace(rollback=lambda: calls.append('rollback')), 'materialize', {})
-    assert calls == ['rollback', 'release']
+    assert calls == ['lock', 'rollback']
+
+
+def test_current_command_runs_while_physical_import_lifecycle_is_busy(db_session, monkeypatch):
+    from app.services import production_control_command_worker as worker
+    from app.services.item_ledger import physical_refresh_orchestrator as physical
+    _scope(db_session)
+    monkeypatch.setattr(physical, '_acquire_lifecycle_lock', lambda db: pytest.fail('import mutex must not guard current commands'))
+    monkeypatch.setattr(worker, '_execute', lambda *a: {'status': 'ok'})
+    assert worker.execute(db_session, 'refresh-executors', {}) == {'status': 'ok'}
 
 
 def test_current_material_worker_uses_compact_custody_without_historical_replay(db_session, monkeypatch):

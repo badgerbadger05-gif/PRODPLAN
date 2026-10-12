@@ -70,6 +70,13 @@ class CompactProvenanceHandoffResult:
     custody_idempotent: bool
 
 
+@dataclass(frozen=True)
+class AcceptedCurrentCustodyFoldResult:
+    folded_events: int
+    semantic_changed: bool
+    affected_product_ids: tuple[int, ...]
+
+
 def _pointer(db: Session) -> models.PlanningTruthState:
     pointer = db.get(models.PlanningTruthState, 1)
     if pointer is None or pointer.current_generation_id is None:
@@ -547,6 +554,7 @@ def apply_bounded_current_material_custody_events(
     parent_generation_id: int,
     target_generation_id: int,
     source_sle_ids: tuple[int, ...] | list[int] | set[int],
+    allow_same_current_repair: bool = False,
 ) -> int:
     """Fold the explicit physical custody tail into the compact current owner.
 
@@ -564,12 +572,21 @@ def apply_bounded_current_material_custody_events(
     other current projections have passed their gates.
     """
 
+    if allow_same_current_repair:
+        db.query(models.PlanningTruthState).filter(
+            models.PlanningTruthState.id == 1
+        ).with_for_update().one()
     parent, target, already_current = _generations(
         db,
         parent_generation_id=int(parent_generation_id),
         target_generation_id=int(target_generation_id),
     )
-    if already_current:
+    same_current_repair = (
+        allow_same_current_repair
+        and already_current
+        and int(parent.id) == int(target.id)
+    )
+    if already_current and not same_current_repair:
         return 0
     parent_manifest = db.get(
         models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
@@ -990,8 +1007,9 @@ def apply_bounded_current_material_custody_events(
         if Decimal(str(row.reserved_qty or 0)) > 0
     }
     before_release_watermark = int(observed_watermark)
+    release_kwargs = {"allow_same_current_repair": True} if same_current_repair else {}
     generated_release_count = _append_terminal_custody_releases(
-        db, generation=target, cells=release_basis,
+        db, generation=target, cells=release_basis, **release_kwargs,
     )
     if generated_release_count:
         db.flush()
@@ -1055,6 +1073,87 @@ def apply_bounded_current_material_custody_events(
     parent_manifest.source_event_high_watermark_id = watermark
     db.flush()
     return len(tail)
+
+
+def apply_accepted_current_material_custody_events(
+    db: Session,
+    *,
+    source_sle_ids: tuple[int, ...] | list[int] | set[int],
+) -> AcceptedCurrentCustodyFoldResult:
+    """Publish an exact accepted-visible recorder tail without moving truth.
+
+    This is the short path for an exact recorder re-pull which discovers a
+    missing custody association for physical facts already owned by the
+    accepted prefix.  The existing bounded fold remains the only quantity
+    engine; this entrypoint adds the exact pointer lock and semantic-change
+    reporting needed by the recorder transaction.
+    """
+    pointer = (
+        db.query(models.PlanningTruthState)
+        .filter(models.PlanningTruthState.id == 1)
+        .with_for_update()
+        .one_or_none()
+    )
+    if pointer is None or pointer.current_generation_id is None:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted current custody fold requires an exact truth pointer"
+        )
+    generation_id = int(pointer.current_generation_id)
+    generation = db.get(models.LedgerGeneration, generation_id)
+    if generation is None or str(generation.status or "") != "accepted":
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted current custody fold requires accepted truth"
+        )
+    explicit = tuple(int(value) for value in source_sle_ids)
+    if len(set(explicit)) != len(explicit):
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted current custody fold source SLE ids are duplicated"
+        )
+    visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=generation.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(explicit)).all()
+    } if explicit else set()
+    if visible_ids != set(explicit):
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted current custody fold source is outside accepted physical visibility"
+        )
+    before = {
+        (
+            int(row.product_id), int(row.component_item_id),
+            str(row.location_kind or ""), str(row.warehouse_ref1c or ""),
+        ): Decimal(str(row.reserved_qty or 0))
+        for row in db.query(models.ProductionMaterialCustodyProjection).filter(
+            models.ProductionMaterialCustodyProjection.is_current.is_(True)
+        ).all()
+    }
+    folded = apply_bounded_current_material_custody_events(
+        db,
+        parent_generation_id=generation_id,
+        target_generation_id=generation_id,
+        source_sle_ids=explicit,
+        allow_same_current_repair=True,
+    )
+    db.flush()
+    after = {
+        (
+            int(row.product_id), int(row.component_item_id),
+            str(row.location_kind or ""), str(row.warehouse_ref1c or ""),
+        ): Decimal(str(row.reserved_qty or 0))
+        for row in db.query(models.ProductionMaterialCustodyProjection).filter(
+            models.ProductionMaterialCustodyProjection.is_current.is_(True)
+        ).all()
+    }
+    changed_keys = {
+        key for key in set(before) | set(after) if before.get(key) != after.get(key)
+    }
+    return AcceptedCurrentCustodyFoldResult(
+        folded_events=int(folded),
+        semantic_changed=bool(changed_keys),
+        affected_product_ids=tuple(sorted({key[0] for key in changed_keys})),
+    )
 
 
 def handoff_current_material_custody_provenance(

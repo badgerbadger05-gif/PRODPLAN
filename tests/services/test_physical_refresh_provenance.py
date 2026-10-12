@@ -8,6 +8,7 @@ from app.services.item_ledger.future_supply_read import future_supply_model
 from app.services.item_ledger import physical_refresh_orchestrator as workflow
 from app.services.item_ledger.physical_refresh_provenance import (
     PhysicalRefreshProvenanceUnavailable,
+    apply_accepted_current_material_custody_events,
     apply_bounded_current_material_custody_events,
     handoff_current_future_supply_provenance,
     handoff_current_material_custody_provenance,
@@ -712,6 +713,80 @@ def test_bounded_late_physical_transfer_replays_terminal_history_once(db_session
         models.ProductionMaterialCustodyProjection, unrelated.id
     ) is None
 
+
+def test_accepted_current_late_terminal_transfer_advances_hwm_without_qty_churn(
+    db_session,
+):
+    (
+        parent, target, unrelated, outbound, inbound,
+        _opening, _old_release, _outbound_event, inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    # The exact recorder rows are already part of accepted physical truth; no
+    # generation or truth-pointer movement is needed to publish their custody
+    # association.  Remove the unrelated demonstration cell so before/after
+    # compares only the late DONE transfer, whose final quantity stays zero.
+    parent.physical_import_batch_id = target.physical_import_batch_id
+    db_session.delete(unrelated)
+    db_session.flush()
+
+    result = apply_accepted_current_material_custody_events(
+        db_session, source_sle_ids=(outbound.id, inbound.id),
+    )
+
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id
+    )
+    assert result.folded_events == 3
+    assert result.semantic_changed is False
+    assert result.affected_product_ids == ()
+    assert manifest.source_event_high_watermark_id > int(inbound_event.id)
+    assert not db_session.query(models.ProductionMaterialCustodyProjection.id).filter(
+        models.ProductionMaterialCustodyProjection.is_current.is_(True)
+    ).first()
+
+
+def test_accepted_current_fold_rejects_staging_source_without_advancing_hwm(
+    db_session,
+):
+    (
+        parent, _target, _unrelated, outbound, inbound,
+        _opening, old_release, _outbound_event, _inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id
+    )
+    original_hwm = int(old_release.id)
+    assert int(manifest.source_event_high_watermark_id) == original_hwm
+
+    with pytest.raises(
+        PhysicalRefreshProvenanceUnavailable,
+        match="outside accepted physical visibility",
+    ):
+        apply_accepted_current_material_custody_events(
+            db_session, source_sle_ids=(outbound.id, inbound.id),
+        )
+
+    assert int(manifest.source_event_high_watermark_id) == original_hwm
+
+
+def test_accepted_current_fold_rejects_duplicate_source_manifest(db_session):
+    parent, _target, _unrelated, outbound, _inbound, *_rest = (
+        _late_physical_after_terminal_world(db_session)
+    )
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id
+    )
+    original_hwm = int(manifest.source_event_high_watermark_id)
+
+    with pytest.raises(
+        PhysicalRefreshProvenanceUnavailable,
+        match="source SLE ids are duplicated",
+    ):
+        apply_accepted_current_material_custody_events(
+            db_session, source_sle_ids=(outbound.id, outbound.id),
+        )
+
+    assert int(manifest.source_event_high_watermark_id) == original_hwm
 
 def _late_manual_receipt_after_terminal_world(db):
     parent, target, _current, unrelated = _world(db)

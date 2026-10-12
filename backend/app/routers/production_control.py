@@ -61,6 +61,7 @@ from ..services.item_ledger.current_execution import (
 )
 from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
+    load_current_route_sheet_rows,
     mark_route_sheets_printed_by_snapshot_members as mark_route_sheets_printed_by_members,
     render_route_sheets_from_snapshots,
 )
@@ -1372,14 +1373,8 @@ def _require_current_production_identities(
     wanted = sorted(set(raw_wanted))
     if len(raw_wanted) != len(wanted):
         raise HTTPException(status_code=409, detail={"code": "production_current_identity_duplicate"})
-    rows = [
-        row for row in load_current_execution_rows(
-            db,
-            entity_kind="production_control_journal",
-            scope_key="production:all-live-orders",
-        )
-        if str(row.business_identity) in wanted
-    ]
+    rows = load_current_execution_rows(db, entity_kind="production_control_journal",
+        scope_key="production:all-live-orders", business_identities=wanted)
     if len(rows) != len(wanted):
         raise CurrentExecutionUnavailable("current production identities are missing or ambiguous")
     if locator_key is not None and locator_values is not None:
@@ -1752,6 +1747,9 @@ def get_orders_journal(
             db,
             entity_kind="production_control_journal",
             scope_key="production:all-live-orders",
+            business_identities=[str(current_identity).strip()] if current_identity is not None else None,
+            product_ids=[int(product_id)] if product_id is not None else None,
+            order_ids=[int(order_id)] if order_id is not None else None,
         )
         if current_identity is not None:
             target_identity = str(current_identity).strip()
@@ -2817,21 +2815,8 @@ def _current_route_sheet_payloads(
     requested = {int(value) for value in product_ids}
     if not requested:
         raise ValueError("Не выбраны строки заказа")
-    _require_current_production_identities(
-        db,
-        identities=[str(identity) for identity in current_identities],
-        expected_source_revision=expected_source_revision,
-        locator_key="product_id",
-        locator_values=requested,
-    )
-    rows = [
-        row for row in load_current_execution_rows(
-            db,
-            entity_kind="production_control_journal",
-            scope_key="production:all-live-orders",
-        )
-        if int((row.payload or {}).get("product_id") or 0) in requested
-    ]
+    _, rows = load_current_route_sheet_rows(db, current_identities,
+        product_ids=product_ids, expected_source_revision=str(expected_source_revision or ""))
     if len(rows) != len(requested):
         raise CurrentExecutionUnavailable("current route-sheet membership is missing or ambiguous")
     payloads: list[dict] = []
@@ -2888,6 +2873,9 @@ def post_print_route_sheets(
         ids = [int(x) for x in payload.product_ids if x is not None]
         if not ids:
             raise ValueError("Не выбраны строки заказа")
+        if payload.mark_printed:
+            require_current_execution_scope(db, entity_kind="production_control_journal",
+                scope_key="production:all-live-orders")
         route_payloads = _current_route_sheet_payloads(
             db,
             product_ids=ids,

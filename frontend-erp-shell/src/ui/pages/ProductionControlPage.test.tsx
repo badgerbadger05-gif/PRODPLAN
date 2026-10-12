@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, within, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, useLocation } from 'react-router-dom'
@@ -207,12 +208,15 @@ const fakeTruthMeta = {
   truth_reason: null,
 }
 
-function renderPage(initialEntries: string[] = ['/production-control']) {
-  return render(
+function renderPage(initialEntries: string[] = ['/production-control'], strict = false) {
+  const page = (
     <MemoryRouter initialEntries={initialEntries}>
       <ProductionControlPage />
       <LocationProbe />
-    </MemoryRouter>,
+    </MemoryRouter>
+  )
+  return render(
+    strict ? <StrictMode>{page}</StrictMode> : page,
   )
 }
 
@@ -688,21 +692,44 @@ describe('ProductionControlPage — characterization', () => {
     expect((await screen.findAllByText(/PP059717709/)).length).toBeGreaterThan(0)
   })
 
-  it('keeps a completed 1C export distinct from pending publication and closes stale printing', async () => {
+  it('shows the durable 1C receipt immediately and resumes metadata without another export', async () => {
     const user = userEvent.setup()
-    const printWindow = { document: { write: vi.fn() }, close: vi.fn(), closed: false }
+    const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false }
     vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    let metadataPublished = false
+    let releaseRefresh: (() => void) | undefined
+    vi.mocked(refreshCurrentProductionOrders).mockImplementation(() => new Promise((resolve) => {
+      releaseRefresh = () => {
+        metadataPublished = true
+        resolve({ status: 'refreshed', product_ids: [101], current_identities: ['production:order:101'], source_revision: 'published-rev' })
+      }
+    }))
+    vi.mocked(listProductionOrders).mockImplementation(async (params) => {
+      const row = {
+        ...fakeRows()[0],
+        source_revision: metadataPublished ? 'published-rev' : 'rev-7',
+        order_one_c_number: metadataPublished ? 'PP062017848' : null,
+        order_ref1c: metadataPublished ? 'created-ref' : null,
+      }
+      return { rows: [row], total: 1, limit: Number(params.get('limit') ?? 100), offset: 0,
+        latest_run_id: 77, truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' } }
+    })
     vi.mocked(exportMaterialIssuesTo1C).mockResolvedValue({ status: 'ok', issues_created: 1,
-      projection_refresh_error: 'Ledger refresh busy', parent_orders_export: { orders_created: 1 } })
-    renderPage()
+      projection_refresh_error: 'Ledger refresh busy', parent_orders_export: { orders_created: 1,
+        entries: [{ order_id: 101, number: 'PP062017848', target_ref_key: 'created-ref', status: 'created' }] } })
+    renderPage(['/production-control'], true)
     await screen.findByText('MRP run: 77')
     await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
-    expect(await screen.findByText(/Документы созданы в 1С, но данные журнала и печати/)).toBeVisible()
+    expect(await screen.findByText(/Заказ 1С №PP062017848 создан и проведён/)).toHaveTextContent('повторная выгрузка не требуется')
     expect(fetchRouteSheetsPrintHtml).not.toHaveBeenCalled()
-    expect(printWindow.close).toHaveBeenCalled()
-    await user.click(screen.getByRole('button', { name: 'Обновить' }))
+    expect(within(rowFor('Кронштейн')).getByRole('checkbox')).toBeChecked()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled())
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+    expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
     await waitFor(() => expect(refreshCurrentProductionOrders).toHaveBeenCalledWith([101], ['production:order:101'], 'rev-7'))
+    releaseRefresh?.()
+    await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalledWith([101], ['production:order:101'], 'published-rev'))
     expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
   })
 

@@ -551,14 +551,40 @@ def pull_recorder_movements(
             pull_row.order_ref = header_order_ref
         result.touched_keys = []
         from app.services.production_material_custody_events import (
+            invalidate_material_custody_dependents,
             project_transfer_custody_events_for_recorder,
         )
-        project_transfer_custody_events_for_recorder(
+        appended_custody = project_transfer_custody_events_for_recorder(
             session,
             recorder_type=recorder_type,
             recorder_ref=recorder_ref,
             stock_ledger_entries=active_rows,
+            invalidate_current=False,
         )
+        if appended_custody:
+            from .physical_refresh_provenance import (
+                PhysicalRefreshProvenanceUnavailable,
+                apply_accepted_current_material_custody_events,
+            )
+
+            try:
+                with session.begin_nested():
+                    custody_fold = apply_accepted_current_material_custody_events(
+                        session,
+                        source_sle_ids=tuple(int(row.id) for row in active_rows),
+                    )
+            except PhysicalRefreshProvenanceUnavailable as exc:
+                invalidate_material_custody_dependents(
+                    session,
+                    source_revision=f"custody:transfer:{recorder_ref}",
+                )
+                result.diagnostics.append(f"custody publication deferred: {exc}")
+            else:
+                if custody_fold.semantic_changed:
+                    invalidate_material_custody_dependents(
+                        session,
+                        source_revision=f"custody:transfer:{recorder_ref}",
+                    )
         session.flush()
         return result
 

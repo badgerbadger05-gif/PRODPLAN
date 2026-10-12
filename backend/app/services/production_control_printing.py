@@ -21,6 +21,7 @@ from ..models import (
     ProductionProduct,
     ProductionOrderLineState,
     ProductionStage,
+    CurrentExecutionRow,
     StockWarehouse,
     SpecComponent,
     SpecOperation,
@@ -32,9 +33,62 @@ from . import planning_truth
 from .one_c_production_order_export import PRODUCTION_ORDER_ENTITY
 from .bom_specification_resolver import BomSpecificationResolver
 from .production_output_truth import accepted_product_output
+from .item_ledger.current_execution import (
+    CurrentExecutionUnavailable,
+    load_current_execution_mvcc_rows,
+    require_current_execution_scope,
+)
 
 
 ROUTE_SHEET_SNAPSHOT_VERSION = 1
+ROUTE_SHEET_CURRENT_ENTITY_KIND = "production_control_journal"
+ROUTE_SHEET_CURRENT_SCOPE_KEY = "production:all-live-orders"
+
+
+def load_current_route_sheet_rows(
+    db: Session,
+    current_identities: Sequence[str],
+    *,
+    product_ids: Sequence[int],
+    expected_source_revision: str,
+) -> Tuple[Any, List[CurrentExecutionRow]]:
+    """Load only requested persisted route-sheet rows.
+
+    The production journal can contain thousands of large JSON payloads.  A
+    print request normally needs one or a handful of them, so it must use the
+    current owner's unique business identity instead of materializing the
+    complete journal scope in Python.
+    """
+    raw_identities = [
+        str(identity).strip()
+        for identity in current_identities
+        if str(identity).strip()
+    ]
+    identities = sorted(set(raw_identities))
+    requested_products = {int(product_id) for product_id in product_ids}
+    if not identities or not requested_products or not expected_source_revision:
+        raise CurrentExecutionUnavailable("current route-sheet identity and revision are required")
+    if len(raw_identities) != len(identities):
+        raise CurrentExecutionUnavailable("current route-sheet identity is duplicated")
+
+    manifest, rows = load_current_execution_mvcc_rows(
+        db,
+        entity_kind=ROUTE_SHEET_CURRENT_ENTITY_KIND,
+        scope_key=ROUTE_SHEET_CURRENT_SCOPE_KEY,
+        business_identities=identities,
+    )
+    if str(manifest.source_revision) != str(expected_source_revision):
+        raise CurrentExecutionUnavailable("current route-sheet source revision is stale")
+
+    if len(rows) != len(identities):
+        raise CurrentExecutionUnavailable("current route-sheet identity is missing or ambiguous")
+    resolved_products = {
+        int((row.payload or {}).get("product_id") or 0)
+        for row in rows
+    }
+    if resolved_products != requested_products:
+        raise CurrentExecutionUnavailable("current route-sheet product membership is stale")
+    return manifest, rows
 
 
 def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
@@ -56,6 +110,11 @@ def mark_route_sheets_printed_by_snapshot_members(
 ) -> int:
     # Exact write path for snapshot-backed prints: caller already owns exact members.
     ids = [int(pid) for pid in product_ids]
+    require_current_execution_scope(
+        db,
+        entity_kind=ROUTE_SHEET_CURRENT_ENTITY_KIND,
+        scope_key=ROUTE_SHEET_CURRENT_SCOPE_KEY,
+    )
     return _persist_route_sheets_printed_by_ids(db, ids, return_ids=ids)
 
 

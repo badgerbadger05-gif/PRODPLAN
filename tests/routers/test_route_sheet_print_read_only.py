@@ -37,7 +37,7 @@ def _row(product_id: int, *, identity: str | None = None, chain: dict | None = N
 
 def _patch_current(monkeypatch, rows):
     monkeypatch.setattr(routes, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
-    monkeypatch.setattr(routes, "load_current_execution_rows", lambda *args, **kwargs: list(rows))
+    monkeypatch.setattr(routes, "load_current_route_sheet_rows", lambda *args, **kwargs: (_manifest(), list(rows)))
 
 
 def test_get_route_sheet_is_read_only_even_with_legacy_mark_flag(monkeypatch):
@@ -86,7 +86,7 @@ def test_route_sheets_missing_current_manifest_is_503_even_with_legacy_rows(monk
 
     monkeypatch.setattr(
         routes,
-        "require_current_execution_scope",
+        "load_current_route_sheet_rows",
         lambda *args, **kwargs: (_ for _ in ()).throw(CurrentExecutionUnavailable("current manifest missing")),
     )
 

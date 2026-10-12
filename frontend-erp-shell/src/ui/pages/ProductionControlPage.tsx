@@ -79,11 +79,42 @@ import {
   writeProductionControlUrlState,
 } from './production-control/model'
 
+type ProductionOrderReceipt = {
+  orderId: number
+  number: string
+  targetRef: string
+}
+
+function successfulProductionOrderReceipts(parent: Record<string, unknown>): ProductionOrderReceipt[] {
+  const entries = Array.isArray(parent.entries) ? parent.entries : []
+  return entries.flatMap((raw) => {
+    if (!raw || typeof raw !== 'object') return []
+    const entry = raw as Record<string, unknown>
+    if (entry.status !== 'created' && entry.status !== 'existing') return []
+    const orderId = Number(entry.order_id ?? 0)
+    const number = String(entry.number ?? '').trim()
+    const targetRef = String(entry.target_ref_key ?? '').trim()
+    return orderId > 0 && number && targetRef ? [{ orderId, number, targetRef }] : []
+  })
+}
+
+function orderReceiptLabel(receipts: readonly ProductionOrderReceipt[]) {
+  return receipts.map((receipt) => `№${receipt.number}`).join(', ')
+}
+
 export function ProductionControlPage() {
+  const mounted = useRef(true)
   const listRequestSeq = useRef(0)
   const materialsRequestSeq = useRef(0)
   const dangerousMutationLocked = useRef(false)
   const [searchParams, setSearchParams] = useSearchParams()
+
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
   const focusProductId = searchParams.get('product_id')
   const focusOrderId = searchParams.get('order_id')
   const initialUrlState = useRef(parseProductionControlUrlState(searchParams))
@@ -101,6 +132,7 @@ export function ProductionControlPage() {
   const [materialsRefreshToken, setMaterialsRefreshToken] = useState(0)
   const [launchQtyByWorkItem, setLaunchQtyByWorkItem] = useState<Record<number, number>>({})
   const [loading, setLoading] = useState(false)
+  const [publicationPendingIds, setPublicationPendingIds] = useState<Set<number>>(new Set())
   const [error, setError] = useState('')
   const [total, setTotal] = useState(0)
   const [runId, setRunId] = useState<number | null>(null)
@@ -435,6 +467,44 @@ export function ProductionControlPage() {
     return currentActionSelection(ids, refreshed)
   }
 
+  async function continuePublishedOrderRefresh(
+    ids: number[],
+    receipts: readonly ProductionOrderReceipt[],
+    printWindow: Window | null,
+    successSummary: string,
+  ) {
+    const receiptRefs = new Set(receipts.map((receipt) => receipt.targetRef))
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 1500))
+      if (!mounted.current) return
+      try {
+        const context = await refreshActionSelection(ids)
+        await refreshCurrentProductionOrders(ids, context.identities, context.sourceRevision)
+        const refreshedRows = await Promise.all(ids.map(async (productId) => {
+          const data = await listProductionOrders(new URLSearchParams({
+            product_id: String(productId), limit: '2', offset: '0',
+          }))
+          return data.total === 1 && data.rows.length === 1 ? data.rows[0] : null
+        }))
+        if (refreshedRows.some((row) => !row || !row.order_ref1c || !receiptRefs.has(row.order_ref1c))) continue
+        const freshContext = currentActionSelection(ids, refreshedRows as OrderRow[])
+        await load(offsetRef.current)
+        setPublicationPendingIds((current) => {
+          const next = new Set(current)
+          ids.forEach((productId) => next.delete(productId))
+          return next
+        })
+        setMessage(`${successSummary}. Журнал обновлён; маршрутный лист готов к печати.`)
+        renderRouteSheets(ids, printWindow, freshContext.identities, freshContext.sourceRevision)
+        return
+      } catch {
+        // The worker may still hold the physical-refresh lifecycle lock.
+      }
+    }
+    closeRouteSheetWindow(printWindow)
+    setMessage(`${successSummary}. Журнал и печать ещё обновляются; повторная выгрузка в 1С не требуется.`)
+  }
+
   function renderRouteSheets(ids: number[], printWindow: Window | null, currentIdentities?: string[], sourceRevision?: string) {
     if (!ids.length || !printWindow || printWindow.closed) return
     let context = { identities: currentIdentities, sourceRevision }
@@ -450,7 +520,9 @@ export function ProductionControlPage() {
         printWindow.document.open()
         printWindow.document.write(html)
         printWindow.document.close()
-        window.setTimeout(() => void load(offsetRef.current), 1200)
+        window.setTimeout(() => {
+          if (mounted.current) void load(offsetRef.current)
+        }, 1200)
       })
       .catch((e) => {
         closeRouteSheetWindow(printWindow)
@@ -516,6 +588,10 @@ export function ProductionControlPage() {
       : []
     if (!ids.length && !workItemIds.length) {
       setError('Для выбранных строк недоступен рабочий объект запуска. Обновите журнал; запуск заблокирован.')
+      return
+    }
+    if (ids.some((productId) => publicationPendingIds.has(productId))) {
+      setMessage('Заказ уже создан и проведён в 1С; журнал и печать ещё обновляются. Повторная выгрузка не требуется.')
       return
     }
     if (!beginDangerousMutation()) return
@@ -609,6 +685,7 @@ export function ProductionControlPage() {
       }
       const result = await exportMaterialIssuesTo1C(issueIds)
       const parent = (result.parent_orders_export ?? {}) as Record<string, unknown>
+      const orderReceipts = successfulProductionOrderReceipts(parent)
       const ordersCreated = Number(parent.orders_created ?? 0)
       const ordersExisting = Number(parent.orders_already_linked ?? 0)
       const transfersCreated = Number(result.issues_created ?? 0)
@@ -629,7 +706,16 @@ export function ProductionControlPage() {
         throw new Error(`${summary}${detail ? `. ${detail}` : ''}`)
       }
       if (result.projection_refresh_error) {
-        throw new Error(`Документы созданы в 1С, но данные журнала и печати ещё не обновлены. Нажмите «Обновить»; повторная выгрузка не требуется. ${String(result.projection_refresh_error)}`)
+        const receiptLabel = orderReceiptLabel(orderReceipts)
+        const successSummary = `${summary}${receiptLabel ? `. Заказ 1С ${receiptLabel} создан и проведён` : '. Заказ 1С создан и проведён'}`
+        setSelectedIds(new Set(ids))
+        setPublicationPendingIds((current) => new Set([...current, ...ids]))
+        setActiveId(ids[0] ?? null)
+        setActiveCurrentIdentity(null)
+        setMessage(`${successSummary}. Обновляем журнал и печать; повторная выгрузка не требуется.`)
+        void continuePublishedOrderRefresh(ids, orderReceipts, printWindow, successSummary)
+        printWindow = null
+        return
       }
       setMessage(
         printWindow
@@ -1106,7 +1192,7 @@ export function ProductionControlPage() {
         {view !== 'drum' && view !== 'assembly-queue' && <ProductionCommandBar
           rows={rows}
           selectedIds={selectedIds}
-          loading={loading}
+          loading={loading || selectedRows.some((row) => row.product_id != null && publicationPendingIds.has(row.product_id))}
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}

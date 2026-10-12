@@ -223,12 +223,19 @@ export function postMaterialIssues(productIds: number[], initiatedBy: string, so
   })
 }
 
-export function fetchRouteSheetsPrintHtml(
+export async function fetchRouteSheetsPrintHtml(
   productIds: number[],
   currentIdentities: string[] = [],
   expectedSourceRevision?: string | null,
 ): Promise<string> {
-  return apiText('/v1/production-control/route-sheets/print', {
+  const query = new URLSearchParams({
+    product_ids: productIds.join(','),
+    current_identities: currentIdentities.join(','),
+    expected_source_revision: expectedSourceRevision ?? '',
+    auto_print: 'true',
+  })
+  const html = await apiText(`/v1/production-control/route-sheets/print?${query.toString()}`)
+  void apiText('/v1/production-control/route-sheets/print', {
     method: 'POST',
     body: JSON.stringify({
       product_ids: productIds,
@@ -237,7 +244,8 @@ export function fetchRouteSheetsPrintHtml(
       mark_printed: true,
       auto_print: true,
     }),
-  })
+  }).catch(() => undefined)
+  return html
 }
 
 export function exportMaterialIssuesTo1C(issueIds: number[]) {

@@ -989,6 +989,11 @@ def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
         # document into this candidate, never against the restored parent.
         assert calls == ["fork", "audit", "import", "balance"]
         assert kwargs["target_generation_id"] == physical.id
+        # The import phase may synchronously adopt a local custody command into
+        # the accepted compact owner. Candidate validation must begin after
+        # that latest complete parent HWM, rather than revalidating the already
+        # adopted command from the pre-import watermark captured at startup.
+        assert kwargs["after_event_id"] == 17
         calls.append("custody-gate")
         if custody_gate_rejects:
             raise workflow.PhysicalRefreshOrchestratorError("unproved custody tail")
@@ -1046,11 +1051,17 @@ def test_run_physical_refresh_nonzero_delta_publishes_bounded_current_state(
         "run_physical_recorder_audit",
         lambda *args, **kwargs: calls.append("audit") or object(),
     )
-    monkeypatch.setattr(
-        workflow,
-        "run_historical_physical_import",
-        lambda *args, **kwargs: calls.append("import") or import_result,
-    )
+    def _import(*args, **kwargs):
+        calls.append("import")
+        manifest = db_session.get(
+            models.ProductionMaterialCustodyProjectionManifest, parent.id
+        )
+        assert manifest is not None and manifest.status == "complete"
+        manifest.source_event_high_watermark_id = 17
+        db_session.flush()
+        return import_result
+
+    monkeypatch.setattr(workflow, "run_historical_physical_import", _import)
     monkeypatch.setattr(
         workflow,
         "evaluate_physical_refresh_balance_convergence",

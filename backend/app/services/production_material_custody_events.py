@@ -77,6 +77,25 @@ def _clean_ref2c(value: Optional[str]) -> Optional[str]:
     return raw or None
 
 
+def invalidate_material_custody_dependents(
+    db: Session, *, source_revision: str,
+) -> None:
+    from .item_ledger.current_execution import invalidate_current_execution_scope
+
+    for entity_kind, scope_key in (
+        ("shelf_projection", "shelf:all-live-mrps"),
+        ("assembly_readiness", "assembly:all-live-plans"),
+        ("drum_schedule", "drum:all-live-plans"),
+    ):
+        invalidate_current_execution_scope(
+            db,
+            entity_kind=entity_kind,
+            scope_key=scope_key,
+            source_revision=source_revision,
+            reason="custody_coverage_changed",
+        )
+
+
 def append_material_issue_custody_event(
     db: Session,
     *,
@@ -91,6 +110,7 @@ def append_material_issue_custody_event(
     effective_at: Optional[datetime] = None,
     source_sle_id: Optional[int] = None,
     source_sle_identity: Optional[str] = None,
+    invalidate_current: bool = True,
 ) -> bool:
     """
     Append one custody delta event for a material-issue line, guarded by an
@@ -167,29 +187,10 @@ def append_material_issue_custody_event(
     from .production_material_custody_projection import apply_local_custody_event_to_current
 
     apply_local_custody_event_to_current(db, event=event)
-    from .item_ledger.current_execution import invalidate_current_execution_scope
-
-    invalidate_current_execution_scope(
-        db,
-        entity_kind="shelf_projection",
-        scope_key="shelf:all-live-mrps",
-        source_revision=f"custody:event:{int(event.id)}",
-        reason="custody_coverage_changed",
-    )
-    invalidate_current_execution_scope(
-        db,
-        entity_kind="assembly_readiness",
-        scope_key="assembly:all-live-plans",
-        source_revision=f"custody:event:{int(event.id)}",
-        reason="custody_coverage_changed",
-    )
-    invalidate_current_execution_scope(
-        db,
-        entity_kind="drum_schedule",
-        scope_key="drum:all-live-plans",
-        source_revision=f"custody:event:{int(event.id)}",
-        reason="custody_coverage_changed",
-    )
+    if invalidate_current:
+        invalidate_material_custody_dependents(
+            db, source_revision=f"custody:event:{int(event.id)}"
+        )
     return True
 
 
@@ -317,6 +318,7 @@ def _project_order_based_manual_transfer(
     *,
     recorder_ref: str,
     stock_ledger_entries: Iterable[StockLedgerEntry],
+    invalidate_current: bool = True,
 ) -> int:
     """Project a posted 1C transfer made manually for one exact order line.
 
@@ -391,29 +393,9 @@ def _project_order_based_manual_transfer(
             )
         )
         appended += 1
-    if appended:
-        from .item_ledger.current_execution import invalidate_current_execution_scope
-
-        invalidate_current_execution_scope(
-            db,
-            entity_kind="shelf_projection",
-            scope_key="shelf:all-live-mrps",
-            source_revision=f"custody:transfer:{recorder_ref}",
-            reason="custody_coverage_changed",
-        )
-        invalidate_current_execution_scope(
-            db,
-            entity_kind="assembly_readiness",
-            scope_key="assembly:all-live-plans",
-            source_revision=f"custody:transfer:{recorder_ref}",
-            reason="custody_coverage_changed",
-        )
-        invalidate_current_execution_scope(
-            db,
-            entity_kind="drum_schedule",
-            scope_key="drum:all-live-plans",
-            source_revision=f"custody:transfer:{recorder_ref}",
-            reason="custody_coverage_changed",
+    if appended and invalidate_current:
+        invalidate_material_custody_dependents(
+            db, source_revision=f"custody:transfer:{recorder_ref}"
         )
     return appended
 
@@ -424,6 +406,7 @@ def project_transfer_custody_events_for_recorder(
     recorder_type: str,
     recorder_ref: str,
     stock_ledger_entries: Iterable[StockLedgerEntry],
+    invalidate_current: bool = True,
 ) -> int:
     """Append custody changes only from freshly persisted physical SLE facts."""
     if str(recorder_type or "") != _STOCK_TRANSFER_ENTITY:
@@ -447,6 +430,7 @@ def project_transfer_custody_events_for_recorder(
             db,
             recorder_ref=ref,
             stock_ledger_entries=stock_ledger_entries,
+            invalidate_current=invalidate_current,
         )
     issue = (
         db.query(ProductionMaterialIssue)
@@ -535,6 +519,7 @@ def project_transfer_custody_events_for_recorder(
                 source_ref1c=source,
                 source_ref2c=ref,
                 effective_at=sle.posting_at,
+                invalidate_current=invalidate_current,
             ):
                 appended += 1
             db.flush()
@@ -598,6 +583,7 @@ def project_transfer_custody_events_for_recorder(
             source_sle_id=int(sle.id),
             source_sle_identity=stable_physical_sle_identity(sle),
             effective_at=sle.posting_at,
+            invalidate_current=invalidate_current,
         ):
             appended += 1
     return appended

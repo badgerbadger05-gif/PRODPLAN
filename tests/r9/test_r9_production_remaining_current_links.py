@@ -233,6 +233,7 @@ def test_route_sheet_get_and_post_use_current_payload_not_snapshot_reader(monkey
     row = _current_row(product_id=77)
     monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
     monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [row])
+    monkeypatch.setattr(router, "load_current_route_sheet_rows", lambda *args, **kwargs: (_manifest(), [row]))
     monkeypatch.setattr(router, "render_route_sheets_from_snapshots", lambda payloads, **kwargs: "<html>current</html>")
     printed = []
     monkeypatch.setattr(router, "mark_route_sheets_printed_by_members", lambda *args, **kwargs: printed.append(True))
@@ -259,9 +260,12 @@ def test_route_sheet_get_and_post_use_current_payload_not_snapshot_reader(monkey
 
 def test_route_sheet_rejects_foreign_current_identity(monkeypatch):
     import app.routers.production_control as router
+    from app.services.item_ledger.current_execution import CurrentExecutionUnavailable
 
     monkeypatch.setattr(router, "require_current_execution_scope", lambda *args, **kwargs: _manifest())
     monkeypatch.setattr(router, "load_current_execution_rows", lambda *args, **kwargs: [_current_row()])
+    monkeypatch.setattr(router, "load_current_route_sheet_rows", lambda *args, **kwargs:
+        (_ for _ in ()).throw(CurrentExecutionUnavailable("current identity is missing")))
     with pytest.raises(Exception) as caught:
         print_route_sheets(
             product_ids="77",
