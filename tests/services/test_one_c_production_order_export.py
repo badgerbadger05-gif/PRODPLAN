@@ -651,6 +651,52 @@ def test_successful_export_records_where_the_output_lands(db_session, monkeypatc
     assert product.destination_warehouse_ref1c == "production-warehouse-ref"
 
 
+@pytest.mark.parametrize('blocked', [None, 'exported', 'issued', 'unknown_warehouse'])
+def test_manual_combined_route_keeps_weld_materials_and_separate_result_warehouse(db_session, monkeypatch, blocked):
+    from app.services.production_control_journal import update_line_state
+    db = db_session
+    item = _mk_item(db, code='COMBINED-ROUTE', ref1c='55555555-5555-5555-5555-555555555555')
+    resource = ProductionResource(resource_name='Welding')
+    db.add(resource)
+    db.flush()
+    binding = WorkshopWarehouseBinding(workshop_id=resource.resource_id,
+        warehouse_ref1c='weld-materials', production_warehouse_ref1c='paint-workshop')
+    result_ref = '33333333-3333-3333-3333-333333333333'
+    db.add_all([binding, models.StockWarehouse(warehouse_ref1c=result_ref, warehouse_name='Warehouse 3')])
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=15)
+    product = db.query(ProductionProduct).filter_by(order_id=order.order_id).one()
+    if blocked == 'exported': order.order_ref1c = 'already-exported'
+    if blocked == 'issued':
+        db.add(ProductionMaterialIssue(document_number='Existing issue', product_id=product.product_id,
+            order_id=order.order_id, status='draft', warehouse_ref1c='weld-materials'))
+    db.commit()
+    payload = {'workshop_id': resource.resource_id,
+               'destination_warehouse_ref1c': 'missing' if blocked == 'unknown_warehouse' else result_ref}
+    if blocked:
+        with pytest.raises(ValueError): update_line_state(db, product.product_id, payload)
+        db.rollback()
+        assert product.destination_warehouse_ref1c is None
+        assert binding.production_warehouse_ref1c == 'paint-workshop'
+        return
+    update_line_state(db, product.product_id, payload)
+    state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    assert state.workshop_id_source == 'manual_route'
+    assert binding.production_warehouse_ref1c == 'paint-workshop'
+    _stub_odata_config(monkeypatch, base_url='http://unf.local/odata')
+    monkeypatch.setattr(exporter, 'OData1CClient', lambda **_: pytest.fail('preview must not call 1C'))
+    preview = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=True)
+    document = preview['payloads'][0]['payload']
+    assert document['СтруктурнаяЕдиницаРезерв_Key'] == 'weld-materials'
+    assert document['СтруктурнаяЕдиницаПродукции_Key'] == result_ref
+    assert document['Продукция'][0]['СтруктурнаяЕдиница_Key'] == result_ref
+    assert document['Продукция'][0]['Количество'] == 15
+    binding.production_warehouse_ref1c = 'another-global-default'
+    db.commit()
+    again = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=True)
+    assert again['payloads'][0]['payload']['СтруктурнаяЕдиницаПродукции_Key'] == result_ref
+
+
 def test_recalculated_existing_order_is_reused_patched_and_reposted(
     db_session, monkeypatch
 ):

@@ -4942,6 +4942,8 @@ export interface components {
             issue_status?: string | null;
             /** Workshop Id */
             workshop_id?: number | null;
+            /** Destination Warehouse Ref1C */
+            destination_warehouse_ref1c?: string | null;
             /** Planned Start Date */
             planned_start_date?: string | null;
             /** Planned Finish Date */

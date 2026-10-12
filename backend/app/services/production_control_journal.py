@@ -30,6 +30,7 @@ from ..models import (
     ShelfProjection,
     SpecComponent,
     Specification,
+    StockWarehouse,
     SyncLink,
     Unit,
 )
@@ -1755,6 +1756,37 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
     if not product:
         raise ValueError("Строка заказа не найдена")
 
+    result_warehouse = None
+    route_workshop = None
+    if "destination_warehouse_ref1c" in payload:
+        from .workshop_resolution import resolve_workshop_for_product, warehouse_binding_for_workshop
+
+        order = product.order
+        output = accepted_product_output(product)
+        if (order is None or str(order.source or "").lower() != "mrp"
+                or _production_order_has_1c_link(db, order) or order.is_posted
+                or order.deletion_mark
+                or (product.control_state and str(product.control_state.status or "") in _TERMINAL_LINE_STATUSES)
+                or _to_float(output.produced_qty) > 1e-9):
+            raise ValueError("Склад результата задаётся только до выгрузки локального заказа в 1С и выпуска")
+        if db.query(PaintWeldChainLink.id).filter(
+            (PaintWeldChainLink.painted_order_id == int(order.order_id))
+            | (PaintWeldChainLink.welded_order_id == int(order.order_id))
+        ).first():
+            raise ValueError("Склад результата открытой цепочки сварки и окраски задаётся маршрутом цепочки")
+        if db.query(ProductionMaterialIssue.issue_id).filter(
+            ProductionMaterialIssue.product_id == int(product_id)
+        ).first():
+            raise ValueError("Склад результата задаётся до оформления выдачи материалов")
+        result_warehouse = str(payload.get("destination_warehouse_ref1c") or "").strip() or None
+        if result_warehouse:
+            if not db.query(StockWarehouse.warehouse_id).filter_by(warehouse_ref1c=result_warehouse).first():
+                raise ValueError("Склад результата отсутствует в справочнике складов")
+            route_workshop = (int(payload["workshop_id"]) if payload.get("workshop_id")
+                              else resolve_workshop_for_product(db, product))
+            if not route_workshop or not warehouse_binding_for_workshop(db, route_workshop):
+                raise ValueError("Для явного маршрута задайте участок с настроенным складом материалов")
+
     state = _ensure_state(db, product)
     prev_status = str(state.status or "")
     if "status" in payload and payload.get("status"):
@@ -1784,8 +1816,17 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         state.issue_status = issue_status
     if "workshop_id" in payload:
         state.workshop_id = int(payload["workshop_id"]) if payload.get("workshop_id") else None
-        state.workshop_id_source = "manual" if state.workshop_id else None
+        state.workshop_id_source = ("manual_route" if state.workshop_id and state.workshop_id_source == "manual_route"
+                                    else "manual" if state.workshop_id else None)
         state.workshop_id_set_at = datetime.now(timezone.utc) if state.workshop_id else None
+    if "destination_warehouse_ref1c" in payload:
+        product.destination_warehouse_ref1c = result_warehouse
+        if result_warehouse:
+            state.workshop_id = route_workshop
+            state.workshop_id_source = "manual_route"
+            state.workshop_id_set_at = datetime.now(timezone.utc)
+        elif state.workshop_id_source == "manual_route":
+            state.workshop_id_source = "manual"
     if "planned_start_date" in payload:
         state.planned_start_date = _parse_date(payload.get("planned_start_date"))
     if "planned_finish_date" in payload:

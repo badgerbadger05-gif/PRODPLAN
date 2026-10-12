@@ -850,6 +850,8 @@ class ProductionOrderLineState(Base):
     status = Column(String(32), nullable=False, default="shortage", server_default="shortage", index=True)
     workshop_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True, index=True)
     workshop_id_source = Column(String(16), nullable=True, index=True)
+    # manual_route pins both this workshop and the existing product destination;
+    # manual alone keeps the workshop's default finished-product recipient.
     workshop_id_set_at = Column(TIMESTAMP, nullable=True)
     planned_start_date = Column(Date, nullable=True, index=True)
     planned_finish_date = Column(Date, nullable=True, index=True)

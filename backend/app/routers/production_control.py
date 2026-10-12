@@ -1167,6 +1167,7 @@ class LineStatePayload(BaseModel):
     status: Optional[str] = None
     issue_status: Optional[str] = None
     workshop_id: Optional[int] = None
+    destination_warehouse_ref1c: Optional[str] = None
     planned_start_date: Optional[str] = None
     planned_finish_date: Optional[str] = None
     comment: Optional[str] = None

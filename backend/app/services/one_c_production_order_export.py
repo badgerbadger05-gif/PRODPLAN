@@ -480,8 +480,18 @@ def _collect_export_entries(
             material_destination_ref = (
                 _clean_ref1c(issue.warehouse_ref1c) if issue else None
             ) or workshop_warehouse_ref
+            state = (
+                db.query(ProductionOrderLineState)
+                .filter(ProductionOrderLineState.product_id == int(product.product_id))
+                .first()
+            )
+            manual_destination_ref = (
+                _clean_ref1c(product.destination_warehouse_ref1c)
+                if state and state.workshop_id_source == "manual_route" else None
+            )
             product_destination_ref = (
                 chain_destination_ref
+                or manual_destination_ref
                 or production_warehouse_ref
                 or material_destination_ref
             )
@@ -490,11 +500,6 @@ def _collect_export_entries(
                 reserve_ref = product_reserve_ref
             if product_destination_ref and not product_structural_unit_ref:
                 product_structural_unit_ref = product_destination_ref
-            state = (
-                db.query(ProductionOrderLineState)
-                .filter(ProductionOrderLineState.product_id == int(product.product_id))
-                .first()
-            )
             if state and state.planned_start_date:
                 start_dates.append(state.planned_start_date)
             if state and state.planned_finish_date:
