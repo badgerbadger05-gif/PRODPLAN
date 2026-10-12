@@ -584,6 +584,21 @@ def test_direct_1c_writer_registry_is_exact() -> None:
     # and mutation remain inside the sanctioned one_c export owners.
     assert actual == {
         (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_create_merged_specification",
+            "post",
+        ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_default_specification_guarded",
+            "patch",
+        ),
+        (
+            "backend/app/services/spec_writeback_1c.py",
+            "_run_compensate_specification_writeback",
+            "patch",
+        ),
+        (
             "backend/app/services/one_c_export_common.py",
             "post_export_entries",
             "post",

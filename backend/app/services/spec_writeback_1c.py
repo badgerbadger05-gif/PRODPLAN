@@ -1292,7 +1292,7 @@ def writeback_create_merged_specification(
 ) -> Dict[str, Any]:
     """Preview or explicitly create one lossless merged specification."""
 
-    def _run() -> Dict[str, Any]:
+    def _run_create_merged_specification() -> Dict[str, Any]:
         mode = _require_mutation_mode(mutation_mode)
         payload = build_merged_specification_create_payload(
             header_template,
@@ -1347,7 +1347,7 @@ def writeback_create_merged_specification(
             "after_etag": explicit_odata_etag(after),
         }
 
-    return _guard("merged_spec_create", _run)
+    return _guard("merged_spec_create", _run_create_merged_specification)
 
 
 def build_specification_create_payload(
@@ -1771,7 +1771,7 @@ def writeback_default_specification_guarded(
 ) -> Dict[str, Any]:
     """ETag-bound default switch; conditional creation is intentionally absent."""
 
-    def _run() -> Dict[str, Any]:
+    def _run_default_specification_guarded() -> Dict[str, Any]:
         mode = _require_mutation_mode(mutation_mode)
         preview = writeback_default_specification(
             client,
@@ -1844,7 +1844,7 @@ def writeback_default_specification_guarded(
             "after_etag": explicit_odata_etag(after),
         }
 
-    return _guard("default_spec_guarded", _run)
+    return _guard("default_spec_guarded", _run_default_specification_guarded)
 
 
 def preview_specification_replacement_batch(
@@ -1915,7 +1915,7 @@ def compensate_specification_writeback(
     a concurrent change aborts the whole local compensation attempt.
     """
 
-    def _run() -> Dict[str, Any]:
+    def _run_compensate_specification_writeback() -> Dict[str, Any]:
         mode = _require_mutation_mode(mutation_mode)
         prepared: List[Dict[str, Any]] = []
         for reverse_index, entry in enumerate(reversed(list(journal))):
@@ -2084,7 +2084,7 @@ def compensate_specification_writeback(
             "delete_specifications": [],
         }
 
-    return _guard("compensation", _run)
+    return _guard("compensation", _run_compensate_specification_writeback)
 
 
 def _dominant_stage(rows: List[Dict[str, Any]]) -> Optional[str]:
