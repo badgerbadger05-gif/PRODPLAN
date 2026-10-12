@@ -85,6 +85,12 @@ type ProductionOrderReceipt = {
   targetRef: string
 }
 
+type PendingPublicationReceipt = {
+  targetRefs: Set<string>
+  exportBasisRevision: string
+  requiresRevisionMove: boolean
+}
+
 function successfulProductionOrderReceipts(parent: Record<string, unknown>): ProductionOrderReceipt[] {
   const entries = Array.isArray(parent.entries) ? parent.entries : []
   return entries.flatMap((raw) => {
@@ -104,6 +110,7 @@ function orderReceiptLabel(receipts: readonly ProductionOrderReceipt[]) {
 
 export function ProductionControlPage() {
   const mounted = useRef(true)
+  const pendingPublicationReceipts = useRef<Map<number, PendingPublicationReceipt>>(new Map())
   const listRequestSeq = useRef(0)
   const materialsRequestSeq = useRef(0)
   const dangerousMutationLocked = useRef(false)
@@ -226,6 +233,21 @@ export function ProductionControlPage() {
       const data = await listProductionOrders(params)
       if (requestSeq !== listRequestSeq.current) return
       setRows(data.rows ?? [])
+      const publishedProductIds = data.truth_meta?.truth_status === 'accepted' ? (data.rows ?? []).flatMap((row) => {
+        if (row.product_id == null) return []
+        const pending = pendingPublicationReceipts.current.get(row.product_id)
+        if (!pending || !row.order_ref1c || !row.source_revision || !pending.targetRefs.has(row.order_ref1c)) return []
+        if (pending.requiresRevisionMove && row.source_revision === pending.exportBasisRevision) return []
+        pendingPublicationReceipts.current.delete(row.product_id)
+        return [row.product_id]
+      }) : []
+      if (publishedProductIds.length) {
+        setPublicationPendingIds((current) => {
+          const next = new Set(current)
+          publishedProductIds.forEach((productId) => next.delete(productId))
+          return next
+        })
+      }
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
       setTruthMeta(data.truth_meta)
@@ -472,21 +494,37 @@ export function ProductionControlPage() {
     receipts: readonly ProductionOrderReceipt[],
     printWindow: Window | null,
     successSummary: string,
+    exportBasisRevision: string,
+    requiresRevisionMove: boolean,
   ) {
     const receiptRefs = new Set(receipts.map((receipt) => receipt.targetRef))
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
       if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 1500))
       if (!mounted.current) return
       try {
-        const context = await refreshActionSelection(ids)
-        await refreshCurrentProductionOrders(ids, context.identities, context.sourceRevision)
         const refreshedRows = await Promise.all(ids.map(async (productId) => {
           const data = await listProductionOrders(new URLSearchParams({
             product_id: String(productId), limit: '2', offset: '0',
           }))
-          return data.total === 1 && data.rows.length === 1 ? data.rows[0] : null
+          return data.truth_meta?.truth_status === 'accepted'
+            && data.total === 1 && data.rows.length === 1
+            ? data.rows[0]
+            : null
         }))
-        if (refreshedRows.some((row) => !row || !row.order_ref1c || !receiptRefs.has(row.order_ref1c))) continue
+        const metadataPublished = refreshedRows.every((row) => row
+          && row.order_ref1c && receiptRefs.has(row.order_ref1c)
+          && row.source_revision
+          && (!requiresRevisionMove || row.source_revision !== exportBasisRevision))
+        if (!metadataPublished) {
+          // The command response already scheduled an after-response refresh.
+          // Retry that canonical command only as a bounded fallback if the
+          // background publication has still not appeared after ~30/~48 sec.
+          if (attempt === 20 || attempt === 32) {
+            const context = currentActionSelection(ids, refreshedRows.filter(Boolean) as OrderRow[])
+            await refreshCurrentProductionOrders(ids, context.identities, context.sourceRevision)
+          }
+          continue
+        }
         const freshContext = currentActionSelection(ids, refreshedRows as OrderRow[])
         await load(offsetRef.current)
         setPublicationPendingIds((current) => {
@@ -494,6 +532,7 @@ export function ProductionControlPage() {
           ids.forEach((productId) => next.delete(productId))
           return next
         })
+        ids.forEach((productId) => pendingPublicationReceipts.current.delete(productId))
         setMessage(`${successSummary}. Журнал обновлён; маршрутный лист готов к печати.`)
         renderRouteSheets(ids, printWindow, freshContext.identities, freshContext.sourceRevision)
         return
@@ -709,11 +748,21 @@ export function ProductionControlPage() {
         const receiptLabel = orderReceiptLabel(orderReceipts)
         const successSummary = `${summary}${receiptLabel ? `. Заказ 1С ${receiptLabel} создан и проведён` : '. Заказ 1С создан и проведён'}`
         setSelectedIds(new Set(ids))
+        const requiresRevisionMove = ordersCreated > 0 || transfersCreated > 0
+        const pendingReceipt = {
+          targetRefs: new Set(orderReceipts.map((receipt) => receipt.targetRef)),
+          exportBasisRevision: materialContext.sourceRevision,
+          requiresRevisionMove,
+        }
+        ids.forEach((productId) => pendingPublicationReceipts.current.set(productId, pendingReceipt))
         setPublicationPendingIds((current) => new Set([...current, ...ids]))
         setActiveId(ids[0] ?? null)
         setActiveCurrentIdentity(null)
         setMessage(`${successSummary}. Обновляем журнал и печать; повторная выгрузка не требуется.`)
-        void continuePublishedOrderRefresh(ids, orderReceipts, printWindow, successSummary)
+        void continuePublishedOrderRefresh(
+          ids, orderReceipts, printWindow, successSummary, materialContext.sourceRevision,
+          requiresRevisionMove,
+        )
         printWindow = null
         return
       }
@@ -1192,7 +1241,8 @@ export function ProductionControlPage() {
         {view !== 'drum' && view !== 'assembly-queue' && <ProductionCommandBar
           rows={rows}
           selectedIds={selectedIds}
-          loading={loading || selectedRows.some((row) => row.product_id != null && publicationPendingIds.has(row.product_id))}
+          loading={loading}
+          exportDisabled={selectedRows.some((row) => row.product_id != null && publicationPendingIds.has(row.product_id))}
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}

@@ -5,6 +5,7 @@ type Props = {
   rows: OrderRow[]
   selectedIds: Set<number | string>
   loading: boolean
+  exportDisabled: boolean
   onExportTo1C: () => void
   onSyncFrom1C: () => void
   onProduce: () => void
@@ -23,6 +24,7 @@ export function ProductionCommandBar({
   rows,
   selectedIds,
   loading,
+  exportDisabled,
   onExportTo1C,
   onSyncFrom1C,
   onProduce,
@@ -46,7 +48,7 @@ export function ProductionCommandBar({
   const canProduce = selectedOrders.length === 1 && selectedRows.length === 1
   return (
     <div className="commandBar">
-      <button className="primary" onClick={onExportTo1C} disabled={!canLaunch || loading} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
+      <button className="primary" onClick={onExportTo1C} disabled={!canLaunch || loading || exportDisabled} title="Создать и оперативно провести заказ на производство, затем создать непроведённое перемещение">Запустить в 1С</button>
       <button className="success" onClick={onProduce} disabled={!canProduce || loading} title="Указать фактическое количество, оформить выпуск и сдельный, затем завершить заказ; частичный выпуск оставляет заказ открытым; факт будет принят после read-back Ledger">Произвести</button>
       <button onClick={onPiecework} disabled={!canProduce || loading}
         style={{ background: '#e8c7d6', borderColor: '#bc91a5', color: '#111', fontWeight: 700 }}

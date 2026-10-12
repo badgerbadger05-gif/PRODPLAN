@@ -338,14 +338,150 @@ def test_executor_publication_refreshes_1c_number_and_print_without_proposal(db_
     assert error.value.status_code==409
 
 
-def test_export_snapshot_failure_preserves_success_and_requires_explicit_refresh(monkeypatch):
+def test_export_schedules_metadata_refresh_only_after_success_commit(monkeypatch):
     from types import SimpleNamespace
-    from app.routers.production_control import _refresh_exported_executors
+    from app.routers.production_control import (
+        _refresh_exported_executors,
+        _refresh_exported_executors_metadata,
+    )
     from app.services import production_control_command_worker
     calls=[]
-    def busy(*args):raise HTTPException(409,detail={'message':'Ledger refresh busy'})
-    monkeypatch.setattr(production_control_command_worker,'run_command',busy)
-    result=_refresh_exported_executors(SimpleNamespace(commit=lambda:calls.append('committed')),[19487],{'status':'ok','issues_created':1})
-    assert calls==['committed']
-    assert result['issues_created']==1 and result['status']=='ok'
-    assert result['projection_refresh_error']=='Ledger refresh busy'
+
+    def worker(*args):
+        calls.append(("run_command", args))
+
+    monkeypatch.setattr(production_control_command_worker, 'run_command', worker)
+
+    class Tasks:
+        def add_task(self, function, *args, **kwargs):
+            assert calls == ['committed']
+            calls.append(("scheduled", function, args, kwargs))
+
+    receipt = {
+        'status': 'ok',
+        'issues_created': 1,
+        'entries': [{'status': 'created', 'number': 'PP059717709'}],
+    }
+    result = _refresh_exported_executors(
+        SimpleNamespace(commit=lambda: calls.append('committed')),
+        [19487],
+        receipt,
+        background_tasks=Tasks(),
+    )
+
+    assert result is receipt
+    assert result['entries'] == [{'status': 'created', 'number': 'PP059717709'}]
+    assert result['projection_refresh_error'] == 'Обновление журнала выполняется в фоне'
+    assert len(calls) == 2 and calls[0] == 'committed'
+    _, function, args, kwargs = calls[1]
+    assert function is _refresh_exported_executors_metadata
+    assert args == ([19487],) and kwargs == {}
+    assert not any(isinstance(call, tuple) and call[0] == 'run_command' for call in calls)
+
+    function(*args, **kwargs)
+    assert calls[-1] == (
+        'run_command',
+        ('refresh-executors', {'product_ids': [19487]}),
+    )
+
+
+def test_background_metadata_busy_cannot_change_success_receipt(monkeypatch):
+    from app.routers.production_control import _refresh_exported_executors_metadata
+    from app.services import production_control_command_worker
+
+    receipt = {
+        'status': 'ok',
+        'entries': [{'status': 'existing', 'number': 'MT059717709'}],
+    }
+    calls = []
+
+    def busy(*args):
+        calls.append(args)
+        raise HTTPException(409, detail={'message': 'Ledger refresh busy'})
+
+    monkeypatch.setattr(production_control_command_worker, 'run_command', busy)
+
+    assert _refresh_exported_executors_metadata([19487, 19488]) is None
+    assert calls == [
+        ('refresh-executors', {'product_ids': [19487, 19488]})
+    ]
+    assert receipt == {
+        'status': 'ok',
+        'entries': [{'status': 'existing', 'number': 'MT059717709'}],
+    }
+
+
+def test_asgi_sends_success_receipt_before_metadata_background_starts(monkeypatch):
+    import asyncio
+    import json
+    from fastapi import BackgroundTasks, FastAPI
+    from app.routers import production_control
+
+    timeline = []
+
+    def metadata_only(product_ids):
+        timeline.append(("background", list(product_ids)))
+
+    monkeypatch.setattr(
+        production_control,
+        "_refresh_exported_executors_metadata",
+        metadata_only,
+    )
+
+    app = FastAPI()
+
+    @app.post("/export")
+    def export(background_tasks: BackgroundTasks):
+        receipt = {
+            "status": "ok",
+            "entries": [{"status": "created", "number": "PP059717709"}],
+        }
+        return production_control._refresh_exported_executors(
+            type("DB", (), {"commit": lambda self: timeline.append("committed")})(),
+            [19487],
+            receipt,
+            background_tasks=background_tasks,
+        )
+
+    sent = []
+    request_delivered = False
+
+    async def receive():
+        nonlocal request_delivered
+        if not request_delivered:
+            request_delivered = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+        if message["type"] == "http.response.body":
+            assert not any(
+                isinstance(entry, tuple) and entry[0] == "background"
+                for entry in timeline
+            )
+            timeline.append("body-sent")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/export",
+        "raw_path": b"/export",
+        "query_string": b"",
+        "headers": [],
+        "client": ("test", 1),
+        "server": ("test", 80),
+        "root_path": "",
+    }
+    asyncio.run(app(scope, receive, send))
+
+    body = next(message for message in sent if message["type"] == "http.response.body")
+    payload = json.loads(body["body"])
+    assert payload["status"] == "ok"
+    assert payload["entries"] == [
+        {"status": "created", "number": "PP059717709"}
+    ]
+    assert timeline == ["committed", "body-sent", ("background", [19487])]

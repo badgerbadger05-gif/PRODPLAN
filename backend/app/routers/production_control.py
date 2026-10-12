@@ -4,7 +4,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, List, Literal, Optional, Sequence, Union
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -2590,26 +2590,41 @@ async def post_refresh_current_orders(payload: RefreshProductionOrdersPayload, d
     })
 
 
-def _refresh_exported_executors(db: Session, product_ids: list[int], result: dict) -> dict:
+def _refresh_exported_executors_metadata(product_ids: list[int]) -> None:
     from ..services.production_control_command_worker import run_command
-    # The external operation has succeeded independently of read-model work.
-    # Persist/release its transaction before starting the bounded worker.
-    db.commit()
+
     try:
-        result["current_projection"] = run_command("refresh-executors", {"product_ids": product_ids})
-    except HTTPException as exc:
-        detail = exc.detail
-        result["projection_refresh_error"] = str(detail.get("message") or detail.get("reason") or detail) if isinstance(detail, dict) else str(detail)
+        run_command("refresh-executors", {"product_ids": [int(value) for value in product_ids]})
     except Exception:
         import logging
-        logging.getLogger(__name__).exception("1C export completed but executor publication failed")
-        result["projection_refresh_error"] = "Воркер обновления журнала временно недоступен"
+
+        logging.getLogger(__name__).exception(
+            "1C export completed but background executor publication failed"
+        )
+
+
+def _refresh_exported_executors(
+    db: Session,
+    product_ids: list[int],
+    result: dict,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
+    # The external operation and its receipt are durable before any metadata
+    # continuation is made visible to the response lifecycle.
+    db.commit()
+    result["projection_refresh_error"] = "Обновление журнала выполняется в фоне"
+    if background_tasks is not None:
+        background_tasks.add_task(
+            _refresh_exported_executors_metadata,
+            [int(value) for value in product_ids],
+        )
     return result
 
 
 @router.post("/orders/export-to-1c", response_model=dict)
 def post_export_production_orders_to_1c(
     payload: ExportProductionOrdersPayload,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -2643,7 +2658,9 @@ def post_export_production_orders_to_1c(
         if not payload.dry_run:
             ids = [int(row[0]) for row in db.query(models.ProductionProduct.product_id)
                    .filter(models.ProductionProduct.order_id.in_(payload.order_ids)).all()]
-            return _refresh_exported_executors(db, ids, result)
+            return _refresh_exported_executors(
+                db, ids, result, background_tasks=background_tasks,
+            )
         return result
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
@@ -2727,6 +2744,7 @@ def delete_material_issue(issue_id: int, db: Session = Depends(get_db)):
 @router.post("/material-issues/export-to-1c", response_model=dict)
 def post_export_material_issues_to_1c(
     payload: ExportMaterialIssuesPayload,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -2747,7 +2765,9 @@ def post_export_material_issues_to_1c(
         if not payload.dry_run:
             ids = sorted({int(row[0]) for row in db.query(models.ProductionMaterialIssue.product_id)
                           .filter(models.ProductionMaterialIssue.issue_id.in_(payload.issue_ids)).all()})
-            return _refresh_exported_executors(db, ids, result)
+            return _refresh_exported_executors(
+                db, ids, result, background_tasks=background_tasks,
+            )
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

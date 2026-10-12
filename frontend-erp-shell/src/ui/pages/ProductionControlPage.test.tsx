@@ -696,15 +696,20 @@ describe('ProductionControlPage — characterization', () => {
     const user = userEvent.setup()
     const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false }
     vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
-    let metadataPublished = false
-    let releaseRefresh: (() => void) | undefined
-    vi.mocked(refreshCurrentProductionOrders).mockImplementation(() => new Promise((resolve) => {
-      releaseRefresh = () => {
-        metadataPublished = true
-        resolve({ status: 'refreshed', product_ids: [101], current_identities: ['production:order:101'], source_revision: 'published-rev' })
+    const realSetTimeout = window.setTimeout.bind(window)
+    const publicationTimers: Array<() => void> = []
+    vi.spyOn(window, 'setTimeout').mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 1500 && typeof handler === 'function') {
+        publicationTimers.push(() => handler(...args))
+        return 1
       }
-    }))
+      return realSetTimeout(handler, timeout, ...args)
+    }) as typeof window.setTimeout)
+    let exportCompleted = false
+    let publicationPolls = 0
     vi.mocked(listProductionOrders).mockImplementation(async (params) => {
+      if (exportCompleted && params.get('product_id') === '101') publicationPolls += 1
+      const metadataPublished = publicationPolls >= 13 // 13 × 1.5 sec ≈ 18 sec server background refresh.
       const row = {
         ...fakeRows()[0],
         source_revision: metadataPublished ? 'published-rev' : 'rev-7',
@@ -714,9 +719,12 @@ describe('ProductionControlPage — characterization', () => {
       return { rows: [row], total: 1, limit: Number(params.get('limit') ?? 100), offset: 0,
         latest_run_id: 77, truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' } }
     })
-    vi.mocked(exportMaterialIssuesTo1C).mockResolvedValue({ status: 'ok', issues_created: 1,
-      projection_refresh_error: 'Ledger refresh busy', parent_orders_export: { orders_created: 1,
-        entries: [{ order_id: 101, number: 'PP062017848', target_ref_key: 'created-ref', status: 'created' }] } })
+    vi.mocked(exportMaterialIssuesTo1C).mockImplementation(async () => {
+      exportCompleted = true
+      return { status: 'ok', issues_created: 1,
+        projection_refresh_error: 'Ledger refresh busy', parent_orders_export: { orders_created: 1,
+          entries: [{ order_id: 101, number: 'PP062017848', target_ref_key: 'created-ref', status: 'created' }] } }
+    })
     renderPage(['/production-control'], true)
     await screen.findByText('MRP run: 77')
     await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
@@ -727,9 +735,50 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled())
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
     expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
-    await waitFor(() => expect(refreshCurrentProductionOrders).toHaveBeenCalledWith([101], ['production:order:101'], 'rev-7'))
-    releaseRefresh?.()
+    for (let elapsedPoll = 0; elapsedPoll < 12; elapsedPoll += 1) {
+      await waitFor(() => expect(publicationTimers.length).toBeGreaterThan(0))
+      await act(async () => publicationTimers.shift()?.())
+    }
     await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalledWith([101], ['production:order:101'], 'published-rev'))
+    expect(publicationPolls).toBeGreaterThanOrEqual(13)
+    expect(refreshCurrentProductionOrders).not.toHaveBeenCalled()
+    expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
+  })
+
+  it('prints an idempotent existing receipt without waiting for a revision move', async () => {
+    const user = userEvent.setup()
+    const printWindow = { document: { write: vi.fn(), open: vi.fn(), close: vi.fn() }, close: vi.fn(), closed: false }
+    vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+    let exportCompleted = false
+    vi.mocked(listProductionOrders).mockImplementation(async (params) => {
+      const row = {
+        ...fakeRows()[0],
+        source_revision: 'rev-7',
+        order_one_c_number: exportCompleted ? 'PP062017848' : null,
+        order_ref1c: exportCompleted ? 'created-ref' : null,
+      }
+      return { rows: [row], total: 1, limit: Number(params.get('limit') ?? 100), offset: 0,
+        latest_run_id: 77, truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' } }
+    })
+    vi.mocked(exportMaterialIssuesTo1C).mockImplementation(async () => {
+      exportCompleted = true
+      return { status: 'ok', issues_created: 0, issues_already_linked: 1,
+        projection_refresh_error: 'publication already current', parent_orders_export: {
+          orders_created: 0, orders_already_linked: 1,
+          entries: [{ order_id: 101, number: 'PP062017848', target_ref_key: 'created-ref', status: 'existing' }],
+        } }
+    })
+
+    renderPage()
+    await screen.findByText('MRP run: 77')
+    await user.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+
+    expect(await screen.findByText(/Заказ 1С №PP062017848 создан и проведён/)).toBeVisible()
+    await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalledWith(
+      [101], ['production:order:101'], 'rev-7',
+    ))
+    expect(refreshCurrentProductionOrders).not.toHaveBeenCalled()
     expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
   })
 
