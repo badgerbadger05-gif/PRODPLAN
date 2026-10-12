@@ -77,6 +77,14 @@ class AcceptedCurrentCustodyFoldResult:
     affected_product_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class AcceptedCurrentCustodyPrefix:
+    upper_event_watermark: int
+    source_sle_ids: tuple[int, ...]
+    event_count: int
+    suffix_has_authoritative_event: bool
+
+
 def _pointer(db: Session) -> models.PlanningTruthState:
     pointer = db.get(models.PlanningTruthState, 1)
     if pointer is None or pointer.current_generation_id is None:
@@ -555,6 +563,7 @@ def apply_bounded_current_material_custody_events(
     target_generation_id: int,
     source_sle_ids: tuple[int, ...] | list[int] | set[int],
     allow_same_current_repair: bool = False,
+    upper_event_watermark: int | None = None,
 ) -> int:
     """Fold the explicit physical custody tail into the compact current owner.
 
@@ -588,6 +597,10 @@ def apply_bounded_current_material_custody_events(
     )
     if already_current and not same_current_repair:
         return 0
+    if upper_event_watermark is not None and not same_current_repair:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "custody upper event watermark is allowed only for accepted-current repair"
+        )
     parent_manifest = db.get(
         models.ProductionMaterialCustodyProjectionManifest, int(parent.id)
     )
@@ -613,17 +626,35 @@ def apply_bounded_current_material_custody_events(
                 "bounded custody source SLE manifest references a missing row"
             )
     previous_watermark = int(parent_manifest.source_event_high_watermark_id or 0)
+    if upper_event_watermark is not None:
+        upper_event_watermark = int(upper_event_watermark)
+        if upper_event_watermark < previous_watermark:
+            raise PhysicalRefreshProvenanceUnavailable(
+                "custody prefix watermark is behind the compact current owner"
+            )
+        if upper_event_watermark > previous_watermark and not db.query(
+            models.ProductionMaterialCustodyEvent.id
+        ).filter(
+            models.ProductionMaterialCustodyEvent.id == upper_event_watermark
+        ).first():
+            raise PhysicalRefreshProvenanceUnavailable(
+                "custody prefix watermark does not name an event"
+            )
     observed_watermark = _custody_event_watermark(db)
     if observed_watermark < previous_watermark:
         raise PhysicalRefreshProvenanceUnavailable(
             "custody event watermark moved backwards"
         )
-    tail = (
-        db.query(models.ProductionMaterialCustodyEvent)
-        .filter(models.ProductionMaterialCustodyEvent.id > previous_watermark)
-        .order_by(models.ProductionMaterialCustodyEvent.id.asc())
-        .all()
+    tail_query = db.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id > previous_watermark
     )
+    if upper_event_watermark is not None:
+        tail_query = tail_query.filter(
+            models.ProductionMaterialCustodyEvent.id <= upper_event_watermark
+        )
+    tail = tail_query.order_by(
+        models.ProductionMaterialCustodyEvent.id.asc()
+    ).all()
     if any(
         event.source_sle_id is not None and int(event.source_sle_id) not in explicit
         for event in tail
@@ -1013,6 +1044,10 @@ def apply_bounded_current_material_custody_events(
     )
     if generated_release_count:
         db.flush()
+        if upper_event_watermark is not None:
+            raise PhysicalRefreshProvenanceUnavailable(
+                "custody terminal audit extends beyond the bounded prefix"
+            )
         generated_releases = (
             db.query(models.ProductionMaterialCustodyEvent)
             .filter(
@@ -1079,6 +1114,7 @@ def apply_accepted_current_material_custody_events(
     db: Session,
     *,
     source_sle_ids: tuple[int, ...] | list[int] | set[int],
+    upper_event_watermark: int | None = None,
 ) -> AcceptedCurrentCustodyFoldResult:
     """Publish an exact accepted-visible recorder tail without moving truth.
 
@@ -1129,23 +1165,31 @@ def apply_accepted_current_material_custody_events(
             models.ProductionMaterialCustodyProjection.is_current.is_(True)
         ).all()
     }
-    folded = apply_bounded_current_material_custody_events(
-        db,
-        parent_generation_id=generation_id,
-        target_generation_id=generation_id,
-        source_sle_ids=explicit,
-        allow_same_current_repair=True,
-    )
-    db.flush()
-    after = {
-        (
-            int(row.product_id), int(row.component_item_id),
-            str(row.location_kind or ""), str(row.warehouse_ref1c or ""),
-        ): Decimal(str(row.reserved_qty or 0))
-        for row in db.query(models.ProductionMaterialCustodyProjection).filter(
-            models.ProductionMaterialCustodyProjection.is_current.is_(True)
-        ).all()
-    }
+    savepoint = db.begin_nested()
+    try:
+        folded = apply_bounded_current_material_custody_events(
+            db,
+            parent_generation_id=generation_id,
+            target_generation_id=generation_id,
+            source_sle_ids=explicit,
+            allow_same_current_repair=True,
+            upper_event_watermark=upper_event_watermark,
+        )
+        db.flush()
+        after = {
+            (
+                int(row.product_id), int(row.component_item_id),
+                str(row.location_kind or ""), str(row.warehouse_ref1c or ""),
+            ): Decimal(str(row.reserved_qty or 0))
+            for row in db.query(models.ProductionMaterialCustodyProjection).filter(
+                models.ProductionMaterialCustodyProjection.is_current.is_(True)
+            ).all()
+        }
+    except Exception:
+        savepoint.rollback()
+        raise
+    else:
+        savepoint.commit()
     changed_keys = {
         key for key in set(before) | set(after) if before.get(key) != after.get(key)
     }
@@ -1153,6 +1197,73 @@ def apply_accepted_current_material_custody_events(
         folded_events=int(folded),
         semantic_changed=bool(changed_keys),
         affected_product_ids=tuple(sorted({key[0] for key in changed_keys})),
+    )
+
+
+def select_accepted_current_material_custody_prefix(
+    db: Session,
+) -> AcceptedCurrentCustodyPrefix:
+    """Return the maximal leading tail prefix owned by accepted physical truth."""
+    pointer = (
+        db.query(models.PlanningTruthState)
+        .filter(models.PlanningTruthState.id == 1)
+        .with_for_update()
+        .one_or_none()
+    )
+    if pointer is None or pointer.current_generation_id is None:
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted custody prefix requires an exact planning-truth pointer"
+        )
+    generation = db.get(models.LedgerGeneration, int(pointer.current_generation_id))
+    if generation is None or str(generation.status or "") != "accepted":
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted custody prefix requires accepted current truth"
+        )
+    manifest = db.get(
+        models.ProductionMaterialCustodyProjectionManifest, int(generation.id)
+    )
+    if manifest is None or str(manifest.status or "") != "complete":
+        raise PhysicalRefreshProvenanceUnavailable(
+            "accepted custody prefix requires a complete current manifest"
+        )
+    watermark = int(manifest.source_event_high_watermark_id or 0)
+    tail = db.query(models.ProductionMaterialCustodyEvent).filter(
+        models.ProductionMaterialCustodyEvent.id > watermark
+    ).order_by(models.ProductionMaterialCustodyEvent.id.asc()).all()
+    physical_ids = {
+        int(event.source_sle_id)
+        for event in tail if event.source_sle_id is not None
+    }
+    visible_ids = {
+        int(row.id) for row in visible_sle_query(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=generation.cutoff,
+        ).filter(models.StockLedgerEntry.id.in_(physical_ids)).all()
+    } if physical_ids else set()
+    known_ids = {
+        int(row[0]) for row in db.query(models.StockLedgerEntry.id).filter(
+            models.StockLedgerEntry.id.in_(physical_ids)
+        ).all()
+    } if physical_ids else set()
+    prefix: list[models.ProductionMaterialCustodyEvent] = []
+    stopped = False
+    suffix_has_authoritative_event = False
+    for event in tail:
+        source_id = int(event.source_sle_id) if event.source_sle_id is not None else None
+        if not stopped and source_id is not None and source_id in visible_ids:
+            prefix.append(event)
+            continue
+        stopped = True
+        if source_id is None or source_id not in known_ids or source_id in visible_ids:
+            suffix_has_authoritative_event = True
+    return AcceptedCurrentCustodyPrefix(
+        upper_event_watermark=int(prefix[-1].id) if prefix else watermark,
+        source_sle_ids=tuple(dict.fromkeys(
+            int(event.source_sle_id) for event in prefix
+        )),
+        event_count=len(prefix),
+        suffix_has_authoritative_event=suffix_has_authoritative_event,
     )
 
 

@@ -565,14 +565,19 @@ def pull_recorder_movements(
             from .physical_refresh_provenance import (
                 PhysicalRefreshProvenanceUnavailable,
                 apply_accepted_current_material_custody_events,
+                select_accepted_current_material_custody_prefix,
             )
 
             try:
-                with session.begin_nested():
-                    custody_fold = apply_accepted_current_material_custody_events(
-                        session,
-                        source_sle_ids=tuple(int(row.id) for row in active_rows),
-                    )
+                prefix = select_accepted_current_material_custody_prefix(session)
+                custody_fold = None
+                if prefix.event_count:
+                    with session.begin_nested():
+                        custody_fold = apply_accepted_current_material_custody_events(
+                            session,
+                            source_sle_ids=prefix.source_sle_ids,
+                            upper_event_watermark=prefix.upper_event_watermark,
+                        )
             except PhysicalRefreshProvenanceUnavailable as exc:
                 invalidate_material_custody_dependents(
                     session,
@@ -580,7 +585,15 @@ def pull_recorder_movements(
                 )
                 result.diagnostics.append(f"custody publication deferred: {exc}")
             else:
-                if custody_fold.semantic_changed:
+                if prefix.suffix_has_authoritative_event:
+                    invalidate_material_custody_dependents(
+                        session,
+                        source_revision=f"custody:transfer:{recorder_ref}",
+                    )
+                    result.diagnostics.append(
+                        "custody publication deferred: authoritative event follows staging suffix"
+                    )
+                elif custody_fold is not None and custody_fold.semantic_changed:
                     invalidate_material_custody_dependents(
                         session,
                         source_revision=f"custody:transfer:{recorder_ref}",

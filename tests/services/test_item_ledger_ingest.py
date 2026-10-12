@@ -314,6 +314,16 @@ def test_exact_repull_rolls_back_partial_custody_fold_before_deferring(
     monkeypatch.setattr(
         provenance, "apply_accepted_current_material_custody_events", partial_fold,
     )
+    monkeypatch.setattr(
+        provenance,
+        "select_accepted_current_material_custody_prefix",
+        lambda _db: type("Prefix", (), {
+            "event_count": 1,
+            "source_sle_ids": (1,),
+            "upper_event_watermark": 1,
+            "suffix_has_authoritative_event": False,
+        })(),
+    )
 
     result = pull_recorder_movements(
         db_session, TRANSFER, "trn-savepoint", client=client,
@@ -325,6 +335,55 @@ def test_exact_repull_rolls_back_partial_custody_fold_before_deferring(
         "custody publication deferred: deferred test tail"
     ]
     assert invalidations == ["custody:transfer:trn-savepoint"]
+
+
+def test_exact_repull_staging_only_tail_does_not_invalidate_accepted_math(
+    db_session, monkeypatch,
+):
+    from app.services import production_material_custody_events as custody_events
+    from app.services.item_ledger import physical_refresh_provenance as provenance
+
+    _setup(db_session)
+    client = FakeODataClient({
+        "trn-staging": [_line("1", "Receipt", "ref-item-1", "wh-1", 5)]
+    })
+    pull_recorder_movements(
+        db_session, TRANSFER, "trn-staging", client=client,
+    )
+    db_session.commit()
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda *args, **kwargs: 1,
+    )
+    invalidations = []
+    monkeypatch.setattr(
+        custody_events,
+        "invalidate_material_custody_dependents",
+        lambda *args, **kwargs: invalidations.append(kwargs),
+    )
+    monkeypatch.setattr(
+        provenance,
+        "select_accepted_current_material_custody_prefix",
+        lambda _db: type("Prefix", (), {
+            "event_count": 0,
+            "source_sle_ids": (),
+            "upper_event_watermark": 0,
+            "suffix_has_authoritative_event": False,
+        })(),
+    )
+    monkeypatch.setattr(
+        provenance,
+        "apply_accepted_current_material_custody_events",
+        lambda *args, **kwargs: pytest.fail("staging suffix must not be folded"),
+    )
+
+    result = pull_recorder_movements(
+        db_session, TRANSFER, "trn-staging", client=client,
+    )
+
+    assert invalidations == []
+    assert result.diagnostics == []
 
 
 def test_pull_replace_by_recorder_updates_qty(db_session):

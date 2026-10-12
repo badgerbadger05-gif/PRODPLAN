@@ -13,6 +13,7 @@ from app.services.item_ledger.physical_refresh_provenance import (
     handoff_current_future_supply_provenance,
     handoff_current_material_custody_provenance,
     canonical_issue_backfill_source_ids,
+    select_accepted_current_material_custody_prefix,
 )
 from app.services.production_material_custody_projection import (
     _event_high_watermark_id_at_cutoff,
@@ -787,6 +788,180 @@ def test_accepted_current_fold_rejects_duplicate_source_manifest(db_session):
         )
 
     assert int(manifest.source_event_high_watermark_id) == original_hwm
+
+
+def _append_staging_custody_suffix(db, *, target, event, key="prefix-staging"):
+    batch = models.PhysicalImportBatch(
+        batch_key=key, status="completed", cutoff=target.cutoff,
+        source_watermarks={}, source_complete=True,
+    )
+    db.add(batch)
+    db.flush()
+    source = db.get(models.StockLedgerEntry, int(event.source_sle_id))
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=batch.id, source_content_hash=key,
+        business_identity=key, item_id=source.item_id,
+        characteristic_ref=source.characteristic_ref,
+        organization_ref=source.organization_ref,
+        warehouse_ref1c=source.warehouse_ref1c, qty=Decimal("1"),
+        posting_at=source.posting_at, record_type="Receipt",
+        movement_kind="transfer_in", recorder_type="Document_Transfer",
+        recorder_ref=key, line_no="1", ingest_source="test", active=True,
+    )
+    db.add(sle)
+    db.flush()
+    suffix = models.ProductionMaterialCustodyEvent(
+        product_id=event.product_id, component_item_id=event.component_item_id,
+        source_kind="transfer_posted", source_sle_id=sle.id,
+        effective_at=event.effective_at, location_kind="workshop",
+        warehouse_ref1c=event.warehouse_ref1c, delta_qty=Decimal("1"),
+        idempotency_key=key,
+    )
+    db.add(suffix)
+    db.flush()
+    return suffix
+
+
+def test_accepted_prefix_fold_leaves_staging_suffix_readable(db_session):
+    (
+        parent, target, _unrelated, outbound, inbound,
+        _opening, _old_release, _outbound_event, inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    parent.physical_import_batch_id = target.physical_import_batch_id
+    product = db_session.get(
+        models.ProductionProduct, int(inbound_event.product_id)
+    )
+    order = db_session.get(models.ProductionOrder, int(product.order_id))
+    order.order_state_key = "open"
+    order.deletion_mark = False
+    suffix = _append_staging_custody_suffix(
+        db_session, target=target, event=inbound_event,
+    )
+
+    prefix = select_accepted_current_material_custody_prefix(db_session)
+    assert prefix.source_sle_ids == (outbound.id, inbound.id)
+    assert prefix.upper_event_watermark == inbound_event.id < suffix.id
+    result = apply_accepted_current_material_custody_events(
+        db_session,
+        source_sle_ids=prefix.source_sle_ids,
+        upper_event_watermark=prefix.upper_event_watermark,
+    )
+
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id
+    )
+    generation_id, state = load_compact_current_material_custody(
+        db_session, consumer="test.accepted-prefix"
+    )
+    assert generation_id == parent.id
+    assert manifest.source_event_high_watermark_id == inbound_event.id
+    assert result.semantic_changed is True
+    assert state.reserved_at_warehouse("WORKSHOP", inbound.item_id) == pytest.approx(43.906)
+
+
+def test_accepted_prefix_boundary_cannot_cross_uncovered_authoritative_event(db_session):
+    (
+        parent, target, _unrelated, outbound, inbound,
+        _opening, old_release, _outbound_event, inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    parent.physical_import_batch_id = target.physical_import_batch_id
+    extra = models.ProductionMaterialCustodyEvent(
+        product_id=inbound_event.product_id,
+        component_item_id=inbound_event.component_item_id,
+        source_kind="transfer_posted", source_sle_id=inbound.id,
+        effective_at=inbound_event.effective_at, location_kind="workshop",
+        warehouse_ref1c=inbound_event.warehouse_ref1c, delta_qty=Decimal("1"),
+        idempotency_key="prefix-uncovered-authoritative",
+    )
+    db_session.add(extra)
+    db_session.flush()
+
+    with pytest.raises(
+        PhysicalRefreshProvenanceUnavailable,
+        match="tail is not covered",
+    ):
+        apply_accepted_current_material_custody_events(
+            db_session,
+            source_sle_ids=(outbound.id,),
+            upper_event_watermark=extra.id,
+        )
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id
+    )
+    assert manifest.source_event_high_watermark_id == old_release.id
+
+
+def test_accepted_prefix_selector_deduplicates_source_sle_ids(db_session):
+    (
+        parent, target, _unrelated, outbound, inbound,
+        _opening, _old_release, _outbound_event, inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    parent.physical_import_batch_id = target.physical_import_batch_id
+    duplicate_source_event = models.ProductionMaterialCustodyEvent(
+        product_id=inbound_event.product_id,
+        component_item_id=inbound_event.component_item_id,
+        source_kind="transfer_posted", source_sle_id=inbound.id,
+        effective_at=inbound_event.effective_at, location_kind="workshop",
+        warehouse_ref1c=inbound_event.warehouse_ref1c, delta_qty=Decimal("1"),
+        idempotency_key="prefix-duplicate-source-event",
+    )
+    db_session.add(duplicate_source_event)
+    db_session.flush()
+
+    prefix = select_accepted_current_material_custody_prefix(db_session)
+
+    assert prefix.event_count == 3
+    assert prefix.upper_event_watermark == duplicate_source_event.id
+    assert prefix.source_sle_ids == (outbound.id, inbound.id)
+
+
+def test_accepted_prefix_terminal_audit_beyond_cap_rolls_back(
+    db_session, monkeypatch,
+):
+    from app.services.item_ledger import physical_refresh_provenance as provenance
+
+    (
+        parent, target, unrelated, outbound, inbound,
+        _opening, old_release, _outbound_event, inbound_event,
+    ) = _late_physical_after_terminal_world(db_session)
+    parent.physical_import_batch_id = target.physical_import_batch_id
+    suffix = _append_staging_custody_suffix(
+        db_session, target=target, event=inbound_event, key="terminal-cap-staging",
+    )
+    before_events = db_session.query(models.ProductionMaterialCustodyEvent).count()
+    before_qty = Decimal(str(unrelated.reserved_qty))
+    prefix = select_accepted_current_material_custody_prefix(db_session)
+    assert prefix.upper_event_watermark == inbound_event.id < suffix.id
+    terminal_counts = []
+    original_terminal = provenance._append_terminal_custody_releases
+
+    def counted_terminal(*args, **kwargs):
+        count = original_terminal(*args, **kwargs)
+        terminal_counts.append(count)
+        return count
+
+    monkeypatch.setattr(
+        provenance, "_append_terminal_custody_releases", counted_terminal,
+    )
+
+    with pytest.raises(
+        PhysicalRefreshProvenanceUnavailable,
+        match="terminal audit extends beyond the bounded prefix",
+    ):
+        apply_accepted_current_material_custody_events(
+            db_session,
+            source_sle_ids=prefix.source_sle_ids,
+            upper_event_watermark=prefix.upper_event_watermark,
+        )
+
+    manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id
+    )
+    db_session.refresh(unrelated)
+    assert manifest.source_event_high_watermark_id == old_release.id
+    assert Decimal(str(unrelated.reserved_qty)) == before_qty
+    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == before_events
+    assert terminal_counts == [2]
 
 def _late_manual_receipt_after_terminal_world(db):
     parent, target, _current, unrelated = _world(db)
