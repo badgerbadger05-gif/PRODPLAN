@@ -1215,6 +1215,7 @@ class OrdersFromWorkItemsPayload(BaseModel):
     initiated_by: Optional[str] = None
     current_identities: List[str] = Field(default_factory=list)
     expected_source_revision: Optional[str] = None
+    require_workshop_routing: bool = False
 
 
 class OrderLineQuantityPayload(BaseModel):
@@ -2386,6 +2387,21 @@ def _materialize_orders_from_work_items(payload: OrdersFromWorkItemsPayload, db:
                     raise HTTPException(400, detail="Количество запуска превышает текущий доступный остаток")
         if current_work_ids != set(selected_ids):
             raise HTTPException(status_code=409, detail={"code": "production_current_locator_stale"})
+        if payload.require_workshop_routing:
+            from ..services.workshop_resolution import diagnose_specs, format_diagnosis_error, no_spec_diagnosis
+
+            spec_ids = [int(row.payload["spec_id"]) for row in current_rows if row.payload.get("spec_id")]
+            diagnoses = diagnose_specs(db, spec_ids)
+            problems = []
+            for row in current_rows:
+                saved = row.payload or {}
+                spec_id = saved.get("spec_id")
+                diagnosis = diagnoses.get(int(spec_id)) if spec_id else None
+                diagnosis = diagnosis or no_spec_diagnosis()
+                if diagnosis.status != "ok":
+                    problems.append(format_diagnosis_error(str(saved.get("order_number") or row.business_identity), diagnosis))
+            if problems:
+                raise HTTPException(status_code=400, detail="\n".join(problems))
         result = materialize_make_work_items(
             db,
             selected_ids,

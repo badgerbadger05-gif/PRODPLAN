@@ -84,6 +84,7 @@ export function materializeMakeWorkItems(
   workItems: number[] | MakeLaunchRequest[],
   currentIdentities: string[] = [],
   expectedSourceRevision?: string | null,
+  requireWorkshopRouting = false,
 ) {
   const legacyIds = workItems.filter((row): row is number => typeof row === 'number')
   const requests = workItems.filter((row): row is MakeLaunchRequest => typeof row !== 'number')
@@ -93,6 +94,7 @@ export function materializeMakeWorkItems(
     initiated_by: 'erp-shell',
     current_identities: currentIdentities,
     expected_source_revision: expectedSourceRevision,
+    require_workshop_routing: requireWorkshopRouting,
   }
   return api<MaterializeMakeWorkItemsResponse>('/v1/production-control/orders/from-work-items', {
     method: 'POST',

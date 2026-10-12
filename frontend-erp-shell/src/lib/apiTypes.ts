@@ -5157,6 +5157,11 @@ export interface components {
             current_identities?: string[];
             /** Expected Source Revision */
             expected_source_revision?: string | null;
+            /**
+             * Require Workshop Routing
+             * @default false
+             */
+            require_workshop_routing: boolean;
         };
         /** OrdersFromWorkItemsResponse */
         OrdersFromWorkItemsResponse: {

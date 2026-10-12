@@ -1265,7 +1265,7 @@ describe('ProductionControlPage — characterization', () => {
       work_item_id: 701,
       launch_qty: 6,
       expected_materialized_qty: 0,
-    }], ['production:order:101'], 'rev-7'))
+    }], ['production:order:101'], 'rev-7', true))
     await waitFor(() => expect(openPaintWeldChains).toHaveBeenCalledWith([901], ['production:order:101'], 'rev-8'))
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
       [901], 'erp-shell', undefined, ['production:order:101'], 'rev-8',
@@ -1339,6 +1339,58 @@ describe('ProductionControlPage — characterization', () => {
     expect(openPaintWeldChains).not.toHaveBeenCalled()
     expect(postMaterialIssues).not.toHaveBeenCalled()
   })
+
+  it.each(['no_issue', 'partial_issue', 'http_error'])(
+    'keeps the saved executor selected after a %s launch failure so retry does not create another order', async (failure) => {
+      const proposal = {
+        ...fakeRows()[0], product_id: null, order_id: null, work_item_id: 701,
+        order_number: 'MRP-R-701', order_prodplan_number: 'MRP-R-701',
+        item_name: 'Предложение MRP', status: 'not_created',
+        available_actions: ['materialize'], materialized_order_qty: 0, launchable_qty: 30,
+      } as OrderRow
+      const created = {
+        ...proposal, product_id: 901, order_id: 801, quantity: 15, remaining_qty: 15,
+        order_number: 'MRP-R-701-1', order_prodplan_number: 'MRP-R-701-1',
+        item_name: 'Сохранённый заказ', status: 'created', available_actions: [],
+        current_identity: 'production:order:901', source_revision: 'rev-8',
+      } as OrderRow
+      let saved = false
+      vi.mocked(listProductionOrders).mockImplementation(async (params) => ({
+        rows: params.get('product_id') === '901' ? [created]
+          : saved ? [created, { ...proposal, materialized_order_qty: 15, launchable_qty: 15, source_revision: 'rev-8' }]
+            : [proposal],
+        total: params.get('product_id') === '901' ? 1 : saved ? 2 : 1,
+        limit: 100, offset: 0, latest_run_id: 77, truth_meta: { ...fakeTruthMeta, truth_status: 'accepted' },
+      }))
+      vi.mocked(materializeMakeWorkItems).mockImplementation(async () => {
+        saved = true
+        return { status: 'ok', created: [{ work_item_id: 701, product_id: 901,
+          order_id: 801, requirement_id: 701, qty: 15 }], reused: [] }
+      })
+      const reason = 'Вид производства «Узел (сборка/сварка, покраска)» не привязан ни к одному участку'
+      if (failure === 'http_error') vi.mocked(postMaterialIssues).mockRejectedValue(new Error(reason))
+      else vi.mocked(postMaterialIssues).mockResolvedValue({
+        status: 'ok', created: failure === 'partial_issue' ? [{ issue_id: 1, document_number: 'MI-1', product_id: 901 }] : [],
+        reused: [], errors: [reason],
+      })
+      const printWindow = { document: { write: vi.fn() }, close: vi.fn(), closed: false }
+      vi.spyOn(window, 'open').mockReturnValue(printWindow as unknown as Window)
+      const user = userEvent.setup()
+      renderPage()
+      await user.click(await screen.findByRole('checkbox', { name: /MRP-R-701/ }))
+      await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+      await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(reason))
+      expect(within(rowFor('Сохранённый заказ')).getByRole('checkbox')).toBeChecked()
+      expect(within(rowFor('Предложение MRP')).getByRole('checkbox')).not.toBeChecked()
+      expect(printWindow.close).toHaveBeenCalled()
+      expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+      await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+      await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledTimes(2))
+      expect(materializeMakeWorkItems).toHaveBeenCalledTimes(1)
+      expect(vi.mocked(postMaterialIssues).mock.calls[1][0]).toEqual([901])
+      expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+    },
+  )
 
   it('retries proposal materials with the journal generation after refresh', async () => {
     const proposal = {

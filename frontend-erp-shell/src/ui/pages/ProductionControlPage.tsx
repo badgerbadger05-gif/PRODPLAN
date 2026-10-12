@@ -547,15 +547,22 @@ export function ProductionControlPage() {
             launch_qty: launchQty,
             expected_materialized_qty: row?.materialized_order_qty ?? 0,
           }
-        }), proposalIdentities as string[], Array.from(proposalRevisions)[0])
-        if (materialized.errors?.length) {
-          throw new Error(materialized.errors.join('\n'))
-        }
+        }), proposalIdentities as string[], Array.from(proposalRevisions)[0], true)
         ids = Array.from(new Set([
           ...ids,
           ...(materialized.created ?? []).map((row) => row.product_id),
           ...(materialized.reused ?? []).map((row) => row.product_id),
         ]))
+        // A later launch step can fail after these orders have been saved.
+        // Keep their locators selected so retry resumes the saved orders.
+        if (ids.length) {
+          setSelectedIds(new Set(ids))
+          setActiveId(ids[0])
+          setActiveCurrentIdentity(null)
+        }
+        if (materialized.errors?.length) {
+          throw new Error(materialized.errors.join('\n'))
+        }
       }
       if (!ids.length) throw new Error('Не удалось создать исполнительные заказы из расчёта MRP')
       const weldedNames = rows
@@ -580,6 +587,9 @@ export function ProductionControlPage() {
         sourceRevision: chains.source_revision ?? '',
       }
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids, materialContext)
+      if (issueResult.errors?.length) {
+        throw new Error(`Запуск в 1С остановлен: ${issueResult.errors.join('\n')}`)
+      }
       const selectionRequired = issueResult.selection_required ?? []
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
       if (selectionRequired.length > 0) {

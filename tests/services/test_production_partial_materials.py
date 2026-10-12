@@ -20,6 +20,55 @@ def _current(db):
     return work, identity, f'accepted:g{work.ledger_generation_id}:production_control_journal'
 
 
+@pytest.mark.parametrize('routing', ['NO_SPEC', 'NO_PRODUCTION_KIND', 'KIND_NOT_BOUND', 'NO_WAREHOUSE_BINDING', 'OK'])
+def test_launch_checks_workshop_routing_before_materializing(db_session, monkeypatch, routing):
+    from app.routers.production_control import OrdersFromWorkItemsPayload, _materialize_orders_from_work_items
+
+    work, identity, revision = _current(db_session)
+    saved = db_session.query(models.CurrentExecutionRow).filter_by(business_identity=identity).one()
+    if routing != 'NO_SPEC':
+        spec = models.Specification(spec_name='Combined weld and paint')
+        db_session.add(spec)
+        if routing != 'NO_PRODUCTION_KIND':
+            kind = models.ProductionKind(ref_1c='combined-weld-paint-kind', name='Combined weld and paint')
+            db_session.add(kind)
+            db_session.flush()
+            spec.production_kind_id = kind.id
+            if routing != 'KIND_NOT_BOUND':
+                resource = models.ProductionResource(resource_name='Welding')
+                db_session.add(resource)
+                db_session.flush()
+                db_session.add(models.ResourceProductionKind(resource_id=resource.resource_id, production_kind_id=kind.id))
+                if routing == 'OK':
+                    db_session.add(models.WorkshopWarehouseBinding(workshop_id=resource.resource_id, warehouse_ref1c='workshop-warehouse'))
+        db_session.flush()
+        saved.payload = {**saved.payload, 'spec_id': spec.spec_id}
+    db_session.commit()
+    frozen = tuple(db_session.query(models.ReservationEntry).one().__dict__.get(key) for key in (
+        'reserved_qty', 'replenishment_required_qty', 'replenishment_received_qty'))
+    calls = []
+    def materialize(*args, **kwargs):
+        calls.append('materialize')
+        return {'created': [], 'reused': [], 'skipped': [], 'errors': []}
+    monkeypatch.setattr('app.routers.production_control.materialize_make_work_items', materialize)
+    payload = OrdersFromWorkItemsPayload(work_items=[{
+        'work_item_id': work.id, 'launch_qty': 3, 'expected_materialized_qty': 0,
+    }], current_identities=[identity], expected_source_revision=revision, require_workshop_routing=True)
+    if routing == 'OK':
+        assert _materialize_orders_from_work_items(payload, db_session)['errors'] == []
+        assert calls == ['materialize']
+    else:
+        with pytest.raises(HTTPException) as error:
+            _materialize_orders_from_work_items(payload, db_session)
+        assert error.value.status_code == 400
+        assert routing in error.value.detail
+        assert calls == []
+    assert db_session.query(models.ProductionOrder).count() == 0
+    assert frozen == tuple(db_session.query(models.ReservationEntry).one().__dict__.get(key) for key in (
+        'reserved_qty', 'replenishment_required_qty', 'replenishment_received_qty'))
+    assert saved.payload['launchable_qty'] == 8
+
+
 def test_quantity_command_persists_preview_and_get_only_reads_it(db_session, monkeypatch):
     work, identity, revision = _current(db_session)
     calls = []
