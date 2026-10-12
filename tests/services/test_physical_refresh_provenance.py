@@ -730,8 +730,12 @@ def test_accepted_current_late_terminal_transfer_advances_hwm_without_qty_churn(
     db_session.delete(unrelated)
     db_session.flush()
 
+    prefix = select_accepted_current_material_custody_prefix(db_session)
+    assert prefix.has_suffix is False
     result = apply_accepted_current_material_custody_events(
-        db_session, source_sle_ids=(outbound.id, inbound.id),
+        db_session,
+        source_sle_ids=prefix.source_sle_ids,
+        upper_event_watermark=None,
     )
 
     manifest = db_session.get(
@@ -839,6 +843,7 @@ def test_accepted_prefix_fold_leaves_staging_suffix_readable(db_session):
     )
 
     prefix = select_accepted_current_material_custody_prefix(db_session)
+    assert prefix.has_suffix is True
     assert prefix.source_sle_ids == (outbound.id, inbound.id)
     assert prefix.upper_event_watermark == inbound_event.id < suffix.id
     result = apply_accepted_current_material_custody_events(
@@ -911,6 +916,7 @@ def test_accepted_prefix_selector_deduplicates_source_sle_ids(db_session):
     prefix = select_accepted_current_material_custody_prefix(db_session)
 
     assert prefix.event_count == 3
+    assert prefix.has_suffix is False
     assert prefix.upper_event_watermark == duplicate_source_event.id
     assert prefix.source_sle_ids == (outbound.id, inbound.id)
 
@@ -931,6 +937,7 @@ def test_accepted_prefix_terminal_audit_beyond_cap_rolls_back(
     before_events = db_session.query(models.ProductionMaterialCustodyEvent).count()
     before_qty = Decimal(str(unrelated.reserved_qty))
     prefix = select_accepted_current_material_custody_prefix(db_session)
+    assert prefix.has_suffix is True
     assert prefix.upper_event_watermark == inbound_event.id < suffix.id
     terminal_counts = []
     original_terminal = provenance._append_terminal_custody_releases

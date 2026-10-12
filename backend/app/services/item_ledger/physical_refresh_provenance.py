@@ -82,6 +82,7 @@ class AcceptedCurrentCustodyPrefix:
     upper_event_watermark: int
     source_sle_ids: tuple[int, ...]
     event_count: int
+    has_suffix: bool
     suffix_has_authoritative_event: bool
 
 
@@ -1263,6 +1264,7 @@ def select_accepted_current_material_custody_prefix(
             int(event.source_sle_id) for event in prefix
         )),
         event_count=len(prefix),
+        has_suffix=len(prefix) < len(tail),
         suffix_has_authoritative_event=suffix_has_authoritative_event,
     )
 

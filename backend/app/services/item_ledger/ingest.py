@@ -576,7 +576,11 @@ def pull_recorder_movements(
                         custody_fold = apply_accepted_current_material_custody_events(
                             session,
                             source_sle_ids=prefix.source_sle_ids,
-                            upper_event_watermark=prefix.upper_event_watermark,
+                            upper_event_watermark=(
+                                prefix.upper_event_watermark
+                                if prefix.has_suffix
+                                else None
+                            ),
                         )
             except PhysicalRefreshProvenanceUnavailable as exc:
                 invalidate_material_custody_dependents(

@@ -319,6 +319,7 @@ def test_exact_repull_rolls_back_partial_custody_fold_before_deferring(
         "select_accepted_current_material_custody_prefix",
         lambda _db: type("Prefix", (), {
             "event_count": 1,
+            "has_suffix": False,
             "source_sle_ids": (1,),
             "upper_event_watermark": 1,
             "suffix_has_authoritative_event": False,
@@ -367,6 +368,7 @@ def test_exact_repull_staging_only_tail_does_not_invalidate_accepted_math(
         "select_accepted_current_material_custody_prefix",
         lambda _db: type("Prefix", (), {
             "event_count": 0,
+            "has_suffix": True,
             "source_sle_ids": (),
             "upper_event_watermark": 0,
             "suffix_has_authoritative_event": False,
