@@ -2580,6 +2580,7 @@ def post_open_paint_weld_chains(
 
 @router.post("/orders/refresh-current", response_model=CurrentProductionRefreshResponse)
 async def post_refresh_current_orders(payload: RefreshProductionOrdersPayload, db: Session = Depends(get_db)):
+    from starlette.concurrency import run_in_threadpool
     from ..services.production_control_command_worker import run_command
     _require_current_production_identities(db, identities=payload.current_identities,
         expected_source_revision=payload.expected_source_revision,

@@ -69,6 +69,59 @@ def test_launch_checks_workshop_routing_before_materializing(db_session, monkeyp
     assert saved.payload['launchable_qty'] == 8
 
 
+@pytest.fixture
+def http_db_session():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine('sqlite://', connect_args={'check_same_thread': False}, poolclass=StaticPool)
+    models.Base.metadata.create_all(engine)
+    try:
+        with Session(engine) as db:
+            yield db
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize('stale', [False, True])
+def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_session, monkeypatch, stale):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.database import get_db
+    from app.routers.production_control import router
+
+    db_session = http_db_session
+    work, _, revision = _current(db_session)
+    identity = 'production:order:42'
+    publish_current_production_control_from_payload(db_session, work.ledger_generation_id, {
+        'meta': {}, 'rows': [{'current_identity': identity, 'product_id': 42,
+                             'order_id': 7, 'item_id': work.item_id}],
+    })
+    db_session.commit()
+    calls = []
+    def worker(action, payload):
+        calls.append((action, payload))
+        return {'status': 'refreshed', 'product_ids': [42], 'current_identities': [identity], 'source_revision': revision}
+    monkeypatch.setattr('app.services.production_control_command_worker.run_command', worker)
+    app = FastAPI()
+    app.include_router(router, prefix='/api')
+    app.dependency_overrides[get_db] = lambda: db_session
+    with TestClient(app) as client:
+        response = client.post('/api/v1/production-control/orders/refresh-current', json={
+            'product_ids': [42], 'current_identities': [identity],
+            'expected_source_revision': 'stale' if stale else revision,
+        })
+    if stale:
+        assert response.status_code == 409
+        assert calls == []
+    else:
+        assert response.status_code == 200
+        assert response.json()['status'] == 'refreshed'
+        assert calls == [('refresh-executors', {'product_ids': [42], 'current_identities': [identity],
+                                               'expected_source_revision': revision})]
+
+
 def test_quantity_command_persists_preview_and_get_only_reads_it(db_session, monkeypatch):
     work, identity, revision = _current(db_session)
     calls = []
