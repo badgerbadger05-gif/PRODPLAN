@@ -238,11 +238,20 @@ def supplier_future_supply_evidence(
             raise ValueError("supplier-order mirror contains duplicate external line identity")
         mirrored[identity] = (line, order)
 
-    visible_ids = visible_sle_query(
-        db,
-        physical_import_batch_id=int(generation.physical_import_batch_id),
-        cutoff=generation.cutoff,
-    ).with_entities(models.StockLedgerEntry.id).subquery()
+    # This is set membership, so the canonical visibility order carries no
+    # business meaning here.  Keeping it forces PostgreSQL to sort the whole
+    # visible prefix before a semi-join, which is catastrophic while a new
+    # generation's provenance rows are still invisible to planner statistics.
+    visible_ids = (
+        visible_sle_query(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=generation.cutoff,
+        )
+        .order_by(None)
+        .with_entities(models.StockLedgerEntry.id)
+        .subquery()
+    )
     realized_by_line: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
     for order_ref, line_no, qty in db.query(
         models.StockLedgerSupplierReceiptProvenance.supplier_order_ref,
