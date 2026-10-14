@@ -651,6 +651,34 @@ def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):
     assert _supplier_event_rows(db_session, generation.id)[0][1].requirement_id == req.id
 
 
+def test_explicit_order_line_disambiguates_repeated_item(db_session):
+    generation, _req = _persistence_fixture(db_session)
+    order = db_session.query(models.SupplierOrder).filter_by(order_ref1c="order-1").one()
+    item = db_session.query(models.Item).filter_by(item_code="SUP-CORE").one()
+    db_session.add(models.SupplierOrderItem(
+        order_id=order.order_id,
+        item_id_ref=item.item_id,
+        line_number=2,
+        quantity=Decimal("5"),
+        received_qty=0,
+        remaining_qty=5,
+    ))
+    db_session.flush()
+
+    normalized = normalize_supplier_receipt_evidence(
+        db_session,
+        explicit_sles=db_session.query(models.StockLedgerEntry).filter_by(
+            recorder_ref="doc"
+        ).all(),
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+    )
+
+    assert len(normalized) == 1
+    assert normalized[0].match_status == "exact"
+    assert normalized[0].canonical_line_no == "1"
+    assert normalized[0].ambiguity_count == 0
+
+
 def test_normalizer_maps_one_document_line_to_multiple_aggregate_sles(db_session):
     generation, _req = _persistence_fixture(db_session)
     first = db_session.query(models.StockLedgerEntry).filter_by(

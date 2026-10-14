@@ -916,6 +916,95 @@ def test_ownerless_supplier_order_receipt_updates_future_supply_without_buy_allo
     db_session.rollback()
 
 
+def test_ownerless_ambiguous_supplier_receipt_publishes_without_future_supply_credit(
+    db_session, monkeypatch,
+):
+    parent, target, _parent_batch, target_batch = _generations(db_session)
+    item = _item(db_session, "STANDALONE-AMBIGUOUS-SUPPLIER")
+    order = models.SupplierOrder(
+        order_number="SO-AMBIGUOUS",
+        order_date=datetime(2026, 9, 1),
+        order_ref1c="ambiguous-order",
+        order_state_name="Заказан (товар в пути)",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add_all([
+        models.SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=item.item_id,
+            line_number=line_no,
+            destination_warehouse_ref1c="WH-BUY",
+            quantity=Decimal("2"),
+            received_qty=Decimal("0"),
+            remaining_qty=Decimal("2"),
+            delivery_date=datetime(2026, 9, 30),
+        )
+        for line_no in (1, 2)
+    ])
+    receipt = _sle(
+        db_session, target_batch, item, qty="4", at=FORWARD_AT,
+        kind="receipt", warehouse="WH-BUY",
+        recorder_type="Document_ПриходнаяНакладная", ref="ambiguous-receipt",
+    )
+    db_session.commit()
+    evidence = SupplierDocumentEvidence(
+        receipt_doc_type=receipt.recorder_type,
+        receipt_doc_ref=receipt.recorder_ref,
+        receipt_doc_line_no=receipt.line_no,
+        operation_key=RECEIPT_OPERATION,
+        operation_name="Приобретение у поставщика",
+        supplier_order_type="Document_ЗаказПоставщику",
+        supplier_order_ref="ambiguous-order",
+        supplier_order_line_no="0",
+        item_id=item.item_id,
+        characteristic_ref="",
+        warehouse_ref1c="WH-BUY",
+        signed_qty=Decimal("4"),
+    )
+    _patch_payloads(monkeypatch, evidence=(evidence,))
+
+    publisher.publish_forward_physical_refresh_current(
+        db_session,
+        target_generation_id=target.id,
+        parent_generation_id=parent.id,
+        delta_manifest={"rows": (receipt,), "supersessions": ()},
+        odata_client=object(),
+        source_revision=target_batch.id,
+        planning_pool_by_warehouse=POOL_BY_WAREHOUSE,
+    )
+
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(
+        ledger_generation_id=target.id,
+        stock_ledger_entry_id=receipt.id,
+    ).one()
+    assert provenance.match_status == "ambiguous"
+    assert provenance.ambiguity_count == 2
+    assert provenance.supplier_order_ref == ""
+    assert provenance.supplier_order_line_no == "0"
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+    supplies = db_session.query(models.LedgerFutureSupply).filter_by(
+        ledger_generation_id=target.id,
+        supply_kind="supplier_order",
+        source_ref="ambiguous-order",
+    ).order_by(models.LedgerFutureSupply.source_line_ref).all()
+    assert [row.source_line_ref for row in supplies] == ["1", "2"]
+    assert [row.realized_qty_at_cutoff for row in supplies] == [
+        Decimal("0"), Decimal("0"),
+    ]
+    assert [row.evidence_status for row in supplies] == [
+        "rejected", "rejected",
+    ]
+    assert [row.open_qty_at_cutoff for row in supplies] == [
+        Decimal("0"), Decimal("0"),
+    ]
+    db_session.rollback()
+
+
 def test_standalone_supplier_selection_respects_buy_owner_in_another_pool(
     db_session,
 ):

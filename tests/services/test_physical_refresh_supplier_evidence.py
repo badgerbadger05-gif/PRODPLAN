@@ -330,7 +330,9 @@ def test_ownerless_exact_supplier_receipt_is_typed_once_without_allocation(
     assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
 
 
-def test_ownerless_unmatched_receipt_does_not_invent_order_line(db_session, monkeypatch):
+def test_ownerless_unmatched_receipt_persists_without_inventing_order_line(
+    db_session, monkeypatch,
+):
     _parent, target, _parent_batch, target_batch, item = _world(db_session)
     row = _sle(db_session, target_batch, item)
     evidence = _fake_evidence(row)
@@ -339,13 +341,101 @@ def test_ownerless_unmatched_receipt_does_not_invent_order_line(db_session, monk
         lambda db, client, rows: _fake_result((evidence,)),
     )
 
-    assert adapter.persist_standalone_supplier_order_receipts(
+    created = adapter.persist_standalone_supplier_order_receipts(
         db_session,
         target_generation_id=target.id,
         rows=(row,),
         odata_client=object(),
-    ) == ()
-    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 0
+    )
+    assert len(created) == 1
+    assert created[0].match_status == "unmatched"
+    assert created[0].supplier_order_ref == ""
+    assert created[0].supplier_order_line_no == "0"
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+
+
+def test_ownerless_ambiguous_receipt_persists_without_order_credit(
+    db_session, monkeypatch,
+):
+    _parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(db_session, target_batch, item)
+    _supplier_order(db_session, item, line_numbers=(1, 2))
+    evidence = _fake_evidence(
+        row, order_ref="order-1", order_type="Document_ЗаказПоставщику",
+    )
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+
+    created = adapter.persist_standalone_supplier_order_receipts(
+        db_session,
+        target_generation_id=target.id,
+        rows=(row,),
+        odata_client=object(),
+    )
+
+    assert len(created) == 1
+    assert created[0].match_status == "ambiguous"
+    assert created[0].ambiguity_count == 2
+    assert created[0].supplier_order_ref == ""
+    assert created[0].supplier_order_line_no == "0"
+    assert db_session.query(models.ReservationConsumptionAllocation).count() == 0
+
+
+def test_explicit_standalone_repair_still_rejects_ambiguous_order_line(
+    db_session, monkeypatch,
+):
+    _parent, target, _parent_batch, target_batch, item = _world(db_session)
+    row = _sle(db_session, target_batch, item)
+    _supplier_order(db_session, item, line_numbers=(1, 2))
+    evidence = _fake_evidence(
+        row, order_ref="order-1", order_type="Document_ЗаказПоставщику",
+    )
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+
+    with pytest.raises(
+        adapter.BoundedSupplierEvidenceError,
+        match="requires an exact order line for every SLE",
+    ):
+        adapter.persist_standalone_supplier_order_receipts(
+            db_session,
+            target_generation_id=target.id,
+            rows=(row,),
+            odata_client=object(),
+            require_all_exact=True,
+        )
+
+
+def test_standalone_receipt_fails_closed_when_extractor_omits_an_eligible_sle(
+    db_session, monkeypatch,
+):
+    _parent, target, _parent_batch, target_batch, item = _world(db_session)
+    first = _sle(db_session, target_batch, item, ref="receipt-1")
+    second = _sle(
+        db_session, target_batch, item, ref="receipt-2",
+        content_hash="receipt-2".ljust(64, "0"),
+        business_identity="supplier:receipt-2:1",
+    )
+    evidence = _fake_evidence(first)
+    monkeypatch.setattr(
+        adapter, "extract_supplier_document_evidence",
+        lambda db, client, rows: _fake_result((evidence,)),
+    )
+
+    with pytest.raises(
+        adapter.BoundedSupplierEvidenceError,
+        match=f"did not classify every eligible SLE: sle={second.id}",
+    ):
+        adapter.persist_standalone_supplier_order_receipts(
+            db_session,
+            target_generation_id=target.id,
+            rows=(first, second),
+            odata_client=object(),
+        )
 
 
 def test_ownerless_exact_supplier_return_keeps_signed_provenance(db_session, monkeypatch):

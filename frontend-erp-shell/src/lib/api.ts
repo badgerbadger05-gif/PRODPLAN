@@ -16,6 +16,20 @@ export class ApiError extends Error {
 type UnauthorizedListener = () => void
 type AccessTokenProvider = () => string | null | undefined
 
+function structuredErrorMessage(detail: Record<string, unknown>): string | null {
+  if (detail.code === 'planning_truth_unavailable') {
+    return detail.truth_status === 'stale'
+      ? 'Данные об остатках устарели. Действия, зависящие от остатков, временно недоступны.'
+      : 'Актуальные данные об остатках недоступны. Действия, зависящие от остатков, временно недоступны.'
+  }
+
+  if (detail.code === 'material_custody_snapshot_unavailable') {
+    return 'Не удалось получить актуальные данные о движении материалов.'
+  }
+
+  return typeof detail.message === 'string' ? detail.message : null
+}
+
 const unauthorizedListeners = new Set<UnauthorizedListener>()
 let accessTokenProvider: AccessTokenProvider | null = null
 
@@ -67,10 +81,10 @@ async function request<T>(
       if (typeof detail === 'string') {
         message = detail
       } else if (detail && typeof detail === 'object') {
-        // Structured detail (e.g. 409 {message, deficit_lines}) — prefer its
-        // human `message` field for the thrown Error, keep the object on detail.
-        const inner = (detail as Record<string, unknown>).message
-        message = typeof inner === 'string' ? inner : JSON.stringify(detail)
+        // Keep the structured payload on ApiError for state and diagnostics,
+        // while Error.message remains concise enough to render in shared UI.
+        message = structuredErrorMessage(detail as Record<string, unknown>)
+          ?? JSON.stringify(detail)
       }
     } catch {
       // Keep the original response text when it is not JSON.

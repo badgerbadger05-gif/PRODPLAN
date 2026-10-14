@@ -953,10 +953,20 @@ def _candidate_order_lines(
     ).one_or_none()
     if order is None:
         return []
-    return db.query(models.SupplierOrderItem).filter(
+    query = db.query(models.SupplierOrderItem).filter(
         models.SupplierOrderItem.order_id == order.order_id,
         models.SupplierOrderItem.item_id_ref == evidence.item_id,
-    ).all()
+    )
+    raw_line_no = _text(evidence.supplier_order_line_no)
+    if raw_line_no and raw_line_no != "0":
+        try:
+            line_no = int(raw_line_no)
+        except ValueError:
+            return []
+        if line_no <= 0:
+            return []
+        query = query.filter(models.SupplierOrderItem.line_number == line_no)
+    return query.all()
 
 
 def normalize_supplier_receipt_evidence(

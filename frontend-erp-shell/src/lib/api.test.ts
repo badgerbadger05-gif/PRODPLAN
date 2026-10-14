@@ -70,6 +70,81 @@ describe('api transport', () => {
     } satisfies Partial<ApiError>)
   })
 
+  it('renders a concise stale-truth message and preserves badge metadata', async () => {
+    const detail = {
+      code: 'planning_truth_unavailable',
+      truth_status: 'stale',
+      ledger_generation: 2131,
+      cutoff: '2026-10-13T09:40:00+03:00',
+      reason: 'Accepted generation exceeded freshness threshold',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    await expect(api('/production-control')).rejects.toMatchObject({
+      message: 'Данные об остатках устарели. Действия, зависящие от остатков, временно недоступны.',
+      status: 503,
+      detail,
+    } satisfies Partial<ApiError>)
+  })
+
+  it('renders a concise unavailable-truth message', async () => {
+    const detail = {
+      code: 'planning_truth_unavailable',
+      truth_status: 'uninitialized',
+      ledger_generation: null,
+      cutoff: null,
+      reason: 'No accepted generation',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    await expect(api('/production-control')).rejects.toMatchObject({
+      message: 'Актуальные данные об остатках недоступны. Действия, зависящие от остатков, временно недоступны.',
+      status: 503,
+      detail,
+    } satisfies Partial<ApiError>)
+  })
+
+  it('renders a concise material-custody unavailable message and preserves detail', async () => {
+    const detail = {
+      code: 'material_custody_snapshot_unavailable',
+      status: 'unavailable',
+      expected_generation_id: 2131,
+      stored_generation_id: 2130,
+      reason: 'compact current custody has an unpublished event tail',
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    await expect(api('/release-feasibility')).rejects.toMatchObject({
+      message: 'Не удалось получить актуальные данные о движении материалов.',
+      status: 503,
+      detail,
+    } satisfies Partial<ApiError>)
+  })
+
   it('notifies unauthorized listeners for a 401 response', async () => {
     const unauthorized = vi.fn()
     const unsubscribe = onApiUnauthorized(unauthorized)

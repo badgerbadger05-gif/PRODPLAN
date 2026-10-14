@@ -329,13 +329,16 @@ def persist_standalone_supplier_order_receipts(
     odata_client: object | None,
     require_all_exact: bool = False,
 ) -> tuple[models.StockLedgerSupplierReceiptProvenance, ...]:
-    """Type exact order receipts without creating an idle BUY allocation.
+    """Type standalone supplier receipts without creating a BUY allocation.
 
     The caller has already bounded these physical rows to its delta and the
     planning contour.  Receipt documents without a current BUY reservation
     can still settle a supplier-order line in future supply.  The canonical
-    extractor and provenance writer establish that link; the mutable order
-    mirror contributes its line identity, never its received quantity.
+    extractor and provenance writer establish that link when it is exact.  An
+    ambiguous or unmatched receipt is persisted with an empty canonical order
+    identity, so it cannot settle any supplier line but its typed document
+    evidence remains durable.  The mutable order mirror contributes line
+    identity, never received quantity.
     """
     explicit = tuple(rows)
     if not explicit:
@@ -353,7 +356,9 @@ def persist_standalone_supplier_order_receipts(
     if extraction.diagnostics:
         diagnostic = extraction.diagnostics[0]
         raise BoundedSupplierEvidenceError(
-            f"supplier document evidence diagnostic {diagnostic.code}: {diagnostic.detail}"
+            "supplier document evidence diagnostic "
+            f"{diagnostic.code} for {diagnostic.recorder_type}/"
+            f"{diagnostic.recorder_ref}/{diagnostic.line_no}: {diagnostic.detail}"
         )
     ignored = {
         int(entry.stock_ledger_entry_id)
@@ -372,19 +377,39 @@ def persist_standalone_supplier_order_receipts(
         )
     except SupplierReceiptEvidenceError as exc:
         raise BoundedSupplierEvidenceError(str(exc)) from exc
-    if any(row.match_status == "ambiguous" for row in normalized):
+    normalized_ids = {int(row.fact.sle_id) for row in normalized}
+    eligible_ids = {int(row.id) for row in eligible}
+    if normalized_ids != eligible_ids:
+        missing = [
+            row for row in eligible if int(row.id) not in normalized_ids
+        ]
+        detail = ", ".join(
+            f"sle={int(row.id)} {row.recorder_type}/"
+            f"{row.recorder_ref}/{row.line_no} item={int(row.item_id)}"
+            for row in missing[:8]
+        )
         raise BoundedSupplierEvidenceError(
-            "standalone supplier receipt has ambiguous order-line evidence"
+            "standalone supplier evidence did not classify every eligible SLE"
+            + (f": {detail}" if detail else "")
         )
     exact = tuple(row for row in normalized if row.match_status == "exact")
     if require_all_exact and {int(row.fact.sle_id) for row in exact} != {
         int(row.id) for row in explicit
     }:
+        status_by_sle = {
+            int(row.fact.sle_id): row.match_status for row in normalized
+        }
+        detail = ", ".join(
+            f"sle={int(row.id)} {row.recorder_type}/"
+            f"{row.recorder_ref}/{row.line_no} item={int(row.item_id)} "
+            f"status={status_by_sle.get(int(row.id), 'missing')}"
+            for row in explicit[:8]
+            if status_by_sle.get(int(row.id)) != "exact"
+        )
         raise BoundedSupplierEvidenceError(
             "explicit standalone supplier repair requires an exact order line for every SLE"
+            + (f": {detail}" if detail else "")
         )
-    if not exact:
-        return ()
     if any(
         not _text(row.fact.supplier_order_ref)
         or not _text(row.fact.supplier_order_line_no).isdigit()
@@ -394,15 +419,16 @@ def persist_standalone_supplier_order_receipts(
         raise BoundedSupplierEvidenceError(
             "standalone supplier evidence lacks an exact order line"
         )
-    exact_ids = {int(row.fact.sle_id) for row in exact}
-    exact_sles = tuple(row for row in eligible if int(row.id) in exact_ids)
-    exact_evidence = tuple(dict.fromkeys(row.evidence for row in exact))
+    normalized_sles = tuple(
+        row for row in eligible if int(row.id) in normalized_ids
+    )
+    normalized_evidence = tuple(dict.fromkeys(row.evidence for row in normalized))
     try:
         return persist_supplier_receipt_provenance_for_sles(
             db,
             ledger_generation_id=int(target.id),
-            explicit_sles=exact_sles,
-            evidence=exact_evidence,
+            explicit_sles=normalized_sles,
+            evidence=normalized_evidence,
         )
     except SupplierReceiptEvidenceError as exc:
         raise BoundedSupplierEvidenceError(str(exc)) from exc
