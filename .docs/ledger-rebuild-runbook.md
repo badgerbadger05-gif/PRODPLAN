@@ -91,22 +91,33 @@ stubs `ALTER TABLE ... ADD CONSTRAINT`, so most KEEP -> CLEAR foreign keys are
 invisible there. `tools/pg_rebuild_check.py` runs the migrations and both files
 against a real PostgreSQL and reports every stage as PASS/FAIL.
 
-Disposable smoke rehearsal (starts and removes its own `postgres:15` on a free
-port, seeds a minimal accepted generation so the clear guard can run, and takes
-about fifteen seconds):
+Disposable smoke rehearsal starts and removes its own `postgres:15` on a free
+port. It migrates the fresh database to `20260911_03`, seeds an accepted empty
+generation and publishes empty current manifests through the existing owner.
+It creates a custom-format backup and checks its catalog before enabling the
+session-only backup guard and upgrading to head. Existing databases are never
+automatically seeded by this path.
 
 ```bash
 python tools/pg_rebuild_check.py
 PRODPLAN_PG_CHECK=1 pytest tests/test_pg_rebuild_check.py   # same run via pytest
 ```
 
-On a **restored copy** of the production dump — never on production — first
-prove that the clear transaction reaches `CLEAR PASS` on the real schema:
+With `PRODPLAN_PG_CHECK_DSN`, the pytest integration creates and later drops a
+new database on that local server; the supplied database is never migrated or
+cleared. Its role needs `CREATEDB`. This keeps reruns independent of earlier
+partial fixtures. An explicit `--bootstrap-empty` CLI run likewise refuses any
+database containing user tables; `--no-seed` cannot be combined with it.
+
+On a **restored copy** of the production dump — never on production — complete
+the canonical migration and backup prerequisites from
+[operational-preservation.md](../tools/operational-preservation.md) first, then
+prove that the clear transaction reaches `CLEAR PASS` on the current schema:
 
 ```bash
 python tools/pg_rebuild_check.py \
   --dsn "postgresql://USER:PASSWORD@HOST:PORT/prodplan_rebuild_copy" \
-  --stages migrate,round-trip,clear \
+  --stages clear \
   --allow-destructive-clear \
   --expected-database prodplan_rebuild_copy \
   --expected-generation-key "$expected_generation_key"
@@ -129,9 +140,10 @@ python tools/pg_rebuild_check.py \
 
 Notes:
 
-- The round trip is `head -> 20260726_14 -> head`. A full downgrade to base is
-  impossible by design: `20260726_04` is a destructive canon cleanup whose
-  `downgrade()` raises `RuntimeError`.
+- The disposable schema round trip is `head -> 20260914_02 -> head`. The
+  current-owner cutovers remain applied; historical R10 migrations cannot be
+  reversed. Data-dependent downgrade guards still apply and must not be
+  bypassed on a restored copy.
 - Default `--smoke` mode tolerates only the documented emptiness failures of the
   verifier and additionally executes its summary projection, which the aborted
   `DO` block never reaches. `--strict` treats any failure as a failure.

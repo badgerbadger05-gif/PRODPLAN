@@ -11,12 +11,11 @@ gap by running the real statements on a real PostgreSQL 15 server.
 Stages (each reported separately as PASS/FAIL):
 
 1. ``migrate``     -- ``alembic upgrade head``.
-2. ``round-trip``  -- ``head -> downgrade 20260726_14 -> head``.  This is the
-   deepest safe floor: ``20260726_04`` is an intentional destructive canon
-   cleanup whose ``downgrade()`` raises ``RuntimeError``, so a full downgrade to
-   base is impossible by design.  The floor is exactly the parent of the two new
-   revisions ``20260730_01`` / ``20260730_02``, which is what the round trip is
-   meant to exercise.
+2. ``round-trip``  -- ``head -> downgrade 20260914_02 -> head``. Historical
+   current-owner cutovers are irreversible; only the later reversible schema
+   is round-tripped. A fresh disposable database is first migrated to the
+   pre-cutover boundary, given an accepted empty fixture through the existing
+   publisher, and backed up before the guarded upgrade to head.
 3. ``clear``       -- executes the destructive clear script through ``COMMIT``.
    On a freshly migrated database the script's guard would refuse to start, so a
    minimal accepted-generation fixture is seeded first (only when the database is
@@ -58,6 +57,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Sequence
 from urllib.parse import quote, urlparse
@@ -69,9 +69,9 @@ ALEMBIC_INI = BACKEND_DIR / "alembic.ini"
 CLEAR_SQL = REPO_ROOT / "tools" / "sql" / "clear_rebuildable_ledger_projections.sql"
 VERIFY_SQL = REPO_ROOT / "tools" / "sql" / "verify_ledger_rebuild.sql"
 
-# Parent of 20260730_01; see the module docstring for why a full downgrade to
-# base is impossible.
-ROUND_TRIP_FLOOR = "20260726_14"
+# Preserve the irreversible R10/R11 cutovers during schema round trips.
+ROUND_TRIP_FLOOR = "20260914_02"
+BOOTSTRAP_REVISION = "20260911_03"
 
 SEED_GENERATION_KEY = "pg-rebuild-check"
 SEED_CUTOFF = "2026-07-28 14:30:24+03"
@@ -240,13 +240,11 @@ class Psql:
         if self.container is None and self.binary is None and not self.wsl and not _docker_available():
             raise CheckError("no psql transport: neither a container, WSL psql, nor a psql binary is available")
 
-    def _command(self, args: Sequence[str], database: str) -> list[str]:
+    def _command(self, args: Sequence[str], database: str, *, program: str = "psql") -> list[str]:
         env = ["-e", f"PGPASSWORD={self.target.password}", "-e", "PGCLIENTENCODING=UTF8"]
         psql = [
-            "psql",
-            "-X",
-            "-v",
-            "ON_ERROR_STOP=1",
+            program,
+            *(["-X", "-v", "ON_ERROR_STOP=1"] if program == "psql" else []),
             "-U",
             self.target.user,
             "-d",
@@ -256,7 +254,8 @@ class Psql:
         if self.container is not None:
             return ["docker", "exec", "-i", *env, self.container, *psql]
         if self.binary is not None:
-            return [self.binary, "-h", self.target.host, "-p", str(self.target.port), *psql]
+            binary = self.binary if program == "psql" else str(Path(self.binary).with_name(program))
+            return [binary, "-h", self.target.host, "-p", str(self.target.port), *psql]
         if self.wsl:
             distro = os.getenv("PRODPLAN_PG_CHECK_WSL_DISTRO", "Ubuntu")
             wsl = shutil.which("wsl.exe") or shutil.which("wsl") or "wsl.exe"
@@ -317,6 +316,26 @@ class Psql:
         if result.returncode != 0:
             raise CheckError(f"probe query failed: {(result.stderr or result.stdout).strip()}")
         return result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
+
+    def verified_backup(self, destination: Path) -> None:
+        """Retain and inspect a real custom archive before the fixture cutover."""
+        dump = subprocess.run(
+            self._command(["--format=custom", "--no-owner", "--no-acl"], self.target.database, program="pg_dump"),
+            env=self._env(), capture_output=True, timeout=600,
+        )
+        if dump.returncode != 0 or not dump.stdout.startswith(b"PGDMP"):
+            raise CheckError("cannot create the empty rehearsal backup")
+        destination.write_bytes(dump.stdout)
+        # pg_restore --list needs no database connection. Reuse only the
+        # transport prefix, then supply the retained archive on stdin.
+        command = self._command([], self.target.database, program="pg_restore")
+        database_option = command.index("-U")
+        inspected = subprocess.run(
+            [*command[:database_option], "--list"], input=destination.read_bytes(),
+            env=self._env(), capture_output=True, timeout=120,
+        )
+        if inspected.returncode != 0 or b"planning_truth_state" not in inspected.stdout:
+            raise CheckError("empty rehearsal backup catalog verification failed")
 
 
 # --------------------------------------------------------------------------- #
@@ -394,10 +413,12 @@ def _wait_ready(target: Target, *, timeout: int) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _alembic(target: Target, *command: str, timeout: int = 3600) -> subprocess.CompletedProcess[str]:
+def _alembic(target: Target, *command: str, timeout: int = 3600, backup_ready: bool = False) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["DATABASE_URL"] = target.url()
     env["PYTHONIOENCODING"] = "utf-8"
+    if backup_ready:
+        env["PGOPTIONS"] = (env.get("PGOPTIONS", "") + " -c prodplan.execution_projection_backup_ready=on").strip()
     return _run(
         [sys.executable, "-m", "alembic", "-c", str(ALEMBIC_INI), *command],
         env=env,
@@ -406,9 +427,53 @@ def _alembic(target: Target, *command: str, timeout: int = 3600) -> subprocess.C
     )
 
 
-def stage_migrate(target: Target) -> StageResult:
+def _bootstrap_empty_rehearsal(target: Target, psql: Psql) -> subprocess.CompletedProcess[str]:
+    """Prepare only an explicitly disposable, provably fresh database.
+
+    Existing/restored databases never receive synthetic accepted truth. Their
+    migration still uses the operator's accepted basis and backup guard.
+    """
+    tables = psql.scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') AND table_type = 'BASE TABLE';")
+    if tables != "0":
+        raise CheckError("empty rehearsal bootstrap requires a database with no user tables")
+    result = _alembic(target, "upgrade", BOOTSTRAP_REVISION)
+    if result.returncode:
+        return result
+    _seed_guard_fixture(psql)
+    # Use the existing publisher and the migration's own required-scope list.
+    # These are valid empty manifests, never guessed business quantities.
+    fixture_code = """
+import sys
+sys.path.insert(0, str(__import__('pathlib').Path.cwd() / 'backend'))
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+from app.services.item_ledger.current_execution import publish_current_execution_scope
+engine = create_engine(__import__('os').environ['DATABASE_URL'])
+config = Config('backend/alembic.ini')
+config.set_main_option('script_location', 'backend/alembic')
+migration = ScriptDirectory.from_config(config).get_revision('20260914_02').module
+with Session(engine) as db:
+    generation_id = db.execute(text('SELECT current_generation_id FROM planning_truth_state WHERE id=1')).scalar_one()
+    for kind, scope in migration._REQUIRED_SCOPES:
+        publish_current_execution_scope(db, source_revision='pg-rebuild-check', source_generation_id=generation_id, scope_key=scope, rows=[], entity_kinds=(kind,))
+    db.commit()
+"""
+    env = {**os.environ, "DATABASE_URL": target.url(), "PYTHONIOENCODING": "utf-8"}
+    result = _run([sys.executable, "-c", fixture_code], env=env, cwd=REPO_ROOT)
+    if result.returncode:
+        return result
+    with tempfile.TemporaryDirectory(prefix="prodplan-empty-rehearsal-") as directory:
+        psql.verified_backup(Path(directory) / "before-current-owner.dump")
+        return _alembic(target, "upgrade", "head", backup_ready=True)
+
+
+def stage_migrate(target: Target, psql: Psql | None = None, *, bootstrap_empty: bool = False) -> StageResult:
     started = time.time()
-    result = _alembic(target, "upgrade", "head")
+    if bootstrap_empty and psql is None:
+        raise CheckError("empty rehearsal bootstrap requires an explicit PostgreSQL client")
+    result = _bootstrap_empty_rehearsal(target, psql) if bootstrap_empty and psql is not None else _alembic(target, "upgrade", "head")
     if result.returncode != 0:
         return StageResult(
             "migrate", "FAIL", _tail(result.stderr or result.stdout), time.time() - started
@@ -601,6 +666,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--strict", action="store_true", help="any verifier failure is a failure")
     parser.add_argument("--no-seed", action="store_true", help="never seed the clear-script guard fixture")
+    parser.add_argument("--bootstrap-empty", action="store_true", help="prepare accepted empty fixtures in a provably fresh rehearsal database")
     parser.add_argument("--allow-destructive-clear", action="store_true")
     parser.add_argument("--expected-database", default=None)
     parser.add_argument("--expected-generation-key", default=None)
@@ -638,6 +704,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     _apply_dsn(args)
     stages = _selected_stages(args.stages)
+    if args.bootstrap_empty and args.no_seed:
+        raise CheckError("--bootstrap-empty cannot be combined with --no-seed")
 
     owned_target: Target | None = None
     results: list[StageResult] = []
@@ -668,7 +736,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for index, name in enumerate(stages, start=1):
             print(f"[{index}/{len(stages)}] {name} ...", flush=True)
             if name == "migrate":
-                result = stage_migrate(target)
+                result = stage_migrate(target, psql, bootstrap_empty=(target.owned and not args.no_seed) or args.bootstrap_empty)
+                if result.status == "PASS" and ((target.owned and not args.no_seed) or args.bootstrap_empty):
+                    args.expected_generation_key = args.expected_generation_key or SEED_GENERATION_KEY
             elif name == "round-trip":
                 result = stage_round_trip(target)
             elif name == "clear":

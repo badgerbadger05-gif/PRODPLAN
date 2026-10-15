@@ -1,9 +1,10 @@
-fastapi>=0.68.0
+# Match the deployed API/schema generator; upgrades regenerate OpenAPI and DTOs.
+fastapi==0.142.2
 # >=0.37: first release with --timeout-worker-healthcheck (backend/Dockerfile CMD).
 uvicorn[standard]>=0.37.0
 sqlalchemy>=2.0,<2.1
 psycopg2-binary>=2.9.0
 alembic>=1.7.0
-pydantic>=1.8.0
+pydantic==2.13.5
 numpy>=1.21.0
 openpyxl>=3.1.2

@@ -53,19 +53,58 @@ def _skip_reason() -> str | None:
     return None
 
 
-def test_round_trip_floor_is_the_parent_of_the_new_revisions():
+def test_round_trip_preserves_irreversible_current_owner_cutovers():
     path = (
         REPO_ROOT
         / "backend"
         / "alembic"
         / "versions"
-        / "20260730_01_material_coverage_generation.py"
+        / "20260924_01_specification_rebase_run_state.py"
     )
     spec = importlib.util.spec_from_file_location("material_coverage_round_trip_floor", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     assert pg_rebuild_check.ROUND_TRIP_FLOOR == module.down_revision
+
+
+def test_empty_bootstrap_refuses_existing_tables_before_migration(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(pg_rebuild_check, "_alembic", lambda *a, **kw: pytest.fail("existing database must not be migrated or seeded"))
+    with pytest.raises(pg_rebuild_check.CheckError, match="no user tables"):
+        pg_rebuild_check._bootstrap_empty_rehearsal(None, SimpleNamespace(scalar=lambda sql: "1"))
+
+
+def test_regular_migration_does_not_seed_truth_or_set_backup_guard(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+    def migrate(target, *command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout="head", stderr="")
+    monkeypatch.setattr(pg_rebuild_check, "_alembic", migrate)
+    monkeypatch.setattr(pg_rebuild_check, "_bootstrap_empty_rehearsal", lambda *a: pytest.fail("regular migration must not seed"))
+    assert pg_rebuild_check.stage_migrate(None).status == "PASS"
+    assert calls == [(("upgrade", "head"), {}), (("current",), {})]
+
+
+def test_empty_bootstrap_never_runs_guarded_upgrade_after_backup_failure(monkeypatch):
+    from types import SimpleNamespace
+
+    commands = []
+    def migrate(target, *command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+    def failed_backup(path):
+        raise pg_rebuild_check.CheckError("backup verification failed")
+    monkeypatch.setattr(pg_rebuild_check, "_alembic", migrate)
+    monkeypatch.setattr(pg_rebuild_check, "_seed_guard_fixture", lambda psql: None)
+    monkeypatch.setattr(pg_rebuild_check, "_run", lambda *a, **kw: SimpleNamespace(returncode=0))
+    client = SimpleNamespace(scalar=lambda sql: "0", verified_backup=failed_backup)
+    with pytest.raises(pg_rebuild_check.CheckError, match="backup verification"):
+        pg_rebuild_check._bootstrap_empty_rehearsal(SimpleNamespace(url=lambda: "local-test-only"), client)
+    assert commands == [("upgrade", pg_rebuild_check.BOOTSTRAP_REVISION)]
 
 
 def test_summary_projection_is_extracted_from_the_verifier():
@@ -120,6 +159,33 @@ def test_local_existing_server_can_use_wsl_psql_transport(monkeypatch):
 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
-def test_ledger_rebuild_sql_executes_on_postgresql():
+def test_ledger_rebuild_sql_executes_on_postgresql(monkeypatch):
     """Smoke rehearsal: migrations round trip, clear COMMITs, verifier runs."""
-    assert pg_rebuild_check.main([]) == 0
+    dsn = os.environ.get("PRODPLAN_PG_CHECK_DSN")
+    if not dsn:
+        assert pg_rebuild_check.main([]) == 0
+        return
+    # Never migrate/clear the supplied database itself. Each run owns a new
+    # database, so a retry cannot reuse a partially migrated fixture.
+    from uuid import uuid4
+    from sqlalchemy import create_engine
+    from sqlalchemy.engine import make_url
+    url = make_url(dsn)
+    assert url.host in {"localhost", "127.0.0.1", "::1"}, "rehearsal tests require a local PostgreSQL server"
+    assert not url.query, "rehearsal tests do not accept connection-query overrides"
+    database = "prodplan_pgcheck_" + uuid4().hex
+    engine = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql(f'CREATE DATABASE "{database}"')
+        try:
+            monkeypatch.setenv("PRODPLAN_PG_CHECK_DSN", url.set(database=database).render_as_string(hide_password=False))
+            assert pg_rebuild_check.main([
+                "--bootstrap-empty", "--allow-destructive-clear",
+                "--expected-generation-key", pg_rebuild_check.SEED_GENERATION_KEY,
+            ]) == 0
+        finally:
+            with engine.connect() as connection:
+                connection.exec_driver_sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        engine.dispose()
