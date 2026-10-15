@@ -26,7 +26,8 @@ jobs:
           tests/services/test_obligation_refresh_validation.py
           tests/services/test_assembly_output_persistence.py
           tests/services/test_mrp_freeze.py
-          tests/services/test_purchase_control_snapshot.py
+          tests/services/test_purchase_control_projection.py
+          tests/services/test_purchase_current_publication.py
 
   backend:
     needs: canon-invariants

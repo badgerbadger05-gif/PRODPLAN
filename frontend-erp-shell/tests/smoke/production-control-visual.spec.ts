@@ -220,7 +220,11 @@ test('launches an existing order with retained MRP work item without recreating 
       published = true
       await route.fulfill({ json: { status: 'ok', issues_created: 1, issues_internal_reserve: 1, issues_other_skipped: 0, parent_orders_export: { orders_created: 1 } } })
     } else if (pathname === `${base}/route-sheets/print`) {
-      expect(request.postDataJSON().expected_source_revision).toBe('rev-8')
+      if (request.method() === 'GET') {
+        expect(new URL(request.url()).searchParams.get('expected_source_revision')).toBe('rev-8')
+      } else {
+        expect(request.postDataJSON()).toMatchObject({ expected_source_revision: 'rev-8', mark_printed: true })
+      }
       await route.fulfill({ contentType: 'text/html', body: '<html><body>Маршрутный лист</body></html>' })
     } else {
       await route.abort('failed')
@@ -235,6 +239,9 @@ test('launches an existing order with retained MRP work item without recreating 
   releaseLaunch?.()
   await expect(page.getByText(/Запуск в 1С: заказов проведено 1/)).toBeVisible()
   await expect(page.getByText(/материал уже на участке/)).toBeVisible()
+  await expect(popup.getByText('Маршрутный лист')).toBeVisible()
+  await expect.poll(() => posts.find(({ path }) => path === `${base}/route-sheets/print`)?.body)
+    .toMatchObject({ expected_source_revision: 'rev-8', mark_printed: true })
   expect(posts.some(({ path }) => path.endsWith('/from-work-items'))).toBe(false)
   expect(posts.find(({ path }) => path === `${base}/material-issues`)?.body.product_ids).toEqual([101])
   expect(posts.find(({ path }) => path.endsWith('/export-to-1c'))?.body.issue_ids).toEqual([1])
@@ -514,9 +521,8 @@ test('unified Produce sends actual quantity and partial intent', async ({ page }
   })
   await page.goto('/#/production-control')
   await page.getByRole('row').filter({ hasText: 'Кронштейн опорный' }).first().getByRole('checkbox').check()
-  // The unified command bar keeps the legacy close action visible but
-  // disabled unless the current row explicitly grants close_1c.
-  await expect(page.getByRole('button', { name: 'Закрыть в 1С', exact: true })).toBeDisabled()
+  // Completion belongs to the unified Produce command.
+  await expect(page.getByRole('button', { name: 'Закрыть в 1С', exact: true })).toHaveCount(0)
   await page.getByRole('button', { name: 'Произвести', exact: true }).click()
   const dialog = page.getByRole('dialog')
   await dialog.getByRole('spinbutton').fill('7')
