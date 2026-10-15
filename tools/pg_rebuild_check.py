@@ -255,7 +255,7 @@ class Psql:
             return ["docker", "exec", "-i", *env, self.container, *psql]
         if self.binary is not None:
             binary = self.binary if program == "psql" else str(Path(self.binary).with_name(program))
-            return [binary, "-h", self.target.host, "-p", str(self.target.port), *psql]
+            return [binary, "-h", self.target.host, "-p", str(self.target.port), *psql[1:]]
         if self.wsl:
             distro = os.getenv("PRODPLAN_PG_CHECK_WSL_DISTRO", "Ubuntu")
             wsl = shutil.which("wsl.exe") or shutil.which("wsl") or "wsl.exe"

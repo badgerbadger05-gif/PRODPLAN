@@ -158,6 +158,20 @@ def test_local_existing_server_can_use_wsl_psql_transport(monkeypatch):
     assert "-p" in command and "55441" in command
 
 
+@pytest.mark.parametrize("program", ["psql", "pg_dump", "pg_restore"])
+def test_native_postgresql_clients_do_not_repeat_the_executable_as_an_argument(program):
+    target = pg_rebuild_check.Target(
+        host="127.0.0.1", port=55441, user="test", password="test", database="test",
+    )
+    binary = str(Path("client-bin") / "psql")
+    client = pg_rebuild_check.Psql(target, image="postgres:15", binary=binary, container=None)
+    command = client._command([], target.database, program=program)
+    assert command[0] == str(Path(binary).with_name(program))
+    assert not {"psql", "pg_dump", "pg_restore"}.intersection(command[1:])
+    assert command[1:5] == ["-h", "127.0.0.1", "-p", "55441"]
+    assert ("ON_ERROR_STOP=1" in command) == (program == "psql")
+
+
 @pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason() or "")
 def test_ledger_rebuild_sql_executes_on_postgresql(monkeypatch):
     """Smoke rehearsal: migrations round trip, clear COMMITs, verifier runs."""
