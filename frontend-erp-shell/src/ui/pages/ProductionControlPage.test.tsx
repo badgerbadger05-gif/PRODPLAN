@@ -1352,6 +1352,47 @@ describe('ProductionControlPage — characterization', () => {
     expect(getOrderMaterials).not.toHaveBeenCalled()
   })
 
+  it('reports a busy publication as not launched and never retries the command automatically', async () => {
+    const proposal = {
+      ...fakeRows()[0],
+      journal_row_key: 'work-item:701',
+      work_item_id: 701,
+      product_id: null,
+      order_id: null,
+      order_number: 'MRP-R-701',
+      order_prodplan_number: 'MRP-R-701',
+      status: 'not_created',
+      available_actions: ['materialize'],
+      materialized_order_qty: 0,
+      launchable_qty: 10,
+    } as OrderRow
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [proposal], total: 1, limit: 100, offset: 0, latest_run_id: 77,
+      truth_meta: fakeTruthMeta,
+    })
+    const message = (
+      'Идёт публикация нового состояния журнала. Запуск не выполнен, '
+      + 'исполнительный заказ не создан. Повторите запуск после обновления журнала.'
+    )
+    vi.mocked(materializeMakeWorkItems).mockRejectedValue(new ApiError(
+      message,
+      409,
+      { code: 'production_ledger_publication_busy', message },
+    ))
+    const user = userEvent.setup()
+    renderPage()
+
+    await user.click(await screen.findByRole('checkbox', { name: /MRP-R-701/ }))
+    await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(message)
+    expect(materializeMakeWorkItems).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(listProductionOrders).mock.calls.length).toBeGreaterThan(1)
+    expect(openPaintWeldChains).not.toHaveBeenCalled()
+    expect(postMaterialIssues).not.toHaveBeenCalled()
+    expect(exportMaterialIssuesTo1C).not.toHaveBeenCalled()
+  })
+
   it.each(['missing_identity', 'missing_revision', 'ambiguous', 'unaccepted'])(
     'stops after materialization when the refreshed owner is %s', async (failure) => {
       const proposal = {

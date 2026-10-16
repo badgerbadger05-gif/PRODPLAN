@@ -1264,6 +1264,140 @@ def _restore_bounded_execution_facts(
         db.flush()
 
 
+def _moved_prefix_execution_transfers(
+    db: Session,
+    target: models.LedgerGeneration,
+    removed_rows: list[models.ProductionPlanExecutionFact],
+    previous_facts: tuple[_OutputFact, ...],
+    new_facts: tuple[_OutputFact, ...],
+) -> list[tuple[models.ProductionPlanExecutionFact, _OutputFact]]:
+    """Match unchanged physical revisions without reallocating their owner.
+
+    A recorder re-pulled into a later physical prefix gets a new SLE id and a
+    supersession edge even when its source content did not change.  The
+    execution fact already owns the accepted quantity in that case.  Restoring
+    it and sending the identical replacement through FIFO assigns the same
+    output a second time against a successor run root whose planned quantity
+    already excludes it.
+
+    Only an explicit supersession path, identical immutable document-line
+    evidence, and equal canonical document-net output qualify.  A changed
+    offset leg can change the net quantity while the positive SLE itself stays
+    byte-identical; that remains a genuine correction and follows the normal
+    restore-and-reallocate path.  A changed hash, recorder identity, item,
+    branch, or missing edge does the same.
+    """
+
+    if not removed_rows or not new_facts:
+        return []
+    if target.physical_import_batch_id is None:
+        raise ValueError("bounded assembly output transfer requires target boundary")
+
+    removed_by_sle: dict[int, list[models.ProductionPlanExecutionFact]] = {}
+    for row in removed_rows:
+        removed_by_sle.setdefault(int(row.stock_ledger_entry_id), []).append(row)
+    previous_by_id = _facts_by_sle(previous_facts)
+    new_by_id = {int(fact.stock_ledger_entry_id): fact for fact in new_facts}
+    origins_by_node: dict[int, set[int]] = {
+        sle_id: {sle_id} for sle_id in removed_by_sle
+    }
+    visited: set[tuple[int, int]] = {
+        (sle_id, sle_id) for sle_id in removed_by_sle
+    }
+    frontier = set(removed_by_sle)
+    reachable_new: dict[int, set[int]] = {
+        sle_id: set() for sle_id in removed_by_sle
+    }
+    boundary = int(target.physical_import_batch_id)
+    while frontier:
+        edges = (
+            db.query(models.StockLedgerFactSupersession)
+            .filter(
+                models.StockLedgerFactSupersession.old_sle_id.in_(sorted(frontier)),
+                models.StockLedgerFactSupersession.import_batch_id <= boundary,
+            )
+            .order_by(
+                models.StockLedgerFactSupersession.import_batch_id.asc(),
+                models.StockLedgerFactSupersession.id.asc(),
+            )
+            .all()
+        )
+        next_frontier: set[int] = set()
+        for edge in edges:
+            old_id = int(edge.old_sle_id)
+            if edge.new_sle_id is None:
+                continue
+            new_id = int(edge.new_sle_id)
+            propagated = origins_by_node.get(old_id, set())
+            if not propagated:
+                continue
+            origins_by_node.setdefault(new_id, set()).update(propagated)
+            for origin in propagated:
+                if new_id in new_by_id:
+                    reachable_new[origin].add(new_id)
+                marker = (origin, new_id)
+                if marker not in visited:
+                    visited.add(marker)
+                    next_frontier.add(new_id)
+        frontier = next_frontier
+
+    transfers: list[tuple[models.ProductionPlanExecutionFact, _OutputFact]] = []
+    claimed_pairs: set[tuple[int, int]] = set()
+    transferred_qty_by_sle: dict[int, Decimal] = {}
+    for old_id, rows in removed_by_sle.items():
+        candidates = reachable_new.get(old_id, set())
+        if len(candidates) != 1:
+            continue
+        fact = new_by_id[next(iter(candidates))]
+        old = previous_by_id.get(old_id)
+        if old is None:
+            continue
+        if (
+            not old.source_content_hash
+            or old.source_content_hash != fact.source_content_hash
+            or int(old.item_id) != int(fact.item_id)
+            or old.recorder_type != fact.recorder_type
+            or old.recorder_ref != fact.recorder_ref
+            or old.line_no != fact.line_no
+            or _comparable_datetime(old.posting_at)
+            != _comparable_datetime(fact.posting_at)
+            or _dec(old.qty) != _dec(fact.qty)
+        ):
+            continue
+        for row in rows:
+            pair = (int(fact.stock_ledger_entry_id), int(row.plan_line_id))
+            if pair in claimed_pairs:
+                raise ValueError(
+                    "bounded assembly output moved-prefix transfer is ambiguous"
+                )
+            claimed_pairs.add(pair)
+            transferred_qty_by_sle[pair[0]] = (
+                transferred_qty_by_sle.get(pair[0], Decimal("0"))
+                + _dec(row.allocated_qty)
+            )
+            transfers.append((row, fact))
+    if any(
+        qty > _dec(new_by_id[sle_id].qty)
+        for sle_id, qty in transferred_qty_by_sle.items()
+    ):
+        raise ValueError(
+            "bounded assembly output moved-prefix transfer exceeds physical fact"
+        )
+    return transfers
+
+
+def _apply_moved_prefix_execution_transfers(
+    db: Session,
+    transfers: list[tuple[models.ProductionPlanExecutionFact, _OutputFact]],
+) -> None:
+    """Move stable execution identity to the unchanged replacement SLE."""
+
+    for row, fact in transfers:
+        row.stock_ledger_entry_id = int(fact.stock_ledger_entry_id)
+    if transfers:
+        db.flush()
+
+
 def _persist_bounded_owner_rows(
     db: Session,
     target: models.LedgerGeneration,
@@ -1309,7 +1443,13 @@ def _persist_bounded_owner_rows(
             )
         qty = _dec(alloc["allocated_qty"])
         if qty <= 0 or qty > _dec(line.remaining_output_qty) or qty > _dec(root.remaining_qty):
-            raise ValueError("bounded assembly output exceeds current owner remainder")
+            raise ValueError(
+                "bounded assembly output exceeds current owner remainder "
+                f"(sle_id={sle_id}, run_id={run_id}, plan_line_id={plan_line_id}, "
+                f"qty={_qty_text(qty)}, "
+                f"line_remaining={_qty_text(line.remaining_output_qty)}, "
+                f"root_remaining={_qty_text(root.remaining_qty)})"
+            )
         db.add(
             models.ProductionPlanExecutionFact(
                 stock_ledger_entry_id=sle_id,
@@ -1416,11 +1556,46 @@ def apply_bounded_assembly_output_plan_execution(
         if int(fact.stock_ledger_entry_id) not in existing_fact_ids
     )
 
+    previous_facts = (
+        _bounded_visible_facts(
+            db,
+            parent,
+            ordered_scopes,
+            earliest_posting_at=earliest_posting_at,
+        )
+        if removed_existing and new_facts
+        else ()
+    )
+    moved_prefix_transfers = _moved_prefix_execution_transfers(
+        db, target, removed_existing, previous_facts, new_facts
+    )
+    if moved_prefix_transfers:
+        _apply_moved_prefix_execution_transfers(db, moved_prefix_transfers)
+        transferred_row_ids = {
+            int(row.id) for row, _fact in moved_prefix_transfers
+        }
+        transferred_sle_ids = {
+            int(fact.stock_ledger_entry_id) for _row, fact in moved_prefix_transfers
+        }
+        transferred_rows = [
+            row for row, _fact in moved_prefix_transfers
+        ]
+        removed_existing = [
+            row for row in removed_existing if int(row.id) not in transferred_row_ids
+        ]
+        retained_existing.extend(transferred_rows)
+        new_facts = tuple(
+            fact for fact in new_facts
+            if int(fact.stock_ledger_entry_id) not in transferred_sle_ids
+        )
+    else:
+        transferred_sle_ids = set()
+
     # A physical refresh with no bounded semantic diff is a true no-op even
     # when the stable line has execution facts under several historical roots.
     # Do not collapse that lineage into one owner merely to recompute a
     # checksum: unchanged rows must remain byte-stable and incur no DML.
-    if not removed_existing and not new_facts:
+    if not removed_existing and not new_facts and not moved_prefix_transfers:
         return BoundedAssemblyOutputResult(
             target_generation_id=int(target.id),
             parent_generation_id=int(parent.id),
@@ -1437,6 +1612,7 @@ def apply_bounded_assembly_output_plan_execution(
                 "affected_scopes": len(ordered_scopes),
                 "bounded_fact_rows": len(facts),
                 "replayed_fact_rows": 0,
+                "moved_prefix_transfers": 0,
                 "source_revision": _text(source_revision),
             },
             idempotent=True,
@@ -1502,7 +1678,10 @@ def apply_bounded_assembly_output_plan_execution(
             **metrics,
             "affected_scopes": len(ordered_scopes),
             "bounded_fact_rows": len(facts),
-            "replayed_fact_rows": len(new_facts) + len(removed_existing),
+            "replayed_fact_rows": (
+                len(new_facts) + len(removed_existing) + len(transferred_sle_ids)
+            ),
+            "moved_prefix_transfers": len(transferred_sle_ids),
             "source_revision": _text(source_revision),
         },
         idempotent=False,

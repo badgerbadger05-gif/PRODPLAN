@@ -727,6 +727,299 @@ def test_bounded_output_correction_restores_scope_before_reallocation(db_session
     assert Decimal(str(line.remaining_output_qty)) == Decimal("1")
 
 
+def test_bounded_output_moved_prefix_preserves_execution_owner(db_session):
+    """An unchanged SLE revision must not consume the successor root twice."""
+
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-prefix-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-prefix-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED-PREFIX")
+    plan, old_run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("10"),
+    )
+    old_run.status = "CLOSED"
+    old_root = (
+        db_session.query(models.MrpRunRoot)
+        .filter_by(run_id=int(old_run.run_id), plan_line_id=int(line.id))
+        .one()
+    )
+    old_root.accepted_qty = Decimal("4")
+    old_root.remaining_qty = Decimal("6")
+    line.accepted_output_qty = Decimal("4")
+    line.remaining_output_qty = Decimal("6")
+
+    current_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=int(parent.id),
+        ledger_cutoff=parent.cutoff,
+        active_freeze_version=1,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+    db_session.add(current_run)
+    db_session.flush()
+    current_root = models.MrpRunRoot(
+        run_id=int(current_run.run_id),
+        plan_line_id=int(line.id),
+        planned_qty=Decimal("6"),
+        accepted_qty=Decimal("0"),
+        remaining_qty=Decimal("6"),
+    )
+    db_session.add(current_root)
+    line.locked_by_run_id = int(current_run.run_id)
+
+    old = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="8",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-prefix-moved",
+        content_hash="m" * 64,
+        line_no="3",
+    )
+    old_offset = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="-4",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-prefix-moved",
+        movement_kind="assembly_out",
+        content_hash="o" * 64,
+        line_no="4",
+    )
+    existing = models.ProductionPlanExecutionFact(
+        stock_ledger_entry_id=int(old.id),
+        plan_id=int(plan.id),
+        plan_line_id=int(line.id),
+        run_id=int(old_run.run_id),
+        allocated_qty=Decimal("4"),
+        match_rule="fifo",
+        accepted_at=cutoff,
+    )
+    db_session.add(existing)
+    db_session.flush()
+    existing_id = int(existing.id)
+
+    old.active = False
+    old_offset.active = False
+    replacement = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="8",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-prefix-moved",
+        content_hash="m" * 64,
+        line_no="3",
+    )
+    replacement_offset = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="-4",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-prefix-moved",
+        movement_kind="assembly_out",
+        content_hash="o" * 64,
+        line_no="4",
+    )
+    genuinely_new = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="5",
+        at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        recorder="bounded-prefix-new",
+        content_hash="n" * 64,
+        line_no="3",
+    )
+    db_session.add(
+        models.StockLedgerFactSupersession(
+            old_sle_id=int(old.id),
+            new_sle_id=int(replacement.id),
+            import_batch_id=int(target.physical_import_batch.id),
+        )
+    )
+    db_session.add(
+        models.StockLedgerFactSupersession(
+            old_sle_id=int(old_offset.id),
+            new_sle_id=int(replacement_offset.id),
+            import_batch_id=int(target.physical_import_batch.id),
+        )
+    )
+    db_session.flush()
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[
+            int(old.id),
+            int(old_offset.id),
+            int(replacement.id),
+            int(replacement_offset.id),
+            int(genuinely_new.id),
+        ],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="moved-prefix",
+    )
+
+    facts = (
+        db_session.query(models.ProductionPlanExecutionFact)
+        .order_by(models.ProductionPlanExecutionFact.stock_ledger_entry_id)
+        .all()
+    )
+    assert [
+        (
+            int(row.stock_ledger_entry_id),
+            int(row.run_id),
+            Decimal(str(row.allocated_qty)),
+        )
+        for row in facts
+    ] == [
+        (int(replacement.id), int(old_run.run_id), Decimal("4")),
+        (int(genuinely_new.id), int(current_run.run_id), Decimal("5")),
+    ]
+    assert int(facts[0].id) == existing_id
+    assert result.metrics["replayed_fact_rows"] == 2
+    assert result.metrics["moved_prefix_transfers"] == 1
+    assert old_root.accepted_qty == Decimal("4")
+    assert old_root.remaining_qty == Decimal("6")
+    assert current_root.accepted_qty == Decimal("5")
+    assert current_root.remaining_qty == Decimal("1")
+    assert line.accepted_output_qty == Decimal("9")
+    assert line.remaining_output_qty == Decimal("1")
+
+    repeated = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[
+            int(replacement.id),
+            int(replacement_offset.id),
+            int(genuinely_new.id),
+        ],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="moved-prefix-retry",
+    )
+    assert repeated.idempotent is True
+    assert db_session.query(models.ProductionPlanExecutionFact).count() == 2
+
+
+def test_bounded_output_changed_offset_reallocates_same_positive_revision(db_session):
+    """Equal positive-row evidence is insufficient when document net changed."""
+
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    parent = _accepted_parent(db_session, key="bounded-net-parent", cutoff=cutoff)
+    target = _building_generation(db_session, key="bounded-net-target", cutoff=cutoff)
+    item = _item(db_session, "ASM-BOUNDED-NET-CHANGE")
+    plan, run, line = _plan_with_run(
+        db_session,
+        generation=parent,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("10"),
+    )
+    root = (
+        db_session.query(models.MrpRunRoot)
+        .filter_by(run_id=int(run.run_id), plan_line_id=int(line.id))
+        .one()
+    )
+    root.accepted_qty = Decimal("4")
+    root.remaining_qty = Decimal("6")
+    line.accepted_output_qty = Decimal("4")
+    line.remaining_output_qty = Decimal("6")
+
+    old = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="8",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-net-change",
+        content_hash="p" * 64,
+        line_no="3",
+    )
+    old_offset = _sline(
+        db_session,
+        batch=parent.physical_import_batch,
+        item=item,
+        qty="-4",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-net-change",
+        movement_kind="assembly_out",
+        content_hash="x" * 64,
+        line_no="4",
+    )
+    db_session.add(
+        models.ProductionPlanExecutionFact(
+            stock_ledger_entry_id=int(old.id),
+            plan_id=int(plan.id),
+            plan_line_id=int(line.id),
+            run_id=int(run.run_id),
+            allocated_qty=Decimal("4"),
+            match_rule="fifo",
+            accepted_at=cutoff,
+        )
+    )
+
+    old.active = False
+    old_offset.active = False
+    replacement = _sline(
+        db_session,
+        batch=target.physical_import_batch,
+        item=item,
+        qty="8",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="bounded-net-change",
+        content_hash="p" * 64,
+        line_no="3",
+    )
+    db_session.add_all(
+        [
+            models.StockLedgerFactSupersession(
+                old_sle_id=int(old.id),
+                new_sle_id=int(replacement.id),
+                import_batch_id=int(target.physical_import_batch.id),
+            ),
+            models.StockLedgerFactSupersession(
+                old_sle_id=int(old_offset.id),
+                new_sle_id=None,
+                import_batch_id=int(target.physical_import_batch.id),
+            ),
+        ]
+    )
+    db_session.flush()
+
+    result = apply_bounded_assembly_output_plan_execution(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        affected_sle_ids=[int(old.id), int(old_offset.id), int(replacement.id)],
+        earliest_posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        source_revision="net-change",
+    )
+
+    fact = db_session.query(models.ProductionPlanExecutionFact).one()
+    assert int(fact.stock_ledger_entry_id) == int(replacement.id)
+    assert Decimal(str(fact.allocated_qty)) == Decimal("8")
+    assert result.metrics["moved_prefix_transfers"] == 0
+    assert result.metrics["allocated_qty"] == "8"
+    assert line.accepted_output_qty == Decimal("8")
+    assert line.remaining_output_qty == Decimal("2")
+    assert root.accepted_qty == Decimal("8")
+    assert root.remaining_qty == Decimal("2")
+
+
 def test_fifo_across_two_live_fixed_plans(db_session):
     cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
     generation = _building_generation(db_session, key="fifo", cutoff=cutoff)
