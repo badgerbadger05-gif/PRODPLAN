@@ -1190,32 +1190,33 @@ def _require_current_execution_manifest(
     entity_kind: str,
     scope_key: str,
 ) -> models.CurrentExecutionScope:
-    """Validate only the manifest under its publication boundary.
+    """Validate only the manifest under one coherent publication boundary.
 
-    The manifest is the publication lock.  A publisher locks it before
-    replacing current rows, so this reader either locks the old complete
-    scope or waits for the new complete scope; it cannot observe a manifest
-    from one publication and rows from another.  The separate row query also
-    preserves a valid empty scope, which is distinct from a missing/not-ready
-    manifest.
+    Mutation-capable and ordinary callers use the manifest as a publication
+    lock.  Explicit pure production GETs instead run the whole request inside
+    a PostgreSQL REPEATABLE READ, READ ONLY transaction and omit the row lock;
+    their transaction snapshot provides the same whole old-or-new boundary.
+    The separate row query also preserves a valid empty scope, which is
+    distinct from a missing/not-ready manifest.
     """
     scope_model = models.CurrentExecutionScope
-    # Lock the manifest in its own statement.  At READ COMMITTED PostgreSQL
+    # At READ COMMITTED, lock the manifest in its own statement.  PostgreSQL
     # rechecks a row after waiting for the publisher, while an outer-join
     # statement can retain its pre-wait snapshot for the nullable rows and
     # return a new manifest with old rows.  The second statement therefore
     # starts only after the publication lock is acquired and sees one whole
     # committed version.  A row-share lock is sufficient and avoids locking
-    # the nullable side of an outer join.
-    manifest = (
-        db.query(scope_model)
-        .filter(
-            scope_model.entity_kind == str(entity_kind),
-            scope_model.scope_key == str(scope_key),
-        )
-        .with_for_update(read=True, of=scope_model)
-        .one_or_none()
+    # the nullable side of an outer join.  The explicitly marked read-only
+    # route uses one REPEATABLE READ snapshot across this and every later
+    # pointer, row and overlay query, so taking FOR SHARE would only delay it.
+    manifest_query = db.query(scope_model).filter(
+        scope_model.entity_kind == str(entity_kind),
+        scope_model.scope_key == str(scope_key),
     )
+    from app.database import PRODUCTION_READ_SNAPSHOT_INFO_KEY
+    if not bool(getattr(db, "info", {}).get(PRODUCTION_READ_SNAPSHOT_INFO_KEY)):
+        manifest_query = manifest_query.with_for_update(read=True, of=scope_model)
+    manifest = manifest_query.one_or_none()
     if manifest is None:
         raise CurrentExecutionUnavailable("current execution manifest is missing")
     if not bool(manifest.result_ready):

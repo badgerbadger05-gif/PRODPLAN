@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..services import planning_truth
 from ..routers.truth_meta import TruthMeta, build_truth_meta
-from ..database import get_db
+from ..database import get_db, production_read_snapshot
 from ..models import Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
 from ..services.bom_specification_resolver import BomSpecificationResolver
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
@@ -92,6 +92,12 @@ from .production_control_settings import router as settings_router
 
 
 router = APIRouter(prefix="/v1/production-control", tags=["production-control"])
+
+
+def get_production_read_db(db: Session = Depends(get_db)):
+    """Reuse the request Session while marking one pure GET as a read snapshot."""
+    with production_read_snapshot(db):
+        yield db
 
 
 def _route_sheet_member_ids(payloads: List[dict]) -> List[int]:
@@ -1730,7 +1736,7 @@ def get_orders_journal(
     limit: int = 100,
     offset: int = 0,
     current_identity: Optional[str] = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_production_read_db),
 ):
     try:
         truth = planning_truth.require_accepted_truth(db, "production_control.orders")
@@ -1938,7 +1944,7 @@ def delete_local_order(
 @router.get("/orders/{product_id}/materials", response_model=ProductionMaterialsResponse)
 def get_order_line_materials(
     product_id: int,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_production_read_db),
 ):
     try:
         return get_materials_snapshot(db, int(product_id))
@@ -1977,7 +1983,7 @@ def get_work_item_materials(
     ledger_generation_id: Optional[int] = Query(default=None, gt=0),
     current_identity: Optional[str] = None,
     expected_source_revision: Optional[str] = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_production_read_db),
 ):
     """Read persisted current coverage for an MRP row without replaying BOM."""
     try:
