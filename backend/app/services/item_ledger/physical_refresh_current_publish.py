@@ -49,6 +49,7 @@ from app.services.item_ledger.future_supply_capture import (
     publish_current_future_supply,
     replace_future_supply_capture,
 )
+from app.services.item_ledger.live_plan_scope import sealed_lineage_read_batch
 from app.services.item_ledger.physical_refresh_provenance import (
     apply_bounded_current_material_custody_events,
     handoff_current_physical_refresh_provenance,
@@ -1419,13 +1420,14 @@ def _build_obligation_view_payloads(
     operator invalidation are still enforced; only the clock is ignored, and
     only inside a publication.
     """
-    mrp_payloads = {
-        str(run_id): build_mrp_result_current_payload(db, int(run_id))
-        for run_id in sorted({int(value) for value in run_ids})
-    }
-    period_payloads = build_period_plan_execution_current_payloads(
-        db, generation_id=int(generation_id), run_ids=run_ids,
-    )
+    with sealed_lineage_read_batch(db):
+        mrp_payloads = {
+            str(run_id): build_mrp_result_current_payload(db, int(run_id))
+            for run_id in sorted({int(value) for value in run_ids})
+        }
+        period_payloads = build_period_plan_execution_current_payloads(
+            db, generation_id=int(generation_id), run_ids=run_ids,
+        )
     return mrp_payloads, period_payloads
 
 

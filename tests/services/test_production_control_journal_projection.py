@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import event
 
 from app import models
 from app.routers.production_control import get_orders_journal
@@ -881,11 +882,32 @@ def test_bulk_make_material_snapshots_match_scalar_and_load_custody_once(
         "load_material_custody_projection",
         tracked_loader,
     )
-    bulk = material_availability.preview_make_work_items_materials_bulk(
-        db_session,
-        inputs,
-        ledger_generation_id=int(generation.id),
+    monkeypatch.setattr(
+        material_availability,
+        "_unit_display",
+        lambda *args, **kwargs: pytest.fail(
+            "bulk material preview must use its preloaded unit map"
+        ),
     )
+    unit_queries = 0
+
+    def count_unit_queries(
+        _conn, _cursor, statement, _parameters, _context, _executemany,
+    ):
+        nonlocal unit_queries
+        if "FROM units" in statement:
+            unit_queries += 1
+
+    bind = db_session.get_bind()
+    event.listen(bind, "before_cursor_execute", count_unit_queries)
+    try:
+        bulk = material_availability.preview_make_work_items_materials_bulk(
+            db_session,
+            inputs,
+            ledger_generation_id=int(generation.id),
+        )
+    finally:
+        event.remove(bind, "before_cursor_execute", count_unit_queries)
 
     assert bulk == scalar
     assert bulk[work_a.id]["line_quantity"] == 3.0
@@ -893,6 +915,98 @@ def test_bulk_make_material_snapshots_match_scalar_and_load_custody_once(
     assert bulk[work_a.id]["work_item_id"] == work_a.id
     assert bulk[work_a.id]["product_id"] is None
     assert custody_loads == 1
+    assert unit_queries == 1
+
+
+def test_bulk_make_material_snapshot_preserves_negative_synthetic_product_identity(
+    db_session,
+):
+    generation = _building_generation(db_session, "production-journal-negative-bulk")
+    run, work = _make_proposal(db_session, generation, "-negative-bulk")
+    reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+    spec_id = int(
+        db_session.query(models.DefaultSpecification.spec_id)
+        .filter_by(item_id=int(work.item_id))
+        .scalar()
+    )
+    component_id = int(
+        db_session.query(models.SpecComponent.item_id)
+        .filter_by(spec_id=spec_id)
+        .scalar()
+    )
+    # The old scalar compact path passed ``-reservation.id`` as work_item_id,
+    # which creates a virtual product with ``+reservation.id``. Model the
+    # collision explicitly: custody held by that positive product must remain
+    # this preview's own custody, rather than becoming a competing hold.
+    order = models.ProductionOrder(
+        order_number="SYNTHETIC-COLLISION",
+        order_date=generation.cutoff,
+        source="1c",
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add_all([
+        models.ProductionProduct(
+            product_id=int(reservation.id),
+            order_id=int(order.order_id),
+            item_id=int(work.item_id),
+            line_number=1,
+            quantity=1,
+            produced_qty=0,
+            remaining_qty=1,
+        ),
+        models.StockBin(
+            ledger_generation_id=int(generation.id),
+            item_id=component_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH",
+            on_hand=10,
+            is_current=False,
+        ),
+        models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=int(generation.id),
+            product_id=int(reservation.id),
+            component_item_id=component_id,
+            location_kind="workshop",
+            warehouse_ref1c="WH",
+            reserved_qty=7,
+            source_event_high_watermark_id=0,
+            is_current=False,
+        ),
+    ])
+    db_session.flush()
+    preview_input = {
+        "work_item_id": -int(reservation.id),
+        "item_id": int(work.item_id),
+        "quantity": 10.0,
+        "spec_id": spec_id,
+        "order_number": f"MRP-R-{int(work.requirement_id)}",
+        "run_id": int(run.run_id),
+    }
+    scalar = material_availability.preview_make_work_item_materials(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        **preview_input,
+    )
+    with pytest.raises(ValueError, match="положительный"):
+        material_availability.preview_make_work_items_materials_bulk(
+            db_session,
+            [preview_input],
+            ledger_generation_id=int(generation.id),
+        )
+    bulk = material_availability.preview_make_work_items_materials_bulk(
+        db_session,
+        [preview_input],
+        ledger_generation_id=int(generation.id),
+        _allow_synthetic_ids=True,
+    )
+
+    assert bulk[-int(reservation.id)] == scalar
+    component = scalar["components"][0]
+    assert component["reserved_for_order_qty"] == 7
+    assert component["missing_qty"] == 3
 
 
 def test_candidate_builder_loads_custody_per_bulk_phase_not_per_make_row(
@@ -983,6 +1097,80 @@ def test_compact_current_production_control_payload_uses_stable_reservation_not_
     assert db_session.query(models.ReplenishmentWorkItem).count() == 0
 
 
+def test_compact_current_make_snapshots_use_one_detailed_bulk_preview(
+    db_session, monkeypatch,
+):
+    parent = _building_generation(db_session, "production-journal-compact-detail-bulk-parent")
+    parent.status = "accepted"
+    parent.accepted_at = parent.cutoff
+    parent.capabilities = dict(CAPABILITIES)
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=parent.id))
+    run_a, work_a = _make_proposal(db_session, parent, "-detail-a")
+    run_b, work_b = _make_proposal(db_session, parent, "-detail-b")
+    reservations = []
+    for work in (work_a, work_b):
+        reservation = db_session.get(models.ReservationEntry, int(work.reservation_id))
+        reservation.owner_kind = "current"
+        reservation.is_current = True
+        reservation.current_identity = (
+            f"reservation:req:{reservation.requirement_id}:mode:make"
+        )
+        reservations.append(reservation)
+        db_session.delete(work)
+    target = _building_generation(db_session, "production-journal-compact-detail-bulk-target")
+    db_session.flush()
+
+    calls = []
+
+    def preview_bulk(_db, rows, **kwargs):
+        calls.append((tuple(dict(row) for row in rows), dict(kwargs)))
+        return {
+            int(row["work_item_id"]): {
+                "work_item_id": int(row["work_item_id"]),
+                "coverage_status": "ready",
+                "components": [],
+            }
+            for row in rows
+        }
+
+    monkeypatch.setattr(
+        material_availability,
+        "preview_make_work_items_materials_bulk",
+        preview_bulk,
+    )
+    monkeypatch.setattr(
+        material_availability,
+        "preview_make_work_item_materials",
+        lambda *args, **kwargs: pytest.fail(
+            "compact current builder must not preview MAKE snapshots per row"
+        ),
+    )
+
+    payload = build_compact_current_production_control_payload(
+        db_session,
+        target_generation_id=int(target.id),
+        parent_generation_id=int(parent.id),
+        assembly_payload={"queue_rows": []},
+        drum_payload={"rows": []},
+        shelf_payload={"rows": []},
+        accepted_run_ids=[int(run_a.run_id), int(run_b.run_id)],
+    )
+
+    assert len(calls) == 1
+    preview_rows, preview_kwargs = calls[0]
+    assert {int(row["work_item_id"]) for row in preview_rows} == {
+        -int(reservation.id) for reservation in reservations
+    }
+    assert preview_kwargs == {
+        "ledger_generation_id": int(parent.id),
+        "_current_only": True,
+        "_allow_synthetic_ids": True,
+    }
+    proposal_rows = [row for row in payload["rows"] if row.get("product_id") is None]
+    assert len(proposal_rows) == 2
+    assert all("work_item_id" not in row["material_coverage_snapshot"] for row in proposal_rows)
+
+
 def test_compact_make_proposal_keeps_only_its_row_root_membership(db_session):
     parent = _building_generation(db_session, "production-journal-compact-row-roots-parent")
     parent.status = "accepted"
@@ -1052,8 +1240,8 @@ def test_compact_make_proposal_carries_and_reuses_its_material_snapshot(
     """Item 28d: the bounded path publishes the proposal snapshot the
     work-item materials reader serves, previewing only what it cannot reuse.
 
-    Coverage scalars still come from one bulk fold; the per-proposal preview
-    runs for a proposal without a reusable parent snapshot, and an untouched
+    Coverage scalars and detailed snapshots both use one bulk fold. A proposal
+    without a reusable parent snapshot joins that batch, and an untouched
     proposal of the same quantity reuses its parent row with zero change rows.
     """
     from app.services.item_ledger.current_execution import (
@@ -1076,21 +1264,25 @@ def test_compact_make_proposal_carries_and_reuses_its_material_snapshot(
 
     previews = []
 
-    def preview(db, *, work_item_id, item_id, quantity, spec_id, **kwargs):
-        previews.append(int(item_id))
-        # The real preview goes through ``public_materials_payload``, which
-        # drops ``line_quantity``: reuse must not depend on it.
-        return {
-            "work_item_id": int(work_item_id),
-            "coverage_status": "shortage",
-            "components": [{
-                "component_item_id": 555001, "required_qty": str(quantity),
-            }],
-        }
+    def preview_bulk(db, rows, **kwargs):
+        result = {}
+        for preview in rows:
+            previews.append(int(preview["item_id"]))
+            # The real preview goes through ``public_materials_payload``, which
+            # drops ``line_quantity``: reuse must not depend on it.
+            result[int(preview["work_item_id"])] = {
+                "work_item_id": int(preview["work_item_id"]),
+                "coverage_status": "shortage",
+                "components": [{
+                    "component_item_id": 555001,
+                    "required_qty": str(preview["quantity"]),
+                }],
+            }
+        return result
 
     monkeypatch.setattr(
-        "app.services.production_control_material_availability.preview_make_work_item_materials",
-        preview,
+        "app.services.production_control_material_availability.preview_make_work_items_materials_bulk",
+        preview_bulk,
     )
 
     def build(affected_item_ids=None):

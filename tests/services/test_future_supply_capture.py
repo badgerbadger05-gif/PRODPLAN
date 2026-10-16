@@ -667,6 +667,41 @@ def test_capture_hash_is_sealed_from_persisted_numeric_scale(db_session):
     assert verify_future_supply_capture(db_session, generation.id)["rows"] == 1
 
 
+def test_capture_reads_persisted_values_in_constant_query_budget(db_session):
+    from sqlalchemy import event
+
+    generation, batch, item = _context(db_session, suffix="bulk-persisted-values")
+    rows = [
+        _evidence(
+            generation, item, ref=f"bulk-{index}",
+            status="exact" if index % 2 else "ambiguous",
+            ordered="10.12345", realized="4.00004",
+        )
+        for index in range(128)
+    ]
+    reads = []
+
+    def track_reads(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT") and "ledger_future_supply" in statement:
+            reads.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", track_reads)
+    try:
+        metrics = replace_future_supply_capture(db_session, generation.id, batch.id, rows)
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", track_reads)
+
+    # Verification must use the database's scale=3 representation, including
+    # rejected evidence, without one primary-key refresh per captured row.
+    assert len(reads) <= 4
+    assert metrics["rows"] == 128
+    assert metrics["exact_rows"] == 64
+    batch.status = "completed"
+    batch.completed_at = generation.cutoff
+    db_session.flush()
+    assert verify_future_supply_capture(db_session, generation.id)["rows"] == 128
+
+
 def test_verify_future_supply_capture_missing_batch_is_rejected(db_session):
     generation, batch, _ = _captured_batch(db_session, rows=[], status="completed")
     db_session.delete(batch)

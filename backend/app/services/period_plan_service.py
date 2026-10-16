@@ -3861,6 +3861,7 @@ def build_period_plan_execution_payload(
     flow: Optional[str] = None,
     generation_id: Optional[int] = None,
     allow_building: bool = False,
+    _descendants_by_root: Mapping[int, Iterable[int]] | None = None,
 ) -> Dict[str, Any]:
     """Build one direct Ledger-native plan/run execution payload."""
     from .planning_truth import get_truth_state
@@ -3915,7 +3916,19 @@ def build_period_plan_execution_payload(
             .all()
         )
     })
-    descendants_by_root = _bom_descendants_by_item(db, root_item_ids)
+    if _descendants_by_root is None:
+        descendants_by_root = _bom_descendants_by_item(db, root_item_ids)
+    else:
+        missing_roots = sorted(set(root_item_ids) - set(_descendants_by_root))
+        if missing_roots:
+            raise ValueError(
+                "precomputed execution BOM descendants are incomplete for roots "
+                + ", ".join(str(root_id) for root_id in missing_roots)
+            )
+        descendants_by_root = {
+            int(root_id): {int(item_id) for item_id in _descendants_by_root[root_id]}
+            for root_id in root_item_ids
+        }
     roots_by_item: Dict[int, List[int]] = {}
     for root_id, descendant_ids in descendants_by_root.items():
         for item_id in descendant_ids:
@@ -3971,6 +3984,7 @@ def build_period_plan_execution_current_payload(
     *,
     run_id: int,
     generation_id: int,
+    _descendants_by_root: Mapping[int, Iterable[int]] | None = None,
 ) -> Dict[str, Any]:
     """Build one direct period execution payload for current publication.
 
@@ -3992,6 +4006,7 @@ def build_period_plan_execution_current_payload(
             run_id=int(run.run_id),
             generation_id=evidence_generation_id,
             allow_building=True,
+            _descendants_by_root=_descendants_by_root,
         )
     except ValueError as exc:
         if "persisted MRP roots" not in str(exc):
@@ -4045,6 +4060,22 @@ def build_period_plan_execution_current_payloads_for_generation(
     )
     if {int(run.run_id) for run in runs} != set(required_ids):
         raise ValueError("current period payload live run set is incomplete")
+    plan_ids = sorted({
+        int(run.source_plan_id)
+        for run in runs
+        if run.source_plan_id is not None
+    })
+    roots_by_plan: Dict[int, Set[int]] = {}
+    if plan_ids:
+        for plan_id, item_id in db.query(
+            ProductionPlanLine.plan_id,
+            ProductionPlanLine.item_id,
+        ).filter(ProductionPlanLine.plan_id.in_(plan_ids)).all():
+            roots_by_plan.setdefault(int(plan_id), set()).add(int(item_id))
+    all_roots = sorted({
+        root_id for roots in roots_by_plan.values() for root_id in roots
+    })
+    descendants_by_root = _bom_descendants_by_item(db, all_roots)
     result: Dict[str, Dict[str, Any]] = {}
     for run in runs:
         if run.source_plan_id is None:
@@ -4054,6 +4085,11 @@ def build_period_plan_execution_current_payloads_for_generation(
             int(run.source_plan_id),
             run_id=int(run.run_id),
             generation_id=int(generation.id),
+            _descendants_by_root={
+                root_id: descendants_by_root[root_id]
+                for root_id in roots_by_plan.get(int(run.source_plan_id), set())
+                if root_id in descendants_by_root
+            },
         )
         result[str(payload["current_scope_key"])] = payload
     if set(result) != {

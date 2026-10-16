@@ -28,12 +28,34 @@ fact-only fork.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app import models
 from .r3_contract import CurrentMrpResolutionError, current_live_run
+
+
+_LINEAGE_READ_BATCH: ContextVar[tuple[Session, dict] | None] = ContextVar(
+    "sealed_lineage_read_batch", default=None,
+)
+
+
+@contextmanager
+def sealed_lineage_read_batch(db: Session):
+    """Share validated immutable ancestry inside one read-only builder batch.
+
+    This is a request-local proof cache, never a current-plan owner. Callers
+    must not mutate sealed ancestry in the batch. BUILDING roots are never
+    cached, and leaving the batch (also on failure) drops every cached proof.
+    """
+    token = _LINEAGE_READ_BATCH.set((db, {}))
+    try:
+        yield
+    finally:
+        _LINEAGE_READ_BATCH.reset(token)
 
 
 def _same_instant(left: datetime | None, right: datetime | None) -> bool:
@@ -80,6 +102,15 @@ def sealed_generation_lineage_ids(
     missing or cyclic link is a broken Ledger, so it fails closed instead of
     silently truncating the inherited scope.
     """
+    batch = _LINEAGE_READ_BATCH.get()
+    cache = batch[1] if batch is not None and batch[0] is db else None
+    cache_key = (
+        int(generation.id),
+        str(dict(generation.source_watermarks or {}).get("parent_generation_id")),
+    )
+    immutable = str(getattr(generation, "status", "")) == "accepted"
+    if immutable and cache is not None and cache_key in cache:
+        return cache[cache_key]
     lineage: list[int] = []
     seen: set[int] = set()
     current: models.LedgerGeneration | None = generation
@@ -106,7 +137,10 @@ def sealed_generation_lineage_ids(
                 f"ledger generation {current_id} lost its sealed parent {parent_id}"
             )
         current = parent
-    return tuple(lineage)
+    result = tuple(lineage)
+    if immutable and cache is not None:
+        cache[cache_key] = result
+    return result
 
 
 class RunAnchorError(ValueError):

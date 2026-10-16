@@ -290,7 +290,6 @@ def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float
     from .production_control_material_availability import preview_make_work_item_materials, public_materials_payload
     from .item_ledger.current_execution import require_current_execution_scope
 
-    db.query(models.PlanningTruthState).filter_by(id=1).with_for_update().one()
     manifest = require_current_execution_scope(db, entity_kind="production_control_journal", scope_key="production:all-live-orders")
     if str(manifest.source_revision) != expected_source_revision:
         raise HTTPException(409, detail={"code": "production_current_revision_stale", "expected_source_revision": manifest.source_revision})
@@ -1633,7 +1632,7 @@ def build_compact_current_production_control_payload(
         accepted_run_ids=run_ids,
     )
     from app.services.production_control_material_availability import (
-        preview_make_work_item_materials,
+        preview_make_work_items_materials_bulk,
     )
 
     reusable_proposal_snapshots = _parent_current_proposal_snapshots(
@@ -1641,6 +1640,63 @@ def build_compact_current_production_control_payload(
         parent_generation_id=int(parent.id),
         affected_item_ids=affected_item_ids,
     )
+    proposal_material_snapshots: dict[str, dict[str, Any]] = {}
+    preview_inputs: list[dict[str, Any]] = []
+    preview_identity_by_work_item: dict[int, str] = {}
+    for proposal in canonical_proposals:
+        if proposal.get("spec_id") is None or proposal.get("launchable_qty") in (None, 0):
+            continue
+        synthetic_id = int(proposal["work_item_id"])
+        reservation = reservation_by_work_id[synthetic_id]
+        source_identity = str(reservation.current_identity or "").strip()
+        current_identity = f"mrp-reservation:{source_identity}"
+        launchable = float(proposal["launchable_qty"])
+        reused = reusable_proposal_snapshots.get(current_identity)
+        if reused is not None and reused[1] is not None and abs(
+            float(reused[1]) - launchable
+        ) <= 1e-9:
+            proposal_material_snapshots[current_identity] = reused[0]
+            continue
+        # Preserve the former scalar preview identity exactly. It received the
+        # synthetic ``-reservation.id`` work-item locator and therefore built
+        # a virtual product with ``+reservation.id``. Custody exclusion is
+        # keyed by that product id, so changing its sign here would change
+        # availability when the locator collides with a real product.
+        preview_work_item_id = synthetic_id
+        if preview_work_item_id in preview_identity_by_work_item:
+            raise ProductionControlJournalPromotionError(
+                "compact MAKE proposal preview identity is duplicated"
+            )
+        preview_identity_by_work_item[preview_work_item_id] = current_identity
+        preview_inputs.append({
+            "work_item_id": preview_work_item_id,
+            "item_id": int(proposal["item_id"]),
+            "quantity": launchable,
+            "spec_id": int(proposal["spec_id"]),
+            "order_number": f"MRP-R-{int(proposal['source_mrp_requirement_id'])}",
+            "run_id": (
+                int(proposal["source_run_id"])
+                if proposal.get("source_run_id") is not None else None
+            ),
+        })
+    if preview_inputs:
+        previewed = preview_make_work_items_materials_bulk(
+            db,
+            preview_inputs,
+            ledger_generation_id=int(parent.id),
+            _current_only=True,
+            _allow_synthetic_ids=True,
+        )
+        if set(previewed) != set(preview_identity_by_work_item):
+            raise ProductionControlJournalPromotionError(
+                "compact MAKE proposal material preview is incomplete"
+            )
+        for work_item_id, snapshot in previewed.items():
+            direct_snapshot = dict(snapshot)
+            direct_snapshot.pop("work_item_id", None)
+            proposal_material_snapshots[
+                preview_identity_by_work_item[int(work_item_id)]
+            ] = direct_snapshot
     for proposal in canonical_proposals:
         synthetic_id = int(proposal["work_item_id"])
         reservation = reservation_by_work_id[synthetic_id]
@@ -1660,29 +1716,11 @@ def build_compact_current_production_control_payload(
         # preview, and the generation locators that would differ are dropped
         # at publication (``_drop_production_generation_references``).
         if proposal.get("spec_id") is not None and proposal.get("launchable_qty") not in (None, 0):
-            launchable = float(proposal["launchable_qty"])
-            reused = reusable_proposal_snapshots.get(proposal["current_identity"])
-            if reused is not None and reused[1] is not None and abs(
-                float(reused[1]) - launchable
-            ) <= 1e-9:
-                snapshot = reused[0]
-            else:
-                snapshot = preview_make_work_item_materials(
-                    db,
-                    work_item_id=synthetic_id,
-                    item_id=int(proposal["item_id"]),
-                    quantity=launchable,
-                    spec_id=int(proposal["spec_id"]),
-                    ledger_generation_id=int(parent.id),
-                    order_number=f"MRP-R-{int(proposal['source_mrp_requirement_id'])}",
-                    run_id=(
-                        int(proposal["source_run_id"])
-                        if proposal.get("source_run_id") is not None else None
-                    ),
-                    _current_only=True,
+            snapshot = proposal_material_snapshots.get(proposal["current_identity"])
+            if snapshot is None:
+                raise ProductionControlJournalPromotionError(
+                    "compact MAKE proposal material preview is missing"
                 )
-                # A synthetic locator (``-reservation_id``) is not a work item.
-                snapshot.pop("work_item_id", None)
             proposal["material_coverage_snapshot"] = snapshot
         proposal["reservation_id"] = int(reservation.id)
         proposal["root_item_ids"] = sorted(

@@ -56,6 +56,63 @@ def _publish(db, generation, rows):
     )
 
 
+def test_scope_reactivates_exact_closed_identity_without_loading_closed_history(db_session):
+    from sqlalchemy import event
+
+    generation = _generation(db_session, "bounded-current-history")
+    history = [(f"history:{index}", {"qty": index}) for index in range(128)]
+    _publish(db_session, generation, history + [
+        ("keep", {"qty": 1}), ("return", {"qty": 2}), ("retire", {"qty": 3}),
+    ])
+    _publish(db_session, generation, [("keep", {"qty": 1}), ("retire", {"qty": 3})])
+    ids = {
+        row.business_identity: row.id
+        for row in db_session.query(models.CurrentExecutionRow).all()
+    }
+    db_session.expunge_all()
+    loaded = []
+
+    def track_load(_session, instance):
+        if isinstance(instance, models.CurrentExecutionRow):
+            loaded.append(instance.id)
+
+    event.listen(db_session, "loaded_as_persistent", track_load)
+    try:
+        result = _publish(db_session, generation, [("keep", {"qty": 1}), ("return", {"qty": 2})])
+    finally:
+        event.remove(db_session, "loaded_as_persistent", track_load)
+
+    assert set(loaded) == {ids["keep"], ids["return"], ids["retire"]}
+    assert result.changed_rows == 1
+    assert result.closed_rows == 1
+    assert db_session.get(models.CurrentExecutionRow, ids["return"]).result_status == "accepted"
+    assert db_session.get(models.CurrentExecutionRow, ids["retire"]).result_status == "closed"
+    assert all(
+        db_session.get(models.CurrentExecutionRow, ids[identity]).result_status == "closed"
+        for identity, _payload in history
+    )
+
+
+def test_noop_scope_normalizes_each_incoming_business_payload_once(db_session, monkeypatch):
+    from app.services.item_ledger import current_execution
+
+    generation = _generation(db_session, "current-normalization-budget")
+    rows = [(f"stable:{index}", {"qty": index}) for index in range(128)]
+    _publish(db_session, generation, rows)
+    original = current_execution._semantic_view
+    calls = []
+
+    def normalized(payload, entity_kind):
+        calls.append(entity_kind)
+        return original(payload, entity_kind)
+
+    monkeypatch.setattr(current_execution, "_semantic_view", normalized)
+    result = _publish(db_session, generation, rows)
+
+    assert result.idempotent
+    assert len(calls) == len(rows)
+
+
 def test_current_scope_replacement_is_stable_across_generations(db_session):
     generation_a = _generation(db_session, "current-a")
     first = _publish(db_session, generation_a, [("purchase:1", {"qty": 4})])

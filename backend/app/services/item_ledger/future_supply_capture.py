@@ -1113,9 +1113,7 @@ def replace_future_supply_capture(
         persisted_rows = db.query(models.LedgerFutureSupply).filter(
             models.LedgerFutureSupply.ledger_generation_id == int(generation.id),
             models.LedgerFutureSupply.capture_batch_id == int(batch.id),
-        ).all()
-        for persisted_row in persisted_rows:
-            db.refresh(persisted_row)
+        ).populate_existing().all()
         persisted_summary = _capture_summary(
             _stored_row_payload(row) for row in persisted_rows
         )

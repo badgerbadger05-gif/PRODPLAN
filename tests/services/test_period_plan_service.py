@@ -84,6 +84,68 @@ def test_generation_snapshot_build_skips_legacy_run_without_persisted_roots(
     assert detail["planned_output_qty"] is None
 
 
+def test_generation_period_payload_reuses_one_union_root_descendant_map(
+    db_session, monkeypatch,
+):
+    generation_id = int(
+        db_session.query(PlanningTruthState.current_generation_id).scalar()
+    )
+    generation = db_session.get(LedgerGeneration, generation_id)
+    run_ids = []
+    expected = {}
+    root_ids = set()
+    for suffix in ("A", "B"):
+        item = _make_purchased_item(db_session, f"PERIOD-UNION-{suffix}")
+        plan = _make_fixed_plan(
+            db_session, item, date(2026, 7, 1), qty=2.0,
+        )
+        # SQLite stores this column without timezone information; keep both
+        # the direct and bulk paths on the same persisted representation.
+        plan.fixed_at = datetime.datetime(2026, 7, 1)
+        run = PlanningRun(
+            source_plan_id=int(plan.id),
+            ledger_generation_id=int(generation.id),
+            ledger_cutoff=generation.cutoff,
+            status="FIXED_SNAPSHOT",
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            active_freeze_version=1,
+            config_snapshot={},
+        )
+        db_session.add(run)
+        db_session.flush()
+        _add_root_for_plan(db_session, run, plan)
+        run_ids.append(int(run.run_id))
+        root_ids.add(int(item.item_id))
+        payload = period_plan_service.build_period_plan_execution_current_payload(
+            db_session,
+            int(plan.id),
+            run_id=int(run.run_id),
+            generation_id=int(generation.id),
+        )
+        expected[str(payload["current_scope_key"])] = payload
+
+    real_descendants = period_plan_service._bom_descendants_by_item
+    calls = []
+
+    def tracked_descendants(db, roots):
+        normalized = tuple(sorted({int(root) for root in roots}))
+        calls.append(normalized)
+        return real_descendants(db, normalized)
+
+    monkeypatch.setattr(
+        period_plan_service, "_bom_descendants_by_item", tracked_descendants,
+    )
+    actual = build_period_plan_execution_current_payloads_for_generation(
+        db_session,
+        int(generation.id),
+        run_ids=run_ids,
+    )
+
+    assert calls == [tuple(sorted(root_ids))]
+    assert actual == expected
+
+
 def test_period_plan_percent_adapter_uses_canonical_clamp_and_zero_base():
     assert period_plan_service._rounded_replenishment_pct(0, 0) is None
     assert period_plan_service._rounded_replenishment_pct(10, 5) == 50.0

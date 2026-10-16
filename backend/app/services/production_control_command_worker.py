@@ -89,7 +89,13 @@ def _lock_command_publication(db, *, action: str) -> None:
 
 def execute(db, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     try:
-        _lock_command_publication(db, action=action)
+        # Quantity-specific material previews hold the production manifest
+        # boundary and exact current row themselves.  Let them keep reading
+        # the old committed scope while a long physical publication prepares
+        # its successor; every domain-changing command retains the global
+        # PlanningTruthState boundary below.
+        if action != "materials":
+            _lock_command_publication(db, action=action)
         return _execute(db, action, arguments)
     except Exception:
         db.rollback()

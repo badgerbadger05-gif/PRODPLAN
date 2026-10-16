@@ -22,9 +22,11 @@ from ..models import (
     ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
+    Unit,
 )
 from .production_control_common import (
     date_to_iso as _date_to_iso,
+    looks_like_guid,
     to_float as _to_float,
     to_float_strict as _to_float_strict,
 )
@@ -74,6 +76,7 @@ def _components_for_product(
     product: ProductionProduct,
     *,
     spec_id_override: int | None = None,
+    unit_display_by_raw: Mapping[str, str] | None = None,
 ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
     spec_id = int(spec_id_override) if spec_id_override is not None else _default_spec_id(db, product)
     if not spec_id:
@@ -97,7 +100,9 @@ def _components_for_product(
                 "item_code": str(item.item_code or ""),
                 "item_name": str(item.item_name or ""),
                 "item_article": str(item.item_article or ""),
-                "unit": _unit_display(db, item.unit),
+                "unit": _bulk_unit_display(
+                    db, item.unit, unit_display_by_raw=unit_display_by_raw,
+                ),
                 "qty_per_unit": _to_float(comp.quantity),
                 "required_qty": required,
                 "source_spec_id": spec_id,
@@ -121,11 +126,33 @@ class _BulkPreviewContext:
     future_supply_eta: Dict[int, List[Dict[str, Any]]]
     reservation_orders: Dict[int, List[Dict[str, Any]]]
     resolved: Dict[int, tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]]]
+    unit_display_by_raw: Dict[str, str]
+
+
+def _bulk_unit_display(
+    db: Session,
+    raw_unit: Any,
+    *,
+    unit_display_by_raw: Mapping[str, str] | None,
+) -> str:
+    """Use the scalar unit contract without a query per component in bulk."""
+
+    if unit_display_by_raw is None:
+        return _unit_display(db, raw_unit)
+    raw = str(raw_unit or "").strip()
+    if not raw:
+        return ""
+    resolved = unit_display_by_raw.get(raw)
+    if resolved is not None:
+        return resolved
+    return "" if looks_like_guid(raw) else raw
 
 
 def _resolve_preview_components(
     db: Session,
     product: ProductionProduct,
+    *,
+    unit_display_by_raw: Mapping[str, str] | None = None,
 ) -> tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]]:
     """Resolve one product's canonical basis/BOM without availability reads."""
     basis_spec_id, basis_item, custody_product_id = _paint_weld_material_basis(db, product)
@@ -142,6 +169,7 @@ def _resolve_preview_components(
                 db,
                 material_product,
                 parent_item_id=int(basis_item.item_id),
+                unit_display_by_raw=unit_display_by_raw,
             )
             if basis_item is not None
             else None
@@ -153,6 +181,7 @@ def _resolve_preview_components(
         db,
         material_product,
         spec_id_override=basis_spec_id,
+        unit_display_by_raw=unit_display_by_raw,
     )
     if frozen_components is not None:
         components = frozen_components
@@ -190,6 +219,7 @@ def _frozen_components_for_product(
     product: ProductionProduct,
     *,
     parent_item_id: int,
+    unit_display_by_raw: Mapping[str, str] | None = None,
 ) -> List[Dict[str, Any]] | None:
     order = getattr(product, "order", None)
     run_id = getattr(order, "source_run_id", None)
@@ -233,7 +263,9 @@ def _frozen_components_for_product(
                 "item_code": str(item.item_code or ""),
                 "item_name": str(item.item_name or ""),
                 "item_article": str(item.item_article or ""),
-                "unit": _unit_display(db, item.unit),
+                "unit": _bulk_unit_display(
+                    db, item.unit, unit_display_by_raw=unit_display_by_raw,
+                ),
                 "qty_per_unit": qty_per_unit,
                 "required_qty": required_qty,
                 "source_spec_id": None,
@@ -713,13 +745,24 @@ def _preview_material_products_bulk(
     if not ids:
         return {}
 
+    unit_display_by_raw = {
+        str(unit.unit_ref1c or "").strip(): str(
+            unit.short_name or unit.unit_name or unit.unit_code or ""
+        ).strip()
+        for unit in db.query(Unit).all()
+        if str(unit.unit_ref1c or "").strip()
+    }
     resolved: dict[
         int,
         tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]],
     ] = {}
     component_ids: set[int] = set()
     for product_id in ids:
-        value = _resolve_preview_components(db, products_by_id[product_id])
+        value = _resolve_preview_components(
+            db,
+            products_by_id[product_id],
+            unit_display_by_raw=unit_display_by_raw,
+        )
         resolved[product_id] = value
         component_ids.update(int(row["component_item_id"]) for row in value[5])
 
@@ -759,6 +802,7 @@ def _preview_material_products_bulk(
         future_supply_eta=future_supply_eta,
         reservation_orders=reservation_orders,
         resolved=resolved,
+        unit_display_by_raw=unit_display_by_raw,
     )
     return {
         product_id: preview_materials(
@@ -819,6 +863,8 @@ def preview_make_work_items_materials_bulk(
     rows: Sequence[Mapping[str, Any]],
     *,
     ledger_generation_id: int,
+    _current_only: bool = False,
+    _allow_synthetic_ids: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Render detailed MAKE snapshots with one transaction-bounded read context.
 
@@ -831,7 +877,11 @@ def preview_make_work_items_materials_bulk(
     seen: set[int] = set()
     for row in rows:
         work_item_id = int(row["work_item_id"])
-        if work_item_id <= 0 or work_item_id in seen:
+        if (
+            work_item_id == 0
+            or (work_item_id < 0 and not _allow_synthetic_ids)
+            or work_item_id in seen
+        ):
             raise ValueError("Строки MAKE должны иметь уникальный положительный идентификатор")
         seen.add(work_item_id)
         normalized.append((
@@ -880,6 +930,7 @@ def preview_make_work_items_materials_bulk(
         db,
         products_by_id,
         ledger_generation_id=int(ledger_generation_id),
+        _current_only=_current_only,
     )
     result: Dict[int, Dict[str, Any]] = {}
     for product_id, payload in previews.items():

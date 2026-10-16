@@ -124,6 +124,14 @@ def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_se
 
 def test_quantity_command_persists_preview_and_get_only_reads_it(db_session, monkeypatch):
     work, identity, revision = _current(db_session)
+    owner = db_session.get(models.ReservationEntry, work.reservation_id)
+    domain_before = (
+        db_session.query(models.ProductionOrder).count(),
+        db_session.query(models.ProductionProduct).count(),
+        owner.reserved_qty,
+        owner.replenishment_required_qty,
+        owner.replenishment_received_qty,
+    )
     calls = []
     def preview(*args, **kw):
         calls.append(kw['quantity'])
@@ -135,6 +143,14 @@ def test_quantity_command_persists_preview_and_get_only_reads_it(db_session, mon
     db_session.commit()
     assert prepared['qty'] == 3
     assert calls == [3]
+    db_session.refresh(owner)
+    assert domain_before == (
+        db_session.query(models.ProductionOrder).count(),
+        db_session.query(models.ProductionProduct).count(),
+        owner.reserved_qty,
+        owner.replenishment_required_qty,
+        owner.replenishment_received_qty,
+    )
     monkeypatch.setattr('app.services.production_control_material_availability.preview_make_work_item_materials',
                         lambda *a, **k: pytest.fail('GET must never calculate BOM'))
     result = get_work_item_materials(work.id, qty=3, ledger_generation_id=None,
@@ -241,14 +257,70 @@ def test_local_launch_publishes_new_executor_when_retained_order_is_fully_produc
 def test_command_worker_does_not_race_physical_publication(monkeypatch):
     from app.services import production_control_command_worker as worker
     def busy(db, *, action):
-        assert action == 'materials'
+        assert action == 'materialize'
         raise HTTPException(409, detail={"code": "production_ledger_publication_busy"})
     monkeypatch.setattr(worker, '_lock_command_publication', busy)
     monkeypatch.setattr(worker, '_execute', lambda *a: pytest.fail('busy Ledger must not write'))
     with pytest.raises(HTTPException) as error:
         from types import SimpleNamespace
-        worker.execute(SimpleNamespace(rollback=lambda: None), 'materials', {})
+        worker.execute(SimpleNamespace(rollback=lambda: None), 'materialize', {})
     assert error.value.status_code == 409
+
+
+def test_materials_command_skips_global_publication_lock(monkeypatch):
+    from types import SimpleNamespace
+    from app.services import production_control_command_worker as worker
+
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        '_lock_command_publication',
+        lambda *args, **kwargs: pytest.fail('materials must not acquire the global P lock'),
+    )
+    monkeypatch.setattr(
+        worker,
+        '_execute',
+        lambda db, action, arguments: calls.append((action, arguments)) or {'qty': 3},
+    )
+
+    result = worker.execute(
+        SimpleNamespace(rollback=lambda: calls.append(('rollback', {}))),
+        'materials',
+        {'work_item_id': 7, 'qty': 3},
+    )
+
+    assert result == {'qty': 3}
+    assert calls == [('materials', {'work_item_id': 7, 'qty': 3})]
+
+
+def test_prepare_materials_never_takes_planning_truth_row_lock(db_session, monkeypatch):
+    work, identity, revision = _current(db_session)
+    real_query = db_session.query
+
+    def guarded_query(*entities, **kwargs):
+        query = real_query(*entities, **kwargs)
+        if entities == (models.PlanningTruthState,):
+            query.with_for_update = lambda *args, **kwargs: pytest.fail(
+                'materials must rely on manifest-to-row locks, not the global P lock'
+            )
+        return query
+
+    monkeypatch.setattr(db_session, 'query', guarded_query)
+    monkeypatch.setattr(
+        'app.services.production_control_material_availability.preview_make_work_item_materials',
+        lambda *args, **kwargs: {
+            'qty': kwargs['quantity'], 'line_quantity': kwargs['quantity'],
+            'components': [], 'coverage_status': 'ready',
+        },
+    )
+
+    assert prepare_current_work_materials(
+        db_session,
+        work_item_id=work.id,
+        qty=3,
+        current_identity=identity,
+        expected_source_revision=revision,
+    )['qty'] == 3
 
 
 def test_command_worker_waits_briefly_before_reporting_busy_launch(monkeypatch):

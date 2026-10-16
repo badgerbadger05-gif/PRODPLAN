@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
-from sqlalchemy import and_, case
+from sqlalchemy import and_, case, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -873,6 +873,7 @@ def publish_current_execution_scope(
         str(value).strip() for value in (entity_kinds or ()) if str(value).strip()
     }
     incoming: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any], str, bool]] = {}
+    semantic_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for raw in rows:
         row = dict(raw)
         entity_kind = str(row.get("entity_kind") or "").strip()
@@ -889,6 +890,7 @@ def publish_current_execution_scope(
         key = (entity_kind, identity)
         if key in incoming:
             raise CurrentExecutionUnavailable(f"duplicate current execution identity {entity_kind}:{identity}")
+        semantic_by_key[key] = semantic_payload
         incoming[key] = (
             payload,
             manual,
@@ -903,7 +905,7 @@ def publish_current_execution_scope(
         raise CurrentExecutionUnavailable("empty complete scope requires explicit entity kinds")
     for kind in sorted(expected_kinds):
         entries = [
-            (identity, _semantic_view(payload, kind), manual)
+            (identity, semantic_by_key[(entry_kind, identity)], manual)
             for (entry_kind, identity), (payload, manual, _content_hash, _manual_supplied)
             in incoming.items()
             if entry_kind == kind
@@ -938,7 +940,15 @@ def publish_current_execution_scope(
         models.CurrentExecutionRow.scope_key == scope,
     )
     existing_query = existing_query.filter(
-        models.CurrentExecutionRow.entity_kind.in_(sorted(expected_kinds))
+        models.CurrentExecutionRow.entity_kind.in_(sorted(expected_kinds)),
+        # Already closed history cannot be closed again. Load it only when
+        # this publication explicitly reactivates its stable identity.
+        or_(
+            models.CurrentExecutionRow.result_status != "closed",
+            models.CurrentExecutionRow.business_identity.in_(
+                sorted({identity for _kind, identity in incoming})
+            ),
+        ),
     )
     existing = existing_query.with_for_update().all()
     existing_by_key = {(str(row.entity_kind), str(row.business_identity)): row for row in existing}
@@ -947,10 +957,10 @@ def publish_current_execution_scope(
     closed = 0
     for key, (payload, manual, content_hash, manual_supplied) in incoming.items():
         row = existing_by_key.get(key)
-        if row is not None and not manual_supplied:
+        if row is not None and not manual_supplied and row.manual_input:
             manual = dict(row.manual_input or {})
             content_hash = _hash({
-                "payload": _semantic_view(payload, key[0]),
+                "payload": semantic_by_key[key],
                 "manual_input": manual,
             })
         if row is not None and str(row.result_status) == "accepted":
@@ -958,11 +968,13 @@ def publish_current_execution_scope(
             # not rewrite every row merely to migrate its hash: compare the
             # persisted payload through the new view and preserve the legacy
             # hash until a real business update occurs.
-            existing_manual = dict(row.manual_input or {})
-            existing_semantic_hash = _hash({
-                "payload": _semantic_view(dict(row.payload or {}), key[0]),
-                "manual_input": existing_manual,
-            })
+            existing_semantic_hash = None
+            if str(row.content_hash) != content_hash:
+                existing_manual = dict(row.manual_input or {})
+                existing_semantic_hash = _hash({
+                    "payload": _semantic_view(dict(row.payload or {}), key[0]),
+                    "manual_input": existing_manual,
+                })
             if str(row.content_hash) == content_hash or content_hash == existing_semantic_hash:
                 # A reference writer may have marked this row unavailable until
                 # the worker republished it.  Recomputing the same business
