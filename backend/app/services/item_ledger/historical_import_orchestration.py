@@ -17,7 +17,12 @@ from sqlalchemy.orm import Session
 from app import models
 
 from .historical_register_scan import scan_historical_register_range
-from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
+from .ingest import (
+    HistoricalPullBeyondCutoffError,
+    finalize_deferred_current_custody,
+    persist_deferred_custody_inputs,
+    pull_recorder_movements,
+)
 from .physical import canonical_content_hash, guard_physical_batch_writer
 
 
@@ -280,6 +285,7 @@ def run_historical_physical_import(
 
             pull_metrics: list[dict[str, Any]] = []
             deferred_recorders: list[dict[str, str]] = []
+            deferred_custody_recorders: list[tuple[str, str]] = []
             for discovered in scan.recorders:
                 identity = discovered.identity
                 pull_kwargs = dict(
@@ -321,6 +327,10 @@ def run_historical_physical_import(
                     raise HistoricalImportError(
                         f"recorder {identity.recorder_type} "
                         f"{identity.recorder_ref} was quarantined"
+                    )
+                if result.deferred_current_custody:
+                    deferred_custody_recorders.append(
+                        (identity.recorder_type, identity.recorder_ref)
                     )
                 pull_metrics.append({
                     "recorder_type": identity.recorder_type,
@@ -382,6 +392,17 @@ def run_historical_physical_import(
                 "historical_import_completed_through": window_end.isoformat(),
                 "historical_physical_import_batch_id": int(physical_batch.id),
             }
+            db.flush()
+            custody = finalize_deferred_current_custody(
+                db, recorders=deferred_custody_recorders,
+            )
+            if custody.finalized_recorders != len(set(deferred_custody_recorders)):
+                raise HistoricalImportError(
+                    "historical import left deferred custody recorders unclosed"
+                )
+            persist_deferred_custody_inputs(
+                generation, custody.pending_recorders,
+            )
             db.flush()
             db.commit()
         except Exception as exc:

@@ -21,6 +21,7 @@ import {
   exportMaterialIssuesTo1C,
   refreshCurrentProductionOrders,
   fetchRouteSheetsPrintHtml,
+  markRouteSheetsPrinted,
   getOrderMaterials,
   getWorkItemMaterials,
   getProductionControlSettings,
@@ -569,6 +570,13 @@ export function ProductionControlPage() {
       })
   }
 
+  function renderRouteSheetReceipt(printWindow: Window | null, html: string) {
+    if (!printWindow || printWindow.closed) return
+    printWindow.document.open()
+    printWindow.document.write(html)
+    printWindow.document.close()
+  }
+
   function openRouteSheets(ids: number[]) {
     if (!ids.length) return
     renderRouteSheets(ids, prepareRouteSheetWindow())
@@ -722,7 +730,11 @@ export function ProductionControlPage() {
         await load(offsetRef.current)
         return
       }
-      const result = await exportMaterialIssuesTo1C(issueIds)
+      const result = await exportMaterialIssuesTo1C(
+        issueIds,
+        materialContext.identities,
+        materialContext.sourceRevision,
+      )
       const parent = (result.parent_orders_export ?? {}) as Record<string, unknown>
       const orderReceipts = successfulProductionOrderReceipts(parent)
       const ordersCreated = Number(parent.orders_created ?? 0)
@@ -758,7 +770,19 @@ export function ProductionControlPage() {
         setPublicationPendingIds((current) => new Set([...current, ...ids]))
         setActiveId(ids[0] ?? null)
         setActiveCurrentIdentity(null)
-        setMessage(`${successSummary}. Обновляем журнал и печать; повторная выгрузка не требуется.`)
+        const printReceipt = result.print_receipt
+        if (printReceipt?.html && printReceipt.basis_revision && printReceipt.identities.length) {
+          renderRouteSheetReceipt(printWindow, printReceipt.html)
+          void markRouteSheetsPrinted(
+            ids,
+            printReceipt.identities,
+            printReceipt.basis_revision,
+          ).catch(() => undefined)
+          printWindow = null
+          setMessage(`${successSummary}. Маршрутный лист открыт; журнал обновляется в фоне; повторная выгрузка не требуется.`)
+        } else {
+          setMessage(`${successSummary}. Обновляем журнал и печать; повторная выгрузка не требуется.`)
+        }
         void continuePublishedOrderRefresh(
           ids, orderReceipts, printWindow, successSummary, materialContext.sourceRevision,
           requiresRevisionMove,

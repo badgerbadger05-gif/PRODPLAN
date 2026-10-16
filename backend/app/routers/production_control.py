@@ -61,8 +61,10 @@ from ..services.item_ledger.current_execution import (
 )
 from ..services.paint_weld_chain import open_paint_chains_for_products
 from ..services.production_control_printing import (
+    capture_route_sheet_command_basis,
     load_current_route_sheet_rows,
     mark_route_sheets_printed_by_snapshot_members as mark_route_sheets_printed_by_members,
+    render_route_sheet_command_receipt,
     render_route_sheets_from_snapshots,
 )
 from ..services.production_control_production_flow import (
@@ -1258,6 +1260,8 @@ class ExportProductionOrdersPayload(BaseModel):
 class ExportMaterialIssuesPayload(BaseModel):
     issue_ids: List[int]
     dry_run: bool = True
+    current_identities: List[str] = Field(default_factory=list)
+    expected_source_revision: Optional[str] = None
     # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
 
@@ -2603,15 +2607,52 @@ def _refresh_exported_executors_metadata(product_ids: list[int]) -> None:
         )
 
 
+def _export_result_allows_print_receipt(result: dict) -> bool:
+    if str(result.get("status") or "") != "ok":
+        return False
+    if result.get("skipped_rows"):
+        return False
+    if int(result.get("orders_error") or 0) or int(result.get("issues_error") or 0):
+        return False
+    parent = result.get("parent_orders_export")
+    if isinstance(parent, dict):
+        if (
+            str(parent.get("status") or "") != "ok"
+            or parent.get("skipped_rows")
+            or int(parent.get("orders_error") or 0)
+        ):
+            return False
+    return True
+
+
 def _refresh_exported_executors(
     db: Session,
     product_ids: list[int],
     result: dict,
     background_tasks: BackgroundTasks | None = None,
+    *,
+    print_basis: dict[str, Any] | None = None,
+    required_order_ids: Sequence[int] = (),
+    required_issue_ids: Sequence[int] = (),
 ) -> dict:
     # The external operation and its receipt are durable before any metadata
     # continuation is made visible to the response lifecycle.
     db.commit()
+    if _export_result_allows_print_receipt(result) and print_basis is not None:
+        try:
+            print_receipt = render_route_sheet_command_receipt(
+                db,
+                print_basis,
+                required_order_ids=required_order_ids,
+                required_issue_ids=required_issue_ids,
+            )
+            if print_receipt is not None:
+                result["print_receipt"] = print_receipt
+        except Exception:
+            # The durable 1C acknowledgement must never be hidden by optional
+            # command-receipt formatting.  The client retains its current
+            # revision-poll fallback when this field is absent.
+            db.rollback()
     result["projection_refresh_error"] = "Обновление журнала выполняется в фоне"
     if background_tasks is not None:
         background_tasks.add_task(
@@ -2643,12 +2684,17 @@ def post_export_production_orders_to_1c(
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы для экспорта")
     try:
-        _require_current_production_identities(
+        manifest, current_rows = _require_current_production_identities(
             db,
             identities=[str(identity) for identity in payload.current_identities],
             expected_source_revision=payload.expected_source_revision,
             locator_key="order_id",
             locator_values={int(value) for value in payload.order_ids},
+        )
+        print_basis = capture_route_sheet_command_basis(
+            db,
+            current_rows,
+            source_revision=str(manifest.source_revision),
         )
         result = export_production_orders_to_1c(
             db,
@@ -2660,6 +2706,8 @@ def post_export_production_orders_to_1c(
                    .filter(models.ProductionProduct.order_id.in_(payload.order_ids)).all()]
             return _refresh_exported_executors(
                 db, ids, result, background_tasks=background_tasks,
+                print_basis=print_basis,
+                required_order_ids=payload.order_ids,
             )
         return result
     except CurrentExecutionUnavailable as e:
@@ -2757,9 +2805,30 @@ def post_export_material_issues_to_1c(
     if not payload.issue_ids:
         raise HTTPException(status_code=400, detail="Не выбраны документы выдачи")
     try:
+        requested_issue_ids = [int(value) for value in payload.issue_ids]
+        product_ids = sorted({
+            int(row[0])
+            for row in db.query(models.ProductionMaterialIssue.product_id)
+            .filter(models.ProductionMaterialIssue.issue_id.in_(requested_issue_ids))
+            .all()
+        })
+        print_basis = None
+        if payload.current_identities or payload.expected_source_revision:
+            manifest, current_rows = _require_current_production_identities(
+                db,
+                identities=[str(identity) for identity in payload.current_identities],
+                expected_source_revision=payload.expected_source_revision,
+                locator_key="product_id",
+                locator_values=set(product_ids),
+            )
+            print_basis = capture_route_sheet_command_basis(
+                db,
+                current_rows,
+                source_revision=str(manifest.source_revision),
+            )
         result = export_material_issues_to_1c(
             db,
-            [int(x) for x in payload.issue_ids],
+            requested_issue_ids,
             dry_run=bool(payload.dry_run),
         )
         if not payload.dry_run:
@@ -2767,8 +2836,12 @@ def post_export_material_issues_to_1c(
                           .filter(models.ProductionMaterialIssue.issue_id.in_(payload.issue_ids)).all()})
             return _refresh_exported_executors(
                 db, ids, result, background_tasks=background_tasks,
+                print_basis=print_basis,
+                required_issue_ids=requested_issue_ids,
             )
         return result
+    except CurrentExecutionUnavailable as e:
+        raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

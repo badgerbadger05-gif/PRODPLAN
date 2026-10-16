@@ -54,7 +54,14 @@ from .physical_refresh_provenance import (
     canonical_issue_backfill_source_ids,
     physical_batch_has_recorder,
 )
-from .ingest import HistoricalPullBeyondCutoffError, pull_recorder_movements
+from .ingest import (
+    DEFERRED_CUSTODY_KEY,
+    HistoricalPullBeyondCutoffError,
+    finalize_deferred_current_custody,
+    persist_deferred_custody_inputs,
+    project_deferred_custody_for_target,
+    pull_recorder_movements,
+)
 from .physical_refresh_import import (
     PhysicalRefreshImportResult,
     run_physical_recorder_audit,
@@ -1203,6 +1210,7 @@ def _repair_mismatched_recorders(
     deferred: list[tuple[str, str]] = []
     repaired = 0
     failed: list[tuple[str, str]] = []
+    deferred_custody_recorders: list[tuple[str, str]] = []
     for recorder_type, recorder_ref in sorted(identities)[
         :_TARGETED_REPAIR_MAX_RECORDERS
     ]:
@@ -1214,6 +1222,7 @@ def _repair_mismatched_recorders(
                 client=client,
                 source="physical_refresh_targeted_repair",
                 ledger_generation_id=None,
+                publish_current=False,
                 max_posting_at=generation.cutoff,
                 strict_historical=True,
             )
@@ -1235,6 +1244,8 @@ def _repair_mismatched_recorders(
             # mismatched cell unexplained; the snap still closes what stays.
             failed.append((recorder_type, recorder_ref))
             continue
+        if result.deferred_current_custody:
+            deferred_custody_recorders.append((recorder_type, recorder_ref))
         repaired += 1
 
     terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
@@ -1292,6 +1303,18 @@ def _repair_mismatched_recorders(
             "physical_import_batch_id": int(terminal),
         },
     }
+    db.flush()
+    custody = finalize_deferred_current_custody(
+        db, recorders=deferred_custody_recorders,
+    )
+    if custody.finalized_recorders != len(set(deferred_custody_recorders)):
+        raise PhysicalRefreshOrchestratorError(
+            "targeted convergence repair left deferred custody recorders unclosed"
+        )
+    persist_deferred_custody_inputs(
+        generation, custody.pending_recorders,
+    )
+    db.flush()
     db.commit()
     return repaired
 
@@ -1308,6 +1331,34 @@ def _current_parent(db: Session) -> models.LedgerGeneration:
             "current planning truth is not an accepted generation"
         )
     return parent
+
+
+def _inherit_deferred_custody_inputs(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target: models.LedgerGeneration,
+) -> None:
+    """Carry retry inputs only from rejected siblings of this parent."""
+
+    pending: list[tuple[str, str]] = []
+    for sibling in db.query(models.LedgerGeneration).filter(
+        models.LedgerGeneration.status == "rejected",
+        models.LedgerGeneration.id < int(target.id),
+    ).order_by(models.LedgerGeneration.id.desc()).all():
+        marks = dict(sibling.source_watermarks or {})
+        if int(marks.get("parent_generation_id") or 0) != int(parent_generation_id):
+            continue
+        for raw in marks.get(DEFERRED_CUSTODY_KEY) or []:
+            if not isinstance(raw, Mapping):
+                raise PhysicalRefreshOrchestratorError(
+                    "rejected custody retry input is malformed"
+                )
+            pending.append((
+                str(raw.get("recorder_type") or "").strip(),
+                str(raw.get("recorder_ref") or "").strip(),
+            ))
+    persist_deferred_custody_inputs(target, pending)
 
 
 def _bounded_custody_tail_sle_ids(
@@ -1874,7 +1925,20 @@ def run_physical_refresh(
             int(evidence["input_delta_rows"]),
             int(delta["input_delta_rows"]),
         )
+        # Batch pulls persist only technical recorder identities. Project them
+        # once now that every network read is complete, inside the target
+        # transaction. The bounded provenance check maps a repaired
+        # non-physical opening to its exact transfer witness, so an appended
+        # event makes ``movement_delta`` true; a genuine no-op has no event to
+        # commit. Every later rejection rolls this transaction back before the
+        # candidate is discarded in its recovery transaction.
         try:
+            _inherit_deferred_custody_inputs(
+                db,
+                parent_generation_id=int(parent.id),
+                target=physical_generation,
+            )
+            project_deferred_custody_for_target(db, physical_generation)
             # Local commands may advance the accepted compact custody owner
             # while this lifecycle is fetching 1C data. Already adopted local
             # events must not be revalidated as an unproved physical tail.
@@ -1885,9 +1949,16 @@ def run_physical_refresh(
                 .one_or_none()
             )
             if latest_custody_manifest is not None:
-                latest_watermark = int(latest_custody_manifest.source_event_high_watermark_id or 0)
-                if str(latest_custody_manifest.status or "") != "complete" or latest_watermark < custody_event_start:
-                    raise PhysicalRefreshOrchestratorError("accepted custody publication marker regressed or became incomplete")
+                latest_watermark = int(
+                    latest_custody_manifest.source_event_high_watermark_id or 0
+                )
+                if (
+                    str(latest_custody_manifest.status or "") != "complete"
+                    or latest_watermark < custody_event_start
+                ):
+                    raise PhysicalRefreshOrchestratorError(
+                        "accepted custody publication marker regressed or became incomplete"
+                    )
                 custody_event_start = latest_watermark
             custody_source_sle_ids = _bounded_custody_tail_sle_ids(
                 db,
@@ -1896,14 +1967,22 @@ def run_physical_refresh(
                 target_cutoff=cutoff,
                 target_generation_id=int(physical_generation.id),
             )
-        except PhysicalRefreshOrchestratorError as exc:
+        except Exception as exc:
             db.rollback()
-            discard_physical_refresh_candidate(
-                db, ledger_generation_id=int(fork.ledger_generation_id),
-                reason=f"custody candidate validation failed: {exc}",
+            reason = f"custody candidate validation failed: {exc}"
+            candidate = db.get(
+                models.LedgerGeneration, int(fork.ledger_generation_id)
             )
-            db.commit()
-            raise
+            if candidate is not None and str(candidate.status or "") == "building":
+                discard_physical_refresh_candidate(
+                    db,
+                    ledger_generation_id=int(candidate.id),
+                    reason=reason,
+                )
+                db.commit()
+            if isinstance(exc, PhysicalRefreshOrchestratorError):
+                raise
+            raise PhysicalRefreshOrchestratorError(reason) from exc
         # Decision §25: a real change of the supply-relevant supplier-order
         # fields is accepted only by a new physical generation.  A tick with no
         # movement at all therefore still has to ask whether the 1C order

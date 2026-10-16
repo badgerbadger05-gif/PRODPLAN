@@ -416,6 +416,249 @@ def test_executor_publication_refreshes_1c_number_and_print_without_proposal(db_
     assert error.value.status_code==409
 
 
+def test_command_print_receipt_captures_issue_created_after_saved_snapshot(db_session, monkeypatch):
+    from app.services.production_control_journal import materialize_make_work_items
+    from app.services import production_control_material_issues as material_issues
+    from app.services.production_material_custody import MaterialCustodyState
+    from app.services.production_control_printing import (
+        capture_route_sheet_command_basis,
+        render_route_sheet_command_receipt,
+    )
+
+    work, _, _ = _current(db_session)
+    created = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {'launch_qty': 3, 'expected_materialized_qty': 0},
+    })['created'][0]
+    product = db_session.get(models.ProductionProduct, created['product_id'])
+    order = product.order
+    component = models.Item(
+        item_code='RECEIPT-COMPONENT', item_name='Receipt component',
+        unit='шт', status='active',
+    )
+    db_session.add(component)
+    db_session.flush()
+    identity = f'production:test:{product.product_id}'
+    snapshot = {
+        'version': 1,
+        'anchor_product_id': product.product_id,
+        'sheet': {
+            'product_id': product.product_id,
+            'order_id': order.order_id,
+            'order_number': order.order_number,
+            'one_c_number': '',
+            'remaining_qty': 3,
+            'components': [],
+            'operations': [],
+            'chain': {},
+            'weld_operations': [],
+            # This is the real first-launch ordering: the accepted snapshot is
+            # saved before create_material_issues commits its local document.
+            'transfer_rows': [],
+            'route_context': {},
+        },
+    }
+    publish_current_production_control_from_payload(db_session, work.ledger_generation_id, {
+        'meta': {},
+        'rows': [{
+            'current_identity': identity,
+            'product_id': product.product_id,
+            'order_id': order.order_id,
+            'quantity': 3,
+            'spec_id': product.spec_id,
+            'spec_revision_hash': product.spec_revision_hash,
+            '_route_sheet_snapshot': snapshot,
+        }],
+    }, source_revision='receipt-basis')
+    db_session.commit()
+
+    monkeypatch.setattr(
+        material_issues,
+        'load_current_accepted_material_custody',
+        lambda *args, **kwargs: (int(work.ledger_generation_id), MaterialCustodyState()),
+    )
+    monkeypatch.setattr(
+        material_issues,
+        '_components_for_product',
+        lambda *args, **kwargs: (None, [{
+            'component_item_id': int(component.item_id),
+            'item_name': component.item_name,
+            'item_article': '',
+            'required_qty': 2.0,
+            'unit': 'шт',
+        }]),
+    )
+    monkeypatch.setattr(material_issues, '_destination_warehouse_for_product', lambda *args: 'destination')
+    monkeypatch.setattr(material_issues, '_free_destination_stock', lambda *args, **kwargs: {int(component.item_id): 0.0})
+    monkeypatch.setattr(
+        material_issues,
+        '_allocate_components_by_source_warehouse',
+        lambda db, components, **kwargs: ({'source': components}, []),
+    )
+    monkeypatch.setattr(material_issues, 'append_material_issue_custody_event', lambda *args, **kwargs: None)
+    created_issues = material_issues.create_material_issues(
+        db_session,
+        [product.product_id],
+        source_warehouse_ref1c='source',
+    )
+    issue = db_session.get(
+        models.ProductionMaterialIssue,
+        created_issues['created'][0]['issue_id'],
+    )
+    assert issue is not None
+    current_row = db_session.query(models.CurrentExecutionRow).filter_by(
+        entity_kind='production_control_journal', business_identity=identity,
+    ).one()
+    basis = capture_route_sheet_command_basis(
+        db_session, [current_row], source_revision='receipt-basis',
+    )
+    assert basis is not None
+    assert basis['snapshots'][0]['sheet']['transfer_rows'][0]['transfer_number'] == issue.document_number
+
+    order.order_ref1c = 'order-ref'
+    issue.status = 'exported'
+    issue.exported_ref1c = 'issue-ref'
+    db_session.add_all([
+        models.SyncLink(
+            source_system='PRODPLAN', target_system='1C',
+            source_doctype='production_order', source_id=order.order_id,
+            target_entity='Document_ЗаказНаПроизводство',
+            target_ref_key='order-ref', target_number='PP000001', status='success',
+        ),
+        models.SyncLink(
+            source_system='PRODPLAN', target_system='1C',
+            source_doctype='material_issue', source_id=issue.issue_id,
+            target_entity='Document_ПеремещениеЗапасов',
+            target_ref_key='issue-ref', target_number='MT000002', status='success',
+        ),
+    ])
+    db_session.flush()
+
+    receipt = render_route_sheet_command_receipt(
+        db_session,
+        basis,
+        required_order_ids=[order.order_id],
+        required_issue_ids=[issue.issue_id],
+    )
+
+    assert receipt is not None
+    assert receipt['basis_revision'] == 'receipt-basis'
+    assert receipt['identities'] == [identity]
+    assert 'PP000001' in receipt['html']
+    assert f'{issue.document_number} / MT000002' in receipt['html']
+    assert 'window.print()' in receipt['html']
+    issue.status = 'error'
+    db_session.flush()
+    assert render_route_sheet_command_receipt(
+        db_session, basis, required_issue_ids=[issue.issue_id],
+    ) is None
+    issue.status = 'exported'
+    product.quantity = 4
+    db_session.flush()
+    assert render_route_sheet_command_receipt(
+        db_session, basis, required_order_ids=[order.order_id],
+    ) is None
+
+
+def test_both_export_routes_capture_print_basis_before_external_service(db_session, monkeypatch):
+    from types import SimpleNamespace
+    from app.routers import production_control as router
+    from app.routers.production_control import (
+        ExportMaterialIssuesPayload,
+        ExportProductionOrdersPayload,
+    )
+    from app.services.production_control_journal import materialize_make_work_items
+
+    work, _, _ = _current(db_session)
+    created = materialize_make_work_items(db_session, [work.id], launch_requests={
+        work.id: {'launch_qty': 3, 'expected_materialized_qty': 0},
+    })['created'][0]
+    product = db_session.get(models.ProductionProduct, created['product_id'])
+    issue = models.ProductionMaterialIssue(
+        product_id=product.product_id,
+        order_id=product.order_id,
+        document_number='LOCAL-MT-1',
+        status='draft',
+        direction='issue',
+        source_warehouse_ref1c='source',
+        warehouse_ref1c='destination',
+        ledger_generation_id=work.ledger_generation_id,
+    )
+    db_session.add(issue)
+    db_session.commit()
+    manifest = SimpleNamespace(source_revision='rev-before-1c')
+    current_row = SimpleNamespace(
+        business_identity='production:order:test',
+        payload={'product_id': product.product_id},
+    )
+    timeline = []
+
+    def capture(*args, **kwargs):
+        timeline.append(('capture', kwargs['source_revision']))
+        return {'captured': True}
+
+    def refresh(_db, product_ids, result, **kwargs):
+        timeline.append((
+            'refresh', tuple(product_ids), kwargs.get('print_basis'),
+            tuple(kwargs.get('required_order_ids') or ()),
+            tuple(kwargs.get('required_issue_ids') or ()),
+        ))
+        return result
+
+    monkeypatch.setattr(router, 'capture_route_sheet_command_basis', capture)
+    monkeypatch.setattr(router, '_refresh_exported_executors', refresh)
+    monkeypatch.setattr(
+        router,
+        '_require_current_production_identities',
+        lambda *args, **kwargs: (manifest, [current_row]),
+    )
+    monkeypatch.setattr(
+        router,
+        'export_production_orders_to_1c',
+        lambda *args, **kwargs: timeline.append(('order-export',)) or {'status': 'ok'},
+    )
+
+    router.post_export_production_orders_to_1c(
+        ExportProductionOrdersPayload(
+            order_ids=[product.order_id],
+            dry_run=False,
+            current_identities=['production:order:test'],
+            expected_source_revision='rev-before-1c',
+        ),
+        db=db_session,
+    )
+
+    assert timeline[:2] == [('capture', 'rev-before-1c'), ('order-export',)]
+    assert timeline[2] == (
+        'refresh', (product.product_id,), {'captured': True},
+        (product.order_id,), (),
+    )
+
+    timeline.clear()
+    monkeypatch.setattr(router, 'require_current_execution_scope', lambda *args, **kwargs: manifest)
+    monkeypatch.setattr(router, 'load_current_execution_rows', lambda *args, **kwargs: [current_row])
+    monkeypatch.setattr(
+        router,
+        'export_material_issues_to_1c',
+        lambda *args, **kwargs: timeline.append(('issue-export',)) or {'status': 'ok'},
+    )
+
+    router.post_export_material_issues_to_1c(
+        ExportMaterialIssuesPayload(
+            issue_ids=[issue.issue_id],
+            dry_run=False,
+            current_identities=['production:order:test'],
+            expected_source_revision='rev-before-1c',
+        ),
+        db=db_session,
+    )
+
+    assert timeline[:2] == [('capture', 'rev-before-1c'), ('issue-export',)]
+    assert timeline[2] == (
+        'refresh', (product.product_id,), {'captured': True},
+        (), (issue.issue_id,),
+    )
+
+
 def test_export_schedules_metadata_refresh_only_after_success_commit(monkeypatch):
     from types import SimpleNamespace
     from app.routers.production_control import (
@@ -463,6 +706,35 @@ def test_export_schedules_metadata_refresh_only_after_success_commit(monkeypatch
     )
 
 
+@pytest.mark.parametrize('incomplete', [
+    {'status': 'ok', 'skipped_rows': [{'order_id': 7, 'reason': 'line missing'}]},
+    {'status': 'partial_error', 'skipped_rows': []},
+    {'status': 'ok', 'orders_error': 1, 'skipped_rows': []},
+    {'status': 'ok', 'issues_error': 1, 'skipped_rows': []},
+    {'status': 'ok', 'skipped_rows': [], 'parent_orders_export': {
+        'status': 'partial_error', 'orders_error': 1,
+    }},
+])
+def test_incomplete_export_never_formats_print_receipt(monkeypatch, incomplete):
+    from types import SimpleNamespace
+    from app.routers import production_control
+
+    monkeypatch.setattr(
+        production_control,
+        'render_route_sheet_command_receipt',
+        lambda *args, **kwargs: pytest.fail('incomplete export must not format a receipt'),
+    )
+    result = production_control._refresh_exported_executors(
+        SimpleNamespace(commit=lambda: None),
+        [19487],
+        dict(incomplete),
+        print_basis={'captured': True},
+    )
+
+    assert 'print_receipt' not in result
+    assert result['projection_refresh_error'] == 'Обновление журнала выполняется в фоне'
+
+
 def test_background_metadata_busy_cannot_change_success_receipt(monkeypatch):
     from app.routers.production_control import _refresh_exported_executors_metadata
     from app.services import production_control_command_worker
@@ -505,6 +777,17 @@ def test_asgi_sends_success_receipt_before_metadata_background_starts(monkeypatc
         "_refresh_exported_executors_metadata",
         metadata_only,
     )
+    print_receipt = {
+        "html": "<html>PP059717709</html>",
+        "basis_revision": "rev-7",
+        "identities": ["production:order:19487"],
+        "verified_refs": {"production_orders": [], "material_issues": []},
+    }
+    monkeypatch.setattr(
+        production_control,
+        "render_route_sheet_command_receipt",
+        lambda *args, **kwargs: print_receipt,
+    )
 
     app = FastAPI()
 
@@ -519,6 +802,7 @@ def test_asgi_sends_success_receipt_before_metadata_background_starts(monkeypatc
             [19487],
             receipt,
             background_tasks=background_tasks,
+            print_basis={"basis": "captured-before-1c"},
         )
 
     sent = []
@@ -562,4 +846,5 @@ def test_asgi_sends_success_receipt_before_metadata_background_starts(monkeypatc
     assert payload["entries"] == [
         {"status": "created", "number": "PP059717709"}
     ]
+    assert payload["print_receipt"] == print_receipt
     assert timeline == ["committed", "body-sent", ("background", [19487])]

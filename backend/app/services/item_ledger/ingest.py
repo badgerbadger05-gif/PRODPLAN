@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
@@ -100,6 +100,23 @@ class PullResult:
     diagnostics: List[str] = field(default_factory=list)
     physical_import_batch_id: Optional[int] = None
     error: Optional[str] = None
+    # Batch callers with ``publish_current=False`` must close this flag at
+    # their final local transaction boundary. No custody event is appended
+    # while network I/O may still follow.
+    deferred_current_custody: bool = False
+
+
+@dataclass(frozen=True)
+class DeferredCustodyFinalizeResult:
+    finalized_recorders: int
+    accepted_events: int
+    candidate_events: int
+    folded_events: int
+    semantic_changed: bool
+    pending_recorders: tuple[tuple[str, str], ...] = ()
+
+
+DEFERRED_CUSTODY_KEY = "deferred_custody_recorders"
 
 
 class HistoricalPullValidationError(ValueError):
@@ -554,6 +571,10 @@ def pull_recorder_movements(
             invalidate_material_custody_dependents,
             project_transfer_custody_events_for_recorder,
         )
+        if not publish_current:
+            result.deferred_current_custody = True
+            session.flush()
+            return result
         appended_custody = project_transfer_custody_events_for_recorder(
             session,
             recorder_type=recorder_type,
@@ -633,7 +654,6 @@ def pull_recorder_movements(
     for old in active_rows:
         old.active = False
 
-    new_by_line: Dict[str, models.StockLedgerEntry] = {}
     new_entries: List[models.StockLedgerEntry] = []
     for key, signed_qty, record_type, line_no, posting_at in normalized:
         entry = models.StockLedgerEntry(
@@ -658,25 +678,55 @@ def pull_recorder_movements(
             )
         session.add(entry)
         new_entries.append(entry)
-        new_by_line[line_no] = entry
         touched[key] = None
     session.flush()
     from app.services.production_material_custody_events import (
         project_transfer_custody_events_for_recorder,
     )
-    project_transfer_custody_events_for_recorder(
-        session,
-        recorder_type=recorder_type,
-        recorder_ref=recorder_ref,
-        stock_ledger_entries=new_entries,
-    )
+    if publish_current:
+        project_transfer_custody_events_for_recorder(
+            session,
+            recorder_type=recorder_type,
+            recorder_ref=recorder_ref,
+            stock_ledger_entries=new_entries,
+        )
+    else:
+        result.deferred_current_custody = True
 
+    # Canonical document-line continuity is physical-key based. A 1C table
+    # part can reorder every LineNumber while keeping the same movements; line
+    # number pairing then creates cross-item supersession edges and sends BUY
+    # replay into the wrong distribution scope. Reuse the one revision matcher
+    # used by freeze history (§55): same number is only a fast path inside the
+    # same physical key, otherwise repeated keys pair by stable ordinal.
+    from .physical_visibility import known_revisions_by_sle
+
+    revisions = known_revisions_by_sle(
+        session, active_rows, _include_sle_ids=True,
+    )
+    new_ids = {int(row.id) for row in new_entries}
+    paired_new_ids: set[int] = set()
     for old in active_rows:
-        new = new_by_line.get(str(old.line_no or ""))
+        candidates = {
+            int(revision[3])
+            for revision in revisions.get(int(old.id), ())
+            if len(revision) >= 4 and int(revision[3]) in new_ids
+        }
+        if len(candidates) > 1:
+            raise HistoricalPullValidationError(
+                "recorder revision has ambiguous physical-key continuity"
+            )
+        new_id = next(iter(candidates), None)
+        if new_id is not None and new_id in paired_new_ids:
+            raise HistoricalPullValidationError(
+                "recorder revision maps multiple old rows to one replacement"
+            )
+        if new_id is not None:
+            paired_new_ids.add(new_id)
         session.add(
             models.StockLedgerFactSupersession(
                 old_sle_id=old.id,
-                new_sle_id=new.id if new is not None else None,
+                new_sle_id=new_id,
                 import_batch_id=import_batch.id,
             )
         )
@@ -708,6 +758,250 @@ def pull_recorder_movements(
         pull_row.order_ref = header_order_ref
     session.flush()
     return result
+
+
+def finalize_deferred_current_custody(
+    session: Session,
+    *,
+    recorders: Iterable[tuple[str, str]],
+) -> DeferredCustodyFinalizeResult:
+    """Project deferred custody once, after the caller's last network read.
+
+    Accepted-prefix recorders are projected and folded into the compact
+    accepted owner only when no prior event suffix exists. Candidate recorders
+    stay as technical identities until the target publication transaction.
+    Their projector may repair a missing issue opening with a non-physical
+    event, so even a candidate-only projection can fence compact current reads.
+    """
+
+    deferred = tuple(dict.fromkeys(
+        (str(kind or "").strip(), _norm_ref(ref))
+        for kind, ref in recorders
+    ))
+    total = len(deferred)
+    if total == 0:
+        return DeferredCustodyFinalizeResult(0, 0, 0, 0, False)
+
+    from app.services.production_material_custody_events import (
+        invalidate_material_custody_dependents,
+        project_transfer_custody_events_for_recorder,
+    )
+
+    def active_rows(identity: tuple[str, str]) -> list[models.StockLedgerEntry]:
+        kind, ref = identity
+        return (
+            session.query(models.StockLedgerEntry)
+            .filter(
+                models.StockLedgerEntry.recorder_type == kind,
+                models.StockLedgerEntry.recorder_ref == ref,
+                models.StockLedgerEntry.ingest_source == INGEST_SOURCE,
+                models.StockLedgerEntry.active.is_(True),
+            )
+            .order_by(models.StockLedgerEntry.line_no, models.StockLedgerEntry.id)
+            .all()
+        )
+
+    rows_by_recorder = {identity: active_rows(identity) for identity in deferred}
+    pointer = session.get(models.PlanningTruthState, 1)
+    accepted_visible_ids: set[int] = set()
+    if pointer is not None and pointer.current_generation_id is not None:
+        generation = session.get(
+            models.LedgerGeneration, int(pointer.current_generation_id)
+        )
+        explicit_ids = {
+            int(row.id)
+            for rows in rows_by_recorder.values()
+            for row in rows
+        }
+        if (
+            generation is not None
+            and str(generation.status or "") == "accepted"
+            and generation.physical_import_batch_id is not None
+            and explicit_ids
+        ):
+            from .physical_visibility import visible_sle_query
+
+            accepted_visible_ids = {
+                int(row.id)
+                for row in visible_sle_query(
+                    session,
+                    physical_import_batch_id=int(generation.physical_import_batch_id),
+                    cutoff=generation.cutoff,
+                ).filter(models.StockLedgerEntry.id.in_(sorted(explicit_ids))).all()
+            }
+    accepted = tuple(
+        identity for identity, rows in rows_by_recorder.items()
+        if rows and all(int(row.id) in accepted_visible_ids for row in rows)
+    )
+    candidates = tuple(identity for identity in deferred if identity not in set(accepted))
+
+    pending_accepted: tuple[tuple[str, str], ...] = ()
+    if accepted and pointer is not None and pointer.current_generation_id is not None:
+        manifest = session.get(
+            models.ProductionMaterialCustodyProjectionManifest,
+            int(pointer.current_generation_id),
+        )
+        manifest_high = int(manifest.source_event_high_watermark_id or 0) if manifest else 0
+        stream_high = int(
+            session.query(func.max(models.ProductionMaterialCustodyEvent.id)).scalar()
+            or 0
+        )
+        if stream_high > manifest_high:
+            # An earlier window already committed target-staging events. Do
+            # not append accepted events behind that fence: the accepted fold
+            # cannot cross it. Persist identities on the target and project
+            # them inside the eventual target publication transaction.
+            pending_accepted = accepted
+            accepted = ()
+
+    accepted_events = 0
+    for identity in accepted:
+        accepted_events += int(project_transfer_custody_events_for_recorder(
+            session,
+            recorder_type=identity[0],
+            recorder_ref=identity[1],
+            stock_ledger_entries=rows_by_recorder[identity],
+            invalidate_current=False,
+        ))
+
+    folded_events = 0
+    semantic_changed = False
+    if accepted_events:
+        from .physical_refresh_provenance import (
+            apply_accepted_current_material_custody_events,
+            select_accepted_current_material_custody_prefix,
+        )
+
+        prefix = select_accepted_current_material_custody_prefix(session)
+        fold = None
+        if prefix.event_count:
+            with session.begin_nested():
+                fold = apply_accepted_current_material_custody_events(
+                    session,
+                    source_sle_ids=prefix.source_sle_ids,
+                    upper_event_watermark=(
+                        prefix.upper_event_watermark if prefix.has_suffix else None
+                    ),
+                )
+        pointer = session.get(models.PlanningTruthState, 1)
+        if pointer is None or pointer.current_generation_id is None:
+            raise RuntimeError("deferred custody finalizer lost accepted pointer")
+        manifest = session.get(
+            models.ProductionMaterialCustodyProjectionManifest,
+            int(pointer.current_generation_id),
+        )
+        high = int(manifest.source_event_high_watermark_id or 0) if manifest else 0
+        last_accepted_event = int(
+            session.query(func.max(models.ProductionMaterialCustodyEvent.id)).scalar()
+            or 0
+        )
+        if high < last_accepted_event:
+            raise RuntimeError(
+                "deferred accepted-current custody tail was not closed before commit"
+            )
+        folded_events = int(getattr(fold, "folded_events", 0) or 0)
+        semantic_changed = bool(getattr(fold, "semantic_changed", False))
+        if prefix.suffix_has_authoritative_event or semantic_changed:
+            invalidate_material_custody_dependents(
+                session,
+                source_revision=f"custody:event:{high}",
+            )
+
+    session.flush()
+    return DeferredCustodyFinalizeResult(
+        finalized_recorders=total,
+        accepted_events=accepted_events,
+        candidate_events=0,
+        folded_events=folded_events,
+        semantic_changed=semantic_changed,
+        pending_recorders=tuple(dict.fromkeys((*pending_accepted, *candidates))),
+    )
+
+
+def persist_deferred_custody_inputs(
+    generation: models.LedgerGeneration,
+    recorders: Iterable[tuple[str, str]],
+) -> None:
+    """Persist technical recorder inputs; never a custody quantity owner."""
+
+    marks = dict(generation.source_watermarks or {})
+    existing = marks.get(DEFERRED_CUSTODY_KEY) or []
+    identities: set[tuple[str, str]] = set()
+    for raw in existing:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("deferred custody input is malformed")
+        identity = (
+            str(raw.get("recorder_type") or "").strip(),
+            _norm_ref(raw.get("recorder_ref")),
+        )
+        if not all(identity):
+            raise RuntimeError("deferred custody input is incomplete")
+        identities.add(identity)
+    identities.update(
+        (str(kind or "").strip(), _norm_ref(ref))
+        for kind, ref in recorders
+        if str(kind or "").strip() and _norm_ref(ref)
+    )
+    if identities:
+        marks[DEFERRED_CUSTODY_KEY] = [
+            {"recorder_type": kind, "recorder_ref": ref}
+            for kind, ref in sorted(identities)
+        ]
+    else:
+        marks.pop(DEFERRED_CUSTODY_KEY, None)
+    generation.source_watermarks = marks
+
+
+def project_deferred_custody_for_target(
+    session: Session,
+    generation: models.LedgerGeneration,
+) -> int:
+    """Append saved recorder inputs as target-owned custody evidence."""
+
+    marks = dict(generation.source_watermarks or {})
+    raw_inputs = marks.get(DEFERRED_CUSTODY_KEY) or []
+    if not raw_inputs:
+        return 0
+    identities: list[tuple[str, str]] = []
+    for raw in raw_inputs:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("deferred custody input is malformed")
+        identity = (
+            str(raw.get("recorder_type") or "").strip(),
+            _norm_ref(raw.get("recorder_ref")),
+        )
+        if not all(identity):
+            raise RuntimeError("deferred custody input is incomplete")
+        identities.append(identity)
+
+    from app.services.production_material_custody_events import (
+        project_transfer_custody_events_for_recorder,
+    )
+
+    appended = 0
+    for kind, ref in sorted(set(identities)):
+        rows = (
+            session.query(models.StockLedgerEntry)
+            .filter(
+                models.StockLedgerEntry.recorder_type == kind,
+                models.StockLedgerEntry.recorder_ref == ref,
+                models.StockLedgerEntry.ingest_source == INGEST_SOURCE,
+                models.StockLedgerEntry.active.is_(True),
+            )
+            .order_by(models.StockLedgerEntry.line_no, models.StockLedgerEntry.id)
+            .all()
+        )
+        appended += int(project_transfer_custody_events_for_recorder(
+            session,
+            recorder_type=kind,
+            recorder_ref=ref,
+            stock_ledger_entries=rows,
+            invalidate_current=False,
+        ))
+    marks.pop(DEFERRED_CUSTODY_KEY, None)
+    generation.source_watermarks = marks
+    session.flush()
+    return appended
 
 
 # ---------------------------------------------------------------------------

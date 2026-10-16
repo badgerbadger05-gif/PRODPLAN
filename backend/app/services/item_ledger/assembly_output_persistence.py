@@ -1280,12 +1280,13 @@ def _moved_prefix_execution_transfers(
     output a second time against a successor run root whose planned quantity
     already excludes it.
 
-    Only an explicit supersession path, identical immutable document-line
-    evidence, and equal canonical document-net output qualify.  A changed
-    offset leg can change the net quantity while the positive SLE itself stays
-    byte-identical; that remains a genuine correction and follows the normal
-    restore-and-reallocate path.  A changed hash, recorder identity, item,
-    branch, or missing edge does the same.
+    Only an explicit supersession path, membership in the same canonical §55
+    physical revision family, equal immutable physical fields, and equal
+    canonical document-net output qualify.  Line number, business identity and
+    source hash may move when 1C reorders a table part; they are not physical
+    identity.  A changed offset leg can change the net quantity while the
+    positive SLE itself stays otherwise identical; that remains a genuine
+    correction and follows the normal restore-and-reallocate path.
     """
 
     if not removed_rows or not new_facts:
@@ -1298,6 +1299,20 @@ def _moved_prefix_execution_transfers(
         removed_by_sle.setdefault(int(row.stock_ledger_entry_id), []).append(row)
     previous_by_id = _facts_by_sle(previous_facts)
     new_by_id = {int(fact.stock_ledger_entry_id): fact for fact in new_facts}
+    sle_ids = sorted(set(removed_by_sle) | set(new_by_id))
+    sle_by_id = {
+        int(row.id): row
+        for row in db.query(models.StockLedgerEntry).filter(
+            models.StockLedgerEntry.id.in_(sle_ids)
+        ).all()
+    }
+    from .physical_visibility import known_revisions_by_sle
+
+    canonical_revisions = known_revisions_by_sle(
+        db,
+        [sle_by_id[sle_id] for sle_id in sorted(removed_by_sle) if sle_id in sle_by_id],
+        _include_sle_ids=True,
+    )
     origins_by_node: dict[int, set[int]] = {
         sle_id: {sle_id} for sle_id in removed_by_sle
     }
@@ -1350,17 +1365,32 @@ def _moved_prefix_execution_transfers(
             continue
         fact = new_by_id[next(iter(candidates))]
         old = previous_by_id.get(old_id)
-        if old is None:
+        old_sle = sle_by_id.get(old_id)
+        new_sle = sle_by_id.get(int(fact.stock_ledger_entry_id))
+        revision_ids = {
+            int(revision[3])
+            for revision in canonical_revisions.get(old_id, ())
+            if len(revision) >= 4
+        }
+        if (
+            old is None
+            or old_sle is None
+            or new_sle is None
+            or int(fact.stock_ledger_entry_id) not in revision_ids
+        ):
             continue
         if (
-            not old.source_content_hash
-            or old.source_content_hash != fact.source_content_hash
-            or int(old.item_id) != int(fact.item_id)
-            or old.recorder_type != fact.recorder_type
-            or old.recorder_ref != fact.recorder_ref
-            or old.line_no != fact.line_no
-            or _comparable_datetime(old.posting_at)
-            != _comparable_datetime(fact.posting_at)
+            int(old_sle.item_id) != int(new_sle.item_id)
+            or _text(old_sle.characteristic_ref) != _text(new_sle.characteristic_ref)
+            or _text(old_sle.organization_ref) != _text(new_sle.organization_ref)
+            or _text(old_sle.warehouse_ref1c) != _text(new_sle.warehouse_ref1c)
+            or _text(old_sle.recorder_type) != _text(new_sle.recorder_type)
+            or _text(old_sle.recorder_ref) != _text(new_sle.recorder_ref)
+            or _text(old_sle.record_type) != _text(new_sle.record_type)
+            or _text(old_sle.movement_kind) != _text(new_sle.movement_kind)
+            or _comparable_datetime(old_sle.posting_at)
+            != _comparable_datetime(new_sle.posting_at)
+            or _dec(old_sle.qty) != _dec(new_sle.qty)
             or _dec(old.qty) != _dec(fact.qty)
         ):
             continue

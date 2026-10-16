@@ -238,7 +238,7 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
     ])
     db_session.commit()
 
-    calls: list[tuple[str, str, bool, datetime]] = []
+    calls: list[tuple[str, str, bool, datetime, object]] = []
     outcomes = {
         ("Document_Expense", "expense-pending"): PullResult(
             status="done",
@@ -249,6 +249,7 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
             status="done",
             inserted=0,
             touched_keys=[],
+            deferred_current_custody=True,
         ),
         ("Document_Receipt", "receipt-visible-2"): PullResult(
             status="empty",
@@ -268,7 +269,13 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
         strict_historical=True,
         **kwargs,
     ):
-        calls.append((recorder_type, recorder_ref, strict_historical, max_posting_at, kwargs.get("sequence_lock_held")))
+        calls.append((
+            recorder_type,
+            recorder_ref,
+            strict_historical,
+            max_posting_at,
+            kwargs.get("publish_current"),
+        ))
         result = outcomes[(recorder_type, recorder_ref)]
         if result.inserted:
             batch = models.PhysicalImportBatch(
@@ -296,6 +303,20 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
         "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
         _pull_recorder_movements,
     )
+    finalized = []
+
+    def _finalize(_db, *, recorders):
+        assert len(calls) == 3
+        finalized.append(tuple(recorders))
+        return type("Finalized", (), {
+            "finalized_recorders": 1,
+            "pending_recorders": (),
+        })()
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.finalize_deferred_current_custody",
+        _finalize,
+    )
 
     result = run_physical_recorder_audit(
         db_session,
@@ -311,10 +332,11 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
     assert result.changed_recorders == 1
     assert result.terminal_physical_import_batch_id > int(parent.physical_import_batch_id)
     assert calls == [
-        ("Document_Expense", "expense-pending", True, target.cutoff, None),
-        ("Document_Receipt", "receipt-visible", True, target.cutoff, None),
-        ("Document_Receipt", "receipt-visible-2", True, target.cutoff, None),
+        ("Document_Expense", "expense-pending", True, target.cutoff, False),
+        ("Document_Receipt", "receipt-visible", True, target.cutoff, False),
+        ("Document_Receipt", "receipt-visible-2", True, target.cutoff, False),
     ]
+    assert finalized == [(('Document_Receipt', 'receipt-visible'),)]
 
     checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
         ledger_generation_id=int(target.id),

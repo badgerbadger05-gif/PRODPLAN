@@ -338,6 +338,42 @@ def test_exact_repull_rolls_back_partial_custody_fold_before_deferring(
     assert invalidations == ["custody:transfer:trn-savepoint"]
 
 
+def test_batch_exact_repull_defers_custody_until_network_boundary(
+    db_session, monkeypatch,
+):
+    from app.services import production_material_custody_events as custody_events
+
+    _setup(db_session)
+    client = FakeODataClient({
+        "trn-batch-deferred": [
+            _line("1", "Receipt", "ref-item-1", "wh-1", 5),
+        ]
+    })
+    pull_recorder_movements(
+        db_session, TRANSFER, "trn-batch-deferred", client=client,
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda *args, **kwargs: pytest.fail(
+            "batch pull must not project accepted custody inside network loop"
+        ),
+    )
+    result = pull_recorder_movements(
+        db_session,
+        TRANSFER,
+        "trn-batch-deferred",
+        client=client,
+        publish_current=False,
+    )
+
+    assert result.inserted == 0
+    assert result.deleted == 0
+    assert result.deferred_current_custody is True
+
+
 def test_exact_repull_staging_only_tail_does_not_invalidate_accepted_math(
     db_session, monkeypatch,
 ):
@@ -404,6 +440,51 @@ def test_pull_replace_by_recorder_updates_qty(db_session):
         recorder_ref="asm-1", active=True
     ).count() == 1
     assert _f(db_session.query(models.StockBin).filter_by(item_id=item1.item_id).one().on_hand) == 8
+
+
+def test_reordered_document_lines_supersede_same_physical_key(db_session):
+    item1, item2 = _setup(db_session)
+    recorder = "asm-reordered-lines"
+    first = FakeODataClient({
+        recorder: [
+            _line("1", "Receipt", "ref-item-1", "wh-1", 5),
+            _line("2", "Receipt", "ref-item-2", "wh-2", 3),
+        ]
+    })
+    pull_recorder_movements(db_session, ASSEMBLY, recorder, client=first)
+    db_session.commit()
+    old_by_item = {
+        int(row.item_id): int(row.id)
+        for row in db_session.query(models.StockLedgerEntry).filter_by(
+            recorder_ref=recorder, active=True,
+        )
+    }
+
+    reordered = FakeODataClient({
+        recorder: [
+            _line("1", "Receipt", "ref-item-2", "wh-2", 3),
+            _line("2", "Receipt", "ref-item-1", "wh-1", 5),
+        ]
+    })
+    pull_recorder_movements(db_session, ASSEMBLY, recorder, client=reordered)
+    db_session.flush()
+
+    new_by_item = {
+        int(row.item_id): int(row.id)
+        for row in db_session.query(models.StockLedgerEntry).filter_by(
+            recorder_ref=recorder, active=True,
+        )
+    }
+    edges = db_session.query(models.StockLedgerFactSupersession).filter(
+        models.StockLedgerFactSupersession.old_sle_id.in_(old_by_item.values())
+    ).all()
+    assert {
+        int(edge.old_sle_id): int(edge.new_sle_id)
+        for edge in edges
+    } == {
+        old_by_item[item1.item_id]: new_by_item[item1.item_id],
+        old_by_item[item2.item_id]: new_by_item[item2.item_id],
+    }
 
 
 # ---------------------------------------------------------------------------

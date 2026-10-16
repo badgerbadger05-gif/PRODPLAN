@@ -5,6 +5,7 @@ import type {
   MaterialIssueCreateResponse,
   MaterialIssueCreatePayload,
   MaterialsResponse,
+  MaterialIssueExportResponse,
   PaintWeldChainClosePayload,
   ProductionOperationsResponse,
   ProduceLinePayload,
@@ -235,26 +236,46 @@ export async function fetchRouteSheetsPrintHtml(
     auto_print: 'true',
   })
   const html = await apiText(`/v1/production-control/route-sheets/print?${query.toString()}`)
-  void apiText('/v1/production-control/route-sheets/print', {
+  void markRouteSheetsPrinted(
+    productIds,
+    currentIdentities,
+    expectedSourceRevision ?? '',
+    true,
+  ).catch(() => undefined)
+  return html
+}
+
+export function markRouteSheetsPrinted(
+  productIds: number[],
+  currentIdentities: string[],
+  expectedSourceRevision: string,
+  autoPrint = false,
+) {
+  return apiText('/v1/production-control/route-sheets/print', {
     method: 'POST',
     body: JSON.stringify({
       product_ids: productIds,
       current_identities: currentIdentities,
       expected_source_revision: expectedSourceRevision,
       mark_printed: true,
-      auto_print: true,
+      auto_print: autoPrint,
     }),
-  }).catch(() => undefined)
-  return html
+  })
 }
 
-export function exportMaterialIssuesTo1C(issueIds: number[]) {
+export function exportMaterialIssuesTo1C(
+  issueIds: number[],
+  currentIdentities: string[] = [],
+  expectedSourceRevision?: string,
+) {
   const payload: ApiSchemas['ExportMaterialIssuesPayload'] = {
     issue_ids: issueIds,
     dry_run: false,
     allow_production: true,
+    current_identities: currentIdentities,
+    expected_source_revision: expectedSourceRevision,
   }
-  return api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
+  return api<MaterialIssueExportResponse>('/v1/production-control/material-issues/export-to-1c', {
     method: 'POST',
     body: JSON.stringify(payload),
   })

@@ -6,6 +6,12 @@ import pytest
 from app import models
 from app.services.item_ledger.future_supply_read import future_supply_model
 from app.services.item_ledger import physical_refresh_orchestrator as workflow
+from app.services.item_ledger.ingest import (
+    DEFERRED_CUSTODY_KEY,
+    finalize_deferred_current_custody,
+    persist_deferred_custody_inputs,
+    project_deferred_custody_for_target,
+)
 from app.services.item_ledger.physical_refresh_provenance import (
     PhysicalRefreshProvenanceUnavailable,
     apply_accepted_current_material_custody_events,
@@ -87,6 +93,218 @@ def _world(db):
     db.add_all([current, custody, manifest])
     db.flush()
     return parent, target, current, custody
+
+
+def test_deferred_accepted_alias_waits_behind_prior_staging_suffix(
+    db_session, monkeypatch,
+):
+    from app.services import production_material_custody_events as custody_events
+
+    parent, target, _current, custody = _world(db_session)
+    accepted_sle = models.StockLedgerEntry(
+        ingest_batch_id=int(parent.physical_import_batch_id),
+        source_content_hash="accepted-alias",
+        business_identity="accepted-alias",
+        item_id=int(custody.component_item_id),
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("1"),
+        posting_at=parent.cutoff,
+        record_type="Receipt",
+        movement_kind="transfer_in",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="accepted-alias-recorder",
+        line_no="1",
+        ingest_source="document_pull",
+        active=True,
+    )
+    staging_sle = models.StockLedgerEntry(
+        ingest_batch_id=int(target.physical_import_batch_id),
+        source_content_hash="staging-suffix",
+        business_identity="staging-suffix",
+        item_id=int(custody.component_item_id),
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("1"),
+        posting_at=target.cutoff,
+        record_type="Receipt",
+        movement_kind="transfer_in",
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="staging-recorder",
+        line_no="1",
+        ingest_source="document_pull",
+        active=True,
+    )
+    db_session.add_all([accepted_sle, staging_sle])
+    db_session.flush()
+    db_session.add(models.ProductionMaterialCustodyEvent(
+        product_id=int(custody.product_id),
+        component_item_id=int(custody.component_item_id),
+        source_kind="transfer_posted",
+        source_sle_id=int(staging_sle.id),
+        effective_at=target.cutoff,
+        location_kind="workshop",
+        warehouse_ref1c="WH",
+        delta_qty=Decimal("1"),
+        idempotency_key="prior-window-staging-suffix",
+    ))
+    db_session.flush()
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda *args, **kwargs: pytest.fail(
+            "accepted alias must not be appended behind staging suffix"
+        ),
+    )
+
+    finalized = finalize_deferred_current_custody(
+        db_session,
+        recorders=((accepted_sle.recorder_type, accepted_sle.recorder_ref),),
+    )
+
+    assert finalized.accepted_events == 0
+    assert finalized.pending_recorders == ((
+        accepted_sle.recorder_type, accepted_sle.recorder_ref,
+    ),)
+    persist_deferred_custody_inputs(
+        target, finalized.pending_recorders,
+    )
+    assert target.source_watermarks[DEFERRED_CUSTODY_KEY] == [{
+        "recorder_type": accepted_sle.recorder_type,
+        "recorder_ref": accepted_sle.recorder_ref,
+    }]
+
+    projected = []
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda _db, **kwargs: projected.append(
+            (kwargs["recorder_type"], kwargs["recorder_ref"])
+        ) or 0,
+    )
+    assert project_deferred_custody_for_target(
+        db_session, target,
+    ) == 0
+    assert projected == [(
+        accepted_sle.recorder_type, accepted_sle.recorder_ref,
+    )]
+    assert DEFERRED_CUSTODY_KEY not in target.source_watermarks
+
+
+def test_candidate_custody_waits_across_windows_without_fencing_current(
+    db_session, monkeypatch,
+):
+    from app.services import production_material_custody_events as custody_events
+
+    parent, first_target, _current, custody = _world(db_session)
+
+    def candidate_sle(target, *, ref: str, suffix: str):
+        row = models.StockLedgerEntry(
+            ingest_batch_id=int(target.physical_import_batch_id),
+            source_content_hash=f"candidate-{suffix}",
+            business_identity=f"candidate-{suffix}",
+            item_id=int(custody.component_item_id),
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH",
+            qty=Decimal("1"),
+            posting_at=target.cutoff,
+            record_type="Receipt",
+            movement_kind="transfer_in",
+            recorder_type="Document_ПеремещениеЗапасов",
+            recorder_ref=ref,
+            line_no="1",
+            ingest_source="document_pull",
+            active=True,
+        )
+        db_session.add(row)
+        db_session.flush()
+        return row
+
+    # The real projector can append a source_sle_id=None issue opening while
+    # repairing an older transfer. Any call at a window checkpoint would make
+    # compact current unavailable immediately, so both windows must only save
+    # their recorder identities.
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda *args, **kwargs: pytest.fail(
+            "candidate custody must wait for target publication"
+        ),
+    )
+    first = candidate_sle(first_target, ref="candidate-window-1", suffix="one")
+    finalized = finalize_deferred_current_custody(
+        db_session,
+        recorders=((first.recorder_type, first.recorder_ref),),
+    )
+    assert finalized.candidate_events == 0
+    assert finalized.pending_recorders == ((first.recorder_type, first.recorder_ref),)
+    persist_deferred_custody_inputs(first_target, finalized.pending_recorders)
+    db_session.flush()
+    assert load_compact_current_material_custody(
+        db_session, consumer="candidate-window-one",
+    )[0] == int(parent.id)
+
+    first_target.status = "rejected"
+    second_batch = models.PhysicalImportBatch(
+        batch_key="handoff-target-batch-2",
+        status="completed",
+        source_watermarks={},
+        cutoff=parent.cutoff,
+    )
+    second_target = models.LedgerGeneration(
+        generation_key="handoff-target-2",
+        status="building",
+        cutoff=parent.cutoff,
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities={},
+        physical_import_batch=second_batch,
+        algorithm_version="test",
+    )
+    db_session.add_all([second_batch, second_target])
+    db_session.flush()
+    second = candidate_sle(second_target, ref="candidate-window-2", suffix="two")
+    finalized = finalize_deferred_current_custody(
+        db_session,
+        recorders=((second.recorder_type, second.recorder_ref),),
+    )
+    persist_deferred_custody_inputs(second_target, finalized.pending_recorders)
+    workflow._inherit_deferred_custody_inputs(
+        db_session,
+        parent_generation_id=int(parent.id),
+        target=second_target,
+    )
+    db_session.delete(first)
+    db_session.flush()
+
+    # Even after the first rejected window's candidate SLE is discarded, no
+    # orphaned physical event or repaired non-physical opening exists to fence
+    # the accepted compact owner.
+    assert load_compact_current_material_custody(
+        db_session, consumer="candidate-window-two",
+    )[0] == int(parent.id)
+    assert second_target.source_watermarks[DEFERRED_CUSTODY_KEY] == [
+        {
+            "recorder_type": "Document_ПеремещениеЗапасов",
+            "recorder_ref": "candidate-window-1",
+        },
+        {
+            "recorder_type": "Document_ПеремещениеЗапасов",
+            "recorder_ref": "candidate-window-2",
+        },
+    ]
+
+    projected = []
+    monkeypatch.setattr(
+        custody_events,
+        "project_transfer_custody_events_for_recorder",
+        lambda _db, **kwargs: projected.append(kwargs["recorder_ref"]) or 0,
+    )
+    project_deferred_custody_for_target(db_session, second_target)
+    assert projected == ["candidate-window-1", "candidate-window-2"]
+    assert DEFERRED_CUSTODY_KEY not in second_target.source_watermarks
 
 
 @pytest.mark.parametrize('mutation', ['valid', 'bad_key', 'backdated', 'future', 'foreign_warehouse'])

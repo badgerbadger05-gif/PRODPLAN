@@ -4424,6 +4424,10 @@ export interface components {
              * @default true
              */
             dry_run: boolean;
+            /** Current Identities */
+            current_identities?: string[];
+            /** Expected Source Revision */
+            expected_source_revision?: string | null;
             /**
              * Allow Production
              * @default false

@@ -36,6 +36,8 @@ from .historical_register_scan import (
 from .ingest import (
     DEFAULT_MAX_ATTEMPTS,
     HistoricalPullBeyondCutoffError,
+    finalize_deferred_current_custody,
+    persist_deferred_custody_inputs,
     pull_recorder_movements,
 )
 from .opening_balance_reconcile import (
@@ -637,6 +639,7 @@ def run_physical_recorder_audit(
     expected_terminal_id = start_boundary_id
     pull_state_drift_set = set(pull_state_drift)
     deferred_pull_state_drift: list[tuple[str, str]] = []
+    deferred_custody_recorders: list[tuple[str, str]] = []
 
     try:
         for recorder_type, recorder_ref in target_recorders:
@@ -649,6 +652,7 @@ def run_physical_recorder_audit(
                 ledger_generation_id=None,
                 max_posting_at=generation.cutoff,
                 strict_historical=True,
+                publish_current=False,
             )
             try:
                 result = pull_recorder_movements(
@@ -696,6 +700,8 @@ def run_physical_recorder_audit(
                 raise PhysicalRefreshImportError(
                     f"recorder {recorder_type} {recorder_ref} produced skipped movements"
                 )
+            if result.deferred_current_custody:
+                deferred_custody_recorders.append((recorder_type, recorder_ref))
 
             observed_terminal = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
             result_batch_id = result.physical_import_batch_id
@@ -806,6 +812,17 @@ def run_physical_recorder_audit(
             completed_at=datetime.now(timezone.utc),
         )
         db.add(checkpoint)
+        db.flush()
+        custody = finalize_deferred_current_custody(
+            db, recorders=deferred_custody_recorders,
+        )
+        if custody.finalized_recorders != len(set(deferred_custody_recorders)):
+            raise PhysicalRefreshImportError(
+                "physical recorder audit left deferred custody recorders unclosed"
+            )
+        persist_deferred_custody_inputs(
+            generation, custody.pending_recorders,
+        )
         db.flush()
         db.commit()
 

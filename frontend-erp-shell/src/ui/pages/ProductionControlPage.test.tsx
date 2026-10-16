@@ -36,6 +36,7 @@ vi.mock('../../services/productionControl', () => ({
   updateOrderStatus: vi.fn(),
   postMaterialIssues: vi.fn(),
   fetchRouteSheetsPrintHtml: vi.fn(),
+  markRouteSheetsPrinted: vi.fn(),
   exportMaterialIssuesTo1C: vi.fn(),
   refreshCurrentProductionOrders: vi.fn(),
   markMaterialIssueAssembled: vi.fn(),
@@ -76,6 +77,7 @@ import {
   syncExecutionFrom1C,
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
+  markRouteSheetsPrinted,
   produceOrderLine,
   closeProductionOrder,
   listRootProductOptions,
@@ -399,6 +401,7 @@ beforeEach(() => {
   vi.mocked(deleteProductionOrder).mockResolvedValue({} as never)
   vi.mocked(produceOrderLine).mockResolvedValue({ qty: 10 } as never)
   vi.mocked(fetchRouteSheetsPrintHtml).mockResolvedValue('<html></html>')
+  vi.mocked(markRouteSheetsPrinted).mockResolvedValue('<html></html>')
   vi.mocked(postMaterialIssues).mockResolvedValue({
     status: 'ok',
     created: [{ issue_id: 1, document_number: 'MI-1', product_id: 101 }],
@@ -723,7 +726,15 @@ describe('ProductionControlPage — characterization', () => {
       exportCompleted = true
       return { status: 'ok', issues_created: 1,
         projection_refresh_error: 'Ledger refresh busy', parent_orders_export: { orders_created: 1,
-          entries: [{ order_id: 101, number: 'PP062017848', target_ref_key: 'created-ref', status: 'created' }] } }
+          entries: [{ order_id: 101, number: 'PP062017848', target_ref_key: 'created-ref', status: 'created' }] },
+        print_receipt: {
+          html: '<html><body>Заказ 1С PP062017848 · Перемещение MT062017849</body></html>',
+          basis_revision: 'rev-7', identities: ['production:order:101'],
+          verified_refs: {
+            production_orders: [{ order_id: 101, ref: 'created-ref', number: 'PP062017848' }],
+            material_issues: [{ issue_id: 1, ref: 'transfer-ref', number: 'MT062017849' }],
+          },
+        } }
     })
     renderPage(['/production-control'], true)
     await screen.findByText('MRP run: 77')
@@ -731,6 +742,8 @@ describe('ProductionControlPage — characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
     expect(await screen.findByText(/Заказ 1С №PP062017848 создан и проведён/)).toHaveTextContent('повторная выгрузка не требуется')
     expect(fetchRouteSheetsPrintHtml).not.toHaveBeenCalled()
+    expect(printWindow.document.write).toHaveBeenLastCalledWith(expect.stringContaining('PP062017848 · Перемещение MT062017849'))
+    expect(markRouteSheetsPrinted).toHaveBeenCalledWith([101], ['production:order:101'], 'rev-7')
     expect(within(rowFor('Кронштейн')).getByRole('checkbox')).toBeChecked()
     await waitFor(() => expect(screen.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled())
     await user.click(screen.getByRole('button', { name: 'Запустить в 1С' }))
@@ -739,7 +752,7 @@ describe('ProductionControlPage — characterization', () => {
       await waitFor(() => expect(publicationTimers.length).toBeGreaterThan(0))
       await act(async () => publicationTimers.shift()?.())
     }
-    await waitFor(() => expect(fetchRouteSheetsPrintHtml).toHaveBeenCalledWith([101], ['production:order:101'], 'published-rev'))
+    expect(fetchRouteSheetsPrintHtml).not.toHaveBeenCalled()
     expect(publicationPolls).toBeGreaterThanOrEqual(13)
     expect(refreshCurrentProductionOrders).not.toHaveBeenCalled()
     expect(exportMaterialIssuesTo1C).toHaveBeenCalledTimes(1)
@@ -1240,7 +1253,9 @@ describe('ProductionControlPage — characterization', () => {
       [101], 'erp-shell', undefined, ['production:order:101'], 'rev-7',
     ))
     // issue_id 1 from postMaterialIssues result flows into the 1C export.
-    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
+    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith(
+      [1], ['production:order:101'], 'rev-7',
+    ))
   })
 
   it('launches an order created after cutoff without materializing its retained work item again', async () => {
@@ -1274,7 +1289,9 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
       [101], 'erp-shell', undefined, ['production:order:101'], 'rev-7',
     ))
-    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
+    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith(
+      [1], ['production:order:101'], 'rev-7',
+    ))
     expect(materializeMakeWorkItems).not.toHaveBeenCalled()
   })
 
@@ -1346,7 +1363,9 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(postMaterialIssues).toHaveBeenCalledWith(
       [901], 'erp-shell', undefined, ['production:order:101'], 'rev-8',
     ))
-    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
+    await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith(
+      [1], ['production:order:101'], 'rev-8',
+    ))
     expect(vi.mocked(listProductionOrders).mock.calls.some(([params]) => params.get('product_id') === '901')).toBe(true)
     expect(screen.queryByText(/текущие строки исполнения недоступны/i)).not.toBeInTheDocument()
     expect(getOrderMaterials).not.toHaveBeenCalled()

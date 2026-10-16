@@ -183,6 +183,23 @@ export type MaterialIssueCreatePayload = {
   expected_source_revision?: string | null
 }
 
+export type RouteSheetPrintReceipt = {
+  html: string
+  basis_revision: string
+  identities: string[]
+  verified_refs: {
+    production_orders: Array<{ order_id: number; ref: string; number: string }>
+    material_issues: Array<{ issue_id: number; ref: string; number: string }>
+  }
+}
+
+export type MaterialIssueExportResponse = Record<string, unknown> & {
+  status?: string
+  projection_refresh_error?: string
+  parent_orders_export?: Record<string, unknown>
+  print_receipt?: RouteSheetPrintReceipt
+}
+
 // Исполнитель одной операции спецификации. Бэкенд ищет его по ссылке
 // (employee_ref1c), исполнителя шапки — по имени сотрудника.
 export type OperationExecutorSelection = {

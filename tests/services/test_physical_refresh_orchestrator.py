@@ -672,12 +672,25 @@ def test_targeted_repair_pulls_only_recorder_touching_mismatch(
         workflow,
         "pull_recorder_movements",
         lambda db, recorder_type, recorder_ref, **kwargs: (
-            pulled.append((recorder_type, recorder_ref))
+            pulled.append((recorder_type, recorder_ref, kwargs["publish_current"]))
             or PullResult(
                 status="done",
                 inserted=0,
                 physical_import_batch_id=parent_batch.id,
+                deferred_current_custody=True,
             )
+        ),
+    )
+    finalized = []
+    monkeypatch.setattr(
+        workflow,
+        "finalize_deferred_current_custody",
+        lambda _db, *, recorders: (
+            finalized.append(tuple(recorders))
+            or type("Finalized", (), {
+                "finalized_recorders": 1,
+                "pending_recorders": (),
+            })()
         ),
     )
 
@@ -692,7 +705,9 @@ def test_targeted_repair_pulls_only_recorder_touching_mismatch(
     assert pulled == [(
         "Document_ПеремещениеЗапасов",
         "changed-recorder",
+        False,
     )]
+    assert finalized == [(('Document_ПеремещениеЗапасов', 'changed-recorder'),)]
     assert generation.source_watermarks["targeted_convergence_repair"][
         "recorder_count"
     ] == 1

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
+from copy import deepcopy
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import select
@@ -43,6 +45,277 @@ from .item_ledger.current_execution import (
 ROUTE_SHEET_SNAPSHOT_VERSION = 1
 ROUTE_SHEET_CURRENT_ENTITY_KIND = "production_control_journal"
 ROUTE_SHEET_CURRENT_SCOPE_KEY = "production:all-live-orders"
+
+
+def capture_route_sheet_command_basis(
+    db: Session,
+    rows: Sequence[CurrentExecutionRow],
+    *,
+    source_revision: str,
+) -> dict[str, Any] | None:
+    """Capture exact persisted print inputs before an external command.
+
+    The returned value is request-local evidence only.  It is never persisted
+    as another read model and contains no values rebuilt from operational rows.
+    """
+    if not rows or not source_revision:
+        return None
+
+    products: dict[int, dict[str, Any]] = {}
+    snapshots: dict[int, dict[str, Any]] = {}
+    identities: list[str] = []
+    for current_row in rows:
+        payload = current_row.payload if isinstance(current_row.payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        required = {"product_id", "order_id", "quantity", "spec_id", "spec_revision_hash", "_route_sheet_snapshot"}
+        if not required.issubset(payload):
+            return None
+        try:
+            product_id = int(payload["product_id"])
+            order_id = int(payload["order_id"])
+            quantity = str(Decimal(str(payload["quantity"])))
+            snapshot = deepcopy(payload["_route_sheet_snapshot"])
+            anchor_product_id = int(snapshot["anchor_product_id"])
+            sheet = snapshot["sheet"]
+            if not isinstance(sheet, dict) or int(sheet["product_id"]) <= 0:
+                return None
+            float(sheet["remaining_qty"])
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+        if product_id in products:
+            return None
+        products[product_id] = {
+            "product_id": product_id,
+            "order_id": order_id,
+            "quantity": quantity,
+            "spec_id": payload.get("spec_id"),
+            "spec_revision_hash": payload.get("spec_revision_hash"),
+        }
+        snapshots.setdefault(anchor_product_id, snapshot)
+        identities.append(str(current_row.business_identity))
+
+    member_ids: set[int] = set()
+    issue_ids_by_anchor: dict[int, list[int]] = {}
+    for anchor_product_id, snapshot in snapshots.items():
+        sheet = snapshot["sheet"]
+        paint_product_id = int(sheet["product_id"])
+        chain = sheet.get("chain") or {}
+        if not isinstance(chain, dict):
+            return None
+        ordered_products = []
+        if chain.get("weld_product_id") is not None:
+            ordered_products.append(int(chain["weld_product_id"]))
+        ordered_products.append(paint_product_id)
+        member_ids.update(ordered_products)
+        product_rows = (
+            db.query(ProductionProduct)
+            .options(
+                joinedload(ProductionProduct.control_state)
+                .joinedload(ProductionOrderLineState.workshop),
+            )
+            .filter(ProductionProduct.product_id.in_(ordered_products))
+            .all()
+        )
+        product_by_id = {int(product.product_id): product for product in product_rows}
+        if set(product_by_id) != set(ordered_products):
+            return None
+        # Material issues are created after the accepted route-sheet snapshot.
+        # Reuse the canonical document/workshop/warehouse formatter to enrich
+        # only this request-local copy; quantities, components and operations
+        # remain exactly as persisted in the captured snapshot.
+        transfer_rows_by_product = _material_transfer_rows_for_products(
+            db,
+            [product_by_id[product_id] for product_id in ordered_products],
+        )
+        command_transfer_rows = [
+            deepcopy(row)
+            for product_id in ordered_products
+            for row in transfer_rows_by_product.get(product_id, [])
+        ]
+        issues = (
+            db.query(ProductionMaterialIssue.issue_id, ProductionMaterialIssue.product_id)
+            .filter(
+                ProductionMaterialIssue.product_id.in_(ordered_products),
+                ProductionMaterialIssue.direction == "issue",
+                ProductionMaterialIssue.status != "cancelled",
+            )
+            .order_by(ProductionMaterialIssue.product_id.asc(), ProductionMaterialIssue.issue_id.asc())
+            .all()
+        )
+        by_product: dict[int, list[int]] = {product_id: [] for product_id in ordered_products}
+        for issue_id, product_id in issues:
+            by_product.setdefault(int(product_id), []).append(int(issue_id))
+        ordered_issue_ids = [
+            issue_id
+            for product_id in ordered_products
+            for issue_id in by_product.get(product_id, [])
+        ]
+        if len(ordered_issue_ids) != len(command_transfer_rows):
+            return None
+        sheet["transfer_rows"] = command_transfer_rows
+        issue_ids_by_anchor[anchor_product_id] = ordered_issue_ids
+
+    if not member_ids.issubset(products):
+        return None
+    return {
+        "source_revision": str(source_revision),
+        "identities": sorted(identities),
+        "products": [products[key] for key in sorted(products)],
+        "snapshots": [snapshots[key] for key in sorted(snapshots)],
+        "issue_ids_by_anchor": issue_ids_by_anchor,
+    }
+
+
+def render_route_sheet_command_receipt(
+    db: Session,
+    basis: Mapping[str, Any] | None,
+    *,
+    required_order_ids: Sequence[int] = (),
+    required_issue_ids: Sequence[int] = (),
+) -> dict[str, Any] | None:
+    """Render a command receipt after every requested 1C document is durable."""
+    if not basis:
+        return None
+    product_basis = {
+        int(row["product_id"]): dict(row)
+        for row in basis.get("products") or []
+        if isinstance(row, Mapping) and row.get("product_id") is not None
+    }
+    if not product_basis:
+        return None
+    current_products = {
+        int(row.product_id): row
+        for row in db.query(ProductionProduct)
+        .filter(ProductionProduct.product_id.in_(sorted(product_basis)))
+        .all()
+    }
+    if set(current_products) != set(product_basis):
+        return None
+    for product_id, expected in product_basis.items():
+        product = current_products[product_id]
+        if (
+            Decimal(str(product.quantity)) != Decimal(str(expected["quantity"]))
+            or product.spec_id != expected.get("spec_id")
+            or product.spec_revision_hash != expected.get("spec_revision_hash")
+            or int(product.order_id) != int(expected["order_id"])
+        ):
+            return None
+
+    order_ids = sorted({int(row["order_id"]) for row in product_basis.values()})
+    order_links = {
+        int(link.source_id): link
+        for link in db.query(SyncLink).filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "production_order",
+            SyncLink.source_id.in_(order_ids),
+            SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+            SyncLink.status == "success",
+        ).all()
+    }
+    order_receipts: dict[int, dict[str, Any]] = {}
+    for order_id in order_ids:
+        order = next((p.order for p in current_products.values() if int(p.order_id) == order_id), None)
+        link = order_links.get(order_id)
+        if (
+            order is not None and link is not None
+            and str(order.order_ref1c or "").strip()
+            and str(order.order_ref1c).strip() == str(link.target_ref_key or "").strip()
+            and str(link.target_number or "").strip()
+        ):
+            order_receipts[order_id] = {
+                "order_id": order_id,
+                "ref": str(link.target_ref_key),
+                "number": str(link.target_number),
+            }
+    if not set(map(int, required_order_ids)).issubset(order_receipts):
+        return None
+
+    all_issue_ids = sorted({
+        int(issue_id)
+        for ids in (basis.get("issue_ids_by_anchor") or {}).values()
+        for issue_id in ids
+    })
+    issue_rows = {
+        int(issue.issue_id): issue
+        for issue in db.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.issue_id.in_(all_issue_ids))
+        .all()
+    } if all_issue_ids else {}
+    issue_links = {
+        int(link.source_id): link
+        for link in db.query(SyncLink).filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id.in_(all_issue_ids),
+            SyncLink.status == "success",
+        ).all()
+    } if all_issue_ids else {}
+    issue_receipts: dict[int, dict[str, Any]] = {}
+    for issue_id in all_issue_ids:
+        issue = issue_rows.get(issue_id)
+        link = issue_links.get(issue_id)
+        if (
+            issue is not None and link is not None
+            and str(issue.status or "").lower() in {"exported", "posted"}
+            and str(issue.exported_ref1c or "").strip()
+            and str(issue.exported_ref1c).strip() == str(link.target_ref_key or "").strip()
+            and str(link.target_number or "").strip()
+        ):
+            issue_receipts[issue_id] = {
+                "issue_id": issue_id,
+                "ref": str(link.target_ref_key),
+                "number": str(link.target_number),
+            }
+    if not set(map(int, required_issue_ids)).issubset(issue_receipts):
+        return None
+
+    snapshots = deepcopy(list(basis.get("snapshots") or []))
+    issue_ids_by_anchor = {
+        int(anchor): [int(value) for value in values]
+        for anchor, values in (basis.get("issue_ids_by_anchor") or {}).items()
+    }
+    for snapshot in snapshots:
+        try:
+            anchor = int(snapshot["anchor_product_id"])
+            sheet = snapshot["sheet"]
+            order_id = int(sheet["order_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        order_receipt = order_receipts.get(order_id)
+        if order_receipt:
+            sheet["one_c_number"] = order_receipt["number"]
+        chain = sheet.get("chain") or {}
+        if isinstance(chain, dict) and chain.get("weld_product_id") is not None:
+            weld_basis = product_basis.get(int(chain["weld_product_id"]))
+            weld_receipt = order_receipts.get(int(weld_basis["order_id"])) if weld_basis else None
+            if weld_receipt:
+                chain["weld_one_c"] = weld_receipt["number"]
+        transfer_rows = sheet.get("transfer_rows") or []
+        issue_ids = issue_ids_by_anchor.get(anchor, [])
+        if len(transfer_rows) != len(issue_ids):
+            return None
+        for row, issue_id in zip(transfer_rows, issue_ids):
+            receipt = issue_receipts.get(issue_id)
+            if receipt:
+                local_number = str(row.get("transfer_number") or "")
+                one_c_number = str(receipt["number"])
+                row["transfer_number"] = (
+                    local_number
+                    if one_c_number in local_number
+                    else f"{local_number} / {one_c_number}" if local_number
+                    else one_c_number
+                )
+
+    return {
+        "html": render_route_sheets_from_snapshots(snapshots, auto_print=True),
+        "basis_revision": str(basis["source_revision"]),
+        "identities": list(basis["identities"]),
+        "verified_refs": {
+            "production_orders": [order_receipts[key] for key in sorted(order_receipts)],
+            "material_issues": [issue_receipts[key] for key in sorted(issue_receipts)],
+        },
+    }
 
 
 def load_current_route_sheet_rows(

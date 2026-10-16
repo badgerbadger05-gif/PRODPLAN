@@ -818,8 +818,8 @@ def test_bounded_output_moved_prefix_preserves_execution_owner(db_session):
         qty="8",
         at=datetime(2026, 7, 10, tzinfo=timezone.utc),
         recorder="bounded-prefix-moved",
-        content_hash="m" * 64,
-        line_no="3",
+        content_hash="r" * 64,
+        line_no="15",
     )
     replacement_offset = _sline(
         db_session,
@@ -829,8 +829,8 @@ def test_bounded_output_moved_prefix_preserves_execution_owner(db_session):
         at=datetime(2026, 7, 10, tzinfo=timezone.utc),
         recorder="bounded-prefix-moved",
         movement_kind="assembly_out",
-        content_hash="o" * 64,
-        line_no="4",
+        content_hash="s" * 64,
+        line_no="16",
     )
     genuinely_new = _sline(
         db_session,
