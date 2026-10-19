@@ -1671,6 +1671,87 @@ def test_supplier_checkpoint_keeps_accepted_superseded_provenance_as_archive(
     assert status_counts["unmatched"] == 1
 
 
+def test_supplier_checkpoint_separates_pruned_owner_from_historical_visibility(
+    db_session,
+):
+    visible_cutoff = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    superseded_cutoff = visible_cutoff + timedelta(days=1)
+    visible_batch = models.PhysicalImportBatch(
+        batch_key="supplier-pruned-visible", status="completed",
+        cutoff=visible_cutoff, completed_at=visible_cutoff, source_watermarks={},
+    )
+    visible_ancestor = models.LedgerGeneration(
+        generation_key="supplier-pruned-visible", status="accepted",
+        cutoff=visible_cutoff, accepted_at=visible_cutoff,
+        physical_import_batch=visible_batch, source_watermarks={},
+        capabilities={}, algorithm_version="test",
+    )
+    item = models.Item(
+        item_code="SUPPLIER-PRUNED-OWNER", item_name="Pruned owner evidence",
+    )
+    db_session.add_all([visible_ancestor, item])
+    db_session.flush()
+    old = models.StockLedgerEntry(
+        ingest_batch_id=int(visible_batch.id), source_content_hash="p" * 64,
+        business_identity="movement:supplier-pruned:1", item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH", qty=Decimal("2"), posting_at=visible_cutoff,
+        record_type="Receipt", movement_kind="receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="supplier-pruned", line_no="1", ingest_source="test",
+        active=False,
+    )
+    db_session.add(old)
+    db_session.flush()
+
+    superseded_batch = models.PhysicalImportBatch(
+        batch_key="supplier-pruned-owner", status="completed",
+        cutoff=superseded_cutoff, completed_at=superseded_cutoff,
+        source_watermarks={},
+    )
+    owner_ancestor = models.LedgerGeneration(
+        generation_key="supplier-pruned-owner", status="accepted",
+        cutoff=superseded_cutoff, accepted_at=superseded_cutoff,
+        physical_import_batch=superseded_batch,
+        source_watermarks={"parent_generation_id": int(visible_ancestor.id)},
+        capabilities={}, algorithm_version="test",
+    )
+    db_session.add_all([superseded_batch, owner_ancestor])
+    db_session.flush()
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(old.id), new_sle_id=None,
+        import_batch_id=int(superseded_batch.id),
+    ))
+    # Retention has pruned the oldest accepted owner's provenance.  A later
+    # accepted owner still carries the immutable decision, though its own
+    # physical prefix already hides the superseded SLE.
+    _supplier_archive_provenance(
+        db_session, generation_id=int(owner_ancestor.id), sle=old,
+    )
+
+    target = models.LedgerGeneration(
+        generation_key="supplier-pruned-target", status="building",
+        cutoff=superseded_cutoff, physical_import_batch=superseded_batch,
+        source_watermarks={"parent_generation_id": int(owner_ancestor.id)},
+        capabilities={}, algorithm_version="test",
+    )
+    db_session.add(target)
+    db_session.flush()
+    _supplier_archive_provenance(
+        db_session, generation_id=int(target.id), sle=old,
+    )
+    db_session.flush()
+
+    provenance, candidates, excluded, status_counts = _supplier_provenance_checkpoint(
+        db_session, target, require_full_coverage=True,
+    )
+
+    assert [int(row.stock_ledger_entry_id) for row in provenance] == [int(old.id)]
+    assert candidates == {}
+    assert excluded == set()
+    assert all(value == 0 for value in status_counts.values())
+
+
 @pytest.mark.parametrize(
     "foreign_kind", ["future", "wrong_type", "wrong_org", "unowned"],
 )

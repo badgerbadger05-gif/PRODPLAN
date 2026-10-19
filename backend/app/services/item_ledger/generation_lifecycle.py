@@ -487,13 +487,16 @@ def _archived_supplier_provenance_ids(
     Physical refresh copies every supplier decision, including the decision
     attached to a receipt revision which a later accepted batch superseded or
     tombstoned.  Such a row is no longer a current candidate, but it remains
-    valid audit evidence only when one accepted ancestor owned that exact SLE
-    while the same ancestor's physical boundary exposed it as a canonical
-    supplier candidate.  Future rows, wrong document types and foreign
-    organizations satisfy neither side of that proof and stay rejected.
+    valid audit evidence only when the sealed accepted lineage proves both
+    facts about that exact SLE: some accepted ancestor owned its provenance,
+    and some accepted ancestor exposed it as a canonical supplier candidate.
+    Retention may remove the old owner's row after a later accepted generation
+    has inherited the immutable decision, so the two proofs need not belong to
+    the same ancestor.  Future rows, wrong document types, foreign
+    organizations and unowned rows still fail one side of the proof.
     """
-    remaining = {int(value) for value in candidate_ids}
-    if not remaining:
+    requested = {int(value) for value in candidate_ids}
+    if not requested:
         return set()
     try:
         lineage_ids = sealed_generation_lineage_ids(db, generation)
@@ -502,43 +505,44 @@ def _archived_supplier_provenance_ids(
             f"supplier provenance lineage is unreadable: {exc}"
         ) from exc
 
-    archived: set[int] = set()
+    ownership_missing = set(requested)
+    visibility_missing = set(requested)
     for ancestor_id in lineage_ids[1:]:
         ancestor = db.get(models.LedgerGeneration, int(ancestor_id))
         if ancestor is None or str(ancestor.status or "") != "accepted":
             continue
-        owned = {
-            int(value)
-            for (value,) in db.query(
-                models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
-            ).filter(
-                models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
-                == int(ancestor.id),
-                models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
-                    sorted(remaining)
-                ),
-            ).all()
-        }
-        if not owned:
-            continue
-        visible_owned = {
-            int(value)
-            for (value,) in visible_sle_query_for_generation(
-                db, int(ancestor.id)
-            ).filter(
-                models.StockLedgerEntry.id.in_(sorted(owned)),
-                models.StockLedgerEntry.recorder_type.in_(
-                    sorted(_SUPPLIER_DOCUMENT_TYPES)
-                ),
-                models.StockLedgerEntry.organization_ref
-                == DEFAULT_ORGANIZATION_REF1C,
-            ).order_by(None).with_entities(models.StockLedgerEntry.id).all()
-        }
-        archived.update(visible_owned)
-        remaining.difference_update(visible_owned)
-        if not remaining:
+        if ownership_missing:
+            owned = {
+                int(value)
+                for (value,) in db.query(
+                    models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+                ).filter(
+                    models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+                    == int(ancestor.id),
+                    models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
+                        sorted(ownership_missing)
+                    ),
+                ).all()
+            }
+            ownership_missing.difference_update(owned)
+        if visibility_missing:
+            visible = {
+                int(value)
+                for (value,) in visible_sle_query_for_generation(
+                    db, int(ancestor.id)
+                ).filter(
+                    models.StockLedgerEntry.id.in_(sorted(visibility_missing)),
+                    models.StockLedgerEntry.recorder_type.in_(
+                        sorted(_SUPPLIER_DOCUMENT_TYPES)
+                    ),
+                    models.StockLedgerEntry.organization_ref
+                    == DEFAULT_ORGANIZATION_REF1C,
+                ).order_by(None).with_entities(models.StockLedgerEntry.id).all()
+            }
+            visibility_missing.difference_update(visible)
+        if not ownership_missing and not visibility_missing:
             break
-    return archived
+    return requested - ownership_missing - visibility_missing
 
 
 def _persist_non_supplier_receipt_rows(
