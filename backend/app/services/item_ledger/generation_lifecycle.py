@@ -41,7 +41,10 @@ from .future_supply_capture import (
 )
 from .supplier_future_supply import supplier_future_supply_evidence
 from .physical import canonical_content_hash
-from .physical_visibility import visible_sles_for_generation
+from .physical_visibility import (
+    visible_sle_query_for_generation,
+    visible_sles_for_generation,
+)
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
 from .supplier_receipt_odata import extract_supplier_document_evidence
 from .assembly_queue_materialization import materialize_assembly_queue_lines
@@ -472,6 +475,70 @@ def _supplier_candidates(
         if str(row.recorder_type or "") in _SUPPLIER_DOCUMENT_TYPES
         and str(row.organization_ref or "") == DEFAULT_ORGANIZATION_REF1C
     )
+
+
+def _archived_supplier_provenance_ids(
+    db: Session,
+    generation: models.LedgerGeneration,
+    candidate_ids: set[int],
+) -> set[int]:
+    """Prove immutable decisions archived behind the current physical prefix.
+
+    Physical refresh copies every supplier decision, including the decision
+    attached to a receipt revision which a later accepted batch superseded or
+    tombstoned.  Such a row is no longer a current candidate, but it remains
+    valid audit evidence only when one accepted ancestor owned that exact SLE
+    while the same ancestor's physical boundary exposed it as a canonical
+    supplier candidate.  Future rows, wrong document types and foreign
+    organizations satisfy neither side of that proof and stay rejected.
+    """
+    remaining = {int(value) for value in candidate_ids}
+    if not remaining:
+        return set()
+    try:
+        lineage_ids = sealed_generation_lineage_ids(db, generation)
+    except ValueError as exc:
+        raise GenerationValidationError(
+            f"supplier provenance lineage is unreadable: {exc}"
+        ) from exc
+
+    archived: set[int] = set()
+    for ancestor_id in lineage_ids[1:]:
+        ancestor = db.get(models.LedgerGeneration, int(ancestor_id))
+        if ancestor is None or str(ancestor.status or "") != "accepted":
+            continue
+        owned = {
+            int(value)
+            for (value,) in db.query(
+                models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+            ).filter(
+                models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+                == int(ancestor.id),
+                models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.in_(
+                    sorted(remaining)
+                ),
+            ).all()
+        }
+        if not owned:
+            continue
+        visible_owned = {
+            int(value)
+            for (value,) in visible_sle_query_for_generation(
+                db, int(ancestor.id)
+            ).filter(
+                models.StockLedgerEntry.id.in_(sorted(owned)),
+                models.StockLedgerEntry.recorder_type.in_(
+                    sorted(_SUPPLIER_DOCUMENT_TYPES)
+                ),
+                models.StockLedgerEntry.organization_ref
+                == DEFAULT_ORGANIZATION_REF1C,
+            ).order_by(None).with_entities(models.StockLedgerEntry.id).all()
+        }
+        archived.update(visible_owned)
+        remaining.difference_update(visible_owned)
+        if not remaining:
+            break
+    return archived
 
 
 def _persist_non_supplier_receipt_rows(
@@ -921,7 +988,12 @@ def _supplier_provenance_checkpoint(
         == int(generation.id)
     ).all()
     provenance_ids = {int(row.stock_ledger_entry_id) for row in provenance}
-    if provenance_ids - supplier_physical_ids:
+    current_provenance_ids = provenance_ids & supplier_physical_ids
+    noncurrent_provenance_ids = provenance_ids - supplier_physical_ids
+    archived_provenance_ids = _archived_supplier_provenance_ids(
+        db, generation, noncurrent_provenance_ids,
+    )
+    if archived_provenance_ids != noncurrent_provenance_ids:
         raise GenerationValidationError(
             "supplier receipt provenance must reference supplier candidates"
         )
@@ -930,7 +1002,7 @@ def _supplier_provenance_checkpoint(
     # full-coverage requirement (the accept gate bounds how many may be rejected
     # before it fails closed) rather than freezing truth on one edited document.
     required_ids = supplier_physical_ids - set(rejected_sle_ids)
-    if require_full_coverage and provenance_ids != required_ids:
+    if require_full_coverage and current_provenance_ids != required_ids:
         raise GenerationValidationError(
             "supplier receipt evidence must cover all supplier candidate rows"
         )
@@ -964,10 +1036,13 @@ def _supplier_provenance_checkpoint(
         int(row.stock_ledger_entry_id)
         for row in provenance
         if str(row.match_status or "") == "excluded_non_supplier"
+        and int(row.stock_ledger_entry_id) in supplier_physical_ids
     }
     supplier_status_counts = {
         status: sum(
-            1 for row in provenance if str(row.match_status or "") == status
+            1 for row in provenance
+            if int(row.stock_ledger_entry_id) in supplier_physical_ids
+            and str(row.match_status or "") == status
         )
         for status in sorted(allowed_supplier_statuses)
     }
@@ -1239,6 +1314,7 @@ def validate_generation_build(
         int(row.stock_ledger_entry_id)
         for row in provenance
         if str(row.match_status or "") != "excluded_non_supplier"
+        and int(row.stock_ledger_entry_id) in supplier_candidate_by_id
     }
     supplier_physical_qty = sum(
         (_d(supplier_candidate_by_id[row_id].qty) for row_id in supplier_relevant_ids),

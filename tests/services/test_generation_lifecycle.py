@@ -10,6 +10,7 @@ from app.services.item_ledger.generation_bootstrap import (
 )
 from app.services.item_ledger.generation_lifecycle import (
     GenerationValidationError,
+    _supplier_provenance_checkpoint,
     accept_generation_build,
     OBLIGATION_ALGORITHM_VERSION,
     materialize_generation_stock_bins,
@@ -42,6 +43,7 @@ from app.services.item_ledger.supplier_receipt_odata import (
 from app.services.item_ledger.supplier_receipt_allocation import (
     RECEIPT_OPERATION,
     SupplierDocumentEvidence,
+    build_supplier_receipt_provenance,
 )
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
@@ -1558,6 +1560,197 @@ def test_supplier_candidates_require_explicit_odata_client(db_session):
     db_session.expire_all()
     assert db_session.get(models.LedgerGeneration, generation.id).status == "building"
     assert db_session.get(models.PlanningTruthState, 1) is None
+
+
+def _supplier_archive_provenance(
+    db,
+    *,
+    generation_id: int,
+    sle: models.StockLedgerEntry,
+):
+    row = build_supplier_receipt_provenance(
+        ledger_generation_id=int(generation_id),
+        stock_ledger_entry_id=int(sle.id),
+        receipt_doc_type=sle.recorder_type,
+        receipt_doc_ref=sle.recorder_ref,
+        receipt_doc_line_no=sle.line_no,
+        operation_kind="supplier_receipt",
+        operation_key=RECEIPT_OPERATION,
+        operation_name="Приобретение у поставщика",
+        item_id=int(sle.item_id),
+        signed_qty=sle.qty,
+        match_rule="supplier-receipt-exact-line",
+        match_status="unmatched",
+        characteristic_ref=sle.characteristic_ref,
+        warehouse_ref1c=sle.warehouse_ref1c,
+        reason="no exact typed supplier order line",
+    )
+    db.add(row)
+    return row
+
+
+def test_supplier_checkpoint_keeps_accepted_superseded_provenance_as_archive(
+    db_session,
+):
+    first_cutoff = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    second_cutoff = first_cutoff + timedelta(days=1)
+    first_batch = models.PhysicalImportBatch(
+        batch_key="supplier-archive-parent", status="completed",
+        cutoff=first_cutoff, completed_at=first_cutoff, source_watermarks={},
+    )
+    parent = models.LedgerGeneration(
+        generation_key="supplier-archive-parent", status="accepted",
+        cutoff=first_cutoff, accepted_at=first_cutoff,
+        physical_import_batch=first_batch, source_watermarks={},
+        capabilities={}, algorithm_version="test",
+    )
+    item = models.Item(item_code="SUPPLIER-ARCHIVE", item_name="Supplier archive")
+    db_session.add_all([parent, item])
+    db_session.flush()
+    old = models.StockLedgerEntry(
+        ingest_batch_id=int(first_batch.id), source_content_hash="old" * 21 + "o",
+        business_identity="movement:supplier-archive:1", item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH", qty=Decimal("3"), posting_at=first_cutoff,
+        record_type="Receipt", movement_kind="receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="supplier-archive", line_no="1", ingest_source="test",
+        active=False,
+    )
+    db_session.add(old)
+    db_session.flush()
+    _supplier_archive_provenance(
+        db_session, generation_id=int(parent.id), sle=old,
+    )
+
+    second_batch = models.PhysicalImportBatch(
+        batch_key="supplier-archive-target", status="completed",
+        cutoff=second_cutoff, completed_at=second_cutoff, source_watermarks={},
+    )
+    target = models.LedgerGeneration(
+        generation_key="supplier-archive-target", status="building",
+        cutoff=second_cutoff, physical_import_batch=second_batch,
+        source_watermarks={"parent_generation_id": int(parent.id)},
+        capabilities={}, algorithm_version="test",
+    )
+    db_session.add_all([second_batch, target])
+    db_session.flush()
+    replacement = models.StockLedgerEntry(
+        ingest_batch_id=int(second_batch.id), source_content_hash="new" * 21 + "n",
+        business_identity="movement:supplier-archive:1", item_id=int(item.item_id),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH", qty=Decimal("4"), posting_at=first_cutoff,
+        record_type="Receipt", movement_kind="receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="supplier-archive", line_no="1", ingest_source="test",
+        active=True,
+    )
+    db_session.add(replacement)
+    db_session.flush()
+    db_session.add(models.StockLedgerFactSupersession(
+        old_sle_id=int(old.id), new_sle_id=int(replacement.id),
+        import_batch_id=int(second_batch.id),
+    ))
+    _supplier_archive_provenance(
+        db_session, generation_id=int(target.id), sle=old,
+    )
+    _supplier_archive_provenance(
+        db_session, generation_id=int(target.id), sle=replacement,
+    )
+    db_session.flush()
+
+    provenance, candidates, excluded, status_counts = _supplier_provenance_checkpoint(
+        db_session, target, require_full_coverage=True,
+    )
+
+    assert {int(row.stock_ledger_entry_id) for row in provenance} == {
+        int(old.id), int(replacement.id),
+    }
+    assert set(candidates) == {int(replacement.id)}
+    assert excluded == set()
+    assert status_counts["unmatched"] == 1
+
+
+@pytest.mark.parametrize(
+    "foreign_kind", ["future", "wrong_type", "wrong_org", "unowned"],
+)
+def test_supplier_checkpoint_rejects_nonhistorical_foreign_provenance(
+    db_session, foreign_kind,
+):
+    cutoff = datetime(2026, 7, 20, tzinfo=timezone.utc)
+    batch = models.PhysicalImportBatch(
+        batch_key=f"supplier-foreign-{foreign_kind}", status="completed",
+        cutoff=cutoff, completed_at=cutoff, source_watermarks={},
+    )
+    parent = models.LedgerGeneration(
+        generation_key=f"supplier-foreign-parent-{foreign_kind}", status="accepted",
+        cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch,
+        source_watermarks={}, capabilities={}, algorithm_version="test",
+    )
+    target_batch = batch
+    if foreign_kind == "unowned":
+        target_batch = models.PhysicalImportBatch(
+            batch_key="supplier-foreign-unowned-target", status="completed",
+            cutoff=cutoff + timedelta(seconds=1),
+            completed_at=cutoff + timedelta(seconds=1), source_watermarks={},
+        )
+    target = models.LedgerGeneration(
+        generation_key=f"supplier-foreign-target-{foreign_kind}", status="building",
+        cutoff=(cutoff + timedelta(seconds=1) if foreign_kind == "unowned" else cutoff),
+        physical_import_batch=target_batch,
+        source_watermarks={"parent_generation_id": 0},
+        capabilities={}, algorithm_version="test",
+    )
+    item = models.Item(
+        item_code=f"SUPPLIER-FOREIGN-{foreign_kind}", item_name="Foreign evidence",
+    )
+    db_session.add_all([parent, target, item])
+    db_session.flush()
+    target.source_watermarks = {"parent_generation_id": int(parent.id)}
+    sle = models.StockLedgerEntry(
+        ingest_batch_id=int(batch.id), source_content_hash=(foreign_kind * 10)[:64],
+        business_identity=f"movement:supplier-foreign:{foreign_kind}",
+        item_id=int(item.item_id), characteristic_ref="",
+        organization_ref=(
+            "foreign-organization"
+            if foreign_kind == "wrong_org" else DEFAULT_ORGANIZATION_REF1C
+        ),
+        warehouse_ref1c="WH", qty=Decimal("1"),
+        posting_at=(
+            cutoff + timedelta(seconds=1)
+            if foreign_kind == "future" else cutoff
+        ),
+        record_type="Receipt", movement_kind="receipt",
+        recorder_type=(
+            "Document_ПеремещениеЗапасов"
+            if foreign_kind == "wrong_type" else "Document_ПриходнаяНакладная"
+        ),
+        recorder_ref=f"supplier-foreign-{foreign_kind}", line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(sle)
+    db_session.flush()
+    if foreign_kind == "unowned":
+        db_session.add(models.StockLedgerFactSupersession(
+            old_sle_id=int(sle.id), new_sle_id=None,
+            import_batch_id=int(target_batch.id),
+        ))
+    if foreign_kind != "unowned":
+        _supplier_archive_provenance(
+            db_session, generation_id=int(parent.id), sle=sle,
+        )
+    _supplier_archive_provenance(
+        db_session, generation_id=int(target.id), sle=sle,
+    )
+    db_session.flush()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="supplier receipt provenance must reference supplier candidates",
+    ):
+        _supplier_provenance_checkpoint(
+            db_session, target, require_full_coverage=False,
+        )
 
 
 def test_internal_transfer_does_not_enter_supplier_evidence_gate(
