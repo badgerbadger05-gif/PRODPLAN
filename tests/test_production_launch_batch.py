@@ -1,4 +1,5 @@
 from tools.production_launch_batch import select_rows
+from tools import production_launch_batch as batch
 
 
 def row(number, quantity, *, workshop=7):
@@ -26,3 +27,28 @@ def test_two_insufficient_orders_do_not_pull_a_third():
     result = select([row(1, 1), row(2, 20), row(3, 90)])
     assert result['rows'] == []
     assert result['excluded'][0]['reason'] == 'minimum not met within order limit'
+
+
+def test_issue_export_preserves_run_boundary_and_resumes_successful_runs(tmp_path, monkeypatch):
+    state = {'snapshot_reader': 'resolved-reader.py', 'created': [{'product_id': 1}, {'product_id': 2}],
+             'completed_runs': {'620': {'created': [{'product_id': 1}]},
+                                '621': {'created': [{'product_id': 2}]}},
+             'stages': {'materials': {'created': [{'product_id': 1, 'issue_id': 11},
+                                                 {'product_id': 2, 'issue_id': 22}]}}}
+    snapshot = {'snapshot': {'source_revision': 'current'},
+                'rows': [{'product_id': p, 'current_identity': str(p)} for p in (1, 2)]}
+    monkeypatch.setattr(batch, 'read_current', lambda *args: snapshot)
+    calls = []
+
+    def post(base, endpoint, payload):
+        assert payload['issue_ids'] in ([11], [22]), 'mixed-run export must never be submitted'
+        calls.append(payload)
+        return {'status': 'ok', 'parent_orders_export': {'orders_error': 0}}
+
+    monkeypatch.setattr(batch, 'post', post)
+    path = tmp_path / 'batch.json'
+    batch.export_issues('http://resolved-api', path, state, False)
+    batch.export_issues('http://resolved-api', path, state, False)
+    assert len(calls) == 2
+    assert calls[0]['current_identities'] == ['1']
+    assert calls[1]['current_identities'] == ['2']

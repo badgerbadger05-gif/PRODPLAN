@@ -136,9 +136,9 @@ def export(base: str, path: Path, state: dict, dry_run: bool) -> None:
     print(json.dumps(result, ensure_ascii=True))
 
 
-def product_context(base: str, path: Path, state: dict) -> dict:
+def product_context(base: str, path: Path, state: dict, product_ids: set | None = None) -> dict:
     snapshot = read_current(base, path.with_name('current-journal.json'), state['snapshot_reader'])
-    ids = {r['product_id'] for r in state['created']}
+    ids = product_ids if product_ids is not None else {r['product_id'] for r in state['created']}
     rows = [r for r in snapshot['rows'] if r.get('product_id') in ids]
     if not ids or {r['product_id'] for r in rows} != ids:
         raise RuntimeError('current batch products unavailable')
@@ -168,19 +168,33 @@ def prepare_materials(base: str, path: Path, state: dict) -> None:
 
 def export_issues(base: str, path: Path, state: dict, dry_run: bool) -> None:
     materials = state['stages'].get('materials') or {}
-    ids = sorted({r['issue_id'] for kind in ('created', 'reused') for r in materials.get(kind, [])})
-    if not ids or materials.get('errors') or materials.get('selection_required'):
+    issues = [r for kind in ('created', 'reused') for r in materials.get(kind, [])]
+    if not issues or materials.get('errors') or materials.get('selection_required'):
         raise RuntimeError('material issues are not ready')
-    context = product_context(base, path, state)
-    payload = {k:v for k,v in context.items() if k != 'product_ids'}
-    payload.update(issue_ids=ids, dry_run=dry_run)
-    state['inflight'] = {'stage': 'issue-export', 'payload': payload}
-    save(path, state)
-    result = post(base, '/material-issues/export-to-1c', payload)
-    state['stages']['issue_export_preview' if dry_run else 'issue_export'] = result
-    state.pop('inflight', None)
-    save(path, state)
-    print(json.dumps(result, ensure_ascii=True))
+    stage = 'issue_export_preview' if dry_run else 'issue_export'
+    results = state['stages'].setdefault(stage, {})
+    # Parent order export deliberately rejects mixed planning runs. Preserve
+    # the same run boundary as materialization instead of weakening its guard.
+    for run, materialized in state['completed_runs'].items():
+        if run in results and results[run].get('status') == 'ok':
+            continue
+        products = {r['product_id'] for kind in ('created', 'reused')
+                    for r in materialized.get(kind, [])}
+        ids = sorted({r['issue_id'] for r in issues if r['product_id'] in products})
+        if not ids:
+            raise RuntimeError('run has no prepared material issues')
+        context = product_context(base, path, state, products)
+        payload = {k:v for k,v in context.items() if k != 'product_ids'}
+        payload.update(issue_ids=ids, dry_run=dry_run)
+        state['inflight'] = {'stage': stage, 'run': run, 'payload': payload}
+        save(path, state)
+        result = post(base, '/material-issues/export-to-1c', payload)
+        results[run] = result
+        state.pop('inflight', None)
+        save(path, state)
+        print(json.dumps({'run': run, 'result': result}, ensure_ascii=True))
+        if result.get('status') != 'ok' or (result.get('parent_orders_export') or {}).get('orders_error'):
+            raise RuntimeError('issue export partially applied; inspect saved response')
 
 
 def main() -> None:
