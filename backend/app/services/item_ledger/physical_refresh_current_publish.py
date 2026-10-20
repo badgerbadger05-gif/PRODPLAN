@@ -318,10 +318,13 @@ def _comparable(value: datetime) -> datetime:
     return value.replace(tzinfo=None) if value.tzinfo is not None else value
 
 
-def _is_supplier_receipt(row: Any) -> bool:
+def _is_supplier_document_movement(row: Any) -> bool:
+    # Expense legs need the same document classifier: a sale must retain an
+    # explicit non-supplier exclusion, while a supplier return remains signed.
+    # Otherwise a later complete BUY-scope replay sees an untyped expense.
     return (
         is_supplier_document_type(row.recorder_type)
-        and _text(row.movement_kind) in {"receipt", "supplier_receipt"}
+        and _text(row.movement_kind) in {"receipt", "supplier_receipt", "expense"}
     )
 
 
@@ -1154,7 +1157,7 @@ def _buy_scope_for_receipt(
     which attaches receipts to reservations by item and states the reason: a
     physical receipt carries no pool identity).
     """
-    if not _is_supplier_receipt(row):
+    if not _is_supplier_document_movement(row):
         return None
     warehouse = _text(row.warehouse_ref1c)
     # Only membership is used, never the mapped value: today every contour
@@ -1307,7 +1310,7 @@ def _standalone_supplier_rows(
                 planning_pool_by_warehouse=planning_pool_by_warehouse,
                 current_owners=current_owners,
             ) is None
-            if _is_supplier_receipt(row)
+            if _is_supplier_document_movement(row)
             else not _owner_scopes_for(
                 row, current_owners, {"buy"}, scope_mode="buy",
             )
