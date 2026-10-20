@@ -62,11 +62,11 @@ def post(base: str, endpoint: str, payload: dict) -> dict:
         raise RuntimeError(f'HTTP {exc.code}: {body}') from None
 
 
-def read_current(base: str, output: Path) -> dict:
+def read_current(base: str, output: Path, reader: str) -> dict:
     # Use the canonical revision-consistent reader, including its pagination
     # and accepted-truth checks. Never stitch independent journal pages.
     import subprocess
-    subprocess.run([sys.executable, str(Path(__file__).with_name('prodplan_read_snapshot.py')),
+    subprocess.run([sys.executable, reader,
         '--base-url', base, '--endpoint', '/api/v1/production-control/orders',
         '--output', str(output)], check=True)
     return json.loads(output.read_text(encoding='utf-8'))
@@ -77,7 +77,7 @@ def launch(base: str, path: Path, state: dict) -> None:
     for run in runs:
         if str(run) in state['completed_runs']:
             continue
-        snapshot = read_current(base, path.with_name('current-journal.json'))
+        snapshot = read_current(base, path.with_name('current-journal.json'), state['snapshot_reader'])
         by_identity = {r['current_identity']: r for r in snapshot['rows']}
         original = [r for r in state['rows'] if r['source_run_id'] == run]
         current = [by_identity[r['current_identity']] for r in original]
@@ -119,7 +119,7 @@ def launch(base: str, path: Path, state: dict) -> None:
 def export(base: str, path: Path, state: dict, dry_run: bool) -> None:
     if not state['created']:
         raise RuntimeError('no materialized products in this batch')
-    snapshot = read_current(base, path.with_name('current-journal.json'))
+    snapshot = read_current(base, path.with_name('current-journal.json'), state['snapshot_reader'])
     ids = {r['product_id'] for r in state['created']}
     rows = [r for r in snapshot['rows'] if r.get('product_id') in ids]
     if {r['product_id'] for r in rows} != ids:
@@ -136,14 +136,64 @@ def export(base: str, path: Path, state: dict, dry_run: bool) -> None:
     print(json.dumps(result, ensure_ascii=True))
 
 
+def product_context(base: str, path: Path, state: dict) -> dict:
+    snapshot = read_current(base, path.with_name('current-journal.json'), state['snapshot_reader'])
+    ids = {r['product_id'] for r in state['created']}
+    rows = [r for r in snapshot['rows'] if r.get('product_id') in ids]
+    if not ids or {r['product_id'] for r in rows} != ids:
+        raise RuntimeError('current batch products unavailable')
+    return {'product_ids': sorted(ids), 'current_identities': [r['current_identity'] for r in rows],
+            'expected_source_revision': snapshot['snapshot']['source_revision']}
+
+
+def prepare_materials(base: str, path: Path, state: dict) -> None:
+    context = product_context(base, path, state)
+    chains = post(base, '/orders/open-paint-weld-chains', {
+        **context, 'initiated_by': 'Codex: authorized production batch'})
+    state['stages']['chains'] = chains
+    save(path, state)
+    if set(chains.get('product_ids', [])) != set(context['product_ids']):
+        raise RuntimeError('chain expanded outside the selected batch; inspect before proceeding')
+    result = post(base, '/material-issues', {
+        'product_ids': chains['product_ids'],
+        'current_identities': chains['current_identities'],
+        'expected_source_revision': chains['source_revision'],
+        'initiated_by': 'Codex: authorized production batch'})
+    state['stages']['materials'] = result
+    save(path, state)
+    print(json.dumps(result, ensure_ascii=True))
+    if result.get('errors') or result.get('selection_required'):
+        raise RuntimeError('material preparation requires resolution; see saved response')
+
+
+def export_issues(base: str, path: Path, state: dict, dry_run: bool) -> None:
+    materials = state['stages'].get('materials') or {}
+    ids = sorted({r['issue_id'] for kind in ('created', 'reused') for r in materials.get(kind, [])})
+    if not ids or materials.get('errors') or materials.get('selection_required'):
+        raise RuntimeError('material issues are not ready')
+    context = product_context(base, path, state)
+    payload = {k:v for k,v in context.items() if k != 'product_ids'}
+    payload.update(issue_ids=ids, dry_run=dry_run)
+    state['inflight'] = {'stage': 'issue-export', 'payload': payload}
+    save(path, state)
+    result = post(base, '/material-issues/export-to-1c', payload)
+    state['stages']['issue_export_preview' if dry_run else 'issue_export'] = result
+    state.pop('inflight', None)
+    save(path, state)
+    print(json.dumps(result, ensure_ascii=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=['plan', 'launch', 'export-preview', 'export'])
+    parser.add_argument('phase', choices=['plan', 'launch', 'prepare-materials',
+        'issue-export-preview', 'issue-export', 'export-preview', 'export'])
     parser.add_argument('--state', type=Path, required=True)
     parser.add_argument('--base-url', required=True)
     parser.add_argument('--snapshot', type=Path)
     parser.add_argument('--articles', nargs='+')
     parser.add_argument('--workshop-id', type=int)
+    parser.add_argument('--snapshot-reader', type=Path,
+                        help='Canonical reader resolved by the read-access skill preflight')
     args = parser.parse_args()
     if args.phase == 'plan':
         if args.state.exists():
@@ -151,6 +201,10 @@ def main() -> None:
         state = select_rows(json.loads(args.snapshot.read_text(encoding='utf-8')),
                             args.articles, args.workshop_id)
         state['base_url'] = args.base_url.rstrip('/')
+        reader = args.snapshot_reader or Path(__file__).with_name('prodplan_read_snapshot.py')
+        if not reader.is_file():
+            raise RuntimeError('provide --snapshot-reader from the active read-access route')
+        state['snapshot_reader'] = str(reader.resolve())
         state['batch_digest'] = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
         save(args.state, state)
         print(json.dumps({'selected': len(state['rows']), 'excluded': state['excluded']}))
@@ -165,6 +219,10 @@ def main() -> None:
             raise RuntimeError('batch belongs to a different runtime')
         if args.phase == 'launch':
             launch(args.base_url, args.state, state)
+        elif args.phase == 'prepare-materials':
+            prepare_materials(args.base_url, args.state, state)
+        elif args.phase in ('issue-export-preview', 'issue-export'):
+            export_issues(args.base_url, args.state, state, args.phase == 'issue-export-preview')
         else:
             export(args.base_url, args.state, state, args.phase == 'export-preview')
     finally:
