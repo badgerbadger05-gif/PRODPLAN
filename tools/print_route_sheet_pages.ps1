@@ -27,7 +27,12 @@ if ($DryRun) {
 $receiptLock = [System.IO.File]::Open($Receipt + '.lock', 'CreateNew', 'Write', 'None')
 try {
     Add-Type -AssemblyName System.Drawing
-    Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+    $driverRefs = @(
+        [System.Drawing.Printing.PrinterSettings].Assembly.Location,
+        [System.Drawing.Point].Assembly.Location,
+        [System.ComponentModel.Component].Assembly.Location
+    ) + @(Get-ChildItem -LiteralPath $PSHOME -Filter 'System.Private.Windows.*.dll' | ForEach-Object FullName)
+    Add-Type -ReferencedAssemblies $driverRefs -TypeDefinition @'
 using System;
 using System.Drawing;
 using System.Drawing.Printing;
