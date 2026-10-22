@@ -138,6 +138,11 @@ def _accepted_physical_fork(db, parent, *, key):
     )
     db.add(child)
     db.flush()
+    db.add(models.ProductionMaterialCustodyProjectionManifest(
+        ledger_generation_id=child.id, cutoff=child.cutoff,
+        status="complete", is_baseline=True, source_event_high_watermark_id=0,
+        observed_at=child.cutoff, built_at=child.cutoff,
+    ))
     db.get(models.PlanningTruthState, 1).current_generation_id = int(child.id)
     db.flush()
     return child

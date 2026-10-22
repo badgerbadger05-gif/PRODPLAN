@@ -1093,7 +1093,6 @@ def publish_obligation_refresh_batch(
     # The obligation successor reuses the parent's physical batch and cutoff,
     # so the §57 verification of the parent proves it too; the single pointer
     # writer decides that, not this publisher.
-    move_pointer_to_generation(db, pointer, target)
     from .item_ledger.current_execution import publish_current_execution_from_generation
     publish_current_execution_from_generation(
         db, generation_id=int(target.id)
@@ -1116,6 +1115,11 @@ def publish_obligation_refresh_batch(
         raise ObligationRefreshPublishError(
             f"custody current publication failed: {exc}"
         ) from exc
+    # Custody publication must still see the previous accepted owner: its
+    # post-cutoff local holds are carried into the successor's compact cells.
+    # Moving the pointer first makes that owner look like the target itself
+    # and silently drops the live tail. All contours switch in this transaction.
+    move_pointer_to_generation(db, pointer, target)
     # Future supply is captured as immutable generation evidence but exposed
     # through one compact current projection, alongside the truth-pointer
     # switch.  No reader should select a historical generation copy.
