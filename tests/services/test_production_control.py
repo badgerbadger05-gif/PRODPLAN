@@ -2294,6 +2294,17 @@ def test_full_material_support_keeps_all_units_with_fractional_norm(db_session, 
     assert preview['material_supported_qty'] == quantity
 
 
+def test_fractional_output_keeps_valid_whole_support_snapshot(db_session):
+    from app.services.production_control_material_availability import material_supported_snapshot_is_consistent
+    parent, _spec, _comps = _make_basic_spec(db_session, parent_name='FractionalOutput',
+        child_specs=[('FO', 'Fractional component', 13.680, 0.036)])
+    _order, product = _make_internal_order_for(db_session, parent, qty=3.5)
+    preview = preview_materials(db_session, product.product_id)
+    assert preview['coverage_status'] == 'ready'
+    assert preview['material_supported_qty'] == 3
+    assert material_supported_snapshot_is_consistent(preview)
+
+
 def test_bulk_material_preview_matches_scalar_and_loads_custody_once(
     db_session, monkeypatch
 ):

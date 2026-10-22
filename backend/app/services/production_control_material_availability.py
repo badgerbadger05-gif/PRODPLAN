@@ -1157,9 +1157,11 @@ def public_materials_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bool:
     """A known full-coverage count must not contradict its own quantity."""
     supported = snapshot.get('material_supported_qty')
+    quantity = snapshot.get('qty')
     return not (
         supported is not None and snapshot.get('coverage_status') == 'ready'
-        and supported != snapshot.get('qty')
+        and quantity is not None and float(quantity).is_integer()
+        and supported != quantity
     )
 
 
