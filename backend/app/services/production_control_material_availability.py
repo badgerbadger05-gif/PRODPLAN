@@ -669,6 +669,10 @@ def preview_materials(
         if norm <= 0:
             supported = Decimal('0')
             break
+        if component.get('coverage') == 'ok':
+            # Full coverage already permits the commanded quantity. Dividing
+            # a float-serialized amount by its norm can lose a whole unit.
+            continue
         covering = max(Decimal('0'), Decimal(str(component['required_qty'])) - Decimal(str(component['missing_qty'])))
         supported = min(supported, covering / norm)
     # Executable production lots are whole output units. Fractional component
@@ -1148,6 +1152,15 @@ def public_materials_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     for key in _INTERNAL_MATERIAL_KEYS:
         public.pop(key, None)
     return public
+
+
+def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bool:
+    """A known full-coverage count must not contradict its own quantity."""
+    supported = snapshot.get('material_supported_qty')
+    return not (
+        supported is not None and snapshot.get('coverage_status') == 'ready'
+        and supported != snapshot.get('qty')
+    )
 
 
 def _snapshot_matches_line_command(

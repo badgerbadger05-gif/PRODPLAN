@@ -122,6 +122,27 @@ def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_se
                                                'expected_source_revision': revision})]
 
 
+def test_preparation_repairs_cached_full_coverage_undercount(db_session, monkeypatch):
+    from copy import deepcopy
+    work, identity, revision = _current(db_session)
+    calls = []
+    def preview(*args, **kwargs):
+        calls.append(kwargs['quantity'])
+        return {'qty':kwargs['quantity'], 'line_quantity':kwargs['quantity'],
+                'components':[], 'coverage_status':'ready',
+                'material_supported_qty':kwargs['quantity']}
+    monkeypatch.setattr('app.services.production_control_material_availability.preview_make_work_item_materials', preview)
+    arguments={'work_item_id':work.id,'qty':3,'current_identity':identity,'expected_source_revision':revision}
+    prepare_current_work_materials(db_session, **arguments)
+    row=db_session.query(models.CurrentExecutionRow).filter_by(business_identity=identity).one()
+    payload=deepcopy(row.payload)
+    payload['_material_quantity_snapshots']['3']['payload']['material_supported_qty']=2
+    row.payload=payload;db_session.commit()
+    repaired=prepare_current_work_materials(db_session, **arguments)
+    assert repaired['material_supported_qty']==3
+    assert calls==[3,3]
+
+
 def test_quantity_command_persists_preview_and_get_only_reads_it(db_session, monkeypatch):
     work, identity, revision = _current(db_session)
     owner = db_session.get(models.ReservationEntry, work.reservation_id)

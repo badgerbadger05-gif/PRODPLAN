@@ -2282,6 +2282,18 @@ def test_material_supported_qty_limits_whole_output_by_scarcest_component(
     assert preview['material_supported_qty'] == expected
 
 
+@pytest.mark.parametrize('quantity', [36, 60])
+def test_full_material_support_keeps_all_units_with_fractional_norm(db_session, quantity):
+    parent, _spec, _comps = _make_basic_spec(
+        db_session, parent_name='FractionalFull',
+        child_specs=[('FF', 'Fractional component', 13.680, 0.036)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=quantity)
+    preview = preview_materials(db_session, product.product_id)
+    assert preview['coverage_status'] == 'ready'
+    assert preview['material_supported_qty'] == quantity
+
+
 def test_bulk_material_preview_matches_scalar_and_loads_custody_once(
     db_session, monkeypatch
 ):

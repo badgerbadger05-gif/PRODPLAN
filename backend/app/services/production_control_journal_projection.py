@@ -312,7 +312,8 @@ def prepare_current_work_materials(db: Session, *, work_item_id: int, qty: float
     key = format(quantity.normalize(), "f")
     variants = dict(row.get("_material_quantity_snapshots") or {})
     saved = variants.get(key)
-    if saved and saved.get("source_revision") == expected_source_revision:
+    from .production_control_material_availability import material_supported_snapshot_is_consistent
+    if saved and saved.get("source_revision") == expected_source_revision and material_supported_snapshot_is_consistent(saved['payload']):
         snapshot = saved["payload"]
     else:
         snapshot = preview_make_work_item_materials(db, work_item_id=work.id, item_id=work.item_id,
@@ -860,6 +861,9 @@ def _snapshot_is_touched(
     The one reuse rule for every persisted material snapshot: an untouched
     row's parent-boundary snapshot is still exact; a touched one is rebuilt.
     """
+    from .production_control_material_availability import material_supported_snapshot_is_consistent
+    if not material_supported_snapshot_is_consistent(snapshot):
+        return True
     if not touched:
         return False
     if int(payload.get("item_id") or 0) in touched:
