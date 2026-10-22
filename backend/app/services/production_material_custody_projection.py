@@ -1700,13 +1700,9 @@ def publish_current_material_custody(
         if next_qty == 0:
             candidate_values.pop(key, None)
             if row is not None:
-                if row in db.new:
-                    # A post-cutoff hold and its full release can cancel
-                    # before the new compact cell has ever been flushed.
-                    db.expunge(row)
-                else:
-                    db.delete(row)
-                candidate_by_key.pop(key, None)
+                # Keep the same ORM cell until the complete tail is folded:
+                # a later local hold can reuse this key after a full release.
+                row.reserved_qty = 0
         elif row is not None:
             row.reserved_qty = next_qty
             candidate_values[key] = next_qty
@@ -1724,6 +1720,14 @@ def publish_current_material_custody(
             db.add(row)
             candidate_by_key[key] = row
             candidate_values[key] = next_qty
+
+    for key in tuple(candidate_by_key):
+        if key not in candidate_values:
+            row = candidate_by_key.pop(key)
+            if row in db.new:
+                db.expunge(row)
+            else:
+                db.delete(row)
 
     published_watermark = max(
         int(candidate_seed.cutoff_high_watermark_id),

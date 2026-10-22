@@ -1004,3 +1004,52 @@ def test_obligation_successor_preserves_current_post_cutoff_material_hold(
     )
     assert generation_id == parent.id
     assert custody.reserved_at_warehouse('WH-SOURCE', component.item_id) == 5 - release_qty
+
+
+def test_obligation_successor_reuses_persisted_cell_after_release_and_rehold(db_session):
+    from app.services.production_material_custody_projection import (
+        load_compact_current_material_custody,
+    )
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    item = _line_item(db_session, 'rehold-output')
+    component = _line_item(db_session, 'rehold-component')
+    order = models.ProductionOrder(order_number='REHOLD', order_date=cutoff, source='mrp')
+    db_session.add(order)
+    db_session.flush()
+    product = models.ProductionProduct(
+        order_id=order.order_id, item_id=item.item_id, line_number=1,
+        quantity=8, produced_qty=0, remaining_qty=8,
+    )
+    db_session.add(product)
+    db_session.flush()
+    for index, delta in enumerate((-5, 3), start=1):
+        event = models.ProductionMaterialCustodyEvent(
+            product_id=product.product_id, component_item_id=component.item_id,
+            source_kind='terminal_release' if delta < 0 else 'issue_created',
+            source_sle_id=None, effective_at=cutoff + timedelta(minutes=index),
+            location_kind='transit', warehouse_ref1c='WH-REHOLD',
+            delta_qty=Decimal(delta), idempotency_key=f'rehold-{index}',
+        )
+        db_session.add(event)
+        db_session.flush()
+    watermark = event.id
+    parent_manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id,
+    )
+    parent_manifest.source_event_high_watermark_id = watermark
+    for generation, qty, current, hwm in ((parent, 3, True, watermark), (target, 5, False, 0)):
+        db_session.add(models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=generation.id, product_id=product.product_id,
+            component_item_id=component.item_id, location_kind='transit',
+            warehouse_ref1c='WH-REHOLD', reserved_qty=Decimal(qty),
+            source_event_high_watermark_id=hwm, is_current=current,
+        ))
+    db_session.commit()
+    assert _publish(db_session, parent, target, cutoff).published is True
+    generation_id, custody = load_compact_current_material_custody(
+        db_session, consumer='test.obligation.rehold',
+    )
+    assert generation_id == target.id
+    assert custody.reserved_at_warehouse('WH-REHOLD', component.item_id) == 3
+    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 2
+    assert product.quantity == 8
