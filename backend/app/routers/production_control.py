@@ -1677,6 +1677,41 @@ def _canonical_journal_sort(
     rows[:] = present + missing
 
 
+# Сортировки readiness_* — исполнительная очередь DBR: её приоритетная
+# последовательность не группируется, иначе меняется порядок исполнения.
+_NO_ARTICLE_GROUPING_SORT_FIELDS = {
+    "readiness_need_date",
+    "readiness_action_date",
+    "readiness_priority_key",
+}
+
+
+def _group_journal_rows_by_article(rows: list[dict]) -> None:
+    """Pull rows of the same item into one consecutive block.
+
+    Grouping is stable: a block takes the position of its first row in the
+    already-sorted list, and rows inside the block keep that sort order. The
+    planner sees the whole launchable volume of one article at a glance
+    instead of collecting it across plans and orders.
+    """
+
+    groups: dict[tuple[str, Any], list[dict]] = {}
+    order: list[tuple[str, Any]] = []
+    for row in rows:
+        raw_item_id = row.get("item_id")
+        try:
+            key = ("item", int(raw_item_id)) if raw_item_id is not None else None
+        except (TypeError, ValueError):
+            key = None
+        if key is None:
+            key = ("article", str(row.get("item_article") or ""))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+    rows[:] = [row for key in order for row in groups[key]]
+
+
 @router.get("/orders/root-products", response_model=ProductionControlRootProductOptionsResponse)
 def list_root_products(
     db: Session = Depends(get_db),
@@ -1830,6 +1865,8 @@ def get_orders_journal(
             _canonical_journal_sort(rows, field=sort_field, descending=descending)
         else:
             _canonical_journal_sort(rows, field="order_date", descending=True)
+        if sort_field not in _NO_ARTICLE_GROUPING_SORT_FIELDS:
+            _group_journal_rows_by_article(rows)
         for row in rows:
             row.pop("__r9_root_item_ids", None)
         effective_limit = max(1, min(int(limit or 100), 500))
