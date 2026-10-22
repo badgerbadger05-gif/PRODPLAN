@@ -3535,34 +3535,6 @@ def apply_current_replenishment_for_bounded_buy_scopes(
         scopes=scopes,
         fallback_by_id=delta_by_id,
     )
-    outside_contour_basis: dict[DistributionScope, set[int]] = {
-        scope: set() for scope in scopes
-    }
-    if planning_pool_by_warehouse is not None and (
-        manifest.scope_receipt_facts or manifest.supersession_edge_ids
-    ):
-        # The complete stream adapter excludes receipts outside the selected
-        # planning contour. Older current assignments can still own such a
-        # receipt. Retire them through the same complete-scope replay rather
-        # than requiring the adapter to reintroduce excluded physical input.
-        # Only target-visible basis rows prove a contour retirement; missing
-        # rows still require explicit supersession evidence.
-        from .physical_visibility import visible_sle_query
-
-        basis_ids = {int(f.sle_id) for values in basis_by_scope.values() for f in values}
-        visible_basis = {
-            int(row.id): row for row in visible_sle_query(
-                db, physical_import_batch_id=int(target.physical_import_batch_id),
-                cutoff=target.cutoff,
-            ).filter(models.StockLedgerEntry.id.in_(basis_ids)).all()
-        } if basis_ids else {}
-        for scope, facts in basis_by_scope.items():
-            for fact in facts:
-                row = visible_basis.get(int(fact.sle_id))
-                if row is not None and _text(planning_pool_by_warehouse.get(
-                    _text(row.warehouse_ref1c)
-                )) != scope[3]:
-                    outside_contour_basis[scope].add(int(fact.sle_id))
     from .supplier_receipt_allocation import _exact_allocation_caps_by_order_line
 
     exact_caps = _exact_allocation_caps_by_order_line(
@@ -3587,9 +3559,9 @@ def apply_current_replenishment_for_bounded_buy_scopes(
     replay_rows = 0
     for scope in scopes:
         explicit = tuple(scope_facts[scope])
-        retired_here = ({
+        retired_here = {
             int(fact.sle_id) for fact in basis_by_scope[scope]
-        } & set(superseded_ids)) | outside_contour_basis[scope]
+        } & set(superseded_ids)
         if not explicit and scope not in delta_scopes and not retired_here:
             # A declared scope may legitimately have no semantic input in a
             # multi-scope manifest.  Do not touch its marker or allocations.
@@ -3600,7 +3572,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
             # assignment is retired by this very replay.
             baseline_ids = {
                 int(fact.sle_id) for fact in basis_by_scope[scope]
-            } - set(superseded_ids) - outside_contour_basis[scope]
+            } - set(superseded_ids)
             explicit_ids = {int(fact.sle_id) for fact in explicit}
             if not baseline_ids.issubset(explicit_ids):
                 raise CurrentReplenishmentError(
@@ -3664,9 +3636,7 @@ def apply_current_replenishment_for_bounded_buy_scopes(
                     "BUY empty scope evidence contradicts target-visible supplier facts"
                 )
             confirmed_empty_reason = (
-                ("bounded_current_contour_retirement: parent receipt "
-                 if outside_contour_basis[scope] else
-                 "bounded_supersession_tombstone: parent receipt ")
+                "bounded_supersession_tombstone: parent receipt "
                 + ",".join(str(sle_id) for sle_id in sorted(retired_here))
                 + " has no target-visible supplier replacement"
             )

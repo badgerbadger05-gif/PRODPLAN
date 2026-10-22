@@ -886,10 +886,6 @@ def _bounded_scope_receipt_facts(
         )
         if scope not in affected_scopes:
             continue
-        if planning_pool_by_warehouse is not None and (
-            _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c))) != scope[3]
-        ):
-            continue
         rows_and_scopes.append((row, scope))
     rows = [row for row, _scope in rows_and_scopes]
     evidence_by_id = _persisted_scope_evidence(
@@ -904,10 +900,22 @@ def _bounded_scope_receipt_facts(
         if int(row.id) in excluded_sle_ids:
             continue
         delta = delta_facts_by_id.get(int(row.id))
+        evidence = evidence_by_id.get(int(row.id))
+        if (
+            planning_pool_by_warehouse is not None
+            and _text(planning_pool_by_warehouse.get(_text(row.warehouse_ref1c))) != scope[3]
+            and delta is None
+            and evidence is None
+        ):
+            # The contour qualifies new, untyped input. It cannot erase an
+            # already typed supplier fact: full accepted-generation replay
+            # retains that same signed provenance, irrespective of today's
+            # warehouse selection. Otherwise bounded/full refreshes disagree
+            # and the complete-scope guard correctly rejects the lost basis.
+            continue
         if delta is not None:
             facts.append(delta)
             continue
-        evidence = evidence_by_id.get(int(row.id))
         if evidence is None:
             raise BoundedSupplierEvidenceError(
                 "bounded BUY scope evidence lacks persisted supplier provenance "

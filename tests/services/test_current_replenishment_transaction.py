@@ -988,6 +988,54 @@ def _supplier_typed_world(db, *, prefix):
     return generation_id, item_id, reservations, facts
 
 
+def test_full_and_bounded_replay_preserve_typed_basis_after_warehouse_deselection(db_session):
+    from datetime import timedelta
+    from app.services.item_ledger.current_replenishment import (
+        BoundedBuyReceiptDeltaManifest, apply_current_replenishment_for_bounded_buy_scopes,
+    )
+    from app.services.item_ledger.physical_refresh_supplier_evidence import _bounded_scope_receipt_facts
+    from app.services.item_ledger.supplier_receipt_allocation import ReceiptFact
+    generation_id, item_id, _reservations, facts = _supplier_typed_world(db_session, prefix='warehouse-basis')
+    parent=db_session.get(models.LedgerGeneration,generation_id)
+    old=db_session.get(models.StockLedgerEntry,int(facts[0].fact_id))
+    selected=db_session.get(models.StockLedgerEntry,int(facts[1].fact_id)).warehouse_ref1c
+    old.warehouse_ref1c='no-longer-selected'
+    db_session.add(models.StockWarehouse(warehouse_ref1c=selected,warehouse_name='Selected planning warehouse',is_selected=True,is_finished_goods=False))
+    db_session.flush()
+    _point_at(db_session,parent)
+    apply_current_replenishment_for_accepted_generation(db_session,generation_id=parent.id)
+    def assignments():
+        return sorted((r.sle_id,r.reservation_id,r.allocated_qty) for r in db_session.query(models.ReservationConsumptionAllocation).filter_by(is_current=True,allocation_role='replenishment_receipt'))
+    expected=assignments()
+    assert any(sle_id==old.id for sle_id,_owner,_qty in expected)
+    child=_obligation_refresh_over(db_session,parent,key='warehouse-bounded')
+    cutoff=parent.cutoff+timedelta(days=1)
+    batch=models.PhysicalImportBatch(batch_key='warehouse-new-batch',status='completed',cutoff=cutoff,completed_at=cutoff,source_complete=True,source_watermarks={})
+    db_session.add(batch);db_session.flush()
+    child.physical_import_batch_id=batch.id;child.cutoff=cutoff
+    new=models.StockLedgerEntry(ingest_batch_id=batch.id,source_content_hash='a'*64,
+        business_identity='warehouse-new-receipt',item_id=item_id,characteristic_ref='',organization_ref='',
+        warehouse_ref1c=selected,qty=Decimal('2'),qty_after=Decimal('2'),posting_at=cutoff,known_at=cutoff,
+        record_type='Receipt',movement_kind='supplier_receipt',recorder_type=SUPPLIER_RECORDER_TYPE,
+        recorder_ref='warehouse-new-receipt',line_no='1',ingest_source='test',active=True)
+    db_session.add(new);db_session.flush()
+    delta=ReceiptFact(sle_id=new.id,posting_at=cutoff,known_at=cutoff,signed_qty=Decimal('2'),item_id=item_id,
+        supplier_order_ref='',supplier_order_line_no='',receipt_ref=new.recorder_ref,receipt_line_no='1',planning_stock_pool='default')
+    child.status='building';_point_at(db_session,parent)
+    scope=(item_id,'','','default','buy')
+    stream=_bounded_scope_receipt_facts(db_session,target=child,target_cutoff=child.cutoff,
+        scopes=(scope,),delta_facts_by_id={new.id:delta},planning_pool_by_warehouse={selected:'default'})
+    result=apply_current_replenishment_for_bounded_buy_scopes(db_session,
+        target_generation_id=child.id,parent_generation_id=parent.id,target_cutoff=child.cutoff,
+        affected_scopes=(scope,),planning_pool_by_warehouse={selected:'default'},
+        delta_manifest=BoundedBuyReceiptDeltaManifest(new_sle_ids=(new.id,),receipt_facts=(delta,),scope_receipt_facts=stream,backdate_from=parent.cutoff-timedelta(days=1)))
+    assert result.results and all(pair in assignments() for pair in expected)
+    expected=assignments()
+    child.status='accepted';_point_at(db_session,child)
+    apply_current_replenishment_for_accepted_generation(db_session,generation_id=child.id)
+    assert assignments()==expected
+
+
 def _successor_over_the_same_prefix(db, parent, *, key):
     """A later accepted generation over the parent's own physical prefix."""
     successor = models.LedgerGeneration(

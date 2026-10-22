@@ -528,7 +528,7 @@ def test_forward_manifest_uses_only_explicit_changed_sles_and_canonical_odata_ma
     assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 0
 
 
-def test_bounded_buy_stream_collapses_physical_organization_and_skips_outside_contour(
+def test_bounded_buy_stream_collapses_physical_organization_and_skips_untyped_outside_contour(
     db_session, monkeypatch,
 ):
     parent, target, parent_batch, target_batch, item = _world(db_session)
@@ -561,6 +561,45 @@ def test_bounded_buy_stream_collapses_physical_organization_and_skips_outside_co
     assert [fact.sle_id for fact in manifest.scope_receipt_facts] == [changed.id]
     assert outside.id not in {fact.sle_id for fact in manifest.scope_receipt_facts}
     assert manifest.scope_receipt_facts[0].planning_stock_pool == "default"
+
+
+def test_bounded_buy_stream_preserves_typed_receipt_and_return_outside_current_contour(
+    db_session, monkeypatch,
+):
+    parent, target, parent_batch, target_batch, item = _world(db_session)
+    old = _sle(db_session, parent_batch, item, ref='historic-receipt', qty='4', warehouse_ref1c='outside-wh')
+    returned = _sle(db_session, parent_batch, item, ref='historic-return', qty='-1',
+                    warehouse_ref1c='outside-wh', recorder_type='Document_РасходнаяНакладная')
+    for row, kind, operation in ((old, 'supplier_receipt', RECEIPT_OPERATION),
+                                 (returned, 'supplier_return', SUPPLIER_RETURN_OPERATION)):
+        db_session.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=parent.id, stock_ledger_entry_id=row.id,
+            receipt_doc_type=row.recorder_type, receipt_doc_ref=row.recorder_ref,
+            receipt_doc_line_no=row.line_no, operation_kind=kind,
+            operation_key=operation, operation_name=kind,
+            correction_receipt_ref=old.recorder_ref if row is returned else None,
+            match_rule='supplier-receipt-unmatched', match_status='unmatched',
+            ambiguity_count=0, reason='persisted typed supplier evidence',
+            evidence_payload={'signed_qty': str(row.qty)},
+        ))
+    db_session.flush()
+    changed = _sle(db_session, target_batch, item, ref='new-receipt', qty='3')
+    seen=[]
+    def extract(db, client, rows):
+        seen.extend(row.id for row in rows)
+        return _fake_result((_fake_evidence(changed),))
+    monkeypatch.setattr(adapter, 'extract_supplier_document_evidence', extract)
+    manifest = adapter.build_bounded_supplier_receipt_manifest(
+        db_session, parent_generation_id=parent.id, target_generation_id=target.id,
+        target_cutoff=target.cutoff, odata_client=object(), changed_sle_ids=(changed.id,),
+        affected_scopes=((item.item_id, '', '', 'default', 'buy'),),
+        backdate_from=parent.cutoff-timedelta(days=1),
+        planning_pool_by_warehouse={'wh-ref-1':'default'},
+    )
+    assert seen == [changed.id]  # Existing typing is preserved, never guessed again.
+    assert {fact.sle_id:fact.signed_qty for fact in manifest.scope_receipt_facts} == {
+        old.id:Decimal('4'), returned.id:Decimal('-1'), changed.id:Decimal('3'),
+    }
 
 
 @pytest.mark.parametrize("evidence_state", ["valid", "missing", "malformed", "conflicting"])
