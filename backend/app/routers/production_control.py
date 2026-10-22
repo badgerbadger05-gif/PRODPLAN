@@ -268,6 +268,8 @@ class AssemblyReadinessListResponse(BaseModel):
 
 class ProductionMaterialsResponse(BaseModel):
     material_supported_qty: Optional[float] = None
+    material_launchable_qty: Optional[float] = None
+    material_launch_coverage_status: Optional[str] = None
     model_config = ConfigDict(extra="forbid")
 
     ledger_generation_id: int
@@ -1246,6 +1248,7 @@ class OpenPaintWeldChainsPayload(BaseModel):
 
 class RefreshProductionOrdersPayload(OpenPaintWeldChainsPayload):
     product_ids: List[int] = Field(min_length=1, max_length=100)
+    recalculate_materials: bool = False
 
 
 class CurrentProductionRefreshResponse(BaseModel):
@@ -2633,10 +2636,13 @@ async def post_refresh_current_orders(payload: RefreshProductionOrdersPayload, d
         expected_source_revision=payload.expected_source_revision,
         locator_key="product_id", locator_values=set(payload.product_ids))
     db.rollback()  # The worker owns the publication transaction and its lock.
-    return await run_in_threadpool(run_command, "refresh-executors", {
+    arguments = {
         "product_ids": payload.product_ids, "current_identities": payload.current_identities,
         "expected_source_revision": payload.expected_source_revision,
-    })
+    }
+    if payload.recalculate_materials:
+        arguments['recalculate_materials'] = True
+    return await run_in_threadpool(run_command, "refresh-executors", arguments)
 
 
 def _refresh_exported_executors_metadata(product_ids: list[int]) -> None:

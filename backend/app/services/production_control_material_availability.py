@@ -632,6 +632,9 @@ def preview_materials(
         comp["reserved_in_transit_qty"] = own_in_transit
         comp["reserved_orders"] = reserved_orders_by_item.get(iid, [])
         comp["missing_qty"] = missing
+        launch_covering = max(own_at_workshop, raw_stock - reserved)
+        comp["launch_available_qty"] = max(0.0, launch_covering)
+        comp["launch_coverage"] = _component_coverage_label(required, launch_covering)
         comp["coverage"] = label
         comp["availability_status"] = _ui_coverage_status(label)
         comp["coverage_status"] = _ui_coverage_status(label)
@@ -664,22 +667,28 @@ def preview_materials(
 
     remaining = accepted_product_output(product).remaining_qty
     supported = max(Decimal('0'), Decimal(str(remaining)))
+    launchable = supported
     for component in components:
         norm = Decimal(str(component['qty_per_unit']))
         if norm <= 0:
             supported = Decimal('0')
+            launchable = Decimal('0')
             break
+        if component.get('launch_coverage') != 'ok':
+            launchable = min(launchable, _supported_whole_count(Decimal(str(component['launch_available_qty'])), norm))
         if component.get('coverage') == 'ok':
             # Full coverage already permits the commanded quantity. Dividing
             # a float-serialized amount by its norm can lose a whole unit.
             continue
         covering = max(Decimal('0'), Decimal(str(component['required_qty'])) - Decimal(str(component['missing_qty'])))
-        supported = min(supported, covering / norm)
+        supported = min(supported, _supported_whole_count(covering, norm))
     # Executable production lots are whole output units. Fractional component
     # norms remain Decimal; future supply never increases physical support.
     supported = supported.to_integral_value(rounding=ROUND_FLOOR)
+    launchable = launchable.to_integral_value(rounding=ROUND_FLOOR)
     if ambiguous_bom:
         supported = Decimal('0')
+        launchable = Decimal('0')
 
     payload = {
         "ledger_generation_id": ledger_generation_id,
@@ -704,6 +713,8 @@ def preview_materials(
         "coverage": order_coverage,
         "coverage_status": order_coverage,
         "material_supported_qty": float(supported),
+        "material_launchable_qty": float(launchable),
+        "material_launch_coverage_status": "unavailable" if ambiguous_bom else _aggregate_coverage([str(c['launch_coverage']) for c in components]),
         "coverage_label": "Неоднозначная спецификация" if ambiguous_bom else _ui_coverage_label(order_coverage),
         "coverage_basis": "welded_bom" if basis_item is not None else "direct_bom",
         "coverage_basis_item_id": int(basis_item.item_id) if basis_item is not None else int(product.item_id),
@@ -1154,9 +1165,23 @@ def public_materials_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return public
 
 
+def _supported_whole_count(covering: Decimal, norm: Decimal) -> Decimal:
+    count = (covering / norm).to_integral_value(rounding=ROUND_FLOOR)
+    # Use the same coverage tolerance as a quantity-specific preview, rather
+    # than losing an output unit to float serialization at an integer boundary.
+    candidate = count + 1
+    if _component_coverage_label(float(norm * candidate), float(covering)) == 'ok':
+        count = candidate
+    return count
+
+
 def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bool:
     """A known full-coverage count must not contradict its own quantity."""
     supported = snapshot.get('material_supported_qty')
+    if supported is not None and 'material_launchable_qty' not in snapshot:
+        return False
+    if supported is not None and 'material_launchable_qty' not in snapshot:
+        return False
     quantity = snapshot.get('qty')
     return not (
         supported is not None and snapshot.get('coverage_status') == 'ready'

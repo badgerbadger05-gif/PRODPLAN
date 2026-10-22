@@ -2305,6 +2305,27 @@ def test_fractional_output_keeps_valid_whole_support_snapshot(db_session):
     assert material_supported_snapshot_is_consistent(preview)
 
 
+@pytest.mark.parametrize('stock,expected', [(0.300,2),(0.299,1)])
+def test_launch_support_respects_other_holds_and_integer_boundary(db_session,monkeypatch,stock,expected):
+    parent,_spec,comps=_make_basic_spec(db_session,parent_name='HeldFractional',
+        child_specs=[('HF','Fractional input',stock,0.100)])
+    _order,product=_make_internal_order_for(db_session,parent,qty=3)
+    custody=MaterialCustodyState(by_product={999999:ProductMaterialCustody(in_transit={comps[0].item_id:0.100})})
+    monkeypatch.setattr('app.services.production_material_custody_projection.load_material_custody_projection',lambda *a,**k:custody)
+    preview=preview_materials(db_session,product.product_id)
+    assert preview['material_launchable_qty']==expected
+
+
+def test_unfunded_transit_promise_cannot_create_launch_stock(db_session,monkeypatch):
+    parent,_spec,comps=_make_basic_spec(db_session,parent_name='NoPhysicalInput',child_specs=[('NP','No stock',0,1)])
+    _order,product=_make_internal_order_for(db_session,parent,qty=3)
+    custody=MaterialCustodyState(by_product={product.product_id:ProductMaterialCustody(in_transit={comps[0].item_id:100})})
+    monkeypatch.setattr('app.services.production_material_custody_projection.load_material_custody_projection',lambda *a,**k:custody)
+    preview=preview_materials(db_session,product.product_id)
+    assert preview['material_launchable_qty']==0
+    assert preview['material_launch_coverage_status']=='shortage'
+
+
 def test_bulk_material_preview_matches_scalar_and_loads_custody_once(
     db_session, monkeypatch
 ):
@@ -2429,6 +2450,8 @@ def test_bulk_material_preview_preserves_own_vs_other_custody_semantics(
     assert bulk[product_two.product_id]["components"][0]["reserved_qty"] == 5.0
     assert bulk[product_one.product_id]['material_supported_qty'] == 0
     assert bulk[product_two.product_id]['material_supported_qty'] == 3
+    assert bulk[product_one.product_id]['material_launchable_qty'] == 2
+    assert bulk[product_one.product_id]['material_launch_coverage_status'] == 'ready'
 
 
 def test_bulk_material_preview_matches_scalar_for_paint_weld_basis(

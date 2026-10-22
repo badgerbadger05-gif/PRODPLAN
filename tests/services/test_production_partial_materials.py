@@ -85,7 +85,8 @@ def http_db_session():
 
 
 @pytest.mark.parametrize('stale', [False, True])
-def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_session, monkeypatch, stale):
+@pytest.mark.parametrize('recalculate', [False, True])
+def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_session, monkeypatch, stale, recalculate):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from app.database import get_db
@@ -111,6 +112,7 @@ def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_se
         response = client.post('/api/v1/production-control/orders/refresh-current', json={
             'product_ids': [42], 'current_identities': [identity],
             'expected_source_revision': 'stale' if stale else revision,
+            'recalculate_materials': recalculate,
         })
     if stale:
         assert response.status_code == 409
@@ -118,8 +120,9 @@ def test_http_refresh_current_dispatches_validated_executor_to_worker(http_db_se
     else:
         assert response.status_code == 200
         assert response.json()['status'] == 'refreshed'
-        assert calls == [('refresh-executors', {'product_ids': [42], 'current_identities': [identity],
-                                               'expected_source_revision': revision})]
+        expected={'product_ids':[42],'current_identities':[identity],'expected_source_revision':revision}
+        if recalculate:expected['recalculate_materials']=True
+        assert calls == [('refresh-executors', expected)]
 
 
 def test_preparation_repairs_cached_full_coverage_undercount(db_session, monkeypatch):
@@ -130,7 +133,9 @@ def test_preparation_repairs_cached_full_coverage_undercount(db_session, monkeyp
         calls.append(kwargs['quantity'])
         return {'qty':kwargs['quantity'], 'line_quantity':kwargs['quantity'],
                 'components':[], 'coverage_status':'ready',
-                'material_supported_qty':kwargs['quantity']}
+                'material_supported_qty':kwargs['quantity'],
+                'material_launchable_qty':kwargs['quantity'],
+                'material_launch_coverage_status':'ready'}
     monkeypatch.setattr('app.services.production_control_material_availability.preview_make_work_item_materials', preview)
     arguments={'work_item_id':work.id,'qty':3,'current_identity':identity,'expected_source_revision':revision}
     prepare_current_work_materials(db_session, **arguments)
@@ -464,7 +469,8 @@ def test_current_material_worker_uses_compact_custody_without_historical_replay(
     assert calls == ['production.current_materials_bulk']
 
 
-def test_executor_publication_refreshes_1c_number_and_print_without_proposal(db_session, monkeypatch):
+@pytest.mark.parametrize('recalculate', [False, True])
+def test_executor_publication_refreshes_1c_number_and_print_without_proposal(db_session, monkeypatch, recalculate):
     from app.services.production_control_journal import materialize_make_work_items
     from app.services.production_control_journal_projection import publish_current_executor_changes, _candidate_business_identity
     work, req, owner = _scope(db_session)
@@ -490,14 +496,20 @@ def test_executor_publication_refreshes_1c_number_and_print_without_proposal(db_
         target_entity='Document_ПеремещениеЗапасов',target_ref_key='transfer-ref',target_number='MT059717709',status='success'))
     db_session.commit()
     before=(owner.reserved_qty,owner.covered_from_stock_at_freeze_qty,owner.replenishment_required_qty,owner.replenishment_received_qty)
-    monkeypatch.setattr('app.services.production_control_material_availability.preview_materials_bulk',
-                        lambda *a,**kw:pytest.fail('operational export must preserve accepted material math'))
+    preview_calls=[]
+    def preview(*args,**kwargs):
+        if not recalculate:pytest.fail('operational export must preserve accepted material math')
+        preview_calls.append(args[1])
+        return {product.product_id:{'qty':8,'components':[],'coverage_status':'shortage','material_supported_qty':0,'material_launchable_qty':0,'material_launch_coverage_status':'shortage'}}
+    monkeypatch.setattr('app.services.production_control_material_availability.preview_materials_bulk', preview)
     # Journal and printing use their real builders; they must pick up the 1C link.
-    result=publish_current_executor_changes(db_session,[product.product_id])
+    result=publish_current_executor_changes(db_session,[product.product_id],recalculate_materials=recalculate)
     db_session.commit()
     record=db_session.query(models.CurrentExecutionRow).filter_by(entity_kind='production_control_journal',business_identity=identity).one()
     assert record.payload['order_one_c_number']=='PP059717709'
     assert record.payload['order_ref1c']=='created-1c-ref'
+    assert record.payload['material_coverage_snapshot']['coverage_status']==('shortage' if recalculate else 'ready')
+    assert preview_calls==([[product.product_id]] if recalculate else [])
     assert record.payload['_route_sheet_snapshot']['sheet']['one_c_number']=='PP059717709'
     assert 'MT059717709' in record.payload['_route_sheet_snapshot']['sheet']['transfer_rows'][0]['transfer_number']
     assert before==(owner.reserved_qty,owner.covered_from_stock_at_freeze_qty,owner.replenishment_required_qty,owner.replenishment_received_qty)

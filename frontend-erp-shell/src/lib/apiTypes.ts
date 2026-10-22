@@ -5620,6 +5620,10 @@ export interface components {
         ProductionMaterialsResponse: {
             /** Material Supported Qty */
             material_supported_qty?: number | null;
+            /** Material Launchable Qty */
+            material_launchable_qty?: number | null;
+            /** Material Launch Coverage Status */
+            material_launch_coverage_status?: string | null;
             /** Ledger Generation Id */
             ledger_generation_id: number;
             /** Truth Status */
@@ -6450,6 +6454,11 @@ export interface components {
             current_identities?: string[];
             /** Expected Source Revision */
             expected_source_revision?: string | null;
+            /**
+             * Recalculate Materials
+             * @default false
+             */
+            recalculate_materials: boolean;
         };
         /** RemoveRequest */
         RemoveRequest: {

@@ -285,6 +285,7 @@ export function refreshCurrentProductionOrders(productIds: number[], currentIden
   const payload: ApiSchemas['RefreshProductionOrdersPayload'] = {
     product_ids: productIds, current_identities: currentIdentities,
     expected_source_revision: sourceRevision,
+    recalculate_materials: false,
   }
   return api<ApiSchemas['CurrentProductionRefreshResponse']>('/v1/production-control/orders/refresh-current', {
     method: 'POST', body: JSON.stringify(payload),

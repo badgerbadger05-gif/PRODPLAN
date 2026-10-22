@@ -148,7 +148,8 @@ def _publish_local_payloads(db, truth, manifest, payloads):
 
 def publish_current_executor_changes(db: Session, product_ids: Sequence[int], *,
                                      expected_source_revision: str | None = None,
-                                     current_identities: Sequence[str] | None = None) -> dict[str, Any]:
+                                     current_identities: Sequence[str] | None = None,
+                                     recalculate_materials: bool = False) -> dict[str, Any]:
     """Worker publication after operational changes, including 1C export.
 
     Refreshes saved journal/material/print results for current executors only.
@@ -185,7 +186,7 @@ def publish_current_executor_changes(db: Session, product_ids: Sequence[int], *,
     material_snapshots = {pid: deepcopy(by_product[pid].payload.get("material_coverage_snapshot")) for pid in ids}
     products = {int(product.product_id): product for product in db.query(models.ProductionProduct)
                 .filter(models.ProductionProduct.product_id.in_(ids)).all()}
-    recalculated = [pid for pid in ids if not material_snapshots[pid]
+    recalculated = [pid for pid in ids if recalculate_materials or not material_snapshots[pid]
                     or Decimal(str(products[pid].quantity)) != Decimal(str(by_product[pid].payload.get("quantity")))
                     or products[pid].spec_id != by_product[pid].payload.get("spec_id")
                     or products[pid].spec_revision_hash != by_product[pid].payload.get("spec_revision_hash")]
