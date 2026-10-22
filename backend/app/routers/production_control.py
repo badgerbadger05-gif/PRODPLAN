@@ -1189,6 +1189,7 @@ class MaterialIssueCreatePayload(BaseModel):
     initiated_by: Optional[str] = None
     warehouse_ref1c: Optional[str] = None
     source_warehouse_ref1c: Optional[str] = None
+    component_source_warehouses: dict[int, str] = Field(default_factory=dict)
     current_identities: List[str] = Field(default_factory=list)
     expected_source_revision: Optional[str] = None
 
@@ -2781,6 +2782,7 @@ def post_material_issues(payload: MaterialIssueCreatePayload, db: Session = Depe
             initiated_by=payload.initiated_by,
             warehouse_ref1c=payload.warehouse_ref1c,
             source_warehouse_ref1c=payload.source_warehouse_ref1c,
+            component_source_warehouses=payload.component_source_warehouses,
         )
     except CurrentExecutionUnavailable as e:
         raise HTTPException(status_code=503, detail={"code": "production_control_current_unavailable", "reason": str(e)}) from e

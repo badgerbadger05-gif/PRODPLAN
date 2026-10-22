@@ -1690,6 +1690,58 @@ def test_posted_transfer_retry_reuses_live_custody(db_session):
     )
 
 
+def test_components_with_disjoint_source_choices_create_and_reuse_issues(db_session):
+    parent = Item(item_code="P-MULTI-SOURCE", item_name="Parent", unit="шт")
+    components = [Item(item_code=f"C-MULTI-{i}", item_name=f"Component {i}", unit="шт") for i in range(2)]
+    db_session.add_all([parent, *components]); db_session.flush()
+    spec = Specification(spec_name="Multiple source spec", spec_ref1c="multi-source-spec")
+    db_session.add(spec); db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "multi-source")
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    for component in components:
+        db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+    generation_id = db_session.info["production_journal_generation_id"]
+    for index, component in enumerate(components):
+        for suffix in ("a", "b"):
+            ref = f"source-{index}-{suffix}"
+            db_session.add(StockWarehouse(warehouse_ref1c=ref, warehouse_name=ref, is_selected=True))
+            db_session.add(StockBin(ledger_generation_id=generation_id, item_id=component.item_id,
+                warehouse_ref1c=ref, characteristic_ref="", organization_ref="", on_hand=10))
+    order = ProductionOrder(order_number="MULTI-SOURCE", order_date=datetime(2026, 6, 4), deletion_mark=False)
+    db_session.add(order); db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1,
+        quantity=5, produced_qty=0, remaining_qty=5)
+    db_session.add(product); db_session.commit()
+    pending = create_material_issues(db_session, [product.product_id])
+    assert pending["created"] == []
+    assert len(pending["selection_required"][0]["components"]) == 2
+    choices = {components[0].item_id: "source-0-a", components[1].item_id: "source-1-b"}
+    first = create_material_issues(db_session, [product.product_id], component_source_warehouses=choices)
+    assert first["selection_required"] == []
+    assert {row["source_warehouse_ref1c"] for row in first["created"]} == set(choices.values())
+    second = create_material_issues(db_session, [product.product_id], component_source_warehouses=choices)
+    assert second["created"] == []
+    assert {row["issue_id"] for row in second["reused"]} == {row["issue_id"] for row in first["created"]}
+    assert db_session.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).count() == 2
+
+
+@pytest.mark.parametrize("invalid_source", ["", "not-a-current-candidate"])
+def test_component_source_selection_rejects_non_candidate(db_session, invalid_source):
+    from app.services.production_control_material_issues import _allocate_components_by_source_warehouse
+    component = Item(item_code="SOURCE-VALIDATION", item_name="Component")
+    db_session.add(component); db_session.flush()
+    generation_id = db_session.info["production_journal_generation_id"]
+    db_session.add(StockWarehouse(warehouse_ref1c="valid-source", warehouse_name="Valid", is_selected=True))
+    db_session.add(StockBin(ledger_generation_id=generation_id, item_id=component.item_id,
+        warehouse_ref1c="valid-source", characteristic_ref="", organization_ref="", on_hand=10))
+    db_session.flush()
+    with pytest.raises(ValueError, match="not an accepted stock candidate"):
+        _allocate_components_by_source_warehouse(db_session,
+            [{"component_item_id":component.item_id,"required_qty":5}],
+            ledger_generation_id=generation_id,
+            component_source_warehouses={component.item_id:invalid_source})
+
+
 def test_existing_issue_source_change_reuses_original_live_issue(db_session):
     parent = Item(item_code="P-SRC-REUSE", item_name="Parent source reuse", unit="шт", status="active")
     comp = Item(item_code="C-SRC-REUSE", item_name="Component source reuse", unit="шт", status="active")

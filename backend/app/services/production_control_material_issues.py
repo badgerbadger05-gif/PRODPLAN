@@ -238,6 +238,7 @@ def _allocate_components_by_source_warehouse(
     destination_warehouse_ref1c: Optional[str] = None,
     selected_source_warehouse_ref1c: Optional[str] = None,
     ledger_generation_id: Optional[int] = None,
+    component_source_warehouses: Optional[Dict[int, str]] = None,
 ) -> Tuple[Dict[Optional[str], List[Dict[str, Any]]], List[Dict[str, Any]]]:
     component_item_ids = [int(c["component_item_id"]) for c in components]
     excluded = {str(destination_warehouse_ref1c)} if destination_warehouse_ref1c else set()
@@ -254,6 +255,13 @@ def _allocate_components_by_source_warehouse(
     for comp in components:
         component_id = int(comp["component_item_id"])
         options = options_by_item.get(component_id, [])
+        explicit_source = (component_source_warehouses or {}).get(component_id)
+        component_source = _clean_ref1c(explicit_source) if explicit_source is not None else None
+        if explicit_source is not None:
+            if not component_source or component_source not in {str(row["ref1c"]) for row in options}:
+                raise ValueError(f"component_item_id={component_id}: selected source warehouse is not an accepted stock candidate")
+            groups.setdefault(component_source, []).append(comp)
+            continue
         if not options:
             groups.setdefault(None, []).append(comp)
             continue
@@ -806,6 +814,7 @@ def create_material_issues(
     initiated_by: Optional[str] = None,
     warehouse_ref1c: Optional[str] = None,
     source_warehouse_ref1c: Optional[str] = None,
+    component_source_warehouses: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
     """
     Bring the order's component reservations up to its BOM requirement.
@@ -999,6 +1008,7 @@ def create_material_issues(
                 destination_warehouse_ref1c=resolved_warehouse,
                 selected_source_warehouse_ref1c=source_warehouse_ref1c,
                 ledger_generation_id=generation_id,
+                component_source_warehouses=component_source_warehouses,
             )
             if needed_selection:
                 selection_required.append(
