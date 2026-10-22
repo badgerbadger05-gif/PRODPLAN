@@ -7,6 +7,15 @@ export type TruthBadgeMeta = {
   cutoff?: string | null
 }
 
+export function isProductionSnapshotInvalid(error: unknown): boolean {
+  if (truthBadgeMetaFromApiError(error)) return true
+  if (!(error instanceof ApiError) || error.status !== 409) return false
+  if (!error.detail || typeof error.detail !== 'object') return false
+  const detail = error.detail as Record<string, unknown>
+  return detail.code === 'production_current_revision_stale'
+    || detail.code === 'production_current_locator_stale'
+}
+
 export function truthBadgeMetaFromApiError(error: unknown): TruthBadgeMeta | null {
   if (!(error instanceof ApiError) || error.status !== 503) return null
   if (!error.detail || typeof error.detail !== 'object') return null

@@ -185,6 +185,56 @@ test.use({
   timezoneId: 'Europe/Moscow',
 })
 
+for (const failure of ['stale truth', 'revision conflict']) {
+  test(`production discards retained coverage after ${failure} and recovers`, async ({ page }) => {
+    let rejected = false
+    const base = '/api/v1/production-control'
+    await page.route('**/api/**', async (route) => {
+      const { pathname } = new URL(route.request().url())
+      if (pathname === `${base}/orders`) {
+        if (rejected && failure === 'stale truth') {
+          await route.fulfill({ status: 503, json: { detail: {
+            code: 'planning_truth_unavailable', truth_status: 'stale', ledger_generation: 77,
+          } } })
+        } else {
+          await route.fulfill({ json: {
+            rows: [{ ...orders[0], current_identity: 'production:order:101', source_revision: 'rev-7' }],
+            total: 1, limit: 100, offset: 0, latest_run_id: 77,
+            truth_meta: { ledger_generation: 77, truth_status: 'accepted' },
+          } })
+        }
+      } else if (pathname === `${base}/orders/101/materials`) {
+        await route.fulfill(rejected ? { status: 409, json: { detail: {
+          code: 'production_current_revision_stale', expected_source_revision: 'rev-8',
+        } } } : { json: materials })
+      } else if (pathname === '/api/v1/resources/') {
+        await route.fulfill({ json: [] })
+      } else if (pathname === `${base}/orders/root-products`) {
+        await route.fulfill({ json: { rows: [] } })
+      } else {
+        await route.abort('failed')
+      }
+    })
+    await page.goto('/#/production-control')
+    await expect(page.getByText('Болт М8')).toBeVisible()
+    await page.getByRole('checkbox', { name: /ПП-000101/ }).check()
+    rejected = true
+    await page.getByRole('button', { name: failure === 'stale truth' ? 'Сформировать' : 'Повторить загрузку', exact: true }).click()
+    await expect(page.getByRole('alert')).toContainText(failure === 'stale truth'
+      ? 'Данные об остатках устарели.' : 'Журнал производства изменился.')
+    await expect(page.getByRole('table', { name: 'Заказы на производство' })).toHaveCount(0)
+    await expect(page.getByText('Выберите строку', { exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled()
+    await expect(page.getByText('Собрано', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('Болт М8')).toHaveCount(0)
+    await expect(page.getByText('production_current_revision_stale', { exact: false })).toHaveCount(0)
+    rejected = false
+    await page.getByRole('button', { name: 'Повторить', exact: true }).click()
+    await expect(page.getByText('Болт М8')).toBeVisible()
+    await expect(page.getByText('Выбрано: 0')).toBeVisible()
+  })
+}
+
 test('launches an existing order with retained MRP work item without recreating it', async ({ page }) => {
   const posts: { path: string; body: Record<string, unknown> }[] = []
   const base = '/api/v1/production-control'

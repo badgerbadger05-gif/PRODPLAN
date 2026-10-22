@@ -17,6 +17,10 @@ type UnauthorizedListener = () => void
 type AccessTokenProvider = () => string | null | undefined
 
 function structuredErrorMessage(detail: Record<string, unknown>): string | null {
+  if (detail.code === 'production_current_revision_stale' || detail.code === 'production_current_locator_stale') {
+    return 'Журнал производства изменился. Обновите журнал и выберите строку повторно.'
+  }
+
   if (detail.code === 'planning_truth_unavailable') {
     return detail.truth_status === 'stale'
       ? 'Данные об остатках устарели. Действия, зависящие от остатков, временно недоступны.'

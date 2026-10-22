@@ -50,6 +50,7 @@ import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
 import { TruthBadge } from '../layout/TruthBadge'
 import {
+  isProductionSnapshotInvalid,
   truthBadgeMetaFromApiError,
   type TruthBadgeMeta,
 } from '../../services/planningTruth'
@@ -217,6 +218,21 @@ export function ProductionControlPage() {
   ), [activeCurrentIdentity, activeId, rows])
   const selectedRows = useMemo(() => selectedProductionRows(rows, selectedIds), [rows, selectedIds])
 
+  const discardSnapshot = useCallback((error: unknown) => {
+    // Retained quantities and coverage are no longer an actionable snapshot.
+    // Also invalidate in-flight details so they cannot restore an old card.
+    ++materialsRequestSeq.current
+    setRows([])
+    setTotal(0)
+    setSelectedIds(new Set())
+    setActiveId(null)
+    setActiveCurrentIdentity(null)
+    setMaterials(null)
+    setMaterialsError('')
+    setMaterialsLoading(false)
+    setTruthMeta(truthBadgeMetaFromApiError(error))
+  }, [])
+
   const load = useCallback(async (nextOffset: number) => {
     const requestSeq = ++listRequestSeq.current
     setLoading(true)
@@ -266,12 +282,12 @@ export function ProductionControlPage() {
       })
     } catch (e) {
       if (requestSeq !== listRequestSeq.current) return
-      setTruthMeta(truthBadgeMetaFromApiError(e))
+      discardSnapshot(e)
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       if (requestSeq === listRequestSeq.current) setLoading(false)
     }
-  }, [focusOrderId, focusProductId])
+  }, [discardSnapshot, focusOrderId, focusProductId])
 
   const loadResources = useCallback(async () => {
     try {
@@ -355,11 +371,18 @@ export function ProductionControlPage() {
       } : row))
     } catch (e) {
       if (requestSeq !== materialsRequestSeq.current) return
+      if (isProductionSnapshotInvalid(e)) {
+        ++listRequestSeq.current
+        discardSnapshot(e)
+        setLoading(false)
+        setError(e instanceof Error ? e.message : String(e))
+        return
+      }
       setMaterialsError(e instanceof Error ? e.message : String(e))
     } finally {
       if (requestSeq === materialsRequestSeq.current) setMaterialsLoading(false)
     }
-  }, [])
+  }, [discardSnapshot])
 
   const loadMaterials = useCallback(
     (productId: number) => requestMaterials(productId, getOrderMaterials),
@@ -1202,6 +1225,7 @@ export function ProductionControlPage() {
       await load(offsetRef.current)
       setMaterialsRefreshToken((current) => current + 1)
     } catch (e) {
+      if (isProductionSnapshotInvalid(e)) discardSnapshot(e)
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)

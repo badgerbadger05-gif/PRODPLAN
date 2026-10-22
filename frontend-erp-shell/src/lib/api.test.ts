@@ -95,6 +95,20 @@ describe('api transport', () => {
     } satisfies Partial<ApiError>)
   })
 
+  it.each(['production_current_revision_stale', 'production_current_locator_stale'])(
+    'renders a readable production snapshot conflict for %s', async (code) => {
+      const detail = { code, expected_source_revision: 'rev-8' }
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+        JSON.stringify({ detail }), { status: 409 },
+      )))
+      await expect(api('/production-control')).rejects.toMatchObject({
+        message: 'Журнал производства изменился. Обновите журнал и выберите строку повторно.',
+        status: 409,
+        detail,
+      } satisfies Partial<ApiError>)
+    },
+  )
+
   it('renders a concise unavailable-truth message', async () => {
     const detail = {
       code: 'planning_truth_unavailable',

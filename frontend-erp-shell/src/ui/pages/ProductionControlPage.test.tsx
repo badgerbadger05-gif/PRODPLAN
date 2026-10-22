@@ -2038,6 +2038,44 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('accepted truth is stale')
   })
 
+  it('discards retained coverage, selection and late materials when a journal reload fails', async () => {
+    const materials = deferred<MaterialsResponse>()
+    vi.mocked(getOrderMaterials).mockReturnValueOnce(materials.promise)
+    renderPage()
+    await screen.findByText('Вал')
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalled())
+    fireEvent.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    vi.mocked(listProductionOrders).mockRejectedValueOnce(new ApiError('Данные об остатках устарели.', 503, {
+      code: 'planning_truth_unavailable', truth_status: 'stale', ledger_generation: 7,
+    }))
+    fireEvent.click(screen.getByRole('button', { name: 'Сформировать' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Данные об остатках устарели.')
+    expect(screen.queryByRole('table', { name: 'Заказы на производство' })).not.toBeInTheDocument()
+    expect(screen.getByText('Выберите строку')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled()
+    await act(async () => { materials.resolve(fakeMaterials()) })
+    expect(screen.queryByText('Ledger по номенклатуре')).not.toBeInTheDocument()
+    expect(screen.queryByText('Собрано')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Повторить' }))
+    expect(await screen.findByText('Вал')).toBeVisible()
+    expect(screen.getByText('Выбрано: 0')).toBeVisible()
+  })
+
+  it.each(['production_current_revision_stale', 'production_current_locator_stale', 'planning_truth_unavailable'])(
+    'discards the journal when materials reject its snapshot with %s', async (code) => {
+      vi.mocked(getOrderMaterials).mockRejectedValueOnce(new ApiError('Обновите журнал.',
+        code === 'planning_truth_unavailable' ? 503 : 409,
+        { code, truth_status: 'stale', ledger_generation: 7 },
+      ))
+      renderPage()
+      expect(await screen.findByRole('alert')).toHaveTextContent('Обновите журнал.')
+      expect(screen.queryByRole('table', { name: 'Заказы на производство' })).not.toBeInTheDocument()
+      expect(screen.getByText('Выберите строку')).toBeVisible()
+      expect(screen.queryByText('Ledger по номенклатуре')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Запустить в 1С' })).toBeDisabled()
+    },
+  )
+
   it('shows an explicit initial loading state before the production response arrives', async () => {
     const request = deferred<Awaited<ReturnType<typeof listProductionOrders>>>()
     vi.mocked(listProductionOrders).mockReturnValueOnce(request.promise)
