@@ -128,6 +128,17 @@ def rebase_fixed_plan_remaining_roots(
     same generation build and rolls the transaction back, so it is suitable for
     the planned shadow benchmark but not for a polling endpoint.
     """
+    # Executor commands acquire this boundary before touching orders/runs.
+    # Take it first too: a late pointer lock after staging successor orders
+    # inverted that order and deadlocked with a simultaneous manual launch.
+    truth = (
+        db.query(models.PlanningTruthState)
+        .filter(models.PlanningTruthState.id == 1)
+        .with_for_update()
+        .one_or_none()
+    )
+    if truth is None or truth.current_generation_id is None:
+        raise ValueError("current accepted planning truth is unavailable")
     predecessor = (
         db.query(models.PlanningRun)
         .filter(models.PlanningRun.run_id == int(run_id))
@@ -163,9 +174,6 @@ def rebase_fixed_plan_remaining_roots(
     if predecessor_plan is None or str(predecessor_plan.status) != "fixed":
         raise ValueError("source production plan must be fixed")
 
-    truth = db.get(models.PlanningTruthState, 1)
-    if truth is None or truth.current_generation_id is None:
-        raise ValueError("current accepted planning truth is unavailable")
     parent_generation_id = int(truth.current_generation_id)
     generation = db.get(models.LedgerGeneration, parent_generation_id)
     if (
