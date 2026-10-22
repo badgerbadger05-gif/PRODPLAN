@@ -5618,6 +5618,8 @@ export interface components {
         };
         /** ProductionMaterialsResponse */
         ProductionMaterialsResponse: {
+            /** Material Supported Qty */
+            material_supported_qty?: number | null;
             /** Ledger Generation Id */
             ledger_generation_id: number;
             /** Truth Status */

@@ -267,6 +267,7 @@ class AssemblyReadinessListResponse(BaseModel):
 
 
 class ProductionMaterialsResponse(BaseModel):
+    material_supported_qty: Optional[float] = None
     model_config = ConfigDict(extra="forbid")
 
     ledger_generation_id: int

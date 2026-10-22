@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_
@@ -661,6 +662,21 @@ def preview_materials(
 
     order_coverage = "unavailable" if ambiguous_bom else _aggregate_coverage([str(c["coverage"]) for c in components])
 
+    remaining = accepted_product_output(product).remaining_qty
+    supported = max(Decimal('0'), Decimal(str(remaining)))
+    for component in components:
+        norm = Decimal(str(component['qty_per_unit']))
+        if norm <= 0:
+            supported = Decimal('0')
+            break
+        covering = max(Decimal('0'), Decimal(str(component['required_qty'])) - Decimal(str(component['missing_qty'])))
+        supported = min(supported, covering / norm)
+    # Executable production lots are whole output units. Fractional component
+    # norms remain Decimal; future supply never increases physical support.
+    supported = supported.to_integral_value(rounding=ROUND_FLOOR)
+    if ambiguous_bom:
+        supported = Decimal('0')
+
     payload = {
         "ledger_generation_id": ledger_generation_id,
         "product_id": int(product.product_id),
@@ -683,6 +699,7 @@ def preview_materials(
         "components": components,
         "coverage": order_coverage,
         "coverage_status": order_coverage,
+        "material_supported_qty": float(supported),
         "coverage_label": "Неоднозначная спецификация" if ambiguous_bom else _ui_coverage_label(order_coverage),
         "coverage_basis": "welded_bom" if basis_item is not None else "direct_bom",
         "coverage_basis_item_id": int(basis_item.item_id) if basis_item is not None else int(product.item_id),

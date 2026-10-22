@@ -2262,10 +2262,24 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
     preview = preview_materials(db_session, product.product_id)
 
     assert preview["coverage"] == "ready"
+    assert preview["material_supported_qty"] == 2
     for c in preview["components"]:
         assert c["coverage"] == "ok"
         assert c["missing_qty"] == 0
         assert c["eta_dates"] == []
+
+
+@pytest.mark.parametrize('stock_a,stock_b,expected', [(7, 100, 3), (100, 8, 2), (0, 100, 0), (5, 8, 2)])
+def test_material_supported_qty_limits_whole_output_by_scarcest_component(
+    db_session, stock_a, stock_b, expected
+):
+    parent, _spec, _comps = _make_basic_spec(
+        db_session, parent_name='PhysicalPartial',
+        child_specs=[('PA', 'A', stock_a, 2), ('PB', 'B', stock_b, 3)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=10)
+    preview = preview_materials(db_session, product.product_id)
+    assert preview['material_supported_qty'] == expected
 
 
 def test_bulk_material_preview_matches_scalar_and_loads_custody_once(
@@ -2390,6 +2404,8 @@ def test_bulk_material_preview_preserves_own_vs_other_custody_semantics(
     assert bulk == scalar
     assert bulk[product_one.product_id]["components"][0]["reserved_for_order_qty"] == 1.0
     assert bulk[product_two.product_id]["components"][0]["reserved_qty"] == 5.0
+    assert bulk[product_one.product_id]['material_supported_qty'] == 0
+    assert bulk[product_two.product_id]['material_supported_qty'] == 3
 
 
 def test_bulk_material_preview_matches_scalar_for_paint_weld_basis(
