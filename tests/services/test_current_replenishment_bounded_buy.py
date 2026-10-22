@@ -20,6 +20,70 @@ def _scope(item_id: int):
     return (int(item_id), "", "", "default", "buy")
 
 
+@pytest.mark.parametrize('outside_contour', [False, True])
+@pytest.mark.parametrize('replacement_same_item', [False, True])
+def test_complete_buy_scope_retires_only_proven_outside_contour_basis(
+    db_session, outside_contour, replacement_same_item,
+):
+    parent, target, batch, items, owners = _world(db_session, item_count=2)
+    old_batch = db_session.get(models.PhysicalImportBatch, parent.physical_import_batch_id)
+    old, _ = _receipt(db_session, old_batch, items[0], ref='old-basis')
+    if outside_contour:
+        old.warehouse_ref1c = 'EXCLUDED-WAREHOUSE'
+    new, fact = _receipt(db_session, batch, items[0 if replacement_same_item else 1], quantity='3', ref='new-basis')
+    old.recorder_type = 'Document_ПриходнаяНакладная'
+    owner = owners[0]
+    db_session.add(models.StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=parent.id, stock_ledger_entry_id=old.id,
+        receipt_doc_type=old.recorder_type, receipt_doc_ref=old.recorder_ref,
+        receipt_doc_line_no=old.line_no, operation_kind='supplier_receipt',
+        operation_key='test', operation_name='test',
+        evidence_hash='contour-basis'.ljust(64, '0'),
+        evidence_payload={'signed_qty': str(old.qty)}, match_rule='bounded-typed',
+        match_status='unmatched', ambiguity_count=0, reason='no exact order line',
+    ))
+    db_session.add(models.ReservationConsumptionAllocation(
+        ledger_generation_id=parent.id, reservation_id=owner.id, sle_id=old.id,
+        requirement_id=owner.requirement_id, allocated_qty=Decimal('4'),
+        match_rule='fifo', item_id=old.item_id, characteristic_ref='',
+        organization_ref='', planning_stock_pool='default',
+        idempotency_key=f'contour-parent:{owner.id}:{old.id}',
+        allocation_role='replenishment_receipt', is_current=True,
+    ))
+    owner.replenishment_received_qty = Decimal('4')
+    db_session.flush()
+    def replay():
+        return apply_current_replenishment_for_bounded_buy_scopes(
+            db_session, target_generation_id=target.id, parent_generation_id=parent.id,
+            target_cutoff=target.cutoff, affected_scopes=tuple(_scope(i.item_id) for i in items),
+            planning_pool_by_warehouse={'WH-BUY': 'default'},
+            delta_manifest=BoundedBuyReceiptDeltaManifest(
+                new_sle_ids=(new.id,), receipt_facts=(fact,),
+                scope_receipt_facts=(fact,), backdate_from=old.posting_at,
+            ),
+        )
+    if not outside_contour and replacement_same_item:
+        with pytest.raises(CurrentReplenishmentError, match='omits current allocation basis'):
+            replay()
+        return
+    replay()
+    replay()  # A retry preserves the same assignments and physical facts.
+    current = db_session.query(models.ReservationConsumptionAllocation).filter(
+        models.ReservationConsumptionAllocation.is_current.is_(True),
+        models.ReservationConsumptionAllocation.reservation_id==owner.id,
+    ).all()
+    if replacement_same_item:
+        assert [(r.sle_id, r.allocated_qty) for r in current] == [(new.id, Decimal('3'))]
+        assert owner.replenishment_received_qty == Decimal('3')
+    elif outside_contour:
+        assert current == []
+        assert owner.replenishment_received_qty == Decimal('0')
+    else:
+        assert [(r.sle_id, r.allocated_qty) for r in current] == [(old.id, Decimal('4'))]
+        assert owner.replenishment_received_qty == Decimal('4')
+    assert db_session.get(models.StockLedgerEntry, old.id).qty == Decimal('4')
+
+
 def _batch(key: str, cutoff: datetime):
     return models.PhysicalImportBatch(
         batch_key=key,
