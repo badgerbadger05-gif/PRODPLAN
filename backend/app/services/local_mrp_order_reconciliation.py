@@ -2,7 +2,9 @@
 
 The MRP run owns the obligation, while an order already exported to 1C or
 touched by execution is an external commitment.  During obligation refresh we
-may therefore resize only a completely local, single-line order.  Locked work
+may therefore resize only a completely local, single-line order without a
+prepared material kit. A nonempty local request already owns material custody;
+resizing its executor here would bypass the material-issue owner. Locked work
 is preserved and the normal production-journal netting exposes any positive
 delta as another proposal.
 """
@@ -598,6 +600,22 @@ def reconcile_local_mrp_orders(
         for issue_id, product_id, exported_ref1c in issue_rows
         if str(exported_ref1c or "").strip() or int(issue_id) in linked_issue_ids
     }
+    prepared_issue_product_ids = {
+        int(product_id)
+        for (product_id,) in db.query(models.ProductionMaterialIssue.product_id)
+        .join(models.ProductionMaterialIssueLine)
+        .filter(
+            models.ProductionMaterialIssue.product_id.in_(sorted(product_ids)),
+            models.ProductionMaterialIssue.direction == "issue",
+            models.ProductionMaterialIssue.status.in_(
+                ("draft", "requested", "issued", "exported", "posted", "error")
+            ),
+            (models.ProductionMaterialIssueLine.required_qty > 0)
+            | (models.ProductionMaterialIssueLine.issued_qty > 0),
+        )
+        .distinct()
+        .all()
+    }
     manufacture_product_ids = {
         int(product_id)
         for (product_id,) in db.query(models.ProductionManufacture.product_id)
@@ -637,6 +655,7 @@ def reconcile_local_mrp_orders(
             or int(order.order_id) in export_attempted_order_ids
             or order_line_counts.get(int(order.order_id), 0) != 1
             or int(product.product_id) in issue_product_ids
+            or int(product.product_id) in prepared_issue_product_ids
             or int(product.product_id) in manufacture_product_ids
             or int(order.order_id) in chain_order_ids
             or _decimal(output.produced_qty) > _EPSILON

@@ -720,3 +720,44 @@ def test_explicit_transition_protects_every_execution_guard(
     assert expected_reason in result["blocked_reasons"]
     assert product.spec_id == old_spec.spec_id
     assert product.spec_revision_hash == old_spec.content_hash
+
+
+@pytest.mark.parametrize('material_qty', [Decimal('0'), Decimal('1')])
+def test_rebase_preserves_partial_launch_with_a_prepared_material_kit(
+    db_session, material_qty,
+):
+    generation, live_run, order, product = _scenario(
+        db_session, order_qty=Decimal('15'), target_qty=Decimal('19'),
+    )
+    component = models.Item(item_code='prepared-partial-component', item_name='Prepared component')
+    db_session.add(component)
+    db_session.flush()
+    issue = models.ProductionMaterialIssue(
+        document_number='PREPARED-PARTIAL', product_id=product.product_id,
+        order_id=order.order_id, status='draft', direction='issue',
+        ledger_generation_id=generation.id,
+    )
+    db_session.add(issue)
+    db_session.flush()
+    db_session.add(models.ProductionMaterialIssueLine(
+        issue_id=issue.issue_id, component_item_id=component.item_id,
+        required_qty=material_qty, issued_qty=0,
+    ))
+    db_session.flush()
+    summary = reconcile_local_mrp_orders(
+        db_session, ledger_generation_id=generation.id, live_run_ids=[live_run.run_id],
+    )
+    if material_qty:
+        assert Decimal(product.quantity) == Decimal('15')
+        assert summary['resized'] == 0
+        assert summary['locked'] == 1
+    else:
+        assert Decimal(product.quantity) == Decimal('19')
+        assert summary['resized'] == 1
+        assert summary['locked'] == 0
+    # Executor protection does not rewrite the MRP obligation or its reserve.
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=live_run.run_id,
+    ).one()
+    assert requirement.net_required_qty == Decimal('19')
+    assert db_session.query(models.ReservationEntry).one().reserved_qty == Decimal('19')
