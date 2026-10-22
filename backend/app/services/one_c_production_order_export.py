@@ -1190,8 +1190,9 @@ def export_production_orders_to_1c(
 ) -> Dict[str, Any]:
     """
     Export the given internal MRP production_orders to 1C as
-    Document_ЗаказНаПроизводство with Posted=false, then operationally posts
-    each created 1C document.
+    Document_ЗаказНаПроизводство with Posted=false, then posts each created
+    document. An exact 1C date rejection permits ordinary posting of the same
+    planning document; its original date and identity remain unchanged.
 
     Default is `dry_run=True` per plan safety rule: the caller must pass
     `dry_run=False` to actually write into the configured 1C base.
@@ -1362,6 +1363,7 @@ def export_production_orders_to_1c(
             entity=PRODUCTION_ORDER_ENTITY,
             ref_key=ref_key,
             unpost_first=False,
+            allow_non_operational_date_retry=True,
         )
         # Stamp success on production_orders.order_ref1c so the journal stops
         # treating it as MRP-only.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
@@ -209,6 +210,7 @@ def post_document_operational(
     entity: str,
     ref_key: str,
     unpost_first: bool = False,
+    allow_non_operational_date_retry: bool = False,
 ) -> None:
     ref = clean_ref1c(ref_key)
     if not ref:
@@ -222,7 +224,22 @@ def post_document_operational(
         return
     if unpost_first:
         post_operation(f"{base}/Unpost")
-    post_operation(f"{base}/Post?PostingModeOperational=true")
+    try:
+        post_operation(f"{base}/Post?PostingModeOperational=true")
+    except Exception as exc:
+        message = str(exc)
+        date_rejection = (
+            "Дата документа не соответствует текущей дате" in message
+            and "Документ не может быть проведен оперативно" in message
+        )
+        if not allow_non_operational_date_retry or not date_rejection:
+            raise
+        # Opt-in for planning documents only. Keep the original document,
+        # date and payload; stock/manufacture callers retain strict posting.
+        logging.getLogger(__name__).warning(
+            "1C date rejection: posting the same %s non-operationally", base,
+        )
+        post_operation(f"{base}/Post?PostingModeOperational=false")
 
 
 def post_export_entries(

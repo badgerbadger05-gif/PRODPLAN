@@ -176,7 +176,9 @@ def export_issues(base: str, path: Path, state: dict, dry_run: bool) -> None:
     # Parent order export deliberately rejects mixed planning runs. Preserve
     # the same run boundary as materialization instead of weakening its guard.
     for run, materialized in state['completed_runs'].items():
-        if run in results and results[run].get('status') == 'ok':
+        if (run in results and results[run].get('status') == 'ok'
+                and results[run].get('issues_error') == 0
+                and (results[run].get('parent_orders_export') or {}).get('orders_error') == 0):
             continue
         products = {r['product_id'] for kind in ('created', 'reused')
                     for r in materialized.get(kind, [])}
@@ -193,7 +195,8 @@ def export_issues(base: str, path: Path, state: dict, dry_run: bool) -> None:
         state.pop('inflight', None)
         save(path, state)
         print(json.dumps({'run': run, 'result': result}, ensure_ascii=True))
-        if result.get('status') != 'ok' or (result.get('parent_orders_export') or {}).get('orders_error'):
+        if (result.get('status') != 'ok' or result.get('issues_error') != 0
+                or (result.get('parent_orders_export') or {}).get('orders_error') != 0):
             raise RuntimeError('issue export partially applied; inspect saved response')
 
 

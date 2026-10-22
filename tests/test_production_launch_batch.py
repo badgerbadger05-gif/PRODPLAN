@@ -1,3 +1,5 @@
+import pytest
+
 from tools.production_launch_batch import select_rows
 from tools import production_launch_batch as batch
 
@@ -43,7 +45,7 @@ def test_issue_export_preserves_run_boundary_and_resumes_successful_runs(tmp_pat
     def post(base, endpoint, payload):
         assert payload['issue_ids'] in ([11], [22]), 'mixed-run export must never be submitted'
         calls.append(payload)
-        return {'status': 'ok', 'parent_orders_export': {'orders_error': 0}}
+        return {'status': 'ok', 'issues_error': 0, 'parent_orders_export': {'orders_error': 0}}
 
     monkeypatch.setattr(batch, 'post', post)
     path = tmp_path / 'batch.json'
@@ -52,3 +54,31 @@ def test_issue_export_preserves_run_boundary_and_resumes_successful_runs(tmp_pat
     assert len(calls) == 2
     assert calls[0]['current_identities'] == ['1']
     assert calls[1]['current_identities'] == ['2']
+
+
+@pytest.mark.parametrize('failed_part', ['parent', 'issue'])
+def test_resume_retries_partial_success_on_same_issue_ids(tmp_path, monkeypatch, failed_part):
+    partial = {'status': 'ok', 'issues_error': int(failed_part == 'issue'),
+               'parent_orders_export': {'orders_error': int(failed_part == 'parent')}}
+    state = {'created': [{'product_id': 1}],
+             'completed_runs': {'620': {'created': [{'product_id': 1}]}},
+             'stages': {'materials': {'created': [{'product_id': 1, 'issue_id': 11}]},
+                        'issue_export': {'620': partial}}}
+    monkeypatch.setattr(batch, 'product_context', lambda *args: {
+        'product_ids': [1], 'current_identities': ['same-executor'],
+        'expected_source_revision': 'fresh-current',
+    })
+    calls = []
+
+    def post(base, endpoint, payload):
+        calls.append(payload)
+        return {'status': 'ok', 'issues_error': 0,
+                'parent_orders_export': {'orders_error': 0}}
+
+    monkeypatch.setattr(batch, 'post', post)
+    path = tmp_path / 'batch.json'
+    batch.export_issues('http://resolved-api', path, state, False)
+    batch.export_issues('http://resolved-api', path, state, False)
+    assert len(calls) == 1
+    assert calls[0]['issue_ids'] == [11]
+    assert state['stages']['issue_export']['620']['parent_orders_export']['orders_error'] == 0

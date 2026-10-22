@@ -1317,3 +1317,79 @@ def test_produce_finalization_requires_complete_documents_and_confirms_order_sta
         if mode == "missing_piecework":
             assert not fake.patches
         assert all(o.order_state_key is None for o in orders)
+
+
+_DATE_POST_ERROR = ('Дата документа не соответствует текущей дате или дате последнего оперативно проведенного документа! '
+                    'Документ не может быть проведен оперативно.')
+
+
+class _MidnightPostingClient(_FakeClient):
+    mode = 'date'
+
+    def post_operation(self, operation_path):
+        self.operations.append(operation_path)
+        if not operation_path.endswith('/Unpost'):
+            if self.mode == 'network':
+                raise RuntimeError('transport failure after creating the document')
+            if self.mode == 'stock':
+                raise RuntimeError('Недостаточно материала для проведения документа')
+            if operation_path.endswith('PostingModeOperational=true'):
+                raise RuntimeError(_DATE_POST_ERROR)
+
+
+def test_production_order_midnight_posting_keeps_date_and_one_document(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code='MIDNIGHT', ref1c='31313131-3131-3131-3131-313131313131')
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=10)
+    _stub_odata_config(monkeypatch, base_url='http://erp-prod.example/odata/unf')
+    fake = _MidnightPostingClient(ref_key='41414141-4141-4141-4141-414141414141')
+    monkeypatch.setattr(exporter, 'OData1CClient', lambda **_: fake)
+    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    assert result['orders_created'] == 1 and result['orders_error'] == 0
+    assert len(fake.posts) == 1
+    base = "Document_ЗаказНаПроизводство(guid'41414141-4141-4141-4141-414141414141')"
+    assert fake.operations == [base+'/Post?PostingModeOperational=true', base+'/Post?PostingModeOperational=false']
+    assert fake.posts[0][1]['Date'].startswith(order.order_date.date().isoformat())
+    again = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    assert again['orders_already_linked'] == 1 and len(fake.posts) == 1
+
+
+def test_midnight_retry_reposts_the_known_failed_ref_without_create(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code='MIDNIGHT-RETRY', ref1c='51515151-5151-5151-5151-515151515151')
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=10)
+    _stub_odata_config(monkeypatch, base_url='http://erp-prod.example/odata/unf')
+    fake = _MidnightPostingClient(ref_key='61616161-6161-6161-6161-616161616161')
+    fake.mode = 'network'
+    monkeypatch.setattr(exporter, 'OData1CClient', lambda **_: fake)
+    first = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    assert first['orders_error'] == 1 and order.order_ref1c is None
+    fake.mode = 'date'
+    second = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    assert second['orders_error'] == 0 and second['orders_created'] == 1
+    assert len(fake.posts) == 1 and len(fake.patches) == 1
+    assert fake.patches[0][0].endswith("(guid'61616161-6161-6161-6161-616161616161')")
+    assert order.order_ref1c == '61616161-6161-6161-6161-616161616161'
+
+
+def test_production_order_does_not_relax_stock_posting_errors(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code='POST-STOCK', ref1c='71717171-7171-7171-7171-717171717171')
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=10)
+    _stub_odata_config(monkeypatch, base_url='http://erp-prod.example/odata/unf')
+    fake = _MidnightPostingClient();fake.mode = 'stock'
+    monkeypatch.setattr(exporter, 'OData1CClient', lambda **_: fake)
+    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    assert result['orders_error'] == 1
+    assert len(fake.operations) == 1 and fake.operations[0].endswith('PostingModeOperational=true')
+
+
+def test_other_document_callers_keep_strict_operational_posting():
+    from app.services.one_c_export_common import post_document_operational
+    fake = _MidnightPostingClient()
+    with pytest.raises(RuntimeError, match='Дата документа'):
+        post_document_operational(fake, entity='Document_СборкаЗапасов', ref_key='81818181-8181-8181-8181-818181818181')
+    assert len(fake.operations) == 1 and fake.operations[0].endswith('PostingModeOperational=true')
