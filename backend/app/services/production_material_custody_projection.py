@@ -1700,7 +1700,12 @@ def publish_current_material_custody(
         if next_qty == 0:
             candidate_values.pop(key, None)
             if row is not None:
-                db.delete(row)
+                if row in db.new:
+                    # A post-cutoff hold and its full release can cancel
+                    # before the new compact cell has ever been flushed.
+                    db.expunge(row)
+                else:
+                    db.delete(row)
                 candidate_by_key.pop(key, None)
         elif row is not None:
             row.reserved_qty = next_qty

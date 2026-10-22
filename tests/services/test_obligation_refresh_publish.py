@@ -932,7 +932,10 @@ def test_publish_requires_intact_sealed_obligation_manifest(db_session, mutation
         _publish(db_session, parent, target, cutoff)
 
 
-def test_obligation_successor_preserves_current_post_cutoff_material_hold(db_session):
+@pytest.mark.parametrize("release_qty", [0, 2, 5])
+def test_obligation_successor_preserves_current_post_cutoff_material_hold(
+    db_session, release_qty,
+):
     from app.services.production_material_custody_projection import (
         load_compact_current_material_custody,
     )
@@ -957,13 +960,29 @@ def test_obligation_successor_preserves_current_post_cutoff_material_hold(db_ses
     )
     db_session.add(event)
     db_session.flush()
-    db_session.get(models.ProductionMaterialCustodyProjectionManifest, parent.id).source_event_high_watermark_id = event.id
-    db_session.add(models.ProductionMaterialCustodyProjection(
-        ledger_generation_id=parent.id, product_id=product.product_id,
-        component_item_id=component.item_id, location_kind='transit',
-        warehouse_ref1c='WH-SOURCE', reserved_qty=Decimal('5'),
-        source_event_high_watermark_id=event.id, is_current=True,
-    ))
+    watermark = event.id
+    if release_qty:
+        release = models.ProductionMaterialCustodyEvent(
+            product_id=product.product_id, component_item_id=component.item_id,
+            source_kind='terminal_release', source_sle_id=None,
+            effective_at=cutoff + timedelta(minutes=2), location_kind='transit',
+            warehouse_ref1c='WH-SOURCE', delta_qty=Decimal(-release_qty),
+            idempotency_key='obligation-publish-local-release',
+        )
+        db_session.add(release)
+        db_session.flush()
+        watermark = release.id
+    parent_manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, parent.id,
+    )
+    parent_manifest.source_event_high_watermark_id = watermark
+    if release_qty < 5:
+        db_session.add(models.ProductionMaterialCustodyProjection(
+            ledger_generation_id=parent.id, product_id=product.product_id,
+            component_item_id=component.item_id, location_kind='transit',
+            warehouse_ref1c='WH-SOURCE', reserved_qty=Decimal(5 - release_qty),
+            source_event_high_watermark_id=watermark, is_current=True,
+        ))
     db_session.commit()
 
     assert _publish(db_session, parent, target, cutoff).published is True
@@ -971,14 +990,17 @@ def test_obligation_successor_preserves_current_post_cutoff_material_hold(db_ses
         db_session, consumer='test.obligation.successor.local-hold',
     )
     assert generation_id == target.id
-    assert custody.reserved_at_warehouse('WH-SOURCE', component.item_id) == 5
-    assert db_session.get(models.ProductionMaterialCustodyProjectionManifest, target.id).source_event_high_watermark_id == event.id
+    assert custody.reserved_at_warehouse('WH-SOURCE', component.item_id) == 5 - release_qty
+    target_manifest = db_session.get(
+        models.ProductionMaterialCustodyProjectionManifest, target.id,
+    )
+    assert target_manifest.source_event_high_watermark_id == watermark
     assert _publish(db_session, parent, target, cutoff).published is False
-    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 1
+    assert db_session.query(models.ProductionMaterialCustodyEvent).count() == 1 + bool(release_qty)
     assert product.quantity == 8
     db_session.rollback()
     generation_id, custody = load_compact_current_material_custody(
         db_session, consumer='test.obligation.rollback.local-hold',
     )
     assert generation_id == parent.id
-    assert custody.reserved_at_warehouse('WH-SOURCE', component.item_id) == 5
+    assert custody.reserved_at_warehouse('WH-SOURCE', component.item_id) == 5 - release_qty
