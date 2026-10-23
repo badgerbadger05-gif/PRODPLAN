@@ -463,6 +463,50 @@ def test_exported_material_issue_locks_quantity(db_session):
     assert summary["locked"] == 1
 
 
+def test_custody_history_locks_quantity_even_without_material_issue(db_session):
+    generation, live_run, order, product = _scenario(
+        db_session,
+        order_qty=Decimal("40"),
+        target_qty=Decimal("30"),
+    )
+    db_session.add_all([
+        models.ProductionMaterialCustodyEvent(
+            product_id=int(product.product_id),
+            component_item_id=int(product.item_id),
+            source_kind="issue_created",
+            effective_at=datetime(2026, 10, 23, 8, tzinfo=timezone.utc),
+            location_kind="workshop",
+            warehouse_ref1c="custody-workshop",
+            delta_qty=Decimal("1"),
+            idempotency_key=f"quantity-guard-custody-in-{int(product.product_id)}",
+        ),
+        models.ProductionMaterialCustodyEvent(
+            product_id=int(product.product_id),
+            component_item_id=int(product.item_id),
+            source_kind="terminal_release",
+            effective_at=datetime(2026, 10, 23, 9, tzinfo=timezone.utc),
+            location_kind="workshop",
+            warehouse_ref1c="custody-workshop",
+            delta_qty=Decimal("-1"),
+            idempotency_key=f"quantity-guard-custody-out-{int(product.product_id)}",
+        ),
+    ])
+    db_session.flush()
+
+    summary = reconcile_local_mrp_orders(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        live_run_ids=[int(live_run.run_id)],
+    )
+
+    assert Decimal(product.quantity) == Decimal("40")
+    assert order.deletion_mark is False
+    assert summary["resized"] == 0
+    assert summary["cancelled"] == 0
+    assert summary["locked"] == 1
+    assert summary["entries"] == []
+
+
 def test_explicit_transition_uses_exact_frozen_target_with_other_legitimate_refs(
     db_session,
 ):

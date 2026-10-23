@@ -616,6 +616,19 @@ def reconcile_local_mrp_orders(
         .distinct()
         .all()
     }
+    custody_product_ids = {
+        int(product_id)
+        for (product_id,) in db.query(
+            models.ProductionMaterialCustodyEvent.product_id
+        )
+        .filter(
+            models.ProductionMaterialCustodyEvent.product_id.in_(
+                sorted(product_ids)
+            )
+        )
+        .distinct()
+        .all()
+    }
     manufacture_product_ids = {
         int(product_id)
         for (product_id,) in db.query(models.ProductionManufacture.product_id)
@@ -656,6 +669,7 @@ def reconcile_local_mrp_orders(
             or order_line_counts.get(int(order.order_id), 0) != 1
             or int(product.product_id) in issue_product_ids
             or int(product.product_id) in prepared_issue_product_ids
+            or int(product.product_id) in custody_product_ids
             or int(product.product_id) in manufacture_product_ids
             or int(order.order_id) in chain_order_ids
             or _decimal(output.produced_qty) > _EPSILON
