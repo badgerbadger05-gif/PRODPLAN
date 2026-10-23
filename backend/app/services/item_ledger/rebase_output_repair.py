@@ -25,6 +25,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.plan_output_quantities import (
+    expected_plan_output_quantities,
+    validate_saved_plan_output,
+)
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 from app.services.item_ledger.physical_refresh_candidacy import (
     has_live_physical_refresh_candidate,
@@ -228,19 +232,22 @@ def _expected_roots(
             raise RebaseOutputRepairError(
                 f"repair plan_line_id={int(line.id)} lacks saved output remainder"
             )
-        planned = _dec(line.qty)
-        accepted = _dec(line.accepted_output_qty)
-        remaining = _dec(line.remaining_output_qty)
+        current = validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context=f"repair plan_line_id={int(line.id)}",
+        )
+        planned = current.planned
+        accepted = current.accepted
+        remaining = current.remaining
         repaired = allocated_by_line.get(int(line.id), ZERO)
         expected_accepted = accepted + repaired
-        expected_remaining = remaining - repaired
-        if (
-            repaired < ZERO
-            or expected_remaining < ZERO
-            or planned != expected_accepted + expected_remaining
-        ):
+        expected = expected_plan_output_quantities(planned, expected_accepted)
+        expected_remaining = expected.remaining
+        if repaired < ZERO or repaired > remaining:
             raise RebaseOutputRepairError(
-                f"repair plan_line_id={int(line.id)} violates output conservation"
+                f"repair plan_line_id={int(line.id)} violates corrected output conservation"
             )
         result.append(
             {

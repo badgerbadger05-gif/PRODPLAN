@@ -998,6 +998,7 @@ def test_period_plan_detail_and_matrix_read_saved_plan_output_projection(db_sess
         "planned_output_qty": 5.0,
         "accepted_plan_output_qty": 3.0,
         "assembly_remaining_qty": 2.0,
+            "overproduction_qty": 0.0,
     }
 
 

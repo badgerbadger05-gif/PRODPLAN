@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.plan_output_quantities import validate_saved_plan_output
 
 
 class PlanningRunCandidateError(RuntimeError):
@@ -345,21 +346,21 @@ def create_replacement_candidate_run(
     lines = db.query(models.ProductionPlanLine).filter(
         models.ProductionPlanLine.plan_id == int(plan.id)
     ).order_by(models.ProductionPlanLine.id).all()
-    persisted_root_count = 0
     for line in lines:
         if line.remaining_output_qty is None:
             raise PlanningRunCandidateError(
                 f"plan line {int(line.id)} has no persisted execution remainder"
             )
-        planned = line.qty or 0
-        accepted = line.accepted_output_qty or 0
-        remaining = line.remaining_output_qty
-        if planned < 0 or accepted < 0 or remaining < 0 or planned != accepted + remaining:
-            raise PlanningRunCandidateError(
-                f"plan line {int(line.id)} violates output conservation"
+        try:
+            quantities = validate_saved_plan_output(
+                line.qty or 0,
+                line.accepted_output_qty or 0,
+                line.remaining_output_qty,
+                context=f"plan line {int(line.id)}",
             )
-        if remaining <= 0:
-            continue
+        except ValueError as exc:
+            raise PlanningRunCandidateError(str(exc)) from exc
+        remaining = quantities.remaining
         db.add(models.MrpRunRoot(
             run_id=int(candidate.run_id),
             plan_line_id=int(line.id),
@@ -367,10 +368,7 @@ def create_replacement_candidate_run(
             accepted_qty=0,
             remaining_qty=remaining,
         ))
-        persisted_root_count += 1
-    if persisted_root_count == 0:
-        raise PlanningRunCandidateError(
-            "replacement source plan has no persisted positive execution remainder"
-        )
+    if not lines:
+        raise PlanningRunCandidateError("replacement source plan has no output lines")
     db.flush()
     return candidate

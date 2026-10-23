@@ -10,6 +10,7 @@ from sqlalchemy import and_, asc
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.plan_output_quantities import validate_saved_plan_output
 from .live_plan_scope import live_plan_run_ids
 
 
@@ -126,19 +127,15 @@ def _build_rows_by_scope(
             raise ValueError(
                 f"assembly queue plan line {int(line.id)} lacks saved output remainder"
             )
-        planned_output_qty = _dec(line.qty)
-        accepted_output_qty = _dec(line.accepted_output_qty)
-        assembly_remaining_qty = _dec(line.remaining_output_qty)
-        if (
-            planned_output_qty < Decimal("0")
-            or accepted_output_qty < Decimal("0")
-            or assembly_remaining_qty < Decimal("0")
-            or planned_output_qty
-            != accepted_output_qty + assembly_remaining_qty
-        ):
-            raise ValueError(
-                f"assembly queue plan line {int(line.id)} violates output conservation"
-            )
+        quantities = validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context=f"assembly queue plan line {int(line.id)}",
+        )
+        planned_output_qty = quantities.planned
+        accepted_output_qty = quantities.accepted
+        assembly_remaining_qty = quantities.remaining
         if not include_zero and assembly_remaining_qty <= Decimal("0"):
             continue
 
@@ -165,6 +162,7 @@ def _build_rows_by_scope(
             "planned_output_qty": float(planned_output_qty),
             "accepted_plan_output_qty": float(accepted_output_qty),
             "assembly_remaining_qty": float(assembly_remaining_qty),
+            "overproduction_qty": float(quantities.overproduction),
             "eligible_from": eligible_from,
             "priority_key": priority,
         }

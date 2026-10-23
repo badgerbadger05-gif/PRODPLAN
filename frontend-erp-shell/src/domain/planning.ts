@@ -180,13 +180,14 @@ export function planningStatusLabel(status: string) {
 type ApiPlanOutputContext = components['schemas']['PeriodPlanOutputFields']
 export type PlanOutputFacts = Pick<
   ApiPlanOutputContext,
-  'planned_output_qty' | 'accepted_plan_output_qty' | 'assembly_remaining_qty'
+  'planned_output_qty' | 'accepted_plan_output_qty' | 'assembly_remaining_qty' | 'overproduction_qty'
 >
 export type PlanOutputContext = Partial<Pick<
   ApiPlanOutputContext,
   | 'planned_output_qty'
   | 'accepted_plan_output_qty'
   | 'assembly_remaining_qty'
+  | 'overproduction_qty'
   | 'plan_output_truth_status'
   | 'plan_output_truth_reason'
   | 'plan_output_generation_id'

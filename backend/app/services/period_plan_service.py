@@ -62,6 +62,7 @@ from .item_ledger.live_plan_scope import live_plan_run_ids
 from .item_ledger.r3_contract import current_live_run
 from .item_ledger.r3_contract import CurrentMrpResolutionError
 from .item_ledger.current_execution import CurrentExecutionUnavailable
+from .plan_output_quantities import validate_saved_plan_output
 from .item_ledger.reservation import (
     replenishment_execution_pct,
     replenishment_execution_status,
@@ -351,9 +352,15 @@ def list_period_plans(
                 planned_output = summary.get("planned_output_qty")
                 accepted_output = summary.get("accepted_plan_output_qty")
                 remaining_output = summary.get("assembly_remaining_qty")
+                overproduction = summary.get("overproduction_qty", 0)
                 plan_output_available = all(
                     value is not None
-                    for value in (planned_output, accepted_output, remaining_output)
+                    for value in (
+                        planned_output,
+                        accepted_output,
+                        remaining_output,
+                        overproduction,
+                    )
                 )
                 execution_by_plan[payload_plan_id] = {
                     "execution_pct": (
@@ -376,6 +383,7 @@ def list_period_plans(
                     "planned_output_qty": planned_output,
                     "accepted_plan_output_qty": accepted_output,
                     "assembly_remaining_qty": remaining_output,
+                    "overproduction_qty": overproduction,
                     "plan_output_truth_status": (
                         "accepted" if plan_output_available else "unavailable"
                     ),
@@ -417,6 +425,7 @@ def list_period_plans(
                         "planned_output_qty": None,
                         "accepted_plan_output_qty": None,
                         "assembly_remaining_qty": None,
+                        "overproduction_qty": None,
                         "plan_output_truth_status": (
                             "not_applicable"
                             if str(plan.status or "") == "draft"
@@ -517,7 +526,8 @@ def _saved_plan_output_validation_error(payload: Dict[str, Any]) -> Optional[str
         summary_planned = Decimal(str(summary["planned_output_qty"]))
         summary_accepted = Decimal(str(summary["accepted_plan_output_qty"]))
         summary_remaining = Decimal(str(summary["assembly_remaining_qty"]))
-        row_totals = [Decimal("0"), Decimal("0"), Decimal("0")]
+        summary_overproduction = Decimal(str(summary.get("overproduction_qty", 0)))
+        row_totals = [Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0")]
         seen_line_ids: set[int] = set()
         if not isinstance(rows, list):
             raise ValueError("plan_output_rows is not a list")
@@ -529,21 +539,32 @@ def _saved_plan_output_validation_error(payload: Dict[str, Any]) -> Optional[str
             row_planned = Decimal(str(row["planned_output_qty"]))
             row_accepted = Decimal(str(row["accepted_plan_output_qty"]))
             row_remaining = Decimal(str(row["assembly_remaining_qty"]))
-            row_values = (row_planned, row_accepted, row_remaining)
-            if (
-                not all(value.is_finite() for value in row_values)
-                or min(row_values) < 0
-                or row_planned != row_accepted + row_remaining
-            ):
-                raise ValueError("plan output row violates conservation")
+            quantities = validate_saved_plan_output(
+                row_planned,
+                row_accepted,
+                row_remaining,
+                context=f"plan output row {line_id}",
+            )
+            row_overproduction = Decimal(
+                str(row.get("overproduction_qty", quantities.overproduction))
+            )
+            if row_overproduction != quantities.overproduction:
+                raise ValueError("plan output row overproduction conflicts")
             row_totals[0] += row_planned
             row_totals[1] += row_accepted
             row_totals[2] += row_remaining
-        summary_values = (summary_planned, summary_accepted, summary_remaining)
+            row_totals[3] += row_overproduction
+        summary_values = (
+            summary_planned,
+            summary_accepted,
+            summary_remaining,
+            summary_overproduction,
+        )
         if (
             not all(value.is_finite() for value in summary_values)
             or min(summary_values) < 0
-            or summary_planned != summary_accepted + summary_remaining
+            or summary_planned + summary_overproduction
+            != summary_accepted + summary_remaining
             or row_totals != list(summary_values)
         ):
             raise ValueError("plan output summary violates conservation")
@@ -598,6 +619,9 @@ def _plan_output_header_fields(
         "assembly_remaining_qty": (
             summary.get("assembly_remaining_qty") if available else None
         ),
+        "overproduction_qty": (
+            summary.get("overproduction_qty", 0) if available else None
+        ),
         "plan_output_truth_status": "accepted" if available else "unavailable",
         "plan_output_truth_reason": reason,
         "plan_output_generation_id": generation_id,
@@ -614,6 +638,7 @@ def get_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
             "planned_output_qty": None,
             "accepted_plan_output_qty": None,
             "assembly_remaining_qty": None,
+            "overproduction_qty": None,
             "plan_output_truth_status": "not_applicable",
             "plan_output_truth_reason": None,
             "plan_output_generation_id": None,
@@ -2471,6 +2496,7 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         rec["planned_output_qty"] = 0.0 if output_payload is not None else None
         rec["accepted_plan_output_qty"] = 0.0 if output_payload is not None else None
         rec["assembly_remaining_qty"] = 0.0 if output_payload is not None else None
+        rec["overproduction_qty"] = 0.0 if output_payload is not None else None
         rec["output_by_bucket"] = {}
         for bucket_key in bucket_keys:
             output_row = output_by_item_bucket.get((int(item_id), bucket_key))
@@ -2482,11 +2508,15 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
                     output_row["accepted_plan_output_qty"]
                 ),
                 "assembly_remaining_qty": float(output_row["assembly_remaining_qty"]),
+                "overproduction_qty": float(
+                    output_row.get("overproduction_qty", 0)
+                ),
             }
             rec["output_by_bucket"][bucket_key] = cell
             rec["planned_output_qty"] += cell["planned_output_qty"]
             rec["accepted_plan_output_qty"] += cell["accepted_plan_output_qty"]
             rec["assembly_remaining_qty"] += cell["assembly_remaining_qty"]
+            rec["overproduction_qty"] += cell["overproduction_qty"]
 
     output_header = (
         _plan_output_header_fields(
@@ -2500,6 +2530,7 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
             "planned_output_qty": None,
             "accepted_plan_output_qty": None,
             "assembly_remaining_qty": None,
+            "overproduction_qty": None,
             "plan_output_truth_status": "not_applicable",
             "plan_output_truth_reason": None,
             "plan_output_generation_id": None,
@@ -2611,23 +2642,22 @@ def _attach_run_output_summary(
     plan_planned = Decimal("0")
     plan_accepted = Decimal("0")
     plan_remaining = Decimal("0")
+    plan_overproduction = Decimal("0")
     for line in plan_lines:
         if line.remaining_output_qty is None:
             raise ValueError(
                 f"plan line {int(line.id)} has no persisted execution remainder"
             )
-        planned = Decimal(str(line.qty))
-        accepted = Decimal(str(line.accepted_output_qty))
-        remaining = Decimal(str(line.remaining_output_qty))
-        if (
-            planned < 0
-            or accepted < 0
-            or remaining < 0
-            or planned != accepted + remaining
-        ):
-            raise ValueError(
-                f"plan line {int(line.id)} violates output conservation"
-            )
+        quantities = validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context=f"plan line {int(line.id)}",
+        )
+        planned = quantities.planned
+        accepted = quantities.accepted
+        remaining = quantities.remaining
+        overproduction = quantities.overproduction
         plan_output_rows.append({
             "plan_line_id": int(line.id),
             "item_id": int(line.item_id),
@@ -2635,10 +2665,12 @@ def _attach_run_output_summary(
             "planned_output_qty": float(planned),
             "accepted_plan_output_qty": float(accepted),
             "assembly_remaining_qty": float(remaining),
+            "overproduction_qty": float(overproduction),
         })
         plan_planned += planned
         plan_accepted += accepted
         plan_remaining += remaining
+        plan_overproduction += overproduction
 
     planned_qty = float(run_planned)
     accepted_qty = float(run_accepted)
@@ -2655,6 +2687,7 @@ def _attach_run_output_summary(
         "planned_output_qty": float(plan_planned),
         "accepted_plan_output_qty": float(plan_accepted),
         "assembly_remaining_qty": float(plan_remaining),
+        "overproduction_qty": float(plan_overproduction),
     })
     result["plan_output_rows"] = plan_output_rows
     result["summary"] = summary
@@ -2701,6 +2734,7 @@ def _execution_unavailable_payload(
             "planned_output_qty": None,
             "accepted_plan_output_qty": None,
             "assembly_remaining_qty": None,
+            "overproduction_qty": None,
             "execution_by_flow": None,
         },
     }

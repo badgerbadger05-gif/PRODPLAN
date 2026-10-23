@@ -92,6 +92,7 @@ def test_period_plan_openapi_types_exact_saved_output_projection(client):
         "planned_output_qty",
         "accepted_plan_output_qty",
         "assembly_remaining_qty",
+        "overproduction_qty",
         "plan_output_truth_status",
         "plan_output_truth_reason",
         "plan_output_generation_id",
@@ -101,7 +102,15 @@ def test_period_plan_openapi_types_exact_saved_output_projection(client):
         "planned_output_qty",
         "accepted_plan_output_qty",
         "assembly_remaining_qty",
+        "overproduction_qty",
     }.issubset(components["PlanOutputRow"]["properties"])
+    correction = paths["/api/v1/plan/period-plans/corrections"]["post"]
+    assert correction["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/FixedPlanCorrectionsRequest"
+    }
+    assert correction["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/FixedPlanCorrectionsResponse"}
 
 
 def test_execution_journal_route_returns_typed_payload_after_fix(client, db_session, accepted_generation):

@@ -712,6 +712,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               planned={plan.planned_output_qty}
               accepted={plan.accepted_plan_output_qty}
               remaining={plan.assembly_remaining_qty}
+              overproduction={plan.overproduction_qty}
               available={plan.plan_output_truth_status === 'accepted'}
             />
             {plan.plan_output_truth_status !== 'accepted' && (
@@ -881,6 +882,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               planned={row.planned_output_qty}
                               accepted={row.accepted_plan_output_qty}
                               remaining={row.assembly_remaining_qty}
+                              overproduction={row.overproduction_qty}
                               available={matrix.plan_output_truth_status === 'accepted'}
                               compact
                             />
@@ -926,6 +928,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                 planned={bucketOutput?.planned_output_qty}
                                 accepted={bucketOutput?.accepted_plan_output_qty}
                                 remaining={bucketOutput?.assembly_remaining_qty}
+                                overproduction={bucketOutput?.overproduction_qty}
                                 available={matrix.plan_output_truth_status === 'accepted'}
                                 compact
                               />
@@ -1074,6 +1077,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   planned={journal.summary.planned_output_qty}
                   accepted={journal.summary.accepted_plan_output_qty}
                   remaining={journal.summary.assembly_remaining_qty}
+                  overproduction={journal.summary.overproduction_qty}
                 />
                 {(journal.summary.planned_output_qty == null
                   || journal.summary.accepted_plan_output_qty == null

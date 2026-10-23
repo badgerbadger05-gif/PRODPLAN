@@ -251,25 +251,28 @@ def test_replacement_candidate_roots_use_only_persisted_plan_remainder(db_sessio
     assert root.remaining_qty == 2
 
 
-def test_replacement_candidate_rejects_zero_saved_remainder(db_session):
+def test_replacement_candidate_keeps_zero_root_for_corrected_current_plan(db_session):
     parent, _accepted_generation, target = _parent_and_target(db_session)
     _replacement_plan_line(
         db_session, parent, planned=10, accepted=10, remaining=0
     )
 
-    with pytest.raises(
-        PlanningRunCandidateError,
-        match="no persisted positive execution remainder",
-    ):
-        create_replacement_candidate_run(
-            db_session,
-            int(parent.run_id),
-            int(target.id),
-            "replacement-test",
-            horizon_days=parent.horizon_days,
-            config_version_id=parent.config_version_id,
-            config_snapshot=dict(parent.config_snapshot or {}),
-        )
+    candidate = create_replacement_candidate_run(
+        db_session,
+        int(parent.run_id),
+        int(target.id),
+        "replacement-test",
+        horizon_days=parent.horizon_days,
+        config_version_id=parent.config_version_id,
+        config_snapshot=dict(parent.config_snapshot or {}),
+    )
+
+    root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(candidate.run_id)
+    ).one()
+    assert root.planned_qty == 0
+    assert root.accepted_qty == 0
+    assert root.remaining_qty == 0
 
 
 def test_replacement_candidate_rejects_broken_plan_output_conservation(db_session):

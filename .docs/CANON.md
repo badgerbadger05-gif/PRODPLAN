@@ -41,6 +41,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Выполнение пополнения | адресное назначение в пределах точно связанного живого резерва, затем единый FIFO (§5, §6, §12.6) |
 | Выполнение и остаток выпуска плана | сохранённый накопленный принятый выпуск; остаток фиксируется как исходный выпуск минус этот факт и не пересчитывается при чтении (§3, §7) |
 | Изменение спецификации живого плана | матрица и факт плана не меняются; старый MRP закрывается, все его живые резервы закрываются/освобождаются, а новый MRP того же плана получает сохранённый остаток корней и новую BOM (§3, §7) |
+| Явная коррекция ошибочного источника зафиксированного плана | `fixed_plan_correction.py`: полный source-hash/idempotence и before/after audit; stable line/fact owners сохраняются; remaining и overproduction записываются по §59; все затронутые MRP заменяются одним obligation refresh |
 | Коррекция после смены MRP | по каждой детали сравниваются сохранённый незакрытый спрос старого MRP и потребность нового MRP; разница добавляет либо снимает рабочее количество (§3, §7) |
 | Очередь сборки | остатки выпуска всех живых планов, oldest-first (§7) |
 | Календарная раскладка сборки | единственный барабан поверх очереди сборки с сохранённым readiness gate (§8, §29) |
@@ -75,6 +76,7 @@ PRODPLAN состоит из четырёх последовательно св�
 | Обеспеченность производственной строки материалами | чистый расчёт `production_control_material_availability.py`, сохранённый только внутри current `production_control_journal_projection.py`; operational `ProductionOrderLineState` не владеет coverage |
 | Custody материалов производства | append-only `ProductionMaterialCustodyEvent` + явные rewind baselines и compact `ProductionMaterialCustodyProjection.is_current`; live fold статусов не является источником чтения или fallback |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py`; пул строится ОДИН раз, базис — исторический SLE-баланс, net после заморозки неизменяем; единственная точка расширения пулов — `pool_key_for` |
+| Коррекция зафиксированной матрицы | `backend/app/services/fixed_plan_correction.py`; формула количества — `plan_output_quantities.py`; второй writer плана запрещён (§59) |
 | Выбор спецификации на ребре BOM | `backend/app/services/bom_specification_resolver.py` (`component_spec_ref1c` всегда сильнее default и разрешается fail closed) |
 | Единая спецификация сборки: узлы и комплектовки со складов | контракт `unified-assembly-specification.md` (§26); развёртка — существующие `backend/app/services/mrp_freeze.py`, `planning_service.py`, `bom_specification_resolver.py`, без второго движка |
 | Живая область планов и привязка run к поколению | `backend/app/services/item_ledger/live_plan_scope.py`; обход sealed-цепочки существует только здесь |

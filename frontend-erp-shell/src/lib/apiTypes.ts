@@ -673,6 +673,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/plan/period-plans/corrections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Period Plans Correct Fixed Groups
+         * @description Atomically correct fixed same-month groups and replace their live MRP.
+         */
+        post: operations["period_plans_correct_fixed_groups_api_v1_plan_period_plans_corrections_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/plan/period-plans/{plan_id}": {
         parameters: {
             query?: never;
@@ -2053,6 +2073,23 @@ export interface paths {
         head?: never;
         /** Patch Order Line State */
         patch: operations["patch_order_line_state_api_v1_production_control_orders__product_id__state_patch"];
+        trace?: never;
+    };
+    "/api/v1/production-control/orders/{product_id}/reduce-in-1c": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reduce Existing Order Quantity */
+        post: operations["reduce_existing_order_quantity_api_v1_production_control_orders__product_id__reduce_in_1c_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/production-control/orders/{product_id}/quantity": {
@@ -4290,6 +4327,8 @@ export interface components {
             accepted_plan_output_qty?: number | null;
             /** Assembly Remaining Qty */
             assembly_remaining_qty?: number | null;
+            /** Overproduction Qty */
+            overproduction_qty?: number | null;
             /** Fully Covered */
             fully_covered?: number | null;
             /** Partially Covered */
@@ -4485,6 +4524,90 @@ export interface components {
              * @default false
              */
             allow_production: boolean;
+        };
+        /** FixedPlanCorrectionGroupRequest */
+        FixedPlanCorrectionGroupRequest: {
+            /** Plan Ids */
+            plan_ids: number[];
+            /** Target Entries */
+            target_entries: components["schemas"]["FixedPlanCorrectionTargetEntry"][];
+        };
+        /** FixedPlanCorrectionTargetEntry */
+        FixedPlanCorrectionTargetEntry: {
+            /** Item Id */
+            item_id: number;
+            /** Bucket Date */
+            bucket_date: string;
+            /** Qty */
+            qty: number;
+            /** Item Code */
+            item_code?: string | null;
+            /** Article */
+            article?: string | null;
+            /** Source Row */
+            source_row?: number | null;
+            /** Week */
+            week?: number | null;
+        };
+        /** FixedPlanCorrectionsRequest */
+        FixedPlanCorrectionsRequest: {
+            /** Groups */
+            groups: components["schemas"]["FixedPlanCorrectionGroupRequest"][];
+            /** Source Id */
+            source_id: string;
+            /** Source Hash */
+            source_hash: string;
+            /** Expected Generation Id */
+            expected_generation_id: number;
+            /** Expected Source Revision */
+            expected_source_revision: string;
+            /** Corrected By */
+            corrected_by?: string | null;
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+        };
+        /** FixedPlanCorrectionsResponse */
+        FixedPlanCorrectionsResponse: {
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "applied" | "already_applied" | "dry_run";
+            /** Correction Id */
+            correction_id: number | null;
+            /** Source Id */
+            source_id: string;
+            /** Source Hash */
+            source_hash: string;
+            /** Request Hash */
+            request_hash: string;
+            /** Plan Ids */
+            plan_ids: number[];
+            /** Groups */
+            groups: {
+                [key: string]: unknown;
+            }[];
+            /** Previous Generation Id */
+            previous_generation_id: number;
+            /** Published Generation Id */
+            published_generation_id: number;
+            /** Previous Run Ids */
+            previous_run_ids: {
+                [key: string]: number;
+            };
+            /** Successor Run Ids */
+            successor_run_ids: {
+                [key: string]: number;
+            };
+            /** Totals */
+            totals: {
+                [key: string]: string;
+            };
+            /** Dry Run */
+            dry_run: boolean;
         };
         /** GenerationAcceptRequest */
         GenerationAcceptRequest: {
@@ -5308,6 +5431,8 @@ export interface components {
             accepted_plan_output_qty?: number | null;
             /** Assembly Remaining Qty */
             assembly_remaining_qty?: number | null;
+            /** Overproduction Qty */
+            overproduction_qty?: number | null;
             /** Plan Output Truth Status */
             plan_output_truth_status: string;
             /** Plan Output Truth Reason */
@@ -5329,6 +5454,8 @@ export interface components {
             accepted_plan_output_qty?: number | null;
             /** Assembly Remaining Qty */
             assembly_remaining_qty?: number | null;
+            /** Overproduction Qty */
+            overproduction_qty?: number | null;
             /** Output By Bucket */
             output_by_bucket?: {
                 [key: string]: components["schemas"]["PlanOutputQtyCell"];
@@ -5352,6 +5479,8 @@ export interface components {
             accepted_plan_output_qty?: number | null;
             /** Assembly Remaining Qty */
             assembly_remaining_qty?: number | null;
+            /** Overproduction Qty */
+            overproduction_qty?: number | null;
             /** Plan Output Truth Status */
             plan_output_truth_status: string;
             /** Plan Output Truth Reason */
@@ -5394,6 +5523,11 @@ export interface components {
             accepted_plan_output_qty: number;
             /** Assembly Remaining Qty */
             assembly_remaining_qty: number;
+            /**
+             * Overproduction Qty
+             * @default 0
+             */
+            overproduction_qty: number;
         };
         /** PlanOutputRow */
         PlanOutputRow: {
@@ -5409,6 +5543,11 @@ export interface components {
             accepted_plan_output_qty: number;
             /** Assembly Remaining Qty */
             assembly_remaining_qty: number;
+            /**
+             * Overproduction Qty
+             * @default 0
+             */
+            overproduction_qty: number;
         };
         /** PlanningConfigCreate */
         PlanningConfigCreate: {
@@ -6443,6 +6582,22 @@ export interface components {
              * @default false
              */
             dry_run: boolean;
+        };
+        /** ReduceExistingOrderQuantityPayload */
+        ReduceExistingOrderQuantityPayload: {
+            /** Expected Quantity */
+            expected_quantity: number;
+            /** Quantity */
+            quantity: number;
+            /**
+             * Dry Run
+             * @default true
+             */
+            dry_run: boolean;
+            /** Current Identity */
+            current_identity: string;
+            /** Expected Source Revision */
+            expected_source_revision: string;
         };
         /** RefreshProductionOrdersPayload */
         RefreshProductionOrdersPayload: {
@@ -8356,6 +8511,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    period_plans_correct_fixed_groups_api_v1_plan_period_plans_corrections_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FixedPlanCorrectionsRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FixedPlanCorrectionsResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10933,6 +11121,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["LineStatePayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reduce_existing_order_quantity_api_v1_production_control_orders__product_id__reduce_in_1c_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReduceExistingOrderQuantityPayload"];
             };
         };
         responses: {

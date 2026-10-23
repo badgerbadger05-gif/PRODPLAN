@@ -1554,6 +1554,140 @@ class ProductionPlanLine(Base):
     locked_by_run = relationship("PlanningRun", foreign_keys=[locked_by_run_id])
 
 
+class ProductionPlanCorrection(Base):
+    """Audited operator correction of an already fixed plan group."""
+
+    __tablename__ = "production_plan_correction"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id",
+            "source_hash",
+            name="uq_production_plan_correction_source",
+        ),
+        CheckConstraint(
+            "length(source_hash) = 64",
+            name="ck_production_plan_correction_source_hash",
+        ),
+        CheckConstraint(
+            "length(group_scope_hash) = 64",
+            name="ck_production_plan_correction_group_hash",
+        ),
+        CheckConstraint(
+            "length(request_hash) = 64",
+            name="ck_production_plan_correction_request_hash",
+        ),
+        Index(
+            "ix_production_plan_correction_published_generation",
+            "published_generation_id",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    source_id = Column(String(255), nullable=False)
+    source_hash = Column(String(64), nullable=False)
+    group_scope_hash = Column(String(64), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    plan_ids = Column(CrossPlatformJSON, nullable=False)
+    primary_plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    expected_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    expected_source_revision = Column(String(256), nullable=False)
+    published_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    target_payload = Column(CrossPlatformJSON, nullable=False)
+    before_payload = Column(CrossPlatformJSON, nullable=False)
+    after_payload = Column(CrossPlatformJSON, nullable=False)
+    result_payload = Column(CrossPlatformJSON, nullable=False)
+    corrected_by = Column(String(100), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ProductionPlanCorrectionLine(Base):
+    """Normalized before/after proof for one stable plan line."""
+
+    __tablename__ = "production_plan_correction_line"
+    __table_args__ = (
+        UniqueConstraint(
+            "correction_id",
+            "plan_line_id",
+            name="uq_production_plan_correction_line",
+        ),
+        CheckConstraint("before_qty >= 0", name="ck_plan_correction_line_before_qty"),
+        CheckConstraint("after_qty >= 0", name="ck_plan_correction_line_after_qty"),
+        CheckConstraint("accepted_qty >= 0", name="ck_plan_correction_line_accepted_qty"),
+        CheckConstraint(
+            "before_remaining_qty >= 0",
+            name="ck_plan_correction_line_before_remaining",
+        ),
+        CheckConstraint(
+            "after_remaining_qty >= 0",
+            name="ck_plan_correction_line_after_remaining",
+        ),
+        CheckConstraint(
+            "after_overproduction_qty >= 0",
+            name="ck_plan_correction_line_after_overproduction",
+        ),
+        CheckConstraint(
+            "target_cell_qty >= 0",
+            name="ck_plan_correction_line_target_cell_qty",
+        ),
+        Index(
+            "ix_production_plan_correction_line_correction",
+            "correction_id",
+        ),
+        Index("ix_production_plan_correction_line_plan", "plan_id", "plan_line_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    correction_id = Column(
+        BigInteger,
+        ForeignKey("production_plan_correction.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    bucket_date = Column(Date, nullable=False)
+    existed_before = Column(Boolean, nullable=False)
+    allocation_role = Column(String(32), nullable=False)
+    before_qty = Column(DECIMAL(15, 3), nullable=False)
+    after_qty = Column(DECIMAL(15, 3), nullable=False)
+    accepted_qty = Column(DECIMAL(15, 3), nullable=False)
+    before_remaining_qty = Column(DECIMAL(15, 3), nullable=False)
+    after_remaining_qty = Column(DECIMAL(15, 3), nullable=False)
+    after_overproduction_qty = Column(DECIMAL(15, 3), nullable=False)
+    target_cell_qty = Column(DECIMAL(15, 3), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class MrpRunRoot(Base):
     """Frozen top-level output owned by one MRP run.
 

@@ -39,6 +39,10 @@ from app.services.item_ledger.assembly_queue_materialization import (
     materialize_assembly_queue_lines,
 )
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids
+from app.services.plan_output_quantities import (
+    expected_plan_output_quantities,
+    validate_saved_plan_output,
+)
 
 _STAGE = "assembly_output_allocation"
 _ALGORITHM_VERSION = "assembly-output-allocation/4"
@@ -133,21 +137,20 @@ def _ensure_plan_execution_baseline(
         .all()
     )
     for line in lines:
-        planned = _dec(line.qty)
-        accepted = _dec(line.accepted_output_qty or 0)
-        if planned < 0 or accepted < 0 or accepted > planned:
-            raise ValueError(
-                f"plan line {int(line.id)} has invalid persisted output quantities"
-            )
+        quantities = expected_plan_output_quantities(
+            line.qty,
+            line.accepted_output_qty or 0,
+        )
         if line.remaining_output_qty is None:
-            line.accepted_output_qty = accepted
-            line.remaining_output_qty = planned - accepted
+            line.accepted_output_qty = quantities.accepted
+            line.remaining_output_qty = quantities.remaining
             continue
-        remaining = _dec(line.remaining_output_qty)
-        if remaining < 0 or planned != accepted + remaining:
-            raise ValueError(
-                f"plan line {int(line.id)} violates output conservation"
-            )
+        validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context=f"plan line {int(line.id)}",
+        )
     if lines:
         db.flush()
 
@@ -898,10 +901,12 @@ def _persist_rows(
         line.remaining_output_qty = _dec(line.remaining_output_qty) - qty
         root.accepted_qty = _dec(root.accepted_qty) + qty
         root.remaining_qty = _dec(root.remaining_qty) - qty
-        if _dec(line.qty) != (
-            _dec(line.accepted_output_qty) + _dec(line.remaining_output_qty)
-        ):
-            raise ValueError("assembly allocation violates plan output conservation")
+        validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context="assembly allocation plan output",
+        )
         if _dec(root.planned_qty) != (
             _dec(root.accepted_qty) + _dec(root.remaining_qty)
         ):
@@ -1245,7 +1250,10 @@ def _restore_bounded_execution_facts(
         if qty <= 0:
             raise ValueError("bounded assembly execution fact has non-positive quantity")
         line.accepted_output_qty = _dec(line.accepted_output_qty) - qty
-        line.remaining_output_qty = _dec(line.remaining_output_qty) + qty
+        line.remaining_output_qty = expected_plan_output_quantities(
+            line.qty,
+            line.accepted_output_qty,
+        ).remaining
         root.accepted_qty = _dec(root.accepted_qty) - qty
         root.remaining_qty = _dec(root.remaining_qty) + qty
         if min(
@@ -1255,8 +1263,12 @@ def _restore_bounded_execution_facts(
             _dec(root.remaining_qty),
         ) < 0:
             raise ValueError("bounded assembly output owner conservation underflow")
-        if _dec(line.qty) != _dec(line.accepted_output_qty) + _dec(line.remaining_output_qty):
-            raise ValueError("bounded assembly plan-line conservation failed")
+        validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context="bounded assembly plan line",
+        )
         if _dec(root.planned_qty) != _dec(root.accepted_qty) + _dec(root.remaining_qty):
             raise ValueError("bounded assembly run-root conservation failed")
         db.delete(row)
@@ -1495,8 +1507,12 @@ def _persist_bounded_owner_rows(
         line.remaining_output_qty = _dec(line.remaining_output_qty) - qty
         root.accepted_qty = _dec(root.accepted_qty) + qty
         root.remaining_qty = _dec(root.remaining_qty) - qty
-        if _dec(line.qty) != _dec(line.accepted_output_qty) + _dec(line.remaining_output_qty):
-            raise ValueError("bounded assembly plan-line conservation failed")
+        validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context="bounded assembly plan line",
+        )
         if _dec(root.planned_qty) != _dec(root.accepted_qty) + _dec(root.remaining_qty):
             raise ValueError("bounded assembly run-root conservation failed")
     if allocation_signature:
@@ -1757,11 +1773,15 @@ def _apply_allocations_to_assembly_queue(
         # _persist_rows has already advanced the canonical accumulated plan
         # execution.  Project that saved state verbatim; the queue must never
         # merge a predecessor tile and the current generation batch with max().
-        planned = _dec(line.qty)
-        accepted = _dec(line.accepted_output_qty)
-        remaining = _dec(line.remaining_output_qty)
-        if planned != accepted + remaining:
-            raise ValueError("assembly allocation violates plan output conservation")
+        quantities = validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context="assembly allocation plan output",
+        )
+        planned = quantities.planned
+        accepted = quantities.accepted
+        remaining = quantities.remaining
         row.planned_output_qty = planned
         row.accepted_plan_output_qty = accepted
         row.assembly_remaining_qty = remaining
@@ -1841,11 +1861,15 @@ def materialize_assembly_output_allocations(
             line = db.get(models.ProductionPlanLine, int(row.plan_line_id))
             if line is None or line.remaining_output_qty is None:
                 raise ValueError("assembly queue references incomplete plan execution")
-            planned = _dec(line.qty)
-            accepted = _dec(line.accepted_output_qty)
-            remaining = _dec(line.remaining_output_qty)
-            if planned != accepted + remaining:
-                raise ValueError("assembly queue violates plan output conservation")
+            quantities = validate_saved_plan_output(
+                line.qty,
+                line.accepted_output_qty,
+                line.remaining_output_qty,
+                context="assembly queue plan output",
+            )
+            planned = quantities.planned
+            accepted = quantities.accepted
+            remaining = quantities.remaining
             row.planned_output_qty = planned
             row.accepted_plan_output_qty = accepted
             row.assembly_remaining_qty = remaining

@@ -915,13 +915,15 @@ def test_assembly_output_read_model_uses_accumulated_plan_truth() -> None:
     plan_router = _read(REPO / "backend/app/routers/plan.py")
 
     for required in (
-        "planned_output_qty = _dec(line.qty)",
-        "accepted_output_qty = _dec(line.accepted_output_qty)",
-        "assembly_remaining_qty = _dec(line.remaining_output_qty)",
+        "quantities = validate_saved_plan_output(",
+        "planned_output_qty = quantities.planned",
+        "accepted_output_qty = quantities.accepted",
+        "assembly_remaining_qty = quantities.remaining",
         "eligible_from = plan.fixed_at",
         '"planned_output_qty": float(planned_output_qty)',
         '"accepted_plan_output_qty": float(accepted_output_qty)',
         '"assembly_remaining_qty": float(assembly_remaining_qty)',
+        '"overproduction_qty": float(quantities.overproduction)',
     ):
         assert required in queue
     for forbidden in (
@@ -937,8 +939,8 @@ def test_assembly_output_read_model_uses_accumulated_plan_truth() -> None:
     assert "root = models.MrpRunRoot(" not in output
     assert "new_accepted = max(" not in output
     assert "line.remaining_output_qty = max(" not in output
-    assert "planned != accepted + remaining" in output
-    assert "planned != accepted + remaining" in rebase
+    assert "validate_saved_plan_output(" in output
+    assert "validate_saved_plan_output(" in rebase
     assert "planned = max(_dec(line.qty)" not in rebase
     assert "accepted = max(_dec(line.accepted_output_qty)" not in rebase
     assert "remaining = max(_dec(line.remaining_output_qty)" not in rebase
@@ -956,10 +958,12 @@ def test_assembly_output_read_model_uses_accumulated_plan_truth() -> None:
     assert '"planned_output_qty": float(plan_planned)' in period_plan
     assert '"accepted_plan_output_qty": float(plan_accepted)' in period_plan
     assert '"assembly_remaining_qty": float(plan_remaining)' in period_plan
+    assert '"overproduction_qty": float(plan_overproduction)' in period_plan
     assert "def _saved_plan_output_validation_error(" in period_plan
     assert 'reason=validation_error' in period_plan
     assert 'return "Saved plan-output read model is missing or invalid"' in period_plan
     assert "class PlanOutputRow(BaseModel):" in plan_router
+    assert "overproduction_qty: float" in plan_router
 
 
 def test_mrp_stock_contour_has_one_owner() -> None:

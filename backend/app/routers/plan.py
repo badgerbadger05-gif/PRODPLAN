@@ -355,6 +355,55 @@ class PeriodPlanUpdateRequest(BaseModel):
     comment: Optional[str] = None
 
 
+class FixedPlanCorrectionTargetEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    bucket_date: str
+    qty: float
+    item_code: str | None = None
+    article: str | None = None
+    source_row: int | None = None
+    week: int | None = None
+
+
+class FixedPlanCorrectionGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_ids: list[int]
+    target_entries: list[FixedPlanCorrectionTargetEntry]
+
+
+class FixedPlanCorrectionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    groups: list[FixedPlanCorrectionGroupRequest]
+    source_id: str
+    source_hash: str
+    expected_generation_id: int
+    expected_source_revision: str
+    corrected_by: str | None = None
+    dry_run: bool = False
+
+
+class FixedPlanCorrectionsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["applied", "already_applied", "dry_run"]
+    correction_id: int | None
+    source_id: str
+    source_hash: str
+    request_hash: str
+    plan_ids: list[int]
+    groups: list[dict[str, object]]
+    previous_generation_id: int
+    published_generation_id: int
+    previous_run_ids: dict[str, int]
+    successor_run_ids: dict[str, int]
+    totals: dict[str, str]
+    dry_run: bool
+
+
 class ExecutionJournalTruthMeta(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -524,6 +573,7 @@ class ExecutionJournalSummary(BaseModel):
     planned_output_qty: float | None = None
     accepted_plan_output_qty: float | None = None
     assembly_remaining_qty: float | None = None
+    overproduction_qty: float | None = None
     fully_covered: int | None = None
     partially_covered: int | None = None
     not_covered: int | None = None
@@ -540,6 +590,7 @@ class PlanOutputRow(BaseModel):
     planned_output_qty: float
     accepted_plan_output_qty: float
     assembly_remaining_qty: float
+    overproduction_qty: float = 0
 
 
 class ExecutionJournalResponse(BaseModel):
@@ -572,6 +623,7 @@ class PeriodPlanOutputFields(BaseModel):
     planned_output_qty: float | None = None
     accepted_plan_output_qty: float | None = None
     assembly_remaining_qty: float | None = None
+    overproduction_qty: float | None = None
     plan_output_truth_status: str
     plan_output_truth_reason: str | None = None
     plan_output_generation_id: int | None = None
@@ -591,6 +643,7 @@ class PlanOutputQtyCell(BaseModel):
     planned_output_qty: float
     accepted_plan_output_qty: float
     assembly_remaining_qty: float
+    overproduction_qty: float = 0
 
 
 class PeriodPlanMatrixRow(BaseModel):
@@ -599,6 +652,7 @@ class PeriodPlanMatrixRow(BaseModel):
     planned_output_qty: float | None = None
     accepted_plan_output_qty: float | None = None
     assembly_remaining_qty: float | None = None
+    overproduction_qty: float | None = None
     output_by_bucket: dict[str, PlanOutputQtyCell] = Field(default_factory=dict)
 
 
@@ -661,6 +715,50 @@ async def period_plans_create(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post(
+    "/period-plans/corrections",
+    response_model=FixedPlanCorrectionsResponse,
+)
+async def period_plans_correct_fixed_groups(
+    req: FixedPlanCorrectionsRequest,
+    db: Session = Depends(get_db),
+):
+    """Atomically correct fixed same-month groups and replace their live MRP."""
+    from ..services.fixed_plan_correction import correct_fixed_plan_groups
+
+    try:
+        return correct_fixed_plan_groups(
+            db,
+            groups=[
+                {
+                    "plan_ids": list(group.plan_ids),
+                    "target_entries": [
+                        entry.model_dump(exclude_none=True)
+                        for entry in group.target_entries
+                    ],
+                }
+                for group in req.groups
+            ],
+            source_id=req.source_id,
+            source_hash=req.source_hash,
+            expected_generation_id=req.expected_generation_id,
+            expected_source_revision=req.expected_source_revision,
+            corrected_by=req.corrected_by,
+            dry_run=bool(req.dry_run),
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 409 if (
+            "expected generation" in detail
+            or "expected source revision" in detail
+            or "already exists" in detail
+        ) else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/period-plans/{plan_id}")

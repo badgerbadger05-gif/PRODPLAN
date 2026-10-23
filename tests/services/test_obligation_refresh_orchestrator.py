@@ -426,6 +426,53 @@ def test_zero_remainder_retires_mrp_without_recreating_demand(db_session):
     ).count() == 0
 
 
+def test_zero_remainder_replacement_keeps_corrected_plan_current(db_session):
+    accepted, plan, line, _item, parent, _cutoff = _world(
+        db_session,
+        qty=12,
+    )
+    line.accepted_output_qty = Decimal("12")
+    line.remaining_output_qty = Decimal("0")
+    parent_root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(parent.run_id), plan_line_id=int(line.id)
+    ).one()
+    parent_root.accepted_qty = Decimal("12")
+    parent_root.remaining_qty = Decimal("0")
+    db_session.commit()
+
+    result = _run(
+        db_session,
+        accepted,
+        "orch-replace-zero-remainder",
+        replace=[plan.id],
+    )
+
+    successor = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=int(parent.run_id),
+        status="FIXED_SNAPSHOT",
+    ).one()
+    root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=int(successor.run_id), plan_line_id=int(line.id)
+    ).one()
+    assert result.published is True
+    assert parent.status == "CLOSED"
+    assert plan.status == "fixed"
+    assert root.planned_qty == 0
+    assert root.accepted_qty == 0
+    assert root.remaining_qty == 0
+    scope = db_session.query(models.CurrentExecutionScope).filter_by(
+        entity_kind="period_plan_execution",
+        scope_key="period-plan:all-live-plans",
+    ).one()
+    payload = scope.summary["snapshots"][
+        f"plan:{int(plan.id)}:run:{int(successor.run_id)}"
+    ]
+    assert payload["summary"]["planned_output_qty"] == 12.0
+    assert payload["summary"]["accepted_plan_output_qty"] == 12.0
+    assert payload["summary"]["assembly_remaining_qty"] == 0.0
+    assert payload["summary"]["overproduction_qty"] == 0.0
+
+
 def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(db_session):
     accepted, plan, _line, _item, _old, _cutoff = _world(db_session, with_parent=False)
     result = _run(db_session, accepted, "orch-add", add=[plan.id], config={"first": True})

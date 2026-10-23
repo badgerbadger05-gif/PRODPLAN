@@ -408,6 +408,7 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                       planned={plan.planned_output_qty}
                       accepted={plan.accepted_plan_output_qty}
                       remaining={plan.assembly_remaining_qty}
+                      overproduction={plan.overproduction_qty}
                       available={plan.plan_output_truth_status === 'accepted'}
                       compact
                     />

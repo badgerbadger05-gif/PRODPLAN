@@ -83,8 +83,8 @@ function makeMatrix(plan: PeriodPlan): PeriodPlanMatrix {
         buckets: { '2026-05-01': 4, '2026-05-08': 6 },
         locked_buckets: {},
         output_by_bucket: outputAvailable ? {
-          '2026-05-01': { planned_output_qty: 4, accepted_plan_output_qty: 2, assembly_remaining_qty: 2 },
-          '2026-05-08': { planned_output_qty: 6, accepted_plan_output_qty: 0, assembly_remaining_qty: 6 },
+          '2026-05-01': { planned_output_qty: 4, accepted_plan_output_qty: 2, assembly_remaining_qty: 2, overproduction_qty: 0 },
+          '2026-05-08': { planned_output_qty: 6, accepted_plan_output_qty: 0, assembly_remaining_qty: 6, overproduction_qty: 0 },
         } : {},
       },
     ],

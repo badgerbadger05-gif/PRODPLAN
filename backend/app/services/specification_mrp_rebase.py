@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 from app.services.item_ledger.reservation_current import current_reservation_query
+from app.services.plan_output_quantities import validate_saved_plan_output
 
 
 ZERO = Decimal("0")
@@ -64,18 +65,15 @@ def _remaining_root_rows(
     for line in lines:
         if line.remaining_output_qty is None:
             raise ValueError("plan line has no persisted execution remainder")
-        planned = _dec(line.qty)
-        accepted = _dec(line.accepted_output_qty)
-        remaining = _dec(line.remaining_output_qty)
-        if (
-            planned < ZERO
-            or accepted < ZERO
-            or remaining < ZERO
-            or planned != accepted + remaining
-        ):
-            raise ValueError(
-                f"plan line {int(line.id)} violates output conservation"
-            )
+        quantities = validate_saved_plan_output(
+            line.qty,
+            line.accepted_output_qty,
+            line.remaining_output_qty,
+            context=f"plan line {int(line.id)}",
+        )
+        planned = quantities.planned
+        accepted = quantities.accepted
+        remaining = quantities.remaining
         bucket_date = max(line.bucket_date, successor_period_from)
         audit.append(
             {
@@ -85,6 +83,7 @@ def _remaining_root_rows(
                 "planned_qty": str(planned),
                 "accepted_output_qty": str(accepted),
                 "remaining_qty": str(remaining),
+                "overproduction_qty": str(quantities.overproduction),
                 "successor_bucket_date": bucket_date.isoformat(),
             }
         )
