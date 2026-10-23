@@ -357,6 +357,10 @@ def verify_result(
     all_plan_ids = sorted(
         {int(plan_id) for group in request["groups"] for plan_id in group["plan_ids"]}
     )
+    local_order_reconciliation = dict(result.get("local_order_reconciliation") or {})
+    local_entries = list(local_order_reconciliation.get("entries") or [])
+    if any(int(entry.get("plan_id") or -1) not in set(all_plan_ids) for entry in local_entries):
+        raise ValueError("local order reconciliation escaped the correction plan scope")
     actual_by_group: list[dict[str, Any]] = []
     for group in request["groups"]:
         plan_ids = [int(value) for value in group["plan_ids"]]
@@ -419,6 +423,7 @@ def verify_result(
         "published_generation_id": published_generation_id,
         "correction_id": int(audit.id),
         "groups": actual_by_group,
+        "local_order_reconciliation": local_order_reconciliation,
         "execution_facts_unchanged": True,
         "historical_roots_unchanged": True,
         "untouched_plans_unchanged": True,

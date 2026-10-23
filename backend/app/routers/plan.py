@@ -400,6 +400,7 @@ class FixedPlanCorrectionsResponse(BaseModel):
     published_generation_id: int
     previous_run_ids: dict[str, int]
     successor_run_ids: dict[str, int]
+    local_order_reconciliation: dict[str, object]
     totals: dict[str, str]
     dry_run: bool
 

@@ -189,6 +189,23 @@ def _stub_refresh(monkeypatch, db, calls):
                     remaining_qty=Decimal(line.remaining_output_qty),
                 ))
         _db.get(models.PlanningTruthState, 1).current_generation_id = int(target.id)
+        _db.add(models.LedgerBuildBatch(
+            ledger_generation_id=int(target.id),
+            stage="snapshot_build",
+            batch_key=f"test-correction-snapshot-{int(target.id)}",
+            status="completed",
+            algorithm_version="test",
+            metrics={
+                "local_order_reconciliation": {
+                    "ledger_generation_id": int(target.id),
+                    "resized": 0,
+                    "cancelled": 0,
+                    "locked": 0,
+                    "entries": [],
+                }
+            },
+            completed_at=CUTOFF,
+        ))
         _db.flush()
         return SimpleNamespace(target_generation_id=int(target.id), published=True)
 
@@ -247,6 +264,8 @@ def test_batch_correction_preserves_fact_owner_and_publishes_once(
     assert result["status"] == "applied"
     assert len(calls) == 1
     assert calls[0]["replace_plan_ids"] == (1, 2, 3)
+    assert calls[0]["local_order_reconciliation_plan_ids"] == (1, 2, 3)
+    assert result["local_order_reconciliation"]["entries"] == []
     db_session.expire_all()
     assert Decimal(db_session.get(models.ProductionPlanLine, lines[1].id).qty) == 4
     secondary = db_session.get(models.ProductionPlanLine, lines[2].id)

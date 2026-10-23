@@ -333,6 +333,7 @@ def _manifest_request_matches(
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
+    local_order_reconciliation_plan_ids: Iterable[int] | None,
 ) -> None:
     marks = dict(target.source_watermarks or {})
     manifest = marks.get(MANIFEST_KEY)
@@ -354,6 +355,11 @@ def _manifest_request_matches(
                 str(key).strip(): str(value).strip()
                 for key, value in sorted(planning_pool_by_warehouse.items())
             },
+            "local_order_reconciliation_plan_ids": (
+                None
+                if local_order_reconciliation_plan_ids is None
+                else sorted(int(value) for value in local_order_reconciliation_plan_ids)
+            ),
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise ObligationRefreshOrchestratorError("published refresh manifest request is malformed") from exc
@@ -368,6 +374,7 @@ def _retry_published(
     horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
+    local_order_reconciliation_plan_ids: Iterable[int] | None,
     allow_stale_parent: bool = False,
 ) -> ObligationRefreshOrchestrationResult:
     _manifest_request_matches(
@@ -375,7 +382,8 @@ def _retry_published(
         replace_plan_ids=replace_plan_ids,
         horizon_days=horizon_days,
                               config_version_id=config_version_id, config_snapshot=config_snapshot,
-                              planning_pool_by_warehouse=planning_pool_by_warehouse)
+                              planning_pool_by_warehouse=planning_pool_by_warehouse,
+                              local_order_reconciliation_plan_ids=local_order_reconciliation_plan_ids)
     marks = dict(target.source_watermarks or {})
     if int(marks.get("parent_generation_id") or -1) != int(parent_generation_id):
         raise ObligationRefreshOrchestratorError("published generation belongs to another parent")
@@ -440,6 +448,7 @@ def run_obligation_refresh(
     config_version_id: int | None = None,
     config_snapshot: Mapping[str, Any] | None = None,
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
+    local_order_reconciliation_plan_ids: Iterable[int] | None = None,
     explicit_make_transfer_recorders: set[str] | None = None,
     accepted_at: datetime | None = None,
     allow_stale_parent: bool = False,
@@ -467,12 +476,24 @@ def run_obligation_refresh(
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
     retire_ids = tuple(sorted(int(v) for v in retire_plan_ids))
     replace_ids = tuple(sorted(int(v) for v in replace_plan_ids))
+    local_order_plan_ids = (
+        None
+        if local_order_reconciliation_plan_ids is None
+        else tuple(sorted(int(v) for v in local_order_reconciliation_plan_ids))
+    )
     if len(add_ids) != len(set(add_ids)) or any(v <= 0 for v in add_ids):
         raise ValueError("add_plan_ids must be unique positive ids")
     if len(retire_ids) != len(set(retire_ids)) or any(v <= 0 for v in retire_ids):
         raise ValueError("retire_plan_ids must be unique positive ids")
     if len(replace_ids) != len(set(replace_ids)) or any(v <= 0 for v in replace_ids):
         raise ValueError("replace_plan_ids must be unique positive ids")
+    if local_order_plan_ids is not None and (
+        len(local_order_plan_ids) != len(set(local_order_plan_ids))
+        or any(v <= 0 for v in local_order_plan_ids)
+    ):
+        raise ValueError(
+            "local_order_reconciliation_plan_ids must be unique positive ids"
+        )
     if (
         set(add_ids).intersection(retire_ids)
         or set(add_ids).intersection(replace_ids)
@@ -525,6 +546,7 @@ def run_obligation_refresh(
             replace_plan_ids=replace_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
             planning_pool_by_warehouse=pool_mapping,
+            local_order_reconciliation_plan_ids=local_order_plan_ids,
             allow_stale_parent=bool(allow_stale_parent),
         )
     if existing is not None and str(existing.status) != "building":
@@ -555,6 +577,7 @@ def run_obligation_refresh(
         started_by=started_by,
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
         planning_pool_by_warehouse=pool_mapping,
+        local_order_reconciliation_plan_ids=local_order_plan_ids,
     )
     candidate_ids = tuple(sorted(
         int(entry["candidate_run_id"])
@@ -724,10 +747,26 @@ def run_obligation_refresh(
     # to the production snapshot which consumes those quantities, after every
     # unrelated heavy projection, so operators are not blocked while assembly,
     # drum, shelf and purchase views are being built.
+    local_order_run_ids = (*candidate_ids, *retained_run_ids)
+    if local_order_plan_ids is not None:
+        allowed_plan_ids = set(local_order_plan_ids)
+        local_order_run_ids = tuple(
+            int(run_id)
+            for run_id, plan_id in db.query(
+                models.PlanningRun.run_id,
+                models.PlanningRun.source_plan_id,
+            ).filter(
+                models.PlanningRun.run_id.in_(local_order_run_ids or (0,))
+            ).order_by(models.PlanningRun.run_id).all()
+            if plan_id is not None and int(plan_id) in allowed_plan_ids
+        )
+    # Default refreshes retain the canonical all-live alignment. Narrow
+    # operator corrections pass an explicit plan scope, so unrelated retained
+    # local executor orders remain byte-for-byte untouched.
     local_order_reconciliation = reconcile_local_mrp_orders(
         db,
         ledger_generation_id=target_id,
-        live_run_ids=(*candidate_ids, *retained_run_ids),
+        live_run_ids=local_order_run_ids,
     )
     production_journal_payload = build_production_journal_payload(
         db,

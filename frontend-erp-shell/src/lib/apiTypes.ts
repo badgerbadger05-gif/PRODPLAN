@@ -4602,6 +4602,10 @@ export interface components {
             successor_run_ids: {
                 [key: string]: number;
             };
+            /** Local Order Reconciliation */
+            local_order_reconciliation: {
+                [key: string]: unknown;
+            };
             /** Totals */
             totals: {
                 [key: string]: string;

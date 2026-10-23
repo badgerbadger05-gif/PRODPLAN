@@ -623,6 +623,7 @@ def correct_fixed_plan_groups(
             horizon_days=horizon_days,
             config_version_id=config_version_id,
             config_snapshot=config_snapshot,
+            local_order_reconciliation_plan_ids=all_ids,
         )
         successor_run_rows = db.query(models.PlanningRun).filter(
                 models.PlanningRun.source_plan_id.in_(all_ids),
@@ -642,6 +643,20 @@ def correct_fixed_plan_groups(
         if set(successor_runs) != set(all_ids):
             raise FixedPlanCorrectionError(
                 "correction publication did not create every successor MRP"
+            )
+        snapshot_batch = db.query(models.LedgerBuildBatch).filter_by(
+            ledger_generation_id=int(report.target_generation_id),
+            stage="snapshot_build",
+            status="completed",
+        ).one_or_none()
+        local_order_reconciliation = (
+            dict((snapshot_batch.metrics or {}).get("local_order_reconciliation") or {})
+            if snapshot_batch is not None
+            else {}
+        )
+        if not local_order_reconciliation:
+            raise FixedPlanCorrectionError(
+                "correction publication lacks local order reconciliation audit"
             )
         after_payload = _matrix_payload(plans, lines, successor_models)
 
@@ -686,6 +701,7 @@ def correct_fixed_plan_groups(
                 str(plan_id): run_id
                 for plan_id, run_id in sorted(successor_runs.items())
             },
+            "local_order_reconciliation": local_order_reconciliation,
             "totals": totals,
             "dry_run": bool(dry_run),
         }

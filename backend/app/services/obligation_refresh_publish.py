@@ -361,6 +361,28 @@ def _require_manifest(
         raise ObligationRefreshPublishError(
             "obligation_refresh_manifest replace request conflicts"
         )
+    raw_local_order_scope = add_request.get("local_order_reconciliation_plan_ids")
+    if raw_local_order_scope is not None:
+        try:
+            local_order_scope = [int(value) for value in raw_local_order_scope]
+        except (TypeError, ValueError) as exc:
+            raise ObligationRefreshPublishError(
+                "obligation_refresh_manifest local order scope is malformed"
+            ) from exc
+        published_live_plan_ids = {
+            int(row.source_plan_id)
+            for row in [*additions, *replacements, *retained]
+            if row.source_plan_id is not None
+        }
+        if (
+            local_order_scope != sorted(local_order_scope)
+            or len(local_order_scope) != len(set(local_order_scope))
+            or any(value <= 0 for value in local_order_scope)
+            or not set(local_order_scope).issubset(published_live_plan_ids)
+        ):
+            raise ObligationRefreshPublishError(
+                "obligation_refresh_manifest local order scope conflicts"
+            )
     if not isinstance(add_request.get("config_snapshot"), dict):
         raise ObligationRefreshPublishError("obligation_refresh_manifest add config is malformed")
     pool_mapping = add_request.get("planning_pool_by_warehouse")

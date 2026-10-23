@@ -154,6 +154,7 @@ def _payload(
     config_version_id: int | None,
     config_snapshot: dict[str, Any],
     planning_pool_by_warehouse: dict[str, str],
+    local_order_reconciliation_plan_ids: list[int] | None,
 ) -> dict[str, Any]:
     return {
         "version": MANIFEST_VERSION,
@@ -166,6 +167,7 @@ def _payload(
             "config_version_id": config_version_id,
             "config_snapshot": config_snapshot,
             "planning_pool_by_warehouse": planning_pool_by_warehouse,
+            "local_order_reconciliation_plan_ids": local_order_reconciliation_plan_ids,
         },
     }
 
@@ -303,6 +305,7 @@ def create_obligation_refresh_manifest(
     config_version_id: int | None,
     config_snapshot: dict[str, Any],
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
+    local_order_reconciliation_plan_ids: Iterable[int] | None = None,
 ) -> ObligationRefreshManifestResult:
     """Create or exactly retry the sealed refresh/add/retain/retire run set.
 
@@ -315,6 +318,11 @@ def create_obligation_refresh_manifest(
     add_ids = _normalise_add_ids(add_plan_ids)
     retire_ids = _normalise_add_ids(retire_plan_ids)
     replace_ids = _normalise_add_ids(replace_plan_ids)
+    local_order_plan_ids = (
+        None
+        if local_order_reconciliation_plan_ids is None
+        else _normalise_add_ids(local_order_reconciliation_plan_ids)
+    )
     if (
         set(add_ids).intersection(retire_ids)
         or set(add_ids).intersection(replace_ids)
@@ -335,6 +343,7 @@ def create_obligation_refresh_manifest(
             horizon_days=horizon_days, config_version_id=config_version_id,
             config_snapshot=deepcopy(config_snapshot),
             planning_pool_by_warehouse=pool_mapping,
+            local_order_reconciliation_plan_ids=local_order_plan_ids,
         )
         if _hash(expected) != existing.content_hash:
             raise ObligationRefreshManifestError("conflicting retry of refresh manifest")
@@ -361,6 +370,13 @@ def create_obligation_refresh_manifest(
     if missing_replace:
         raise ObligationRefreshManifestError(
             f"replace plan has no current FIXED_SNAPSHOT: {min(missing_replace)}"
+        )
+    live_after_refresh = (current_plan_ids - set(retire_ids)) | set(add_ids)
+    invalid_local_order_scope = set(local_order_plan_ids or ()) - live_after_refresh
+    if invalid_local_order_scope:
+        raise ObligationRefreshManifestError(
+            "local order reconciliation plan is outside the published live scope: "
+            f"{min(invalid_local_order_scope)}"
         )
 
     entries: list[dict[str, int | str | None]] = []
@@ -410,6 +426,7 @@ def create_obligation_refresh_manifest(
         horizon_days=horizon_days,
         config_version_id=config_version_id, config_snapshot=deepcopy(config_snapshot),
         planning_pool_by_warehouse=pool_mapping,
+        local_order_reconciliation_plan_ids=local_order_plan_ids,
     )
     content_hash = _hash(payload)
     target.source_watermarks = {

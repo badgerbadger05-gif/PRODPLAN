@@ -102,6 +102,7 @@ def _run(
     replace=(),
     config=None,
     pool_mapping=None,
+    local_order_plan_ids=None,
 ):
     return workflow.run_obligation_refresh(
         db, parent_generation_id=parent.id, generation_key=key, add_plan_ids=add,
@@ -110,6 +111,7 @@ def _run(
         started_by="test", horizon_days=30, config_version_id=None,
         config_snapshot=config or {},
         planning_pool_by_warehouse=pool_mapping,
+        local_order_reconciliation_plan_ids=local_order_plan_ids,
         accepted_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
 
@@ -1312,8 +1314,11 @@ def _extra_fixed_plan(db, accepted, cutoff, *, name, code, qty=3):
     return SimpleNamespace(plan=plan, run=run, owner=owner, item=item)
 
 
+@pytest.mark.parametrize("scoped_local_orders", [False, True])
 def test_replacing_one_plan_keeps_the_other_live_runs_owners_and_work_items(
     db_session,
+    monkeypatch,
+    scoped_local_orders,
 ):
     """A retained run is untouched: a refresh retires only what it replaced.
 
@@ -1332,9 +1337,40 @@ def test_replacing_one_plan_keeps_the_other_live_runs_owners_and_work_items(
         db_session, accepted, cutoff, name="retained B", code="ORCH-RETAIN-B",
     )
     db_session.commit()
+    reconciled_run_ids = []
 
-    result = _run(db_session, accepted, "orch-retain-owners", replace=[plan.id])
+    def capture_local_reconciliation(_db, *, ledger_generation_id, live_run_ids):
+        reconciled_run_ids.append(tuple(sorted(int(value) for value in live_run_ids)))
+        return {
+            "ledger_generation_id": int(ledger_generation_id),
+            "resized": 0,
+            "cancelled": 0,
+            "locked": 0,
+            "entries": [],
+        }
+
+    monkeypatch.setattr(
+        workflow,
+        "reconcile_local_mrp_orders",
+        capture_local_reconciliation,
+    )
+
+    result = _run(
+        db_session,
+        accepted,
+        f"orch-retain-owners-{int(scoped_local_orders)}",
+        replace=[plan.id],
+        local_order_plan_ids=([plan.id] if scoped_local_orders else None),
+    )
     assert result.published is True
+    successor = db_session.query(models.PlanningRun).filter_by(
+        prior_run_id=int(parent.run_id),
+        status="FIXED_SNAPSHOT",
+    ).one()
+    expected_reconciled = {int(successor.run_id)}
+    if not scoped_local_orders:
+        expected_reconciled.update((int(kept_a.run.run_id), int(kept_b.run.run_id)))
+    assert reconciled_run_ids == [tuple(sorted(expected_reconciled))]
 
     for kept in (kept_a, kept_b):
         db_session.refresh(kept.owner)
