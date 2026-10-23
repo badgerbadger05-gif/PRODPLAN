@@ -9,7 +9,7 @@ historical roots, successor roots, and explicitly untouched plans.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date
 from decimal import Decimal
 from hashlib import sha256
@@ -361,6 +361,42 @@ def verify_result(
     local_entries = list(local_order_reconciliation.get("entries") or [])
     if any(int(entry.get("plan_id") or -1) not in set(all_plan_ids) for entry in local_entries):
         raise ValueError("local order reconciliation escaped the correction plan scope")
+    before_facts = list(evidence.get("execution_facts") or [])
+    if _hash(before_facts) != str(evidence.get("execution_facts_hash") or ""):
+        raise ValueError("source execution-fact evidence hash is invalid")
+    facts = _execution_facts(db, all_plan_ids)
+    before_fact_counts = Counter(_canonical(row) for row in before_facts)
+    current_fact_counts = Counter(_canonical(row) for row in facts)
+    removed_fact_counts = before_fact_counts - current_fact_counts
+    if removed_fact_counts:
+        raise ValueError("an accepted plan execution fact changed or disappeared")
+    added_fact_counts = current_fact_counts - before_fact_counts
+    added_facts = [
+        json.loads(encoded)
+        for encoded, count in sorted(added_fact_counts.items())
+        for _ordinal in range(count)
+    ]
+    if any(int(row.get("plan_id") or -1) not in set(all_plan_ids) for row in added_facts):
+        raise ValueError("new plan execution fact escaped the correction plan scope")
+    added_by_line: dict[int, Decimal] = defaultdict(lambda: ZERO)
+    added_by_run_line: dict[tuple[int, int], Decimal] = defaultdict(lambda: ZERO)
+    for row in added_facts:
+        qty = Decimal(str(row["allocated_qty"]))
+        if qty <= ZERO:
+            raise ValueError("new plan execution fact has non-positive quantity")
+        line_id = int(row["plan_line_id"])
+        added_by_line[line_id] += qty
+        added_by_run_line[(int(row["run_id"]), line_id)] += qty
+    source_accepted_by_line = {
+        int(row["plan_line_id"]): Decimal(str(row["accepted_output_qty"]))
+        for row in evidence.get("source_lines") or []
+    }
+    if len(source_accepted_by_line) != len(evidence.get("source_lines") or []):
+        raise ValueError("source line evidence contains duplicate identities")
+    live_runs = {
+        plan_id: current_live_run(db, plan_id)
+        for plan_id in all_plan_ids
+    }
     actual_by_group: list[dict[str, Any]] = []
     for group in request["groups"]:
         plan_ids = [int(value) for value in group["plan_ids"]]
@@ -379,13 +415,29 @@ def verify_result(
                 context=f"plan line {int(line.id)}",
             )
             actual[(int(line.item_id), line.bucket_date.isoformat())] += quantities.planned
-            run = current_live_run(db, int(line.plan_id))
+            run = live_runs[int(line.plan_id)]
             if int(line.locked_by_run_id or -1) != int(run.run_id):
                 raise ValueError(f"plan line {int(line.id)} has a stale current-run lock")
+            accepted_before = source_accepted_by_line.get(int(line.id), ZERO)
+            accepted_delta = added_by_line.get(int(line.id), ZERO)
+            if quantities.accepted != accepted_before + accepted_delta:
+                raise ValueError(
+                    f"plan line {int(line.id)} accepted output changed outside append-only facts"
+                )
             root = db.query(models.MrpRunRoot).filter_by(
                 run_id=int(run.run_id), plan_line_id=int(line.id)
             ).one_or_none()
-            if root is None or Decimal(root.planned_qty) != quantities.remaining:
+            if root is None:
+                raise ValueError(f"successor root for plan line {int(line.id)} is missing or wrong")
+            root_planned = Decimal(root.planned_qty)
+            root_accepted = Decimal(root.accepted_qty)
+            root_remaining = Decimal(root.remaining_qty)
+            if (
+                root_planned != root_accepted + root_remaining
+                or root_remaining != quantities.remaining
+                or root_accepted
+                != added_by_run_line.get((int(run.run_id), int(line.id)), ZERO)
+            ):
                 raise ValueError(f"successor root for plan line {int(line.id)} is missing or wrong")
         if any(actual.get(key, ZERO) != qty for key, qty in expected.items()):
             raise ValueError(f"corrected group {plan_ids} differs from target")
@@ -397,9 +449,6 @@ def verify_result(
             "actual_total": str(sum(actual.values(), ZERO)),
         })
 
-    facts = _execution_facts(db, all_plan_ids)
-    if _hash(facts) != str(evidence["execution_facts_hash"]):
-        raise ValueError("accepted plan execution facts changed during correction")
     untouched = _line_state(db, evidence.get("untouched_plan_ids") or [])
     if _hash(untouched) != str(evidence["untouched_lines_hash"]):
         raise ValueError("an explicitly untouched plan changed")
@@ -424,7 +473,11 @@ def verify_result(
         "correction_id": int(audit.id),
         "groups": actual_by_group,
         "local_order_reconciliation": local_order_reconciliation,
-        "execution_facts_unchanged": True,
+        "execution_facts_preserved": True,
+        "execution_fact_rows_appended": len(added_facts),
+        "execution_fact_qty_appended": str(
+            sum((Decimal(str(row["allocated_qty"])) for row in added_facts), ZERO)
+        ),
         "historical_roots_unchanged": True,
         "untouched_plans_unchanged": True,
     }

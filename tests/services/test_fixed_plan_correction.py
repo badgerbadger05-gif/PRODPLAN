@@ -177,6 +177,9 @@ def _stub_refresh(monkeypatch, db, calls):
             )
             _db.add(successor)
             _db.flush()
+            pointer = _db.get(models.PlanningLivePointer, int(plan_id))
+            pointer.run_id = int(successor.run_id)
+            pointer.status = "active"
             for line in _db.query(models.ProductionPlanLine).filter_by(
                 plan_id=int(plan_id)
             ):
@@ -448,3 +451,132 @@ def test_scenario_builder_binds_target_to_current_guards(db_session, tmp_path):
     assert request["groups"][1]["target_entries"] == []
     assert evidence["current_run_ids"].keys() == {"1", "2", "3"}
     assert evidence["untouched_plan_ids"] == [4]
+
+
+def test_scenario_verifier_preserves_prior_facts_and_accepts_only_successor_appends(
+    db_session, monkeypatch
+):
+    generation, _plans, runs, lines, items = _world(db_session)
+    existing_sle = models.StockLedgerEntry(
+        ingest_batch_id=int(generation.physical_import_batch_id),
+        source_content_hash="existing-plan-fact".ljust(64, "0"),
+        item_id=int(lines[1].item_id),
+        qty=Decimal("4"),
+        qty_after=Decimal("4"),
+        posting_at=CUTOFF,
+        movement_kind="assembly_in",
+        recorder_type="test",
+        recorder_ref="existing-plan-fact",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(existing_sle)
+    db_session.flush()
+    existing_fact = models.ProductionPlanExecutionFact(
+        stock_ledger_entry_id=int(existing_sle.id),
+        plan_id=1,
+        plan_line_id=int(lines[1].id),
+        run_id=int(runs[1].run_id),
+        allocated_qty=Decimal("4"),
+        match_rule="fifo",
+        accepted_at=CUTOFF,
+    )
+    db_session.add(existing_fact)
+    db_session.commit()
+
+    from tools.fixed_plan_correction_scenario import (
+        _execution_facts,
+        _hash,
+        _line_state,
+        verify_result,
+    )
+
+    request = {
+        "groups": _groups(items),
+        "source_id": "google-plan-correction-append-proof",
+        "source_hash": "d" * 64,
+        "expected_generation_id": int(generation.id),
+        "expected_source_revision": REVISION,
+        "corrected_by": "test",
+        "dry_run": False,
+    }
+    facts_before = _execution_facts(db_session, [1, 2, 3])
+    untouched_before = _line_state(db_session, [4])
+    evidence = {
+        "execution_facts": facts_before,
+        "execution_facts_hash": _hash(facts_before),
+        "source_lines": _line_state(db_session, [1, 2, 3]),
+        "untouched_plan_ids": [4],
+        "untouched_lines_hash": _hash(untouched_before),
+    }
+    calls = []
+    _stub_refresh(monkeypatch, db_session, calls)
+    result = correct_fixed_plan_groups(
+        db_session,
+        groups=request["groups"],
+        source_id=request["source_id"],
+        source_hash=request["source_hash"],
+        expected_generation_id=request["expected_generation_id"],
+        expected_source_revision=request["expected_source_revision"],
+        corrected_by="test",
+    )
+
+    created = db_session.query(models.ProductionPlanLine).filter_by(
+        plan_id=1,
+        item_id=int(items[2].item_id),
+        bucket_date=date(2026, 1, 15),
+    ).one()
+    successor_run = int(created.locked_by_run_id)
+    successor_root = db_session.query(models.MrpRunRoot).filter_by(
+        run_id=successor_run,
+        plan_line_id=int(created.id),
+    ).one()
+    appended_sle = models.StockLedgerEntry(
+        ingest_batch_id=int(generation.physical_import_batch_id),
+        source_content_hash="appended-plan-fact".ljust(64, "0"),
+        item_id=int(created.item_id),
+        qty=Decimal("1"),
+        qty_after=Decimal("1"),
+        posting_at=CUTOFF,
+        movement_kind="assembly_in",
+        recorder_type="test",
+        recorder_ref="appended-plan-fact",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(appended_sle)
+    db_session.flush()
+    db_session.add(models.ProductionPlanExecutionFact(
+        stock_ledger_entry_id=int(appended_sle.id),
+        plan_id=1,
+        plan_line_id=int(created.id),
+        run_id=successor_run,
+        allocated_qty=Decimal("1"),
+        match_rule="fifo",
+        accepted_at=CUTOFF,
+    ))
+    created.accepted_output_qty = Decimal("1")
+    created.remaining_output_qty = Decimal("4")
+    successor_root.accepted_qty = Decimal("1")
+    successor_root.remaining_qty = Decimal("4")
+    db_session.commit()
+
+    verified = verify_result(
+        db_session,
+        request=request,
+        evidence=evidence,
+        result=result,
+    )
+    assert verified["execution_facts_preserved"] is True
+    assert verified["execution_fact_rows_appended"] == 1
+    assert verified["execution_fact_qty_appended"] == "1.000"
+
+    existing_fact.match_rule = "changed"
+    db_session.commit()
+    with pytest.raises(ValueError, match="changed or disappeared"):
+        verify_result(
+            db_session,
+            request=request,
+            evidence=evidence,
+            result=result,
+        )
