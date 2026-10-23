@@ -355,12 +355,23 @@ def _manifest_request_matches(
                 str(key).strip(): str(value).strip()
                 for key, value in sorted(planning_pool_by_warehouse.items())
             },
-            "local_order_reconciliation_plan_ids": (
+        }
+        has_local_order_scope = (
+            "local_order_reconciliation_plan_ids" in request
+        )
+        if has_local_order_scope:
+            expected["local_order_reconciliation_plan_ids"] = (
                 None
                 if local_order_reconciliation_plan_ids is None
-                else sorted(int(value) for value in local_order_reconciliation_plan_ids)
-            ),
-        }
+                else sorted(
+                    int(value)
+                    for value in local_order_reconciliation_plan_ids
+                )
+            )
+        elif local_order_reconciliation_plan_ids is not None:
+            raise ObligationRefreshOrchestratorError(
+                "conflicting retry of legacy published refresh request"
+            )
     except (KeyError, TypeError, ValueError) as exc:
         raise ObligationRefreshOrchestratorError("published refresh manifest request is malformed") from exc
     if request != expected:

@@ -1,6 +1,7 @@
 """End-to-end contract tests for the caller-owned refresh orchestrator."""
 
 from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
 from types import SimpleNamespace
 from decimal import Decimal
 
@@ -1002,6 +1003,56 @@ def test_committed_exact_retry_is_publisher_noop_and_changed_request_is_rejected
     assert pointer_retry.published is False
     with pytest.raises(workflow.ObligationRefreshOrchestratorError, match="conflicting retry"):
         _run(db_session, accepted, "orch-retry", add=[plan.id], config={"v": 2})
+
+
+def test_legacy_published_manifest_without_local_order_scope_retries_only_default(
+    db_session,
+):
+    accepted, plan, _line, _item, _old, _cutoff = _world(
+        db_session, with_parent=False
+    )
+    first = _run(
+        db_session,
+        accepted,
+        "orch-legacy-published-retry",
+        add=[plan.id],
+        config={"v": 1},
+    )
+    target = db_session.get(models.LedgerGeneration, first.target_generation_id)
+    marks = dict(target.source_watermarks or {})
+    manifest = dict(marks[workflow.MANIFEST_KEY])
+    request = dict(manifest["add_request"])
+    request.pop("local_order_reconciliation_plan_ids")
+    manifest["add_request"] = request
+    marks[workflow.MANIFEST_KEY] = manifest
+    marks[workflow.MANIFEST_HASH_KEY] = sha256(
+        workflow._canonical(manifest).encode()
+    ).hexdigest()
+    target.source_watermarks = marks
+    db_session.commit()
+
+    retry = _run(
+        db_session,
+        accepted,
+        "orch-legacy-published-retry",
+        add=[plan.id],
+        config={"v": 1},
+    )
+    assert retry.target_generation_id == first.target_generation_id
+    assert retry.published is False
+
+    with pytest.raises(
+        workflow.ObligationRefreshOrchestratorError,
+        match="legacy published refresh",
+    ):
+        _run(
+            db_session,
+            accepted,
+            "orch-legacy-published-retry",
+            add=[plan.id],
+            config={"v": 1},
+            local_order_plan_ids=[plan.id],
+        )
 
 
 def test_committed_retry_rejects_changed_planning_pool_mapping(db_session):

@@ -336,6 +336,23 @@ def create_obligation_refresh_manifest(
         # Rebuild the request shape before returning.  This is intentionally
         # stricter than just checking the hash: a caller may not add/omit a
         # plan or alter sealed first-plan settings on a retry.
+        existing_manifest = dict(target.source_watermarks or {}).get(MANIFEST_KEY)
+        existing_request = (
+            existing_manifest.get("add_request")
+            if isinstance(existing_manifest, dict)
+            else None
+        )
+        if not isinstance(existing_request, dict):
+            raise ObligationRefreshManifestError(
+                "target refresh manifest add request is malformed"
+            )
+        has_local_order_scope = (
+            "local_order_reconciliation_plan_ids" in existing_request
+        )
+        if not has_local_order_scope and local_order_plan_ids is not None:
+            raise ObligationRefreshManifestError(
+                "conflicting retry of legacy refresh manifest"
+            )
         expected = _payload(
             list(existing.entries), add_plan_ids=add_ids,
             retire_plan_ids=retire_ids,
@@ -345,6 +362,13 @@ def create_obligation_refresh_manifest(
             planning_pool_by_warehouse=pool_mapping,
             local_order_reconciliation_plan_ids=local_order_plan_ids,
         )
+        if not has_local_order_scope:
+            # Pre-scope manifests were sealed without this key. _existing_result
+            # has already verified their original content hash; preserve that
+            # exact historical shape for a None/default resume.
+            expected["add_request"].pop(
+                "local_order_reconciliation_plan_ids", None
+            )
         if _hash(expected) != existing.content_hash:
             raise ObligationRefreshManifestError("conflicting retry of refresh manifest")
         return existing

@@ -8,6 +8,7 @@ from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
     MANIFEST_KEY,
     ObligationRefreshManifestError,
+    _hash,
     _current_parents,
     create_obligation_refresh_manifest,
 )
@@ -109,6 +110,66 @@ def test_manifest_allows_first_add_only_and_exact_retry(db_session):
     assert again.created is False
     assert again.content_hash == first.content_hash
     assert again.entries == first.entries
+
+
+def test_legacy_building_manifest_without_local_order_scope_resumes_only_default(
+    db_session,
+):
+    accepted, target, _parents = _fixture(db_session, plans=0)
+    plan = models.ProductionPlanHeader(
+        name="legacy building", period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31), status="fixed",
+    )
+    db_session.add(plan)
+    db_session.commit()
+    first = _create(db_session, accepted, target, [plan.id])
+    marks = dict(target.source_watermarks or {})
+    manifest = dict(marks[MANIFEST_KEY])
+    request = dict(manifest["add_request"])
+    request.pop("local_order_reconciliation_plan_ids")
+    manifest["add_request"] = request
+    marks[MANIFEST_KEY] = manifest
+    marks[MANIFEST_HASH_KEY] = _hash(manifest)
+    target.source_watermarks = marks
+    db_session.commit()
+
+    resumed = _create(db_session, accepted, target, [plan.id])
+    assert resumed.created is False
+    assert resumed.entries == first.entries
+    assert resumed.content_hash == _hash(manifest)
+
+    with pytest.raises(ObligationRefreshManifestError, match="legacy refresh"):
+        _create(
+            db_session,
+            accepted,
+            target,
+            [plan.id],
+            local_order_reconciliation_plan_ids=[plan.id],
+        )
+
+
+def test_legacy_shape_compatibility_never_bypasses_stored_manifest_hash(db_session):
+    accepted, target, _parents = _fixture(db_session, plans=0)
+    plan = models.ProductionPlanHeader(
+        name="tampered legacy", period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31), status="fixed",
+    )
+    db_session.add(plan)
+    db_session.commit()
+    _create(db_session, accepted, target, [plan.id])
+    marks = dict(target.source_watermarks or {})
+    manifest = dict(marks[MANIFEST_KEY])
+    request = dict(manifest["add_request"])
+    request.pop("local_order_reconciliation_plan_ids")
+    manifest["add_request"] = request
+    marks[MANIFEST_KEY] = manifest
+    # Deliberately retain the old hash: compatibility is allowed only after an
+    # authentic legacy manifest has proved its original sealed shape.
+    target.source_watermarks = marks
+    db_session.commit()
+
+    with pytest.raises(ObligationRefreshManifestError, match="hash conflicts"):
+        _create(db_session, accepted, target, [plan.id])
 
 
 def test_manifest_replaces_run_on_saved_remainder_of_same_plan(db_session):
