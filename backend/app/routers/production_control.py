@@ -21,6 +21,7 @@ from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_piecework_export import export_piecework_to_1c
 from ..services.one_c_production_order_export import (
     close_production_orders_to_1c,
+    reduce_existing_production_quantity_to_1c,
     export_production_orders_to_1c,
 )
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
@@ -1919,6 +1920,30 @@ def patch_order_line_state(product_id: int, payload: LineStatePayload, db: Sessi
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class ReduceExistingOrderQuantityPayload(BaseModel):
+    expected_quantity: float = Field(gt=0)
+    quantity: float = Field(gt=0)
+    dry_run: bool = True
+    current_identity: str
+    expected_source_revision: str
+
+
+@router.post("/orders/{product_id}/reduce-in-1c", response_model=dict)
+def reduce_existing_order_quantity(
+    product_id: int, payload: ReduceExistingOrderQuantityPayload,
+    db: Session = Depends(get_db),
+):
+    try:
+        _require_current_production_action(db, product_id=product_id, current_identity=payload.current_identity, expected_source_revision=payload.expected_source_revision)
+        return reduce_existing_production_quantity_to_1c(db, product_id, expected_quantity=payload.expected_quantity, quantity=payload.quantity, dry_run=payload.dry_run)
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=jsonable_encoder(exc.as_dict())) from exc
+    except CurrentExecutionUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/orders/{product_id}/quantity", response_model=dict)

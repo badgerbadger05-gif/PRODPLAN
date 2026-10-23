@@ -21,6 +21,8 @@ from datetime import date, datetime
 from decimal import Decimal
 import hashlib
 import json
+import copy
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
@@ -77,6 +79,112 @@ PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 PRODUCTION_ORDER_PRODUCTS_ENTITY = "Document_ЗаказНаПроизводство_Продукция"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 DONE_VARIANT_VALUE = "Успешно"
+
+
+def _reduced_native_payload(document: Dict[str, Any], quantity: float) -> Dict[str, Any]:
+    """Amend a single native executor without replacing its linked row keys.
+
+    This scales this document's planned quantities, never stock or MRP facts.
+    Native extras, specification bindings and manual line keys stay intact.
+    """
+    products = document.get("Продукция") or []
+    if len(products) != 1:
+        raise ValueError("Quantity reduction requires one native product line")
+    old = Decimal(str(products[0]["Количество"]))
+    new = Decimal(str(quantity))
+    if not new.is_finite() or not old.is_finite() or not 0 < new <= old:
+        raise ValueError("Native production quantity can only be reduced")
+    payload = {key: copy.deepcopy(document[key]) for key in ("Продукция", "Запасы", "Операции") if key in document}
+    payload["Продукция"][0]["Количество"] = float(new)
+    for row in payload.get("Запасы", []):
+        row["Количество"] = float(Decimal(str(row["Количество"])) * new / old)
+    for row in payload.get("Операции", []):
+        row["КоличествоПлан"] = float(new)
+        row["Нормочасы"] = float(Decimal(str(row["НормаВремени"])) * new)
+    return payload
+
+
+def reduce_existing_production_quantity_to_1c(
+    db: Session, product_id: int, *, expected_quantity: float,
+    quantity: float, dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Explicit downward amendment, with same-Ref recovery after unknown I/O.
+
+    The original export SyncLink stays a historical receipt. A separate
+    amendment link records intent before I/O; an unknown result never creates
+    another executor or overwrites the accepted production facts.
+    """
+    from .item_ledger.production_output_cache import accepted_product_output, update_accepted_product_output_cache
+    from .production_control_material_availability import get_materials_snapshot
+
+    if not math.isfinite(quantity) or not math.isfinite(expected_quantity) or not 0 < quantity < expected_quantity:
+        raise ValueError("Expected a positive strict quantity reduction")
+    product = db.query(ProductionProduct).filter_by(product_id=int(product_id)).with_for_update().one()
+    order = product.order
+    if len(order.products) != 1 or order.deletion_mark:
+        raise ValueError("Reduction requires an existing single-line executor")
+    generation_id = require_materialized_orders(db, [order], consumer="one_c_production_order_reduce", existing_executor_reduction=True)
+    if float(product.quantity) not in (float(expected_quantity), float(quantity)):
+        raise ValueError("Executor quantity changed; inspect before amending")
+    output = accepted_product_output(product)
+    if output.produced_qty:
+        raise ValueError("Accepted production exists; automatic quantity reduction is blocked")
+    material = get_materials_snapshot(db, product_id)
+    if material.get("truth_status") != "accepted" or material.get("ledger_generation_id") != generation_id:
+        raise ValueError("Accepted current physical material coverage is required")
+    if material.get("material_launchable_qty") is None or quantity > float(material["material_launchable_qty"]) + 1e-6:
+        raise ValueError("Reduced quantity exceeds physical material support")
+    link = _existing_link(db, order.order_id)
+    ref = _clean_ref1c(order.order_ref1c)
+    if not link or link.status != "success" or not ref or _clean_ref1c(link.target_ref_key) != ref:
+        raise ValueError("Existing executor has no agreeing successful 1C link")
+    request_hash = _payload_hash({"product_id": int(product_id), "ref": ref, "expected_quantity": expected_quantity, "quantity": quantity})
+    amendment = _find_sync_link(db, SyncLink, source_doctype="production_order_quantity_amendment", source_id=int(product_id), target_entity=PRODUCTION_ORDER_ENTITY)
+    if amendment and amendment.status != "success" and amendment.payload_hash != request_hash:
+        raise ValueError("Another quantity amendment has an unresolved result")
+    client = _create_odata_client(_load_odata_config(), OData1CClient)
+    endpoint = f"{PRODUCTION_ORDER_ENTITY}(guid'{ref}')"
+    document = client._make_request(endpoint)
+    products = document.get("Продукция") or []
+    if document.get("DeletionMark") or _clean_ref1c(document.get("СостояниеЗаказа_Key")) == DONE_STATE_KEY:
+        raise ValueError("Native executor is deleted or completed")
+    if len(products) != 1 or _clean_ref1c(products[0].get("Номенклатура_Key")) != _clean_ref1c(product.item.item_ref1c):
+        raise ValueError("Native executor product identity changed")
+    native_quantity = float(products[0]["Количество"])
+    if native_quantity not in (float(expected_quantity), float(quantity)):
+        raise ValueError("Native quantity differs from expected and target; reconcile first")
+    payload = _reduced_native_payload(document, quantity)
+    summary = {"product_id": product_id, "order_id": order.order_id, "number": document["Number"], "ref1c": ref, "previous_quantity": expected_quantity, "quantity": quantity, "dry_run": dry_run, "payload": payload}
+    if dry_run:
+        return {"status": "preview", **summary}
+    _upsert_sync_link(db, SyncLink, source_doctype="production_order_quantity_amendment", source_id=int(product_id), target_entity=PRODUCTION_ORDER_ENTITY, target_number=document["Number"], payload_hash=request_hash, target_ref_key=ref, status="pending", last_error=None)
+    db.commit()
+    needs_patch = any(document.get(key) != value for key, value in payload.items())
+    if needs_patch:
+        if document.get("Posted"):
+            client.post_operation(f"{endpoint}/Unpost")
+        client.patch(endpoint, payload)
+    if needs_patch or not document.get("Posted"):
+        _post_document_operational(client, entity=PRODUCTION_ORDER_ENTITY, ref_key=ref, allow_non_operational_date_retry=True)
+    observed = client._make_request(endpoint)
+    if observed.get("Number") != document["Number"] or observed.get("Date") != document.get("Date") or not observed.get("Posted"):
+        raise ValueError("Native executor identity/posting was not confirmed")
+    for key, expected_rows in payload.items():
+        actual_rows = observed.get(key) or []
+        if len(actual_rows) != len(expected_rows):
+            raise ValueError("Native amendment row count was not confirmed")
+        for expected, actual in zip(expected_rows, actual_rows):
+            for field in ("КлючСвязи", "КлючСвязиПродукция", "Номенклатура_Key", "Операция_Key", "Спецификация_Key"):
+                if expected.get(field) != actual.get(field):
+                    raise ValueError("Native amendment changed a linked row identity")
+            for field in ("Количество", "КоличествоПлан", "Нормочасы"):
+                if field in expected and abs(float(expected[field]) - float(actual.get(field, -1))) > 1e-6:
+                    raise ValueError("Native amendment quantity was not confirmed")
+    product.quantity = float(quantity)
+    update_accepted_product_output_cache(product, produced_qty=output.produced_qty)
+    _upsert_sync_link(db, SyncLink, source_doctype="production_order_quantity_amendment", source_id=int(product_id), target_entity=PRODUCTION_ORDER_ENTITY, target_number=document["Number"], payload_hash=request_hash, target_ref_key=ref, status="success", last_error=None)
+    db.commit()
+    return {"status": "ok", **summary, "requires_materials_refresh": True}
 
 
 @dataclass
@@ -904,7 +1012,8 @@ def close_production_orders_to_1c(
     if {int(order.order_id) for order in selected_orders} != set(selected_ids):
         raise MrpMutationLineageError("one or more selected production orders do not exist")
     generation_id = require_materialized_orders(
-        db, selected_orders, consumer="one_c_production_order_close"
+        db, selected_orders, consumer="one_c_production_order_close",
+        existing_executor_reduction=True,
     )
     if not selected_orders:
         return {

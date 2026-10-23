@@ -334,6 +334,17 @@ def test_guard_rejects_closed_run_order_above_current_make_remainder(db_session)
         require_materialized_orders(db_session, [order], consumer="test")
 
 
+def test_close_can_reduce_historical_executor_after_make_remainder_is_zero(db_session):
+    generation = _generation(db_session, key="close-zero-make", cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc))
+    order, product, _ = _historical_materialized_order(db_session, generation, order_qty=Decimal("6"), current_remaining=Decimal("0"))
+    assert require_materialized_orders(db_session, [order], consumer="one_c_production_order_close", existing_executor_reduction=True) == generation.id
+    with pytest.raises(MrpMutationLineageError, match="exceeds current MAKE remainder"):
+        require_materialized_orders(db_session, [order], consumer="one_c_production_order_export")
+    product.ledger_generation_id = None
+    with pytest.raises(MrpMutationLineageError, match="lineage"):
+        require_materialized_orders(db_session, [order], consumer="one_c_production_order_close", existing_executor_reduction=True)
+
+
 def test_dry_run_is_blocked_before_network_when_truth_unavailable(
     db_session, monkeypatch
 ):

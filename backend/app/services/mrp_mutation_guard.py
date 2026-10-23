@@ -344,7 +344,12 @@ def require_materialized_orders(
     orders: Sequence[models.ProductionOrder],
     *,
     consumer: str,
+    existing_executor_reduction: bool = False,
 ) -> int:
+    if existing_executor_reduction and consumer not in {
+        "one_c_production_order_close", "one_c_production_order_reduce",
+    }:
+        raise MrpMutationLineageError("executor reduction is restricted to close/reduce commands")
     run_ids = {int(order.source_run_id) for order in orders if order.source_run_id is not None}
     if len(run_ids) != 1 or any(order.source_run_id is None for order in orders):
         raise MrpMutationLineageError("selected orders have null or mixed planning runs")
@@ -368,9 +373,9 @@ def require_materialized_orders(
     # the accepted generation's sealed lineage.
     allowed_generation_ids = set(_accepted_lineage(db, generation_id))
     historical_run = str(run.status or "").upper() == "CLOSED"
-    if not historical_run:
+    if not historical_run and not existing_executor_reduction:
         run, generation_id = require_current_run(db, run.run_id, consumer=consumer)
-    if historical_run:
+    if historical_run or existing_executor_reduction:
         generation = db.get(models.LedgerGeneration, generation_id)
         try:
             sealed_run_anchor(db, run, generation)
@@ -395,6 +400,8 @@ def require_materialized_orders(
                 require_selected_proposals(
                     db, [proposal], run=run, generation_id=generation_id, consumer=consumer
                 )
+                if existing_executor_reduction:
+                    continue
                 if historical_run:
                     _current_make_work_for_historical_product(
                         db,
@@ -409,6 +416,12 @@ def require_materialized_orders(
                 if requirement is None:
                     raise MrpMutationLineageError("source MRP requirement is missing")
                 require_selected_requirements([requirement], run=run)
+                if existing_executor_reduction:
+                    if (product.ledger_generation_id is None
+                        or int(product.ledger_generation_id) not in allowed_generation_ids
+                        or int(requirement.item_id) != int(product.item_id)):
+                        raise MrpMutationLineageError("executor reduction has invalid original lineage")
+                    continue
                 if historical_run:
                     if (
                         product.ledger_generation_id is None
