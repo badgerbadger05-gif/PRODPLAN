@@ -9,6 +9,7 @@ from app.services import planning_truth
 from app.services import production_control_material_issues as issues
 from app.services.one_c_stock_transfer_export import export_material_issues_to_1c
 from app.services.production_material_custody import MaterialCustodyState
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 
 def _accepted(db, key="one"):
@@ -52,7 +53,7 @@ def _two_generation_bins(db_session, *, foreign_is_current):
             ledger_generation_id=generation.id,
             item_id=item.item_id,
             characteristic_ref="",
-            organization_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c="BIN",
             on_hand=4,
         ),
@@ -60,7 +61,7 @@ def _two_generation_bins(db_session, *, foreign_is_current):
             ledger_generation_id=foreign_generation.id,
             item_id=item.item_id,
             characteristic_ref="",
-            organization_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c="LEGACY",
             on_hand=99,
             is_current=foreign_is_current,
