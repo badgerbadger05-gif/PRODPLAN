@@ -436,6 +436,68 @@ def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypa
     assert payload["ПоложениеИсполнителя"] == "ВТабличнойЧасти"
     assert payload["Операции"][0]["Исполнитель"] == "brigade-ref"
     assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
+    assert {row["КлючСвязи"] for row in payload["СоставБригады"]} == {
+        payload["Операции"][0]["КлючСвязи"]
+    }
+
+
+def test_brigade_composition_covers_mixed_operation_executors_without_duplicates():
+    entry = exporter.PieceworkExportEntry(
+        manufacture_id=91,
+        product_id=1,
+        order_id=1,
+        order_ref1c="order-ref",
+        basis_ref1c="basis-ref",
+        item_ref1c="item-ref",
+        item_name="Item",
+        unit_ref1c="шт",
+        qty=5.0,
+        number="PW-MIXED",
+        structural_unit_ref1c="unit-ref",
+        employee_ref1c="paint-employee",
+        employee_type="employee",
+    )
+    payload = {
+        "СтруктурнаяЕдиница_Key": "unit-ref",
+        "Операции": [
+            {
+                "КлючСвязи": 100,
+                "Исполнитель": "paint-employee",
+                "Исполнитель_Type": "StandardODATA.Catalog_Сотрудники",
+            },
+            {
+                "КлючСвязи": 101,
+                "Исполнитель": "brigade-a",
+                "Исполнитель_Type": "StandardODATA.Catalog_Бригады",
+            },
+            {
+                "КлючСвязи": 102,
+                "Исполнитель": "brigade-a",
+                "Исполнитель_Type": "StandardODATA.Catalog_Бригады",
+            },
+            {
+                "КлючСвязи": 103,
+                "Исполнитель": "brigade-b",
+                "Исполнитель_Type": "StandardODATA.Catalog_Бригады",
+            },
+        ],
+    }
+    fake = _FakeClient()
+
+    exporter._add_brigade_composition_to_payload(fake, entry, payload)
+
+    brigade_requests = [
+        endpoint for endpoint, _params in fake.requests if "Catalog_Бригады" in endpoint
+    ]
+    assert brigade_requests == [
+        "Catalog_Бригады(guid'brigade-a')",
+        "Catalog_Бригады(guid'brigade-b')",
+    ]
+    rows = payload["СоставБригады"]
+    assert len(rows) == 6
+    assert len({(row["Сотрудник_Key"], row["КлючСвязи"]) for row in rows}) == 6
+    assert {row["КлючСвязи"] for row in rows} == {101, 102, 103}
+    assert all(row["СтруктурнаяЕдиница_Key"] == "unit-ref" for row in rows)
 
 
 def test_optional_org_and_unit_in_payload(db_session):

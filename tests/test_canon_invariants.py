@@ -639,6 +639,11 @@ def test_direct_1c_writer_registry_is_exact() -> None:
             "patch",
         ),
         (
+            "backend/app/services/one_c_production_order_export.py",
+            "reduce_existing_production_quantity_to_1c",
+            "patch",
+        ),
+        (
             "backend/app/services/one_c_stock_transfer_export.py",
             "export_material_issues_to_1c",
             "_post_export_entries",

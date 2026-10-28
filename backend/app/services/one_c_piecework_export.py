@@ -682,40 +682,59 @@ def _add_brigade_composition_to_payload(
     entry: PieceworkExportEntry,
     payload: Dict[str, Any],
 ) -> None:
-    if entry.employee_type != "brigade":
+    brigade_links: Dict[str, List[int]] = {}
+    for operation in payload.get("Операции") or []:
+        if operation.get("Исполнитель_Type") != "StandardODATA.Catalog_Бригады":
+            continue
+        brigade_ref = _clean_ref1c(operation.get("Исполнитель"))
+        if not brigade_ref:
+            continue
+        try:
+            link_key = int(operation.get("КлючСвязи"))
+        except (TypeError, ValueError):
+            continue
+        links = brigade_links.setdefault(brigade_ref, [])
+        if link_key not in links:
+            links.append(link_key)
+    if not brigade_links:
         return
-    brigade_ref = _clean_ref1c(entry.employee_ref1c)
-    if not brigade_ref:
-        return
-    link_key = int(entry.manufacture_id) % 2_000_000_000
     structural_unit_ref = (
         _clean_ref1c(payload.get("СтруктурнаяЕдиница_Key"))
         or _clean_ref1c(entry.structural_unit_ref1c)
         or None
     )
-    try:
-        doc = client._make_request(
-            f"Catalog_Бригады(guid'{brigade_ref}')",
-            params={"$format": "json"},
-            timeout=60,
-            retries=1,
-        )
-    except Exception:
-        return
     rows = []
-    for row in doc.get("Состав") or []:
-        employee_ref = _clean_ref1c(row.get("Сотрудник_Key"))
-        if not employee_ref:
+    seen_rows: set[tuple[str, int]] = set()
+    for brigade_ref, link_keys in brigade_links.items():
+        try:
+            doc = client._make_request(
+                f"Catalog_Бригады(guid'{brigade_ref}')",
+                params={"$format": "json"},
+                timeout=60,
+                retries=1,
+            )
+        except Exception:
             continue
-        rows.append(
-            {
-                "LineNumber": len(rows) + 1,
-                "Сотрудник_Key": employee_ref,
-                "КТУ": float(row.get("КТУ") or 1),
-                "КлючСвязи": link_key,
-                **({"СтруктурнаяЕдиница_Key": structural_unit_ref} if structural_unit_ref else {}),
-            }
-        )
+        for link_key in link_keys:
+            for member in doc.get("Состав") or []:
+                employee_ref = _clean_ref1c(member.get("Сотрудник_Key"))
+                identity = (employee_ref, link_key)
+                if not employee_ref or identity in seen_rows:
+                    continue
+                seen_rows.add(identity)
+                rows.append(
+                    {
+                        "LineNumber": len(rows) + 1,
+                        "Сотрудник_Key": employee_ref,
+                        "КТУ": float(member.get("КТУ") or 1),
+                        "КлючСвязи": link_key,
+                        **(
+                            {"СтруктурнаяЕдиница_Key": structural_unit_ref}
+                            if structural_unit_ref
+                            else {}
+                        ),
+                    }
+                )
     if rows:
         payload["СоставБригады"] = rows
 
