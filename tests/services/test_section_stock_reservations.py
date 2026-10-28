@@ -359,6 +359,67 @@ def test_create_issues_claims_destination_stock_and_moves_only_delta(db_session)
     assert transfer_issue.lines[0].custody_event_revision == 1
 
 
+def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_session):
+    """52 on the workshop minus 27 transit and 25 workshop custody is zero.
+
+    Both custody rows intentionally name the same physical warehouse.  Their
+    workflow labels differ, but source/destination availability is owned by
+    the warehouse+item cell and therefore neither quantity is free for a new
+    zero-distance claim.
+    """
+    db = db_session
+    _add_warehouses(db)
+    parent, comp, transit_owner = _setup(db, order_qty=27.0, suffix="HELD")
+    workshop_owner = _make_order_line(db, parent, order_qty=25.0, suffix="HELD-W")
+    current = _make_order_line(db, parent, order_qty=9.0, suffix="CURRENT")
+    _set_stock(db, comp, {WORKSHOP_WH: 52.0, SOURCE_WH: 100.0})
+    generation = db.get(LedgerGeneration, int(db.info["section_stock_generation"]))
+    db.add_all(
+        (
+            ProductionMaterialCustodyProjection(
+                ledger_generation_id=int(generation.id),
+                product_id=int(transit_owner.product_id),
+                component_item_id=int(comp.item_id),
+                location_kind="transit",
+                warehouse_ref1c=WORKSHOP_WH,
+                reserved_qty=27.0,
+                source_event_high_watermark_id=0,
+                built_at=generation.cutoff,
+            ),
+            ProductionMaterialCustodyProjection(
+                ledger_generation_id=int(generation.id),
+                product_id=int(workshop_owner.product_id),
+                component_item_id=int(comp.item_id),
+                location_kind="workshop",
+                warehouse_ref1c=WORKSHOP_WH,
+                reserved_qty=25.0,
+                source_event_high_watermark_id=0,
+                built_at=generation.cutoff,
+            ),
+        )
+    )
+    db.commit()
+    db.expire_all()
+
+    result = create_material_issues(
+        db, [current.product_id], warehouse_ref1c=WORKSHOP_WH
+    )
+
+    assert result["already_on_destination"] == []
+    assert len(result["created"]) == 1
+    issue = db.get(ProductionMaterialIssue, result["created"][0]["issue_id"])
+    assert issue.source_warehouse_ref1c == SOURCE_WH
+    assert issue.lines[0].required_qty == pytest.approx(9.0)
+    current_events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(ProductionMaterialCustodyEvent.product_id == current.product_id)
+        .all()
+    )
+    assert [(event.location_kind, event.delta_qty) for event in current_events] == [
+        ("transit", pytest.approx(9.0))
+    ]
+
+
 def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_session):
     db = db_session
     _add_warehouses(db)
