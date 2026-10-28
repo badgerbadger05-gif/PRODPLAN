@@ -836,9 +836,9 @@ def _parent_current_material_coverage(
                 "coverage_label": str(label or status),
             }
         from .production_control_material_availability import (
-            material_supported_snapshot_is_consistent,
+            material_workshop_snapshot_is_consistent,
         )
-        if not material_supported_snapshot_is_consistent(snapshot_copy):
+        if not material_workshop_snapshot_is_consistent(snapshot_copy):
             invalidated.add(product_id)
         reusable[product_id] = snapshot_copy
         if _snapshot_is_touched(
@@ -878,9 +878,9 @@ def _snapshot_is_touched(
     """
     if payload.get("product_id") is not None:
         from .production_control_material_availability import (
-            material_supported_snapshot_is_consistent,
+            material_workshop_snapshot_is_consistent,
         )
-        if not material_supported_snapshot_is_consistent(snapshot):
+        if not material_workshop_snapshot_is_consistent(snapshot):
             return True
     if not touched:
         return False

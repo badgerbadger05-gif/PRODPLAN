@@ -34,6 +34,7 @@ from app.services.production_material_custody_projection import (
     initialize_material_custody_baseline,
 )
 from app.services.planning_truth import publish_generation
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 PAINT_WH = "wh-paint"      # склад-получатель окрасочного участка
 WELD_WH = "wh-weld-stock"  # склад сварных остатков («Участок сварочный»)
@@ -86,7 +87,7 @@ def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session
     db.add(SpecComponent(spec_id=paint_spec.spec_id, item_id=welded.item_id, quantity=1, component_type="Сборка"))
 
     # сварная деталь лежит только на складе сварных остатков
-    db.add(StockBin(ledger_generation_id=generation.id, item_id=welded.item_id, characteristic_ref="", organization_ref="", warehouse_ref1c=WELD_WH, on_hand=50))
+    db.add(StockBin(ledger_generation_id=generation.id, item_id=welded.item_id, characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c=WELD_WH, on_hand=50))
 
     order = ProductionOrder(
         order_number="PWC-P-paint",

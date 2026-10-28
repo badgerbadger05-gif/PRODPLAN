@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
+from fastapi import HTTPException
 
 from app import models
 from app.services.item_ledger.current_execution import (
@@ -378,8 +379,10 @@ def test_r9_materials_read_current_payload_without_snapshot_fallback(db_session)
     _publish_current(db_session, generation)
     db_session.commit()
 
-    result = get_order_line_materials(77, db=db_session)
-    assert result["components"][0]["item_id"] == 20
+    with pytest.raises(HTTPException) as caught:
+        get_order_line_materials(77, db=db_session)
+    assert caught.value.status_code == 503
+    assert "warehouse-local evidence" in str(caught.value.detail)
 
 
 def test_r9_materials_missing_current_manifest_returns_503(db_session):

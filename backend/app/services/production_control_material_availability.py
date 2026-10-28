@@ -1373,6 +1373,20 @@ def _supported_whole_count(covering: Decimal, norm: Decimal) -> Decimal:
 
 def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bool:
     """A known full-coverage count must not contradict its own quantity."""
+
+    supported = snapshot.get('material_supported_qty')
+    if supported is not None and 'material_launchable_qty' not in snapshot:
+        return False
+    quantity = snapshot.get('qty')
+    return not (
+        supported is not None and snapshot.get('coverage_status') == 'ready'
+        and quantity is not None and float(quantity).is_integer()
+        and supported != quantity
+    )
+
+
+def material_workshop_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bool:
+    """A materialized executor snapshot must carry warehouse-local evidence."""
     if snapshot.get("workshop_coverage_status") in (None, ""):
         return False
     components = snapshot.get("components")
@@ -1383,17 +1397,7 @@ def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bo
         for component in components
     ):
         return False
-    supported = snapshot.get('material_supported_qty')
-    if supported is not None and 'material_launchable_qty' not in snapshot:
-        return False
-    if supported is not None and 'material_launchable_qty' not in snapshot:
-        return False
-    quantity = snapshot.get('qty')
-    return not (
-        supported is not None and snapshot.get('coverage_status') == 'ready'
-        and quantity is not None and float(quantity).is_integer()
-        and supported != quantity
-    )
+    return material_supported_snapshot_is_consistent(snapshot)
 
 
 def _snapshot_matches_line_command(
@@ -1473,7 +1477,7 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
     material = (matching[0].payload or {}).get("material_coverage_snapshot")
     if not isinstance(material, dict):
         raise CurrentExecutionUnavailable("current production material coverage is missing")
-    if not material_supported_snapshot_is_consistent(material):
+    if not material_workshop_snapshot_is_consistent(material):
         raise CurrentExecutionUnavailable(
             "current production material coverage lacks warehouse-local evidence"
         )

@@ -209,7 +209,9 @@ def _source_warehouse_options(
         (
             int(item_id),
             str((component_scopes or {}).get(int(item_id), ("", ""))[0]),
-            str((component_scopes or {}).get(int(item_id), ("", ""))[1]),
+            str((component_scopes or {}).get(
+                int(item_id), ("", DEFAULT_ORGANIZATION_REF1C)
+            )[1]),
         )
         for item_id in component_item_ids
     ]
