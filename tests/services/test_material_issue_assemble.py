@@ -181,8 +181,12 @@ def test_assemble_accepts_stale_executor_when_parent_order_is_current(
     _stub_1c(monkeypatch, fake)
     checked: list[tuple[list[int], str]] = []
 
-    def _require_current_parent(db, orders, *, consumer):
-        checked.append(([int(order.order_id) for order in orders], consumer))
+    def _require_current_parent(db, orders, *, consumer, existing_executor_followup=False):
+        checked.append((
+            [int(order.order_id) for order in orders],
+            consumer,
+            existing_executor_followup,
+        ))
         return int(current_generation.id)
 
     monkeypatch.setattr(
@@ -193,7 +197,7 @@ def test_assemble_accepts_stale_executor_when_parent_order_is_current(
 
     assert result["status"] == "ok"
     assert checked == [
-        ([1], "production_material_issue_assemble_stale_executor")
+        ([1], "production_material_issue_assemble_stale_executor", True)
     ]
     assert fake.operations[-1].endswith("/Post?PostingModeOperational=true")
 
@@ -219,6 +223,37 @@ def test_assemble_rejects_stale_executor_when_parent_order_is_not_current(
         assert "retired" in str(exc)
 
     assert fake.operations == []
+
+
+def test_assemble_already_posted_stale_issue_is_idempotent_without_lineage_recheck(
+    db_session, monkeypatch
+):
+    creation_generation = _accepted(db_session, key="posted-stale-creation")
+    issue = _issue(db_session, creation_generation)
+    issue.status = "posted"
+    db_session.commit()
+    _accepted(db_session, key="posted-stale-current")
+
+    monkeypatch.setattr(
+        issues,
+        "require_materialized_orders",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("already-posted retry must not revalidate MAKE")
+        ),
+    )
+    monkeypatch.setattr(
+        issues,
+        "_create_odata_client",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("already-posted retry must not write to 1C")
+        ),
+    )
+
+    assert issues.assemble_material_issue(db_session, issue.issue_id) == {
+        "status": "ok",
+        "issue_id": int(issue.issue_id),
+        "already_posted": True,
+    }
 
 
 def test_assemble_failure_does_not_enqueue_pull(db_session, monkeypatch):

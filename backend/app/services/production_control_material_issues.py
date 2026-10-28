@@ -1504,6 +1504,11 @@ def assemble_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
         raise ValueError("Заявка на перемещение не найдена")
     if issue.ledger_generation_id is None:
         raise ValueError("material issue is not bound to current accepted Ledger generation")
+    ref_key = _clean_ref1c(issue.exported_ref1c)
+    if not ref_key:
+        raise ValueError("Перемещение ещё не выгружено в 1С")
+    if str(issue.status or "") == "posted":
+        return {"status": "ok", "issue_id": int(issue.issue_id), "already_posted": True}
     if int(issue.ledger_generation_id) != int(truth.generation_id):
         # The transfer is an executor document: a fact-only Ledger refresh
         # must not invalidate an already exported 1C document.  Reuse the
@@ -1516,13 +1521,8 @@ def assemble_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
             db,
             [issue.order],
             consumer="production_material_issue_assemble_stale_executor",
+            existing_executor_followup=True,
         )
-    ref_key = _clean_ref1c(issue.exported_ref1c)
-    if not ref_key:
-        raise ValueError("Перемещение ещё не выгружено в 1С")
-    if str(issue.status or "") == "posted":
-        return {"status": "ok", "issue_id": int(issue.issue_id), "already_posted": True}
-
     link = (
         db.query(SyncLink)
         .filter(

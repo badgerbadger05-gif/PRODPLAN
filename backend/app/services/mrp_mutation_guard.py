@@ -222,6 +222,7 @@ def _current_make_work_for_historical_product(
     source_run: models.PlanningRun,
     product: models.ProductionProduct,
     generation_id: int,
+    allow_existing_executor_overcommit: bool = False,
 ) -> models.ReplenishmentWorkItem:
     """Resolve the live MAKE obligation that already nets this old order.
 
@@ -330,7 +331,15 @@ def _current_make_work_for_historical_product(
     current_remaining = replenishment_remaining(
         owner.replenishment_required_qty or 0, owner.replenishment_received_qty or 0,
     )
-    if open_qty - current_remaining > Decimal("0.000001"):
+    if allow_existing_executor_overcommit and current_remaining <= Decimal("0.000001"):
+        raise MrpMutationLineageError(
+            f"historical production product {product.product_id} has no positive "
+            "current MAKE remainder for an unposted transfer follow-up"
+        )
+    if (
+        not allow_existing_executor_overcommit
+        and open_qty - current_remaining > Decimal("0.000001")
+    ):
         raise MrpMutationLineageError(
             f"historical open production quantity {open_qty} exceeds current "
             f"MAKE remainder {current_remaining} for plan "
@@ -345,11 +354,18 @@ def require_materialized_orders(
     *,
     consumer: str,
     existing_executor_reduction: bool = False,
+    existing_executor_followup: bool = False,
 ) -> int:
     if existing_executor_reduction and consumer not in {
         "one_c_production_order_close", "one_c_production_order_reduce",
     }:
         raise MrpMutationLineageError("executor reduction is restricted to close/reduce commands")
+    if existing_executor_followup and consumer not in {
+        "production_material_issue_assemble_stale_executor",
+    }:
+        raise MrpMutationLineageError(
+            "executor follow-up is restricted to an existing exported material issue"
+        )
     run_ids = {int(order.source_run_id) for order in orders if order.source_run_id is not None}
     if len(run_ids) != 1 or any(order.source_run_id is None for order in orders):
         raise MrpMutationLineageError("selected orders have null or mixed planning runs")
@@ -408,6 +424,7 @@ def require_materialized_orders(
                         source_run=run,
                         product=product,
                         generation_id=generation_id,
+                        allow_existing_executor_overcommit=existing_executor_followup,
                     )
             elif product.source_mrp_requirement_id is not None:
                 requirement = db.get(
@@ -437,6 +454,7 @@ def require_materialized_orders(
                         source_run=run,
                         product=product,
                         generation_id=generation_id,
+                        allow_existing_executor_overcommit=existing_executor_followup,
                     )
                     continue
                 if (

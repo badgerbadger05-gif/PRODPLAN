@@ -334,10 +334,76 @@ def test_guard_rejects_closed_run_order_above_current_make_remainder(db_session)
         require_materialized_orders(db_session, [order], consumer="test")
 
 
+def test_existing_exported_transfer_followup_does_not_reapply_overlaunch_guard(db_session):
+    generation = _generation(
+        db_session,
+        key="guard-historical-transfer-followup",
+        cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    order, _product, _live_run = _historical_materialized_order(
+        db_session,
+        generation,
+        order_qty=Decimal("17"),
+        current_remaining=Decimal("8"),
+    )
+
+    assert require_materialized_orders(
+        db_session,
+        [order],
+        consumer="production_material_issue_assemble_stale_executor",
+        existing_executor_followup=True,
+    ) == int(generation.id)
+
+    with pytest.raises(MrpMutationLineageError, match="restricted"):
+        require_materialized_orders(
+            db_session,
+            [order],
+            consumer="one_c_production_order_export",
+            existing_executor_followup=True,
+        )
+
+
+def test_existing_transfer_followup_rejects_retired_current_make_owner(db_session):
+    generation = _generation(
+        db_session,
+        key="guard-retired-transfer-followup",
+        cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc),
+    )
+    order, _product, live_run = _historical_materialized_order(
+        db_session,
+        generation,
+        order_qty=Decimal("4"),
+        current_remaining=Decimal("8"),
+    )
+    current_owner = (
+        db_session.query(models.ReservationEntry)
+        .filter(models.ReservationEntry.run_id == int(live_run.run_id))
+        .one()
+    )
+    current_owner.lifecycle_status = "closed"
+    current_owner.is_current = False
+    db_session.flush()
+
+    with pytest.raises(MrpMutationLineageError, match="no current MAKE obligation"):
+        require_materialized_orders(
+            db_session,
+            [order],
+            consumer="production_material_issue_assemble_stale_executor",
+            existing_executor_followup=True,
+        )
+
+
 def test_close_can_reduce_historical_executor_after_make_remainder_is_zero(db_session):
     generation = _generation(db_session, key="close-zero-make", cutoff=datetime(2026, 9, 2, tzinfo=timezone.utc))
     order, product, _ = _historical_materialized_order(db_session, generation, order_qty=Decimal("6"), current_remaining=Decimal("0"))
     assert require_materialized_orders(db_session, [order], consumer="one_c_production_order_close", existing_executor_reduction=True) == generation.id
+    with pytest.raises(MrpMutationLineageError, match="no positive current MAKE"):
+        require_materialized_orders(
+            db_session,
+            [order],
+            consumer="production_material_issue_assemble_stale_executor",
+            existing_executor_followup=True,
+        )
     with pytest.raises(MrpMutationLineageError, match="exceeds current MAKE remainder"):
         require_materialized_orders(db_session, [order], consumer="one_c_production_order_export")
     product.ledger_generation_id = None
