@@ -72,6 +72,10 @@ BEGIN
             'database still has % other client session(s); stop API/workers first',
             guard_row.other_client_sessions;
     END IF;
+    IF EXISTS (SELECT 1 FROM production_plan_correction) THEN
+        RAISE EXCEPTION
+            'canonical rebuild clear refuses to discard audited fixed-plan corrections';
+    END IF;
 END
 $guard$;
 
@@ -110,6 +114,8 @@ BEGIN
           FROM (
               VALUES
                   ('planning_truth_state', 'current_generation_id', 'ledger_generation'),
+                  ('production_plan_correction', 'expected_generation_id', 'ledger_generation'),
+                  ('production_plan_correction', 'published_generation_id', 'ledger_generation'),
                   ('production_material_issues', 'ledger_generation_id', 'ledger_generation'),
                   ('production_orders', 'source_run_id', 'planning_run'),
                   ('production_plan_header', 'predecessor_run_id', 'planning_run'),
@@ -280,6 +286,16 @@ SELECT setval(
 ALTER TABLE planning_truth_state
     ADD CONSTRAINT planning_truth_state_current_generation_id_fkey
     FOREIGN KEY (current_generation_id)
+    REFERENCES ledger_generation(id)
+    ON DELETE RESTRICT;
+ALTER TABLE production_plan_correction
+    ADD CONSTRAINT production_plan_correction_expected_generation_id_fkey
+    FOREIGN KEY (expected_generation_id)
+    REFERENCES ledger_generation(id)
+    ON DELETE RESTRICT;
+ALTER TABLE production_plan_correction
+    ADD CONSTRAINT production_plan_correction_published_generation_id_fkey
+    FOREIGN KEY (published_generation_id)
     REFERENCES ledger_generation(id)
     ON DELETE RESTRICT;
 ALTER TABLE production_material_issues
