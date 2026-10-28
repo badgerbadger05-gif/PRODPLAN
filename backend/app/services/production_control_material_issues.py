@@ -178,6 +178,7 @@ def _source_warehouse_options(
     *,
     excluded_refs: Optional[set[str]] = None,
     ledger_generation_id: Optional[int] = None,
+    reservation_state: Optional[MaterialCustodyState] = None,
 ) -> Dict[int, List[Dict[str, Any]]]:
     if not component_item_ids:
         return {}
@@ -219,11 +220,21 @@ def _source_warehouse_options(
             continue
         if selected_refs and ref not in selected_refs:
             continue
+        # A pending transfer remains physically on its source warehouse and
+        # already belongs to another production line.  StockBin is the
+        # physical balance, so it still includes that quantity; source
+        # selection must subtract custody in the same physical cell instead
+        # of treating global/on-hand stock as free for a second transfer.
+        free_qty = _to_float(qty)
+        if reservation_state is not None:
+            free_qty -= reservation_state.reserved_at_warehouse(ref, int(item_id))
+        if free_qty <= 1e-9:
+            continue
         result.setdefault(int(item_id), []).append(
             {
                 "ref1c": ref,
                 "name": wh_names.get(ref, ref),
-                "qty": _to_float(qty),
+                "qty": free_qty,
             }
         )
     for options in result.values():
@@ -239,6 +250,7 @@ def _allocate_components_by_source_warehouse(
     selected_source_warehouse_ref1c: Optional[str] = None,
     ledger_generation_id: Optional[int] = None,
     component_source_warehouses: Optional[Dict[int, str]] = None,
+    reservation_state: Optional[MaterialCustodyState] = None,
 ) -> Tuple[Dict[Optional[str], List[Dict[str, Any]]], List[Dict[str, Any]]]:
     component_item_ids = [int(c["component_item_id"]) for c in components]
     excluded = {str(destination_warehouse_ref1c)} if destination_warehouse_ref1c else set()
@@ -247,6 +259,7 @@ def _allocate_components_by_source_warehouse(
         component_item_ids,
         excluded_refs=excluded,
         ledger_generation_id=ledger_generation_id,
+        reservation_state=reservation_state,
     )
     selected_ref = _clean_ref1c(selected_source_warehouse_ref1c) or None
 
@@ -1009,6 +1022,7 @@ def create_material_issues(
                 selected_source_warehouse_ref1c=source_warehouse_ref1c,
                 ledger_generation_id=generation_id,
                 component_source_warehouses=component_source_warehouses,
+                reservation_state=reservation_state,
             )
             if needed_selection:
                 selection_required.append(
@@ -1490,6 +1504,7 @@ def assemble_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
             entity=STOCK_TRANSFER_ENTITY,
             ref_key=ref_key,
             unpost_first=True,
+            allow_non_operational_date_retry=True,
         )
     except Exception as exc:
         message = _clean_odata_error_message(exc)

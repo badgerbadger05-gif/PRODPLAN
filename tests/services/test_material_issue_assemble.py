@@ -31,6 +31,16 @@ class _FakeClient:
         self.operations.append(operation_path)
 
 
+class _DateRejectingClient(_FakeClient):
+    def post_operation(self, operation_path):
+        self.operations.append(operation_path)
+        if operation_path.endswith("/Post?PostingModeOperational=true"):
+            raise RuntimeError(
+                "Дата документа не соответствует текущей дате или дате последнего "
+                "оперативно проведенного документа! Документ не может быть проведен оперативно."
+            )
+
+
 def _accepted(db, key="assemble"):
     cutoff = datetime(2026, 7, 23, tzinfo=timezone.utc)
     batch = models.PhysicalImportBatch(
@@ -114,6 +124,22 @@ def test_assemble_posts_operationally_and_enqueues_recorder_pull(db_session, mon
     assert pull.recorder_type == TRANSFER_ENTITY
     assert pull.status == "pending"
     assert pull.source == "material_issue_assemble"
+
+
+def test_assemble_retries_only_date_rejection_non_operationally(db_session, monkeypatch):
+    generation = _accepted(db_session, key="date-retry")
+    issue = _issue(db_session, generation, ref1c="transfer-date-retry")
+    fake = _DateRejectingClient()
+    _stub_1c(monkeypatch, fake)
+
+    result = issues.assemble_material_issue(db_session, issue.issue_id)
+
+    assert result["status"] == "ok"
+    assert fake.operations == [
+        f"{TRANSFER_ENTITY}(guid'transfer-date-retry')/Unpost",
+        f"{TRANSFER_ENTITY}(guid'transfer-date-retry')/Post?PostingModeOperational=true",
+        f"{TRANSFER_ENTITY}(guid'transfer-date-retry')/Post?PostingModeOperational=false",
+    ]
 
 
 def test_assemble_repull_resets_an_exhausted_pull_row(db_session, monkeypatch):

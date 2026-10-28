@@ -8,6 +8,7 @@ from app import models
 from app.services import planning_truth
 from app.services import production_control_material_issues as issues
 from app.services.one_c_stock_transfer_export import export_material_issues_to_1c
+from app.services.production_material_custody import MaterialCustodyState
 
 
 def _accepted(db, key="one"):
@@ -74,6 +75,40 @@ def test_source_selection_uses_the_current_stockbin_set_only(db_session):
     generation, item = _two_generation_bins(db_session, foreign_is_current=False)
     options = issues._source_warehouse_options(db_session, [item.item_id], ledger_generation_id=generation.id)
     assert options[item.item_id] == [{"ref1c": "BIN", "name": "BIN", "qty": 4.0}]
+
+
+def test_source_selection_subtracts_custody_in_the_same_physical_cell(db_session):
+    generation, item = _two_generation_bins(db_session, foreign_is_current=False)
+    custody = MaterialCustodyState(
+        by_warehouse_item={("BIN", int(item.item_id)): 4.0}
+    )
+
+    options = issues._source_warehouse_options(
+        db_session,
+        [item.item_id],
+        ledger_generation_id=generation.id,
+        reservation_state=custody,
+    )
+
+    assert options == {}
+
+
+def test_source_selection_reports_only_free_cell_quantity_after_custody(db_session):
+    generation, item = _two_generation_bins(db_session, foreign_is_current=False)
+    custody = MaterialCustodyState(
+        by_warehouse_item={("BIN", int(item.item_id)): 1.5}
+    )
+
+    options = issues._source_warehouse_options(
+        db_session,
+        [item.item_id],
+        ledger_generation_id=generation.id,
+        reservation_state=custody,
+    )
+
+    assert options[item.item_id] == [
+        {"ref1c": "BIN", "name": "BIN", "qty": 2.5}
+    ]
 
 
 def test_source_selection_fails_closed_on_a_current_bin_of_an_unrelated_generation(db_session):
