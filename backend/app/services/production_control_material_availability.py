@@ -164,7 +164,16 @@ def _material_workshop_warehouse(
     ref = str(binding.warehouse_ref1c or "")
     name = str(getattr(binding, "warehouse_name", "") or "")
     if ref and not name:
-        warehouse = db.get(StockWarehouse, ref)
+        # The binding stores the 1С business key (warehouse_ref1c), not the
+        # local integer PK, so the name lookup must filter by ref1c. A
+        # primary-key get with a GUID makes Postgres raise
+        # InvalidTextRepresentation (invalid input syntax for type integer)
+        # and kills the material-availability publication for the line.
+        warehouse = (
+            db.query(StockWarehouse)
+            .filter(StockWarehouse.warehouse_ref1c == ref)
+            .one_or_none()
+        )
         name = str(getattr(warehouse, "warehouse_name", "") or "")
     return ref, name
 
