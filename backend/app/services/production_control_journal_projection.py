@@ -98,6 +98,15 @@ class ProductionControlJournalPromotionError(RuntimeError):
 
 def _public_journal_row(payload: Mapping[str, Any]) -> dict[str, Any]:
     row = dict(payload)
+    snapshot = row.get("material_coverage_snapshot")
+    if row.get("product_id") is not None and (
+        not isinstance(snapshot, Mapping)
+        or snapshot.get("workshop_coverage_status") in (None, "")
+    ):
+        row["coverage_status"] = "unavailable"
+        row["coverage_label"] = "Недоступно"
+        row["material_coverage_status"] = "unavailable"
+        row["material_coverage_label"] = "Недоступно"
     row.pop("material_coverage_snapshot", None)
     row.pop("_route_sheet_snapshot", None)
     row.pop("_material_quantity_snapshots", None)
@@ -826,6 +835,11 @@ def _parent_current_material_coverage(
                 "coverage_status": str(status),
                 "coverage_label": str(label or status),
             }
+        from .production_control_material_availability import (
+            material_supported_snapshot_is_consistent,
+        )
+        if not material_supported_snapshot_is_consistent(snapshot_copy):
+            invalidated.add(product_id)
         reusable[product_id] = snapshot_copy
         if _snapshot_is_touched(
             payload, snapshot_copy, touched, label=f"product {product_id}"
@@ -862,9 +876,12 @@ def _snapshot_is_touched(
     The one reuse rule for every persisted material snapshot: an untouched
     row's parent-boundary snapshot is still exact; a touched one is rebuilt.
     """
-    from .production_control_material_availability import material_supported_snapshot_is_consistent
-    if not material_supported_snapshot_is_consistent(snapshot):
-        return True
+    if payload.get("product_id") is not None:
+        from .production_control_material_availability import (
+            material_supported_snapshot_is_consistent,
+        )
+        if not material_supported_snapshot_is_consistent(snapshot):
+            return True
     if not touched:
         return False
     if int(payload.get("item_id") or 0) in touched:

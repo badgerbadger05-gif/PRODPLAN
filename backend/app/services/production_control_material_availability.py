@@ -1373,6 +1373,16 @@ def _supported_whole_count(covering: Decimal, norm: Decimal) -> Decimal:
 
 def material_supported_snapshot_is_consistent(snapshot: Mapping[str, Any]) -> bool:
     """A known full-coverage count must not contradict its own quantity."""
+    if snapshot.get("workshop_coverage_status") in (None, ""):
+        return False
+    components = snapshot.get("components")
+    if not isinstance(components, list) or any(
+        not isinstance(component, Mapping)
+        or "workshop_coverage_status" not in component
+        or "workshop_free_qty" not in component
+        for component in components
+    ):
+        return False
     supported = snapshot.get('material_supported_qty')
     if supported is not None and 'material_launchable_qty' not in snapshot:
         return False
@@ -1463,6 +1473,10 @@ def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
     material = (matching[0].payload or {}).get("material_coverage_snapshot")
     if not isinstance(material, dict):
         raise CurrentExecutionUnavailable("current production material coverage is missing")
+    if not material_supported_snapshot_is_consistent(material):
+        raise CurrentExecutionUnavailable(
+            "current production material coverage lacks warehouse-local evidence"
+        )
     public = public_materials_payload(material)
     public["truth_status"] = "accepted"
     # Generation provenance belongs to the accepted current manifest, not to

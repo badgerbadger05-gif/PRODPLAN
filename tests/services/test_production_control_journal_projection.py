@@ -53,7 +53,7 @@ CAPABILITIES = {
 }
 
 
-def test_public_journal_row_strips_internal_material_snapshot():
+def test_public_journal_row_strips_legacy_material_snapshot_and_fails_closed():
     source = {
         "product_id": 7,
         "reservation_id": 11838054,
@@ -61,7 +61,13 @@ def test_public_journal_row_strips_internal_material_snapshot():
         "_route_sheet_snapshot": {"version": 1},
     }
 
-    assert _public_journal_row(source) == {"product_id": 7}
+    assert _public_journal_row(source) == {
+        "product_id": 7,
+        "coverage_status": "unavailable",
+        "coverage_label": "Недоступно",
+        "material_coverage_status": "unavailable",
+        "material_coverage_label": "Недоступно",
+    }
     assert source["reservation_id"] == 11838054
     assert "material_coverage_snapshot" in source
     assert "_route_sheet_snapshot" in source
@@ -1344,7 +1350,14 @@ def test_compact_production_reuses_unchanged_parent_material_snapshot(
         "product_id": int(product.product_id),
         "coverage_status": "ready",
         "coverage_label": "Обеспечен",
-        "components": [{"component_item_id": 987654, "coverage": "ok"}],
+        "workshop_coverage_status": "ready",
+        "workshop_coverage_label": "Обеспечен",
+        "components": [{
+            "component_item_id": 987654,
+            "coverage": "ok",
+            "workshop_coverage_status": "ready",
+            "workshop_free_qty": 1,
+        }],
     }
     db_session.add(
         models.CurrentExecutionScope(
@@ -1399,7 +1412,7 @@ def test_compact_production_reuses_unchanged_parent_material_snapshot(
     assert calls == []
     row = payload["rows"][0]
     assert row["product_id"] == product.product_id
-    assert row["coverage_status"] == "unavailable"
+    assert row["coverage_status"] == "ready"
 
     calls.clear()
 
@@ -2070,6 +2083,40 @@ def test_public_current_read_is_paged_and_stable_after_live_mutation(db_session)
     second = read_current_projection(db_session, search="SNAP-ARTICLE", limit=20, offset=0)
     assert second == first
     assert get_materials_snapshot(db_session, product.product_id) == material_first
+
+
+def test_legacy_current_material_snapshot_is_unavailable_until_republished(db_session):
+    generation = _building_generation(db_session, "production-journal-legacy-material")
+    _item, _order, product = _journal_line(db_session)
+    snapshot = _build_candidate(db_session, generation.id, accepted_run_ids=[])
+    _accept(db_session, generation, snapshot)
+    _publish_current(db_session, generation, snapshot)
+
+    current = next(
+        row
+        for row in db_session.query(models.CurrentExecutionRow)
+        .filter(models.CurrentExecutionRow.entity_kind == "production_control_journal")
+        .all()
+        if int((row.payload or {}).get("product_id") or 0) == int(product.product_id)
+    )
+    payload = dict(current.payload)
+    material = dict(payload["material_coverage_snapshot"])
+    material.pop("workshop_coverage_status", None)
+    material.pop("workshop_coverage_label", None)
+    for component in material.get("components") or []:
+        component.pop("workshop_coverage_status", None)
+        component.pop("workshop_free_qty", None)
+    payload["material_coverage_snapshot"] = material
+    payload["coverage_status"] = "ready"
+    payload["coverage_label"] = "Обеспечен"
+    current.payload = payload
+    db_session.commit()
+
+    public = read_current_projection(db_session, limit=20, offset=0)["rows"][0]
+    assert public["coverage_status"] == "unavailable"
+    assert public["coverage_label"] == "Недоступно"
+    with pytest.raises(CurrentExecutionUnavailable, match="warehouse-local evidence"):
+        get_materials_snapshot(db_session, product.product_id)
 
 
 def test_operator_quantity_is_live_while_accepted_output_stays_frozen(db_session):
