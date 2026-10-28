@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func, text
+from sqlalchemy import func, text, tuple_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -31,6 +31,7 @@ from .production_control_domain import ensure_state as _ensure_state, unit_displ
 from .paint_weld_chain import chain_supplied_component_item_ids
 from .production_control_material_availability import _components_for_product
 from .one_c_export_common import (
+    DEFAULT_ORGANIZATION_REF1C,
     clean_ref1c as _clean_ref1c,
     create_odata_client as _create_odata_client,
     post_document_operational as _post_document_operational,
@@ -179,6 +180,7 @@ def _source_warehouse_options(
     excluded_refs: Optional[set[str]] = None,
     ledger_generation_id: Optional[int] = None,
     reservation_state: Optional[MaterialCustodyState] = None,
+    component_scopes: Optional[Dict[int, Tuple[str, str]]] = None,
 ) -> Dict[int, List[Dict[str, Any]]]:
     if not component_item_ids:
         return {}
@@ -203,12 +205,27 @@ def _source_warehouse_options(
         raise ValueError("accepted Ledger generation is required for source stock selection")
     from .mrp_stock_helpers import current_stock_bin_query
 
+    physical_keys = [
+        (
+            int(item_id),
+            str((component_scopes or {}).get(int(item_id), ("", ""))[0]),
+            str((component_scopes or {}).get(int(item_id), ("", ""))[1]),
+        )
+        for item_id in component_item_ids
+    ]
     rows = (
         current_stock_bin_query(
             db, int(ledger_generation_id),
             StockBin.item_id, StockBin.warehouse_ref1c, func.sum(StockBin.on_hand),
         )
-        .filter(StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0)
+        .filter(
+            tuple_(
+                StockBin.item_id,
+                StockBin.characteristic_ref,
+                StockBin.organization_ref,
+            ).in_(physical_keys),
+            StockBin.on_hand > 0,
+        )
         .group_by(StockBin.item_id, StockBin.warehouse_ref1c)
         .all()
     )
@@ -260,6 +277,13 @@ def _allocate_components_by_source_warehouse(
         excluded_refs=excluded,
         ledger_generation_id=ledger_generation_id,
         reservation_state=reservation_state,
+        component_scopes={
+            int(component["component_item_id"]): (
+                str(component.get("characteristic_ref") or ""),
+                str(component.get("organization_ref") or ""),
+            )
+            for component in components
+        },
     )
     selected_ref = _clean_ref1c(selected_source_warehouse_ref1c) or None
 
@@ -553,7 +577,7 @@ def _destination_warehouse_for_product(
 
 def _free_destination_stock(
     db: Session,
-    component_item_ids: List[int],
+    components: List[Dict[str, Any]],
     destination_warehouse_ref1c: Optional[str],
     reservation_state: MaterialCustodyState,
     ledger_generation_id: Optional[int] = None,
@@ -564,7 +588,7 @@ def _free_destination_stock(
     accounting (selected, not ignored) — mirrors the coverage rules.
     """
     dest = _clean_ref1c(destination_warehouse_ref1c)
-    if not dest or not component_item_ids:
+    if not dest or not components:
         return {}
     ignored = {
         str(r[0]) for r in db.query(IgnoredWarehouse.warehouse_ref1c).all()
@@ -578,11 +602,24 @@ def _free_destination_stock(
             return {}
     if ledger_generation_id is None:
         raise ValueError("accepted Ledger generation is required for destination stock selection")
+    physical_keys = [
+        (
+            int(component["component_item_id"]),
+            str(component.get("characteristic_ref") or ""),
+            str(component.get("organization_ref") or ""),
+        )
+        for component in components
+    ]
     rows = (
         db.query(StockBin.item_id, func.sum(StockBin.on_hand))
         .filter(
             StockBin.is_current.is_(True),
-            StockBin.item_id.in_(component_item_ids), StockBin.warehouse_ref1c == dest,
+            tuple_(
+                StockBin.item_id,
+                StockBin.characteristic_ref,
+                StockBin.organization_ref,
+            ).in_(physical_keys),
+            StockBin.warehouse_ref1c == dest,
         )
         .group_by(StockBin.item_id)
         .all()
@@ -935,6 +972,21 @@ def create_material_issues(
             else:
                 errors.append(f"product_id={pid}: в спецификации нет материалов")
             continue
+        unsupported_physical_scope = [
+            component
+            for component in components
+            if str(component.get("characteristic_ref") or "")
+            or str(component.get("organization_ref") or DEFAULT_ORGANIZATION_REF1C)
+            != DEFAULT_ORGANIZATION_REF1C
+        ]
+        if unsupported_physical_scope:
+            first = unsupported_physical_scope[0]
+            errors.append(
+                "product_id="
+                f"{pid}: component_item_id={int(first['component_item_id'])}: "
+                "заявка перемещения не сохраняет characteristic/organization exact physical key"
+            )
+            continue
 
         # If the caller did not pin a destination warehouse, fall back to the
         # workshop->warehouse binding from settings. Plan rule:
@@ -984,7 +1036,7 @@ def create_material_issues(
         # free stock already on the destination workshop as zero-distance posts.
         free_dest = _free_destination_stock(
             db,
-            [int(c["component_item_id"]) for c in outstanding_components],
+            outstanding_components,
             resolved_warehouse,
             reservation_state,
             ledger_generation_id=generation_id,

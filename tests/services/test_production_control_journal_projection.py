@@ -1399,7 +1399,7 @@ def test_compact_production_reuses_unchanged_parent_material_snapshot(
     assert calls == []
     row = payload["rows"][0]
     assert row["product_id"] == product.product_id
-    assert row["coverage_status"] == "ready"
+    assert row["coverage_status"] == "unavailable"
 
     calls.clear()
 

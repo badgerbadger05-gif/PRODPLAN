@@ -612,6 +612,13 @@ def _build_header_payload(
     defaults: Optional[StockTransferExportDefaults] = None,
 ) -> Dict[str, Any]:
     defaults = defaults or StockTransferExportDefaults()
+    if (
+        defaults.organization_ref1c
+        and defaults.organization_ref1c != DEFAULT_ORGANIZATION_REF1C
+    ):
+        raise ValueError(
+            "stock transfer organization does not match the canonical physical scope"
+        )
     comment = (
         f"PRODPLAN source=material_issue/{entry.issue_id}; "
         f"order_id={entry.order_id}; product_id={entry.product_id}; "

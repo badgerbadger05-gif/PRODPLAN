@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -23,6 +23,8 @@ from ..models import (
     ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
+    StockBin,
+    StockWarehouse,
     Unit,
 )
 from .production_control_common import (
@@ -45,6 +47,7 @@ from .production_output_truth import (
     accepted_product_output,
     accepted_product_remaining_expr,
 )
+from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from .production_material_custody_projection import (
     MaterialCustodySnapshotUnavailable,
 )
@@ -107,6 +110,8 @@ def _components_for_product(
                 "qty_per_unit": _to_float(comp.quantity),
                 "required_qty": required,
                 "source_spec_id": spec_id,
+                "characteristic_ref": "",
+                "organization_ref": DEFAULT_ORGANIZATION_REF1C,
             }
         )
     return spec_id, components
@@ -128,6 +133,86 @@ class _BulkPreviewContext:
     reservation_orders: Dict[int, List[Dict[str, Any]]]
     resolved: Dict[int, tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]]]
     unit_display_by_raw: Dict[str, str]
+    workshop_warehouse_by_product: Dict[int, Tuple[str, str]]
+    warehouse_stock_by_item: Dict[Tuple[str, int, str, str], float]
+
+
+def _material_workshop_warehouse(
+    db: Session,
+    product: ProductionProduct,
+    *,
+    custody_product_id: int,
+    spec_id: int | None,
+) -> Tuple[str, str]:
+    """Return the canonical material destination for this executor line."""
+    from .workshop_resolution import (
+        resolve_workshop_for_product,
+        warehouse_binding_for_workshop,
+    )
+
+    material_product = product
+    if int(custody_product_id) != int(product.product_id):
+        material_product = db.get(ProductionProduct, int(custody_product_id))
+        if material_product is None:
+            raise ValueError("Связанная строка заказа для material custody не найдена")
+    workshop_id = resolve_workshop_for_product(
+        db, material_product, spec_id=spec_id,
+    )
+    binding = warehouse_binding_for_workshop(db, workshop_id)
+    if binding is None:
+        return "", ""
+    ref = str(binding.warehouse_ref1c or "")
+    name = str(getattr(binding, "warehouse_name", "") or "")
+    if ref and not name:
+        warehouse = db.get(StockWarehouse, ref)
+        name = str(getattr(warehouse, "warehouse_name", "") or "")
+    return ref, name
+
+
+def _warehouse_stock(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    warehouse_refs: Sequence[str],
+    physical_keys: Sequence[Tuple[int, str, str]],
+) -> Dict[Tuple[str, int, str, str], float]:
+    refs = sorted({str(ref) for ref in warehouse_refs if str(ref)})
+    keys = sorted({(int(item_id), str(characteristic), str(organization)) for item_id, characteristic, organization in physical_keys})
+    if not refs or not keys:
+        return {}
+    from .mrp_stock_helpers import current_stock_bin_query
+
+    rows = (
+        current_stock_bin_query(
+            db,
+            int(ledger_generation_id),
+            StockBin.warehouse_ref1c,
+            StockBin.item_id,
+            StockBin.characteristic_ref,
+            StockBin.organization_ref,
+            StockBin.on_hand,
+        )
+        .filter(
+            StockBin.warehouse_ref1c.in_(refs),
+            tuple_(
+                StockBin.item_id,
+                StockBin.characteristic_ref,
+                StockBin.organization_ref,
+            ).in_(keys),
+        )
+        .all()
+    )
+    return {
+        (
+            str(warehouse_ref),
+            int(item_id),
+            str(characteristic_ref or ""),
+            str(organization_ref or ""),
+        ): _to_float_strict(
+            qty, field="stock_bin.workshop_on_hand"
+        )
+        for warehouse_ref, item_id, characteristic_ref, organization_ref, qty in rows
+    }
 
 
 def _bulk_unit_display(
@@ -272,6 +357,10 @@ def _frozen_components_for_product(
                 "source_spec_id": None,
                 "source_spec_ref": str(frozen.spec_ref or ""),
                 "source_spec_version": str(frozen.spec_version or "") or None,
+                "characteristic_ref": str(frozen.component_characteristic_ref or ""),
+                "organization_ref": str(
+                    frozen.component_organization_ref or DEFAULT_ORGANIZATION_REF1C
+                ),
             }
         )
     return components
@@ -394,6 +483,7 @@ def _ui_coverage_label(label: str) -> str:
         "ready": "Обеспечен",
         "partial": "Частично",
         "shortage": "Дефицит",
+        "unavailable": "Недоступно",
     }.get(label, label)
 
 
@@ -407,6 +497,8 @@ def _aggregate_coverage(component_labels: Sequence[str]) -> str:
     """
     if not component_labels:
         return "shortage"
+    if any(label == "unavailable" for label in component_labels):
+        return "unavailable"
     if any(label == "shortage" for label in component_labels):
         return "shortage"
     if any(label == "partial" for label in component_labels):
@@ -604,8 +696,31 @@ def preview_materials(
             ledger_generation_id=ledger_generation_id,
             current_only=not allow_building_read,
         )
-    use_projection_coverage = bool(comp_ids)
-    live_require_reserved_at_workshop = False
+    if _bulk_context is not None:
+        workshop_ref, workshop_name = _bulk_context.workshop_warehouse_by_product.get(
+            int(product.product_id), ("", "")
+        )
+        workshop_stock_by_item = _bulk_context.warehouse_stock_by_item
+    else:
+        workshop_ref, workshop_name = _material_workshop_warehouse(
+            db,
+            product,
+            custody_product_id=int(custody_product_id),
+            spec_id=spec_id,
+        )
+        workshop_stock_by_item = _warehouse_stock(
+            db,
+            ledger_generation_id=int(ledger_generation_id),
+            warehouse_refs=[workshop_ref],
+            physical_keys=[
+                (
+                    int(component["component_item_id"]),
+                    str(component.get("characteristic_ref") or ""),
+                    str(component.get("organization_ref") or ""),
+                )
+                for component in components
+            ],
+        )
 
     for comp in components:
         iid = int(comp["component_item_id"])
@@ -616,11 +731,56 @@ def preview_materials(
         available = raw_stock - reserved - own_reserved
         own_at_workshop = own_reservation.at_workshop.get(iid, 0.0)
         own_in_transit = own_reservation.in_transit.get(iid, 0.0)
-        require_reserved_at_workshop = (
-            own_at_workshop > 1e-9
-            if use_projection_coverage
-            else live_require_reserved_at_workshop
+        characteristic_ref = str(comp.get("characteristic_ref") or "")
+        organization_ref = str(comp.get("organization_ref") or "")
+        exact_custody_scope_supported = (
+            not characteristic_ref
+            and organization_ref == DEFAULT_ORGANIZATION_REF1C
         )
+        if workshop_ref:
+            workshop_stock = workshop_stock_by_item.get(
+                (workshop_ref, iid, characteristic_ref, organization_ref), 0.0
+            )
+            workshop_reserved_total = reservation_state.reserved_at_warehouse(
+                workshop_ref, iid
+            )
+            own_at_workshop_cell = reservation_state.reserved_for_product_at_warehouse(
+                int(custody_product_id),
+                workshop_ref,
+                iid,
+                location_kind="workshop",
+            )
+            own_at_workshop_cell_total = reservation_state.reserved_for_product_at_warehouse(
+                int(custody_product_id), workshop_ref, iid
+            )
+            workshop_reserved_other = max(
+                0.0, workshop_reserved_total - own_at_workshop_cell_total
+            )
+            workshop_free = max(0.0, workshop_stock - workshop_reserved_total)
+            workshop_overheld = max(0.0, workshop_reserved_total - workshop_stock)
+            workshop_unavailable_reason = (
+                "unsupported_exact_custody_scope"
+                if not exact_custody_scope_supported
+                else "negative_physical_stock"
+                if workshop_stock < -1e-9
+                else "custody_exceeds_physical"
+                if workshop_overheld > 1e-9
+                else None
+            )
+        else:
+            workshop_stock = None
+            own_at_workshop_cell = None
+            workshop_reserved_other = None
+            workshop_free = None
+            workshop_overheld = None
+            workshop_unavailable_reason = "workshop_warehouse_unresolved"
+        if workshop_ref and workshop_unavailable_reason is None:
+            workshop_covering = float(own_at_workshop_cell or 0.0) + float(workshop_free or 0.0)
+            workshop_label = _component_coverage_label(required, workshop_covering)
+        else:
+            workshop_covering = None
+            workshop_label = "unavailable"
+        require_reserved_at_workshop = own_at_workshop > 1e-9
         covering = own_at_workshop if require_reserved_at_workshop else available + own_reserved
         missing = max(0.0, required - covering)
         label = _component_coverage_label(required, covering)
@@ -630,6 +790,17 @@ def preview_materials(
         comp["reserved_for_order_qty"] = own_reserved
         comp["reserved_at_workshop_qty"] = own_at_workshop
         comp["reserved_in_transit_qty"] = own_in_transit
+        comp["workshop_warehouse_ref1c"] = workshop_ref or None
+        comp["workshop_warehouse_name"] = workshop_name or None
+        comp["workshop_stock_qty"] = workshop_stock
+        comp["workshop_reserved_for_order_qty"] = own_at_workshop_cell
+        comp["workshop_reserved_other_qty"] = workshop_reserved_other
+        comp["workshop_free_qty"] = workshop_free
+        comp["workshop_overheld_qty"] = workshop_overheld
+        comp["workshop_availability_reason"] = workshop_unavailable_reason
+        comp["workshop_coverage_qty"] = workshop_covering
+        comp["workshop_coverage_status"] = _ui_coverage_status(workshop_label)
+        comp["workshop_coverage_label"] = _ui_coverage_label(workshop_label)
         comp["reserved_orders"] = reserved_orders_by_item.get(iid, [])
         comp["missing_qty"] = missing
         launch_covering = max(own_at_workshop, raw_stock - reserved)
@@ -715,6 +886,8 @@ def preview_materials(
         "material_supported_qty": float(supported),
         "material_launchable_qty": float(launchable),
         "material_launch_coverage_status": "unavailable" if ambiguous_bom else _aggregate_coverage([str(c['launch_coverage']) for c in components]),
+        "workshop_coverage_status": "unavailable" if ambiguous_bom else _aggregate_coverage([str(c['workshop_coverage_status']) for c in components]),
+        "workshop_coverage_label": "Неоднозначная спецификация" if ambiguous_bom else _ui_coverage_label(_aggregate_coverage([str(c['workshop_coverage_status']) for c in components])),
         "coverage_label": "Неоднозначная спецификация" if ambiguous_bom else _ui_coverage_label(order_coverage),
         "coverage_basis": "welded_bom" if basis_item is not None else "direct_bom",
         "coverage_basis_item_id": int(basis_item.item_id) if basis_item is not None else int(product.item_id),
@@ -789,6 +962,7 @@ def _preview_material_products_bulk(
         tuple[int | None, Item | None, int, bool, int | None, List[Dict[str, Any]]],
     ] = {}
     component_ids: set[int] = set()
+    workshop_warehouse_by_product: Dict[int, Tuple[str, str]] = {}
     for product_id in ids:
         value = _resolve_preview_components(
             db,
@@ -797,6 +971,12 @@ def _preview_material_products_bulk(
         )
         resolved[product_id] = value
         component_ids.update(int(row["component_item_id"]) for row in value[5])
+        workshop_warehouse_by_product[product_id] = _material_workshop_warehouse(
+            db,
+            products_by_id[product_id],
+            custody_product_id=int(value[2]),
+            spec_id=value[4],
+        )
 
     from .item_ledger import item_ledger_position
     from .production_material_custody_projection import load_material_custody_projection
@@ -826,6 +1006,20 @@ def _preview_material_products_bulk(
         ledger_generation_id=generation_id,
         current_only=_current_only,
     )
+    warehouse_stock_by_item = _warehouse_stock(
+        db,
+        ledger_generation_id=generation_id,
+        warehouse_refs=[value[0] for value in workshop_warehouse_by_product.values()],
+        physical_keys=[
+            (
+                int(component["component_item_id"]),
+                str(component.get("characteristic_ref") or ""),
+                str(component.get("organization_ref") or ""),
+            )
+            for value in resolved.values()
+            for component in value[5]
+        ],
+    )
     context = _BulkPreviewContext(
         ledger_generation_id=generation_id,
         allow_building_read=not _current_only,
@@ -835,6 +1029,8 @@ def _preview_material_products_bulk(
         reservation_orders=reservation_orders,
         resolved=resolved,
         unit_display_by_raw=unit_display_by_raw,
+        workshop_warehouse_by_product=workshop_warehouse_by_product,
+        warehouse_stock_by_item=warehouse_stock_by_item,
     )
     return {
         product_id: preview_materials(

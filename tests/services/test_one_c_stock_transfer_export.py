@@ -861,6 +861,38 @@ def test_same_contents_at_different_times_have_distinct_origins():
     assert exporter._entry_origin_token(first) != exporter._entry_origin_token(second)
 
 
+def test_transfer_payload_rejects_noncanonical_organization_scope():
+    entry = exporter.StockTransferExportEntry(
+        issue_id=1,
+        document_number="MT-SCOPE",
+        product_id=5,
+        order_id=10,
+        order_ref1c="order-ref",
+        source_warehouse_ref1c="source-ref",
+        destination_warehouse_ref1c="destination-ref",
+        product_item_ref1c="product-ref",
+        product_line_number=1,
+        lines=[exporter.StockTransferExportLine(
+            line_number=1,
+            component_item_id=20,
+            item_ref1c="component-ref",
+            item_name="Component",
+            item_article="COMP",
+            unit_ref1c=None,
+            qty=5,
+        )],
+        document_date=datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ValueError, match="canonical physical scope"):
+        exporter._build_header_payload(
+            entry,
+            exporter.StockTransferExportDefaults(
+                organization_ref1c="different-organization-ref"
+            ),
+        )
+
+
 def test_posted_transfer_is_not_patched_on_second_export(db_session, monkeypatch):
     db = db_session
     parent = _mk_item(db, code="TRP5P", ref1c="parent-ref-5p")

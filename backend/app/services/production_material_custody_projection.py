@@ -142,6 +142,10 @@ def _state_from_projection_rows(
             state.by_warehouse_item[(warehouse, comp_id)] = (
                 state.by_warehouse_item.get((warehouse, comp_id), 0.0) + qty
             )
+            cell = (product_id, warehouse, comp_id, str(row.location_kind))
+            state.by_product_warehouse_item[cell] = (
+                state.by_product_warehouse_item.get(cell, 0.0) + qty
+            )
     return state
 
 
@@ -194,6 +198,10 @@ def _state_from_projection_values(
         bucket[component_id] = bucket.get(component_id, 0.0) + qty
         state.by_warehouse_item[(warehouse, component_id)] = (
             state.by_warehouse_item.get((warehouse, component_id), 0.0) + qty
+        )
+        cell = (product_id, warehouse, component_id, location)
+        state.by_product_warehouse_item[cell] = (
+            state.by_product_warehouse_item.get(cell, 0.0) + qty
         )
     return state
 
@@ -1147,6 +1155,14 @@ def _build_projection_from_seed_and_events(
             state.by_warehouse_item.pop((warehouse, comp_id), None)
         else:
             state.by_warehouse_item[(warehouse, comp_id)] = warehouse_qty
+        product_cell = (int(event.product_id), warehouse, comp_id, location)
+        product_warehouse_qty = (
+            state.by_product_warehouse_item.get(product_cell, 0.0) + delta
+        )
+        if product_warehouse_qty <= _EPSILON:
+            state.by_product_warehouse_item.pop(product_cell, None)
+        else:
+            state.by_product_warehouse_item[product_cell] = product_warehouse_qty
 
     return state, projection_rows
 
@@ -2163,6 +2179,14 @@ def load_current_accepted_material_custody(
             state.by_warehouse_item.pop((warehouse, component_id), None)
         else:
             state.by_warehouse_item[(warehouse, component_id)] = next_warehouse_qty
+        product_cell = (int(event.product_id), warehouse, component_id, location)
+        next_product_warehouse_qty = (
+            state.by_product_warehouse_item.get(product_cell, 0.0) + delta
+        )
+        if next_product_warehouse_qty <= _EPSILON:
+            state.by_product_warehouse_item.pop(product_cell, None)
+        else:
+            state.by_product_warehouse_item[product_cell] = next_product_warehouse_qty
 
     return generation_id, state
 

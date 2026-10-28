@@ -85,6 +85,7 @@ ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 COVERAGE_LABELS = {
     "unknown": "Недоступно",
+    "unavailable": "Недоступно",
     "shortage": "Дефицит",
     "partial": "Частично",
     "ready": "Обеспечен",
@@ -107,7 +108,7 @@ STATUS_FILTER_GROUPS = {
     "done": ("done", "produced_partial", "produced"),
 }
 
-ACTIVE_COVERAGE_STATUSES = {"shortage", "partial", "ready"}
+ACTIVE_COVERAGE_STATUSES = {"shortage", "partial", "ready", "unavailable"}
 
 # Where a journal line takes its launch quantity and launch date from.
 # 'shelf_pull'    — DBR shelf projection of the accepted generation drives it;
@@ -1297,8 +1298,17 @@ def list_journal(
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
         material_snapshot = (_material_coverage_by_product or {}).get(int(product.product_id))
-        material_coverage_status = str((material_snapshot or {}).get("coverage_status") or "")
-        material_coverage_label = str((material_snapshot or {}).get("coverage_label") or "")
+        # A materialized executor's readiness is warehouse-local.  Global
+        # coverage remains inside the snapshot as transfer/sourcing evidence,
+        # but must not drive the journal's "Обеспечение" pill.
+        material_coverage_status = str(
+            (material_snapshot or {}).get("workshop_coverage_status")
+            or "unavailable"
+        )
+        material_coverage_label = str(
+            (material_snapshot or {}).get("workshop_coverage_label")
+            or COVERAGE_LABELS.get(material_coverage_status, material_coverage_status)
+        )
         row_coverage_status = _journal_coverage_status(line_status, issue_status, material_coverage_status)
         work_status = _journal_work_status(line_status)
         has_1c_link = _production_order_has_1c_link(db, product.order)

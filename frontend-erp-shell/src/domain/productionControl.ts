@@ -56,6 +56,17 @@ export type MaterialRow = {
   reserved_for_order_qty?: number
   reserved_at_workshop_qty?: number
   reserved_in_transit_qty?: number
+  workshop_warehouse_ref1c?: string | null
+  workshop_warehouse_name?: string | null
+  workshop_stock_qty?: number | null
+  workshop_reserved_for_order_qty?: number | null
+  workshop_reserved_other_qty?: number | null
+  workshop_free_qty?: number | null
+  workshop_overheld_qty?: number | null
+  workshop_coverage_qty?: number | null
+  workshop_coverage_status?: string | null
+  workshop_coverage_label?: string | null
+  workshop_availability_reason?: string | null
   reserved_orders?: Array<{
     product_id: number
     order_id?: number | null
@@ -81,6 +92,8 @@ export type EmployeesResponse = ApiSchemas['ProductionEmployeeListResponse']
 
 export type MaterialsResponse = Omit<ApiSchemas['ProductionMaterialsResponse'], 'components'> & {
   components: MaterialRow[]
+  workshop_coverage_status?: string | null
+  workshop_coverage_label?: string | null
   coverage_basis_item_name?: string | null
   coverage_basis_item_article?: string | null
   coverage_basis_item_code?: string | null

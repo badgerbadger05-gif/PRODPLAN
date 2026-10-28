@@ -21,19 +21,25 @@ from app.models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionResource,
     SpecComponent,
     Specification,
     StockWarehouse,
     StockBin,
+    WorkshopWarehouseBinding,
     PhysicalImportBatch,
     LedgerGeneration,
 )
+from app.services import production_control_material_availability as material_availability
 from app.services.production_control_material_availability import preview_materials
+from app.services import production_control_material_issues as material_issues
 from app.services.production_control_material_issues import create_material_issues
+from app.services.production_control_journal import list_journal
 from app.services.production_material_custody_projection import (
     initialize_material_custody_baseline,
 )
 from app.services.planning_truth import publish_generation
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 WORKSHOP_WH = "wh-weld"
 SOURCE_WH = "wh-metal"
@@ -86,7 +92,7 @@ def _add_warehouses(db, *, selected=(WORKSHOP_WH, SOURCE_WH)):
 def _set_stock(db, item: Item, breakdown: dict[str, float]):
     db.query(StockBin).filter(StockBin.ledger_generation_id == db.info["section_stock_generation"], StockBin.item_id == item.item_id).delete()
     for ref, qty in breakdown.items():
-        db.add(StockBin(ledger_generation_id=db.info["section_stock_generation"], item_id=item.item_id, characteristic_ref="", organization_ref="", warehouse_ref1c=ref, on_hand=qty))
+        db.add(StockBin(ledger_generation_id=db.info["section_stock_generation"], item_id=item.item_id, characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c=ref, on_hand=qty))
     db.commit()
 
 
@@ -287,6 +293,11 @@ def test_second_order_cannot_be_covered_by_first_orders_kit(db_session):
             "reserved_in_transit_qty": pytest.approx(0.0),
         }
     ]
+    # Without a canonical workshop->warehouse binding the local cell is
+    # unavailable, never a fabricated zero or a fallback to global stock.
+    assert comp_row["workshop_warehouse_ref1c"] is None
+    assert comp_row["workshop_stock_qty"] is None
+    assert comp_row["workshop_free_qty"] is None
 
     # Order A itself stays covered by its own reservation.
     preview_a = preview_materials(db, product_a.product_id)
@@ -360,12 +371,11 @@ def test_create_issues_claims_destination_stock_and_moves_only_delta(db_session)
 
 
 def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_session):
-    """52 on the workshop minus 27 transit and 25 workshop custody is zero.
+    """52 on the workshop minus accepted holds 27 and 25 is locally zero.
 
-    Both custody rows intentionally name the same physical warehouse.  Their
-    workflow labels differ, but source/destination availability is owned by
-    the warehouse+item cell and therefore neither quantity is free for a new
-    zero-distance claim.
+    Both accepted movements are workshop custody in the same destination
+    physical cell.  Global stock on another warehouse must neither make this
+    cell look free nor let a third order claim it locally.
     """
     db = db_session
     _add_warehouses(db)
@@ -373,6 +383,29 @@ def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_
     workshop_owner = _make_order_line(db, parent, order_qty=25.0, suffix="HELD-W")
     current = _make_order_line(db, parent, order_qty=9.0, suffix="CURRENT")
     _set_stock(db, comp, {WORKSHOP_WH: 52.0, SOURCE_WH: 100.0})
+    # Same item and warehouse, but another characteristic is a different
+    # physical key and must not inflate this BOM component's local stock.
+    db.add(
+        StockBin(
+            ledger_generation_id=int(db.info["section_stock_generation"]),
+            item_id=int(comp.item_id),
+            characteristic_ref="other-characteristic",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c=WORKSHOP_WH,
+            on_hand=100.0,
+        )
+    )
+    workshop = ProductionResource(resource_name="Сварочный участок")
+    db.add(workshop)
+    db.flush()
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=int(workshop.resource_id),
+            warehouse_ref1c=WORKSHOP_WH,
+        )
+    )
+    current.control_state.workshop_id = int(workshop.resource_id)
+    current.control_state.workshop_id_source = "manual"
     generation = db.get(LedgerGeneration, int(db.info["section_stock_generation"]))
     db.add_all(
         (
@@ -380,7 +413,7 @@ def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_
                 ledger_generation_id=int(generation.id),
                 product_id=int(transit_owner.product_id),
                 component_item_id=int(comp.item_id),
-                location_kind="transit",
+                location_kind="workshop",
                 warehouse_ref1c=WORKSHOP_WH,
                 reserved_qty=27.0,
                 source_event_high_watermark_id=0,
@@ -401,6 +434,49 @@ def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_
     db.commit()
     db.expire_all()
 
+    before = preview_materials(db, current.product_id)
+    component = before["components"][0]
+    assert component["stock_qty"] == pytest.approx(252.0)
+    assert component["workshop_warehouse_ref1c"] == WORKSHOP_WH
+    assert component["workshop_stock_qty"] == pytest.approx(52.0)
+    assert component["workshop_reserved_for_order_qty"] == pytest.approx(0.0)
+    assert component["workshop_reserved_other_qty"] == pytest.approx(52.0)
+    assert component["workshop_free_qty"] == pytest.approx(0.0)
+    assert component["workshop_overheld_qty"] == pytest.approx(0.0)
+    assert component["workshop_coverage_status"] == "shortage"
+    assert before["workshop_coverage_status"] == "shortage"
+    # Global stock still permits a transfer, but is not local readiness.
+    assert component["launch_coverage"] == "ok"
+    journal_row = list_journal(
+        db,
+        product_id=current.product_id,
+        _material_coverage_by_product={current.product_id: before},
+    )["rows"][0]
+    assert journal_row["coverage_status"] == "shortage"
+    assert journal_row["coverage_label"] == "Дефицит"
+
+    overheld_row = (
+        db.query(ProductionMaterialCustodyProjection)
+        .filter(
+            ProductionMaterialCustodyProjection.product_id == workshop_owner.product_id,
+            ProductionMaterialCustodyProjection.component_item_id == comp.item_id,
+        )
+        .one()
+    )
+    overheld_row.reserved_qty = 35.0
+    db.commit()
+    db.expire_all()
+    overheld = preview_materials(db, current.product_id)["components"][0]
+    assert overheld["workshop_stock_qty"] == pytest.approx(52.0)
+    assert overheld["workshop_free_qty"] == pytest.approx(0.0)
+    assert overheld["workshop_overheld_qty"] == pytest.approx(10.0)
+    assert overheld["workshop_coverage_status"] == "unavailable"
+    assert overheld["workshop_availability_reason"] == "custody_exceeds_physical"
+    overheld_row = db.get(ProductionMaterialCustodyProjection, overheld_row.id)
+    overheld_row.reserved_qty = 25.0
+    db.commit()
+    db.expire_all()
+
     result = create_material_issues(
         db, [current.product_id], warehouse_ref1c=WORKSHOP_WH
     )
@@ -418,6 +494,51 @@ def test_fully_held_physical_workshop_cell_cannot_create_another_local_claim(db_
     assert [(event.location_kind, event.delta_qty) for event in current_events] == [
         ("transit", pytest.approx(9.0))
     ]
+
+
+def test_material_issue_fails_closed_when_exact_physical_scope_cannot_be_persisted(
+    db_session, monkeypatch
+):
+    db = db_session
+    _add_warehouses(db)
+    _parent, component, product = _setup(db, order_qty=1.0, suffix="SCOPE")
+    original = material_issues._components_for_product
+
+    def scoped_components(session, selected_product, **kwargs):
+        spec_id, components = original(session, selected_product, **kwargs)
+        components[0]["characteristic_ref"] = "characteristic-1c-ref"
+        return spec_id, components
+
+    monkeypatch.setattr(material_issues, "_components_for_product", scoped_components)
+    monkeypatch.setattr(material_availability, "_components_for_product", scoped_components)
+    workshop = ProductionResource(resource_name="Scope workshop")
+    db.add(workshop)
+    db.flush()
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=int(workshop.resource_id),
+            warehouse_ref1c=WORKSHOP_WH,
+        )
+    )
+    product.control_state.workshop_id = int(workshop.resource_id)
+    product.control_state.workshop_id_source = "manual"
+    db.commit()
+
+    preview = preview_materials(db, product.product_id)
+    scoped = preview["components"][0]
+    assert scoped["workshop_coverage_status"] == "unavailable"
+    assert scoped["workshop_availability_reason"] == "unsupported_exact_custody_scope"
+
+    result = create_material_issues(
+        db, [product.product_id], warehouse_ref1c=WORKSHOP_WH
+    )
+
+    assert result["created"] == []
+    assert result["errors"] == [
+        f"product_id={product.product_id}: component_item_id={component.item_id}: "
+        "заявка перемещения не сохраняет characteristic/organization exact physical key"
+    ]
+    assert db.query(ProductionMaterialIssue).count() == 0
 
 
 def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_session):

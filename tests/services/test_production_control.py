@@ -76,6 +76,7 @@ from app.services.production_control_printing import (
     render_route_sheets_from_snapshots,
 )
 from app.services.one_c_production_order_export import PRODUCTION_ORDER_ENTITY
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.planning_truth import PlanningTruthUnavailable, publish_generation
 from app.services.mrp_mutation_guard import MrpMutationLineageError
 
@@ -155,7 +156,7 @@ def _accepted_stock_bin(db_session, item_id: int, warehouse_ref1c: str, qty: flo
     """Seed the exact accepted Ledger fold only."""
     return StockBin(
         ledger_generation_id=int(db_session.info["production_journal_generation_id"]),
-        item_id=int(item_id), characteristic_ref="", organization_ref="",
+        item_id=int(item_id), characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c=warehouse_ref1c, on_hand=qty,
     )
 
@@ -641,7 +642,7 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal["rows"][0]["order_number"] == "1839"
     assert journal["rows"][0]["item_article"] == "ART-P"
     assert journal["rows"][0]["status"] == "created"
-    assert journal["rows"][0]["coverage_status"] == "unknown"
+    assert journal["rows"][0]["coverage_status"] == "unavailable"
     # 1C-synced order: source defaults to '1c', order_ref1c populated.
     # Frontend uses these to hide the "Export to 1C" button on 1C rows.
     assert journal["rows"][0]["order_source"] == "1c"
@@ -1042,7 +1043,7 @@ def test_journal_splits_work_status_from_material_coverage(db_session):
     row = list_journal(db_session)["rows"][0]
 
     assert row["status"] == "ready"
-    assert row["coverage_status"] == "unknown"
+    assert row["coverage_status"] == "unavailable"
     assert row["coverage_label"] == "Недоступно"
 
 
@@ -1065,6 +1066,8 @@ def test_posted_assembled_line_uses_frozen_ready_coverage_when_available(db_sess
     frozen_coverage = {
         "coverage_status": "ready",
         "coverage_label": "Обеспечен",
+        "workshop_coverage_status": "ready",
+        "workshop_coverage_label": "Обеспечен",
     }
     row = list_journal(
         db_session,
@@ -1123,7 +1126,10 @@ def test_journal_filters_by_workshop_and_coverage_before_paging(db_session):
         limit=1,
         offset=0,
         _material_coverage_by_product={
-            rows[1].product_id: {"coverage_status": "ready", "coverage_label": "Обеспечен"},
+            rows[1].product_id: {
+                "coverage_status": "ready", "coverage_label": "Обеспечен",
+                "workshop_coverage_status": "ready", "workshop_coverage_label": "Обеспечен",
+            },
         },
     )
 
@@ -1282,6 +1288,8 @@ def test_journal_without_coverage_filter_does_not_reuse_last_row_status(db_sessi
         product.product_id: {
             "coverage_status": status,
             "coverage_label": "Обеспечен" if status == "ready" else "Частично обеспечен",
+                "workshop_coverage_status": status,
+                "workshop_coverage_label": "Обеспечен" if status == "ready" else "Частично обеспечен",
         }
         for product, status in zip(
             db_session.query(ProductionProduct).filter(ProductionProduct.item_id == item.item_id).order_by(ProductionProduct.product_id).all(),
@@ -1706,7 +1714,7 @@ def test_components_with_disjoint_source_choices_create_and_reuse_issues(db_sess
             ref = f"source-{index}-{suffix}"
             db_session.add(StockWarehouse(warehouse_ref1c=ref, warehouse_name=ref, is_selected=True))
             db_session.add(StockBin(ledger_generation_id=generation_id, item_id=component.item_id,
-                warehouse_ref1c=ref, characteristic_ref="", organization_ref="", on_hand=10))
+                warehouse_ref1c=ref, characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, on_hand=10))
     order = ProductionOrder(order_number="MULTI-SOURCE", order_date=datetime(2026, 6, 4), deletion_mark=False)
     db_session.add(order); db_session.flush()
     product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1,
@@ -1733,7 +1741,7 @@ def test_component_source_selection_rejects_non_candidate(db_session, invalid_so
     generation_id = db_session.info["production_journal_generation_id"]
     db_session.add(StockWarehouse(warehouse_ref1c="valid-source", warehouse_name="Valid", is_selected=True))
     db_session.add(StockBin(ledger_generation_id=generation_id, item_id=component.item_id,
-        warehouse_ref1c="valid-source", characteristic_ref="", organization_ref="", on_hand=10))
+        warehouse_ref1c="valid-source", characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, on_hand=10))
     db_session.flush()
     with pytest.raises(ValueError, match="not an accepted stock candidate"):
         _allocate_components_by_source_warehouse(db_session,
@@ -2618,8 +2626,8 @@ def test_live_posted_issue_does_not_mutate_accepted_custody_coverage(db_session)
         product_id=product.product_id,
         _material_coverage_by_product={product.product_id: preview},
     )["rows"][0]
-    assert row["coverage_status"] == "ready"
-    assert row["coverage_label"] == "Обеспечен"
+    assert row["coverage_status"] == "unavailable"
+    assert row["coverage_label"] == "Недоступно"
 
 
 def test_journal_uses_candidate_material_coverage_for_coverage_band_rows(db_session):
@@ -2650,8 +2658,8 @@ def test_journal_uses_candidate_material_coverage_for_coverage_band_rows(db_sess
         _material_coverage_by_product={product.product_id: material},
     )["rows"][0]
 
-    assert row["coverage_status"] == "ready"
-    assert row["coverage_label"] == "Обеспечен"
+    assert row["coverage_status"] == "unavailable"
+    assert row["coverage_label"] == "Недоступно"
     assert row["status"] == "created"
 
 

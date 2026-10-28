@@ -271,6 +271,8 @@ class ProductionMaterialsResponse(BaseModel):
     material_supported_qty: Optional[float] = None
     material_launchable_qty: Optional[float] = None
     material_launch_coverage_status: Optional[str] = None
+    workshop_coverage_status: Optional[str] = None
+    workshop_coverage_label: Optional[str] = None
     model_config = ConfigDict(extra="forbid")
 
     ledger_generation_id: int

@@ -5767,6 +5767,10 @@ export interface components {
             material_launchable_qty?: number | null;
             /** Material Launch Coverage Status */
             material_launch_coverage_status?: string | null;
+            /** Workshop Coverage Status */
+            workshop_coverage_status?: string | null;
+            /** Workshop Coverage Label */
+            workshop_coverage_label?: string | null;
             /** Ledger Generation Id */
             ledger_generation_id: number;
             /** Truth Status */

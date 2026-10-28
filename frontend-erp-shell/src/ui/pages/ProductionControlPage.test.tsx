@@ -1568,12 +1568,19 @@ describe('ProductionControlPage — characterization', () => {
       ...fakeMaterials(),
       components: [{ ...fakeMaterials().components[0], stock_qty: 318,
         reserved_qty: 492, reserved_for_order_qty: 0, available_qty: -174,
+        workshop_warehouse_name: 'Участок сварочный', workshop_stock_qty: 52,
+        workshop_reserved_for_order_qty: 0, workshop_reserved_other_qty: 52,
+        workshop_free_qty: 0,
         required_qty: 400, missing_qty: 574 }],
     })
     renderPage()
-    expect(await screen.findByText('Остаток: 318')).toBeInTheDocument()
-    expect(screen.getByText('Под другие заказы: 492')).toBeInTheDocument()
-    expect(screen.getByText('Доступно: -174')).toBeInTheDocument()
+    expect(await screen.findByText('Участок: Участок сварочный')).toBeInTheDocument()
+    expect(screen.getByText('На участке физически: 52')).toBeInTheDocument()
+    expect(screen.getByText('На участке под другие заказы: 52')).toBeInTheDocument()
+    expect(screen.getByText('На участке свободно: 0')).toBeInTheDocument()
+    expect(screen.getByText('Все склады физически: 318')).toBeInTheDocument()
+    expect(screen.getByText('Все склады под другие заказы: 492')).toBeInTheDocument()
+    expect(screen.getByText('Все склады не удержано (справочно): -174')).toBeInTheDocument()
     expect(screen.getByText('Дефицит: 574')).toBeInTheDocument()
     expect(screen.queryByText('есть -174')).not.toBeInTheDocument()
   })

@@ -126,11 +126,13 @@ export function ProductionDetailPane({
   const rowSource = activeRow?.order_source || activeRow?.source
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty
-  const activeCoverageStatus = materials?.coverage_status
+  const activeCoverageStatus = materials?.workshop_coverage_status
+    || materials?.coverage_status
     || activeRow?.coverage_status
     || activeRow?.status
     || 'unknown'
-  const activeCoverageLabel = materials?.coverage_label
+  const activeCoverageLabel = materials?.workshop_coverage_label
+    || materials?.coverage_label
     || (activeRow?.coverage_status === 'unknown' ? coverageLabels.unknown : activeRow?.coverage_label)
     || coverageLabels[String(activeCoverageStatus)]
     || activeCoverageStatus
@@ -419,14 +421,35 @@ export function ProductionDetailPane({
                 </div>
                 <div className="matNums">
                   <span>Нужно: {qty(m.required_qty)}</span>
-                  <span title="Физический остаток по принятому Ledger до вычета удержаний">Остаток: {m.stock_qty == null ? 'н/д' : qty(m.stock_qty)}</span>
-                  <span>Под другие заказы: {m.reserved_qty == null ? 'н/д' : qty(m.reserved_qty)}</span>
-                  <span>Под эту строку: {m.reserved_for_order_qty == null ? 'н/д' : qty(m.reserved_for_order_qty)}</span>
-                  <span title="Свободный остаток после вычета удержаний. Отрицательное значение означает превышение удержаний над остатком.">Доступно: {qty(m.available_qty)}</span>
+                  <span title="Склад назначения материала для этого производственного участка">
+                    Участок: {m.workshop_warehouse_name || m.workshop_warehouse_ref1c || 'н/д'}
+                  </span>
+                  <span title="Физический остаток принятого Ledger только на складе участка">
+                    На участке физически: {m.workshop_stock_qty == null ? 'н/д' : qty(m.workshop_stock_qty)}
+                  </span>
+                  <span>На участке под эту строку: {m.workshop_reserved_for_order_qty == null ? 'н/д' : qty(m.workshop_reserved_for_order_qty)}</span>
+                  <span>На участке под другие заказы: {m.workshop_reserved_other_qty == null ? 'н/д' : qty(m.workshop_reserved_other_qty)}</span>
+                  <span title="Физический остаток склада участка минус все custody-удержания в этой же ячейке">
+                    На участке свободно: {m.workshop_free_qty == null ? 'н/д' : qty(m.workshop_free_qty)}
+                  </span>
+                  {(m.workshop_overheld_qty ?? 0) > 0 && (
+                    <span className="matMissing">На участке удержано сверх физики: {qty(m.workshop_overheld_qty)}</span>
+                  )}
+                  {m.workshop_availability_reason && (
+                    <span className="matMissing">Локальная доступность: недоступна ({m.workshop_availability_reason})</span>
+                  )}
+                  <span title="Справочный физический остаток по всем складам принятого Ledger">
+                    Все склады физически: {m.stock_qty == null ? 'н/д' : qty(m.stock_qty)}
+                  </span>
+                  <span>Все склады под другие заказы: {m.reserved_qty == null ? 'н/д' : qty(m.reserved_qty)}</span>
+                  <span>Всего под эту строку: {m.reserved_for_order_qty == null ? 'н/д' : qty(m.reserved_for_order_qty)}</span>
+                  <span title="Справочный агрегат всех складов после custody. Он не доказывает переносимость exact physical key.">
+                    Все склады не удержано (справочно): {qty(m.available_qty)}
+                  </span>
                   <span className={(m.missing_qty ?? 0) > 0 ? 'matMissing' : undefined}>Дефицит: {m.missing_qty == null ? 'н/д' : qty(m.missing_qty)}</span>
                 </div>
-                <span className={`miniPill ${m.availability_status || m.coverage_status || 'unknown'}`}>
-                  {m.coverage_label || coverageLabels[String(m.availability_status || m.coverage_status || '')] || m.availability_status || m.coverage_status}
+                <span className={`miniPill ${m.workshop_coverage_status || 'unknown'}`}>
+                  {m.workshop_coverage_label || coverageLabels[String(m.workshop_coverage_status || '')] || m.workshop_coverage_status || 'Недоступно'}
                 </span>
               </div>
             ))}

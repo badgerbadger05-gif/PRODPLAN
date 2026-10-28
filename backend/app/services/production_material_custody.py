@@ -51,6 +51,13 @@ class MaterialCustodyState:
     by_product: Dict[int, ProductMaterialCustody] = field(default_factory=dict)
     # (warehouse_ref1c, component_item_id) -> reserved qty located there.
     by_warehouse_item: Dict[Tuple[str, int], float] = field(default_factory=dict)
+    # Exact compact custody cells retained for read-model presentation and
+    # warehouse-local availability.  Location stays explicit: a pending
+    # transfer is custody at its source cell, while an accepted transfer is
+    # workshop custody at its destination cell.
+    by_product_warehouse_item: Dict[Tuple[int, str, int, str], float] = field(
+        default_factory=dict
+    )
 
     def total_by_item(self, *, exclude_product_id: Optional[int] = None) -> Dict[int, float]:
         result: Dict[int, float] = {}
@@ -67,6 +74,28 @@ class MaterialCustodyState:
         if not warehouse_ref1c:
             return 0.0
         return self.by_warehouse_item.get((str(warehouse_ref1c), int(component_item_id)), 0.0)
+
+    def reserved_for_product_at_warehouse(
+        self,
+        product_id: int,
+        warehouse_ref1c: Optional[str],
+        component_item_id: int,
+        *,
+        location_kind: Optional[str] = None,
+    ) -> float:
+        if not warehouse_ref1c:
+            return 0.0
+        product = int(product_id)
+        warehouse = str(warehouse_ref1c)
+        component = int(component_item_id)
+        return sum(
+            qty
+            for (pid, ref, cid, location), qty in self.by_product_warehouse_item.items()
+            if pid == product
+            and ref == warehouse
+            and cid == component
+            and (location_kind is None or location == location_kind)
+        )
 
     def for_product(self, product_id: int) -> ProductMaterialCustody:
         return self.by_product.get(int(product_id), ProductMaterialCustody())
