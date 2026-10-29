@@ -697,6 +697,353 @@ def test_ledger_projector_holds_only_what_was_reserved(db_session):
     ) == 0
 
 
+def _append_order_terminal_release(
+    db,
+    *,
+    issue,
+    line,
+    order_ref1c: str,
+    delta_qty: float,
+    warehouse_ref1c: str,
+) -> None:
+    """Write the terminal release exactly like the order-terminal observer."""
+    db.add(
+        ProductionMaterialCustodyEvent(
+            issue_id=None,
+            product_id=int(issue.product_id),
+            component_item_id=int(line.component_item_id),
+            source_kind="terminal_release",
+            effective_at=datetime(2026, 7, 31, 9, 0, 0),
+            location_kind="transit",
+            warehouse_ref1c=warehouse_ref1c,
+            source_ref1c=order_ref1c,
+            source_ref2c="order-terminal-v1:done:2026-07-31T09:00:00",
+            document_number="O-TERMINAL",
+            delta_qty=delta_qty,
+            idempotency_key=(
+                f"custody-terminal:test:{int(issue.issue_id)}:"
+                f"{order_ref1c}:{warehouse_ref1c}:{delta_qty}"
+            ),
+        )
+    )
+    db.commit()
+
+
+def _set_order_ref1c(db, issue, order_ref1c: str | None) -> None:
+    order = db.get(ProductionOrder, int(issue.order_id))
+    order.order_ref1c = order_ref1c
+    db.commit()
+
+
+def test_ledger_projector_skips_late_transfer_consumed_by_order_terminal_release(
+    db_session,
+):
+    """issue +10 -> order DONE terminal -10 -> late exact transfer 10.
+
+    The physical movement is real and stays in the Item Ledger, but the order
+    custody was already terminal-released before the transfer's effective
+    time, so a re-posted transfer must not debit the released transit cell a
+    second time and must not revive a workshop hold for the closed order.
+    """
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-late-terminal",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    line = issue.lines[0]
+    _set_order_ref1c(db, issue, "order-ref-late-terminal")
+    append_material_issue_custody_event(
+        db,
+        issue=issue,
+        line=line,
+        delta_qty=10.0,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        source_ref1c="WH-SRC",
+    )
+    db.flush()
+    _append_order_terminal_release(
+        db,
+        issue=issue,
+        line=line,
+        order_ref1c="order-ref-late-terminal",
+        delta_qty=-10.0,
+        warehouse_ref1c="WH-SRC",
+    )
+
+    batch = _mk_transfer_batch(db, batch_key="batch-late-terminal")
+    posting_at = datetime(2026, 8, 4, 15, 4, 35)
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-late-terminal",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-10.0, posting_at=posting_at, line_no=1,
+    )
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-late-terminal",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=10.0, posting_at=posting_at, line_no=2,
+    )
+    db.commit()
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-late-terminal").all()
+
+    appended = project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-late-terminal",
+        stock_ledger_entries=rows,
+    )
+    db.commit()
+
+    assert appended == 0
+    # Physical fact untouched: the SLE rows the Item Ledger owns are still there.
+    assert len(rows) == 2
+    # No transfer_posted custody was attributed to this recorder at all.
+    assert (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(
+            ProductionMaterialCustodyEvent.source_kind == "transfer_posted",
+            ProductionMaterialCustodyEvent.source_ref2c == "ref-late-terminal",
+        )
+        .count()
+        == 0
+    )
+    # The chronology is exactly opening +10 and terminal -10; nothing revived.
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(
+            ProductionMaterialCustodyEvent.product_id == int(issue.product_id),
+            ProductionMaterialCustodyEvent.component_item_id
+            == int(line.component_item_id),
+        )
+        .all()
+    )
+    assert sorted(
+        (str(e.source_kind), str(e.location_kind), float(e.delta_qty)) for e in events
+    ) == [
+        ("issue_created", "transit", 10.0),
+        ("terminal_release", "transit", -10.0),
+    ]
+    # A replay stays a no-op.
+    assert project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-late-terminal",
+        stock_ledger_entries=rows,
+    ) == 0
+
+
+def test_ledger_projector_partial_terminal_release_bounds_late_transfer(
+    db_session,
+):
+    """Partial terminal release leaves only the un-released part attributable."""
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-partial-terminal",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    line = issue.lines[0]
+    _set_order_ref1c(db, issue, "order-ref-partial-terminal")
+    append_material_issue_custody_event(
+        db,
+        issue=issue,
+        line=line,
+        delta_qty=10.0,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        source_ref1c="WH-SRC",
+    )
+    db.flush()
+    _append_order_terminal_release(
+        db,
+        issue=issue,
+        line=line,
+        order_ref1c="order-ref-partial-terminal",
+        delta_qty=-4.0,
+        warehouse_ref1c="WH-SRC",
+    )
+
+    batch = _mk_transfer_batch(db, batch_key="batch-partial-terminal")
+    posting_at = datetime(2026, 8, 4, 15, 4, 35)
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-partial-terminal",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-10.0, posting_at=posting_at, line_no=1,
+    )
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-partial-terminal",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=10.0, posting_at=posting_at, line_no=2,
+    )
+    db.commit()
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-partial-terminal").all()
+
+    appended = project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-partial-terminal",
+        stock_ledger_entries=rows,
+    )
+    db.commit()
+
+    # Only the 6 units the order still holds are attributed.
+    assert appended == 2
+    events = (
+        db.query(ProductionMaterialCustodyEvent)
+        .filter(
+            ProductionMaterialCustodyEvent.product_id == int(issue.product_id),
+            ProductionMaterialCustodyEvent.component_item_id
+            == int(line.component_item_id),
+        )
+        .all()
+    )
+    transit = [e for e in events if e.location_kind == "transit"]
+    workshop = [e for e in events if e.location_kind == "workshop"]
+    # +10 opening, -4 terminal, -6 transfer: the whole cell closes exactly.
+    assert sum(float(e.delta_qty) for e in transit) == pytest.approx(0.0)
+    # … and only the still-unreleased 6 units arrive as this product's hold.
+    assert sum(float(e.delta_qty) for e in workshop) == pytest.approx(6.0)
+
+
+def test_ledger_projector_terminal_release_of_another_order_does_not_suppress(
+    db_session,
+):
+    """A terminal release carrying a different exact order ref is no grounds
+    to skip attribution — same item on another order is never cross-credited."""
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-other-order",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    line = issue.lines[0]
+    _set_order_ref1c(db, issue, "order-ref-this")
+    append_material_issue_custody_event(
+        db,
+        issue=issue,
+        line=line,
+        delta_qty=10.0,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        source_ref1c="WH-SRC",
+    )
+    db.flush()
+    _append_order_terminal_release(
+        db,
+        issue=issue,
+        line=line,
+        order_ref1c="order-ref-ANOTHER-ORDER",
+        delta_qty=-10.0,
+        warehouse_ref1c="WH-SRC",
+    )
+
+    batch = _mk_transfer_batch(db, batch_key="batch-other-order")
+    posting_at = datetime(2026, 8, 4, 15, 4, 35)
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-other-order",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-10.0, posting_at=posting_at, line_no=1,
+    )
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-other-order",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=10.0, posting_at=posting_at, line_no=2,
+    )
+    db.commit()
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-other-order").all()
+
+    appended = project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-other-order",
+        stock_ledger_entries=rows,
+    )
+    db.commit()
+
+    # The unrelated terminal release must not suppress this order's transfer.
+    assert appended == 2
+
+
+def test_ledger_projector_missing_order_ref_keeps_legacy_attribution(
+    db_session,
+):
+    """Without a resolvable order ref the terminal lineage cannot be proven,
+    so the projector keeps its legacy attribution and the fail-closed fold
+    downstream stays the guard. Behavior must stay deterministic."""
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        line_status="issued",
+        issue_status="exported",
+        target_ref_key="ref-no-order-ref",
+        direction="issue",
+        source_warehouse_ref1c="WH-SRC",
+        warehouse_ref1c="WH-DEST",
+    )
+    line = issue.lines[0]
+    _set_order_ref1c(db, issue, None)
+    append_material_issue_custody_event(
+        db,
+        issue=issue,
+        line=line,
+        delta_qty=10.0,
+        source_kind="issue_created",
+        location_kind="transit",
+        warehouse_ref1c="WH-SRC",
+        source_ref1c="WH-SRC",
+    )
+    db.flush()
+    _append_order_terminal_release(
+        db,
+        issue=issue,
+        line=line,
+        order_ref1c="order-ref-unresolvable",
+        delta_qty=-10.0,
+        warehouse_ref1c="WH-SRC",
+    )
+
+    batch = _mk_transfer_batch(db, batch_key="batch-no-order-ref")
+    posting_at = datetime(2026, 8, 4, 15, 4, 35)
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-no-order-ref",
+        item_id=int(line.component_item_id), movement_kind="transfer_out",
+        warehouse_ref1c="WH-SRC", qty=-10.0, posting_at=posting_at, line_no=1,
+    )
+    _add_transfer_sle(
+        db, batch=batch, transfer_ref="ref-no-order-ref",
+        item_id=int(line.component_item_id), movement_kind="transfer_in",
+        warehouse_ref1c="WH-DEST", qty=10.0, posting_at=posting_at, line_no=2,
+    )
+    db.commit()
+    rows = db.query(StockLedgerEntry).filter_by(recorder_ref="ref-no-order-ref").all()
+
+    appended = project_transfer_custody_events_for_recorder(
+        db,
+        recorder_type=STOCK_TRANSFER_ENTITY,
+        recorder_ref="ref-no-order-ref",
+        stock_ledger_entries=rows,
+    )
+    db.commit()
+
+    assert appended == 2
+
+
 def test_ledger_projector_never_rewrites_a_transfer_it_already_recorded(db_session):
     """Rows written by the older rule stay as they are — repair is not automatic.
 

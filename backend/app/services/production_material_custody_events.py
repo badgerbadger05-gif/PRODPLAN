@@ -4,13 +4,14 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     ProductionMaterialCustodyEvent,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
+    ProductionOrder,
     ProductionProduct,
     StockLedgerEntry,
     SyncLink,
@@ -225,6 +226,7 @@ def _custody_balance(
     location_kind: str,
     warehouse_ref1c: str,
     exclude_recorder_ref: str,
+    terminal_order_ref: Optional[str] = None,
 ) -> float:
     """What one custody cell holds before a given transfer is folded into it.
 
@@ -233,11 +235,31 @@ def _custody_balance(
     its own consumption and refuse to finish a half-written pair.  Reservations
     of the same document are kept — the opening is exactly what the transfer is
     allowed to consume.
+
+    The order-terminal observer releases custody with ``issue_id=None`` and the
+    exact order ref in ``source_ref1c``.  When that exact order ref is
+    resolvable for this issue, those terminal releases count against the same
+    cell: a transfer re-posted after the order went terminal must not consume
+    custody the terminal release already closed.  Without a resolvable order
+    ref the lineage cannot be proven and the legacy issue-scoped balance is
+    kept — attribution without proof stays fail-closed downstream.
     """
+    ownership = or_(
+        ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id),
+        (
+            and_(
+                ProductionMaterialCustodyEvent.source_kind == "terminal_release",
+                ProductionMaterialCustodyEvent.source_ref1c
+                == str(terminal_order_ref),
+            )
+            if terminal_order_ref
+            else False
+        ),
+    )
     query = db.query(
         func.coalesce(func.sum(ProductionMaterialCustodyEvent.delta_qty), 0)
     ).filter(
-        ProductionMaterialCustodyEvent.issue_id == int(issue.issue_id),
+        ownership,
         ProductionMaterialCustodyEvent.component_item_id
         == int(line.component_item_id),
         ProductionMaterialCustodyEvent.location_kind == str(location_kind),
@@ -253,6 +275,20 @@ def _custody_balance(
             )
         )
     return _to_float(query.scalar() or 0)
+
+
+def _issue_terminal_order_ref(
+    db: Session, *, issue: ProductionMaterialIssue
+) -> Optional[str]:
+    """Exact 1С order ref behind an issue's product, for terminal lineage."""
+    order_id = int(getattr(issue, "order_id", 0) or 0)
+    if not order_id:
+        return None
+    order = db.get(ProductionOrder, order_id)
+    if order is None:
+        return None
+    ref = str(getattr(order, "order_ref1c", "") or "").strip()
+    return _clean_ref1c(ref) or None
 
 
 def _has_transit_issue_opening(
@@ -497,6 +533,9 @@ def project_transfer_custody_events_for_recorder(
     # instead drove the transit cell negative and failed the whole Ledger build
     # behind it.
     covered: dict[int, float] = {}
+    terminal_order_ref = (
+        _issue_terminal_order_ref(db, issue=issue) if direction == "issue" else None
+    )
     for sle, line, movement, qty in movements:
         if direction != "issue" or movement != "transfer_out":
             continue
@@ -534,6 +573,7 @@ def project_transfer_custody_events_for_recorder(
                     location_kind="transit",
                     warehouse_ref1c=warehouse,
                     exclude_recorder_ref=ref,
+                    terminal_order_ref=terminal_order_ref,
                 ),
             ),
         )
