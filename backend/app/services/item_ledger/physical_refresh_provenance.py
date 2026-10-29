@@ -995,7 +995,11 @@ def apply_bounded_current_material_custody_events(
         next_qty = current_qty + Decimal(str(event.delta_qty or 0))
         if next_qty < 0:
             raise PhysicalRefreshProvenanceUnavailable(
-                "bounded custody event would make compact current quantity negative"
+                "bounded custody event would make compact current quantity negative "
+                f"(event_id={int(event.id)}, source_kind={event.source_kind}, "
+                f"source_sle_id={event.source_sle_id}, key={key}, "
+                f"current_qty={current_qty}, delta_qty={event.delta_qty}, "
+                f"next_qty={next_qty})"
             )
         if row is not None and next_qty == 0:
             # A canonical opening and its transfer-out can cancel in this

@@ -1670,25 +1670,36 @@ def test_bounded_unknown_forward_negative_tail_still_fails_closed(db_session):
     )
     db_session.add(sle)
     db_session.flush()
-    db_session.add(models.ProductionMaterialCustodyEvent(
+    event = models.ProductionMaterialCustodyEvent(
         product_id=int(custody.product_id),
         component_item_id=int(custody.component_item_id),
         source_kind="transfer_posted", source_sle_id=sle.id,
         effective_at=sle.posting_at, location_kind="transit",
         warehouse_ref1c="UNKNOWN", delta_qty=Decimal("-1"),
         idempotency_key="unknown-forward-negative-event",
-    ))
+    )
+    db_session.add(event)
     db_session.flush()
     with pytest.raises(
         PhysicalRefreshProvenanceUnavailable,
         match="bounded custody event would make compact current quantity negative",
-    ):
+    ) as exc_info:
         apply_bounded_current_material_custody_events(
             db_session,
             parent_generation_id=parent.id,
             target_generation_id=target.id,
             source_sle_ids=(sle.id,),
         )
+    message = str(exc_info.value)
+    assert f"event_id={int(event.id)}" in message
+    assert f"source_sle_id={int(sle.id)}" in message
+    assert (
+        f"key=({int(custody.product_id)}, {int(custody.component_item_id)}, "
+        "'transit', 'UNKNOWN')"
+    ) in message
+    assert "current_qty=0" in message
+    assert "delta_qty=-1" in message
+    assert "next_qty=-1" in message
 
 
 def _accept(db, generation: models.LedgerGeneration) -> None:
